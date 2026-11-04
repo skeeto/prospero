@@ -49,6 +49,12 @@ except Ctrl+G in the prompt box, which is Ctrl there too.
   returns to the empty draft.
 - **Tab** completes a `/` command or skill name, and Up and Down pick
   one from the list that shows as you type it.
+- **@** at the start of a word, after a space or `(`, opens a list of
+  the session's files and folders, and once a word is typed, other
+  sessions, ranked as you type. **Tab** or a
+  plain **Enter** puts the pick in the message without sending it,
+  **Up** and **Down** move the pick, and **Esc** closes the list before
+  it reaches the turn.
 - **Ctrl+G** opens the draft in your editor (`[ui] editor`); the draft
   becomes what you save, once the editor exits.
 - **Ctrl+V** pastes text, or attaches a copied image. **Ctrl+Shift+V**

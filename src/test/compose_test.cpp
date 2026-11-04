@@ -1,6 +1,7 @@
 // Compose box tests: slash commands as a message's first word only, their
 // completion, Up and Down through the session's history, the draft's
-// debounce, and the editor's command line.
+// debounce, the editor's command line, and the '@' mentions the caret can
+// be inside while they are typed.
 
 static Str slashstr(Arena *a, Str text)
 {
@@ -32,6 +33,54 @@ static Str argstr(Arena *a, Slice<Str> argv)
     for (iz i = 0; i < argv.len; i++) {
         print(&b, i ? Str("|") : Str(""));
         print(&b, argv[i]);
+    }
+    return finish(&b);
+}
+
+// A mention parse as "on beg end [query]", or "off" for none.
+static Str mentionstr(Arena *a, Str text, iz caret)
+{
+    MentionAt m = mentionat(text, caret);
+    Buf       b(a, 64);
+    print(&b, m.on ? Str("on") : Str("off"));
+    putbyte(&b, ' ');
+    print(&b, (i64)m.beg);
+    putbyte(&b, ' ');
+    print(&b, (i64)m.end);
+    putbyte(&b, ' ');
+    putbyte(&b, '[');
+    print(&b, m.query);
+    putbyte(&b, ']');
+    return finish(&b);
+}
+
+// A pick list as "index:score" entries, or just the indices.
+static Str pickstr(Arena *a, Slice<MentionPick> p, b32 scores)
+{
+    Buf b(a, 64);
+    for (iz i = 0; i < p.len; i++) {
+        if (i) {
+            putbyte(&b, ' ');
+        }
+        print(&b, (i64)p[i].i);
+        if (scores) {
+            putbyte(&b, ':');
+            print(&b, (i64)p[i].score);
+        }
+    }
+    return finish(&b);
+}
+
+// A pick list's paths in order: what the same query gives on any
+// filesystem, whatever order the candidates came in.
+static Str pickpaths(Arena *a, Slice<Str> paths, Slice<MentionPick> p)
+{
+    Buf b(a, 64);
+    for (iz i = 0; i < p.len; i++) {
+        if (i) {
+            putbyte(&b, ' ');
+        }
+        print(&b, paths[p[i].i]);
     }
     return finish(&b);
 }
@@ -92,6 +141,135 @@ static void test_compose(Test *t)
     expect(t, "slash.completes", istr(&a, slashcompletes("/fo", SLASH_FORK)), "1");
     expect(t, "slash.complete", istr(&a, slashcompletes("/fork", SLASH_FORK)), "0");
 
+    // Mentions: '@' at a word's start, the word it runs through, quotes
+    expect(t, "mention.trigger", mentionstr(&a, "@src/ui", 7), "on 0 7 [src/ui]");
+    expect(t, "mention.spacebefore", mentionstr(&a, "hi @src", 7), "on 3 7 [src]");
+    expect(t, "mention.newline", mentionstr(&a, "hi\n@src", 7), "on 3 7 [src]");
+    expect(t, "mention.paren", mentionstr(&a, "(see @src", 9), "on 5 9 [src]");
+    expect(t, "mention.lead", mentionstr(&a, "@", 1), "on 0 1 []");
+    expect(t, "mention.word", mentionstr(&a, "foo@bar.com", 11), "off 0 0 []");
+    expect(t, "mention.scope", mentionstr(&a, "packages/@scope/pkg", 18), "off 0 0 []");
+    expect(t, "mention.tight", mentionstr(&a, "a@b", 3), "off 0 0 []");
+    // The caret mid-word: beg and end span the whole word
+    expect(t, "mention.mid", mentionstr(&a, "@src/ui/draw.cpp", 7), "on 0 16 [src/ui]");
+    // Quoted, with and without the closing quote
+    expect(t, "mention.quote", mentionstr(&a, "@\"my file.txt\"", 14), "on 0 14 [my file.txt]");
+    expect(t, "mention.quotemid", mentionstr(&a, "@\"my file.txt\"", 7), "on 0 14 [my fi]");
+    expect(t, "mention.quoteafter", mentionstr(&a, "@\"my file.txt\" x", 16), "off 0 0 []");
+    expect(t, "mention.quoteempty", mentionstr(&a, "@\"my file.txt\"", 2), "on 0 14 []");
+    expect(t, "mention.quoteatstart", mentionstr(&a, "@\"my file.txt\"", 1), "on 0 14 []");
+    expect(t, "mention.quoteat", mentionstr(&a, "@\"my file.txt\"", 13), "on 0 14 [my file.txt]");
+    // A space inside the quotes does not end the token
+    expect(t, "mention.quotespace", mentionstr(&a, "@\"my file.txt\"", 5), "on 0 14 [my ]");
+    // Nor does the space after the closing quote stay in the token
+    expect(t, "mention.quotespacedone", mentionstr(&a, "@\"my file.txt\" ", 15), "off 0 0 []");
+    // A quoted folder's '/' is inside the quotes, as mentiontext makes it
+    expect(t, "mention.quotedir", mentionstr(&a, "@\"my dir/\"", 10), "on 0 10 [my dir/]");
+    expect(t, "mention.quotedirdone", mentionstr(&a, "@\"my dir/\" x", 12), "off 0 0 []");
+    // A quoted token with no closing quote yet runs to the end of the
+    // line, spaces and all, so accepting it replaces the whole path
+    expect(t, "mention.quoteopen", mentionstr(&a, "@\"my file.tx", 12), "on 0 12 [my file.tx]");
+    expect(t, "mention.quoteopenmid", mentionstr(&a, "@\"my file.tx", 5), "on 0 12 [my ]");
+    expect(t, "mention.quoteopenline", mentionstr(&a, "@\"my file\nnext", 9), "on 0 9 [my file]");
+    // A space outside them does, and the caret after it is in none
+    expect(t, "mention.space", mentionstr(&a, "@src more", 4), "on 0 4 [src]");
+    expect(t, "mention.spaceat", mentionstr(&a, "@src more", 5), "off 0 0 []");
+    expect(t, "mention.spaceend", mentionstr(&a, "@src more", 9), "off 0 0 []");
+    // A second '@' in the word
+    expect(t, "mention.second", mentionstr(&a, "@a@b", 4), "off 0 0 []");
+    expect(t, "mention.secondmid", mentionstr(&a, "@a@b", 2), "off 0 0 []");
+    // The token is capped at MENTION_QUERY bytes from the '@'
+    {
+        Buf b(&a, MENTION_QUERY+32);
+        putbyte(&b, '@');
+        for (i32 i = 0; i < MENTION_QUERY-1; i++) {
+            putbyte(&b, 'a');
+        }
+        Str at = finish(&b);
+        expect(t, "mention.cap", istr(&a, mentionat(at, at.len).on), "1");
+        MentionAt m = mentionat(at, at.len);
+        expect(t, "mention.capend", istr(&a, m.end), istr(&a, MENTION_QUERY));
+        expect(t, "mention.capquery", istr(&a, m.query.len), istr(&a, MENTION_QUERY-1));
+        b = Buf(&a, MENTION_QUERY+32);
+        putbyte(&b, '@');
+        for (i32 i = 0; i < MENTION_QUERY; i++) {
+            putbyte(&b, 'a');
+        }
+        at = finish(&b);
+        expect(t, "mention.caplong", istr(&a, mentionat(at, at.len).on), "0");
+    }
+    expect(t, "mention.textdirparse", mentionstr(&a, mentiontext(&a, "my dir", 1), 10),
+           "on 0 10 [my dir/]");
+    expect(t, "mention.textparse", mentionstr(&a, mentiontext(&a, "my file.txt", 0), 14),
+           "on 0 14 [my file.txt]");
+    // The text accepting a pick makes
+    expect(t, "mention.text", mentiontext(&a, "src/ui/draw.cpp", 0), "@src/ui/draw.cpp ");
+    expect(t, "mention.textspace", mentiontext(&a, "my file.txt", 0), "@\"my file.txt\" ");
+    expect(t, "mention.textdir", mentiontext(&a, "src/ui", 1), "@src/ui/");
+    expect(t, "mention.textdirspace", mentiontext(&a, "my dir", 1), "@\"my dir/\"");
+    // A path that cannot be read back is refused
+    expect(t, "mention.refuse", istr(&a, mentiontext(&a, "a@b", 0).len), "0");
+    expect(t, "mention.refusequote", istr(&a, mentiontext(&a, "a\"b", 0).len), "0");
+    expect(t, "mention.refuseempty", istr(&a, mentiontext(&a, "", 0).len), "0");
+    // Ranking a query against candidate paths: the basename first, the
+    // letters in order, a '/' honoured segment by segment, and one fixed
+    // order for equal scores
+    {
+        Str draw[] = {"src/ui/draw.cpp", "src/ui/draw.h", "docs/draw.md",
+                      "docs/drawing/notes.txt"};
+        Slice<Str> dp = {draw, countof(draw)};
+        // The three basename matches tie on score and the shorter path
+        // leads: docs/draw.md, src/ui/draw.h, src/ui/draw.cpp. The folder
+        // that merely holds the letters is last; without
+        // MENTION_BASE_BONUS the two under src/ui win at 94 instead, which
+        // is this case failing.
+        expect(t, "mention.rank.basename", pickstr(&a, mentionpicks(&a, dp, "draw", 10), 1),
+               "2:158 1:158 0:158 3:83");
+        Str one[] = {"src/ui/draw.cpp"};
+        Slice<Str> op = {one, countof(one)};
+        expect(t, "mention.rank.sub", pickstr(&a, mentionpicks(&a, op, "drw", 10), 0), "0");
+        expect(t, "mention.rank.none", istr(&a, mentionpicks(&a, op, "zzz", 10).len), "0");
+        // A query with '/' matches inside one segment per part, so a path
+        // that only straddles two of them does not
+        Str seg[] = {"src/ui/draw.cpp", "src/uindex/dr/w.cpp"};
+        Slice<Str> sp = {seg, countof(seg)};
+        expect(t, "mention.rank.segment", pickstr(&a, mentionpicks(&a, sp, "ui/drw", 10), 0), "0");
+        expect(t, "mention.rank.case", pickstr(&a, mentionpicks(&a, dp, "DRAW", 10), 0),
+               "2 1 0 3");
+        // Equal scores: the shorter path, then its bytes, whatever order
+        // the candidates arrive in
+        Str ord1[] = {"z/abc.cpp", "a/abc.cpp"};
+        Str ord2[] = {"a/abc.cpp", "z/abc.cpp"};
+        Slice<Str> o1 = {ord1, countof(ord1)};
+        Slice<Str> o2 = {ord2, countof(ord2)};
+        expect(t, "mention.rank.order", pickpaths(&a, o1, mentionpicks(&a, o1, "abc", 10)),
+               "a/abc.cpp z/abc.cpp");
+        expect(t, "mention.rank.order2", pickpaths(&a, o2, mentionpicks(&a, o2, "abc", 10)),
+               "a/abc.cpp z/abc.cpp");
+        expect(t, "mention.rank.max", istr(&a, mentionpicks(&a, dp, "draw", 2).len), "2");
+        expect(t, "mention.rank.maxstr", pickstr(&a, mentionpicks(&a, dp, "draw", 2), 0), "2 1");
+        // An empty, or blank, query ranks nothing and keeps the list's own
+        // order, truncated to max
+        Str rec[] = {"c.txt", "a.txt", "b.txt"};
+        Slice<Str> rp = {rec, countof(rec)};
+        expect(t, "mention.rank.empty", pickstr(&a, mentionpicks(&a, rp, "", 2), 1), "0:0 1:0");
+        expect(t, "mention.rank.emptyall", pickstr(&a, mentionpicks(&a, rp, "", 10), 0), "0 1 2");
+        expect(t, "mention.rank.space", pickstr(&a, mentionpicks(&a, rp, "  ", 10), 0), "0 1 2");
+        // With nodots, a dot file or a dot folder's file is no candidate,
+        // unless the query has a part beginning with '.', as a folder's
+        // listing hides them; without it, every path is
+        Str ds[] = {".claude/skills/a.md", "src/a.md", ".env", "a.md", "src/.hidden/a.md"};
+        Slice<Str> dp2 = {ds, countof(ds), countof(ds)};
+        expect(t, "mention.rank.dots", pickpaths(&a, dp2, mentionpicks(&a, dp2, "a.md", 10, 1)),
+               "a.md src/a.md");
+        expect(t, "mention.rank.dotsempty", pickstr(&a, mentionpicks(&a, dp2, "", 10, 1), 0),
+               "1 3");
+        expect(t, "mention.rank.dotsasked",
+               pickpaths(&a, dp2, mentionpicks(&a, dp2, ".claude/a", 10, 1)),
+               ".claude/skills/a.md");
+        expect(t, "mention.rank.dotsall", istr(&a, mentionpicks(&a, dp2, "a.md", 10).len),
+               "4");
+    }
     // Skills: /name exactly, after the commands, which keep their names
     {
         SkillItem items[] = {{"pdf", "Read PDFs", "/s/pdf/SKILL.md", 0, 0},

@@ -8919,6 +8919,63 @@ def attach_text(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+@scenario(bound=15)
+def attach_path(t):
+    """upload {kind:"file", path}: a file in the session's working
+    directory attached where it is, as a frontend on another machine asks
+    for an '@' mention's: a text file kept as one uploaded is, an image as
+    one, the reply saying which. A binary file is refused as an upload's
+    is; so is a path outside the working directory, by '..', an absolute
+    path, or a link, and a session that is not open."""
+    h = t.headless()
+    try:
+        h.call("hello", proto=0, client="scenarios")
+        caps = h.all("hello")[0].get("caps", [])
+        t.check("files.path" in caps, f"caps: {caps}")
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        t.host.mkdir(t.host.join(t.work, "notes"))
+        t.host.write(t.host.join(t.work, "notes", "a b.txt"), "one\ntwo\n")
+        r = h.call("upload", kind="file", sid=sid, path="notes/a b.txt")
+        t.check(r.get("ok") == 1 and r.get("kind") == "file" and
+                r.get("name") == "files/1-a_b.txt" and r.get("bytes") == 8 and
+                r.get("lines") == 2, f"a text file: {r}")
+        kept = t.host.join(t.state, "sessions", sid, "files", "1-a_b.txt")
+        t.check(t.host.read(kept) == "one\ntwo\n", "kept as it is")
+        t.host.write(t.host.join(t.work, "pic.png"), PNG)
+        r2 = h.call("upload", kind="file", sid=sid, path="pic.png")
+        t.check(r2.get("ok") == 1 and r2.get("kind") == "image" and
+                r2.get("name") == "img/1.png" and (r2.get("w"), r2.get("h")) == (3, 2),
+                f"an image: {r2}")
+        r3 = h.call("prompt", sid=sid, text="@notes/a b.txt @pic.png", files=[r["name"]],
+                    images=[r2["name"]])
+        t.check(r3.get("ok") == 1, f"prompt: {r3}")
+        ended(h, sid, 1)
+
+        def refused(r, err):
+            t.check(r.get("ok") == 0 and r.get("err", "").startswith(err), f"{err}: {r}")
+
+        t.host.write(t.host.join(t.work, "x.bin"), b"\x7fELF\x00\x01")
+        refused(h.call("upload", kind="file", sid=sid, path="x.bin"),
+                "x.bin is a binary file (6 bytes), so it is not attached")
+        outside = "no such file in the session's working directory"
+        t.host.write(t.host.join(t.state, "secret.txt"), "no\n")
+        refused(h.call("upload", kind="file", sid=sid, path="../state/secret.txt"), outside)
+        refused(h.call("upload", kind="file", sid=sid, path="..\\state\\secret.txt"), outside)
+        refused(h.call("upload", kind="file", sid=sid,
+                       path=t.host.join(t.state, "secret.txt")), outside)
+        refused(h.call("upload", kind="file", sid=sid, path="missing.txt"), outside)
+        if isinstance(t.host, LocalHost) and os.name != "nt":
+            os.symlink(t.host.join(t.state, "secret.txt"), t.host.join(t.work, "link.txt"))
+            refused(h.call("upload", kind="file", sid=sid, path="link.txt"), outside)
+        refused(h.call("upload", kind="image", sid=sid, path="pic.png"),
+                "a path is attached with kind \"file\"")
+        refused(h.call("upload", kind="file", sid="20200101-000000-none", path="pic.png"),
+                "no such session open")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 @scenario(bound=20)
 def attach_text_long(t):
     """A long file is cut as read cuts it, with where it goes on; the
@@ -8982,6 +9039,64 @@ def attach_text_replay(t):
         t.check(r.get("ok") == 1, f"imported: {r}")
         users = [e for e in logged(t, imp) if e["ev"] == "user"]
         t.check(users and not any("files" in e for e in users), f"stripped: {users}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=20)
+def mention_sessions(t):
+    """prompt {sessions: [sid]}: the sessions a message mentions by an
+    '@' token, each a line before its text in requests, giving the id
+    send_message takes. The user record keeps each with its title; one
+    unknown, repeated or in the Trash is left out, the message going on.
+    Opened again, the line is in requests still; an import drops them."""
+    h = t.headless()
+    try:
+        h.call("hello", proto=0, client="scenarios")
+        caps = h.all("hello")[0].get("caps", [])
+        t.check("sessions.mention" in caps, f"caps: {caps}")
+        other = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.call("prompt", sid=other, text="Fix the parser")
+        ended(h, other, 1)
+        gone = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        t.check(h.call("trash", sid=gone).get("ok") == 1, "trashed")
+        h.call("list")
+        entry = [s for s in h.all("sessions")[-1]["list"] if s["sid"] == other]
+        title = entry[0].get("title", "") if entry else ""
+        t.check(title, f"its title: {entry}")
+
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        text = f'Please message @"{title}" about it'
+        r = h.call("prompt", sid=sid, text=text,
+                   sessions=[other, "20200101-000000-none", other, gone])
+        t.check(r.get("ok") == 1, f"prompt: {r}")
+        ended(h, sid, 1)
+        user = h.all("user", sid)[0]
+        t.check(user["text"] == text and
+                user.get("sessions") == [{"sid": other, "title": title}],
+                f"the user record: {user}")
+        line = f'[The user mentioned session {other} ("{title}"): send_message'
+        said = fake_provider.user_text_all(t.requests()[-1]["body"])
+        t.check(line in said and said.index(line) < said.index(text),
+                f"the request: {said[:400]}")
+        t.check(lastsaid(h, sid) == "1 sessions mentioned.", f"said: {lastsaid(h, sid)}")
+    finally:
+        h.close()
+    h = t.headless()
+    try:
+        t.check(h.call("open", sid=sid).get("ok") == 1, "reopened")
+        h.call("prompt", sid=sid, text="again")
+        ended(h, sid, 2)
+        said = fake_provider.user_text_all(t.requests()[-1]["body"])
+        t.check(line in said, f"replayed: {said[:400]}")
+
+        raw = t.host.read(t.host.join(t.state, "sessions", sid, "events.jsonl"))
+        r = importlog(t, h, raw, model=t.model, endpoint="fake")
+        imp = r.get("sid")
+        t.check(r.get("ok") == 1, f"imported: {r}")
+        users = [e for e in logged(t, imp) if e["ev"] == "user"]
+        t.check(users and not any("sessions" in e for e in users), f"stripped: {users}")
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")

@@ -78,6 +78,9 @@ static i64 msgbytes(Msg *m)
         n += 128 + (f->bytes<READ_BYTES ? f->bytes : (i64)READ_BYTES) +
              8*(f->lines<READ_LINES ? f->lines : (i64)READ_LINES);
     }
+    for (iz i = 0; i < m->sessions.len; i++) {
+        n += 128 + m->sessions[i].title.len;  // its line (sessrefstext)
+    }
     return n;
 }
 

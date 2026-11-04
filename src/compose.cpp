@@ -11,6 +11,14 @@
 // typing has paused for DRAFT_IDLE, and at once when the session is left
 // or the GUI quits.
 //
+// A mention is '@' and a path the agent can read, "@src/ui/draw.cpp",
+// or quoted when the path holds a space, @"my file.txt". The token is
+// recognized only at a word's start — offset 0, or after a space or
+// '(' — which is the rule instrimports (instructions.cpp) reads @path
+// by, so foo@bar.com and packages/@scope/pkg are never mentions. A path
+// that cannot be written back as a token, one holding '@' or '"', is
+// refused when picked: mentiontext is empty and the caller says why.
+//
 // This is free and unencumbered software released into the public domain.
 
 enum : i32 {
@@ -192,6 +200,412 @@ static i32 slashcount(u32 mask)
 static b32 slashcompletes(Str text, i32 cmd)
 {
     return cmd && text!=slashinfo[cmd].name;
+}
+
+// Mentions: '@' and a path, typed in the box
+
+enum : i32 {
+    MENTION_QUERY = 1024,  // bytes from the '@' to the caret, and of the whole token
+    MENTION_KEEP  = 4096,  // bytes of a path or a line the picker keeps a frame on
+};
+
+// A string the picker keeps from one frame to the next, in a buffer of its
+// own, cut to fit: an arena would grow by each one, as often as a key.
+struct MentionKeep {
+    iz len;
+    u8 buf[MENTION_KEEP];
+};
+
+static Str keepstr(MentionKeep *k)
+{
+    return {k->buf, k->len};
+}
+
+static void keepset(MentionKeep *k, Str s)
+{
+    k->len = s.len<(iz)MENTION_KEEP ? s.len : (iz)MENTION_KEEP;
+    copybytes(k->buf, s.data, k->len);
+}
+
+struct MentionAt {
+    b32 on;     // the caret is inside a mention being typed
+    iz  beg;    // the '@'
+    iz  end;    // one past the word: the next whitespace, or past the closing quote
+    Str query;  // between the '@' and the caret, or the closing quote
+};
+
+// The mention the caret is in, if any: the nearest '@' before it within
+// MENTION_QUERY bytes, at a word's start, with a query holding no space
+// and no second '@' — unless the token is quoted, which allows spaces.
+// The query points into the text.
+static MentionAt mentionat(Str text, iz caret)
+{
+    MentionAt r = {};
+    if (caret < 0) {
+        caret = 0;
+    } else if (caret > text.len) {
+        caret = text.len;
+    }
+
+    // The nearest '@' before the caret, inside the cap
+    iz at = -1;
+    for (iz i = caret; i > 0 && caret-i < MENTION_QUERY; i--) {
+        if (text[i-1] == '@') {
+            at = i - 1;
+            break;
+        }
+    }
+    // At a word's start only: offset 0, or after a space or '('
+    if (at < 0 || (at && !whitespace(text[at-1]) && text[at-1]!='(')) {
+        return r;
+    }
+
+    iz q = at + 1;
+    if (q < text.len && text[q] == '"') {
+        // Quoted: spaces inside the quotes, and the query runs from them
+        // to the caret, no further than the closing quote when it is
+        // typed. The token ends one past that quote.
+        iz close = -1;
+        for (iz i = q+1; i<text.len && i-at<MENTION_QUERY; i++) {
+            if (text[i] == '"') {
+                close = i;
+                break;
+            }
+        }
+        if (close >= 0) {
+            iz end = close + 1;
+            if (caret>end) {
+                return r;  // the caret is past the token, not in it
+            }
+            iz qe = caret<close ? caret : close;
+            if (qe < q+1) {
+                qe = q + 1;  // the caret before the quotes: an empty query
+            }
+            r.on    = 1;
+            r.beg   = at;
+            r.end   = end;
+            r.query = span(text.data+q+1, text.data+qe);
+            return r;
+        }
+        // No closing quote yet: the token runs to the end of the line,
+        // spaces and all, since a quoted path may hold them. Past the
+        // cap, it is no mention at all.
+        iz end = caret;
+        while (end<text.len && text[end]!='\n' && end-at<MENTION_QUERY) {
+            end++;
+        }
+        if (end-at >= MENTION_QUERY && end<text.len && text[end]!='\n') {
+            return r;
+        }
+        r.on    = 1;
+        r.beg   = at;
+        r.end   = end;
+        r.query = span(text.data+q+1, text.data+(caret>q+1 ? caret : q+1));
+        return r;
+    }
+
+    // Plain: the query is the '@' .. the caret, with no space or '@' in
+    // it, and no second '@' in the rest of the word either
+    iz end = caret;
+    while (end<text.len && !whitespace(text[end])) {
+        end++;
+    }
+    if (end-at > MENTION_QUERY) {
+        return r;
+    }
+    for (iz i = q; i < end; i++) {
+        if (whitespace(text[i]) || text[i] == '@') {
+            return r;
+        }
+    }
+    r.on    = 1;
+    r.beg   = at;
+    r.end   = end;
+    r.query = span(text.data+q, text.data+caret);
+    return r;
+}
+
+// The token accepting a pick inserts: "@path", quoted when the path
+// holds a space, a trailing space after a file, and a folder's trailing
+// '/' inside the quotes, so the query names the folder and the popup
+// stays open. Empty for a path the parser could not read back.
+static Str mentiontext(Arena *a, Str path, b32 isdir)
+{
+    for (; path.len && path[path.len-1]=='/'; path.len--) {}
+    if (!path.len) {
+        return {};
+    }
+    b32 space = 0;
+    for (iz i = 0; i < path.len; i++) {
+        if (path[i]=='@' || path[i]=='"') {
+            return {};
+        }
+        space |= whitespace(path[i]);
+    }
+    Buf b(a, path.len + 4);
+    putbyte(&b, '@');
+    if (space) {
+        putbyte(&b, '"');
+    }
+    print(&b, path);
+    if (isdir) {
+        putbyte(&b, '/');
+    }
+    if (space) {
+        putbyte(&b, '"');
+    }
+    if (!isdir) {
+        putbyte(&b, ' ');
+    }
+    return finish(&b);
+}
+
+// Ranking a mention query against candidate paths, fzf's way: these are
+// fzf V2's constants (src/algo/algo.go), the same ones nucleo and zf
+// use, and the DP matrix that finds fzf's best alignment is deliberately
+// not here — the greedy walk below is a few dozen lines, easy to test,
+// and a working tree is not a corpus that pays for it. Upgrading later is
+// local to this block.
+enum : i32 {
+    MENTION_MATCH        = 16,  // scoreMatch: every matched character
+    MENTION_GAP_FIRST    = -3,  // a gap's first character
+    MENTION_GAP_REST     = -1,  // and each one after it
+    MENTION_BONUS_START  = 9,   // the path's start, or a character after '/'
+    MENTION_BONUS_DELIM  = 8,   // after a space, '_', '-' or '.'
+    MENTION_BONUS_CAMEL  = 7,   // a lower-case or digit before an upper-case
+    MENTION_BONUS_RUN    = 4,   // part of a run of consecutive matches
+    MENTION_BASE_BONUS   = 64,  // the pattern matched the basename alone
+    MENTION_PICKS        = 200, // candidates one query is ranked to
+};
+
+// A candidate as the picker offers it: i indexes the list it came from.
+struct MentionPick {
+    i32 i;
+    i32 score;
+};
+
+// The bonus a match at path[i] earns by its position alone, the best of
+// the position rules; the run bonus needs the previous match, so
+// mentionrange adds that.
+static i32 mentionbonus(Str path, iz i)
+{
+    if (i == 0 || path[i-1] == '/') {
+        return MENTION_BONUS_START;
+    }
+    u8 prev = path[i-1];
+    if (prev==' ' || prev=='_' || prev=='-' || prev=='.') {
+        return MENTION_BONUS_DELIM;
+    }
+    u8 c = path[i];
+    if (c>='A' && c<='Z' && ((prev>='a' && prev<='z') || digit(prev))) {
+        return MENTION_BONUS_CAMEL;
+    }
+    return 0;
+}
+
+// The score of lowpat matched greedily inside path[beg,end): MENTION_MATCH
+// a character, less the gap before it, plus its bonus, of which the first
+// pattern character's counts twice. -1 if it is not a subsequence of the
+// range. No allocation: the path is folded a byte at a time.
+static i32 mentionrange(Str path, iz beg, iz end, Str lowpat, b32 first)
+{
+    i32 score = 0;
+    iz  pi    = 0;   // the pattern character sought
+    iz  last  = -1;  // the previous match, -1 before the first
+    for (iz i = beg; i<end && pi<lowpat.len; i++) {
+        if (lowercase(path[i]) != lowpat[pi]) {
+            continue;
+        }
+        i32 b = mentionbonus(path, i);
+        if (last >= 0) {
+            if (i == last+1) {
+                b = b>MENTION_BONUS_RUN ? b : MENTION_BONUS_RUN;
+            } else {
+                i32 gap = (i32)(i-last-1);
+                score += MENTION_GAP_FIRST + (gap-1)*MENTION_GAP_REST;
+            }
+        }
+        if (pi==0 && first) {
+            b *= 2;
+        }
+        score += MENTION_MATCH + b;
+        last   = i;
+        pi++;
+    }
+    return pi==lowpat.len ? score : -1;
+}
+
+// How well a lower-cased query matches a path, -1 if it does not. The
+// basename alone decides when it matches there — the rule that makes a
+// query find the file it names rather than a folder that merely holds the
+// letters — and a query holding '/' must match segment by segment, in
+// order, so "ui/drw" is never satisfied by straddling two of the path's.
+static i32 mentionscore(Str path, Str lowpat)
+{
+    if (!lowpat.len) {
+        return 0;
+    }
+    b32 slash = 0;
+    for (iz i = 0; i < lowpat.len; i++) {
+        slash |= lowpat[i]=='/';
+    }
+    if (!slash) {
+        Str base = basename(path);
+        i32 b    = mentionrange(path, path.len-base.len, path.len, lowpat, 1);
+        if (b >= 0) {
+            return b + MENTION_BASE_BONUS;
+        }
+        return mentionrange(path, 0, path.len, lowpat, 1);
+    }
+
+    // Each pattern segment inside one path segment, the earliest that
+    // holds it, and the next one's search begins after that segment
+    i32 total = 0;
+    iz  pi    = 0;  // the pattern segment's start
+    iz  pbeg  = 0;  // the path segment to search from
+    b32 first = 1;
+    while (pi < lowpat.len) {
+        iz pe = pi;
+        while (pe<lowpat.len && lowpat[pe]!='/') pe++;
+        Str pseg = span(lowpat.data+pi, lowpat.data+pe);
+        if (pseg.len) {
+            i32 got = -1;
+            iz  at  = 0;  // the end of the segment that held it
+            for (iz i = pbeg;;) {
+                iz j = i;
+                while (j<path.len && path[j]!='/') j++;
+                got = mentionrange(path, i, j, pseg, first);
+                if (got>=0 || j>=path.len) {
+                    at = j;
+                    break;
+                }
+                i = j + 1;
+            }
+            if (got < 0) {
+                return -1;
+            }
+            total += got;
+            first  = 0;
+            pbeg   = at<path.len ? at+1 : path.len;
+        }
+        pi = pe + 1;  // past the '/'
+    }
+    return total;
+}
+
+// The paths the picks being sorted index: sort hands its comparator no
+// context, and a pick carries only an index. Set by mentionpicks for the
+// length of its sort.
+static Slice<Str> mentionpickpaths;
+
+// A pick's order: the higher score, then the shorter path, then the path's
+// bytes — never the list's own order, which is the walk's and differs
+// across filesystems, so the same query must give the same list anywhere.
+static b32 mentionpickless(MentionPick *a, MentionPick *b)
+{
+    if (a->score != b->score) {
+        return a->score > b->score;
+    }
+    Str x = mentionpickpaths[a->i];
+    Str y = mentionpickpaths[b->i];
+    if (x.len != y.len) {
+        return x.len < y.len;
+    }
+    return compare(x, y) < 0;
+}
+
+// Whether a path has a part beginning with '.': a dot file, or anything
+// in a dot folder. Also a query's rule: one with such a part asks for them.
+static b32 mentiondotted(Str path)
+{
+    for (iz i = 0; i < path.len; i++) {
+        if (path[i]=='.' && (i==0 || path[i-1]=='/')) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// The best max candidates for a query, best first. The query is as typed:
+// it is folded here. An empty, or all-whitespace, query ranks nothing and
+// keeps the list's own order — the caller's, recent files first — each
+// pick scoring 0, so a caller's ordering survives. With nodots, a dotted
+// path is no candidate unless the query is dotted too (mentiondotted), as
+// a folder's listing keeps dot files out of the way (mentionhidden).
+static Slice<MentionPick> mentionpicks(Arena *a, Slice<Str> paths, Str query, iz max,
+                                       b32 nodots = 0)
+{
+    Slice<MentionPick> r = {};
+    if (max<=0 || !paths.len) {
+        return r;
+    }
+    Str q = trim(query);
+    nodots = nodots && !mentiondotted(q);
+    if (!q.len) {
+        iz n = paths.len<max ? paths.len : max;
+        r.data = alloc<MentionPick>(a, n);
+        r.cap  = n;
+        for (iz i = 0; i<paths.len && r.len<n; i++) {
+            if (!nodots || !mentiondotted(paths[i])) {
+                r.data[r.len++] = MentionPick{(i32)i, 0};
+            }
+        }
+        return r;
+    }
+    Buf b(a, q.len);
+    for (iz i = 0; i < q.len; i++) {
+        putbyte(&b, lowercase(q[i]));
+    }
+    Str lowpat = finish(&b);
+
+    // At most the candidates, and only those that match
+    r.data = alloc<MentionPick>(a, paths.len);
+    r.cap  = paths.len;
+    for (iz i = 0; i < paths.len; i++) {
+        i32 s = nodots && mentiondotted(paths[i]) ? -1 : mentionscore(paths[i], lowpat);
+        if (s >= 0) {
+            r.data[r.len++] = MentionPick{(i32)i, s};
+        }
+    }
+    mentionpickpaths = paths;
+    sort(r.data, r.len, mentionpickless, *a);
+    mentionpickpaths = {};
+    if (r.len > max) {
+        r.len = max;
+    }
+    return r;
+}
+
+// A pick's edit, queued for the GUI to apply to the box on the next
+// frame: what to replace, as it was when the user accepted. Its strings
+// are its own, in buffers a token's size, so a pick costs no memory kept.
+struct MentionEdit {
+    b32 on;
+    iz  beg, end;   // what to replace, as they were when the user accepted
+    Str was;        // the token that was there then, to check the offsets
+    Str text;       // the replacement
+    iz  caret;      // where the caret goes after it
+    u8  wasbuf[MENTION_QUERY];
+    u8  textbuf[MENTION_QUERY];
+};
+
+// Queue a pick's edit: replace was, at [beg, end), with text. Returns 0,
+// queuing nothing, when either is longer than a token can be, which
+// mentionat could not read back as one mention.
+static b32 mentionqueue(MentionEdit *e, iz beg, iz end, Str was, Str text)
+{
+    if (was.len>(iz)MENTION_QUERY || text.len>(iz)MENTION_QUERY) {
+        return 0;
+    }
+    copybytes(e->wasbuf, was.data, was.len);
+    copybytes(e->textbuf, text.data, text.len);
+    e->on    = 1;
+    e->beg   = beg;
+    e->end   = end;
+    e->was   = {e->wasbuf, was.len};
+    e->text  = {e->textbuf, text.len};
+    e->caret = beg + text.len;
+    return 1;
 }
 
 

@@ -281,6 +281,14 @@ struct MsgFile {
     i64 lines;
 };
 
+// A session the user mentioned in a message (an '@' token): a request has
+// a line for each, before the message's own text, so that the agent has
+// its id for send_message.
+struct MsgSess {
+    Str sid;
+    Str title;  // as it was when the message was sent
+};
+
 struct Msg {
     i32          role;
     Str          text;    // user and tool messages
@@ -300,6 +308,7 @@ struct Msg {
     i32          floor;   // FLOOR_*: a cache breakpoint just before it
     Slice<MsgImage> images;  // user messages: those attached
     Slice<MsgFile>  files;   // and the text files
+    Slice<MsgSess>  sessions;  // and the sessions mentioned
 };
 
 // Where a request's prefix stops matching the one before, at a step of

@@ -71,6 +71,7 @@
 #include "place.cpp"
 #include "compose.cpp"
 #include "pathpick.cpp"
+#include "filewalk.cpp"
 #include "sidebar.cpp"
 #include "dock.cpp"
 
@@ -550,6 +551,8 @@ enum : i32 {
     GUI_RELAYQ = 8 << 20,   // bytes of a host's lines waiting for room
 };
 
+// MentionIdx is not forward declared here: filewalk.cpp, included above,
+// defines it whole, and GuiSession below holds a pointer to it.
 struct AttBox;
 
 // The user's answers to the agent's questions (ask_user) as they fill
@@ -605,11 +608,20 @@ struct GuiSession {
     i32          histmsg;   // its message in the view
     Str          note;      // what the latest command from the box came to
     b32          noteerr;
+    b32          notefixed; // it says what typing does not clear (a mention's)
     i64          noteat;    // when, in sched µs: a note not an error fades
     Str          cmdtext;   // that command, put back in the box if it fails
     i64          unqueue;   // the queued message being withdrawn, else 0
     Str          cuttext;   // the prompt a rewind (cut) put in the box
     i64          cmdid;
+    // The '@' picker (mention.cpp, ui.cpp): the queued edit and the '@'
+    // the user dismissed are per session, so neither can land in another
+    // session's box
+    MentionIdxs *midx;      // the '@' picker's file lists, built when it opens
+    MentionEdit  medit;     // a pick's edit, waiting for the box's next frame
+    MentionKeep  mattach;   // a picked file, attached as the next frame begins
+    i32          mutebeg;   // the '@' the user dismissed, -1 for none
+    i32          draftslen; // the draft's length last frame, to spot a paste
     AttBox      *att;       // images attached to the draft, null until one is
     Str          group;     // its group, from the list (only a root's counts)
     b32          archived;  // from the list (only a root's counts)
@@ -682,6 +694,9 @@ struct DirList {
     i64              id;    // its dir command in flight, 0 if none
     b32              got;   // ents and err are an answer
     b32              more;  // there were more entries than these
+    b32              files; // files listed too, for the '@' picker: a listing
+                            // of its own, so files cannot crowd out the
+                            // folders the new session dialog lists
 };
 
 enum : i32 {
@@ -691,7 +706,8 @@ enum : i32 {
 
 enum : i64 {
     DIRLIST_TTL = 5000000,  // µs
-    DIRLIST_MAX = 2000,     // entries of a folder listed here
+    DIRLIST_MAX   = 2000,   // folders of a folder listed here
+    DIRLIST_FILES = 4000,   // entries, files too, of one the '@' picker lists
 };
 
 // The new session dialog's directory field's completion: the folders
@@ -1073,10 +1089,22 @@ struct AttImage {
     b32     file;   // a text file, not an image
     i64     bytes;  // and its size
     i64     lines;
+    Str     src;        // the absolute path it was read from, empty for a paste
+    b32     mention;    // an '@' pick made it: the send drops it with its token
+    b32     pathonly;   // a mention whose contents could not be attached: drawn
+                        // as a chip, never uploaded nor sent
+    Str     why;        // that chip's short reason, for its tooltip
+    Str     rpath;      // a mention on another machine: the path, relative to
+                        // the working directory, its engine attaches as the
+                        // message goes (upload {path}), until then no data
+};
+
+enum : i32 {
+    ATTACH_CHIPS = 10,  // path-only chips beside a message's attachments
 };
 
 struct AttBox {
-    AttImage imgs[ATTACH_MAX];
+    AttImage imgs[(i32)ATTACH_MAX + ATTACH_CHIPS];
     i32      len;
     i32      state;      // ATT_*
     i32      cur;        // the image uploading
@@ -1469,6 +1497,7 @@ struct Gui {
     b32                realreveal; // the checklist's show the file manager
     // Desktop notifications ([ui] notify, toastpass)
     u32                notify;     // NOTIFY_*
+    b32                nomentions; // [ui] mentions = false: '@' is plain text
     i32                toastids;   // the last id given a root
     b32                toastprep;  // the platform made ready
     Str                toastwhy;   // the latest refusal, said in the log
@@ -1514,6 +1543,13 @@ struct Gui {
     Str                edlog;      // the editor's output
     Str                edname;     // as the box names it
     i32                slashsel;   // the slash popup's pick, among its matches
+    i32                mentionsel;   // the '@' popup's pick, among its rows
+    MentionKeep        mentionpath;  // the selected row's path, which survives
+                                     //   a re-rank
+    MentionKeep        mentionquery; // the query that pick was made for: a new
+                                     //   one starts again at the top
+    MentionKeep        mentionstatus; // the '@' popup's one line, as drawn:
+                                     //   the source's status, without its keys
     GuiSession        *pickmodel;  // /model's list is open for it
     GuiSession        *pickshell;  // /shell's list is open for it
     i32                menuact;    // a context menu pick waiting for the box
@@ -1713,6 +1749,14 @@ struct Gui {
     Str                longval;      // the long setting before its edit
     WinGeom            geommark;     // the window's, as OP_GEOMMARK found it
     b32                slashshown;   // the slash popup drew
+    b32                mentionshown; // the '@' popup drew
+    i32                mentionrows;  // and how many rows it listed
+    i32                mentionkind;  // MENTION_*: where its candidates came
+                                     //   from (the enum is not defined yet)
+    b32                mentiontrunc; // its list was capped
+    b32                mentiontag;   // its pick was drawn marked attached
+    b32                mentionhold;  // the '@' index's walk is held, so the
+                                     //   picker lists a folder (OP_MENTIONHOLD)
     b32                cmenushown;   // the compose box's context menu drew
     u32                cmenustate;   // and what it enabled: 1 undo, 2 redo,
                                      // 4 cut and copy, 8 paste, 16 editor
@@ -1814,6 +1858,7 @@ static GuiSession *addsess(Gui *g, GuiHost *h, Str sid)
     s->sid   = clone(&g->perm, sid);
     s->stick = 1;
     s->state = LIVE_CLOSED;
+    s->mutebeg = -1;  // no '@' dismissed: offset 0 is a real one
     s->next  = g->sessions;
     g->sessions = s;
     return s;
@@ -3445,6 +3490,9 @@ static void guinew(Gui *g, GuiHost *h, Str cwd, Str endpoint, Str model, Str rol
     cmdsend(g, &w, a);
 }
 
+static Slice<Str> mentionrefs(Arena *, Gui *, GuiSession *, Str text);
+static void mentionputrefs(JsonOut *, Slice<Str> refs);
+
 // Send text to the current session: a prompt, or a steer while its turn
 // runs.
 static void guiprompt(Gui *g, Str text)
@@ -3453,12 +3501,14 @@ static void guiprompt(Gui *g, Str text)
     if (!s || !s->view || !text.len) {
         return;
     }
-    Arena a = newarena(g->cmdr);
-    Buf   b(&a, 256 + text.len);
-    EvOut w = cmdopen(g, &b, s->view->busy ? CMD_STEER : CMD_PROMPT, s);
+    Arena      a    = newarena(g->cmdr);
+    Slice<Str> refs = mentionrefs(&a, g, s, text);  // before b, which grows
+    Buf        b(&a, 256 + text.len + 32*refs.len);
+    EvOut      w = cmdopen(g, &b, s->view->busy ? CMD_STEER : CMD_PROMPT, s);
     s->stick = 1;  // to see the reply
     putkey(&w.json, "text");
     putstr(&w.json, text);
+    mentionputrefs(&w.json, refs);
     cmdsend(g, &w, a);
 }
 
@@ -3739,7 +3789,7 @@ static void guiside(Gui *g, GuiSession *s, Str quote)
 
 static b32  hostready(Gui *, GuiHost *);
 static void fieldput(char *, Str);
-static void setnote(Gui *, GuiSession *, Str, b32);
+static void setnote(Gui *, GuiSession *, Str, b32, b32 fixed = 0);
 
 // What a change in Settings came to, shown as a toast (drawcfgtoast).
 static void cfgsay(Gui *g, Str text, b32 ok)
@@ -4250,6 +4300,8 @@ static void loadcfg(Gui *g, Str line)
             setcfgstr(g, &g->editor, r);
         } else if (r.kind=="ui" && r.key=="terminal") {
             setcfgstr(g, &g->terminal, r);
+        } else if (r.kind=="ui" && r.key=="mentions") {
+            g->nomentions = cfgbool(r.valid && r.value.len ? r.value : r.dflt) == 0;
         } else if (r.kind=="ui" && r.key=="notify") {
             setnotify(g, notifyparse(r.valid && r.value.len ? r.value : r.dflt));
         } else if (r.kind=="tools" && r.key=="path_prepend") {
@@ -4408,7 +4460,7 @@ static void onfile(Gui *, Json *, b32 ok, Str err);
 static Str  draftstr(GuiSession *);
 static void draftput(Gui *, GuiSession *, Str);
 static void setdraft(Gui *, GuiSession *, Str);
-static void setnote(Gui *, GuiSession *, Str, b32);
+static void setnote(Gui *, GuiSession *, Str, b32, b32);
 static Str  sesstitle(GuiSession *);
 static Str  shorten(Arena *, Str, iz);
 
@@ -4418,6 +4470,17 @@ static Str  shorten(Arena *, Str, iz);
 // Why the session takes no attachment now, or empty if it does: a text
 // file, if its engine takes them ("files"), else an image, if its
 // model has vision.
+// The attachments a message carries, path-only chips aside: what the
+// limit of ATTACH_MAX counts.
+static i32 attachcount(AttBox *x)
+{
+    i32 n = 0;
+    for (i32 i = 0; i < x->len; i++) {
+        n += !x->imgs[i].pathonly;
+    }
+    return n;
+}
+
 static Str attachwhy(GuiSession *s)
 {
     AttBox *x = s ? s->att : 0;
@@ -4429,8 +4492,10 @@ static Str attachwhy(GuiSession *s)
         return "This model takes no images: [model] vision is off for it";
     } else if (x && x->state!=ATT_IDLE) {
         return "Wait for the attachments being sent";
-    } else if (x && x->len==ATTACH_MAX) {
+    } else if (x && attachcount(x)>=ATTACH_MAX) {
         return "At most 10 files go in a message";
+    } else if (x && x->len==countof(x->imgs)) {
+        return "No room for another attachment: remove one";
     }
     return {};
 }
@@ -4467,7 +4532,7 @@ static GuiTex *attthumb(Gui *g, Str data)
 // converts to a PNG if not a PNG or JPEG, or else a text file, which the
 // agent gets as read shows it, its bytes copied. A binary file, by read's
 // measure, is refused. Returns why not, or empty if attached.
-static Str attachadd(Gui *g, GuiSession *s, Str data, Str label)
+static Str attachadd(Gui *g, GuiSession *s, Str data, Str label, Str src = {})
 {
     Str why = attachwhy(s);
     if (why.len) {
@@ -4500,6 +4565,7 @@ static Str attachadd(Gui *g, GuiSession *s, Str data, Str label)
         m->file  = 1;
         m->bytes = data.len;
         m->lines = countlines(startswith(data, "\xef\xbb\xbf") ? cuthead(data, 3) : data);
+        m->src   = clone(&m->mem, src);
         scheddirty(&g->sched);
         return {};
     } else if (s->view->novision) {
@@ -4527,6 +4593,7 @@ static Str attachadd(Gui *g, GuiSession *s, Str data, Str label)
     m->w     = k.w;
     m->h     = k.h;
     m->tex   = attthumb(g, data);
+    m->src   = clone(&m->mem, src);  // set for an '@'-picked image too
     scheddirty(&g->sched);
     return {};
 }
@@ -4553,7 +4620,7 @@ static Str attachfile(Gui *g, GuiSession *s, Str path)
     } else if (rd.err != READ_OK) {
         err = concat(&g->frame, "cannot read ", path);
     } else {
-        err = attachadd(g, s, rd.data, name);
+        err = attachadd(g, s, rd.data, name, path);
     }
     os_release(g->os, r);
     return err;
@@ -4664,8 +4731,20 @@ static void attachnext(Gui *g, GuiSession *s)
     AttBox *x = s->att;
     Arena   a = newarena(g->cmdr);
     i32     i = 0;
-    for (; i<x->len && x->imgs[i].name.len; i++) {}
-    if (i < x->len) {
+    for (; i<x->len && (x->imgs[i].name.len || x->imgs[i].pathonly); i++) {}
+    if (i < x->len && x->imgs[i].rpath.len) {
+        // A mention on another machine: its engine reads it there
+        AttImage *m = x->imgs + i;
+        Buf       b(&a, 256 + 6*m->rpath.len);
+        EvOut     w = cmdopen(g, &b, CMD_UPLOAD, s);
+        putstrkey(&w.json, "kind", "file");
+        putstrkey(&w.json, "path", m->rpath);
+        x->state = ATT_UPLOADING;
+        x->cur   = i;
+        x->id    = g->nextid;
+        cmdsend(g, &w, a);
+        return;
+    } else if (i < x->len) {
         AttImage *m    = x->imgs + i;
         iz        n    = m->data.len - (iz)x->off;
         n              = n<(iz)UPLOAD_PART ? n : (iz)UPLOAD_PART;
@@ -4690,14 +4769,19 @@ static void attachnext(Gui *g, GuiSession *s)
         cmdsend(g, &w, a);
         return;
     }
-    Buf   b(&a, 256 + 2*x->text.len + 160*x->len);
+    Slice<Str> refs = mentionrefs(&a, g, s, x->text);  // before b, which grows
+    Buf   b(&a, 256 + 2*x->text.len + 160*x->len + 32*refs.len);
     EvOut w = cmdopen(g, &b, s->view->busy ? CMD_STEER : CMD_PROMPT, s);
     putstrkey(&w.json, "text", x->text);
+    mentionputrefs(&w.json, refs);
     // The images, and the text files only if any, which older engines refuse
     b32 files = 0;
     putkey(&w.json, "images");
     putarray(&w.json);
     for (i32 k = 0; k < x->len; k++) {
+        if (x->imgs[k].pathonly) {
+            continue;  // a chip only: nothing was uploaded to name
+        }
         files |= x->imgs[k].file;
         if (!x->imgs[k].file) {
             putstr(&w.json, x->imgs[k].name);
@@ -4708,7 +4792,7 @@ static void attachnext(Gui *g, GuiSession *s)
         putkey(&w.json, "files");
         putarray(&w.json);
         for (i32 k = 0; k < x->len; k++) {
-            if (x->imgs[k].file) {
+            if (x->imgs[k].file && !x->imgs[k].pathonly) {
                 putstr(&w.json, x->imgs[k].name);
             }
         }
@@ -4724,14 +4808,19 @@ static void attachnext(Gui *g, GuiSession *s)
 static void attachsend(Gui *g, GuiSession *s, Str text)
 {
     AttBox *x = s->att;
-    s->cmdtext = clone(&g->perm, text);
-    s->note    = {};
-    s->stick   = 1;  // to see the reply
-    x->text    = s->cmdtext;
-    x->off     = 0;
-    x->toklen  = 0;
+    s->cmdtext   = clone(&g->perm, text);
+    s->note      = {};  // sent: no note, fixed or not
+    s->notefixed = 0;
+    s->stick     = 1;  // to see the reply
+    x->text      = s->cmdtext;
+    x->off       = 0;
+    x->toklen    = 0;
     attachnext(g, s);
 }
+
+// The note for a mention that went as a path (mention.cpp, included with
+// ui.cpp further down).
+static Str mentionpathnote(Arena *, Str name, Str why);
 
 // A reply to an upload of an attachment: on to the next part.
 static void onattach(Gui *g, GuiSession *s, EvRec *r)
@@ -4744,6 +4833,36 @@ static void onattach(Gui *g, GuiSession *s, EvRec *r)
     i64       off   = jsonint(jsonget(j, "off"), -1);
     Str       name  = jsonstr(jsonget(j, "name"));
     x->id = 0;
+    if (m->rpath.len) {
+        // A mention its host's engine attached, or could not: one that
+        // could not goes as a path, as a mention here does, and the
+        // message is sent all the same
+        b32 image = jsonstr(jsonget(j, "kind")) == "image";
+        Str why   = {};
+        if (!jsonint(jsonget(j, "ok"), 0)) {
+            why = err.len ? err : Str("the host could not attach it");
+        } else if (!name.len || name.len>128) {
+            why = "the host's answer came garbled";
+        } else if (image && s->view && s->view->novision) {
+            why = "this model takes no images";
+        }
+        if (why.len) {
+            m->pathonly = 1;
+            m->why      = clone(&m->mem, why);
+            setnote(g, s, mentionpathnote(&g->frame, m->label, why), 0);
+        } else {
+            m->name  = clone(&m->mem, name);
+            m->file  = !image;
+            m->mime  = clone(&m->mem, jsonstr(jsonget(j, "mime")));
+            m->w     = (i32)jsonint(jsonget(j, "w"), 0);
+            m->h     = (i32)jsonint(jsonget(j, "h"), 0);
+            m->bytes = jsonint(jsonget(j, "bytes"), 0);
+            m->lines = jsonint(jsonget(j, "lines"), 0);
+        }
+        m->rpath = {};  // done with, either way
+        attachnext(g, s);
+        return;
+    }
     if (!jsonint(jsonget(j, "ok"), 0)) {
         attachfail(g, s, err.len ? err : Str("the upload failed"));
         return;
@@ -5117,6 +5236,10 @@ static void ongit(Gui *g, GuiSession *s, i64 id, Json *j, b32 ok)
 }
 
 static void sessgone(Gui *, GuiSession *);
+// The '@' picker's index (mention.cpp), which sessgone lets go: mention.cpp
+// is included with ui.cpp, further down, so its freeing is named here
+static void mentionidxdrop(Gui *, GuiSession *);
+static void mentionlate(Gui *);
 static b32  trashtoasted(Gui *, GuiSession *);
 static void updatestatus(Gui *, GuiHost *, b32 idle);
 static void cfgeditrun(Gui *, Arena, Str path);
@@ -5739,12 +5862,15 @@ static void setdraft(Gui *g, GuiSession *s, Str text)
 
 // What the latest command from the box came to, shown in a toast at the
 // foot of the transcript (drawtoast): an error until the next is typed,
-// else for a few seconds.
-static void setnote(Gui *g, GuiSession *s, Str note, b32 err)
+// else for a few seconds. A fixed note is the exception to that: it says
+// what typing must not take away (the reason a mention attached no text),
+// so drawprompt's edit leaves it, and only a new note or a send ends it.
+static void setnote(Gui *g, GuiSession *s, Str note, b32 err, b32 fixed)
 {
-    s->note    = clone(&g->perm, note);
-    s->noteerr = err;
-    s->noteat  = g->sched.now;
+    s->note      = clone(&g->perm, note);
+    s->noteerr   = err;
+    s->notefixed = fixed;
+    s->noteat    = g->sched.now;
     scheddirty(&g->sched);
 }
 
@@ -6128,7 +6254,7 @@ static b32 hostlists(GuiHost *h)
 
 // Folders as listed, kept in pc->mem, which starts over when it runs
 // low: a reply to a list let go then finds no slot and is dropped.
-static DirList *dirslot(Gui *g, GuiHost *h, Str dir)
+static DirList *dirslot(Gui *g, GuiHost *h, Str dir, b32 files)
 {
     PathComp *pc = &g->pc;
     if (!pc->base) {
@@ -6138,7 +6264,7 @@ static DirList *dirslot(Gui *g, GuiHost *h, Str dir)
     DirList *free = 0;  // else the one asked for longest ago
     for (i32 i = 0; i < DIRLISTS; i++) {
         DirList *l = &pc->lists[i];
-        if (l->host==h->uid && l->dir==dir) {
+        if (l->host==h->uid && l->files==files && l->dir==dir) {
             return l;
         }
         if (!free || (free->host && (!l->host || l->at<free->at))) {
@@ -6153,8 +6279,9 @@ static DirList *dirslot(Gui *g, GuiHost *h, Str dir)
         free = &pc->lists[0];
     }
     *free = {};
-    free->host = h->uid;
-    free->dir  = clone(&pc->mem, dir);
+    free->host  = h->uid;
+    free->files = files;
+    free->dir   = clone(&pc->mem, dir);
     return free;
 }
 
@@ -6172,24 +6299,28 @@ static void dirput(PathComp *pc, DirList *l, Slice<PathEntry> ents, b32 more, St
     l->id   = 0;
 }
 
-// The folders in a folder typed on a host, as listed so far, which is
-// listed if it is not, or was a while ago: here at once, or by the
-// host's engine (dir), its answer coming in later (ondir).
-static DirList *dirget(Gui *g, Arena scratch, GuiHost *h, Str dir)
+// The folders in a folder typed on a host, or with files its files too,
+// as listed so far, which is listed if it is not, or was a while ago:
+// here at once, or by the host's engine (dir), its answer later (ondir).
+static DirList *dirget(Gui *g, Arena scratch, GuiHost *h, Str dir, b32 files = 0)
 {
-    DirList *l = dirslot(g, h, dir);
+    DirList *l = dirslot(g, h, dir, files);
     if (l->id || (l->got && g->sched.now-l->at<DIRLIST_TTL)) {
         return l;
     }
     l->at = g->sched.now;
     if (h->kind != GH_REMOTE) {
         Arena            a  = scratch;
-        HomePath         hp = tildepath(&a, dir, h->home, HOST_WINDOWS);
+        // The slot's own copy of the directory, not the caller's: the
+        // listing's arena starts where the caller's string may lie, so
+        // cstr's NUL-terminated copy of it would overwrite it as it is made
+        HomePath         hp = tildepath(&a, l->dir, h->home, HOST_WINDOWS);
         Listing          ls = hp.err.len ? Listing{} :
-                              os_listall(g->os, &a, hp.path, 1, DIRLIST_MAX);
+                              os_listall(g->os, &a, hp.path, !files,
+                                         files ? DIRLIST_FILES : DIRLIST_MAX);
         Slice<PathEntry> e  = {};
         for (Dirent *d = ls.head; d; d = d->next) {
-            e = push(&a, e, PathEntry{d->name, 1});
+            e = push(&a, e, PathEntry{d->name, d->isdir});
         }
         Str err = hp.err.len ? hp.err : ls.ok ? Str{} :
                   os_stat(g->os, a, hp.path).type==STAT_MISSING ? Str("no such folder") :
@@ -6203,7 +6334,7 @@ static DirList *dirget(Gui *g, Arena scratch, GuiHost *h, Str dir)
     putkey(&w.json, "path");
     putstr(&w.json, dir);
     putkey(&w.json, "dirs");
-    putint(&w.json, 1);
+    putint(&w.json, !files);
     l->id = g->nextid;
     cmdsend(g, &w, a);
     return l;
@@ -6223,8 +6354,9 @@ static void ondir(Gui *g, Arena a, i64 id, Json *j, b32 ok, Str err)
     Slice<PathEntry> e = {};
     for (Json *x = jsonget(j, "entries")->child; ok && x; x = x->next) {
         Str name = jsonstr(jsonget(x, "name"));
-        if (name.len && jsonint(jsonget(x, "dir"), 0)) {
-            e = push(&a, e, PathEntry{name, 1});
+        // Files too, carrying each entry's own flag: a mention needs them
+        if (name.len) {
+            e = push(&a, e, PathEntry{name, (b32)jsonint(jsonget(x, "dir"), 0)});
         }
     }
     dirput(pc, l, e, ok && jsonint(jsonget(j, "more"), 0), ok ? Str{} : err);
@@ -8189,6 +8321,7 @@ static void sessgone(Gui *g, GuiSession *s)
     s->listed = 0;
     imgdrop(g, s);
     attachclear(g, s);
+    mentionidxdrop(g, s);  // its 16 MiB of file list must not outlive it
     if (g->out.s == s) {
         g->out.s   = 0;
         g->outopen = 0;
@@ -11442,6 +11575,7 @@ static void gui_frame(Gui *g)
     toastlook(g);
     i64 t0 = s->now;
     g->frame.beg = g->framebase;
+    mentionlate(g);  // while nothing holds a copy of the frame arena
     if (g->exp.want) {
         exportstart(g);  // asked for in the last frame
     }
@@ -12065,6 +12199,10 @@ enum : i32 {
     OP_NOTIFY,    // [ui] notify is dx (NOTIFY_*), as a setting would
     OP_TOASTMARK, // remember the toasts shown and withdrawn so far
     OP_TOASTCLICK,// click the latest toast, which gives the window focus
+    OP_MENTIONHOLD,// dx 1: the shown session's '@' index begins again and is
+                  // not walked, as a tree too big for one frame is not, so
+                  // the picker lists a folder; dx 0 lets the walk go on
+    OP_MENTIONS,  // dx 0 as [ui] mentions = false would, dx 1 as true
 };
 // OP_TEXTCWD with text types the --cwd directory and text after it, on
 // Windows with backslashes, as a Windows user types a path.
@@ -12497,6 +12635,12 @@ enum : i32 {
     CHK_VIA,          // the session shown streams via this computer
     CHK_CFGSEARCH,    // the settings' search field has the keyboard
     CHK_CTR,          // the first container is as text says (ctrcheck)
+    CHK_MENTION,      // the '@' picker's rows: dx -1 none, 0 one or more,
+                      // else exactly dx
+    CHK_MENTIONKIND,  // its source by name: "index", "list" or "none"
+    CHK_MENTIONSTATUS,// its one line, as drawn ("no files match")
+    CHK_MENTIONSEL,   // its pick's path is text, from the path not the row
+    CHK_MENTIONTAG,   // its pick was drawn marked attached (dx 1) or not (0)
     CHK_COUNT,
 };
 
@@ -12765,6 +12909,11 @@ static Str chknames[] = {
     "the remote is thin", "its calls go via this computer",
     "the settings' search field has the keyboard",
     "the container is as expected",
+    "the '@' picker listed the rows it should",
+    "the '@' picker's source: index, list or none",
+    "the '@' picker's one line, as drawn",
+    "the '@' picker's pick is the path it should be",
+    "the '@' picker's pick says it is attached, or does not",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -15662,6 +15811,33 @@ static DriveOp remoteops[] = {
     {OP_CHECK, CHK_LASTUSER, 0, 0, 0, "Run the tools: read, edit, then a slow shell command."},
     {OP_CHECK, CHK_IMPORTREMOTE, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "remote-imported"},
+    // A mention there: the picker lists the host's files through its
+    // engine, a folder at a time, and the file picked goes with the
+    // message, its engine reading it there as the message goes
+    // (upload {path}), as the GUI cannot. A character at a time, as a
+    // burst is a paste, which opens no picker
+    {OP_MOVE, T_PROMPT, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_TEXT, 0, 0, 0, 120, "@"},
+    {OP_TEXT, 0, 0, 0, 120, "h"},
+    {OP_TEXT, 0, 0, 0, 120, "e"},
+    {OP_TEXT, 0, 0, 0, 120, "l"},
+    {OP_TEXT, 0, 0, 0, 120, "l"},
+    {OP_TEXT, 0, 0, 0, 120, "o"},
+    {OP_MARK, 0, 0, 0, 1500, ""},  // the listing's answer, from there
+    {OP_CHECK, CHK_MENTIONKIND, 0, 0, 0, "list"},
+    {OP_CHECK, CHK_MENTIONSEL, 0, 0, 0, "hello.txt"},
+    {OP_SHOT, 0, 0, 0, 300, "remote-mention"},
+    {OP_KEYDOWN, 0, GKEY_TAB, 0, 50, ""}, {OP_KEYUP, 0, GKEY_TAB, 0, 600, ""},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "@hello.txt "},
+    {OP_CHECK, CHK_ATTACHED, 1, 0, 0, ""},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""}, {OP_KEYUP, 0, GKEY_ENTER, 0, 600, ""},
+    {OP_WAIT, W_IDLE, 0, 0, 60000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_LASTUSER, 0, 0, 0, "@hello.txt"},
+    {OP_CHECK, CHK_USERFILES, 0, 0, 0, "Attached: hello.txt"},
+    {OP_CHECK, CHK_ATTACHED, 0, 0, 0, ""},
     // URL includes, fetched again from the settings window
     {OP_MOVE, T_SETTINGSTAB, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -16637,6 +16813,11 @@ static DriveOp launchops[] = {
     {OP_KEYDOWN, 0, GKEY_SHIFT, KEY_CMD|KEY_SHIFT, 50, ""}, \
     KEY(GKEY_V, KEY_CMD|KEY_SHIFT, 50), \
     {OP_KEYUP, 0, GKEY_SHIFT, KEY_CMD, 50, ""}, {OP_KEYUP, 0, GKEY_CMD, 0, 200, ""}
+// One character typed into the box: a mention's query goes in a
+// character at a time, since a burst of bytes is a paste to the box,
+// which dismisses the picker for that word (drawprompt)
+#define TYPE1(c) \
+    {OP_TEXT, 0, 0, 0, 120, c}
 
 static DriveOp composeops[] = {
     {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
@@ -16772,7 +16953,10 @@ static DriveOp composeops[] = {
     {OP_SHOT, 0, 0, 0, 300, "compose-slash"},
     KEY(GKEY_DOWN, 0, 300),
     {OP_CHECK, CHK_SLASHSEL, 0, 0, 0, "/model"},
-    {OP_TEXT, 0, 0, 0, 300, "re"},
+    // Spelled out past "re" on purpose: a skill installed on the machine
+    // can match that prefix too, and the pick Down left would complete
+    // the skill instead of the command
+    {OP_TEXT, 0, 0, 0, 300, "rena"},
     {OP_CHECK, CHK_SLASH, 1, 0, 0, ""},
     KEY(GKEY_TAB, 0, 300),
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, "/rename "},
@@ -16948,6 +17132,280 @@ static DriveOp composeops[] = {
     {OP_CHECK, CHK_USERIMAGES, 0, 0, 0, "I see 3 lines, 0 lost."},
     {OP_CHECK, CHK_USERFILES, 0, 0, 0, "Attached: notes.txt"},
     {OP_SHOT, 0, 0, 0, 300, "compose-filesent"},
+    // Mentions: '@' at a word's start opens the picker of the session
+    // folder's files and folders, which typing narrows, Up/Down pick in,
+    // and Tab or a bare Enter insert without sending, a file's text
+    // coming with its token; Esc dismisses it while the caret stays in
+    // that word. Three files of the checklist's own, so that the names
+    // cannot be confused with what it writes elsewhere, and made before
+    // the picker's first '@', since its index is walked then and only
+    // rebuilt on a turn's edge or a minute after
+    {OP_TOUCH, 0, 0, 0, 300, "mention-a.txt"},
+    {OP_TOUCH, 0, 0, 0, 300, "mention-b.txt"},
+    {OP_TOUCH, 0, 0, 0, 300, "mention-send.txt"},
+    CLICK(T_PROMPT, "", 300),
+    TYPE1("@"),
+    {OP_CHECK, CHK_MENTION, 0, 0, 0, ""},  // dx 0: one row or more
+    {OP_SHOT, 0, 0, 0, 300, "compose-mention"},
+    TYPE1("m"), TYPE1("e"), TYPE1("n"), TYPE1("t"), TYPE1("i"), TYPE1("o"),
+    TYPE1("n"), TYPE1("-"), TYPE1("a"),
+    {OP_CHECK, CHK_MENTION, 1, 0, 0, ""},
+    {OP_CHECK, CHK_MENTIONSEL, 0, 0, 0, "mention-a.txt"},
+    KEY(GKEY_DOWN, 0, 200),
+    KEY(GKEY_UP, 0, 300),
+    {OP_CHECK, CHK_MENTIONSEL, 0, 0, 0, "mention-a.txt"},
+    KEY(GKEY_TAB, 0, 600),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "@mention-a.txt "},
+    {OP_CHECK, CHK_ATTACHED, 1, 0, 0, ""},
+    {OP_CHECK, CHK_MENTION, -1, 0, 0, ""},  // dx -1: the picker closed
+    // A file already in the draft says so in the picker, and Down moves
+    // off it: the row's path is what the checks name, not its index
+    TYPE1("@"),
+    TYPE1("m"), TYPE1("e"), TYPE1("n"), TYPE1("t"), TYPE1("i"), TYPE1("o"),
+    TYPE1("n"),
+    {OP_CHECK, CHK_MENTION, 3, 0, 0, ""},
+    {OP_CHECK, CHK_MENTIONSEL, 0, 0, 0, "mention-a.txt"},
+    {OP_CHECK, CHK_MENTIONTAG, 1, 0, 0, ""},
+    KEY(GKEY_DOWN, 0, 300),
+    {OP_CHECK, CHK_MENTIONSEL, 0, 0, 0, "mention-b.txt"},
+    {OP_CHECK, CHK_MENTIONTAG, 0, 0, 0, ""},
+    KEY(GKEY_UP, 0, 300),
+    {OP_CHECK, CHK_MENTIONSEL, 0, 0, 0, "mention-a.txt"},
+    {OP_CHECK, CHK_MENTIONTAG, 1, 0, 0, ""},
+    SELALL,
+    RCLICK(500),
+    PICK(T_CMCUT),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    // Enter on the picker inserts the pick and sends nothing, even with
+    // the caret at the end of a message that is otherwise ready
+    {OP_TEXT, 0, 0, 0, 300, "hi "},
+    TYPE1("@"),
+    TYPE1("m"), TYPE1("e"), TYPE1("n"), TYPE1("t"), TYPE1("i"), TYPE1("o"),
+    TYPE1("n"),
+    {OP_CHECK, CHK_MENTION, 3, 0, 0, ""},
+    KEY(GKEY_ENTER, 0, 600),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "hi @mention-a.txt "},
+    {OP_CHECK, CHK_ATTACHED, 1, 0, 0, ""},
+    {OP_CHECK, CHK_LASTUSER, 0, 0, 0, "Describe the files."},
+    // Esc dismisses the picker, and the box leaves that word alone
+    TYPE1("@"),
+    TYPE1("m"), TYPE1("e"), TYPE1("n"), TYPE1("t"), TYPE1("i"), TYPE1("o"),
+    TYPE1("n"),
+    {OP_CHECK, CHK_MENTION, 3, 0, 0, ""},
+    KEY(GKEY_ESCAPE, 0, 400),
+    {OP_CHECK, CHK_MENTION, -1, 0, 0, ""},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "hi @mention-a.txt @mention"},
+    TYPE1("x"),
+    {OP_CHECK, CHK_MENTION, -1, 0, 0, ""},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "hi @mention-a.txt @mentionx"},
+    // Mid-text: the pick replaces the token alone, the words after it
+    // staying. They are typed first, since Up is the only key here that
+    // moves the caret to the start of the line; the token brings a
+    // trailing space of its own, which stands beside the sentence's
+    SELALL,
+    {OP_TEXT, 0, 0, 0, 300, " for details"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, " for details"},
+    KEY(GKEY_UP, 0, 300),
+    {OP_TEXT, 0, 0, 0, 300, "see "},
+    TYPE1("@"),
+    TYPE1("m"), TYPE1("e"), TYPE1("n"), TYPE1("t"), TYPE1("i"), TYPE1("o"),
+    TYPE1("n"),
+    {OP_CHECK, CHK_MENTION, 3, 0, 0, ""},
+    KEY(GKEY_TAB, 0, 600),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "see @mention-a.txt  for details"},
+    // Left as the next steps expect: no text, no attachment
+    SELALL,
+    RCLICK(500),
+    PICK(T_CMCUT),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    CLICK(T_NAMED, "attach remove", 600),
+    {OP_CHECK, CHK_ATTACHED, 0, 0, 0, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 600, ""},
+    // The picker's source, by name: the index of the whole tree, which a
+    // one-folder listing standing in for it would draw just as well
+    CLICK(T_PROMPT, "", 300),
+    TYPE1("@"),
+    {OP_CHECK, CHK_MENTION, 0, 0, 0, ""},  // dx 0: one row or more
+    {OP_CHECK, CHK_MENTIONKIND, 0, 0, 0, "index"},
+    // A query that matches nothing leaves the popup up, its one line
+    // saying why there is no row: the zero-row popup the fix repaired
+    TYPE1("z"), TYPE1("z"), TYPE1("z"), TYPE1("z"), TYPE1("z"), TYPE1("z"),
+    {OP_CHECK, CHK_MENTION, -1, 0, 0, ""},  // dx -1: no rows at all
+    {OP_CHECK, CHK_MENTIONSTATUS, 0, 0, 0, "no files match"},
+    SELALL,
+    RCLICK(500),
+    PICK(T_CMCUT),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    // The mute is that word's, not that offset's: Esc dismisses '@' at the
+    // start of the box, and once the box is cleared, '@' at the start
+    // opens the picker again
+    TYPE1("@"),
+    {OP_CHECK, CHK_MENTION, 0, 0, 0, ""},
+    KEY(GKEY_ESCAPE, 0, 400),
+    {OP_CHECK, CHK_MENTION, -1, 0, 0, ""},
+    SELALL,
+    RCLICK(500),
+    PICK(T_CMCUT),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    TYPE1("@"),
+    {OP_CHECK, CHK_MENTION, 0, 0, 0, ""},  // the same offset, opened again
+    SELALL,
+    RCLICK(500),
+    PICK(T_CMCUT),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    // A pick is one undo: the delete of the token and the insert of its
+    // text are one record, and undoing it puts the typed query back
+    TYPE1("@"),
+    TYPE1("m"), TYPE1("e"), TYPE1("n"), TYPE1("t"), TYPE1("i"), TYPE1("o"),
+    TYPE1("n"),
+    {OP_CHECK, CHK_MENTION, 3, 0, 0, ""},
+    KEY(GKEY_TAB, 0, 600),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "@mention-a.txt "},
+    {OP_CHECK, CHK_ATTACHED, 1, 0, 0, ""},
+    RCLICK(500),
+    PICK(T_CMUNDO),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "@mention"},
+    // The chip the pick made outlives the undo: mentionreconcile runs at
+    // send, not on every edit, which the plan accepts (its orphaned chip,
+    // docs/plans/at-mentions.md). Taken off by its x, as a user would
+    {OP_CHECK, CHK_ATTACHED, 1, 0, 0, ""},
+    CLICK(T_NAMED, "attach remove", 600),
+    {OP_CHECK, CHK_ATTACHED, 0, 0, 0, ""},
+    CLICK(T_PROMPT, "", 300),  // the box again: the chip's x took the keys
+    SELALL,
+    RCLICK(500),
+    PICK(T_CMCUT),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    // A pasted '@' opens nothing: the box takes a burst of bytes as a
+    // paste, and dismisses the word it landed in, so the next Enter is
+    // the box's own. '@media' is typed, copied, cut, then pasted back
+    TYPE1("@"),
+    TYPE1("m"), TYPE1("e"), TYPE1("d"), TYPE1("i"), TYPE1("a"),
+    SELALL,
+    RCLICK(500),
+    PICK(T_CMCOPY),
+    RCLICK(500),
+    PICK(T_CMCUT),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    RCLICK(500),
+    PICK(T_CMPASTE),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "@media"},
+    {OP_CHECK, CHK_MENTION, -1, 0, 0, ""},  // dx -1: no rows, none opened
+    // Left as the steps after expect: no text, no attachment
+    SELALL,
+    RCLICK(500),
+    PICK(T_CMCUT),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    {OP_CHECK, CHK_ATTACHED, 0, 0, 0, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 600, ""},
+    // A mention sent: the token stays in the message, and the file's text
+    // goes with it, as the Attach button's does, so the agent has the
+    // contents as well as the path. The note under the message names the
+    // file, as it does for the Attach button's, which is the feature's
+    // payoff: the file's text reached the agent with the message
+    CLICK(T_PROMPT, "", 300),
+    TYPE1("@"),
+    TYPE1("m"), TYPE1("e"), TYPE1("n"), TYPE1("t"), TYPE1("i"), TYPE1("o"),
+    TYPE1("n"), TYPE1("-"), TYPE1("s"), TYPE1("e"), TYPE1("n"), TYPE1("d"),
+    {OP_CHECK, CHK_MENTION, 1, 0, 0, ""},
+    KEY(GKEY_TAB, 0, 600),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "@mention-send.txt "},
+    {OP_CHECK, CHK_ATTACHED, 1, 0, 0, ""},
+    KEY(GKEY_ENTER, 0, 600),
+    {OP_WAIT, W_TURNS, 2, 0, 10000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 600, ""},
+    {OP_CHECK, CHK_LASTUSER, 0, 0, 0, "@mention-send.txt"},
+    {OP_CHECK, CHK_USERFILES, 0, 0, 0, "Attached: mention-send.txt"},
+    // Left as the steps after expect: no text, no attachment
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    {OP_CHECK, CHK_ATTACHED, 0, 0, 0, ""},
+    // The folder listing that stands in for the index while a tree too big
+    // for one frame is walked, on this machine: the tree above is walked
+    // in the frame that opens the picker, so it never gets here. Held, the
+    // walk stays at its start, and the picker lists the folder; a pick
+    // from it attaches as the index's does, and a folder typed is listed
+    // in its turn
+    {OP_MENTIONHOLD, 0, 1, 0, 300, ""},
+    CLICK(T_PROMPT, "", 300),
+    TYPE1("@"),
+    {OP_CHECK, CHK_MENTIONKIND, 0, 0, 0, "list"},
+    {OP_CHECK, CHK_MENTION, 0, 0, 0, ""},  // dx 0: one row or more
+    TYPE1("m"), TYPE1("e"), TYPE1("n"), TYPE1("t"), TYPE1("i"), TYPE1("o"),
+    TYPE1("n"), TYPE1("-"), TYPE1("a"),
+    {OP_CHECK, CHK_MENTION, 1, 0, 0, ""},
+    {OP_CHECK, CHK_MENTIONSEL, 0, 0, 0, "mention-a.txt"},
+    KEY(GKEY_TAB, 0, 600),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "@mention-a.txt "},
+    {OP_CHECK, CHK_ATTACHED, 1, 0, 0, ""},
+    TYPE1("@"), TYPE1("."), TYPE1("c"), TYPE1("l"), TYPE1("a"), TYPE1("u"),
+    TYPE1("d"), TYPE1("e"), TYPE1("/"),
+    {OP_CHECK, CHK_MENTIONKIND, 0, 0, 0, "list"},
+    {OP_CHECK, CHK_MENTIONSEL, 0, 0, 0, ".claude/skills"},
+    {OP_SHOT, 0, 0, 0, 300, "compose-mention-list"},
+    // Left as the steps after expect: no text, no attachment, the walk free
+    SELALL,
+    RCLICK(500),
+    PICK(T_CMCUT),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    CLICK(T_NAMED, "attach remove", 600),
+    {OP_CHECK, CHK_ATTACHED, 0, 0, 0, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 600, ""},
+    {OP_MENTIONHOLD, 0, 0, 0, 300, ""},
+    // A file whose contents cannot come, a binary one (gui.py writes it):
+    // its token goes in with a path-only chip, and a note that typing
+    // leaves; the message, with that chip alone, goes as its text, the
+    // chip with it
+    CLICK(T_PROMPT, "", 300),
+    TYPE1("@"),
+    TYPE1("z"), TYPE1("b"), TYPE1("i"), TYPE1("n"),
+    {OP_CHECK, CHK_MENTIONSEL, 0, 0, 0, "zbinary.dat"},
+    KEY(GKEY_TAB, 0, 600),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "@zbinary.dat "},
+    {OP_CHECK, CHK_ATTACHED, 1, 0, 0, ""},
+    {OP_CHECK, CHK_NOTE, 0, 0, 0, "added as a path \xe2\x80\x94 binary"},
+    {OP_SHOT, 0, 0, 0, 300, "compose-mention-pathonly"},
+    KEY(GKEY_ENTER, 0, 600),
+    {OP_WAIT, W_TURNS, 3, 0, 10000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 600, ""},
+    {OP_CHECK, CHK_LASTUSER, 0, 0, 0, "@zbinary.dat"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    {OP_CHECK, CHK_ATTACHED, 0, 0, 0, ""},
+    // Another session, by letters of its title (A's, renamed above),
+    // ranked with the files: /export's Session-A.md scores the same, and a
+    // file comes first on a tie. Its token is the title, quoted for its
+    // space, attaching nothing, and the message goes with the session's
+    // id, which the note under it says the agent was given
+    CLICK(T_PROMPT, "", 300),
+    TYPE1("@"),
+    TYPE1("s"), TYPE1("e"), TYPE1("s"), TYPE1("s"), TYPE1("a"),
+    {OP_CHECK, CHK_MENTION, 2, 0, 0, ""},
+    {OP_CHECK, CHK_MENTIONSEL, 0, 0, 0, "Session-A.md"},
+    KEY(GKEY_DOWN, 0, 300),
+    {OP_CHECK, CHK_MENTIONSEL, 0, 0, 0, "Session A"},
+    {OP_SHOT, 0, 0, 0, 300, "compose-mention-session"},
+    KEY(GKEY_TAB, 0, 600),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "@\"Session A\" "},
+    {OP_CHECK, CHK_ATTACHED, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 200, "say hi"},
+    KEY(GKEY_ENTER, 0, 600),
+    {OP_WAIT, W_TURNS, 4, 0, 10000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 600, ""},
+    {OP_CHECK, CHK_LASTUSER, 0, 0, 0, "@\"Session A\" say hi"},
+    {OP_CHECK, CHK_USERFILES, 0, 0, 0, "Mentioned: Session A"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    // [ui] mentions = false: '@' is plain text, and no picker opens
+    {OP_MENTIONS, 0, 0, 0, 300, ""},
+    CLICK(T_PROMPT, "", 300),
+    TYPE1("@"),
+    TYPE1("s"), TYPE1("e"), TYPE1("s"), TYPE1("s"), TYPE1("a"),
+    {OP_CHECK, CHK_MENTION, -1, 0, 0, ""},  // dx -1: no rows, none opened
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "@sessa"},
+    SELALL,
+    RCLICK(500),
+    PICK(T_CMCUT),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 600, ""},
+    {OP_MENTIONS, 0, 1, 0, 300, ""},
     // C: enough of a conversation for /compact, with a focus
     {OP_NEWSESSION, 0, 0, 0, 0, ""},
     {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
@@ -17017,6 +17475,7 @@ static DriveOp firstops[] = {
 #undef PICK
 #undef SELALL
 #undef CTRLG
+#undef TYPE1
 #undef FIRSTRUN
 #undef LAYOUT
 #undef SHOWPANE
@@ -18354,6 +18813,39 @@ static b32 composecheck(Gui *g, i32 chk, DriveOp *op)
         got = g->slashsel<p.len ? slashpickinfo(&a, p[g->slashsel], sk).name : Str{};
         ok  = g->slashshown && got==want;
     } break;
+    case CHK_MENTION: {
+        // The rows the picker drew, none once it closed: dx -1 for none,
+        // 0 for one or more (the popup opened), else exactly dx
+        i32 n  = g->mentionrows;
+        i32 dx = (i32)op->dx;
+        Buf b(&a, 24);
+        print(&b, (i64)n);
+        got = finish(&b);
+        ok  = dx < 0 ? n==0 : dx==0 ? n>0 : n==dx;
+    } break;
+    case CHK_MENTIONSEL:
+        // The pick's path, which a re-rank of its rows cannot move
+        got = keepstr(&g->mentionpath);
+        ok  = g->mentionrows>0 && got==want;
+        break;
+    case CHK_MENTIONKIND:
+        // Where the rows came from, by name: the index of the whole tree,
+        // or one folder listed in its place, which a count of rows alone
+        // cannot tell apart
+        got = g->mentionkind==MENTION_INDEX ? Str("index") :
+              g->mentionkind==MENTION_LIST  ? Str("list") : Str("none");
+        ok  = g->mentionshown && got==want;
+        break;
+    case CHK_MENTIONSTATUS:
+        // Its one line, as drawn, which with no row to list is all it has
+        // to say: the popup draws with no rows rather than closing
+        got = keepstr(&g->mentionstatus);
+        ok  = g->mentionshown && got==want;
+        break;
+    case CHK_MENTIONTAG:
+        got = g->mentiontag ? Str("attached") : Str("not attached");
+        ok  = g->mentionrows>0 && g->mentiontag==(b32)op->dx;
+        break;
     case CHK_TITLE:
         got = v->title;
         ok  = got == want;
@@ -18716,6 +19208,11 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_SLASHSEL:
     case CHK_TITLE:
     case CHK_LASTUSER:
+    case CHK_MENTION:
+    case CHK_MENTIONKIND:
+    case CHK_MENTIONSTATUS:
+    case CHK_MENTIONSEL:
+    case CHK_MENTIONTAG:
         return composecheck(g, chk, &g->ops[g->drivepc-1]);
     case CHK_COMPOSEQUIET: {
         i64 n = g->total.frames - g->driveframes;
@@ -20761,6 +21258,15 @@ static void drivestep(Gui *g)
         g->drivetoasts = g->toastsshown;
         g->drivegone   = g->toastsgone;
         break;
+    case OP_MENTIONHOLD:
+        g->mentionhold = op->dx != 0;
+        if (g->mentionhold && g->sess) {
+            mentionidxdrop(g, g->sess);  // begun again, and held unwalked
+        }
+        break;
+    case OP_MENTIONS:
+        g->nomentions = op->dx == 0;
+        break;
     case OP_TOASTCLICK:
         g->drivefocus = 1;  // as the window comes forward
         e.kind = GEV_TOAST;
@@ -21239,6 +21745,7 @@ static void readconfig(Gui *g, Arena scratch)
     g->editor     = clone(&g->perm, cfgget(cfg, "ui", "", "editor", 0));
     g->terminal   = clone(&g->perm, cfgget(cfg, "ui", "", "terminal", 0));
     g->notify     = notifyparse(cfgget(cfg, "ui", "", "notify", 0));
+    g->nomentions = cfgbool(cfgget(cfg, "ui", "", "mentions", 0)) == 0;
     g->pathpre    = clone(&g->perm, cfgget(cfg, "tools", "", "path_prepend", 0));
     g->pathpost   = clone(&g->perm, cfgget(cfg, "tools", "", "path_append", 0));
     g->configured = cfgconfigured(cfg);

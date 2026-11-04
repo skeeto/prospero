@@ -485,7 +485,11 @@ class Local:
 
     def __init__(self, args):
         self.args = args
-        self.root = tempfile.mkdtemp(prefix="prospero-gui-")
+        # Resolved, as macOS's /var is a link to /private/var: the session's
+        # folder is the real path, so the paths dropped and attached must
+        # be too, as a user's are, or a check comparing them passes by
+        # missing (a mention's attachments once dropped every attachment)
+        self.root = os.path.realpath(tempfile.mkdtemp(prefix="prospero-gui-"))
         self.prospero = os.path.abspath(args.prospero)
         # The system's temporary directory for what this starts, as the
         # sessions' scratch directories go there
@@ -1786,6 +1790,8 @@ def main():
         host.mkdir(host.path("work", ".claude", "skills", "zzcheck"))
         host.write(host.path("work", ".claude", "skills", "zzcheck", "SKILL.md"),
                    "---\ndescription: A skill of the checklist's\n---\nCheck.\n")
+        # A binary file for a mention whose contents cannot come
+        host.write(host.path("work", "zbinary.dat"), "\x7fELF\x00\x01binary\n")
         before = config(curl, model, extra=composeconfig(editor, nonce))
     elif args.mode == "plan":
         # The agent plans (fake_provider's sc_plan); a model to switch to

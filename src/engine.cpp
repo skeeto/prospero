@@ -137,6 +137,7 @@ enum : i64 {
     FARREPORT_MAX = 512 << 10,    // bytes of a task.report's text
     MSG_TURN     = 20,            // send_message calls a turn
     SESS_SHOWN   = 50,            // unrelated sessions the sessions tool lists
+    MENTION_SESSIONS = 16,        // sessions a message may mention
     // Images attached to a message (upload, prompt)
     ATTACH_MAX    = 10,           // a message's
     ATTACH_BYTES  = 5 << 20,      // its base64, as the APIs take it
@@ -596,6 +597,7 @@ struct Queued {
     i64             id;
     Slice<MsgImage> images;
     Slice<MsgFile>  files;
+    Slice<MsgSess>  sessions;
 };
 
 // A worktree session's worktree, as its session record has it, and its
@@ -1294,6 +1296,36 @@ static Slice<MsgFile> getfiles(Arena *perm, Json *list)
     return r;
 }
 
+// Put the sessions a message mentioned as the user record has them:
+// [{sid, title}].
+static void putsessrefs(JsonOut *w, Slice<MsgSess> refs)
+{
+    putkey(w, "sessions");
+    putarray(w);
+    for (iz i = 0; i < refs.len; i++) {
+        putobject(w);
+        putstrkey(w, "sid", refs[i].sid);
+        putstrkey(w, "title", refs[i].title);
+        putend(w);
+    }
+    putend(w);
+}
+
+// The sessions a user record mentioned, in perm, those well formed.
+static Slice<MsgSess> getsessrefs(Arena *perm, Json *list)
+{
+    Slice<MsgSess> r = {};
+    for (Json *x = list->child; x; x = x->next) {
+        MsgSess m = {};
+        m.sid   = clone(perm, jsonstr(jsonget(x, "sid")));
+        m.title = clone(perm, jsonstr(jsonget(x, "title")));
+        if (m.sid.len) {
+            r = push(perm, r, m);
+        }
+    }
+    return r;
+}
+
 // The images of a user record, in perm, those well formed.
 static Slice<MsgImage> getimages(Arena *perm, Json *list)
 {
@@ -1347,10 +1379,15 @@ static Slice<Str> geturls(Arena *a, Json *list)
 // Log a user record and append its message: the images in perm. A
 // task's names the URLs in its prompt that the parent saw (webvouch).
 static void adduser(Session *s, Arena scratch, Str text, Str via,
-                    Slice<MsgImage> images = {}, Slice<MsgFile> files = {})
+                    Slice<MsgImage> images = {}, Slice<MsgFile> files = {},
+                    Slice<MsgSess> refs = {})
 {
     Slice<Str> urls = via=="task" ? webvouch(s->parent, &scratch, text) : Slice<Str>{};
-    Buf   b(&scratch, 256 + text.len + 128*images.len + 128*files.len);
+    iz    reflen = 0;
+    for (iz i = 0; i < refs.len; i++) {
+        reflen += 64 + refs[i].sid.len + 2*refs[i].title.len;
+    }
+    Buf   b(&scratch, 256 + text.len + 128*images.len + 128*files.len + reflen);
     EvOut w = sbegin(s, &b, EV_USER);
     putstrkey(&w.json, "text", text);
     putstrkey(&w.json, "via", via);
@@ -1365,13 +1402,17 @@ static void adduser(Session *s, Arena scratch, Str text, Str via,
     if (files.len) {
         putfiles(&w.json, files);
     }
+    if (refs.len) {
+        putsessrefs(&w.json, refs);
+    }
     puturls(&w.json, urls);
     ssend(s, &w);
     Msg m = {};
     m.role   = ROLE_USER;
     m.text   = clone(&s->perm, text);
-    m.images = images;
-    m.files  = files;
+    m.images   = images;
+    m.files    = files;
+    m.sessions = refs;
     addmsg(s, m);
     webnoteuser(s, scratch, via, text, urls);
 }
@@ -6597,6 +6638,27 @@ static Str filestext(Session *s, Arena *a, Slice<MsgFile> files)
     return r;
 }
 
+// The text a request has for the sessions a user message mentioned, in
+// a, before its own and its files': a line for each, giving the id that
+// send_message takes, since the token the user typed is only a title.
+static Str sessrefstext(Arena *a, Slice<MsgSess> refs)
+{
+    Buf b(a, 256);
+    for (iz i = 0; i < refs.len; i++) {
+        print(&b, "[The user mentioned session ");
+        print(&b, refs[i].sid);
+        if (refs[i].title.len) {
+            print(&b, " (\"");
+            print(&b, refs[i].title);
+            print(&b, "\")");
+        }
+        print(&b, ": send_message reaches it by that id, and the sessions "
+                  "tool lists it]\n");
+    }
+    putbyte(&b, '\n');
+    return finish(&b);
+}
+
 // The history for a request: the screenshots shown read in as base64,
 // with a short text in place of each left out, and the floors marked;
 // the images attached, each read in, or a note if its file is lost; and
@@ -6608,7 +6670,7 @@ static Slice<Msg> deskimages(Session *s, Arena *a)
     b32     any = 0;
     for (iz i = 0; i<s->history.len && !any; i++) {
         any = s->history[i].image.len>0 || s->history[i].images.len>0 ||
-              s->history[i].files.len>0;
+              s->history[i].files.len>0 || s->history[i].sessions.len>0;
     }
     if (!any) {
         return s->history;
@@ -6661,6 +6723,9 @@ static Slice<Msg> deskimages(Session *s, Arena *a)
         }
         if (m.files.len) {
             m.text = concat(a, filestext(s, a, m.files), m.text);
+        }
+        if (m.sessions.len) {
+            m.text = concat(a, sessrefstext(a, m.sessions), m.text);
         }
         h.data[i] = m;
     }
@@ -12528,7 +12593,7 @@ static void prepare(Session *s, Arena scratch)
 {
     for (iz i = 0; i < s->steers.len; i++) {
         adduser(s, scratch, s->steers[i].text, "steer", s->steers[i].images,
-                s->steers[i].files);
+                s->steers[i].files, s->steers[i].sessions);
         userinput(s);
     }
     if (s->steers.len) {
@@ -12686,13 +12751,14 @@ static void turnready(Session *s, Arena scratch)
 
 // A subagent's task carries its parent's hop, and user input resets it.
 static void startturn(Session *s, Arena scratch, Str text, Str via,
-                      Slice<MsgImage> images = {}, Slice<MsgFile> files = {})
+                      Slice<MsgImage> images = {}, Slice<MsgFile> files = {},
+                      Slice<MsgSess> refs = {})
 {
     s->cancelled = 0;
     if (via != "task") {
         userinput(s);
     }
-    adduser(s, scratch, text, via, images, files);
+    adduser(s, scratch, text, via, images, files, refs);
     if (!s->title.len) {
         Str title = cleantitle(&scratch, text, TITLE_MAX);
         settitle(s, scratch, title, "auto");
@@ -12782,7 +12848,7 @@ static void endturn(Session *s, Arena scratch, Str why, Str err)
     if (next.text.data) {
         // Its message goes out ahead of the queue without it, so that a
         // frontend never shows it in neither
-        startturn(s, scratch, next.text, "queue", next.images, next.files);
+        startturn(s, scratch, next.text, "queue", next.images, next.files, next.sessions);
         sendqueue(s, scratch);
     } else if (mhop) {
         s->hop = mhop;
@@ -16523,6 +16589,7 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             m.seq    = r.seq;
             m.images = getimages(&s->perm, jsonget(j, "images"));
             m.files  = getfiles(&s->perm, jsonget(j, "files"));
+            m.sessions = getsessrefs(&s->perm, jsonget(j, "sessions"));
             addmsg(s, m);
             if (r.ev == EV_USER) {
                 Slice<Str> urls = geturls(&t, jsonget(j, "urls"));
@@ -17466,6 +17533,28 @@ static void cmduncut(Engine *e, Session *s, Arena scratch, i64 id)
 // size, and more:1 if there is more after it. With encoding "base64",
 // for a binary file such as a screenshot, the part comes as is in
 // base64, as data rather than text, and cut anywhere.
+// The real path of path inside dir, links resolved, or null when it is
+// not one: path must be plain names below dir, with no root, drive, ".."
+// or NUL, and what it resolves to must stay inside dir's own real path.
+static Str pathinside(Os *os, Arena *a, Str dir, Str path)
+{
+    b32 bad = !path.len || path[0]=='/' || path[0]=='\\' ||
+              cut(path, 0).ok || cut(path, ':').ok;
+    for (Str rest = path; !bad && rest.len;) {
+        iz i = 0;
+        for (; i<rest.len && rest[i]!='/' && rest[i]!='\\'; i++) {}
+        bad  = takehead(rest, i) == "..";
+        rest = cuthead(rest, i + (i<rest.len));
+    }
+    Str rdir = bad ? Str{} : os_realpath(os, a, dir);
+    Str real = rdir.data ? os_realpath(os, a, join(a, dir, path)) : Str{};
+    if (!real.data || !within(normpath(a, rdir, ".", HOST_WINDOWS),
+                              normpath(a, rdir, real, HOST_WINDOWS), HOST_WINDOWS)) {
+        return {};
+    }
+    return real;
+}
+
 static void cmdfile(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
 {
     Os *os     = e->os;
@@ -17478,19 +17567,8 @@ static void cmdfile(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
     most = most<(iz)FILECMD_MAX ? most : (iz)FILECMD_MAX;
     max  = max<1 || max>most ? most : max;
 
-    // Plain names below the directory: no root, drive, "..", or NUL
-    b32 bad = !path.len || off<0 || path[0]=='/' || path[0]=='\\' ||
-              cut(path, 0).ok || cut(path, ':').ok;
-    for (Str rest = path; !bad && rest.len;) {
-        iz i = 0;
-        for (; i<rest.len && rest[i]!='/' && rest[i]!='\\'; i++) {}
-        bad  = takehead(rest, i) == "..";
-        rest = cuthead(rest, i + (i<rest.len));
-    }
-    Str dir  = bad ? Str{} : os_realpath(os, &scratch, s->dir);
-    Str real = dir.data ? os_realpath(os, &scratch, join(&scratch, s->dir, path)) : Str{};
-    if (!real.data || !within(normpath(&scratch, dir, ".", HOST_WINDOWS),
-                              normpath(&scratch, dir, real, HOST_WINDOWS), HOST_WINDOWS)) {
+    Str real = off<0 ? Str{} : pathinside(os, &scratch, s->dir, path);
+    if (!real.data) {
         reply(e, scratch, id, 0, "no such file in the session's directory", s->sid);
         return;
     }
@@ -19146,8 +19224,36 @@ static b32 readimage(Session *s, Arena scratch, Str path)
 struct Attaching {
     Slice<MsgImage> images;
     Slice<MsgFile>  files;
+    Slice<MsgSess>  sessions;
     Str             err;
 };
+
+// The sessions a prompt or a steer mentions (sessions: their ids), in
+// perm, each with its title as it is now: those of this state directory,
+// once each, and not in the Trash, since send_message would refuse it.
+// One not found is left out rather than failing the message, whose
+// token still names it to the agent.
+static Slice<MsgSess> mentioned(Session *s, Arena *perm, Arena scratch, Json *list)
+{
+    Slice<MsgSess> r = {};
+    if (!list->child) {
+        return r;
+    }
+    SessScan sc = scansessions(s->e, &scratch);
+    for (Json *x = list->child; x && r.len<MENTION_SESSIONS; x = x->next) {
+        Str  sid  = jsonstr(x);
+        iz  *p    = sid.len ? upsert(&sc.bysid, sid, (Arena *)0) : 0;
+        b32  seen = 0;
+        for (iz i = 0; i < r.len; i++) {
+            seen |= r[i].sid == sid;
+        }
+        if (p && !seen && !(scanaside(&sc, *p) & ASIDE_TRASHED)) {
+            MsgSess m = {clone(perm, sid), clone(perm, sc.list[*p].title)};
+            r = push(perm, r, m);
+        }
+    }
+    return r;
+}
 
 // The images a prompt or a steer names (images), as attached to the
 // session, read for their kind and size, in perm, and only once all are
@@ -19197,6 +19303,91 @@ static Attaching attaching(Session *s, Arena *perm, Arena scratch, Json *list)
     return r;
 }
 
+// upload {kind:"file", sid, path}: a file in session sid's working
+// directory attached as if it were uploaded, read here by this engine,
+// for a frontend on another machine that cannot read it to send it (an
+// '@' mention). The path is relative to the working directory, '/' or
+// '\' separated, and must stay inside it, links resolved. An image, as
+// upload {kind:"image"} would take it; else a text file, as {kind:"file"}
+// would, named by the path's last part. The reply has kind, "image" or
+// "file", and what upload's last reply has for that kind.
+static void attachpath(Engine *e, Arena scratch, i64 id, Str sid, Str rel)
+{
+    Os      *os  = e->os;
+    Session *s   = validsid(sid) ? findsession(e, sid) : 0;
+    Str      cwd = s ? s->cwd : Str{};
+    if (!s) {
+        reply(e, scratch, id, 0, "no such session open", {});
+        return;
+    } else if (!cwd.len) {
+        reply(e, scratch, id, 0, "the session has no working directory", {});
+        return;
+    }
+    Str real = pathinside(os, &scratch, cwd, rel);
+    if (!real.data) {
+        reply(e, scratch, id, 0, "no such file in the session's working directory", {});
+        return;
+    }
+    Read rd = os_read(os, &scratch, real, ATTACH_UPLOAD);
+    if (rd.err == READ_TOOBIG) {
+        reply(e, scratch, id, 0, "too large to attach: an image is at most 64 MiB, "
+                                 "a text file 16 MiB", {});
+        return;
+    } else if (rd.err != READ_OK) {
+        reply(e, scratch, id, 0, rd.err==READ_NOTFOUND ? Str("no such file")
+                                                       : Str("cannot read the file"), {});
+        return;
+    }
+
+    // Staged as an upload is, so that attachstaged and attachfile keep it
+    // as they keep one, and remove the staged copy as they do
+    Buf tb(&scratch, 16);
+    printhex(&tb, os_random(os), 16);
+    Str token  = finish(&tb);
+    Str staged = uploadpath(&scratch, e, token, 0);
+    Str tmp    = join(&scratch, e->statedir, "tmp");  // not in the call: scratch is copied
+    b32 image  = imagekind(scratch, rd.data).mime.data != 0;
+    if (!image && rd.data.len>ATTACH_FILE) {
+        reply(e, scratch, id, 0, "too large to attach: a text file is at most 16 MiB", {});
+        return;
+    } else if (!os_mkdirs(os, scratch, tmp) || !os_write(os, scratch, staged, rd.data)) {
+        reply(e, scratch, id, 0, "cannot stage the file", {});
+        return;
+    }
+    Str          name = rel;  // filesafe keeps its last part
+    Attached     at   = {};
+    AttachedFile af   = {};
+    Str          err  = {};
+    if (image) {
+        at  = attachstaged(e, &scratch, sid, staged);
+        err = at.err;
+    } else {
+        af  = attachfile(e, &scratch, sid, staged, name);
+        err = af.err;
+    }
+    if (err.len) {
+        reply(e, scratch, id, 0, err, {});
+        return;
+    }
+    Buf   b(&scratch, 256);
+    EvOut w = evbegin(&b, {}, 0, os_time(os), EV_REPLY);
+    putintkey(&w.json, "id", id);
+    putintkey(&w.json, "ok", 1);
+    if (image) {
+        putstrkey(&w.json, "kind", "image");
+        putstrkey(&w.json, "name", at.img.name);
+        putstrkey(&w.json, "mime", at.img.mime);
+        putintkey(&w.json, "w", at.img.w);
+        putintkey(&w.json, "h", at.img.h);
+    } else {
+        putstrkey(&w.json, "kind", "file");
+        putstrkey(&w.json, "name", af.file.name);
+        putintkey(&w.json, "bytes", af.file.bytes);
+        putintkey(&w.json, "lines", af.file.lines);
+    }
+    emit(e, evend(&w));
+}
+
 // upload {token?, data, off, done?, kind?, sid?}: a part of a raw log,
 // its bytes in base64 at offset off, which must be the bytes staged so
 // far, so that a part sent twice, or out of order, is refused. The first
@@ -19207,8 +19398,19 @@ static Attaching attaching(Session *s, Arena *perm, Arena scratch, Json *list)
 // last reply naming it, with its mime, w and h; with kind "file", a
 // text file so, its name its own (the last part's name), kept as
 // attachfile does, the last reply naming it, with its bytes and lines.
+// With kind "file" and a path in place of data, a file this machine holds
+// instead, in one go (attachpath).
 static void cmdupload(Engine *e, Arena scratch, i64 id, Json *j)
 {
+    if (jsonget(j, "path")->type != JSON_MISSING) {
+        if (jsonstr(jsonget(j, "kind")) != "file") {
+            reply(e, scratch, id, 0, "a path is attached with kind \"file\"", {});
+        } else {
+            attachpath(e, scratch, id, jsonstr(jsonget(j, "sid")),
+                       jsonstr(jsonget(j, "path")));
+        }
+        return;
+    }
     Os      *os    = e->os;
     Str      token = jsonstr(jsonget(j, "token"));
     Json    *oj    = jsonget(j, "off");
@@ -20146,6 +20348,7 @@ static void command(Engine *e, Arena scratch, Str line)
             reply(e, scratch, id, 0, at.err, sid);
             return;
         }
+        at.sessions = mentioned(s, &s->perm, scratch, jsonget(j, "sessions"));
         Json *skill = jsonget(j, "skill");
         if (skill->type!=JSON_MISSING && skill->type!=JSON_NULL) {
             SkillUse u = skillinvoke(s, &scratch, jsonstr(skill), text);
@@ -20163,16 +20366,16 @@ static void command(Engine *e, Arena scratch, Str line)
         sidecarwrite(e, scratch, s->sid, "draft", {});  // sent, so no draft
         if (!busy(s)) {
             startturn(s, scratch, text, cmd==CMD_PROMPT ? Str("prompt") : Str("steer"), imgs,
-                      at.files);
+                      at.files, at.sessions);
         } else if (cmd == CMD_PROMPT) {
-            Queued q = {clone(&s->perm, text), ++s->queueid, imgs, at.files};
+            Queued q = {clone(&s->perm, text), ++s->queueid, imgs, at.files, at.sessions};
             s->queued = push(&s->perm, s->queued, q);
             sendqueue(s, scratch);
         } else {
             // Read at the next step; a pending ask yields to it, as do
             // any more asks before then (askcall), except the agent's
             // questions, which the steer waits behind (askusercall)
-            Queued q = {clone(&s->perm, text), ++s->queueid, imgs, at.files};
+            Queued q = {clone(&s->perm, text), ++s->queueid, imgs, at.files, at.sessions};
             s->steers = push(&s->perm, s->steers, q);
             sendqueue(s, scratch);
             if (s->state==S_ASK && s->ask.tool!=TOOL_ASKUSER) {

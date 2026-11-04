@@ -155,6 +155,47 @@ request, so it needs no vision. A file with a NUL byte in its first
 8 KiB is binary, and is refused, as `read` refuses it. The transcript
 notes the files under their message, folded.
 
+A file or folder may be mentioned in the prompt: type `@` at the start of
+a word (the text's start, or after a space or `(`), and a picker of the
+session's files and folders opens, ranked as you type, a subsequence of
+the path matching and the file's own name counting for more. Up and Down
+move the pick, and Tab or a plain Enter puts `@path` in the message
+without sending it; Shift+Enter and Ctrl+Enter still start a new line,
+and Esc closes the picker and leaves the message alone, a second Esc then
+cancelling the turn as it always did. A path holding a space is quoted,
+`@"my file.txt" `, and a folder's pick puts `@src/ui/` in the message
+and keeps the picker open inside it. `@` is already how an instruction
+file imports another, `@docs/a.md`, so the two read alike. `[ui]
+mentions = false` turns the picker off, and `@` is then plain text.
+
+Picking a file also attaches its text to the next message, as the Attach
+button does, so the agent has the contents as well as the path. A file
+that cannot be attached (binary, over 16 MiB) still gets its token, with
+a dimmed chip that says why, and the mention still works: the agent reads
+the file itself. With ten files already attached the box has no room for
+another chip: the token goes in, no chip is added, and a note says ten
+files are already attached, the mention still working.
+
+An `@path` the message no longer holds when it is sent takes what it
+attached with it: the check is made when the message is sent, not as the
+text changes. A path typed by hand and dismissed with Esc stays a plain
+pointer, with no contents. A session on another machine lists one folder
+at a time, through its engine, and its engine reads a picked file there
+as the message goes; an engine too old for that gives the pick a dimmed,
+path-only chip. A path that cannot be written as a token, one holding `"`
+or `@`, is refused with a note.
+
+The picker lists other sessions too, once a word is typed: those on the
+session's host that are neither archived, in the Trash, nor subagents,
+matched by title or id and ranked with the files, each marked with a
+discussion icon and its id. A pick puts the title in the message,
+`@"Fix the parser" ` (the id where no token can hold the title, or
+another session has it too), and attaches nothing: when the message is
+sent, each session it mentions goes with it by id, and the agent is told
+that id before the message, so `send_message` reaches the session even
+after a rename. A token typed by hand counts as a pick does. The
+transcript shows a folded "Mentioned:" line under the message.
+
 The agent can look at image files on its own, too: `read` shows a PNG,
 JPEG, GIF, WebP or BMP file to a model that takes images, as an image,
 scaled down to the model's limits as a screenshot is ([Desktop control](desktop.md)). Images

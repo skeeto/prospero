@@ -1083,6 +1083,7 @@ static void testcfgjson(Test *t)
         "ui//fonts=auto*\n"
         "ui//editor=*\n"
         "ui//terminal=*\n"
+        "ui//mentions=true*\n"
         "ui//notify=allow done*\n"
         "desktop//offer=all*\n"
         "desktop//ask=true*\n"

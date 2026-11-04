@@ -198,6 +198,9 @@ A url from a local include, or from your own file, needs no approval.
   notifications are off or unavailable, the window asks for attention
   instead (a flashing taskbar button, a bouncing Dock icon). On macOS
   only Prospero.app can show them, after you allow it once.
+- **[`[ui] mentions`](settings:ui#mentions)**: `false` turns off the
+  `@` picker of files, folders and sessions in the compose box, leaving
+  `@` as plain text. On by default.
 - **[`[ui] font_size`](settings:ui#font_size)**: the text's size in
   pixels, 8 to 40 (17 by default). The View menu's zoom scales it until Prospero exits.
 - **[`[ui] theme`](settings:ui#theme)**: `system`, `dark` or `light`,

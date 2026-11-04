@@ -595,6 +595,10 @@ static CfgKey cfgschema[] = {
      "$TERMINAL or the first found of ptyxis, gnome-terminal, kgx, konsole, "
      "xfce4-terminal, x-terminal-emulator, alacritty, kitty, wezterm, foot, "
      "ghostty and xterm"},
+    {"ui", "mentions", CFG_BOOL, "true", {}, {}, "ui",
+     "Whether @ at a word's start in the compose box opens the picker of "
+     "the session's files and folders and other sessions; false leaves @ "
+     "as plain text, and a message carries no mentioned sessions' ids"},
     {"ui", "notify", CFG_LIST, "allow done", {}, "allow done none", "ui",
      "Desktop notifications while you look elsewhere: allow when an "
      "ask waits for you (a permission, a plan to approve, the agent's "

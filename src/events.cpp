@@ -318,6 +318,14 @@ static Str capnames[] = {
                        // approve, answers by "shared" for every session
                        // waiting, mcp's approve and the server state
                        // "approve"
+    "files.path",      // upload {kind:"file", path}: a file in the session's
+                       // working directory attached where it is, read by
+                       // the engine, with kind on the reply (an '@' mention
+                       // from a frontend on another machine)
+    "sessions.mention", // prompt and steer {sessions: [sid]}: sessions the
+                       // message mentions, each a line before its text in
+                       // requests, and the user record's sessions: [{sid,
+                       // title}]
 };
 
 static Str evname(i32 ev)
@@ -1812,8 +1820,8 @@ static b32 importkeeps(i32 ev)
 // Whether an import drops a field: of a tool result, one naming a file
 // or a session of the old state directory (spill, image, child, a
 // message's target), or describing one; of a message's notice, its
-// sender, whose title and text stay; of a user record, its images and
-// files. The
+// sender, whose title and text stay; of a user record, its images,
+// files and the sessions it mentioned. The
 // URLs one session vouched for to another (urls) go too, as grants do.
 static b32 importdrops(i32 ev, Str key)
 {
@@ -1823,7 +1831,7 @@ static b32 importdrops(i32 ev, Str key)
     if (ev == EV_NOTICE) {
         return key == "from";
     } else if (ev == EV_USER) {
-        return key=="images" || key=="files";
+        return key=="images" || key=="files" || key=="sessions";
     }
     return key=="spill" || key=="bytes" || key=="image" || key=="width" ||
            key=="height" || key=="shot" || key=="child" || key=="host" ||

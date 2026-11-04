@@ -4762,6 +4762,12 @@ def sc_attach_text(model, n, req):
 
 
 sc_attach_text_replay = sc_attach_text
+
+
+def sc_mention_sessions(model, n, req):
+    # How many mentioned sessions the request names
+    k = user_text_all(req).count("[The user mentioned session ")
+    yield from answer(model, f"{k} sessions mentioned.")
 sc_attach_text_b = sc_attach_text  # its model without vision
 
 

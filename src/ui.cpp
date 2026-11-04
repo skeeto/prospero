@@ -34,6 +34,11 @@
 //
 // This is free and unencumbered software released into the public domain.
 
+// The '@' picker's adapter (mention.cpp): the compose box asks it for
+// candidates, and the popup below draws them. It is included here, with
+// the code that uses it, rather than from app.cpp with the rest.
+#include "mention.cpp"
+
 static ImVec2 v2(f32 x, f32 y)
 {
     ImVec2 r;
@@ -5192,12 +5197,17 @@ struct ComposeCb {
     GuiSession *s;
     View       *v;
     i32        *slashsel;
+    i32        *mentionsel;  // the '@' popup's pick, as slashsel is the slash's
     i32         slash;     // the slash popup's entries, 0 if it is closed
+    i32         mention;   // and the '@' popup's rows, 0 if it is closed
+    MentionEdit *edit;     // a pick's edit, queued for this frame to apply
     i32         cursor;    // the caret before this frame's keys, -1 if inactive
     b32         hadsel;
     b32         recalled;  // history replaced the text
     b32         tab;       // Tab, kept out of the text, completes the pick
     b32         escaped;   // Esc left history: the box stays active
+    b32         full;      // the box had no room for the edit
+    b32         applied;   // the edit landed: the text grew, but not by a paste
 };
 
 // Up and Down that moved nothing, on the first or last visual line,
@@ -5205,17 +5215,43 @@ struct ComposeCb {
 // recalling, through the session's history (histkey). With the slash
 // popup open, they pick among its commands instead, and Tab, which the
 // box then takes as a character, completes (filtered out). Esc while
-// recalling empties the box, as the box gives it up. The active box
-// owns every key, so the callback, inside it, is where they are seen.
+// recalling empties the box, as the box gives it up. A pick the '@'
+// popup accepted is applied here first, its offsets checked against the
+// token they were taken from. The active box owns every key, so the
+// callback, inside it, is where they are seen.
 static i32 composecb(ImGuiInputTextCallbackData *d)
 {
     ComposeCb *c  = (ComposeCb *)d->UserData;
     ImGuiIO   &io = ImGui::GetIO();
     if (d->EventFlag == ImGuiInputTextFlags_CallbackCharFilter) {
-        if (d->EventChar=='\t' && c->slash) {
+        if (d->EventChar=='\t' && (c->slash || c->mention)) {
             c->tab = 1;
             return 1;
         }
+        return 0;
+    }
+    // A pick queued last frame, applied now that the box is at the top of
+    // its own frame: before the keys, so they see the text it made, and
+    // never after the token has moved, which is checked below.
+    MentionEdit *e = c->edit;
+    if (e && e->on) {
+        // The offsets are a frame old: the token must still be there
+        if (e->end > d->BufTextLen || e->end - e->beg != e->was.len ||
+                __builtin_memcmp(d->Buf + e->beg, e->was.data, (uz)e->was.len)) {
+            e->on = 0;
+            return 0;
+        }
+        // Never delete before this check: InsertChars clips silently
+        if (d->BufTextLen - (e->end - e->beg) + e->text.len >= d->BufSize) {
+            e->on = 0;
+            c->full = 1;
+            return 0;
+        }
+        d->DeleteChars((i32)e->beg, (i32)(e->end - e->beg));
+        d->InsertChars((i32)e->beg, e->text.cdata, e->text.cdata + e->text.len);
+        d->CursorPos = d->SelectionStart = d->SelectionEnd = (i32)e->caret;
+        e->on = 0;
+        c->applied = 1;  // the text grew: a pick, not a paste
         return 0;
     }
     if (c->s->hist && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
@@ -5233,6 +5269,13 @@ static i32 composecb(ImGuiInputTextCallbackData *d)
     if (c->slash) {
         i32 n = c->slash;
         *c->slashsel = (*c->slashsel + (up ? n-1 : 1)) % n;
+        return 0;
+    }
+    // The '@' popup's rows, claimed as the slash popup's are, before
+    // histkey reads the same keys as history
+    if (c->mention) {
+        i32 n = c->mention;
+        *c->mentionsel = (*c->mentionsel + (up ? n-1 : 1)) % n;
         return 0;
     }
     b32     edge = d->CursorPos==c->cursor && !c->hadsel;
@@ -5438,11 +5481,159 @@ static void drawslash(Gui *g, Arena a, Str text, Slice<SkillItem> skills, ImVec2
             ImGui::SameLine();
             ImGui::TextDisabled("%s", cstr0(&a, utf8head(c.desc, 120)));
         }
-        ImGui::TextDisabled("Tab or Enter completes; Up and Down pick");
+        ImGui::TextDisabled("Tab or Enter completes; Up and Down pick "
+                            "\xc2\xb7 @ mentions a file");
     }
     ImGui::End();
     g->slashshown = 1;
 }
+
+// A string cut to fit w pixels, its middle replaced by "..." when it does
+// not: a long folder keeps its first and last characters, which are what tell
+// one from another, and the caller keeps the rest of the row's columns.
+static Str mentionelide(Arena *a, Str s, f32 w)
+{
+    if (w <= 0 || ImGui::CalcTextSize(s.cdata, s.cdata+s.len).x <= w) {
+        return s;
+    }
+    for (iz keep = s.len; keep > 1; keep--) {
+        iz  head = keep/2, tail = keep - head;
+        Buf b(a, keep + 4);
+        print(&b, span(s.data, s.data+head));
+        print(&b, "...");
+        print(&b, span(s.data+s.len-tail, s.data+s.len));
+        Str t = finish(&b);
+        if (ImGui::CalcTextSize(t.cdata, t.cdata+t.len).x <= w) {
+            return t;
+        }
+    }
+    return "...";
+}
+
+// The '@' picker, above the box while the caret is in an '@' word: the
+// candidates the source found, the pick marked, and one line under them
+// saying what they are and which keys work. It takes no input, as the slash
+// popup does not, so the caret keeps blinking and typing goes on. It draws
+// with no rows too, so that the adapter's one line — no files match,
+// indexing, a folder it could not list — is not written to nobody.
+static void drawmention(Gui *g, Arena a, MentionSrc *src, ImVec2 at, f32 maxw)
+{
+    ImGui::SetNextWindowPos(at, ImGuiCond_Always, v2(0, 1));
+    ImGuiWindowFlags f = ImGuiWindowFlags_Tooltip | ImGuiWindowFlags_NoTitleBar |
+                         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
+                         ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
+                         ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav |
+                         ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoDocking;
+    i32 rows  = (i32)src->cands.len;
+    i32 sel   = g->mentionsel<rows ? g->mentionsel : 0;
+    i32 first = sel<MENTION_ROWS ? 0 : sel-MENTION_ROWS+1;  // the window follows it
+    if (ImGui::Begin("##mention", 0, f)) {
+        f32 cue   = ImGui::CalcTextSize("\xe2\x80\xba ").x;  // "> "
+        f32 glyph = ImGui::CalcTextSize(ICON_FILE).x;
+        f32 gap   = ImGui::GetStyle().ItemSpacing.x;
+        Str tag   = "attached";  // the right column, where a file is in already
+        f32 tagw  = ImGui::CalcTextSize(tag.cdata, tag.cdata+tag.len).x;
+        // The name column is one width for every row, so the parents line up
+        // and the eye can scan them: without it the dim text starts wherever
+        // each name ends and the row reads as a sentence
+        f32 namew = 0;
+        for (i32 i = first; i<rows && i<first+MENTION_ROWS; i++) {
+            f32 nw = ImGui::CalcTextSize(cstr0(&a, src->cands.data[i].name)).x;
+            namew = nw>namew ? nw : namew;
+        }
+        f32 lead  = cue + glyph + gap + namew + gap;  // to the parent's column
+        f32 w     = 0;
+        for (i32 i = first; i<rows && i<first+MENTION_ROWS; i++) {
+            MentionCand *c  = &src->cands.data[i];
+            f32          rw = lead;
+            if (c->dir.len) {
+                rw += ImGui::CalcTextSize(cstr0(&a, c->dir)).x;
+            }
+            if (c->attached) {
+                rw += gap + tagw;  // the right column, as it is drawn below
+            }
+            w = rw>w ? rw : w;
+        }
+        // A deep parent must not make the popup wider than the box it serves
+        if (maxw > 0 && w > maxw) {
+            w = maxw;
+        }
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        f32         lh = ImGui::GetTextLineHeight();
+        for (i32 i = first; i<rows && i<first+MENTION_ROWS; i++) {
+            MentionCand *c    = &src->cands.data[i];
+            b32          s    = i == sel;
+            char        *name = cstr0(&a, c->name);
+            ImGui::PushID(i);
+            ImVec2 p = ImGui::GetCursorScreenPos();
+            ImGui::Selectable("##row", s, 0, v2(w, lh));
+            ImGui::PopID();
+            // Drawn over the row, so each part keeps its own color: the
+            // cue, the kind's glyph, the name, and the folder it is in
+            f32 x = p.x;
+            if (s) {
+                dl->AddText(v2(x, p.y), g->pal->text, "\xe2\x80\xba ");
+            }
+            x += cue;
+            // The kind, so a folder does not look like a file until picked,
+            // nor a session like either
+            dl->AddText(v2(x, p.y), g->pal->dim,
+                        c->sid.len ? ICON_SESSION : c->isdir ? ICON_FOLDER : ICON_FILE);
+            x += glyph + gap;
+            dl->AddText(v2(x, p.y), g->pal->text, name);
+            x = p.x + lead;  // the parent's column, the same on every row
+            if (c->dir.len) {
+                // What is left after the name column and, when it is drawn,
+                // the tag: the parent gives way to both
+                f32 room = w - lead - (c->attached ? gap + tagw : 0);
+                dl->AddText(v2(x, p.y), g->pal->dim,
+                            cstr0(&a, mentionelide(&a, c->dir, room)));
+            }
+            // The right column: a file already in the draft, at the row's
+            // right. A folder has nothing to say there: its token is a
+            // pointer the agent lists itself, not a file attached.
+            if (c->attached) {
+                dl->AddText(v2(p.x + w - tagw, p.y), g->pal->paneldim, tag.cdata,
+                            tag.cdata + tag.len);
+            }
+        }
+        // Space commits a folder as a token, since it ends the word; the
+        // line says so while a folder is the pick, so Enter is not pressed
+        // twice expecting something to happen
+        MentionCand *pick = rows ? &src->cands.data[sel] : 0;
+        Str keys = pick && pick->isdir
+                 ? Str("Enter opens \xc2\xb7 Space keeps this folder \xc2\xb7 Esc close")
+                 : Str("Tab or Enter insert \xc2\xb7 Up/Down pick \xc2\xb7 Esc close");
+        Str line = src->status.len ? concat(&a, concat(&a, src->status, " \xc2\xb7 "), keys) : keys;
+        ImGui::TextDisabled("%s", cstr0(&a, line));
+        // What a check reads is what this frame drew, so it is written
+        // here, inside the block: a Begin that returned false drew nothing,
+        // and the state then stays as drawprompt reset it
+        g->mentionshown = 1;
+        g->mentionrows  = rows;
+        g->mentionkind  = src->kind;
+        g->mentiontrunc = src->truncated;
+        // The pick's path, kept in the permanent arena so that a check can
+        // name it, and whether it was drawn with its attached tag: a re-rank
+        // may move the pick, so the path is what a check compares, not the
+        // row. Cloned only when the pick changed, since this runs on every
+        // frame the popup is up and the arena keeps all it is given; with no
+        // row there is no pick to name, and the last one stands (mentionrows
+        // is 0, so nothing reads it as this frame's)
+        MentionCand *row = rows ? &src->cands.data[sel] : 0;
+        if (row) {
+            keepset(&g->mentionpath, row->path);
+        }
+        g->mentiontag = row && row->attached;
+        // The popup's one line, as drawn, kept in the permanent arena so that
+        // a check can read it, and cloned only when it changes: with no row to
+        // list it is all the popup says, so it must outlive the frame that drew
+        // it (the keys after it are the popup's own, not the source's)
+        keepset(&g->mentionstatus, src->status);
+    }
+    ImGui::End();
+}
+
 
 // The images attached to the draft: thumbnails above the box, in rows,
 // each with an x that removes it, dimmed while they are sent.
@@ -5477,7 +5668,7 @@ static void drawattached(Gui *g, GuiSession *s)
         ImTextureData *td = m->tex ? &m->tex->td : 0;
         if (m->file) {
             f32 fs = ImGui::GetFontSize();
-            ImU32 col = busy ? g->pal->dim : ImGui::GetColorU32(ImGuiCol_Text);
+            ImU32 col = busy || m->pathonly ? g->pal->dim : ImGui::GetColorU32(ImGuiCol_Text);
             dl->AddText(ImGui::GetFont(), 1.6f*fs, v2(c0.x + (box - 1.6f*fs)/2, c0.y + 6*sc),
                         col, ICON_FILE);
             dl->PushClipRect(v2(c0.x+3*sc, c0.y), v2(c1.x-3*sc, c1.y), true);
@@ -5531,22 +5722,38 @@ static void drawattached(Gui *g, GuiSession *s)
         if (ImGui::IsItemHovered()) {
             Buf b(&a, 128 + m->label.len);
             print(&b, m->label.len ? m->label : Str("Pasted"));
-            print(&b, ", ");
-            if (m->file) {
-                print(&b, m->lines);
-                print(&b, m->lines==1 ? Str(" line of text") : Str(" lines of text"));
+            if (m->file && m->pathonly) {
+                // Never read: no size and no lines, only the path it names
+                // and why its text did not come
+                print(&b, ": its text did not come ");
+                if (m->why.len) {
+                    print(&b, "\xe2\x80\x94 ");
+                    print(&b, m->why);
+                    print(&b, " \xe2\x80\x94 ");
+                }
+                print(&b, "so the agent reads this path itself");
+            } else if (m->rpath.len) {
+                // On another machine: its host reads it as the message goes
+                print(&b, busy ? Str(": being attached on its host")
+                               : Str(": its host attaches it to the next message"));
             } else {
-                print(&b, (i64)m->w);
-                putbyte(&b, 'x');
-                print(&b, (i64)m->h);
-                putbyte(&b, ' ');
-                print(&b, imagename(m->mime));
-            }
-            if (m->data.len || m->bytes) {
                 print(&b, ", ");
-                print(&b, bytesize(&a, m->data.len ? m->data.len : m->bytes));
+                if (m->file) {
+                    print(&b, m->lines);
+                    print(&b, m->lines==1 ? Str(" line of text") : Str(" lines of text"));
+                } else {
+                    print(&b, (i64)m->w);
+                    putbyte(&b, 'x');
+                    print(&b, (i64)m->h);
+                    putbyte(&b, ' ');
+                    print(&b, imagename(m->mime));
+                }
+                if (m->data.len || m->bytes) {
+                    print(&b, ", ");
+                    print(&b, bytesize(&a, m->data.len ? m->data.len : m->bytes));
+                }
+                print(&b, busy ? Str(": being sent") : Str(": sent with the next message"));
             }
-            print(&b, busy ? Str(": being sent") : Str(": sent with the next message"));
             tipnow("%s", cstr0(&a, finish(&b)));
         }
         drop = go ? i : drop;
@@ -5585,11 +5792,23 @@ static void drawprompt(Gui *g)
     b32         editing = g->edsess && g->edsess==s && !g->edplan;
     char       *buf     = draftbuf(g, s);
     Arena       a       = g->frame;
-    g->slashshown  = 0;
-    g->cmenushown  = 0;
-    g->histshown   = 0;
-    g->attshown    = 0;
-    g->attready    = 0;
+    b32         wasshown = g->mentionshown;  // last frame's: the Esc test's
+    i32         wasrows  = g->mentionrows;   // and its rows, for the callback's
+    // Views of last frame's pick and query, which nothing changes before
+    // they are last read: the query after its compare, the pick in
+    // drawmention, after the fill that looks for it
+    Str         waspath  = keepstr(&g->mentionpath);   // its pick, to keep
+    Str         wasquery = keepstr(&g->mentionquery);  // and its query
+    g->slashshown   = 0;
+    g->cmenushown   = 0;
+    g->histshown    = 0;
+    g->attshown     = 0;
+    g->attready     = 0;
+    g->mentionshown = 0;
+    g->mentionrows  = 0;  // the picker's, as drawmention sets them
+    g->mentiontag   = 0;
+    // mentionpath and mentionquery are not reset here: they are how the
+    // next fill re-finds the pick among the rows it makes (below)
     drawstrip(g);
 
     // A line for the editor at work, else the latest command's outcome,
@@ -5627,6 +5846,13 @@ static void drawprompt(Gui *g)
     s->draftid = id;
     ImGui::PopID();
 
+    // A pick queued for a box the editor holds read-only is dropped before
+    // the box runs: its offsets are the moment it was accepted, and this
+    // frame it could only land in a draft nobody may type in
+    if (s->medit.on && editing) {
+        s->medit.on = 0;
+    }
+
     // The slash popup while its first word is typed: its pick, which
     // Tab completes, as does Enter on a word typed in part (below)
     Str        text  = draftstr(s);
@@ -5638,6 +5864,34 @@ static void drawprompt(Gui *g)
         pick = picks[g->slashsel];
     } else {
         g->slashsel = 0;
+    }
+
+    // The '@' picker: the caret's mention as the box left it last frame,
+    // and the rows last frame's fill found, which are the count the
+    // callback claims Tab and the arrows for. Those offsets are a keystroke
+    // old, so they only say which keys the callback claims here; the popup
+    // and the accept are worked out again once the box has run (below), and
+    // that one fill a frame is all the walk, the ranker and the listing get.
+    ImGuiInputTextState *st = ImGui::GetInputTextState(id);
+    MentionAt  m0    = {};
+    i32        mrows = wasrows;
+    if (active && !editing) {
+        m0 = mentionat(text, st ? st->GetCursorPos() : 0);
+        // The mute is this word's, not this offset's: it is dropped as soon
+        // as the caret is in no mention, or in another one, so an '@' the
+        // user dismissed can be opened again where it stands
+        if (!m0.on || m0.beg != s->mutebeg) {
+            s->mutebeg = -1;
+        }
+        m0.on = m0.on && m0.beg != s->mutebeg;  // dismissed: not opened again
+    }
+    // Esc closes the '@' popup before it reaches the turn: the key is
+    // taken here, ahead of escapecancel's Shortcut, which honours key
+    // ownership, as ##pathkeys does in the path field
+    if (wasshown && m0.on && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+        s->mutebeg = (i32)m0.beg;
+        ImGui::SetKeyOwner(ImGuiKey_Escape, ImGui::GetID("##mentionkeys"),
+                           ImGuiInputFlags_LockThisFrame);
     }
 
     // Esc while recalling empties the box (composecb), else it cancels
@@ -5669,12 +5923,15 @@ static void drawprompt(Gui *g)
     }
 
     ComposeCb cb = {};
-    cb.s        = s;
-    cb.v        = v;
-    cb.slashsel = &g->slashsel;
-    cb.slash    = slash;
-    cb.cursor   = -1;
-    ImGuiInputTextState *st = ImGui::GetInputTextState(id);
+    cb.s          = s;
+    cb.v          = v;
+    cb.slashsel   = &g->slashsel;
+    cb.slash      = slash;
+    cb.mentionsel = &g->mentionsel;
+    cb.mention    = mrows;
+    cb.edit       = &s->medit;
+    cb.cursor     = -1;
+    st = ImGui::GetInputTextState(id);
     if (st && active) {
         cb.cursor = st->GetCursorPos();
         cb.hadsel = st->HasSelection();
@@ -5688,7 +5945,7 @@ static void drawprompt(Gui *g)
     if (editing) {
         flags |= ImGuiInputTextFlags_ReadOnly;
     }
-    if (slash) {
+    if (slash || mrows) {
         flags |= ImGuiInputTextFlags_AllowTabInput;  // to complete, not move on
     }
     // Paste: an image, or an image file, the clipboard holds is attached,
@@ -5702,6 +5959,7 @@ static void drawprompt(Gui *g)
     f32 bw = 1.5f*ImGui::GetFrameHeight();  // its buttons' icons
     ImVec2 size = v2(ImGui::GetContentRegionAvail().x - bw - ImGui::GetStyle().ItemSpacing.x,
                      ImGui::GetContentRegionAvail().y);
+    i32 selbefore = g->mentionsel;  // the pick before this frame's keys
     ImGui::PushID(s);
     b32 send = ImGui::InputTextMultiline("##prompt", buf, DRAFT_MAX+1, size, flags, composecb, &cb);
     b32 edited = ImGui::IsItemEdited();
@@ -5710,9 +5968,13 @@ static void drawprompt(Gui *g)
     ImVec2 r0 = ImGui::GetItemRectMin();
     ImVec2 r1 = ImGui::GetItemRectMax();
     if (edited && !cb.recalled) {
-        // Typed: the draft, kept once typing pauses, out of history
+        // Typed: the draft, kept once typing pauses, out of history. A note
+        // marked fixed is what typing must not take away, as a mention's
+        // reason for attaching no text is
         s->hist = 0;
-        s->note = {};
+        if (!s->notefixed) {
+            s->note = {};
+        }
         drafttyped(&s->dclock, g->sched.now);
     }
     // Not from under a dialog: the focus waits until it closes
@@ -5721,16 +5983,129 @@ static void drawprompt(Gui *g)
         g->promptfocus = 0;
     }
     g->promptactive = ImGui::GetActiveID() == id;
+    // A pick the box did not take as it ran is dropped: the active box is
+    // what applies it (composecb), so a box that ran without it means the
+    // moment it was accepted for has passed — another session's box, or
+    // this one after the user moved away — and it must not land later
+    if (s->medit.on && !g->promptactive) {
+        s->medit.on = 0;
+    }
     SlashInfo c = pick ? slashpickinfo(&a, pick, s->skills) : SlashInfo{};
     if (pick && (cb.tab || (send && text!=c.name))) {
         // Completed rather than sent, the box kept active
         draftput(g, s, c.args.len ? concat(&a, c.name, " ") : c.name);
         drafttyped(&s->dclock, g->sched.now);
         send = 0;
-        ImGui::ActivateItemByID(id);
+    }
+    // The '@' picker once the box has run: this frame's offsets, the rows
+    // the popup shows, and the pick Tab or a bare Enter accepts. The pick
+    // is queued for the callback, which applies it next frame, and never
+    // sends: a half-typed path must not start a turn.
+    MentionSrc msrc = {};
+    MentionAt  m1   = {};
+    i32        rows = 0;
+    st      = ImGui::GetInputTextState(id);
+    Str now = draftstr(s);
+    // A bare Enter is the box's send, and it lets go of the box's active id
+    // as it returns, so the send itself says the box had the keys
+    b32 hadkeys = g->promptactive || send;
+    if (hadkeys && !editing) {
+        m1 = mentionat(now, st ? st->GetCursorPos() : 0);
+        // The mute is this word's, not this offset's: the caret has left a
+        // mention, or is in another one, so the '@' it dismissed is
+        // forgotten. Cleared before the paste below, so that a paste still
+        // mutes the word it landed in
+        if (!m1.on || m1.beg != s->mutebeg) {
+            s->mutebeg = -1;
+        }
+        // A paste lands as a burst of bytes: the mention it makes is
+        // dismissed as Esc dismisses one, so a pasted @Override does not
+        // open the picker and eat the next Enter. It is told by the text
+        // just before the caret ending with the clipboard's, and by the
+        // draft growing by that text's length in the one frame, which a
+        // burst of typing does not do: growth alone would mute the '@' of
+        // two keys that landed in one frame on a loaded machine. One byte
+        // on the clipboard is left out, since a paste of it is a keystroke
+        // to the box, and typing must open the picker. A pick's own growth
+        // and a recalled message are not pastes.
+        char const *clip   = ImGui::GetClipboardText();
+        Str         pasted = clip ? Str{(u8 *)clip, (iz)__builtin_strlen(clip)} : Str{};
+        b32         paste;
+        if (pasted.len > 1) {
+            // A paste puts the clipboard's text in at the caret, so the
+            // draft grows by its length in one frame, however few the
+            // frames; typing cannot, however many keys land in one
+            paste = st && now.len - s->draftslen >= pasted.len &&
+                    endswith(takehead(now, st->GetCursorPos()), pasted);
+        } else {
+            // Nothing on the clipboard worth matching, so growth is all
+            // there is to go on: a paste of a burst arrives as one
+            paste = now.len - s->draftslen > 1;
+        }
+        if (!cb.applied && !cb.recalled && paste && m1.on) {
+            s->mutebeg = (i32)m1.beg;
+        }
+        m1.on = m1.on && m1.beg != s->mutebeg && !g->nomentions;
+        if (m1.on) {
+            mentionfill(&a, g, s, m1.query, &msrc);
+            rows = (i32)msrc.cands.len;
+            // The pick is pinned by a path, not by a row: a fill that brings
+            // a candidate in late re-ranks the rows, and the highlight must
+            // not move under the user's hands. So with the query as it was
+            // last frame, the row whose path was the pick is the pick again,
+            // wherever it now stands; a query that changed starts at the top.
+            // A key this frame moved the pick already, and is kept.
+            b32 sameq = m1.query.len==wasquery.len && m1.query==wasquery;
+            if (g->mentionsel == selbefore) {
+                g->mentionsel = 0;
+                for (i32 i = 0; sameq && i<rows; i++) {
+                    if (msrc.cands.data[i].path == waspath) {
+                        g->mentionsel = i;
+                        break;
+                    }
+                }
+            }
+            g->mentionsel = g->mentionsel<rows ? g->mentionsel : 0;
+            if (!sameq) {
+                keepset(&g->mentionquery, m1.query);
+            }
+        } else {
+            g->mentionsel = 0;
+        }
+    }
+    s->draftslen = (i32)now.len;
+    if (cb.full) {
+        setnote(g, s, "the message is full: delete some text, then pick again", 1);
+    }
+    MentionCand *cand = rows && g->mentionsel<rows ? &msrc.cands.data[g->mentionsel] : 0;
+    if (cand && hadkeys && (cb.tab || (send && !io.KeyShift && !io.KeyCtrl))) {
+        Str t   = mentiontext(&a, cand->path, cand->isdir);
+        Str was = span(now.data+m1.beg, now.data+m1.end);  // to check, as it is now
+        if (t.len && !mentionqueue(&s->medit, m1.beg, m1.end, was, t)) {
+            setnote(g, s, "that path is too long to be a mention", 1);
+        } else if (t.len) {
+            ImGui::ActivateItemByID(id);
+            // A file's text comes with the token, once; a folder's does
+            // not, since the token is a pointer the agent lists itself
+            // (mentionlate, as the next frame begins), and a session's id
+            // goes with the message (mentionrefs)
+            if (!cand->isdir && !cand->sid.len && cand->path.len<=(iz)MENTION_KEEP) {
+                keepset(&s->mattach, cand->path);
+            }
+        } else {
+            setnote(g, s, "that path cannot be a mention: it holds a quote or @", 1);
+        }
+        send = 0;  // a pick never sends, and never makes a new line
     }
     if (slash && ImGui::GetActiveID()==id) {
         drawslash(g, a, draftstr(s), s->skills, v2(r0.x, r0.y));
+    }
+    // The popup while a mention is on, even with no row to list: its line
+    // is then all there is to say (no files match, indexing, a folder it
+    // could not list), and the accept above still needs a candidate, so
+    // Enter sends as it does with no pick
+    if (m1.on && ImGui::GetActiveID()==id) {
+        drawmention(g, a, &msrc, v2(r0.x, r0.y), 0.7f*(r1.x - r0.x));
     }
 
     // The context menu
@@ -5809,7 +6184,8 @@ static void drawprompt(Gui *g)
         whytip(why.len ? why :
                hostcap(s->host, "files")
                ? Str("Attach a text file or an image (PNG, JPEG, GIF, WebP, BMP) "
-                     "to the next message")
+                     "to the next message; or type @ in the prompt to mention a "
+                     "file (its text is attached too)")
                : Str("Attach an image (PNG, JPEG, GIF, WebP, BMP) to the next message"));
     }
     if (s->hist) {
@@ -5840,6 +6216,9 @@ static void drawprompt(Gui *g)
         } else if (s->att && s->att->state!=ATT_IDLE) {
             setnote(g, s, "wait for the images being sent", 1);
         } else if (s->att && s->att->len) {
+            // A token deleted from the box takes its attachment with it, so
+            // the message sent and the box cannot disagree
+            mentionreconcile(g, s, p);
             draftdone(&s->dclock);
             attachsend(g, s, p);
             draftput(g, s, "");
@@ -5847,7 +6226,8 @@ static void drawprompt(Gui *g)
             draftdone(&s->dclock);  // the prompt clears the engine's draft
             guiprompt(g, p);
             draftput(g, s, "");
-            s->note = {};
+            s->note      = {};  // sent: no note, fixed or not
+            s->notefixed = 0;
         }
         if (!g->pickmodel && !g->pickshell && !g->openexport) {
             // To type the next, unless a popup of another window's

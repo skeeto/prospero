@@ -79,6 +79,12 @@ session keeps a copy in its own folder, so the agent can read the rest
 without asking. A binary file (one with a NUL byte) is refused. The
 transcript shows a folded "Attached:" line under the message.
 
+`@` in the prompt mentions a file or folder instead: a picked file's text is
+attached too, and the path stays in the message, so the agent can read the
+file or list the folder itself (see [Keyboard and mouse](help:keys)). A
+word after `@` lists other sessions too, by title: picked, the agent is
+given that session's id, to message it with `send_message`.
+
 A long command or subagent keeps the agent from reading what you
 send until it ends. Run in background, on its row, or Ctrl+B (also in
 the Session menu and as `/background`) lets it go on by itself while

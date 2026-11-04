@@ -2170,6 +2170,33 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
             v->msgs[k].collapsed = 1;
             v->msgs[k].label     = concat(&v->aux, "Attached: ", finish(&names));
         }
+        // The sessions it mentioned, as a folded note: their titles, and
+        // the ids the agent was given for them
+        Json *refs = jsonget(j, "sessions");
+        if (refs->child) {
+            Buf names(&scratch, 256);
+            Buf body(&scratch, 512);
+            for (Json *k = refs->child; k; k = k->next) {
+                Str sid   = jsonstr(jsonget(k, "sid"));
+                Str title = jsonstr(jsonget(k, "title"));
+                print(&names, names.len ? Str(", ") : Str(""));
+                print(&names, title.len ? title : sid);
+                print(&body, "- `");
+                print(&body, sid);
+                print(&body, "`");
+                if (title.len) {
+                    print(&body, ": ");
+                    print(&body, title);
+                }
+                print(&body, "\n");
+            }
+            print(&body, "\nThe agent has each one's id, which send_message takes.");
+            i32 k = addmsg(v, VIEW_NOTE, finish(&body));
+            v->msgs[k].seq       = r->seq;
+            v->msgs[k].fold      = 1;
+            v->msgs[k].collapsed = 1;
+            v->msgs[k].label     = concat(&v->aux, "Mentioned: ", finish(&names));
+        }
         if (skill.len) {
             iz  end  = find(text, "\n</skill>");
             Str body = end<0 ? text : takehead(text, end + 9);
