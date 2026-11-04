@@ -614,7 +614,7 @@ static Slice<MentionCand> mentionsessions(Arena *a, Gui *g, GuiSession *s, Str q
         r = push(a, r, c);
     }
     sort(r.data, r.len, mentionsessless, *a);
-    r.len = r.len<MENTION_SESS ? r.len : MENTION_SESS;
+    r.len = r.len<MENTION_SESS ? r.len : (iz)MENTION_SESS;
     return r;
 }
 
