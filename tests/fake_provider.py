@@ -1276,6 +1276,14 @@ def sc_compaction(model, n, req):
         yield from real_answer(model, req, "All files read.")
 
 
+def sc_compact_heed_now(model, n, req):
+    # Two turns of sc_compaction's reads, each compacting
+    if n % 9 < 8:
+        yield from real_tool(model, req, n, "read", {"path": f"f{n % 9}.txt"})
+    else:
+        yield from real_answer(model, req, "All files read.")
+
+
 def sc_compact_guard(model, n, req):
     yield from sc_compaction(model, n, req)
 

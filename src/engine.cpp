@@ -12434,7 +12434,10 @@ static void compacted(Session *s, Arena scratch, Partial *p)
     shellheed(s, scratch);
     wtheed(s, scratch);  // and a side chat in a worktree, where it works
     compactheed(s, scratch);  // and what it was told of its instructions
-    if (modeof(s)!=MODE_BUILD && cp.why!=CW_MANUAL) {
+    // Right after the summary, in every mode: the step that follows is
+    // made from these, never left to learn them a step late. A manual
+    // compaction's wait for the next turn's prompt
+    if (cp.why != CW_MANUAL) {
         deliver(s, scratch);
     }
 

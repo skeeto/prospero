@@ -6960,6 +6960,38 @@ def compact_manual(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+@scenario(conf=SMALL, bound=40, alone=True)
+def compact_heed_now(t):
+    """A summary at the threshold, mid-turn and in Build mode: the step
+    right after it already has the notices of what it may have left out,
+    rather than learning them a step late."""
+    t.host.mkdir(t.host.join(t.work, ".git"))
+    t.put("AGENTS.md", "Rule one.\n")
+    bigfiles(t, 8, 150)
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="read them")
+        t.check(ended(h, sid, 1)["why"] == "done", "the first reads")
+        t.put("AGENTS.md", "Rule two, longer.\n")
+        t.host.touch(t.host.join(t.work, "AGENTS.md"), time.time() + 10)
+        h.send("prompt", sid=sid, text="read them")
+        t.check(ended(h, sid, 2)["why"] == "done", "the second reads")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+    reqs = [chat(x) for x in t.requests()]
+    # Where each summary begins: a checkpoint unlike the request before's
+    starts = [k for k in range(1, len(reqs)) if checkpointed(reqs[k]) and
+              (not checkpointed(reqs[k-1]) or reqs[k][1] != reqs[k-1][1])]
+    t.check(len(starts) >= 2, f"summarized in both turns: {starts}")
+    first = reqs[starts[-1]]
+    told = [str(m.get("content")) for m in first[2:] if m.get("role") == "user" and
+            str(m.get("content")).startswith("Your conversation was summarized")]
+    t.check(told and "Rule two, longer." in told[0],
+            f"told at once: {[str(m.get('content'))[:60] for m in first[2:]]}")
+
+
 @scenario(conf=BIG, bound=60, alone=True)
 def compact_heed(t):
     """A summary may leave out the notices since the system prompt, so
