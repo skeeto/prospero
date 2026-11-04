@@ -110,11 +110,15 @@ static i32 panenamed(Str name)
 
 // Standard's splits, each a share of the node split: the right column's
 // of the width, the left column's of the rest, the prompt's of the
-// center's height, and the lower node's of each column. At the first
-// window's 1700 pixels wide, the side columns are 425 and about 280
-// wide; at 1280, 320 and about 210.
-static f32 const LAYOUT_RIGHT  = 0.25f;
-static f32 const LAYOUT_LEFT   = 0.22f;
+// center's height, and the lower node's of each column. The left
+// column is a third of the window, room for sessions' titles and
+// folders, up to LAYOUT_LEFTMAX points (at the GUI's scale), past which
+// a wider window widens the transcript: at the first window's 1700
+// points wide, the side columns are 425 and 430 wide; at 1280, 320 and
+// about 420.
+static f32 const LAYOUT_RIGHT   = 0.25f;
+static f32 const LAYOUT_LEFT    = 0.44f;
+static f32 const LAYOUT_LEFTMAX = 430;
 static f32 const LAYOUT_PROMPT = 0.28f;
 static f32 const LAYOUT_PLAN   = 0.5f;
 static f32 const LAYOUT_TODO   = 0.25f;
@@ -159,6 +163,8 @@ struct DockPart {
     i32 front;             // a leaf's pane in front, -1 for its first
     b32 central;           // a leaf's: the dock space's central node
     b32 bare;              // a leaf's: its tab bar hidden
+    f32 most;              // a split's first child's most width, in points
+                           // at scale 1, 0 for none (presets only)
 };
 
 struct DockRect {
@@ -194,6 +200,14 @@ static DockPart *dockpart(DockLayout *l, i32 kind)
     p->kind  = kind;
     p->front = -1;
     return p;
+}
+
+// A split's share of a node size wide, at most a width of most points at
+// scale sc, if most.
+static f32 dockcapped(f32 share, f32 most, f32 size, f32 sc)
+{
+    f32 cap = most>0 && size>0 ? most*sc/size : 1;
+    return share<cap ? share : cap;
 }
 
 static void docksplit(DockLayout *l, i32 kind, f64 share)
@@ -477,6 +491,7 @@ static DockLayout dockpreset(i32 preset)
         dockline(&l, "Shown", "Sessions,Transcript,Prompt,Todo,Plan,Jobs,Log");
         docksplit(&l, DOCK_X, 1 - LAYOUT_RIGHT);
         docksplit(&l, DOCK_X, LAYOUT_LEFT);
+        l.parts[l.nparts-1].most = LAYOUT_LEFTMAX;
         docksplit(&l, DOCK_Y, 1 - LAYOUT_TODO);
         dockline(&l, "Tabs", "Sessions");
         dockline(&l, "Tabs", "Todo");
@@ -491,6 +506,7 @@ static DockLayout dockpreset(i32 preset)
     case PRESET_COMPACT:
         dockline(&l, "Shown", "Sessions,Transcript,Prompt,Todo,Plan,Jobs");
         docksplit(&l, DOCK_X, LAYOUT_LEFT*(1 - LAYOUT_RIGHT));  // as Standard's
+        l.parts[l.nparts-1].most = LAYOUT_LEFTMAX;
         docksplit(&l, DOCK_Y, 1 - LAYOUT_TODO);
         dockline(&l, "Tabs", "Sessions");
         dockline(&l, "Tabs", "*Todo,Jobs,Log");

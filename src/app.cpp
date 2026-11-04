@@ -1677,6 +1677,15 @@ struct Gui {
     b32                retryshown;   // the strip counted down to a retry
     b32                etashown;     // and to the prompt's end
     b32                prateshown;   // and gave its rate
+    i32                stripform;    // the readouts' form last drawn: STRIP_*
+    b32                striprate;    // and the prompt's rate among them
+    b32                stripover;    // a readout ran past the pane's edge
+    Str                stripwhat;    // the first that did, and the room
+    b32                stripcramped; // a form other than STRIP_FULL was drawn
+    b32                stripseen;    // the readouts' line, last drawn: below
+    b32                stripbelow;   // the picks or not, with that room for
+    f32                striproom;    // them there
+    b32                stripbob;     // it changed lines in the same room
     b32                bannershown;  // the read-only banner was drawn
     b32                roclock;      // a read-only view's turn had a clock
     b32                queuedshown;  // the strip showed the line's position
@@ -12452,6 +12461,7 @@ enum : i32 {
     CHK_AMBER,
     CHK_RETRYSHOWN,
     CHK_ETASHOWN,
+    CHK_STRIPFIT,     // the status line gave way, brief or below, within the pane
     CHK_CLOCKSHOWN,
     CHK_RAILFOLD,
     CHK_RAILOPEN,
@@ -12760,7 +12770,8 @@ static Str chknames[] = {
     "a closed session opened, its log replayed",
     "a session held elsewhere opened read-only, with its banner",
     "amber after 15 s without data", "a retry's countdown shown",
-    "the prompt's time left and rate shown", "a message's time shown under the mouse",
+    "the prompt's time left and rate shown",
+    "a cramped status line gave way within the pane", "a message's time shown under the mouse",
     "the fold rail folded its message, its header in view",
     "the fold rail opened the folded message again",
     "configuration diagnostics listed with file and line",
@@ -13020,6 +13031,7 @@ enum : i32 {
     W_OPENED,     // the session shown is open, its replay applied
     W_AMBER,      // the strip went amber
     W_ETA,        // the strip showed the prompt's ETA
+    W_STRIPFULL,  // in full, the rate too, on the picks' line
     W_BACKOFF,    // the session shown backs off to retry
     W_GONE,       // the engine stopped
     W_TASKS,      // the session shown waits for two subagents
@@ -13085,7 +13097,7 @@ enum : i32 {
 static Str waitnames[] = {
     "", "the engine", "the session", "the turn to end", "an ask",
     "a running tool", "the configuration", "the settings edit", "quitting",
-    "every turn to end", "the session to open", "amber", "an ETA", "a retry",
+    "every turn to end", "the session to open", "amber", "an ETA", "the status line in full", "a retry",
     "the engine to stop", "two subagents at work", "a subagent's ask",
     "a todo item in progress", "a reply", "the jobs", "a rewind",
     "the conversation's rewind", "a compaction", "the endpoint's line", "streaming", "the window to go",
@@ -13679,11 +13691,18 @@ static DriveOp m3ops[] = {
     {OP_WAIT, W_BACKOFF, 0, 0, 15000, ""},
     {OP_CHECK, CHK_RETRYSHOWN, 0, 0, 0, ""},
     {OP_WAIT, W_IDLE, 0, 0, 20000, ""},
-    // A slow prompt's progress, with the time left and its rate, in a
-    // window wide enough for both (the rate gives way to the time left)
-    {OP_MAXIMIZE, 0, 1, 0, 1500, ""},
+    // A slow prompt's progress, with the time left: in this window too
+    // narrow for the status line in full beside the picks, which gives
+    // way, brief or on a line below; then maximized, in full with its
+    // rate, on whichever line
     {OP_PROMPT, 0, 0, 0, 100, "Read a long prompt."},
     {OP_WAIT, W_ETA, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_STRIPFIT, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "1-etacramped"},
+    {OP_WAIT, W_IDLE, 0, 0, 20000, ""},
+    {OP_MAXIMIZE, 0, 1, 0, 1500, ""},
+    {OP_PROMPT, 0, 0, 0, 100, "Read a long prompt."},
+    {OP_WAIT, W_STRIPFULL, 0, 0, 10000, ""},
     {OP_CHECK, CHK_ETASHOWN, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "1-eta"},
     {OP_WAIT, W_IDLE, 0, 0, 20000, ""},
@@ -18035,7 +18054,8 @@ static b32 docktreecheck(Gui *g)
         return 0;
     }
     b32 ok = dockshare(root, ImGuiAxis_X, 1, LAYOUT_RIGHT) &&
-             dockshare(rest, ImGuiAxis_X, 0, LAYOUT_LEFT) &&
+             dockshare(rest, ImGuiAxis_X, 0, dockcapped(LAYOUT_LEFT, LAYOUT_LEFTMAX,
+                                                        rest->Size.x, g->scale)) &&
              dockshare(center, ImGuiAxis_Y, 1, LAYOUT_PROMPT) &&
              dockshare(right, ImGuiAxis_Y, 1, LAYOUT_PLAN) &&
              dockshare(left, ImGuiAxis_Y, 1, LAYOUT_TODO);
@@ -18121,7 +18141,8 @@ static b32 compactcheck(Gui *g)
         guilog(g, "drive: the dock space is not split in two columns");
         return 0;
     }
-    if (!dockshare(root, ImGuiAxis_X, 0, LAYOUT_LEFT*(1-LAYOUT_RIGHT)) ||
+    if (!dockshare(root, ImGuiAxis_X, 0, dockcapped(LAYOUT_LEFT*(1-LAYOUT_RIGHT),
+                                                    LAYOUT_LEFTMAX, root->Size.x, g->scale)) ||
         !dockshare(left, ImGuiAxis_Y, 1, LAYOUT_TODO) ||
         !dockshare(center, ImGuiAxis_Y, 1, LAYOUT_PROMPT)) {
         guilog(g, "drive: the compact layout's splits are not in their shares");
@@ -18635,6 +18656,9 @@ static b32 drivewaitdone(Gui *g)
         return g->ambershown;
     case W_ETA:
         return g->etashown;
+    case W_STRIPFULL:
+        return (g->stripform==STRIP_FULL || g->stripform==STRIP_BELOW) &&
+               g->striprate && v->petaat;
     case W_BACKOFF:
         return g->sess && v->state==LIVE_BACKOFF;
     case W_GONE:
@@ -19687,7 +19711,18 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_RETRYSHOWN:
         return g->retryshown;
     case CHK_ETASHOWN:
-        return g->etashown && g->prateshown;
+        return g->etashown && g->striprate &&
+               (g->stripform==STRIP_FULL || g->stripform==STRIP_BELOW);
+    case CHK_STRIPFIT:
+        if (g->stripover) {
+            Arena a = g->frame;
+            guilog(g, concat(&a, "drive: a status readout ran past the Prompt "
+                                 "pane's edge: ", g->stripwhat));
+        }
+        if (g->stripbob) {
+            guilog(g, "drive: the status readouts changed lines in the same room");
+        }
+        return g->stripcramped && !g->stripover && !g->stripbob && g->etashown;
     case CHK_CLOCKSHOWN:
         return g->clockshown;
     case CHK_RAILFOLD:

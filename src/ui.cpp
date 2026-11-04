@@ -4941,6 +4941,150 @@ static void backgroundkey(Gui *g)
 
 // What the session is doing, how fast, and how long since the model sent
 // anything: one line, whose clocks ask for frames only while shown.
+enum : i32 {
+    STRIP_FULL,     // on the picks' line, in full
+    STRIP_BRIEF,    // on the picks' line, brief
+    STRIP_BELOW,    // on a line of their own, in full
+    STRIP_BELOWBRIEF,
+};
+
+// One readout of the Prompt's status line, after the picks: its text,
+// or a progress bar, each in a full form and a brief one for a cramped
+// line (stripdraw).
+struct StripItem {
+    Str  text;    // the full form
+    Str  brief;   // the brief form, null for the full form's
+    b32  drop;    // left out of the brief form altogether
+    u32  col;     // its text color, 0 for the disabled color
+    f32  bar;     // a progress bar's fraction, else negative
+    f32  barw;    // and its widths, full and brief
+    f32  briefw;
+    Str  tip;     // its tooltip, null for none
+    b32 *shown;   // set once drawn
+};
+
+struct Strip {
+    StripItem items[16];
+    i32       n;
+};
+
+static StripItem *stripadd(Strip *st, Str text, Str brief = {}, u32 col = 0)
+{
+    if (st->n == countof(st->items)) {
+        return 0;
+    }
+    StripItem *it = st->items + st->n++;
+    *it = {};
+    it->text  = text;
+    it->brief = brief;
+    it->col   = col;
+    it->bar   = -1;
+    return it;
+}
+
+// The readouts' width, in a form (brief or not), spaced as SameLine
+// spaces them.
+static f32 stripwidth(Strip *st, b32 brief)
+{
+    f32 gap = ImGui::GetStyle().ItemSpacing.x;
+    f32 w   = 0;
+    i32 n   = 0;
+    for (i32 i = 0; i < st->n; i++) {
+        StripItem *it = st->items + i;
+        if (brief && it->drop) {
+            continue;
+        }
+        Str t = brief && it->brief.data ? it->brief : it->text;
+        w += n++ ? gap : 0;
+        w += it->bar>=0 ? (brief ? it->briefw : it->barw)
+                        : ImGui::CalcTextSize(t.cdata, t.cdata+t.len).x;
+    }
+    return w;
+}
+
+// The readouts after the picks, on the picks' line, or on a line of their
+// own below where that line's room is short of a reference: the brief
+// form of a prompt being read (stripref). The room depends only on the
+// pane's width and the picks, a long model name's widening its pick, never
+// on what the readouts say, so the line they take, and the compose box's
+// height with it, stays put as they change. On whichever line, they are
+// in full if they fit, else brief.
+static f32 stripref(f32 sc)
+{
+    Strip st = {};
+    stripadd(&st, "streaming");
+    stripadd(&st, "10 min 59 s");
+    StripItem *it = stripadd(&st, "prompt 99%");
+    it->bar    = 1;
+    it->briefw = 100*sc;
+    stripadd(&st, "4 min 59 s left");
+    return stripwidth(&st, 1);
+}
+
+static void stripdraw(Gui *g, Arena a, Strip *st, b32 picks)
+{
+    f32 room  = ImGui::GetContentRegionAvail().x;
+    b32 below = picks && room<stripref(g->scale);
+    // The line taken changes only with the room
+    g->stripbob    |= g->stripseen && below!=g->stripbelow && room==g->striproom;
+    g->stripseen    = 1;
+    g->stripbelow   = below;
+    g->striproom    = room;
+    if (below) {
+        ImGui::NewLine();
+        room = ImGui::GetContentRegionAvail().x;
+    }
+    b32 brief = stripwidth(st, 0) > room;
+    g->stripform     = below ? (brief ? STRIP_BELOWBRIEF : STRIP_BELOW)
+                             : (brief ? STRIP_BRIEF : STRIP_FULL);
+    g->stripcramped |= g->stripform != STRIP_FULL;
+    g->striprate     = 0;
+    ImGui::AlignTextToFramePadding();
+    f32 right = ImGui::GetCursorScreenPos().x + room;
+    i32 n = 0;
+    for (i32 i = 0; i < st->n; i++) {
+        StripItem *it = st->items + i;
+        if (brief && it->drop) {
+            continue;
+        }
+        if (n++) {
+            ImGui::SameLine();
+        }
+        Str t = brief && it->brief.data ? it->brief : it->text;
+        if (it->bar >= 0) {
+            ImGui::ProgressBar(it->bar, v2(brief ? it->briefw : it->barw, 0),
+                               cstr0(&a, t));
+        } else {
+            ImGui::PushStyleColor(ImGuiCol_Text, it->col ? it->col :
+                                  ImGui::GetColorU32(ImGuiCol_TextDisabled));
+            ImGui::TextUnformatted(t.cdata, t.cdata+t.len);
+            ImGui::PopStyleColor();
+        }
+        if (it->tip.len) {
+            itemtip("%s", cstr0(&a, it->tip));
+        }
+        if (it->shown) {
+            *it->shown = 1;
+        }
+        g->striprate |= it->shown == &g->prateshown;
+        // Past the edge where the room was enough for the reference,
+        // not in a pane too narrow for any (as briefly while docking)
+        if (!g->stripover && ImGui::GetItemRectMax().x>right+1 &&
+                room>=stripref(g->scale)) {
+            Buf b(&a, 128 + t.len);
+            print(&b, t);
+            print(&b, below ? Str(" (below, ") : Str(" (beside, "));
+            print(&b, brief ? Str("brief, room ") : Str("full, room "));
+            print(&b, (i64)room);
+            print(&b, ", ends at ");
+            print(&b, (i64)(ImGui::GetItemRectMax().x - right + room));
+            print(&b, ")");
+            g->stripover = 1;
+            g->stripwhat = clone(&g->perm, finish(&b));
+        }
+    }
+}
+
 static void drawstrip(Gui *g)
 {
     View *v  = g->view;
@@ -4955,19 +5099,18 @@ static void drawstrip(Gui *g)
     b32   req   = v->state==LIVE_DISCOVER || v->state==LIVE_WAITING ||
                   v->state==LIVE_STREAMING || v->state==LIVE_ERROR ||
                   v->state==LIVE_COMPACTING;
-    if (g->sess->view) {
+    b32   picks = g->sess->view != 0;
+    if (picks) {
         drawsesspicks(g, a, g->sess, v);
     }
-    ImGui::AlignTextToFramePadding();
-    ImGui::PushStyleColor(ImGuiCol_Text, livecolor(g->pal, v->state));
-    ImGui::TextUnformatted(cstr0(&a, livelabel(v, v->state)));
-    ImGui::PopStyleColor();
+    Strip st = {};
+    stripadd(&st, livelabel(v, v->state), {}, livecolor(g->pal, v->state));
 
     if (v->busy && g->sess->readonly) {
         // Its records go to the other process: nothing here would see
         // the turn end, so no clock counts on forever
-        ImGui::SameLine();
-        ImGui::TextDisabled("in another process, as of its log when opened");
+        stripadd(&st, "in another process, as of its log when opened",
+                 "in another process");
     } else if (v->busy && v->turnts) {
         // The turn's clock, once a second
         g->roclock |= g->sess->readonly;
@@ -4976,96 +5119,96 @@ static void drawstrip(Gui *g)
         schedat(&g->sched, now + (1000 - el%1000)*1000 + 1000, DUE_CLOCK);
         Buf b(&a, 32);
         printsecs(&b, el/1000);
-        ImGui::SameLine();
-        ImGui::TextUnformatted(cstr0(&a, finish(&b)));
+        stripadd(&st, finish(&b), {}, ImGui::GetColorU32(ImGuiCol_Text));
     }
     if (v->busy && v->thinking==THINK_HIDE && !v->showthink && v->stream>=0 &&
             v->streamkind==VIEW_THINK) {
         // Why the transcript shows nothing while the model thinks
-        g->thinkhidshown = 1;
-        ImGui::SameLine();
-        ImGui::TextDisabled("thinking (reasoning hidden)");
+        StripItem *it = stripadd(&st, "thinking (reasoning hidden)", "thinking");
+        if (it) {
+            it->shown = &g->thinkhidshown;
+        }
     }
     if (v->state == LIVE_QUEUED) {
         // Its place in the endpoint's line, which live records update
-        g->queuedshown = 1;
         Buf b(&a, 96);
+        Str brief = "waiting";
         print(&b, "waiting for the endpoint");
         if (v->queuepos) {
+            i64 len = v->queuelen>v->queuepos ? v->queuelen : v->queuepos;
             print(&b, ": ");
-            print(&b, (i64)v->queuepos);
-            print(&b, " of ");
-            print(&b, (i64)(v->queuelen>v->queuepos ? v->queuelen : v->queuepos));
-            print(&b, " in line");
+            Buf c(&a, 48);
+            print(&c, (i64)v->queuepos);
+            print(&c, " of ");
+            print(&c, len);
+            print(&c, " in line");
+            brief = finish(&c);
+            print(&b, brief);
         }
-        ImGui::SameLine();
-        ImGui::TextDisabled("%s", cstr0(&a, finish(&b)));
+        StripItem *it = stripadd(&st, finish(&b), brief);
+        if (it) {
+            it->shown = &g->queuedshown;
+        }
     } else if (v->state == LIVE_TASK) {
         g->taskshown = v->tasks;
         Buf b(&a, 64);
         print(&b, (i64)v->tasks);
-        print(&b, v->tasks==1 ? Str(" subagent at work") : Str(" subagents at work"));
-        ImGui::SameLine();
-        ImGui::TextDisabled("%s", cstr0(&a, finish(&b)));
+        print(&b, v->tasks==1 ? Str(" subagent") : Str(" subagents"));
+        Str brief = finish(&b);
+        stripadd(&st, concat(&a, brief, " at work"), brief);
     } else if (v->state == LIVE_COMPACTING) {
-        g->compactingshown = 1;
-        ImGui::SameLine();
-        ImGui::TextDisabled("summarizing the conversation to make room");
+        StripItem *it = stripadd(&st, "summarizing the conversation to make room",
+                                 "summarizing");
+        if (it) {
+            it->shown = &g->compactingshown;
+        }
     }
     if (req && v->tps > 0) {
         Buf b(&a, 32);
         printfloat(&b, v->tps, 1);
         print(&b, " tok/s");
-        ImGui::SameLine();
-        ImGui::TextDisabled("%s", cstr0(&a, finish(&b)));
+        stripadd(&st, finish(&b));
     }
     if (req && v->ptotal>0 && v->pdone<v->ptotal) {
-        ImGui::SameLine();
         f32 frac = (f32)v->pdone / (f32)v->ptotal;
         Buf b(&a, 48);
-        print(&b, "reading the prompt ");
         print(&b, (i64)(frac*100));
         putbyte(&b, '%');
-        ImGui::ProgressBar(frac, v2(160*sc, 0), cstr0(&a, finish(&b)));
+        Str pct = finish(&b);
+        StripItem *it = stripadd(&st, concat(&a, "reading the prompt ", pct),
+                                 concat(&a, "prompt ", pct));
+        if (it) {
+            it->bar    = frac;
+            it->barw   = 160*sc;
+            it->briefw = 100*sc;
+        }
+        if (v->ptps > 0) {
+            // Its rate, as the output's, tokens computed with the cache's
+            // left out: whole tokens, as it runs to thousands; the first
+            // to go from a cramped line
+            Buf r(&a, 32);
+            printgrouped(&r, (i64)(v->ptps + 0.5));
+            print(&r, " tok/s");
+            it = stripadd(&st, finish(&r));
+            if (it) {
+                it->drop  = 1;
+                it->shown = &g->prateshown;
+            }
+        }
         // The engine's estimate, counted down between its records, and
         // left out near the end, where it matters little
         i64 left = v->petaat ? v->petaat - nowms : 0;
-        Str eta  = {};
         if (left >= ETA_MIN) {
             schedat(&g->sched, now + (left%1000)*1000 + 1000, DUE_CLOCK);
             i64 secs = (left + 999)/1000;
             Buf e(&a, 48);
-            print(&e, "about ");
             printsecs(&e, secs<600 ? secs : (secs + 30)/60*60);
             print(&e, " left");
-            eta = finish(&e);
-        }
-        // Its rate, as the output's, tokens computed with the cache's
-        // left out: whole tokens, as it runs to thousands, and only where
-        // the time left still fits after it, which matters more
-        if (v->ptps > 0) {
-            Buf r(&a, 32);
-            printgrouped(&r, (i64)(v->ptps + 0.5));
-            print(&r, " tok/s");
-            Str   rate = finish(&r);
-            // The bar left the cursor on the next line, whose start plus
-            // its width is the right edge; the bar's end plus a spacing
-            // (rightof) is where the rate would start
-            f32    gap  = ImGui::GetStyle().ItemSpacing.x;
-            ImVec2 rs   = ImGui::CalcTextSize(rate.cdata, rate.cdata+rate.len);
-            ImVec2 es   = ImGui::CalcTextSize(eta.cdata, eta.cdata+eta.len);
-            f32    edge = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x;
-            f32    room = edge - rightof();
-            if (rs.x + (eta.len ? gap + es.x : 0) <= room) {
-                g->prateshown = 1;
-                ImGui::SameLine();
-                ImGui::TextDisabled("%s", cstr0(&a, rate));
+            Str brief = finish(&e);
+            it = stripadd(&st, concat(&a, "about ", brief), brief);
+            if (it) {
+                it->shown = &g->etashown;
             }
-        }
-        if (eta.len) {
-            g->etashown = 1;
-            ImGui::SameLine();
-            ImGui::TextDisabled("%s", cstr0(&a, eta));
         }
     }
     if (req && v->lastdata) {
@@ -5082,10 +5225,7 @@ static void drawstrip(Gui *g)
                 print(&b, ", giving up in ");
                 printsecs(&b, (v->watchat - nowms + 999)/1000);
             }
-            ImGui::SameLine();
-            ImGui::PushStyleColor(ImGuiCol_Text, red ? g->pal->bad : g->pal->amber);
-            ImGui::TextUnformatted(cstr0(&a, finish(&b)));
-            ImGui::PopStyleColor();
+            stripadd(&st, finish(&b), {}, red ? g->pal->bad : g->pal->amber);
         } else {
             schedat(&g->sched, now + (AMBER_MS - idle)*1000 + 1000, DUE_CLOCK);
         }
@@ -5102,16 +5242,15 @@ static void drawstrip(Gui *g)
         Buf b(&a, 128 + v->retrymodel.len);
         print(&b, v->retryslow ? Str("slow retry in ") : Str("retrying in "));
         print(&b, left);
+        Str brief = finish(&b);
         b32 other = v->retrymodel.len && v->retrymodel!=v->model;
+        Str full  = brief;
         if (other) {
-            print(&b, v->fallback ? Str(" on fallback ") : Str(" with "));
-            print(&b, v->retrymodel);
+            full = concat(&a, brief, v->fallback ? Str(" on fallback ") : Str(" with "));
+            full = concat(&a, full, v->retrymodel);
             g->fallbackshown |= v->fallback > 0;
         }
-        ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->amber);
-        ImGui::TextUnformatted(cstr0(&a, finish(&b)));
-        ImGui::PopStyleColor();
+        stripadd(&st, full, brief, g->pal->amber);
     }
     if (v->state == LIVE_RELAY) {
         // A thin host's session, with no computer to make its calls
@@ -5123,13 +5262,14 @@ static void drawstrip(Gui *g)
             print(&b, ", for up to ");
             printsecs(&b, (v->relayuntil - nowms + 59999)/60000*60);
         }
-        ImGui::SameLine();
-        ImGui::TextDisabled("%s", cstr0(&a, finish(&b)));
-        itemtip("Its host has no endpoint of its own: a computer "
-                              "connected to it makes its model calls, with its "
-                              "own endpoint and key. It resumes once one that "
-                              "offers this model connects, or the turn ends "
-                              "after the endpoint's slow_retry_budget.");
+        StripItem *it = stripadd(&st, finish(&b), "until a computer connects");
+        if (it) {
+            it->tip = "Its host has no endpoint of its own: a computer "
+                      "connected to it makes its model calls, with its "
+                      "own endpoint and key. It resumes once one that "
+                      "offers this model connects, or the turn ends "
+                      "after the endpoint's slow_retry_budget.";
+        }
     } else if (req && v->relaylen) {
         // The computer making its calls, and its place in that line
         Str machine = Str(v->relay, v->relaylen);
@@ -5138,7 +5278,8 @@ static void drawstrip(Gui *g)
         }
         b32 here = machine == g->machine;
         Buf b(&a, 160);
-        print(&b, here ? Str("via this computer") : concat(&a, "via ", machine));
+        Str via = here ? Str("via this computer") : concat(&a, "via ", machine);
+        print(&b, via);
         if (v->queuepos) {
             print(&b, ", waiting for the endpoint: ");
             print(&b, (i64)v->queuepos);
@@ -5146,18 +5287,18 @@ static void drawstrip(Gui *g)
             print(&b, (i64)(v->queuelen>v->queuepos ? v->queuelen : v->queuepos));
             print(&b, " in line");
         }
-        ImGui::SameLine();
-        ImGui::TextDisabled("%s", cstr0(&a, finish(&b)));
-        itemtip("Its host has no endpoint of its own: %s makes its "
-                              "model calls, with its own endpoint and key.",
-                              here ? "this computer" : cstr0(&a, machine));
+        StripItem *it = stripadd(&st, finish(&b), via);
+        if (it) {
+            it->tip = concat(&a, concat(&a, "Its host has no endpoint of its own: ",
+                                        here ? Str("this computer") : machine),
+                             " makes its model calls, with its own endpoint and key.");
+        }
     }
     if (v->asks) {
-        ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->amber);
-        ImGui::TextUnformatted("waiting for your answer above");
-        ImGui::PopStyleColor();
+        stripadd(&st, "waiting for your answer above", "waiting for your answer",
+                 g->pal->amber);
     }
+    stripdraw(g, a, &st, picks);
 }
 
 // The compose box: one draft per session (app.cpp), with history, slash
@@ -12397,7 +12538,8 @@ static void placefirst(Gui *g, ImGuiID id, ImVec2 pos, ImVec2 size)
 // the home of its panes, the front one of those shown selected (before
 // DockBuilderFinish, which makes the tab bars from it). A split hands
 // the central node to its side opposite the direction split toward.
-static void applypart(DockLayout *l, i32 *i, ImGuiID id, u32 shown, ImGuiID *center)
+static void applypart(DockLayout *l, i32 *i, ImGuiID id, u32 shown, ImGuiID *center,
+                      f32 sc)
 {
     i32       at = (*i)++;
     DockPart *p  = l->parts + at;
@@ -12418,12 +12560,14 @@ static void applypart(DockLayout *l, i32 *i, ImGuiID id, u32 shown, ImGuiID *cen
     b32      lead = dockcentered(l, at+1);  // the center is in the first child
     ImGuiDir dir  = p->kind==DOCK_X ? (lead ? ImGuiDir_Right : ImGuiDir_Left)
                                     : (lead ? ImGuiDir_Down  : ImGuiDir_Up);
-    ImGui::DockBuilderSplitNode(id, dir, lead ? 1-p->share : p->share, 0, 0);
     ImGuiDockNode *n      = ImGui::DockBuilderGetNode(id);
+    f32            share  = p->kind==DOCK_X ? dockcapped(p->share, p->most, n->Size.x, sc)
+                                            : p->share;
+    ImGui::DockBuilderSplitNode(id, dir, lead ? 1-share : share, 0, 0);
     ImGuiID        first  = n->ChildNodes[0]->ID;  // left or top
     ImGuiID        second = n->ChildNodes[1]->ID;
-    applypart(l, i, first, shown, center);
-    applypart(l, i, second, shown, center);
+    applypart(l, i, first, shown, center, sc);
+    applypart(l, i, second, shown, center, sc);
 }
 
 // Windows other than panes, which stay in the dock space if docked
@@ -12456,7 +12600,7 @@ static void applylayout(Gui *g, ImGuiID id, ImVec2 pos, ImVec2 size)
     }
     i32     at     = 0;
     ImGuiID center = id;
-    applypart(l, &at, id, shown, &center);
+    applypart(l, &at, id, shown, &center, g->scale);
     for (i32 i = 0; i < countof(dockguests); i++) {
         if (guests[i]) {
             ImGui::DockBuilderDockWindow(dockguests[i], center);

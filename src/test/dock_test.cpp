@@ -42,7 +42,7 @@ static void test_dock(Test *t)
     expect(t, "dock.standard", dockstr(&a, &std),
            "Shown=Sessions,Transcript,Prompt,Todo,Plan,Jobs,Log\n"
            "Split=X,0.75\n"
-           "Split=X,0.22\n"
+           "Split=X,0.44\n"
            "Split=Y,0.75\n"
            "Tabs=Sessions\n"
            "Tabs=Todo\n"
@@ -57,7 +57,7 @@ static void test_dock(Test *t)
     DockLayout compact = dockpreset(PRESET_COMPACT);
     expect(t, "dock.compact", dockstr(&a, &compact),
            "Shown=Sessions,Transcript,Prompt,Todo,Plan,Jobs\n"
-           "Split=X,0.165\n"
+           "Split=X,0.33\n"
            "Split=Y,0.75\n"
            "Tabs=Sessions\n"
            "Tabs=*Todo,Jobs,Log\n"
