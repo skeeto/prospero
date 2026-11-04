@@ -17,8 +17,10 @@ told of the change at its next step. Subagents running then follow.
 ## While planning
 
 - The file tools may write only the session's plan file, `plan.md` in
-  the session's folder in the state directory, which they do without
-  asking.
+  the session's folder in the state directory, and scratch files in
+  the session's own temporary folder (notes, test inputs), both
+  without asking. Your project's files and the system's shared
+  temporary folders stay unchanged.
 - The agent is told to run only commands that change nothing.
 - The desktop tool may only look.
 - Subagents plan too.

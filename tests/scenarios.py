@@ -9306,6 +9306,35 @@ def plan_reopen(t):
     t.check((t.host.read(ask.get("path", "")) or "").startswith("# Plan"), "the plan stays")
 
 
+@scenario(bound=15, posix=True)
+def plan_scratch(t):
+    """Plan mode lets the file tools write the session's scratch files, as
+    its rules say, but not through a link there that leads into the
+    working directory, nor in the working directory itself."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1,
+                     plan=1)["sid"]
+        scratch = logged(t, sid)[0]["scratch"]
+        os.makedirs(scratch, exist_ok=True)
+        os.symlink(t.work, os.path.join(scratch, "link"))
+        h.send("prompt", sid=sid, text="plan it")
+        ended(h, sid, 1)
+        ends = h.all("tool.end", sid)
+        st = [e["status"] for e in ends]
+        t.check(st == ["ok", "denied", "denied"], f"statuses {st}: {ends}")
+        t.check(t.host.read(os.path.join(scratch, "notes.txt")) == "notes\n", "the notes")
+        t.check(t.file("escape.txt") is None and t.file("inside.txt") is None,
+                "nothing in the working directory")
+        t.check("your scratch files" in ends[2].get("text", ""), f"why: {ends[2]}")
+        told = [str(m.get("content")) for m in t.requests()[0]["body"]["messages"]
+                if str(m.get("content", "")).startswith("Plan mode is on")]
+        t.check(told and scratch in told[0], f"the rules name it: {told}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 @scenario(bound=15)
 def plan_mode(t):
     """The mode command: on and off again before a prompt, which tells the

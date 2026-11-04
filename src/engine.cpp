@@ -4118,12 +4118,18 @@ enum : iz {
 // What plan mode allows, for the agent.
 static Str planrules(Session *s, Arena *a)
 {
-    Buf b(a, 1024 + s->planfile.len);
+    Str dir = s->scratch.len ? normpath(a, s->cwd, s->scratch, s->te.windows) : Str{};
+    Buf b(a, 1024 + s->planfile.len + dir.len);
     if (s->depth) {
         print(&b, "Plan mode is on: the agent you work for is planning, so "
                   "you must not change anything. Do not write or edit "
-                  "files, and run only commands that change nothing. "
-                  "Report what you found.");
+                  "files");
+        if (dir.len) {
+            print(&b, " but scratch files in ");
+            print(&b, dir);
+        }
+        print(&b, ", and run only commands that change nothing. Report what "
+                  "you found.");
         return finish(&b);
     }
     print(&b, "Plan mode is on: explore and plan, but change nothing yet. "
@@ -4132,7 +4138,11 @@ static Str planrules(Session *s, Arena *a)
               "write into the working directory). Write and edit work only "
               "on the plan file, ");
     print(&b, s->planfile);
-    print(&b, ", which stays after plan mode ends. Write your plan there in "
+    if (dir.len) {
+        print(&b, ", and on scratch files (notes, test inputs) in ");
+        print(&b, dir);
+    }
+    print(&b, ". The plan file stays after plan mode ends. Write your plan there in "
               "Markdown: the goal, the changes file by file, and how to "
               "verify them. Once it is complete, call exit_plan_mode to ask "
               "the user to approve it. ");
@@ -4358,17 +4368,42 @@ static b32 bypassrefuses(Session *s, Arena scratch, Str path)
            (real.data && want.data && within(real, want, win));
 }
 
+// Whether plan mode lets the file tools change the file at a normalized
+// absolute path: the plan file, or one in the session's scratch
+// directory, which is its own (its subagents share it), not the user's,
+// for notes and test inputs while it explores. The real path must be
+// in the directory's too, so a link there cannot lead out of it. The
+// system's temporary directories stay closed, shared as they are.
+static b32 planallows(Session *s, Arena scratch, Str path)
+{
+    if (isplanfile(s, path)) {
+        return 1;
+    } else if (!s->scratch.len) {
+        return 0;
+    }
+    Os *os  = s->e->os;
+    b32 win = s->guard.win;
+    Str dir = normpath(&scratch, s->guard.cwd, s->scratch, win);
+    if (!within(dir, path, win) || path.len==dir.len) {
+        return 0;
+    }
+    Str rdir  = realpathof(os, &scratch, dir, win);
+    Str rpath = realpathof(os, &scratch, path, win);
+    return rdir.data && rpath.data && within(rdir, rpath, win);
+}
+
 // Why plan mode refuses a change to the file at path.
 static Str planrefusal(Session *s, Arena *a, Str path)
 {
     Buf b(a, 512 + path.len + s->planfile.len);
     if (s->depth) {
         print(&b, "Not done: plan mode is on, and you must not change "
-                  "anything. Report what you found instead.");
+                  "anything but your scratch files. Report what you found "
+                  "instead.");
         return finish(&b);
     }
     print(&b, "Not done: plan mode is on, so nothing may change but the "
-              "plan file, and this would change ");
+              "plan file and your scratch files, and this would change ");
     print(&b, showpath(s->guard.cwd, path));
     print(&b, ". Write your plan to ");
     print(&b, s->planfile);
@@ -4376,15 +4411,15 @@ static Str planrefusal(Session *s, Arena *a, Str path)
     return finish(&b);
 }
 
-// In plan mode, the first file a patch changes that is not the plan
-// file, or null. The patch's paths are absolute (patchguard).
-static Str planpatchout(Session *s, Patch *p)
+// In plan mode, the first file a patch changes that plan mode does not
+// allow (planallows), or null. The patch's paths are absolute (patchguard).
+static Str planpatchout(Session *s, Arena scratch, Patch *p)
 {
     for (iz i = 0; planning(s) && i<p->files.len; i++) {
         PatchFile *f = &p->files[i];
-        if (f->file.data && !isplanfile(s, f->file)) {
+        if (f->file.data && !planallows(s, scratch, f->file)) {
             return f->file;
-        } else if (f->fileto.data && !isplanfile(s, f->fileto)) {
+        } else if (f->fileto.data && !planallows(s, scratch, f->fileto)) {
             return f->fileto;
         }
     }
@@ -4808,7 +4843,7 @@ static void runpatch(Session *s, Arena scratch, Args *args, Str allowed)
     Engine    *e  = s->e;
     Patch     *p  = &args->patch;
     PatchGuard pg = patchguard(s, &scratch, p, allowed);
-    Str        no = planpatchout(s, p);
+    Str        no = planpatchout(s, scratch, p);
     if (no.data) {
         Str text = planrefusal(s, &scratch, no);
         toolend(s, scratch, "denied", text, 0, 0, {}, 0);
@@ -4898,7 +4933,7 @@ static b32 runfile(Session *s, Arena scratch, i32 tool, Str path, Args *args)
     if (tool==TOOL_EDIT && s->te.edit==EDIT_PATCH) {
         runpatch(s, scratch, args, path);
         return 1;
-    } else if (planning(s) && !toolreads(tool) && !isplanfile(s, path)) {
+    } else if (planning(s) && !toolreads(tool) && !planallows(s, scratch, path)) {
         Str text = planrefusal(s, &scratch, path);
         toolend(s, scratch, "denied", text, 0, 0, {}, 0);
         return 1;
@@ -11964,7 +11999,7 @@ static b32 runtool(Session *s, Arena scratch)
     b32 bypass = bypassing(s);
     if (!s->blocked && tool==TOOL_EDIT && s->te.edit==EDIT_PATCH && !args.issues.len) {
         PatchGuard pg = patchguard(s, &scratch, &args.patch, {});
-        if (planpatchout(s, &args.patch).data || bypass) {
+        if (planpatchout(s, scratch, &args.patch).data || bypass) {
             toolstart(s, scratch);
             return runfile(s, scratch, tool, s->guard.cwd, &args);  // or refused
         } else if (pg.many) {

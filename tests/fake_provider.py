@@ -4407,6 +4407,20 @@ def scratch_of(req):
     return m.group(1) if m else None
 
 
+def sc_plan_scratch(model, n, req):
+    # In plan mode: a scratch file, one through a link in the scratch
+    # directory to the working directory, and one in the working directory
+    d = scratch_of(req)
+    steps = [("write", {"path": f"{d}/notes.txt", "content": "notes"}),
+             ("write", {"path": f"{d}/link/escape.txt", "content": "x"}),
+             ("write", {"path": "inside.txt", "content": "x"})]
+    k = since_user(req)
+    if k < len(steps):
+        yield from tool(model, n, *steps[k])
+    else:
+        yield from answer(model, "Planned.")
+
+
 def sc_always(model, n, req):
     # Asks to answer with always: a write outside, then another beside it;
     # a read outside, then a write beside it; a search of a directory;
