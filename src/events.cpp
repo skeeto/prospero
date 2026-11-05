@@ -336,6 +336,10 @@ static Str capnames[] = {
                        // to (finished by mcp.code {endpoint:1}) and out,
                        // and models' signedin, email and plan; the session
                        // state "auth"
+    "endpoint.copilot", // endpoint kind copilot: endpoint.auth with no
+                       // redirect replies with a GitHub code (url, code),
+                       // and mcp.code {endpoint:1} with none waits for it
+                       // to be entered; models' login
 };
 
 static Str evname(i32 ev)

@@ -416,6 +416,10 @@ struct Endpoint {
     i64 progress;
     i32 connectms;
     i32 kind;       // EP_*
+    i32 wire;       // the format of its requests, EP_*: its kind's, but
+                    // a copilot endpoint's model's own (discovered)
+    Str api;        // a copilot endpoint's account's own API root, its
+                    // url being the kind's, else null
 };
 
 struct Engine;
@@ -925,6 +929,8 @@ struct Engine {
     Str         statedir;
     Str         chatgptauth;  // ChatGPT's issuer (a test hook,
                               // PROSPERO_TEST_CHATGPT_AUTH, replaces it)
+    Str         ghauth;   // GitHub's sign-in, and its API, for Copilot
+    Str         ghapi;    // (PROSPERO_TEST_COPILOT_AUTH replaces both)
     Str         exedir;
     Str         home;     // for "~" in paths
     Str         global;   // the user's own instruction file
@@ -1756,10 +1762,12 @@ static Str authheaders(Arena *a, Endpoint *ep, Str accept)
     print(&b, "Accept: ");
     print(&b, accept);
     print(&b, "\r\nUser-Agent: prospero/" PROSPERO_VERSION "\r\n");
-    if (ep->kind == EP_ANTHROPIC) {
+    if (ep->wire == EP_ANTHROPIC) {
         print(&b, "anthropic-version: ");
         print(&b, anversion);
         print(&b, "\r\n");
+    }
+    if (ep->kind == EP_ANTHROPIC) {
         if (ep->key.len) {
             print(&b, "x-api-key: ");
             print(&b, ep->key);
@@ -1771,6 +1779,25 @@ static Str authheaders(Arena *a, Endpoint *ep, Str accept)
         print(&b, "\r\n");
     }
     return finish(&b);
+}
+
+// The URL of name at an endpoint: under its /v1/ (apiurl), but under a
+// copilot endpoint's root, its account's own if it has one. A relayed
+// endpoint's are apiurl's, which the computer relaying it maps to its
+// own (relaysend).
+static Str epurl(Arena *a, Endpoint *ep, Str name)
+{
+    if (ep->kind==EP_COPILOT && !ep->relay.len) {
+        return copiloturl(a, ep->api.len ? ep->api : ep->url, name);
+    }
+    return apiurl(a, ep->url, name);
+}
+
+// The URL of a model call at an endpoint, in its format.
+static Str callurl(Arena *a, Endpoint *ep)
+{
+    b32 cp = ep->kind==EP_COPILOT && !ep->relay.len;
+    return epurl(a, ep, cp ? copilotpath(ep->wire) : eppath(ep->wire));
 }
 
 // What to check when a server refuses the key, to follow its error: the
@@ -2158,6 +2185,34 @@ static Str chatgptheaders(Engine *, Arena *, Endpoint *, Str sid, u64 *sent);
 static Str epsigninmsg(Arena *, Str name);
 static b32 authgate(Session *, Arena, Endpoint *);
 
+// What Copilot is told of a request, beyond its body: who began it (the
+// user, only for the step that answers the user's own message, else the
+// agent), what for, and whether it shows images. Its premium requests
+// are counted by the first.
+struct CpHint {
+    Str initiator;    // "user" or "agent"
+    Str interaction;  // "conversation-agent", -subagent or -compaction
+    b32 vision;
+};
+
+static CpHint cphint(Session *s)
+{
+    CpHint h  = {};
+    b32    cp = s->purpose == REQ_COMPACT;
+    iz     n  = s->history.len;
+    b32    us = !cp && n && s->history[n-1].role==ROLE_USER;
+    h.initiator   = us ? Str("user") : Str("agent");
+    h.interaction = cp         ? Str("conversation-compaction") :
+                    s->depth>0 ? Str("conversation-subagent")
+                               : Str("conversation-agent");
+    for (iz i = 0; !cp && i < n; i++) {
+        h.vision |= s->history[i].images.len>0 || s->history[i].image.len>0;
+    }
+    return h;
+}
+
+static Str copilotheaders(Engine *, Arena *, Endpoint *, Str sid, CpHint);
+
 // Start a request whose records go to this session, with keep for a
 // turn's body, which a relayed request's next may be a delta against.
 // 0 on failure.
@@ -2174,6 +2229,9 @@ static b32 startreq(Session *s, Arena scratch, Endpoint *ep, Str method,
     r.headers   = authheaders(&scratch, ep, accept);
     if (ep->kind==EP_CHATGPT && !ep->relay.len) {
         Str more  = chatgptheaders(e, &scratch, ep, s->sid, &s->authsent);
+        r.headers = concat(&scratch, r.headers, more);
+    } else if (ep->kind==EP_COPILOT && !ep->relay.len) {
+        Str more  = copilotheaders(e, &scratch, ep, s->sid, cphint(s));
         r.headers = concat(&scratch, r.headers, more);
     }
     r.body      = body;
@@ -2337,12 +2395,12 @@ static void sendchat(Session *s, Arena scratch)
     req.history   = deskimages(s, &scratch);
     req.thinkfrom = s->thinkfrom;
     req.cachekey  = s->sid;
-    i32 kind      = s->ep.kind;
-    Str body      = kind==EP_ANTHROPIC ? anencode(&s->attempt, scratch, &req) :
-                    epresponses(kind)  ? rsencode(&s->attempt, scratch, &req,
-                                                  kind==EP_CHATGPT)
+    i32 wire      = s->ep.wire;
+    Str body      = wire==EP_ANTHROPIC ? anencode(&s->attempt, scratch, &req) :
+                    epresponses(wire)  ? rsencode(&s->attempt, scratch, &req,
+                                                  s->ep.kind==EP_CHATGPT)
                                        : encodechat(&s->attempt, scratch, &req);
-    Str url       = apiurl(&scratch, s->ep.url, eppath(kind));
+    Str url       = callurl(&scratch, &s->ep);
 
     if (!startreq(s, scratch, &s->ep, "POST", url, body, "text/event-stream", 0, 1)) {
         Str err = os_lasterr(e->os, &scratch);
@@ -2438,10 +2496,10 @@ static void proceed(Session *s, Arena scratch)
 
 static void discover(Session *s, Arena scratch)
 {
-    Str url = apiurl(&scratch, s->ep.url, eplistpath(s->ep.kind));
+    Str url = epurl(&scratch, &s->ep, eplistpath(s->ep.kind));
     resetattempt(s);
     s->discovered = 1;
-    if ((s->ep.kind==EP_ANTHROPIC || s->ep.kind==EP_CHATGPT) && s->mc.kwargs.len) {
+    if ((s->ep.kind==EP_ANTHROPIC || epsigned(s->ep.kind)) && s->mc.kwargs.len) {
         Str msg = concat(&scratch, "the template settings of [model ", s->model);
         msg = concat(&scratch, msg, "] are not sent: kind ");
         msg = concat(&scratch, msg, epkindname(s->ep.kind));
@@ -2528,6 +2586,8 @@ static void discovered(Session *s, Arena scratch, b32 ok)
         Str body = finish(&s->body);
         if (s->ep.kind == EP_CHATGPT) {
             body = rslisting(&scratch, s->attempt, body);
+        } else if (s->ep.kind == EP_COPILOT) {
+            body = cplisting(&scratch, s->attempt, body);
         }
         notekinds(e, scratch, s->ep.url, body);
         Str  key     = kindkey(&scratch, s->ep.url, s->mc.name);
@@ -2551,6 +2611,9 @@ static void discovered(Session *s, Arena scratch, b32 ok)
                 s->mc.ctx = s->mc.ctx && !mi.learned ? s->mc.ctx : mi.ctx;
             }
             s->mc.maxout = mi.maxout;
+            if (s->ep.kind == EP_COPILOT) {
+                s->ep.wire = mi.wire;  // each model its own format
+            }
         }
     }
     stopreq(s);
@@ -2903,7 +2966,7 @@ static void fail(Session *s, Arena scratch, i32 cls, i32 status, Str msg, i64 re
     b32      visible = p && committed(p);
     s->part = 0;
 
-    if (cls==CLASS_DETERMINISTIC && reqep(s)->kind==EP_ANTHROPIC &&
+    if (cls==CLASS_DETERMINISTIC && reqep(s)->wire==EP_ANTHROPIC &&
             contains(msg, "signature") && contains(msg, "thinking") &&
             unbind(s)) {
         // Anthropic's reasoning is bound to the conversation before it,
@@ -3169,9 +3232,9 @@ static void emitprogress(Session *s, Arena scratch, Chunk *c)
 // Apply one parsed data event. Returns 0 if the attempt failed.
 static b32 onchunk(Session *s, Arena scratch, Json *j)
 {
-    i32   kind = reqep(s)->kind;
-    Chunk c    = kind==EP_ANTHROPIC ? anchunk(s->part, j, &scratch) :
-                 epresponses(kind)  ? rschunk(s->part, j, &scratch)
+    i32   wire = reqep(s)->wire;
+    Chunk c    = wire==EP_ANTHROPIC ? anchunk(s->part, j, &scratch) :
+                 epresponses(wire)  ? rschunk(s->part, j, &scratch)
                                     : applychunk(s->part, j, &scratch);
     if (c.bad) {
         fail(s, scratch, CLASS_TRANSIENT, 0, "the stream held a malformed chunk", -1);
@@ -3303,7 +3366,7 @@ static void onbody(Session *s, Arena scratch, Str data)
             fail(s, t, CLASS_TRANSIENT, 0, "the stream held a malformed chunk", -1);
             return;
         }
-        if (ev->type=="error" && reqep(s)->kind==EP_OPENAI) {
+        if (ev->type=="error" && reqep(s)->wire==EP_OPENAI) {
             Str msg = errortext(jsonget(d.root, "error"));
             fail(s, t, classify(0, msg), 0, msg, -1);
             return;
@@ -3386,10 +3449,12 @@ static void ondone(Session *s, Arena scratch, i32 err, Str text)
             return;
         }
         Str hint = {};
-        if (cls==CLASS_FATAL && (s->status==401 || s->status==403) && cgp) {
+        if (cls==CLASS_FATAL && (s->status==401 || s->status==403) && epsigned(rep->kind)) {
+            Str svc = epservice(rep->kind);
             hint = rep->relay.len
-                 ? concat(&scratch, " (sign in to ChatGPT on the computer that relays endpoint ",
-                          concat(&scratch, rep->relay, ")"))
+                 ? concat(&scratch, concat(&scratch, " (sign in to ", svc),
+                          concat(&scratch, " on the computer that relays endpoint ",
+                                 concat(&scratch, rep->relay, ")")))
                  : concat(&scratch, " (sign in again ",
                           concat(&scratch, epsigninmsg(&scratch, rep->name), ")"));
         } else if (cls==CLASS_FATAL && (s->status==401 || s->status==403)) {
@@ -6633,7 +6698,7 @@ struct DeskLimits {
 // The largest screenshot to send the session's model.
 static DeskLimits desklimits(Session *s)
 {
-    b32        an = s->ep.kind == EP_ANTHROPIC;
+    b32        an = s->ep.wire == EP_ANTHROPIC;
     DeskLimits r  = {};
     r.edge   = s->mc.imgedge   ? s->mc.imgedge   : an ? DESK_EDGE   : DESK_EDGE_OAI;
     r.pixels = s->mc.imgpixels ? s->mc.imgpixels : an ? DESK_PIXELS : DESK_PIXELS_OAI;
@@ -9147,6 +9212,8 @@ struct McpTokens {
     Str account;  // a chatgpt endpoint's: its account's id, from the
     Str email;    // id_token, and who signed in, on which plan
     Str plan;
+    Str login;    // a copilot endpoint's: the GitHub user signed in,
+    Str api;      // and the account's own API root, if it has one
 };
 
 // Where tokens are kept: <state>/mcp/auth for a server's, and
@@ -9191,7 +9258,18 @@ static McpTokens mcptokens(Engine *e, Arena *a, Str name, Str url, b32 ep = 0)
     t.account  = jsonstr(jsonget(j, "account_id"));
     t.email    = jsonstr(jsonget(j, "email"));
     t.plan     = jsonstr(jsonget(j, "plan"));
+    t.login    = jsonstr(jsonget(j, "login"));
+    t.api      = jsonstr(jsonget(j, "api"));
     return t;
+}
+
+// The URL an endpoint's tokens are kept under: its url, and the client
+// it signs in as if [endpoint] client_id names one, so that a sign-in as
+// another client is kept apart, and changing it asks for a new one.
+static Str epauthurl(Engine *e, Arena *a, Endpoint *ep)
+{
+    Str client = trim(cfgget(e->cfg, "endpoint", ep->name, "client_id", 0));
+    return client.len ? concat(a, concat(a, ep->url, " "), client) : ep->url;
 }
 
 // Whether a server's own headers authorize it (a token, or a header
@@ -11224,20 +11302,32 @@ static i64 mcpnext(Engine *e)
     }
     for (McpAuth *x = e->mcpauths; x; x = x->next) {
         next = x->by<next ? x->by : next;
+        if (x->stage==MCPAUTH_POLL && x->pollat && x->pollat<next) {
+            next = x->pollat;  // GitHub asked again then
+        }
     }
     return next;
 }
 
 static void mcpauthfail(Engine *e, Arena scratch, McpAuth *x, Str why);
 
+static void epdevicepoll(Engine *, Arena, McpAuth *);
+static void mcpauthfree(Engine *, McpAuth *);
+
 static void mcptick(Engine *e, Arena scratch, i64 now)
 {
     for (McpAuth *x = e->mcpauths, *next; x; x = next) {
         next = x->next;
-        if (now >= x->by) {
+        if (now>=x->by && x->stage==MCPAUTH_DONE) {
+            mcpauthfree(e, x);  // nobody came to hear
+        } else if (now >= x->by) {
             mcpauthfail(e, scratch, x, x->stage==MCPAUTH_WAIT
-                        ? Str("nobody signed in within 10 minutes")
+                        ? Str("nobody signed in within 10 minutes") :
+                        x->stage==MCPAUTH_POLL
+                        ? Str("nobody entered the code at GitHub in time")
                         : Str("the server took too long to answer"));
+        } else if (x->stage==MCPAUTH_POLL && x->pollat && now>=x->pollat) {
+            epdevicepoll(e, scratch, x);
         }
     }
     for (McpServer *m = e->mcp; m; m = m->next) {
@@ -11332,6 +11422,12 @@ static b32 mcpsavetokens(Engine *e, Arena scratch, Str name, McpTokens *t, b32 e
     if (t->plan.len) {
         putstrkey(&w, "plan", t->plan);
     }
+    if (t->login.len) {
+        putstrkey(&w, "login", t->login);
+    }
+    if (t->api.len) {
+        putstrkey(&w, "api", t->api);
+    }
     putend(&w);
     print(&b, "\n");
     return os_writemode(e->os, scratch, path, finish(&b), 0600);
@@ -11393,10 +11489,16 @@ static void mcprestartall(Engine *e, Arena scratch, Str name, Str url)
 
 static void epauthwake(Engine *, Arena, Str name, Str why);
 static Str  epsigninmsg(Arena *, Str name);
+static void epdeviceend(Engine *, Arena, McpAuth *, Str err);
 
 // A sign-in or refresh ended badly: whoever waits hears why.
 static void mcpauthfail(Engine *e, Arena scratch, McpAuth *x, Str why)
 {
+    b32 device = x->stage==MCPAUTH_POLL || x->stage==MCPAUTH_USER;
+    if (device && !x->cmd) {
+        epdeviceend(e, scratch, x, why);  // for the wait to come
+        return;
+    }
     if (x->cmd) {
         Str msg = concat(&scratch, "signing in failed: ", why);
         reply(e, scratch, x->cmd, 0, msg, {});
@@ -11429,14 +11531,16 @@ static void mcpauthfail(Engine *e, Arena scratch, McpAuth *x, Str why)
 }
 
 static b32 mcpauthhttp(Engine *e, Arena scratch, McpAuth *x, Str method, Str url,
-                       Str type, Str body)
+                       Str type, Str body, Str more = {})
 {
     if (x->h) {
         os_httpfree(e->os, x->h);
         x->h = 0;
     }
-    Buf h(&scratch, 128);
+    Buf h(&scratch, 256 + more.len);
     print(&h, "Accept: application/json\r\n");
+    print(&h, "User-Agent: prospero/" PROSPERO_VERSION "\r\n");
+    print(&h, more);
     if (type.len) {
         print(&h, "Content-Type: ");
         print(&h, type);
@@ -11687,6 +11791,9 @@ static Str mcpautherr(Arena *a, McpAuth *x)
     return finish(&b);
 }
 
+static void epdevicerecord(Engine *, Arena, McpAuth *, Json *);
+static b32  jsonflag(Json *, b32 dflt);
+
 static void mcpauthrecord(Engine *e, Arena scratch, McpAuth *x, Record r)
 {
     switch (r.type) {
@@ -11705,6 +11812,15 @@ static void mcpauthrecord(Engine *e, Arena scratch, McpAuth *x, Record r)
     if (!err && x->status==200) {
         j = jsonparse(&scratch, Str{x->body.data, x->body.len}).root;
         j = j->type==JSON_OBJECT ? j : 0;
+    }
+    if (x->stage>=MCPAUTH_DEVICE && x->stage<=MCPAUTH_USER) {
+        if (err) {
+            Str msg = concat(&scratch, "GitHub: ", why.len ? why : Str("no response"));
+            mcpauthfail(e, scratch, x, msg);
+        } else {
+            epdevicerecord(e, scratch, x, j);
+        }
+        return;
     }
     switch (x->stage) {
     case MCPAUTH_PRM:
@@ -11915,8 +12031,20 @@ static void cmdmcpcode(Engine *e, Arena scratch, i64 id, Json *j)
     Str      name = jsonstr(jsonget(j, "name"));
     b32      ep   = jsonint(jsonget(j, "endpoint"), 0) != 0;
     McpAuth *x    = 0;
+    McpAuth *dev  = 0;
     for (McpAuth *k = e->mcpauths; k; k = k->next) {
-        x = k->name==name && k->ep==ep && k->stage==MCPAUTH_WAIT ? k : x;
+        x   = k->name==name && k->ep==ep && k->stage==MCPAUTH_WAIT ? k : x;
+        dev = k->name==name && ep && k->stage>=MCPAUTH_POLL ? k : dev;
+    }
+    if (!x && dev && !dev->cmd) {
+        // A device flow: its end waited for, or heard now if it came
+        if (dev->stage == MCPAUTH_DONE) {
+            dev->cmd = id;
+            epdeviceend(e, scratch, dev, dev->err);
+        } else {
+            dev->cmd = id;
+        }
+        return;
     }
     if (!x) {
         Str why = concat(&scratch, "no sign-in waits for ", name);
@@ -11983,17 +12111,27 @@ static void cmdmcplogout(Engine *e, Arena scratch, i64 id, Json *j)
     reply(e, scratch, id, 1, {}, {});
 }
 
-// Signing in to ChatGPT (an endpoint of kind chatgpt)
+// Signing in for an endpoint: to ChatGPT (kind chatgpt) or GitHub
+// Copilot (kind copilot)
 //
-// The sign-in is MCP's (McpAuth) with a fixed issuer and client, the
-// Codex CLI's, started by endpoint.auth and finished by mcp.code
+// ChatGPT's sign-in is MCP's (McpAuth) with a fixed issuer and client,
+// the Codex CLI's, started by endpoint.auth and finished by mcp.code
 // {endpoint:1}. Tokens are kept in <state>/endpoints/auth, one file per
-// endpoint name and URL, and read at each request, so that a sign-in
-// or another engine's refresh applies at once. An access token about
-// to expire, or refused (401) once in a turn, is refreshed once for
-// every session and relayed call that needs it, which wait for it
-// (S_AUTH) at no cost: nothing was shown yet. Refused a refresh, the
-// tokens are forgotten, and what waited ends, saying how to sign in.
+// endpoint name and URL (and client, if [endpoint] client_id names one:
+// epauthurl), and read at each request, so that a sign-in or another
+// engine's refresh applies at once. An access token about to expire, or
+// refused (401) once in a turn, is refreshed once for every session and
+// relayed call that needs it, which wait for it (S_AUTH) at no cost:
+// nothing was shown yet. Refused a refresh, the tokens are forgotten,
+// and what waited ends, saying how to sign in.
+//
+// Copilot's is GitHub's device flow, as Prospero's own GitHub app
+// unless client_id names another: endpoint.auth replies with a code for
+// the user to enter at GitHub's page, while the engine asks GitHub every
+// few seconds whether it was (MCPAUTH_POLL), and mcp.code {endpoint:1}
+// with no code waits for the end. GitHub is then asked whether the
+// account has Copilot, and where its API is (MCPAUTH_USER). The token
+// neither expires nor refreshes: refused, the user signs in again.
 
 enum : i32 { EPAUTH_OK, EPAUTH_WAIT, EPAUTH_NONE };
 
@@ -12006,6 +12144,14 @@ static Str epsigninmsg(Arena *a, Str name)
     print(&b, ", Sign in, or run: prospero endpoint auth ");
     print(&b, name);
     return finish(&b);
+}
+
+// The OAuth client an endpoint signs in as: [endpoint] client_id, else
+// its kind's own, Prospero's GitHub app or the Codex CLI's.
+static Str epclient(Engine *e, Endpoint *ep)
+{
+    Str c = trim(cfgget(e->cfg, "endpoint", ep->name, "client_id", 0));
+    return c.len ? c : ep->kind==EP_COPILOT ? copilotclient : chatgptclient;
 }
 
 static McpAuth *eprefreshing(Engine *e, Str name)
@@ -12024,12 +12170,17 @@ static McpAuth *eprefreshing(Engine *e, Str name)
 // refused, to be refreshed unless another has replaced it already.
 static i32 epauth(Engine *e, Arena scratch, Endpoint *ep, u64 stale, Str *why)
 {
-    McpTokens t = mcptokens(e, &scratch, ep->name, ep->url, 1);
+    Str       key = epauthurl(e, &scratch, ep);
+    McpTokens t   = mcptokens(e, &scratch, ep->name, key, 1);
     if (!t.access.len) {
         Str msg = concat(&scratch, "endpoint ", ep->name);
-        msg  = concat(&scratch, msg, " is not signed in to ChatGPT: sign in ");
-        *why = concat(&scratch, msg, epsigninmsg(&scratch, ep->name));
+        msg  = concat(&scratch, msg, " is not signed in to ");
+        msg  = concat(&scratch, msg, epservice(ep->kind));
+        *why = concat(&scratch, msg, concat(&scratch, ": sign in ",
+                                            epsigninmsg(&scratch, ep->name)));
         return EPAUTH_NONE;
+    } else if (ep->kind == EP_COPILOT) {
+        return EPAUTH_OK;  // never expires; refused, it is signed in again
     }
     i64 now     = os_time(e->os) / 1000;
     b32 expired = t.expires && now>=t.expires-60;
@@ -12051,7 +12202,7 @@ static i32 epauth(Engine *e, Arena scratch, Endpoint *ep, u64 stale, Str *why)
             return EPAUTH_NONE;
         }
     }
-    McpAuth *x = mcpauthnew(e, scratch, ep->name, ep->url, 1);
+    McpAuth *x = mcpauthnew(e, scratch, ep->name, key, 1);
     if (!x) {
         *why = "out of memory";
         return EPAUTH_NONE;
@@ -12060,7 +12211,7 @@ static i32 epauth(Engine *e, Arena scratch, Endpoint *ep, u64 stale, Str *why)
     x->by       = os_ticks(e->os) + 60*SEC;
     x->issuer   = clone(&x->arena, e->chatgptauth);
     x->tokenurl = clone(&x->arena, concat(&scratch, e->chatgptauth, "/oauth/token"));
-    x->client   = clone(&x->arena, chatgptclient);
+    x->client   = clone(&x->arena, epclient(e, ep));
     x->refresh  = clone(&x->arena, t.refresh);
     x->account  = clone(&x->arena, t.account);
     x->email    = clone(&x->arena, t.email);
@@ -12085,7 +12236,7 @@ static i32 epauth(Engine *e, Arena scratch, Endpoint *ep, u64 stale, Str *why)
 // and *sent, if given, gets the token's hash.
 static Str chatgptheaders(Engine *e, Arena *a, Endpoint *ep, Str sid, u64 *sent)
 {
-    McpTokens t = mcptokens(e, a, ep->name, ep->url, 1);
+    McpTokens t = mcptokens(e, a, ep->name, epauthurl(e, a, ep), 1);
     Buf       b(a, 256 + t.access.len + t.account.len + sid.len);
     if (t.access.len) {
         print(&b, "Authorization: Bearer ");
@@ -12104,6 +12255,40 @@ static Str chatgptheaders(Engine *e, Arena *a, Endpoint *ep, Str sid, u64 *sent)
     }
     if (sent) {
         *sent = t.access.len ? hash(t.access) : 0;
+    }
+    return finish(&b);
+}
+
+// A copilot endpoint's request headers, beyond authheaders': its token,
+// the API's version, and what the request is (CpHint, none for a
+// listing). Nothing of the token if it is not signed in, which the
+// server then refuses.
+static Str copilotheaders(Engine *e, Arena *a, Endpoint *ep, Str sid, CpHint h)
+{
+    McpTokens t = mcptokens(e, a, ep->name, epauthurl(e, a, ep), 1);
+    Buf       b(a, 512 + t.access.len + sid.len);
+    if (t.access.len) {
+        print(&b, "Authorization: Bearer ");
+        print(&b, t.access);
+        print(&b, "\r\n");
+    }
+    print(&b, "X-GitHub-Api-Version: ");
+    print(&b, copilotapiver);
+    print(&b, "\r\nOpenai-Intent: conversation-edits\r\n");
+    if (h.initiator.len) {
+        print(&b, "x-initiator: ");
+        print(&b, h.initiator);
+        print(&b, "\r\nX-Interaction-Type: ");
+        print(&b, h.interaction);
+        print(&b, "\r\n");
+    }
+    if (sid.len) {
+        print(&b, "X-Interaction-Id: ");
+        print(&b, sid);
+        print(&b, "\r\n");
+    }
+    if (h.vision) {
+        print(&b, "Copilot-Vision-Request: true\r\n");
     }
     return finish(&b);
 }
@@ -12131,7 +12316,7 @@ static void epauthwake(Engine *e, Arena scratch, Str name, Str why)
 // epauth says: 1 to go on. Relayed, the computer relaying it signs in.
 static b32 authgate(Session *s, Arena scratch, Endpoint *ep)
 {
-    if (ep->kind!=EP_CHATGPT || ep->relay.len) {
+    if (!epsigned(ep->kind) || ep->relay.len) {
         return 1;
     }
     Str why = {};
@@ -12148,14 +12333,16 @@ static b32 authgate(Session *s, Arena scratch, Endpoint *ep)
     return 0;
 }
 
-// The chatgpt endpoint of a command by name, or null with *why set.
-static b32 epchatgpt(Engine *e, Arena *a, Str name, Endpoint *ep, Str *why)
+// The signed-in endpoint (chatgpt or copilot) of a command by name, or
+// null with *why set.
+static b32 epsignedin(Engine *e, Arena *a, Str name, Endpoint *ep, Str *why)
 {
     if (!name.len || !endpointconf(e, a, name, ep) || ep->name!=name) {
         *why = concat(a, "no endpoint is named ", name.len ? name : Str("\"\""));
         return 0;
-    } else if (ep->kind != EP_CHATGPT) {
-        *why = concat(a, concat(a, "endpoint ", name), Str(" is not of kind chatgpt"));
+    } else if (!epsigned(ep->kind)) {
+        *why = concat(a, concat(a, "endpoint ", name),
+                      Str(" is not of kind chatgpt or copilot"));
         return 0;
     } else if (ep->relay.len) {
         *why = concat(a, concat(a, "endpoint ", name),
@@ -12165,48 +12352,204 @@ static b32 epchatgpt(Engine *e, Arena *a, Str name, Endpoint *ep, Str *why)
     return 1;
 }
 
-// endpoint.auth {name, redirect}: replies, late, with the URL the
-// browser is to visit to sign in to ChatGPT, its redirect to the given
-// one, which mcp.code {name, endpoint:1, ...} then completes.
+// A JSON body for GitHub's device flow, of keys and values in pairs.
+static Str ghform(Arena *a, Slice<Str> kv)
+{
+    Buf     b(a, 256);
+    JsonOut w = {&b};
+    putobject(&w);
+    for (iz i = 0; i+1 < kv.len; i += 2) {
+        putstrkey(&w, kv[i], kv[i+1]);
+    }
+    putend(&w);
+    return finish(&b);
+}
+
+// Ask GitHub again whether the code was entered.
+static void epdevicepoll(Engine *e, Arena scratch, McpAuth *x)
+{
+    Str kv[] = {"client_id", x->client, "device_code", x->device,
+                "grant_type", "urn:ietf:params:oauth:grant-type:device_code"};
+    Str body = ghform(&scratch, {kv, countof(kv)});
+    x->pollat = 0;
+    if (!mcpauthhttp(e, scratch, x, "POST", x->tokenurl, "application/json", body)) {
+        mcpauthfail(e, scratch, x, "GitHub could not be asked whether the code was entered");
+    }
+}
+
+// The device flow ended: whoever waits (mcp.code) hears, or the end is
+// kept a minute for the wait to come (stage MCPAUTH_DONE, err empty if
+// it went well).
+static void epdeviceend(Engine *e, Arena scratch, McpAuth *x, Str err)
+{
+    if (x->cmd) {
+        if (err.len) {
+            reply(e, scratch, x->cmd, 0, concat(&scratch, "signing in failed: ", err), {});
+        } else {
+            reply(e, scratch, x->cmd, 1, {}, {});
+        }
+        x->cmd = 0;
+        mcpauthfree(e, x);
+        return;
+    }
+    x->stage = MCPAUTH_DONE;
+    x->err   = clone(&x->arena, err);
+    x->by    = os_ticks(e->os) + 60*SEC;
+}
+
+// A device-flow stage's response.
+static void epdevicerecord(Engine *e, Arena scratch, McpAuth *x, Json *j)
+{
+    i64 now = os_ticks(e->os);
+    switch (x->stage) {
+    case MCPAUTH_DEVICE: {
+        Str dc  = jsonstr(jsonget(j, "device_code"));
+        Str uc  = jsonstr(jsonget(j, "user_code"));
+        Str uri = jsonstr(jsonget(j, "verification_uri"));
+        if (!dc.len || !uc.len || !uri.len) {
+            Str why = concat(&scratch, "GitHub gave no code: ", mcpautherr(&scratch, x));
+            mcpauthfail(e, scratch, x, why);
+            return;
+        }
+        i64 every = jsonint(jsonget(j, "interval"), 5);
+        i64 life  = jsonint(jsonget(j, "expires_in"), 900);
+        x->device = clone(&x->arena, dc);
+        x->every  = (every>0 ? every : 0)*SEC + SEC;
+        x->pollat = now + x->every;
+        x->by     = now + (life>0 ? life : 900)*SEC;
+        x->stage  = MCPAUTH_POLL;
+        Buf   b(&scratch, 256 + uri.len + uc.len);
+        EvOut w = evbegin(&b, {}, 0, os_time(e->os), EV_REPLY);
+        putintkey(&w.json, "id", x->cmd);
+        putintkey(&w.json, "ok", 1);
+        putstrkey(&w.json, "url", uri);
+        putstrkey(&w.json, "code", uc);
+        emit(e, evend(&w));
+        x->cmd = 0;
+    } return;
+
+    case MCPAUTH_POLL: {
+        Str tok = jsonstr(jsonget(j, "access_token"));
+        Str err = jsonstr(jsonget(j, "error"));
+        if (tok.len) {
+            x->access = clone(&x->arena, tok);
+            x->stage  = MCPAUTH_USER;
+            x->by     = now + 60*SEC;
+            Str auth  = concat(&scratch, concat(&scratch, "Authorization: Bearer ", tok),
+                               "\r\nX-GitHub-Api-Version: 2025-04-01\r\n");
+            Str url   = concat(&scratch, e->ghapi, "/copilot_internal/user");
+            if (!mcpauthhttp(e, scratch, x, "GET", url, {}, {}, auth)) {
+                mcpauthfail(e, scratch, x, "GitHub could not be asked about the account");
+            }
+            return;
+        } else if (err=="authorization_pending" || err=="slow_down") {
+            i64 more  = jsonint(jsonget(j, "interval"), 0);
+            x->every  = err!="slow_down" ? x->every :
+                        more>0           ? more*SEC + SEC : x->every + 5*SEC;
+            x->pollat = now + x->every;
+            return;
+        }
+        Str why = err=="expired_token" ? Str("the code expired before it was entered") :
+                  err=="access_denied" ? Str("the sign-in was declined at GitHub") :
+                  concat(&scratch, "GitHub said ", mcpautherr(&scratch, x));
+        mcpauthfail(e, scratch, x, why);
+    } return;
+
+    case MCPAUTH_USER: {
+        if (x->status == 401) {
+            mcpauthfail(e, scratch, x, "GitHub refused the new token");
+            return;
+        } else if (j && !jsonflag(jsonget(j, "chat_enabled"), 1)) {
+            Str why = jsonflag(jsonget(j, "can_signup_for_limited"), 0)
+                ? Str("this GitHub account has no Copilot: sign up for Copilot Free "
+                      "at https://github.com/features/copilot/plans, then sign in again")
+                : Str("this GitHub account has no Copilot access: it needs a "
+                      "Copilot plan, or a seat its organization assigns");
+            mcpauthfail(e, scratch, x, why);
+            return;
+        }
+        // Any other failure to say is no reason to refuse the sign-in
+        McpTokens t = {};
+        t.url    = x->resource;
+        t.issuer = x->issuer;
+        t.client = x->client;
+        t.access = x->access;
+        t.login  = jsonstr(jsonget(j, "login"));
+        t.plan   = jsonstr(jsonget(j, "copilot_plan"));
+        Str api  = jsonstr(jsonget(jsonget(j, "endpoints"), "api"));
+        t.api    = api.len && parseurl(api).ok ? api : Str{};
+        if (!mcpsavetokens(e, scratch, x->name, &t, 1)) {
+            Str why = concat(&scratch, "the token could not be saved: ",
+                             os_lasterr(e->os, &scratch));
+            mcpauthfail(e, scratch, x, why);
+            return;
+        }
+        Str name = clone(&scratch, x->name);
+        epdeviceend(e, scratch, x, {});
+        epauthwake(e, scratch, name, {});
+    } return;
+    }
+}
+
+// endpoint.auth {name, redirect}: for ChatGPT, replies, late, with the
+// URL the browser is to visit to sign in, its redirect to the given
+// one, which mcp.code {name, endpoint:1, ...} then completes. For
+// Copilot, no redirect: replies, late, with GitHub's page (url) and the
+// code to enter there (code), and mcp.code {name, endpoint:1} waits for
+// it to be.
 static void cmdepauth(Engine *e, Arena scratch, i64 id, Json *j)
 {
     Str      name     = jsonstr(jsonget(j, "name"));
     Str      redirect = jsonstr(jsonget(j, "redirect"));
     Endpoint ep       = {};
     Str      why      = {};
-    if (!epchatgpt(e, &scratch, name, &ep, &why)) {
+    b32      cp       = 0;
+    if (!epsignedin(e, &scratch, name, &ep, &why)) {
         reply(e, scratch, id, 0, why, {});
         return;
-    } else if (!redirect.len) {
+    } else if (!(cp = ep.kind==EP_COPILOT) && !redirect.len) {
         reply(e, scratch, id, 0, "no redirect was given", {});
         return;
     }
-    McpAuth *x = mcpauthnew(e, scratch, name, ep.url, 1);
+    McpAuth *x = mcpauthnew(e, scratch, name, epauthurl(e, &scratch, &ep), 1);
     if (!x) {
         reply(e, scratch, id, 0, "out of memory", {});
         return;
     }
-    x->cmd      = id;
+    x->cmd    = id;
+    x->client = clone(&x->arena, epclient(e, &ep));
+    if (cp) {
+        x->issuer   = clone(&x->arena, e->ghauth);
+        x->tokenurl = clone(&x->arena, concat(&scratch, e->ghauth, "/login/oauth/access_token"));
+        x->stage    = MCPAUTH_DEVICE;
+        x->by       = os_ticks(e->os) + 60*SEC;
+        Str kv[]    = {"client_id", x->client, "scope", "read:user"};
+        Str url     = concat(&scratch, e->ghauth, "/login/device/code");
+        Str body    = ghform(&scratch, {kv, countof(kv)});
+        if (!mcpauthhttp(e, scratch, x, "POST", url, "application/json", body)) {
+            mcpauthfail(e, scratch, x, "GitHub could not be asked for a code");
+        }
+        return;
+    }
     x->redirect = clone(&x->arena, redirect);
     x->issuer   = clone(&x->arena, e->chatgptauth);
     x->authz    = clone(&x->arena, concat(&scratch, e->chatgptauth, "/oauth/authorize"));
     x->tokenurl = clone(&x->arena, concat(&scratch, e->chatgptauth, "/oauth/token"));
-    x->client   = clone(&x->arena, chatgptclient);
     x->scope    = clone(&x->arena, chatgptscope);
     mcpauthgo(e, scratch, x);
 }
 
-// endpoint.logout {name}: its ChatGPT tokens forgotten.
+// endpoint.logout {name}: its tokens forgotten.
 static void cmdeplogout(Engine *e, Arena scratch, i64 id, Json *j)
 {
     Str      name = jsonstr(jsonget(j, "name"));
     Endpoint ep   = {};
     Str      why  = {};
-    if (!epchatgpt(e, &scratch, name, &ep, &why)) {
+    if (!epsignedin(e, &scratch, name, &ep, &why)) {
         reply(e, scratch, id, 0, why, {});
         return;
     }
-    Str path = mcpauthpath(e, &scratch, name, ep.url, 1);
+    Str path = mcpauthpath(e, &scratch, name, epauthurl(e, &scratch, &ep), 1);
     if (os_stat(e->os, scratch, path).type!=STAT_MISSING && !os_remove(e->os, scratch, path)) {
         why = concat(&scratch, "its tokens could not be removed: ", os_lasterr(e->os, &scratch));
         reply(e, scratch, id, 0, why, {});
@@ -12783,16 +13126,16 @@ static void sendcompact(Session *s, Arena scratch)
     Str convo = transcript(&s->attempt, scratch, s->history, cp->start,
                            cp->cut, limit);
     i64 words = sumbudget(cp->goal) * 3/4;
-    i32 kind  = cp->ep.kind;
-    Str body  = kind==EP_ANTHROPIC ?
+    i32 wire  = cp->ep.wire;
+    Str body  = wire==EP_ANTHROPIC ?
                     ansummary(&s->attempt, scratch, &cp->mc, prev, convo, words,
                               cp->focus) :
-                epresponses(kind) ?
+                epresponses(wire) ?
                     rssummary(&s->attempt, scratch, &cp->mc, prev, convo, words,
-                              cp->focus, kind==EP_CHATGPT) :
+                              cp->focus, cp->ep.kind==EP_CHATGPT) :
                     encodesummary(&s->attempt, scratch, &cp->mc, prev, convo, words,
                                   cp->focus);
-    Str url   = apiurl(&scratch, cp->ep.url, eppath(kind));
+    Str url   = callurl(&scratch, &cp->ep);
     cp->inbytes = convo.len;
     if (!startreq(s, scratch, &cp->ep, "POST", url, body, "text/event-stream", 0)) {
         Str err = os_lasterr(s->e->os, &scratch);
@@ -13443,6 +13786,7 @@ static b32 endpointconf(Engine *e, Arena *perm, Str which, Endpoint *ep)
         ep->idle      = cfgms(cfg, "endpoint", name, "idle_timeout", 0)*MS;
         ep->progress  = cfgms(cfg, "endpoint", name, "progress_timeout", 0)*MS;
         ep->kind      = ru.kind;
+        ep->wire      = ru.kind==EP_COPILOT ? EP_OPENAI : ru.kind;  // until discovered
         return 1;
     }
     Url u = parseurl(url);
@@ -13467,6 +13811,14 @@ static b32 endpointconf(Engine *e, Arena *perm, Str which, Endpoint *ep)
     ep->key       = ep->held ? Str{} : cfgsecret(cfg, perm, "endpoint", name, "key");
     Str kind      = trim(cfgget(cfg, "endpoint", name, "kind", 0));
     ep->kind      = epkindof(kind);
+    ep->wire      = ep->kind==EP_COPILOT ? EP_OPENAI : ep->kind;  // until discovered
+    ep->api       = {};
+    if (ep->kind==EP_COPILOT && name.len && sameurl(url, epkindurl(EP_COPILOT))) {
+        // The account's own API, which signing in learned, in place of
+        // the kind's: a url the user wrote is used as written
+        McpTokens t = mcptokens(e, perm, name, epauthurl(e, perm, ep), 1);
+        ep->api     = t.api;
+    }
     return 1;
 }
 
@@ -20169,6 +20521,8 @@ static void listerreply(Engine *e, Arena scratch, Lister *l)
         Json    *ms   = 0;
         if (p->kind == "chatgpt") {
             body = rslisting(&scratch, l->arena, body);
+        } else if (p->kind == "copilot") {
+            body = cplisting(&scratch, l->arena, body);
         }
         if (!p->done) {
             err = "no answer in 5 s";
@@ -20183,12 +20537,18 @@ static void listerreply(Engine *e, Arena scratch, Lister *l)
         putstrkey(&w.json, "name", p->name);
         putstrkey(&w.json, "url", p->url);
         putstrkey(&w.json, "kind", p->kind);
-        if (p->kind=="chatgpt" && !relayurl(p->url).ok) {
+        if ((p->kind=="chatgpt" || p->kind=="copilot") && !relayurl(p->url).ok) {
             // Who is signed in, for its page
-            McpTokens t = mcptokens(e, &scratch, p->name, p->url, 1);
+            Endpoint  ep = {};
+            ep.name      = p->name;
+            ep.url       = p->url;
+            McpTokens t  = mcptokens(e, &scratch, p->name, epauthurl(e, &scratch, &ep), 1);
             putintkey(&w.json, "signedin", t.access.len > 0);
             if (t.email.len) {
                 putstrkey(&w.json, "email", t.email);
+            }
+            if (t.login.len) {
+                putstrkey(&w.json, "login", t.login);
             }
             if (t.plan.len) {
                 putstrkey(&w.json, "plan", t.plan);
@@ -20291,16 +20651,18 @@ static void cmdmodels(Engine *e, Arena scratch, i64 id)
         }
         HttpReq r = {};
         r.method    = "GET";
-        r.url       = apiurl(&t, ep.url, eplistpath(ep.kind));
+        r.url       = epurl(&t, &ep, eplistpath(ep.kind));
         r.headers   = authheaders(&t, &ep, "application/json");
-        if (ep.kind == EP_CHATGPT) {
+        if (epsigned(ep.kind) && !ep.relay.len) {
             Str why = {};
             if (epauth(e, t, &ep, 0, &why) == EPAUTH_NONE) {
                 p->err  = clone(&l->arena, why);
                 p->done = 1;
                 continue;
             }
-            r.headers = concat(&t, r.headers, chatgptheaders(e, &t, &ep, {}, 0));
+            Str more  = ep.kind==EP_CHATGPT ? chatgptheaders(e, &t, &ep, {}, 0)
+                                            : copilotheaders(e, &t, &ep, {}, {});
+            r.headers = concat(&t, r.headers, more);
         }
         r.connectms = ep.connectms;
         r.readms    = 5000;
@@ -21399,6 +21761,9 @@ static Engine *newengine(Os *os, Arena *perm, Config *cfg, Str statedir,
     e->minute  = minute.ok && minute.val>0 && minute.val<=60000 ? minute.val*MS : 60*SEC;
     Str issuer = os_getenv(os, &e->perm, "PROSPERO_TEST_CHATGPT_AUTH");
     e->chatgptauth = issuer.len ? issuer : chatgptissuer;
+    Str gh = os_getenv(os, &e->perm, "PROSPERO_TEST_COPILOT_AUTH");
+    e->ghauth = gh.len ? gh : copilotgithub;
+    e->ghapi  = gh.len ? gh : copilotghapi;
     // URL includes refresh in the background now, every ten minutes
     cfgattach(cfg, e->in, 10*e->minute);
     return e;

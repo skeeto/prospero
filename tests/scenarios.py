@@ -3616,7 +3616,8 @@ def hello_caps(t):
                  "fork", "answer.always.desktop", "skills", "plan", "queue",
                  "message", "bypass", "nofolder", "dir", "config.create", "side", "background", "models",
                  "mcp", "mcp.auth", "task.remote", "task.host", "memory", "shell",
-                 "git", "answer.trust", "trash", "cut", "endpoint.auth"} <= set(caps)
+                 "git", "answer.trust", "trash", "cut", "endpoint.auth",
+                 "endpoint.copilot"} <= set(caps)
                 and "host" not in caps,
                 f"caps: {caps}")
 
@@ -7050,6 +7051,164 @@ def cg_limit(t):
     t.check(end.get("why") == "error" and "usage limit was reached" in end.get("err", "") and
             "2 h 5 min" in end.get("err", ""), f"ended {end}")
     t.check(len(t.requests()) == 1, f"one request {len(t.requests())}")
+
+
+# GitHub Copilot (kind copilot), against the fake's device flow and API
+
+CP = {"kind": "copilot", "_path": "copilot"}
+
+
+def cpenv(t):
+    return {"PROSPERO_TEST_COPILOT_AUTH": t.host.url + "/copilot-gh"}
+
+
+def cpsignin(t, ok=True):
+    """prospero endpoint auth fake, the code entered as a person would at
+    the page it names: its output, and the token file kept, if any."""
+    import urllib.request
+    p = t.host.popen(["endpoint", "auth", "fake", "--state", t.state, "-c", t.config],
+                     t.work, env=dict(t.tmpenv, **cpenv(t)))
+    killer = threading.Timer(30, p.kill)
+    killer.start()
+    try:
+        out, url = [], None
+        for line in p.stdout:
+            out.append(line)
+            m = re.search(r"(https?://\S+/login/device)\s*$", line)
+            url = m.group(1) if m else url
+            m = re.search(r"^\s+(FAKE-\d+)\s*$", line)
+            if m and url:
+                urllib.request.urlopen(f"{url}?user_code={m.group(1)}", timeout=10).read()
+                break
+        rest, err = p.communicate()
+    finally:
+        killer.cancel()
+    out = "".join(out) + rest + err
+    files = cgfiles(t)
+    if ok:
+        t.check(p.returncode == 0 and "Signed in to fake." in out, f"signed in: {out}")
+        t.check(len(files) == 1, f"the token kept: {files}")
+    return out, files[0] if files else None
+
+
+def cplog(t, kind, model=None):
+    with fake_provider.STATE.lock:
+        return [e for e in fake_provider.STATE.cp["log"] if kind in e and
+                (model is None or e.get("model") == model)]
+
+
+@scenario(conf=CP, bound=40)
+def cp_signin(t):
+    """Signing in to GitHub Copilot for an endpoint: GitHub's device flow
+    as Prospero's own app, polled until the code is entered (slowing down
+    when told), the account asked about, and the token kept privately
+    with its login and the account's API; each request with the token,
+    the API's version, and who began it; the URL written is used, not
+    the account's API; signed out, a turn ends before any request."""
+    out, path = cpsignin(t)
+    t.check("visit this in any browser" in out and "FAKE-" in out, f"told {out}")
+    if os.name != "nt":
+        mode = os.stat(path).st_mode & 0o777
+        t.check(mode == 0o600, f"privately: {oct(mode)}")
+    keep = json.loads(open(path).read())
+    t.check(keep.get("login") == "me" and keep.get("plan") == "individual" and
+            keep.get("client_id") == fake_provider.CP_CLIENT and
+            keep.get("api") == "https://api.example.invalid" and
+            keep.get("access_token", "").startswith("gho_"), f"kept {keep}")
+    dc = keep["access_token"][4:]
+    dev = [e for e in cplog(t, "_device") if e.get("device_code") == dc]
+    polls = [e for e in cplog(t, "_poll") if e.get("device_code") == dc]
+    t.check(dev and dev[-1].get("client_id") == fake_provider.CP_CLIENT and
+            dev[-1].get("scope") == "read:user", f"asked {dev[-1:]}")
+    t.check(len(polls) >= 2, f"polled until entered: {len(polls)}")
+    users = cplog(t, "_user")
+    t.check(users and all(u.get("version") == "2025-04-01" for u in users),
+            f"the account {users[-1:]}")
+
+    r = t.run(env=cpenv(t))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.last('turn.end')} {r.stderr}")
+    t.check(r.text() == "Hello! This is a plain answer.", f"text {r.text()!r}")
+    calls = cplog(t, "_call", t.model)
+    t.check(len(calls) == 1 and calls[0]["_call"] == "/chat/completions",
+            f"one call, Chat Completions: {calls}")
+    h = calls[0]["headers"]
+    t.check(h.get("authorization") == "Bearer " + keep["access_token"] and
+            h.get("x-github-api-version") == "2026-08-01" and
+            h.get("openai-intent") == "conversation-edits" and
+            h.get("x-initiator") == "user" and
+            h.get("x-interaction-type") == "conversation-agent" and
+            h.get("x-interaction-id") == r.events[0].get("sid") and
+            "copilot-vision-request" not in h, f"headers {h}")
+    listed = cplog(t, "_models")
+    t.check(listed and listed[-1]["_models"] == fake_provider.CP_CLIENT, "listed, signed in")
+
+    rc, out, err = prun(t, ["endpoint", "logout", "fake", "--state", t.state, "-c", t.config],
+                        env=cpenv(t))
+    t.check(rc == 0 and "Signed out of fake." in out, f"signed out: {rc} {out} {err}")
+    t.check(not cgfiles(t), "forgotten")
+    r = t.run(env=cpenv(t))
+    end = r.last("turn.end")
+    t.check(end.get("why") == "error" and "not signed in to GitHub Copilot" in end.get("err", "") and
+            "prospero endpoint auth fake" in end.get("err", ""), f"ended {end}")
+    t.check(len(cplog(t, "_call", t.model)) == 1, "no request made")
+
+
+@scenario(conf=CP, bound=40)
+def cp_wire(t):
+    """Each model in the format Copilot's listing says it takes: Messages
+    at /v1/messages, Responses at /responses, Chat Completions, and with
+    no endpoints listed, by its name; the steps after the first, a
+    tool's, are the agent's."""
+    cpsignin(t)
+    t.put("hello.txt", "hello world\n")
+    want = {"+msg": "/v1/messages", "+rs": "/responses", "+guess": "/chat/completions",
+            "": "/chat/completions"}
+    for suffix, path in want.items():
+        # Messages answered as Anthropic's API answers (an_tools')
+        model = (t.model.replace(":cp_wire:", ":cp_wire_an:") if suffix == "+msg"
+                 else t.model) + suffix
+        fake_provider.STATE.register(model)
+        r = t.run(env=cpenv(t), extra=["-m", model])
+        t.check(r.rc == 0, f"{suffix}: exit {r.rc}: {r.last('turn.end')} {r.stderr}")
+        calls = cplog(t, "_call", model)
+        t.check(calls and all(c["_call"] == path for c in calls),
+                f"{suffix or 'chat'} at {path}: {[c['_call'] for c in calls]}")
+        inits = [c["headers"].get("x-initiator") for c in calls]
+        t.check(inits[:1] == ["user"] and all(i == "agent" for i in inits[1:]),
+                f"{suffix}: who began each: {inits}")
+        if suffix == "+msg":
+            t.check(all(c["headers"].get("anthropic-version") for c in calls),
+                    "Messages with its version")
+        t.check(t.file("hello.txt") == "hello there\n", f"{suffix}: the edit landed")
+        t.put("hello.txt", "hello world\n")
+
+
+@scenario(conf=dict(CP, client_id=fake_provider.CP_UNLICENSED), bound=30)
+def cp_unlicensed(t):
+    """An account with no Copilot is not signed in: it is told to sign
+    up for Copilot Free."""
+    out, path = cpsignin(t, ok=False)
+    t.check("sign up for Copilot Free" in out and path is None, f"refused: {out} {path}")
+
+
+@scenario(conf=dict(CP, client_id=fake_provider.CP_OTHER), bound=30)
+def cp_clientid(t):
+    """[endpoint] client_id signs in as that client, and its token is
+    kept apart: without it, the endpoint is not signed in."""
+    out, path = cpsignin(t)
+    keep = json.loads(open(path).read())
+    dev = [e for e in cplog(t, "_device")
+           if e.get("device_code") == keep.get("access_token", "")[4:]]
+    t.check(dev and dev[-1].get("client_id") == fake_provider.CP_OTHER, f"asked as {dev[-1:]}")
+    t.check(keep.get("client_id") == fake_provider.CP_OTHER, f"kept {keep}")
+    r = t.run(env=cpenv(t))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.last('turn.end')} {r.stderr}")
+    conf = t.host.read(t.config).replace(f"client_id = {fake_provider.CP_OTHER}\n", "")
+    t.host.write(t.config, conf)
+    r = t.run(env=cpenv(t))
+    end = r.last("turn.end")
+    t.check(end.get("why") == "error" and "not signed in" in end.get("err", ""),
+            f"another client's token is not this one's: {end}")
 
 
 # M8: session operations, on a session open here, parked, closed, or

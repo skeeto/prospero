@@ -98,6 +98,8 @@ class State:
         self.encs = {}      # Responses: encrypted_content -> its reasoning
         self.cg = {"n": 0, "codes": {}, "access": set(), "refresh": set(),
                    "log": []}  # ChatGPT's sign-in and backend
+        self.cp = {"n": 0, "devices": {}, "approved": set(), "tokens": {},
+                   "log": []}  # GitHub's device flow and Copilot's API
         self.stop = threading.Event()
 
     def register(self, model, **listing):
@@ -5570,6 +5572,149 @@ def sc_cg_limit(model, n, req):
 sc_cg_signin = sc_plain
 sc_cg_refresh = sc_plain
 sc_cg_refused = sc_plain
+
+
+# GitHub Copilot: GitHub's device flow (its sign-in at /copilot-gh, as
+# github.com and api.github.com both, which PROSPERO_TEST_COPILOT_AUTH
+# names) and Copilot's API at /copilot, which takes only the tokens the
+# flow gave. Tokens issued to CP_UNLICENSED's client belong to an
+# account with no Copilot. The listing gives each registered model the
+# endpoints its id's suffix says: +msg Messages, +rs Responses, +guess
+# none (the name decides), +off turned off by policy, else Chat
+# Completions.
+
+CP_CLIENT = "Ov23lion1hTLsXGBOJAZ"
+CP_OTHER = "other-client"
+CP_UNLICENSED = "unlicensed-client"
+
+
+def cp_log(entry):
+    with STATE.lock:
+        STATE.cp["log"].append(entry)
+
+
+def cp_token(handler):
+    """The client a request's token was issued to, or None."""
+    auth = handler.headers.get("Authorization", "")
+    with STATE.lock:
+        return STATE.cp["tokens"].get(auth[7:]) if auth.startswith("Bearer ") else None
+
+
+def cp_get(handler, url, path):
+    q = dict(urllib.parse.parse_qsl(url.query))
+    if path == "/copilot-gh/login/device":
+        # The page where the code is entered: entering it approves it
+        with STATE.lock:
+            STATE.cp["approved"].add(q.get("user_code", ""))
+        cp_log({"_entered": q.get("user_code", "")})
+        handler.send_json(200, {"ok": True})
+    elif path == "/copilot-gh/copilot_internal/user":
+        client = cp_token(handler)
+        cp_log({"_user": client, "version": handler.headers.get("X-GitHub-Api-Version")})
+        if not client:
+            handler.send_json(401, {"message": "Bad credentials"})
+        elif client == CP_UNLICENSED:
+            handler.send_json(200, {"login": "me", "chat_enabled": False,
+                                    "can_signup_for_limited": True})
+        else:
+            handler.send_json(200, {"login": "me", "copilot_plan": "individual",
+                                    "chat_enabled": True,
+                                    "endpoints": {"api": "https://api.example.invalid"}})
+    elif path == "/copilot/models":
+        client = cp_token(handler)
+        cp_log({"_models": client, "headers": dict(handler.headers.items())})
+        if not client:
+            handler.send_json(401, {"error": {"message": "unauthorized"}})
+            return
+        data = []
+        for m in models()["data"]:
+            mid = m["id"]
+            entry = {"id": mid, "name": mid, "version": mid, "object": "model",
+                     "model_picker_enabled": True,
+                     "capabilities": {"family": "fake", "limits": {
+                         "max_context_window_tokens": 128000, "max_prompt_tokens": 60000,
+                         "max_output_tokens": 4000}, "supports": {"tool_calls": True}}}
+            if mid.endswith("+msg"):
+                entry["supported_endpoints"] = ["/v1/messages", "/chat/completions"]
+            elif mid.endswith("+rs"):
+                entry["supported_endpoints"] = ["/responses", "/chat/completions"]
+            elif mid.endswith("+off"):
+                entry["policy"] = {"state": "disabled"}
+            elif not mid.endswith("+guess"):
+                entry["supported_endpoints"] = ["/chat/completions"]
+            data.append(entry)
+        handler.send_json(200, {"data": data, "object": "list"})
+    else:
+        handler.send_json(404, {"error": {"message": "not found"}})
+
+
+def cp_post(handler, path, raw):
+    """POST /copilot-gh/...: the device flow; else None, a model call at
+    /copilot/ checked and logged, with the path it is served as."""
+    try:
+        body = json.loads(raw) if raw else {}
+    except ValueError:
+        body = {}
+    if path == "/copilot-gh/login/device/code":
+        if body.get("client_id") not in (CP_CLIENT, CP_OTHER, CP_UNLICENSED):
+            cp_log({"_device": path, **body})
+            handler.send_json(400, {"error": "unauthorized_client"})
+            return None
+        with STATE.lock:
+            STATE.cp["n"] += 1
+            n = STATE.cp["n"]
+            STATE.cp["devices"][f"dc-{n}"] = {"code": f"FAKE-{n:04d}",
+                                              "client": body["client_id"], "polls": 0}
+        cp_log({"_device": path, "device_code": f"dc-{n}", **body})
+        host = handler.headers.get("Host", "127.0.0.1")
+        handler.send_json(200, {"device_code": f"dc-{n}", "user_code": f"FAKE-{n:04d}",
+                                "verification_uri": f"http://{host}/copilot-gh/login/device",
+                                "interval": 0, "expires_in": 900})
+        return None
+    if path == "/copilot-gh/login/oauth/access_token":
+        cp_log({"_poll": path, **body})
+        with STATE.lock:
+            d = STATE.cp["devices"].get(body.get("device_code"))
+            if d:
+                d["polls"] += 1
+        if (not d or body.get("client_id") != d["client"] or
+                body.get("grant_type") != "urn:ietf:params:oauth:grant-type:device_code"):
+            handler.send_json(200, {"error": "bad_verification_code"})
+        elif d["polls"] == 1:
+            handler.send_json(200, {"error": "slow_down", "interval": 1})
+        elif d["code"] not in STATE.cp["approved"]:
+            handler.send_json(200, {"error": "authorization_pending"})
+        else:
+            tok = f"gho_{body['device_code']}"
+            with STATE.lock:
+                STATE.cp["tokens"][tok] = d["client"]
+            handler.send_json(200, {"access_token": tok, "token_type": "bearer",
+                                    "scope": "read:user"})
+        return None
+    client = cp_token(handler)
+    serve = path[len("/copilot"):]
+    model = body.get("model", "") if isinstance(body, dict) else ""
+    cp_log({"_call": serve, "client": client, "model": model,
+            "headers": {k.lower(): v for k, v in handler.headers.items()}})
+    if not client:
+        handler.send_json(401, {"error": {"message": "unauthorized"}})
+        return None
+    if serve not in ("/chat/completions", "/responses", "/v1/messages"):
+        handler.send_json(404, {"error": {"message": "not found"}})
+        return None
+    return serve
+
+
+def cp_revoke(token):
+    with STATE.lock:
+        STATE.cp["tokens"].pop(token, None)
+
+
+sc_cp_signin = sc_plain
+sc_cp_unlicensed = sc_plain
+sc_cp_clientid = sc_plain
+sc_cp_wire = sc_read_edit_shell
+sc_cp_wire_an = sc_an_tools
 sc_rs_compaction = sc_compaction
 
 
@@ -5636,6 +5781,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         url, path, prefix = self.route()
         q = urllib.parse.parse_qs(url.query)
+        if path.startswith("/copilot-gh/") or path.startswith("/copilot/"):
+            cp_get(self, url, path)
+            return
         if path.startswith("/chatgpt/"):
             cg_get(self, url, path)
         elif path in ("/v1/models", "/models") and self.headers.get("anthropic-version"):
@@ -5900,6 +6048,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         url, path, prefix = self.route()
         raw = self.body()
+        if path.startswith("/copilot-gh/") or path.startswith("/copilot/"):
+            path = cp_post(self, path, raw)
+            if not path:
+                return
+            if path == "/v1/messages":
+                self.messages(prefix, raw, copilot=True)
+                return
         if path.endswith("/chat/completions"):
             # By model: scenarios running meanwhile send theirs too
             try:
@@ -5953,12 +6108,13 @@ class Handler(BaseHTTPRequestHandler):
             STATE.end(prefix, model)
             STATE.finished(key, n)
 
-    def messages(self, prefix, raw):
-        """Anthropic's Messages API, checked as the API would."""
+    def messages(self, prefix, raw, copilot=False):
+        """Anthropic's Messages API, checked as the API would (Copilot's
+        has checked its own token)."""
         def fail(status, kind, message):
             self.send_json(status, {"type": "error", "error": {
                 "type": kind, "message": message}})
-        if self.headers.get("x-api-key") != AN_KEY:
+        if not copilot and self.headers.get("x-api-key") != AN_KEY:
             fail(401, "authentication_error", "invalid x-api-key")
             return
         if self.headers.get("anthropic-version") != AN_VERSION:

@@ -433,4 +433,63 @@ static void test_responses(Test *t)
         expect(t, "cg.form", mcpauthform(a, &x, "grant_type=refresh_token"),
                "grant_type=refresh_token&client_id=app_EMoamEEZ73f0CkXaXp7hrann");
     }
+    // Copilot: its listing, each model's format, and its URLs
+    {
+        Arena tmp = *a;
+        tmp.beg += (tmp.end - tmp.beg) / 2;
+        Str listing = cplisting(a, tmp,
+            "{\"data\":[{\"id\":\"claude-x\",\"supported_endpoints\":[\"/chat/completions\","
+            "\"/v1/messages\"],\"capabilities\":{\"limits\":{\"max_prompt_tokens\":100,"
+            "\"max_output_tokens\":20,\"max_context_window_tokens\":200}}},"
+            "{\"id\":\"gpt-r\",\"supported_endpoints\":[\"/responses\",\"/chat/completions\"]},"
+            "{\"id\":\"gpt-4o\",\"capabilities\":{\"limits\":{\"max_context_window_tokens\":300}}},"
+            "{\"id\":\"off\",\"policy\":{\"state\":\"disabled\"}},{\"name\":\"no id\"}]}");
+        expect(t, "cp.listing", listing,
+               "{\"object\":\"list\",\"data\":[{\"id\":\"claude-x\",\"object\":\"model\","
+               "\"max_input_tokens\":100,\"max_tokens\":20,\"wire\":\"anthropic\"},"
+               "{\"id\":\"gpt-r\",\"object\":\"model\",\"wire\":\"responses\"},"
+               "{\"id\":\"gpt-4o\",\"object\":\"model\",\"max_input_tokens\":300,"
+               "\"wire\":\"openai\"}]}");
+        ModelInfo mi = parsemodels(*a, listing, "claude-x", 0);
+        expect(t, "cp.listing.info", istr(a, mi.found*1000000 + mi.ctx*1000 + mi.maxout),
+               "1100020");
+        expect(t, "cp.listing.wire", epkindname(mi.wire), "anthropic");
+        expect(t, "cp.listing.other", cplisting(a, tmp, "{\"models\":[]}"), "{\"models\":[]}");
+
+        Str guesses = {};
+        Str ids[] = {"gpt-5.6-luna", "gpt-5-mini", "gpt-6", "gpt-4.1", "gpt-41-copilot",
+                     "grok-4.7", "mai-code-1", "claude-sonnet-5", "gpt-"};
+        for (iz i = 0; i < countof(ids); i++) {
+            guesses = concat(a, guesses, concat(a, epkindname(copilotguess(ids[i])), " "));
+        }
+        expect(t, "cp.guess", guesses, "responses openai responses openai openai "
+                                       "responses responses openai openai ");
+
+        expect(t, "cp.url", copiloturl(a, "https://api.githubcopilot.com/", "models"),
+               "https://api.githubcopilot.com/models");
+        expect(t, "cp.paths", concat(a, concat(a, copilotpath(EP_ANTHROPIC), " "),
+                                     concat(a, concat(a, copilotpath(EP_RESPONSES), " "),
+                                            copilotpath(EP_OPENAI))),
+               "v1/messages responses chat/completions");
+        expect(t, "cp.sameurl", istr(a, sameurl("https://h/", "https://h")*10 +
+                                        sameurl("https://h/x", "https://h")), "10");
+
+        Endpoint ep = {};
+        ep.kind = EP_COPILOT;
+        ep.wire = EP_ANTHROPIC;
+        ep.url  = epkindurl(EP_COPILOT);
+        expect(t, "cp.call", callurl(a, &ep), "https://api.githubcopilot.com/v1/messages");
+        ep.api  = "https://api.individual.githubcopilot.com";
+        ep.wire = EP_OPENAI;
+        expect(t, "cp.call account", callurl(a, &ep),
+               "https://api.individual.githubcopilot.com/chat/completions");
+        expect(t, "cp.models", epurl(a, &ep, eplistpath(EP_COPILOT)),
+               "https://api.individual.githubcopilot.com/models");
+        ep.relay = "x";
+        ep.url   = "relay+copilot://x";
+        ep.wire  = EP_ANTHROPIC;
+        expect(t, "cp.relayed", callurl(a, &ep), "relay+copilot://x/v1/messages");
+        RelayUrl ru = relayurl("relay+copilot://x");
+        expect(t, "cp.relayurl", istr(a, ru.ok*10 + (ru.kind==EP_COPILOT)), "11");
+    }
 }

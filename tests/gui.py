@@ -1825,10 +1825,13 @@ def main():
         # And an endpoint of kind chatgpt, signed in to at the fake's
         # issuer, which the window's stand-in browser visits too
         os.environ["PROSPERO_TEST_CHATGPT_AUTH"] = f"{curl}/chatgpt"
+        # And one of kind copilot, signed in to at the fake's GitHub
+        os.environ["PROSPERO_TEST_COPILOT_AUTH"] = f"{curl}/copilot-gh"
         before = (f"include = {curl}/fake/serve/{nonce}-team.ini\n" +
                   config(curl, model, 60, "\n[mcp web]\ntrust = yes\n"
                          f"\n[endpoint gpt]\nkind = chatgpt\n"
-                         f"url = {curl}/chatgpt/backend-api/codex/responses\n"))
+                         f"url = {curl}/chatgpt/backend-api/codex/responses\n"
+                         f"\n[endpoint cop]\nkind = copilot\nurl = {curl}/copilot\n"))
     elif args.mode == "sessions":
         # A model and a shell to switch to; a remote listed always,
         # never reached, and one listed only while connected
@@ -2026,6 +2029,14 @@ def main():
             problems.append(f"ChatGPT's token requests: {cg}")
         else:
             print("chatgpt: signed in through the stand-in browser")
+        with fake_provider.STATE.lock:
+            cp = [e.get("_poll") or e.get("_device") for e in fake_provider.STATE.cp["log"]
+                  if "_poll" in e or "_device" in e]
+            approved = len(fake_provider.STATE.cp["approved"])
+        if not cp or cp[0] != "/copilot-gh/login/device/code" or approved != 1:
+            problems.append(f"Copilot's device flow: {cp}, {approved} approved")
+        else:
+            print(f"copilot: signed in by the device flow, polled {len(cp) - 1} times")
     if args.mode in ("drive", "e2e", "settings", "enginestop", "sessions", "plan",
                      "firstrun", "mcp", "hosttask", "changes", "thin", "containers"):
         summary = [l for l in lines if "drive:" in l and " checks, " in l]
@@ -2054,8 +2065,8 @@ def main():
                  "\n[model fresh]\nreasoning = reasoning_content\n"
                  "\n[remote box]\nssh = me@box.example\npath = ~/bin/prospero\n"
                  "\n[endpoint gpt]\nkind = anthropic\nurl = http://gpt.example/v1\n"
-                 "\n[endpoint oa]\nkind = chatgpt\n"
-                 "url = https://chatgpt.com/backend-api/codex/responses\n")
+                 "\n[endpoint oa]\nkind = copilot\n"
+                 "url = https://api.githubcopilot.com\n")
         if after != want:
             diff = difflib.unified_diff(want.splitlines(), after.splitlines(),
                                         "expected", "saved", lineterm="", n=1)

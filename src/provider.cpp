@@ -105,9 +105,10 @@ enum : i32 {
     EP_ANTHROPIC,  // Messages (anthropic.cpp)
     EP_RESPONSES,  // Responses (responses.cpp)
     EP_CHATGPT,    // Responses at ChatGPT's Codex backend, signed in
+    EP_COPILOT,    // GitHub Copilot, signed in: each model's own format
 };
 
-static Str const epkinds[] = {"openai", "anthropic", "responses", "chatgpt"};
+static Str const epkinds[] = {"openai", "anthropic", "responses", "chatgpt", "copilot"};
 
 // A kind by its name, openai if unknown.
 static i32 epkindof(Str name)
@@ -129,6 +130,18 @@ static Str epkindname(i32 kind)
 static b32 epresponses(i32 kind)
 {
     return kind==EP_RESPONSES || kind==EP_CHATGPT;
+}
+
+// Whether a kind's endpoint is signed in to, with no key.
+static b32 epsigned(i32 kind)
+{
+    return kind==EP_CHATGPT || kind==EP_COPILOT;
+}
+
+// The service a signed-in kind signs in to, for messages.
+static Str epservice(i32 kind)
+{
+    return kind==EP_COPILOT ? Str("GitHub Copilot") : Str("ChatGPT");
 }
 
 // A model call's path under the API root.
@@ -155,8 +168,45 @@ static Str epkindurl(i32 kind)
     case EP_ANTHROPIC: return "https://api.anthropic.com";
     case EP_RESPONSES: return "https://api.openai.com/v1";
     case EP_CHATGPT:   return "https://chatgpt.com/backend-api/codex/responses";
+    case EP_COPILOT:   return "https://api.githubcopilot.com";
     }
     return {};
+}
+
+// Whether two URLs are the same but for trailing slashes.
+static b32 sameurl(Str a, Str b)
+{
+    for (; a.len && a[a.len-1]=='/'; a.len--) {}
+    for (; b.len && b[b.len-1]=='/'; b.len--) {}
+    return a == b;
+}
+
+// The URL of name under Copilot's API root, which has no /v1/: given
+// "https://api.githubcopilot.com/", "https://api.githubcopilot.com/NAME".
+static Str copiloturl(Arena *a, Str base, Str name)
+{
+    for (; base.len && base[base.len-1]=='/'; base.len--) {}
+    Buf b(a, base.len + name.len + 2);
+    print(&b, base);
+    putbyte(&b, '/');
+    print(&b, name);
+    return finish(&b);
+}
+
+// Kind copilot signs in with GitHub's device flow, as Prospero's own
+// GitHub app unless [endpoint] client_id names another (engine.cpp,
+// "Signing in"). An app GitHub has not endorsed is given only its older
+// models, which take Chat Completions.
+static Str const copilotclient = "Ov23lion1hTLsXGBOJAZ";
+static Str const copilotgithub = "https://github.com";
+static Str const copilotghapi  = "https://api.github.com";
+static Str const copilotapiver = "2026-08-01";
+
+// A Copilot model call's path under its root, for a model of format
+// wire: its Messages are at v1/messages, beside the others' paths.
+static Str copilotpath(i32 wire)
+{
+    return wire==EP_ANTHROPIC ? Str("v1/messages") : eppath(wire);
 }
 
 // A thin engine's endpoint, whose model calls a connected computer makes
@@ -1495,6 +1545,7 @@ struct ModelInfo {
     i64 trained;   // n_ctx_train, scaled, 0 if unknown
     i32 slots;     // --parallel, the server's total_slots, 0 if unknown
     i64 maxout;    // most output tokens in a response, 0 if unknown
+    i32 wire;      // the format it takes, EP_*: Copilot's say (cplisting)
 };
 
 static Str argvalue(Json *args, Str name)
@@ -1526,6 +1577,7 @@ static ModelInfo modelinfo(Json *m, i64 trained)
         return r;
     }
     r.found = 1;
+    r.wire  = epkindof(jsonstr(jsonget(m, "wire")));
 
     i64 maxin  = jsonint(jsonget(m, "max_input_tokens"), 0);
     i64 maxout = jsonint(jsonget(m, "max_tokens"), 0);
@@ -1591,6 +1643,80 @@ static ModelInfo parsemodels(Arena scratch, Str body, Str model, i64 trained)
         }
     }
     return modelinfo(m, trained);
+}
+
+// The format Copilot serves a model in, by its name, for a listing that
+// does not say (as an app GitHub grants only its older models gets):
+// Responses for GPT-5 on (but gpt-5-mini), Grok and MAI-Code, else Chat
+// Completions, as OpenCode guesses.
+static i32 copilotguess(Str id)
+{
+    if (startswith(id, "gpt-") && !startswith(id, "gpt-5-mini")) {
+        Str n = cuthead(id, 4);
+        iz  i = 0;
+        for (; i<n.len && digit(n[i]); i++) {}
+        // Copilot writes gpt-4.1 as gpt-41: a 4x is a gpt-4
+        Int v = parseint(takehead(n, i));
+        if (v.ok && v.val>=5 && !(i==2 && n[0]=='4')) {
+            return EP_RESPONSES;
+        }
+    }
+    return startswith(id, "grok-") || startswith(id, "mai-code-") ? EP_RESPONSES
+                                                                    : EP_OPENAI;
+}
+
+// Copilot's model listing as parsemodels reads one: each model's prompt
+// and output limits (max_input_tokens, max_tokens), and the format it
+// takes (wire): Messages if it lists /v1/messages, else Responses if
+// /responses, else Chat Completions, or by its name (copilotguess) if
+// it lists none. Models its policy turned off are left out. The result
+// is in a, temporaries in tmp; the body as it was if it is no listing.
+static Str cplisting(Arena *a, Arena tmp, Str body)
+{
+    Json *d = jsonget(jsonparse(&tmp, body).root, "data");
+    if (d->type != JSON_ARRAY) {
+        return body;
+    }
+    Buf     b(a, 256 + body.len/4);
+    JsonOut w = {&b};
+    putobject(&w);
+    putstrkey(&w, "object", "list");
+    putkey(&w, "data");
+    putarray(&w);
+    for (Json *m = d->child; m; m = m->next) {
+        Str id = jsonstr(jsonget(m, "id"));
+        if (!id.len || jsonstr(jsonget(jsonget(m, "policy"), "state"))=="disabled") {
+            continue;
+        }
+        Json *lim  = jsonget(jsonget(m, "capabilities"), "limits");
+        i64   in   = jsonint(jsonget(lim, "max_prompt_tokens"), 0);
+        in = in>0 ? in : jsonint(jsonget(lim, "max_context_window_tokens"), 0);
+        i64   out  = jsonint(jsonget(lim, "max_output_tokens"), 0);
+        b32   msgs = 0, rs = 0, chat = 0;
+        Json *eps  = jsonget(m, "supported_endpoints");
+        for (Json *k = eps->child; k; k = k->next) {
+            Str p = jsonstr(k);
+            msgs |= p=="/v1/messages";
+            rs   |= p=="/responses";
+            chat |= p=="/chat/completions";
+        }
+        i32 wire = msgs ? EP_ANTHROPIC : rs ? EP_RESPONSES : chat ? EP_OPENAI
+                                                                  : copilotguess(id);
+        putobject(&w);
+        putstrkey(&w, "id", id);
+        putstrkey(&w, "object", "model");
+        if (in > 0) {
+            putintkey(&w, "max_input_tokens", in);
+        }
+        if (out > 0) {
+            putintkey(&w, "max_tokens", out);
+        }
+        putstrkey(&w, "wire", epkindname(wire));
+        putend(&w);
+    }
+    putend(&w);
+    putend(&w);
+    return finish(&b);
 }
 
 

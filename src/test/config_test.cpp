@@ -1005,6 +1005,7 @@ static void testcfgjson(Test *t)
         "endpoint/team/kind=openai*\n"
         "endpoint/team/url=https://t/@/c/team.ini:2\n"
         "endpoint/team/key=(hidden)@/c/team.ini:3!\n"
+        "endpoint/team/client_id=*\n"
         "endpoint/team/connect_timeout=15*\n"
         "endpoint/team/first_byte_timeout=300*\n"
         "endpoint/team/idle_timeout=90*\n"
@@ -1016,6 +1017,7 @@ static void testcfgjson(Test *t)
         "endpoint/local/kind=openai*\n"
         "endpoint/local/url=http://127.0.0.1:8080/@/c/h.ini:3\n"
         "endpoint/local/key=env:KEY@/c/h.ini:5\n"
+        "endpoint/local/client_id=*\n"
         "endpoint/local/connect_timeout=5*\n"
         "endpoint/local/first_byte_timeout=1800*\n"
         "endpoint/local/idle_timeout=30@/c/h.ini:4\n"
@@ -1114,7 +1116,7 @@ static void testcfgjson(Test *t)
     Json *schema = jsonget(j, "schema");
     expect(t, "json.schema", istr(&a, jsonlen(schema)),
            istr(&a, countof(cfgschema)));
-    Json *ft = jsonat(schema, 6);
+    Json *ft = jsonat(schema, cfgkey("endpoint", "first_byte_timeout") - cfgschema);
     expect(t, "json.schema.key", jsonstr(jsonget(ft, "key")),
            "first_byte_timeout");
     expect(t, "json.schema.type", jsonstr(jsonget(ft, "type")), "seconds");

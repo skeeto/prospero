@@ -11634,12 +11634,14 @@ static void drawmcp(Gui *g, Arena a, Str name)
 // A chatgpt endpoint's sign-in, on its page: who is signed in, as the
 // main host's engine lists it (models, asked as the page shows), with
 // Sign in and Sign out.
-static void drawchatgpt(Gui *g, Arena a, Str name)
+// A signed-in endpoint's state (kind chatgpt, or copilot), Sign in,
+// and while GitHub's code waits to be entered, the code.
+static void drawsignin(Gui *g, Arena a, Str name, b32 copilot)
 {
     f32         sc  = g->scale;
     ImGuiStyle &st  = ImGui::GetStyle();
     GuiHost    *h   = g->main;
-    b32         can = h && hostcan(h, "endpoint.auth");
+    b32         can = h && hostcan(h, copilot ? Str("endpoint.copilot") : Str("endpoint.auth"));
     if (can && g->eplistfor!=name && !h->listid && hostlist(g, h)) {
         g->eplistfor = clone(&g->perm, name);
     }
@@ -11648,7 +11650,7 @@ static void drawchatgpt(Gui *g, Arena a, Str name)
         ep = h->eps[i].name==name ? &h->eps[i] : ep;
     }
     u32 dot  = 0;
-    Str line = epstatus(g, &a, name, &dot);
+    Str line = epstatus(g, &a, name, &dot, copilot);
     pushstr(concat(&a, "chatgpt ", name));
     ImVec2 p  = ImGui::GetCursorScreenPos();
     f32    lh = ImGui::GetTextLineHeight();
@@ -11672,20 +11674,43 @@ static void drawchatgpt(Gui *g, Arena a, Str name)
     itemnamed(g, concat(&a, "endpoint signin ", name));
     if (why.len) {
         whytip(why);
+    } else if (copilot) {
+        itemtip("Sign in through the browser, with a code, with the GitHub "
+                "account whose Copilot it uses, for a token kept in the state "
+                "directory");
     } else {
         itemtip("Sign in through the browser with the ChatGPT account whose "
                 "subscription it uses, for tokens kept in the state directory");
     }
     if (in) {
-        epsignin(g, name);
+        epsignin(g, name, copilot);
     }
     if (signed_) {
         ImGui::SameLine();
         b32 out = ImGui::SmallButton("Sign out");
         itemnamed(g, concat(&a, "endpoint signout ", name));
-        itemtip("Forget the ChatGPT tokens");
+        itemtip(copilot ? "Forget the GitHub token" : "Forget the ChatGPT tokens");
         if (out) {
             mcpcmd(g, CMD_EPLOGOUT, name);
+        }
+    }
+    if (g->mcpname==name && g->mcpcode.len) {
+        // GitHub's code, large, to enter at its page
+        ImGui::Spacing();
+        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->dim);
+        ImGui::TextWrapped("Enter this code at %s, which then asks you to "
+                           "authorize Prospero:", cstr0(&a, g->mcpcodeurl));
+        ImGui::PopStyleColor();
+        ImGui::PushFont(g->fonts.mono, g->fonts.size*1.6f);
+        text(g->mcpcode);
+        ImGui::PopFont();
+        itemnamed(g, concat(&a, "endpoint code ", name));
+        if (ImGui::SmallButton("Copy code")) {
+            ImGui::SetClipboardText(cstr0(&a, g->mcpcode));
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Open GitHub")) {
+            os_guiopenurl(g->os, a, g->mcpcodeurl);
         }
     }
     if (g->mcpmsg.len && g->mcpmsgfor==name) {
@@ -11787,14 +11812,9 @@ static void drawcfgpage(Gui *g)
         drawmcp(g, a, name);
     } else if (kind=="endpoint" && name.len) {
         drawapprove(g, a, kind, name);
-        b32 chatgpt = 0;
-        for (iz i = 0; i < g->cfgrows.len; i++) {
-            CfgRow *r = &g->cfgrows[i];
-            chatgpt |= r->kind=="endpoint" && r->name==name && r->key=="kind" &&
-                       trim(r->value)=="chatgpt";
-        }
-        if (chatgpt) {
-            drawchatgpt(g, a, name);
+        Str epkind = cfgepkind(g, name);
+        if (epkind=="chatgpt" || epkind=="copilot") {
+            drawsignin(g, a, name, epkind=="copilot");
         }
     }
     ImGui::Spacing();
@@ -11874,6 +11894,7 @@ static void drawcfgadd(Gui *g)
             "anthropic: Anthropic's Messages API",
             "responses: OpenAI's Responses API",
             "chatgpt: ChatGPT, signed in to your account",
+            "copilot: GitHub Copilot, signed in to your account",
         };
         static_assert(countof(kinds) == countof(epkinds), "a label for each kind");
         i32 k = g->addepkind>=0 && g->addepkind<(i32)countof(kinds) ? g->addepkind : 0;
@@ -11892,7 +11913,7 @@ static void drawcfgadd(Gui *g)
         namedrect(g, "addkind", at, v2(at.x+cw, at.y+ImGui::GetFrameHeight()));
         Str url = epkindurl(g->addepkind);
         ImGui::PushTextWrapPos(0);
-        ImGui::TextDisabled("%s", cstr0(&a, g->addepkind==EP_CHATGPT ?
+        ImGui::TextDisabled("%s", cstr0(&a, epsigned(g->addepkind) ?
             concat(&a, concat(&a, "URL ", url), ": then Sign in on its page, with "
                    "the account whose subscription it uses") :
             url.len ? concat(&a, "URL ", url) :

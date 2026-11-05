@@ -676,7 +676,7 @@ static void test_events(Test *t)
                "\"answer.always.desktop\",\"skills\",\"plan\",\"queue\",\"message\",\"images\",\"home\",\"bypass\",\"nofolder\",\"dir\",\"config.create\",\"side\",\"background\",\"mcp\",\"models\",\"mcp.auth\",\"task.remote\",\"task.host\",\"memory\",\"shell\","
                "\"git\",\"answer.trust\",\"web\",\"question\",\"files\",\"worktree\",\"worktree.side\","
                "\"trash\",\"relay\",\"question.deadline\",\"ask.deadline\",\"shell.env\",\"call.stop\","
-               "\"cut\",\"approve\",\"files.path\",\"sessions.mention\",\"fork.cwd\",\"endpoint.auth\"]}");
+               "\"cut\",\"approve\",\"files.path\",\"sessions.mention\",\"fork.cwd\",\"endpoint.auth\",\"endpoint.copilot\"]}");
         b.len = 0;
         w = {&b};
         putobject(&w);

@@ -233,7 +233,7 @@ struct CfgKind {
 
 static CfgKind cfgkinds[] = {
     {"",         0, "Defaults for new sessions"},
-    {"endpoint", 1, "A server of models: OpenAI-compatible, Anthropic's, OpenAI's Responses API, or ChatGPT's"},
+    {"endpoint", 1, "A server of models: OpenAI-compatible, Anthropic's, OpenAI's Responses API, ChatGPT's, or GitHub Copilot"},
     {"model",    1, "Settings for one model, named as its endpoint lists it"},
     {"role",     1, "Instructions, a model and tools for one kind of work"},
     {"guard",    0, "Where the file tools may go without asking"},
@@ -273,19 +273,28 @@ static CfgKey cfgschema[] = {
      "Model for new sessions: ENDPOINT/MODEL, or MODEL as the endpoint "
      "names it, at the endpoint above, else at one that lists it"},
 
-    {"endpoint", "kind", CFG_ENUM, "openai", {}, "openai anthropic responses chatgpt",
+    {"endpoint", "kind", CFG_ENUM, "openai", {},
+     "openai anthropic responses chatgpt copilot",
      "endpoint", "The API it speaks: openai (Chat Completions), anthropic "
-     "(Messages), responses (OpenAI's Responses), or chatgpt (Responses at "
-     "ChatGPT, signed in with a ChatGPT account instead of a key)"},
+     "(Messages), responses (OpenAI's Responses), chatgpt (Responses at "
+     "ChatGPT, signed in with a ChatGPT account instead of a key), or "
+     "copilot (GitHub Copilot, signed in with a GitHub account, each model "
+     "in the format it takes)"},
     {"endpoint", "url", CFG_URL, "", {}, {}, "endpoint",
      "Base URL: chat requests go to URL/v1/chat/completions, for kind "
      "anthropic to URL/v1/messages, for responses and chatgpt to "
      "URL/v1/responses, but to URL itself when it ends in "
-     "/chat/completions, /messages or /responses, with no /v1 added"},
+     "/chat/completions, /messages or /responses, with no /v1 added; for "
+     "copilot, under URL with no /v1 added"},
     {"endpoint", "key", CFG_SECRET, "", {}, {}, "endpoint",
      "API key sent as a bearer token, or as x-api-key for kind anthropic, "
-     "as env:NAME, or file:PATH to read it from a file; kind chatgpt "
-     "signs in instead"},
+     "as env:NAME, or file:PATH to read it from a file; kinds chatgpt and "
+     "copilot sign in instead"},
+    {"endpoint", "client_id", CFG_STRING, "", {}, {}, "endpoint",
+     "Signing in, for kinds chatgpt and copilot: the OAuth client to sign "
+     "in as, by default the Codex CLI's for chatgpt, and Prospero's own "
+     "GitHub app for copilot, which GitHub gives only its older models. "
+     "Another client's id is used at your own risk"},
     {"endpoint", "connect_timeout", CFG_SECONDS, "15", "5", {}, "timeouts",
      "Seconds to connect"},
     {"endpoint", "first_byte_timeout", CFG_SECONDS, "300", "1800", {},

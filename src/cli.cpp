@@ -720,7 +720,9 @@ static i32 climain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs, b32 
 //   prospero mcp auth NAME       sign in, through a browser
 //   prospero mcp logout NAME     forget its tokens
 //   prospero endpoint auth NAME  sign in to ChatGPT for an endpoint of
-//                                kind chatgpt, through a browser
+//                                kind chatgpt, through a browser, or to
+//                                GitHub Copilot for one of kind copilot,
+//                                with a code entered in any browser
 //   prospero endpoint logout NAME  forget its tokens
 //   prospero approve             what waits for approval: credentials for
 //                                urls of web includes (see "Approvals")
@@ -731,7 +733,8 @@ static i32 climain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs, b32 
 // Approving takes the url typed back, so that it is one the user saw,
 // and only while the configuration still gives it. The sign-in
 // prints the URL to visit and takes the browser's return at a loopback
-// listener of its own, waiting 10 minutes at most.
+// listener of its own, waiting 10 minutes at most; Copilot's prints
+// GitHub's page and a code, and waits for GitHub to say it was entered.
 
 static Str mcpusage =
 "usage: prospero mcp list [options]\n"
@@ -932,6 +935,49 @@ static i32 mcpmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
             print(&out, name);
             print(&out, ".\n");
             os_print(os, 1, finish(&out));
+        }
+    } else if (ep && trim(cfgget(cfg, "endpoint", name, "kind", 0))=="copilot") {
+        // GitHub's device flow: a code to enter at its page, from any
+        // browser, while the engine waits for it to be
+        Arena a = scratch;
+        Json *r = mcpcliwait(&c, &a, mcpcmdline(&a, CMD_EPAUTH, 1, name), 1, 0);
+        Str   url  = jsonstr(jsonget(r, "url"));
+        Str   uc   = jsonstr(jsonget(r, "code"));
+        if (!jsonint(jsonget(r, "ok"), 0) || !url.len || !uc.len) {
+            print(&out, "prospero: ");
+            print(&out, jsonstr(jsonget(r, "err")));
+            putbyte(&out, '\n');
+            os_print(os, 2, finish(&out));
+            code = 1;
+        } else {
+            print(&out, "To sign in to GitHub Copilot for endpoint ");
+            print(&out, name);
+            print(&out, ", visit this in any browser:\n\n  ");
+            print(&out, url);
+            print(&out, "\n\nand enter the code:\n\n  ");
+            print(&out, uc);
+            print(&out, "\n\n");
+            os_print(os, 1, finish(&out));
+            out.len = 0;
+            Buf     cb(&a, 64);
+            JsonOut cw = {&cb};
+            putobject(&cw);
+            putintkey(&cw, "endpoint", 1);
+            putend(&cw);
+            Json *more = jsonparse(&a, finish(&cb)).root;
+            r = mcpcliwait(&c, &a, mcpcmdline(&a, CMD_MCPCODE, 2, name, more), 2, 0);
+            if (!jsonint(jsonget(r, "ok"), 0)) {
+                print(&out, "prospero: ");
+                print(&out, jsonstr(jsonget(r, "err")));
+                putbyte(&out, '\n');
+                os_print(os, 2, finish(&out));
+                code = 1;
+            } else {
+                print(&out, "Signed in to ");
+                print(&out, name);
+                print(&out, ".\n");
+                os_print(os, 1, finish(&out));
+            }
         }
     } else {
         Arena a    = scratch;

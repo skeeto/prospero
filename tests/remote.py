@@ -106,6 +106,7 @@ fake_provider.SCENARIOS["remote_slow"] = sc_remote_slow
 fake_provider.SCENARIOS["remote_search"] = sc_remote_search
 fake_provider.SCENARIOS["remote_tool"] = sc_remote_tool
 fake_provider.SCENARIOS["remote_big"] = sc_remote_big
+fake_provider.SCENARIOS["remote_an"] = fake_provider.sc_an_plain
 
 
 # Frames
@@ -3498,7 +3499,7 @@ class Served:
 
     def call(self, body, path="v1/chat/completions", base=None, keep=1,
              endpoint="fake", model=None, session="s1", deflate=False, parts=1,
-             kind=None):
+             kind=None, hint=None):
         self.next += 1
         cid = self.next
         data = body if base is None else simpledelta(base, body)
@@ -3519,6 +3520,7 @@ class Served:
                            readms=0, keep=keep, len=len(body), size=size)
                 if kind:
                     obj["kind"] = kind
+                obj.update(hint or {})
                 if z is not None:
                     obj["zlen"] = len(z)
                 if base is not None:
@@ -3648,6 +3650,102 @@ def relay_serve_chatgpt(t):
     t.check(h.get("authorization") == "Bearer " + now["access_token"] and
             h.get("chatgpt-account-id") == "acct-fake" and h.get("session_id") == "thin-s1",
             f"headers {h}")
+
+
+@scenario
+def relay_copilot(t):
+    """A thin host's turn at an endpoint of kind copilot: listed and called
+    through the relay, each call saying who began it (the user, then the
+    agent for the tool's follow-up) and what it is, for Copilot's
+    billing."""
+    thinconfig(t)
+    model = t.model("remote_tool")
+    c, rl = relayclient(t, model, kind="copilot")
+    try:
+        r = c.call("new", cwd=t.work, prompt="go")
+        t.check(r.get("ok") == 1, f"new: {r}")
+        sid = r["sid"]
+        end = c.stream.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid,
+                            timeout=30, what="turn.end")
+        t.check(end.get("why") == "done", f"turn.end {end}")
+        t.check(any(h["method"] == "GET" and h["path"].startswith("v1/models")
+                    for h, b in rl.calls), "a listing relayed")
+        posts = [h for h, b in rl.calls if h["method"] == "POST"]
+        t.check([(h["path"], h.get("kind"), h.get("initiator"), h.get("interaction"))
+                 for h in posts] ==
+                [("v1/chat/completions", "copilot", "user", "conversation-agent"),
+                 ("v1/chat/completions", "copilot", "agent", "conversation-agent")],
+                f"calls: {posts}")
+    finally:
+        rl.stop = True
+
+
+@scenario
+def relay_serve_copilot(t):
+    """A relayed call to an endpoint of kind copilot goes with this
+    engine's own GitHub sign-in, to the path its format takes under the
+    API's root, with who began it and what it is as the thin engine
+    said; words not Copilot's are dropped."""
+    t.write_config(t.url, f"[endpoint cop]\nkind = copilot\nurl = {t.url}/copilot\n")
+    t.env["PROSPERO_TEST_COPILOT_AUTH"] = t.url + "/copilot-gh"
+    p = subprocess.Popen([t.prospero, "endpoint", "auth", "cop", "--state", t.state,
+                          "-c", t.config], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, env=t.env)
+    killer = threading.Timer(30, p.kill)
+    killer.start()
+    try:
+        url = None
+        for line in p.stdout:
+            m = re.search(r"(https?://\S+/login/device)\s*$", line)
+            url = m.group(1) if m else url
+            m = re.search(r"^\s+(FAKE-\d+)\s*$", line)
+            if m and url:
+                urllib.request.urlopen(f"{url}?user_code={m.group(1)}", timeout=10).read()
+                break
+        out, err = p.communicate()
+    finally:
+        killer.cancel()
+    t.check(p.returncode == 0 and "Signed in to cop." in out, f"signed in: {out} {err}")
+    d = os.path.join(t.state, "endpoints", "auth")
+    keep = json.loads(open(os.path.join(d, os.listdir(d)[0])).read())
+
+    c = Client(t)
+    c.attach()
+    c.call("hello")
+    sv = Served(t, c)
+
+    def calls():
+        with fake_provider.STATE.lock:
+            return [e for e in fake_provider.STATE.cp["log"] if "_call" in e]
+
+    model = t.model("remote_slow")
+    a = sv.call(chatbody(model, "hi"), endpoint="cop", model=model, kind="copilot",
+                session="thin-s1", hint={"initiator": "agent",
+                                         "interaction": "conversation-subagent",
+                                         "vision": 1})
+    dn = sv.done(a)
+    t.check(dn["err"] == "ok", f"done: {dn}")
+    t.check("w39" in sv.text(a), f"the response {sv.text(a)[-200:]}")
+    e = calls()[-1]
+    h = e["headers"]
+    t.check(e["_call"] == "/chat/completions" and
+            h.get("authorization") == "Bearer " + keep["access_token"] and
+            h.get("x-initiator") == "agent" and
+            h.get("x-interaction-type") == "conversation-subagent" and
+            h.get("x-interaction-id") == "thin-s1" and
+            h.get("copilot-vision-request") == "true" and
+            h.get("x-github-api-version"), f"call {e}")
+
+    an = t.model("remote_an")
+    body = json.dumps({"model": an, "max_tokens": 100, "stream": True,
+                       "messages": [{"role": "user", "content": "hi"}]}).encode()
+    a = sv.call(body, path="v1/messages", endpoint="cop", model=an, kind="copilot",
+                session="thin-s1", hint={"initiator": "boss", "interaction": "conversation-x"})
+    dn = sv.done(a)
+    e = calls()[-1]
+    h = e["headers"]
+    t.check(dn["err"] == "ok" and e["_call"] == "/v1/messages" and
+            h.get("anthropic-version") and "x-initiator" not in h, f"messages {dn} {e}")
 
 
 @scenario

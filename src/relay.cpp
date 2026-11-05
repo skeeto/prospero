@@ -98,6 +98,7 @@ struct RelayCall {
     Str        model;
     i32        readms;
     i32        kind;     // its endpoint's, EP_*
+    CpHint     hint;     // a copilot endpoint's request, what it is
     b32        keep;     // a turn body, the base of the next
     u64        base;     // the base's hash, with data a delta, else 0
     iz         len;      // of the body
@@ -129,6 +130,8 @@ struct RelayServe {
     Endpoint    ep;
     b32         authwait;  // for a chatgpt endpoint's refresh (epauth)
     b32         authtried; // once: then sent as it is
+    CpHint      hint;      // a copilot endpoint's request, as the thin
+                           // engine says, else empty
     Str         path;
     Str         method;
     Str         accept;
@@ -767,6 +770,12 @@ static RelayCall *relaystart(Engine *e, Endpoint *ep, HttpReq *req,
     c->model     = s && ep ? clone(&a, reqmc(s)->name) : Str{};
     c->readms    = req->readms;
     c->kind      = ep ? ep->kind : EP_OPENAI;
+    if (ep && ep->kind==EP_COPILOT && s) {
+        CpHint h = cphint(s);
+        c->hint.initiator   = clone(&a, h.initiator);
+        c->hint.interaction = clone(&a, h.interaction);
+        c->hint.vision      = h.vision;
+    }
     c->keep      = keep && sid.len;
     c->base      = base;
     c->len       = body.len;
@@ -1062,6 +1071,13 @@ static void relaysend(Engine *e, Arena scratch, RelayServe *v)
     Str path = v->path;
     Str url  = startswith(path, "v1/") ? apiurl(&scratch, v->ep.url, cuthead(path, 3))
                                        : rooturl(&scratch, v->ep.url, path);
+    if (v->ep.kind == EP_COPILOT) {
+        // Copilot's API has no /v1/, but for its Messages
+        Str p      = cut(path, '?').head;
+        v->ep.wire = p=="v1/messages" ? EP_ANTHROPIC :
+                     p=="v1/responses" ? EP_RESPONSES : EP_OPENAI;
+        url = epurl(&scratch, &v->ep, p=="v1/messages" ? path : cuthead(path, 3));
+    }
     HttpReq r = {};
     r.method    = v->method;
     r.url       = url;
@@ -1069,6 +1085,9 @@ static void relaysend(Engine *e, Arena scratch, RelayServe *v)
     if (v->ep.kind == EP_CHATGPT) {
         r.headers = concat(&scratch, r.headers,
                            chatgptheaders(e, &scratch, &v->ep, v->session, 0));
+    } else if (v->ep.kind == EP_COPILOT) {
+        r.headers = concat(&scratch, r.headers,
+                           copilotheaders(e, &scratch, &v->ep, v->session, v->hint));
     }
     r.body      = v->body;
     r.connectms = v->ep.connectms;
@@ -1313,6 +1332,18 @@ static void relayserve(Engine *e, Arena scratch, Json *j, i64 cid, Str origin,
         i64 readms = jsonint(jsonget(j, "readms"), 0);
         v->readms  = (i32)(readms>0 && readms<3600000 ? readms : 0);
         v->keep    = jsonflag(jsonget(j, "keep"), 0);
+        {
+            // What a copilot request is, as the thin engine says, but
+            // only Copilot's own words
+            Str ini = jsonstr(jsonget(j, "initiator"));
+            Str act = jsonstr(jsonget(j, "interaction"));
+            if ((ini=="user" || ini=="agent") && startswith(act, "conversation-") &&
+                    act.len<=40 && relayname(act)) {
+                v->hint.initiator   = clone(&v->arena, ini);
+                v->hint.interaction = clone(&v->arena, act);
+                v->hint.vision      = jsonflag(jsonget(j, "vision"), 0);
+            }
+        }
         v->base    = relayhex(jsonstr(jsonget(j, "base")));
         v->len     = (iz)len;
         v->size    = (iz)size;
@@ -1498,6 +1529,13 @@ static Str relaypart(Engine *e, Arena *a, RelayCall *c)
         putstrkey(&w.json, "accept", c->accept);
         putstrkey(&w.json, "model", c->model);
         putintkey(&w.json, "readms", c->readms);
+        if (c->hint.initiator.len) {
+            putstrkey(&w.json, "initiator", c->hint.initiator);
+            putstrkey(&w.json, "interaction", c->hint.interaction);
+            if (c->hint.vision) {
+                putintkey(&w.json, "vision", 1);
+            }
+        }
         if (c->keep) {
             putintkey(&w.json, "keep", 1);
         }

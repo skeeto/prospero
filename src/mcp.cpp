@@ -761,6 +761,10 @@ enum : i32 {
     MCPAUTH_WAIT,     // the user signs in, in the browser
     MCPAUTH_TOKEN,    // the code exchanged for tokens
     MCPAUTH_REFRESH,  // a refresh token exchanged for new ones
+    MCPAUTH_DEVICE,   // GitHub's device flow (kind copilot): a code asked for
+    MCPAUTH_POLL,     // GitHub asked, every few seconds, if it was entered
+    MCPAUTH_USER,     // and then about the account
+    MCPAUTH_DONE,     // ended, err saying how, kept for mcp.code a while
 };
 
 // A sign-in under way, or a refresh: in a region of its own. Its
@@ -790,6 +794,11 @@ struct McpAuth {
     Str        clientname;  // registering
     Str        secret;
     Str        refresh;   // the refresh token, refreshing
+    Str        device;    // the device flow's: GitHub's device code,
+    Str        access;    // the token it gave,
+    i64        every;     // ticks between polls,
+    i64        pollat;    // the next poll, 0 while one is under way,
+    Str        err;       // and how it ended (MCPAUTH_DONE), null if well
     Str        verifier;  // PKCE
     Str        state;
     i64        cmd;       // the command that waits for it, 0 if none
