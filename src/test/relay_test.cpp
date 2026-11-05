@@ -7,10 +7,14 @@ static void testrelayurl(Test *t)
     Arena a = t->perm;
     struct {
         Str url;
-        Str want;  // name, ":a" if anthropic, "-" if not a relay URL
+        Str want;  // name, ":KIND" if not openai, "-" if not a relay URL
     } cases[] = {
         {"relay://fake",            "fake"},
-        {"relay+anthropic://an.1",  "an.1:a"},
+        {"relay+anthropic://an.1",  "an.1:anthropic"},
+        {"relay+responses://r",     "r:responses"},
+        {"relay+chatgpt://c",       "c:chatgpt"},
+        {"relay+nosuch://x",        "-"},
+        {"relay+chatgpt:/c",        "-"},
         {"relay://",                "-"},
         {"relay://a/b",             "-"},
         {"relay://a b",             "-"},
@@ -19,8 +23,14 @@ static void testrelayurl(Test *t)
     };
     for (iz i = 0; i < countof(cases); i++) {
         RelayUrl u   = relayurl(cases[i].url);
-        Str      got = !u.ok ? Str("-") : u.anthropic ? concat(&a, u.name, ":a") : u.name;
+        Str      got = !u.ok ? Str("-") :
+                       u.kind ? concat(&a, concat(&a, u.name, ":"), epkindname(u.kind))
+                              : u.name;
         expect(t, concat(&a, "relayurl ", cases[i].url), got, cases[i].want);
+        if (u.ok) {
+            expect(t, concat(&a, "relayurlof ", cases[i].url),
+                   relayurlof(&a, u.kind, u.name), cases[i].url);
+        }
     }
     expect(t, "endpointurl", istr(&a, endpointurl("relay://x") && endpointurl("http://h/")
                                       && !endpointurl("x")), "1");
@@ -42,6 +52,7 @@ static void testrelayparse(Test *t)
         "\"key\":\"sk-2\",\"first_byte_timeout\":\"5\",\"connect_timeout\":\"1\","
         "\"slow_retry_budget\":\"60\",\"models\":[\"m1\",\"m2\\nx\"]},"
         "{\"name\":\"an\",\"kind\":\"anthropic\",\"idle_timeout\":\"9\\n[x]\"},"
+        "{\"name\":\"gpt\",\"kind\":\"chatgpt\"},{\"name\":\"next\",\"kind\":\"future\"},"
         "{\"name\":\"bad name\"},{\"name\":\"fake\"}],"
         "\"models\":["
         "{\"name\":\"m1\",\"settings\":{\"context\":\"1000\",\"like\":\"x\","
@@ -61,9 +72,9 @@ static void testrelayparse(Test *t)
     expect(t, "relayparse.own.ok", q.own, "9f");
     relayparse(&q, &a, jsonparse(&a, "{\"own\":\"x\\n[y]\"}").root);
     expect(t, "relayparse.own.bad", istr(&a, q.own.len), "0");
-    expect(t, "relayparse.eps", istr(&a, p.eps.len), "2");
+    expect(t, "relayparse.eps", istr(&a, p.eps.len), "3");
     expect(t, "relayparse.models", istr(&a, p.eps[0].models.len), "1");
-    expect(t, "relayparse.kind", istr(&a, p.eps[1].anthropic), "1");
+    expect(t, "relayparse.kind", istr(&a, p.eps[1].kind), istr(&a, EP_ANTHROPIC));
     expect(t, "relayparse.layer", p.layer,
            "# relayed from mybox.localwithaverylongnamethatgoesonandonandonpastsixty-three\n"
            "endpoint = fake\n"
@@ -76,6 +87,9 @@ static void testrelayparse(Test *t)
            "[endpoint an]\n"
            "url = relay+anthropic://an\n"
            "kind = anthropic\n"
+           "[endpoint gpt]\n"
+           "url = relay+chatgpt://gpt\n"
+           "kind = chatgpt\n"
            "[model m1]\n"
            "context = 1000\n"
            "template.enable_thinking = false\n");

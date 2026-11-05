@@ -20,6 +20,13 @@ A compaction request (its system prompt is the summarizer's) is counted
 apart, as model "M#compact", and answered by the scenario's function
 named SCENARIO_compact if there is one, else with a short summary.
 
+OpenAI's Responses API (POST /v1/responses) takes the same model names
+and runs the same scenarios: a request is checked as the API would with
+nothing stored (store false, no item ids, strict false tools, reasoning
+back with the encrypted_content this server gave it), turned into a Chat
+Completions request as llama.cpp turns it, and the scenario's chunks are
+answered as Responses events.
+
 Anthropic's Messages API (POST /v1/messages) takes the same model names,
 and its scenarios, named an_*, answer with its events. It checks each
 request as the real API would, and stricter: the key (AN_KEY, as x-api-key)
@@ -88,6 +95,7 @@ class State:
         self.caches = {}    # Anthropic: model -> {prefix hash: tokens}
         self.listings = []  # Anthropic: headers of /v1/models requests
         self.web = []       # web tools: requests to /web/ and /searxng/
+        self.encs = {}      # Responses: encrypted_content -> its reasoning
         self.stop = threading.Event()
 
     def register(self, model, **listing):
@@ -5125,6 +5133,311 @@ def sc_web_task_b(model, n, req):
         f"imagine https://docs.example.com/{nonce}/hidden too."])
 
 
+# OpenAI's Responses API: requests checked as the API would with nothing
+# stored, run as Chat Completions requests through the same scenarios,
+# and answered with Responses events. Reasoning gets encrypted content
+# that must come back verbatim, with its summary unchanged.
+
+def rs_enc(model, text):
+    enc = "enc_" + hashlib.sha256((model + "\0" + text).encode()).hexdigest()[:24]
+    with STATE.lock:
+        STATE.encs[enc] = text
+    return enc
+
+
+def rs_check(req):
+    """Why the API would refuse the request, or None."""
+    if req.get("store") is not False:
+        return "store must be false: nothing is kept here"
+    if req.get("stream") is not True:
+        return "stream must be true"
+    if "reasoning.encrypted_content" not in req.get("include", []):
+        return "include must ask for reasoning.encrypted_content"
+    if not isinstance(req.get("instructions"), str):
+        return "instructions must be a string"
+    for x in req.get("tools", []):
+        if x.get("type") != "function" or x.get("strict") is not False or "function" in x:
+            return f"a tool not flat with strict false: {x}"
+    calls = set()
+    for i, item in enumerate(req.get("input", [])):
+        kind = item.get("type")
+        where = f"input[{i}]"
+        if "id" in item:
+            return f"{where}: an item id, but nothing is stored"
+        if kind == "message":
+            role = item.get("role")
+            want = {"user": ("input_text", "input_image"),
+                    "assistant": ("output_text",)}.get(role)
+            if not want or not item.get("content"):
+                return f"{where}: a message of role {role!r} or no content"
+            for c in item["content"]:
+                if c.get("type") not in want:
+                    return f"{where}: content {c.get('type')} in a {role} message"
+                if c["type"] == "input_image" and \
+                        not str(c.get("image_url", "")).startswith("data:image/"):
+                    return f"{where}: an image not a data URL"
+                if c["type"] == "output_text" and not c.get("text", "").strip():
+                    return f"{where}: blank output_text"
+        elif kind == "function_call":
+            if not all(isinstance(item.get(k), str) for k in ("call_id", "name", "arguments")):
+                return f"{where}: a call without call_id, name or arguments"
+            try:
+                json.loads(item["arguments"])
+            except ValueError:
+                return f"{where}: arguments not JSON"
+            calls.add(item["call_id"])
+        elif kind == "function_call_output":
+            if item.get("call_id") not in calls:
+                return f"{where}: output of no call before it: {item.get('call_id')}"
+            if not isinstance(item.get("output"), str):
+                return f"{where}: output not a string"
+        elif kind == "reasoning":
+            enc = item.get("encrypted_content")
+            summary = "".join(s.get("text", "") for s in item.get("summary", []))
+            if enc is not None:
+                with STATE.lock:
+                    known = STATE.encs.get(enc)
+                if known is None:
+                    return f"{where}: encrypted_content not given by this server"
+                if summary and summary != known:
+                    return f"{where}: the summary changed"
+            elif not item.get("content") or item.get("summary") != []:
+                return f"{where}: reasoning without encrypted_content or text"
+        else:
+            return f"{where}: unknown item type {kind}"
+    return None
+
+
+def rs_tochat(req):
+    """The request as Chat Completions, as llama.cpp converts it."""
+    msgs = [{"role": "system", "content": req.get("instructions", "")}]
+    def asst():
+        if msgs[-1].get("role") != "assistant":
+            msgs.append({"role": "assistant", "content": ""})
+        return msgs[-1]
+    for item in req.get("input", []):
+        kind = item.get("type")
+        if kind == "message" and item.get("role") == "user":
+            parts = item["content"]
+            if all(c["type"] == "input_text" for c in parts):
+                msgs.append({"role": "user", "content": "".join(c["text"] for c in parts)})
+            else:
+                msgs.append({"role": "user", "content": [
+                    {"type": "text", "text": c["text"]} if c["type"] == "input_text" else
+                    {"type": "image_url", "image_url": {"url": c["image_url"]}}
+                    for c in parts]})
+        elif kind == "message":
+            a = asst()
+            a["content"] += "".join(c.get("text", "") for c in item["content"])
+        elif kind == "function_call":
+            asst().setdefault("tool_calls", []).append({
+                "id": item["call_id"], "type": "function",
+                "function": {"name": item["name"], "arguments": item["arguments"]}})
+        elif kind == "function_call_output":
+            msgs.append({"role": "tool", "tool_call_id": item["call_id"],
+                         "content": item["output"]})
+        elif kind == "reasoning":
+            text = "".join(s.get("text", "") for s in item.get("summary", [])) or \
+                   "".join(c.get("text", "") for c in item.get("content", []))
+            a = asst()
+            a["reasoning_content"] = a.get("reasoning_content", "") + text
+    chat = {k: v for k, v in req.items()
+            if k not in ("input", "instructions", "tools", "include", "store")}
+    chat["messages"] = msgs
+    if req.get("tools"):
+        chat["tools"] = [{"type": "function", "function": {
+            "name": x["name"], "description": x.get("description", ""),
+            "parameters": x.get("parameters", {})}} for x in req["tools"]]
+    return chat
+
+
+class RsStream:
+    """Chat Completions chunks as Responses events."""
+
+    def __init__(self, model):
+        self.model = model
+        self.items = {}   # key -> item, by first sight
+        self.order = []
+        self.finish = None
+        self.usage = None
+        self.ended = False
+
+    def ev(self, obj):
+        return S.raw(f"event: {obj['type']}\ndata: {json.dumps(obj)}\n\n")
+
+    def item(self, key, made):
+        out = []
+        if key not in self.items:
+            it = made()
+            it["id"] = f"{it['type'][:2]}_{len(self.order)}"
+            self.items[key] = it
+            self.order.append(key)
+            out.append(self.ev({"type": "response.output_item.added",
+                                "output_index": self.order.index(key), "item": dict(it)}))
+        return self.items[key], out
+
+    def whole(self, key):
+        it = dict(self.items[key])
+        if it["type"] == "reasoning":
+            text = it.pop("_text", "")
+            it["summary"] = [{"type": "summary_text", "text": text}] if text else []
+            it["encrypted_content"] = rs_enc(self.model, text)
+        elif it["type"] == "message":
+            it["content"] = [{"type": "output_text", "text": it.pop("_text", "")}]
+        return it
+
+    def end(self):
+        if self.ended:
+            return []
+        self.ended = True
+        out = [self.ev({"type": "response.output_item.done",
+                        "output_index": i, "item": self.whole(k)})
+               for i, k in enumerate(self.order)]
+        u = self.usage or {}
+        usage = {"input_tokens": u.get("prompt_tokens", 0),
+                 "output_tokens": u.get("completion_tokens", 0),
+                 "input_tokens_details": {
+                     "cached_tokens": (u.get("prompt_tokens_details") or {}).get(
+                         "cached_tokens", self.cache_n)}}
+        resp = {"id": "resp_fake", "object": "response", "usage": usage,
+                "output": [self.whole(k) for k in self.order]}
+        if self.finish == "length":
+            resp["status"] = "incomplete"
+            resp["incomplete_details"] = {"reason": "max_output_tokens"}
+            out.append(self.ev({"type": "response.incomplete", "response": resp}))
+        else:
+            resp["status"] = "completed"
+            out.append(self.ev({"type": "response.completed", "response": resp}))
+        return out
+
+    cache_n = 0
+
+    def chunk(self, obj):
+        out = []
+        if "error" in obj:
+            e = obj["error"]
+            code = e.get("code")
+            out.append(self.ev({"type": "response.failed", "response": {
+                "status": "failed", "error": {
+                    "code": code if isinstance(code, str) else "server_error",
+                    "message": e.get("message", "")}}}))
+            return out
+        if obj.get("prompt_progress"):
+            out.append(self.ev({"type": "response.in_progress",
+                                "response": {"id": "resp_fake"},
+                                "prompt_progress": obj["prompt_progress"]}))
+        for ch in obj.get("choices", []):
+            d = ch.get("delta") or {}
+            r = d.get("reasoning_content")
+            if r:
+                it, o = self.item("r", lambda: {"type": "reasoning", "summary": []})
+                out += o
+                it["_text"] = it.get("_text", "") + r
+                out.append(self.ev({"type": "response.reasoning_summary_text.delta",
+                                    "item_id": it["id"], "delta": r}))
+            c = d.get("content")
+            if c:
+                it, o = self.item("m", lambda: {"type": "message", "role": "assistant",
+                                                "content": []})
+                out += o
+                it["_text"] = it.get("_text", "") + c
+                out.append(self.ev({"type": "response.output_text.delta",
+                                    "item_id": it["id"], "delta": c}))
+            for tc in d.get("tool_calls", []):
+                fn = tc.get("function", {})
+                it, o = self.item(("c", tc.get("index", 0)), lambda: {
+                    "type": "function_call", "call_id": tc.get("id", ""),
+                    "name": fn.get("name", ""), "arguments": ""})
+                out += o
+                args = fn.get("arguments", "")
+                if args:
+                    it["arguments"] += args
+                    out.append(self.ev({"type": "response.function_call_arguments.delta",
+                                        "item_id": it["id"], "delta": args}))
+            if ch.get("finish_reason"):
+                self.finish = ch["finish_reason"]
+        if obj.get("usage"):
+            self.usage = obj["usage"]
+            self.cache_n = (obj.get("timings") or {}).get("cache_n", 0)
+            if self.finish:
+                out += self.end()
+        return out
+
+    def actions(self, actions):
+        created = False
+        for a in actions:
+            if a[0] == "data":
+                if not created:
+                    created = True
+                    yield self.ev({"type": "response.created",
+                                   "response": {"id": "resp_fake", "status": "in_progress"}})
+                yield from self.chunk(a[1])
+            elif a[0] == "raw" and a[1].strip() == "data: [DONE]":
+                if self.finish:
+                    yield from self.end()
+            else:
+                yield a
+
+
+def rs_handle(handler, prefix, raw):
+    """POST /v1/responses: checked, run, and answered."""
+    def fail(status, message, code="invalid_request_error"):
+        handler.send_json(status, {"error": {"message": message, "type": code,
+                                             "code": None}})
+    try:
+        req = json.loads(raw)
+    except ValueError:
+        fail(400, "invalid JSON body")
+        return
+    model = req.get("model", "")
+    parts = model.split(":")
+    name = parts[1] if len(parts) > 1 and parts[0] == "fake" else ""
+    fn = SCENARIOS.get(name)
+    if not fn:
+        fail(404, f"The model `{model}` does not exist", "model_not_found")
+        return
+    chat = rs_tochat(req)
+    key = model
+    if is_compaction(chat):
+        key = model + "#compact"
+        fn = SCENARIOS.get(name + "_compact", compact_default)
+    headers = {k.lower(): v for k, v in handler.headers.items()}
+    n = STATE.take(key, req, headers)
+    STATE.begin(prefix, model)
+    try:
+        err = rs_check(req)
+        if err:
+            fail(400, err)
+        else:
+            handler.perform(RsStream(model).actions(fn(model, n, chat)))
+    finally:
+        STATE.end(prefix, model)
+        STATE.finished(key, n)
+
+
+# Scenarios run over the Responses API, by the name its scenario has
+sc_rs_plain = sc_plain
+sc_rs_read_edit_shell = sc_read_edit_shell
+sc_rs_length_think = sc_length_think
+sc_rs_midstream_error = sc_midstream_error
+sc_rs_drop_args = sc_drop_args
+sc_rs_compaction = sc_compaction
+
+
+def sc_rs_reasoning(model, n, req):
+    # Reasoning and a call, then reasoning and the answer: the first
+    # reasoning must come back with its encrypted content (rs_check)
+    yield S.head()
+    if n == 0:
+        yield from think(model, "Plan: read it.", 2)
+        yield from call(model, 0, "call_r0", "read", {"path": "hello.txt"}, 2)
+        yield from finish(model, "tool_calls")
+    else:
+        yield from think(model, "It says hello.")
+        yield from text(model, "It says hello.", 2)
+        yield from finish(model)
+
+
 SCENARIOS = {name[3:]: fn for name, fn in globals().items()
              if name.startswith("sc_")}
 
@@ -5455,6 +5768,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/v1/messages":
             self.messages(prefix, raw)
+            return
+        if path in ("/v1/responses", "/responses"):
+            rs_handle(self, prefix, raw)
             return
         if path not in ("/v1/chat/completions", "/chat/completions"):
             self.send_json(404, {"error": {"message": "not found"}})

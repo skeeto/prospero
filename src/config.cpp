@@ -273,15 +273,19 @@ static CfgKey cfgschema[] = {
      "Model for new sessions: ENDPOINT/MODEL, or MODEL as the endpoint "
      "names it, at the endpoint above, else at one that lists it"},
 
+    {"endpoint", "kind", CFG_ENUM, "openai", {}, "openai anthropic responses chatgpt",
+     "endpoint", "The API it speaks: openai (Chat Completions), anthropic "
+     "(Messages), responses (OpenAI's Responses), or chatgpt (Responses at "
+     "ChatGPT, signed in with a ChatGPT account instead of a key)"},
     {"endpoint", "url", CFG_URL, "", {}, {}, "endpoint",
-     "Base URL: chat requests go to URL/v1/chat/completions, or for kind "
-     "anthropic to URL/v1/messages, but to URL itself when it ends in "
-     "/chat/completions or /messages, with no /v1 added"},
-    {"endpoint", "kind", CFG_ENUM, "openai", {}, "openai anthropic", "endpoint",
-     "The API it speaks: openai (Chat Completions) or anthropic (Messages)"},
+     "Base URL: chat requests go to URL/v1/chat/completions, for kind "
+     "anthropic to URL/v1/messages, for responses and chatgpt to "
+     "URL/v1/responses, but to URL itself when it ends in "
+     "/chat/completions, /messages or /responses, with no /v1 added"},
     {"endpoint", "key", CFG_SECRET, "", {}, {}, "endpoint",
      "API key sent as a bearer token, or as x-api-key for kind anthropic, "
-     "as env:NAME, or file:PATH to read it from a file"},
+     "as env:NAME, or file:PATH to read it from a file; kind chatgpt "
+     "signs in instead"},
     {"endpoint", "connect_timeout", CFG_SECONDS, "15", "5", {}, "timeouts",
      "Seconds to connect"},
     {"endpoint", "first_byte_timeout", CFG_SECONDS, "300", "1800", {},
@@ -340,9 +344,10 @@ static CfgKey cfgschema[] = {
     {"model", "thinking_display", CFG_ENUM, "summarized", {},
      "summarized omitted", "model",
      "Anthropic: summarized reasoning to show, or omitted"},
-    {"model", "effort", CFG_ENUM, "", {}, "low medium high xhigh max", "model",
-     "Anthropic: how much the model thinks and writes, by default its own "
-     "default"},
+    {"model", "effort", CFG_ENUM, "", {}, "none minimal low medium high xhigh max",
+     "model", "How much the model thinks and writes, by default its own "
+     "default: Anthropic's output_config.effort (low to max), or the "
+     "Responses API's reasoning.effort (none to xhigh)"},
     {"model", "vision", CFG_BOOL, "true", {}, {}, "model",
      "Whether the model takes images: the desktop tool's screenshots and "
      "image files read"},

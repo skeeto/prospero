@@ -99,13 +99,64 @@ static Url parseurl(Str s)
     return r;
 }
 
+// The request format an endpoint takes ([endpoint] kind).
+enum : i32 {
+    EP_OPENAI,     // Chat Completions
+    EP_ANTHROPIC,  // Messages (anthropic.cpp)
+    EP_RESPONSES,  // Responses (responses.cpp)
+    EP_CHATGPT,    // Responses at ChatGPT's Codex backend, signed in
+};
+
+static Str const epkinds[] = {"openai", "anthropic", "responses", "chatgpt"};
+
+// A kind by its name, openai if unknown.
+static i32 epkindof(Str name)
+{
+    for (i32 i = 0; i < (i32)countof(epkinds); i++) {
+        if (epkinds[i] == name) {
+            return i;
+        }
+    }
+    return EP_OPENAI;
+}
+
+static Str epkindname(i32 kind)
+{
+    return kind>=0 && kind<(i32)countof(epkinds) ? epkinds[kind] : epkinds[0];
+}
+
+// Whether a kind speaks the Responses API.
+static b32 epresponses(i32 kind)
+{
+    return kind==EP_RESPONSES || kind==EP_CHATGPT;
+}
+
+// A model call's path under the API root.
+static Str eppath(i32 kind)
+{
+    return kind==EP_ANTHROPIC ? Str("messages") :
+           epresponses(kind)  ? Str("responses") : Str("chat/completions");
+}
+
+// The URL of a kind's own service, which Settings fills in, or null for
+// a kind any server may speak.
+static Str epkindurl(i32 kind)
+{
+    switch (kind) {
+    case EP_ANTHROPIC: return "https://api.anthropic.com";
+    case EP_RESPONSES: return "https://api.openai.com/v1";
+    case EP_CHATGPT:   return "https://chatgpt.com/backend-api/codex/responses";
+    }
+    return {};
+}
+
 // A thin engine's endpoint, whose model calls a connected computer makes
-// (relay.cpp): relay://NAME for kind openai, relay+anthropic://NAME for
-// anthropic, NAME being the [endpoint] section it offered. The URL is
-// the endpoint's identity, the kind included.
+// (relay.cpp): relay://NAME for kind openai, relay+KIND://NAME for the
+// others (relay+anthropic://NAME), NAME being the [endpoint] section it
+// offered. The URL is the endpoint's identity, the kind included.
 struct RelayUrl {
     Str name;
-    b32 anthropic;
+    i32 kind;
     b32 ok;
 };
 
@@ -125,12 +176,23 @@ static RelayUrl relayurl(Str s)
     RelayUrl r = {};
     if (startswith(s, "relay://")) {
         r.name = cuthead(s, 8);
-    } else if (startswith(s, "relay+anthropic://")) {
-        r.name      = cuthead(s, 18);
-        r.anthropic = 1;
+    } else if (startswith(s, "relay+")) {
+        Cut c = cut(cuthead(s, 6), ':');
+        r.kind = epkindof(c.head);
+        if (r.kind!=EP_OPENAI && startswith(c.tail, "//")) {
+            r.name = cuthead(c.tail, 2);
+        }
     }
     r.ok = relayname(r.name);
     return r;
+}
+
+// A relayed endpoint's URL, of its kind.
+static Str relayurlof(Arena *a, i32 kind, Str name)
+{
+    Str scheme = kind==EP_OPENAI ? Str("relay://")
+                                 : concat(a, concat(a, "relay+", epkindname(kind)), "://");
+    return concat(a, scheme, name);
 }
 
 // An endpoint's URL, real or relayed.
@@ -187,9 +249,10 @@ static b32 localhost(Str host)
 }
 
 // An endpoint URL less trailing slashes and any request path it names in
-// full. Given "http://h/x/chat/completions" (or "/messages"), the root is
-// "http://h/x" and full is set: that API takes requests as named, with no
-// /v1 added, for proxies and providers with no /v1 in their paths.
+// full. Given "http://h/x/chat/completions" (or "/messages", or
+// "/responses"), the root is "http://h/x" and full is set: that API
+// takes requests as named, with no /v1 added, for proxies and providers
+// with no /v1 in their paths.
 static Str apiroot(Str base, b32 *full)
 {
     for (; base.len && base[base.len-1]=='/'; base.len--) {}
@@ -198,6 +261,8 @@ static Str apiroot(Str base, b32 *full)
         base.len -= 17;
     } else if (endswith(base, "/messages")) {
         base.len -= 9;
+    } else if (endswith(base, "/responses")) {
+        base.len -= 10;
     } else {
         *full = 0;
     }
@@ -474,12 +539,6 @@ struct Extra {
     Str json;
 };
 
-// The request format an endpoint takes ([endpoint] kind).
-enum : i32 {
-    EP_OPENAI,     // Chat Completions
-    EP_ANTHROPIC,  // Messages (anthropic.cpp)
-};
-
 // How an Anthropic model is asked to think ([model] thinking).
 enum : i32 {
     THINK_ADAPTIVE,  // the model decides how much
@@ -522,6 +581,7 @@ struct ChatReq {
     i64        thinkfrom;  // reasoning of messages older than this seq
                            // is not sent back (Anthropic: compaction
                            // changed what it was bound to)
+    Str        cachekey;   // the Responses API's prompt_cache_key, if any
 };
 
 // Base64 data as a JSON string, put raw (base64 needs no escapes): as
@@ -789,6 +849,8 @@ struct Partial {
     i32              nblocks;
     Slice<PartCall>  calls;
     Slice<PartBlock> parts;       // blocks numbered by the server
+    Slice<Str>       items;       // the Responses API's item ids, whose
+                                  // positions number its blocks
     b32              indexed;     // so numbered: parts, not think and text
     Str              finish;      // finish_reason, null until one arrives
     Str              id;          // the completion's, null until one arrives

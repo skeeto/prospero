@@ -6741,6 +6741,140 @@ def eval_own(t):
             and "[model" not in out, f"summary:\n{out}")
 
 
+# OpenAI's Responses API (kind responses), against the fake's Responses
+# mode, which refuses (400) any request the API would with nothing stored
+# and answers the scenarios' chunks as Responses events
+
+RS = {"kind": "responses"}
+
+
+def rsok(t, r):
+    t.check(r.rc == 0, f"exit {r.rc}: {r.last('turn.end')} {r.stderr}")
+
+
+def rsinput(req):
+    return req["body"]["input"]
+
+
+@scenario(conf=RS, bound=5)
+def rs_plain(t):
+    """A plain answer: instructions, the prompt as an input item, nothing
+    stored, reasoning's encrypted content asked for, the session as the
+    cache key, and the usage counted."""
+    r = t.run()
+    rsok(t, r)
+    t.seq(r, ["session", "user", "title", "turn", "attempt", "assistant", "turn.end"])
+    t.check(r.text() == "Hello! This is a plain answer.", f"text {r.text()!r}")
+    t.check(not r.all("retry"), "no retries")
+    reqs = t.requests()
+    t.check(len(reqs) == 1, f"one request: {len(reqs)}")
+    body = reqs[0]["body"]
+    t.check(body["input"] == [{"type": "message", "role": "user", "content": [
+        {"type": "input_text", "text": "go"}]}], f"input {body['input']}")
+    t.check(body["instructions"].startswith("You are"), "the system prompt as instructions")
+    t.check(body["store"] is False and body["stream"] is True and
+            body["include"] == ["reasoning.encrypted_content"], "nothing stored")
+    t.check(body["prompt_cache_key"] == r.events[0].get("sid"), "the session as cache key")
+    t.check("messages" not in body and "stream_options" not in body, "no chat fields")
+    t.check(all(x["type"] == "function" and x["strict"] is False and "parameters" in x
+                for x in body["tools"]), "flat tools")
+    u = r.last("assistant").get("usage", {})
+    t.check(u.get("in") == 100 and u.get("out") == 10, f"usage {u}")
+
+
+@scenario(conf=RS, bound=10)
+def rs_read_edit_shell(t):
+    """Tools over the Responses API: calls and their outputs as items, and
+    each request's input extends the last one's."""
+    t.put("hello.txt", "hello world\n")
+    r = t.run()
+    rsok(t, r)
+    ends = r.all("tool.end")
+    t.check([e["status"] for e in ends] == ["ok", "ok", "ok"],
+            f"statuses {[e['status'] for e in ends]}")
+    t.check(t.file("hello.txt") == "hello there\n", "the edit landed")
+    reqs = [rsinput(x) for x in t.requests()]
+    for a, b in zip(reqs, reqs[1:]):
+        t.check(b[:len(a)] == a, "each request extends the previous one")
+    last = reqs[-1]
+    t.check([x["type"] for x in last[1:3]] == ["function_call", "function_call_output"] and
+            last[1]["call_id"] == last[2]["call_id"], f"a call and its output: {last[1:3]}")
+
+
+@scenario(conf=RS, bound=10)
+def rs_reasoning(t):
+    """Reasoning streams as its summary, and goes back in the next request
+    with the encrypted content the server gave it, before its call."""
+    t.put("hello.txt", "hello world\n")
+    r = t.run()
+    rsok(t, r)
+    t.check(r.text() == "It says hello.", f"text {r.text()!r}")
+    first = r.all("assistant")[0]
+    t.check(any(b.get("t") == "think" and b.get("text") == "Plan: read it."
+                for b in first.get("blocks", [])), f"the reasoning kept: {first}")
+    second = rsinput(t.requests()[1])
+    kinds = [x["type"] for x in second]
+    t.check(kinds[:4] == ["message", "reasoning", "function_call", "function_call_output"],
+            f"items {kinds}")
+    rs = second[1]
+    t.check(rs.get("encrypted_content", "").startswith("enc_") and
+            rs.get("summary") == [{"type": "summary_text", "text": "Plan: read it."}],
+            f"reasoning back: {rs}")
+
+
+@scenario(conf=RS, bound=8)
+def rs_length_think(t):
+    """An incomplete response, stopped at max_output_tokens, is a length
+    stop."""
+    r = t.run()
+    rsok(t, r)
+    t.check([n["kind"] for n in r.all("nudge")] == ["length"], "a length nudge")
+    t.check(r.all("assistant")[0]["finish"] == "length", "the stop is recorded")
+
+
+@scenario(conf=RS, bound=8)
+def rs_midstream_error(t):
+    """A failed response mid-stream is retried."""
+    r = t.run()
+    rsok(t, r)
+    rt = r.last("retry")
+    t.check("Context size has been exceeded" in rt.get("msg", ""), f"retry {rt}")
+    t.check(r.text() == "Second try worked.", f"text {r.text()!r}")
+
+
+@scenario(conf=RS, bound=10)
+def rs_drop_args(t):
+    """A call cut off by a dropped connection runs once, as over Chat
+    Completions."""
+    r = t.run()
+    rsok(t, r)
+    t.check(t.file("count.txt") == "once\n", f"executed exactly once: {t.file('count.txt')!r}")
+    t.check(len(r.all("tool.start")) == 1, "one tool run")
+
+
+@scenario(conf=dict(SMALL, **RS), bound=25, alone=True)
+def rs_compaction(t):
+    """Compaction over the Responses API: the summarizer's request has
+    its system prompt as instructions and no tools, and the checkpoint
+    follows."""
+    bigfiles(t, 8, 150)
+    r = t.run()
+    rsok(t, r)
+    t.check(r.text() == "All files read.", f"text {r.text()!r}")
+    cps = r.all("compact")
+    t.check(len(cps) == 1 and cps[0]["kind"] == "summary", f"one summary: {cps}")
+    sreq = t.compactions()
+    t.check(len(sreq) == 1, f"one summary request: {len(sreq)}")
+    body = sreq[0]["body"]
+    t.check("tools" not in body and body["instructions"].startswith("You summarize"),
+            f"the summarizer's request: {str(body)[:300]}")
+    t.check("[tool call: read]" in body["input"][0]["content"][0]["text"],
+            "the conversation to summarize")
+    after = [rsinput(x) for x in t.requests()]
+    t.check(any("<conversation-checkpoint>" in str(x[0]) for x in after),
+            "a request begins at the checkpoint")
+
+
 # M8: session operations, on a session open here, parked, closed, or
 # held by another process
 

@@ -2044,7 +2044,8 @@ static b32 endreasoning(Session *s, Arena scratch, i32 why)
     Endpoint *ep  = reqep(s);
     Str       msg = why==CTL_BUDGET ? Str("the reasoning ran past its budget")
                                     : Str("the model's reasoning repeated itself");
-    b32       can = reqmc(s)->llamacpp && !s->noctl && s->part->id.len;
+    b32       can = reqmc(s)->llamacpp && !s->noctl && s->part->id.len &&
+                    ep->kind==EP_OPENAI;  // the control call is Chat Completions'
     if (s->ctlwhy || !can) {
         s->ctlwhy = why;
         fail(s, scratch, CLASS_LOOP, 0, msg, -1);
@@ -2320,11 +2321,13 @@ static void sendchat(Session *s, Arena scratch)
     req.tools     = s->tools;
     req.history   = deskimages(s, &scratch);
     req.thinkfrom = s->thinkfrom;
-    b32 an        = s->ep.kind == EP_ANTHROPIC;
-    Str body      = an ? anencode(&s->attempt, scratch, &req)
-                       : encodechat(&s->attempt, scratch, &req);
-    Str url       = apiurl(&scratch, s->ep.url, an ? Str("messages")
-                                                   : Str("chat/completions"));
+    req.cachekey  = s->sid;
+    i32 kind      = s->ep.kind;
+    Str body      = kind==EP_ANTHROPIC ? anencode(&s->attempt, scratch, &req) :
+                    epresponses(kind)  ? rsencode(&s->attempt, scratch, &req,
+                                                  kind==EP_CHATGPT)
+                                       : encodechat(&s->attempt, scratch, &req);
+    Str url       = apiurl(&scratch, s->ep.url, eppath(kind));
 
     if (!startreq(s, scratch, &s->ep, "POST", url, body, "text/event-stream", 0, 1)) {
         Str err = os_lasterr(e->os, &scratch);
@@ -2425,10 +2428,11 @@ static void discover(Session *s, Arena scratch)
                      Str("models?limit=1000") : Str("models"));
     resetattempt(s);
     s->discovered = 1;
-    if (s->ep.kind==EP_ANTHROPIC && s->mc.kwargs.len) {
+    if ((s->ep.kind==EP_ANTHROPIC || s->ep.kind==EP_CHATGPT) && s->mc.kwargs.len) {
         Str msg = concat(&scratch, "the template settings of [model ", s->model);
-        msg = concat(&scratch, msg, "] are not sent: kind anthropic takes "
-                     "no chat_template_kwargs");
+        msg = concat(&scratch, msg, "] are not sent: kind ");
+        msg = concat(&scratch, msg, epkindname(s->ep.kind));
+        msg = concat(&scratch, msg, " takes no chat_template_kwargs");
         note(s, scratch, "warn", msg);
     }
     if (!startreq(s, scratch, &s->ep, "GET", url, {}, "application/json", 10000)) {
@@ -3148,8 +3152,10 @@ static void emitprogress(Session *s, Arena scratch, Chunk *c)
 // Apply one parsed data event. Returns 0 if the attempt failed.
 static b32 onchunk(Session *s, Arena scratch, Json *j)
 {
-    Chunk c = reqep(s)->kind==EP_ANTHROPIC ? anchunk(s->part, j, &scratch)
-                                           : applychunk(s->part, j, &scratch);
+    i32   kind = reqep(s)->kind;
+    Chunk c    = kind==EP_ANTHROPIC ? anchunk(s->part, j, &scratch) :
+                 epresponses(kind)  ? rschunk(s->part, j, &scratch)
+                                    : applychunk(s->part, j, &scratch);
     if (c.bad) {
         fail(s, scratch, CLASS_TRANSIENT, 0, "the stream held a malformed chunk", -1);
         return 0;
@@ -3280,12 +3286,12 @@ static void onbody(Session *s, Arena scratch, Str data)
             fail(s, t, CLASS_TRANSIENT, 0, "the stream held a malformed chunk", -1);
             return;
         }
-        if (ev->type=="error" && reqep(s)->kind!=EP_ANTHROPIC) {
+        if (ev->type=="error" && reqep(s)->kind==EP_OPENAI) {
             Str msg = errortext(jsonget(d.root, "error"));
             fail(s, t, classify(0, msg), 0, msg, -1);
             return;
         }
-        if (!onchunk(s, t, d.root)) {  // Anthropic's error events too
+        if (!onchunk(s, t, d.root)) {  // Anthropic's and Responses' errors too
             return;
         }
     }
@@ -12418,13 +12424,16 @@ static void sendcompact(Session *s, Arena scratch)
     Str convo = transcript(&s->attempt, scratch, s->history, cp->start,
                            cp->cut, limit);
     i64 words = sumbudget(cp->goal) * 3/4;
-    b32 an    = cp->ep.kind == EP_ANTHROPIC;
-    Str body  = an ? ansummary(&s->attempt, scratch, &cp->mc, prev, convo, words,
-                               cp->focus)
-                   : encodesummary(&s->attempt, scratch, &cp->mc, prev, convo, words,
-                                   cp->focus);
-    Str url   = apiurl(&scratch, cp->ep.url, an ? Str("messages")
-                                                : Str("chat/completions"));
+    i32 kind  = cp->ep.kind;
+    Str body  = kind==EP_ANTHROPIC ?
+                    ansummary(&s->attempt, scratch, &cp->mc, prev, convo, words,
+                              cp->focus) :
+                epresponses(kind) ?
+                    rssummary(&s->attempt, scratch, &cp->mc, prev, convo, words,
+                              cp->focus, kind==EP_CHATGPT) :
+                    encodesummary(&s->attempt, scratch, &cp->mc, prev, convo, words,
+                                  cp->focus);
+    Str url   = apiurl(&scratch, cp->ep.url, eppath(kind));
     cp->inbytes = convo.len;
     if (!startreq(s, scratch, &cp->ep, "POST", url, body, "text/event-stream", 0)) {
         Str err = os_lasterr(s->e->os, &scratch);
@@ -13073,7 +13082,7 @@ static b32 endpointconf(Engine *e, Arena *perm, Str which, Endpoint *ep)
         ep->firstbyte = cfgms(cfg, "endpoint", name, "first_byte_timeout", 0)*MS;
         ep->idle      = cfgms(cfg, "endpoint", name, "idle_timeout", 0)*MS;
         ep->progress  = cfgms(cfg, "endpoint", name, "progress_timeout", 0)*MS;
-        ep->kind      = ru.anthropic ? EP_ANTHROPIC : EP_OPENAI;
+        ep->kind      = ru.kind;
         return 1;
     }
     Url u = parseurl(url);
@@ -13097,7 +13106,7 @@ static b32 endpointconf(Engine *e, Arena *perm, Str which, Endpoint *ep)
     }
     ep->key       = ep->held ? Str{} : cfgsecret(cfg, perm, "endpoint", name, "key");
     Str kind      = trim(cfgget(cfg, "endpoint", name, "kind", 0));
-    ep->kind      = kind=="anthropic" ? EP_ANTHROPIC : EP_OPENAI;
+    ep->kind      = epkindof(kind);
     return 1;
 }
 
@@ -19881,7 +19890,7 @@ static void cmdmodels(Engine *e, Arena scratch, i64 id)
             EpListing p = {};
             p.name = ep.name;
             p.url  = ep.url;
-            p.kind = ep.kind==EP_ANTHROPIC ? Str("anthropic") : Str("openai");
+            p.kind = epkindname(ep.kind);
             if (ep.relay.len) {
                 // What its offers listed, asking nobody
                 p.body   = Buf(&l->arena, 1<<12);

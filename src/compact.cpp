@@ -419,6 +419,21 @@ static Str ansummary(Arena *a, Arena scratch, ModelConf *mc, Str prev,
     return anencode(a, scratch, &r);
 }
 
+// The same request for the Responses API (responses.cpp), for ChatGPT's
+// backend if codex.
+static Str rssummary(Arena *a, Arena scratch, ModelConf *mc, Str prev,
+                     Str convo, i64 words, Str focus, b32 codex)
+{
+    Msg m = {};
+    m.role = ROLE_USER;
+    m.text = summaryprompt(&scratch, prev, convo, words, focus);
+    ChatReq r = {};
+    r.mc      = mc;
+    r.system  = compactsystem;
+    r.history = {&m, 1, 1};
+    return rsencode(a, scratch, &r, codex);
+}
+
 // The user message that stands for the compacted messages.
 static Str checkpoint(Arena *a, Str summary)
 {

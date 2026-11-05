@@ -661,6 +661,7 @@ static u32     os_guilimits(Os *);
 #include "frame.cpp"
 #include "provider.cpp"
 #include "anthropic.cpp"
+#include "responses.cpp"  // after anthropic.cpp: anpartblock, anappend
 #include "edit.cpp"
 #include "png.cpp"
 #include "image.cpp"

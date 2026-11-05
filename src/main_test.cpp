@@ -615,6 +615,7 @@ static Str istr(Arena *a, i64 v)
 #include "test/frame_test.cpp"
 #include "test/provider_test.cpp"
 #include "test/anthropic_test.cpp"
+#include "test/responses_test.cpp"  // after anthropic_test.cpp: anblocks
 #include "test/edit_test.cpp"
 #include "test/tools_test.cpp"
 #include "test/guard_test.cpp"
@@ -696,6 +697,7 @@ int main()
     test_remotehello(&t);
     test_provider(&t);
     test_anthropic(&t);
+    test_responses(&t);
     test_edit(&t);
     test_tools(&t);
     test_guard(&t);

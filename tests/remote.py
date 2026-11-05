@@ -3081,8 +3081,9 @@ def thinconfig(t, extra=""):
         f.write("[host]\n" + extra)
 
 
-def offer(t, model, machine="testbox", budget=None, name="fake", search=0, listed=()):
-    ep = {"name": name, "kind": "openai", "first_byte_timeout": "5",
+def offer(t, model, machine="testbox", budget=None, name="fake", search=0, listed=(),
+          kind="openai"):
+    ep = {"name": name, "kind": kind, "first_byte_timeout": "5",
           "idle_timeout": "5", "progress_timeout": "10", "models": list(listed)}
     if budget:
         ep["slow_retry_budget"] = str(budget)
@@ -3225,6 +3226,34 @@ def relay_turn(t):
         live = [x for x in c.all() if x.get("ev") == "live" and x.get("sid") == sid
                 and x.get("relay")]
         t.check(live and live[0]["relay"] == "testbox", "live names the relay")
+    finally:
+        rl.stop = True
+
+
+@scenario
+def relay_responses(t):
+    """A thin host's turn at an endpoint of kind responses: the calls go to
+    v1/responses, the records name the kind, and the second body is a
+    delta, as for Chat Completions."""
+    thinconfig(t)
+    model = t.model("remote_tool")
+    c, rl = relayclient(t, model, kind="responses")
+    try:
+        r = c.call("new", cwd=t.work, prompt="go")
+        t.check(r.get("ok") == 1, f"new: {r}")
+        sid = r["sid"]
+        end = c.stream.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid,
+                            timeout=30, what="turn.end")
+        t.check(end.get("why") == "done", f"turn.end {end}")
+        t.check(finaltext(c.all(), sid).startswith("w0 w1"), "the answer")
+        posts = [(h, b) for h, b in rl.calls if h["method"] == "POST"]
+        t.check(len(posts) == 2 and all(h["path"] == "v1/responses" and
+                                        h.get("kind") == "responses" for h, b in posts),
+                f"calls: {[(h['path'], h.get('kind')) for h, b in posts]}")
+        t.check(posts[1][0].get("base"), "the second a delta")
+        body = json.loads(posts[1][1])
+        t.check(body["store"] is False and body["input"][0]["role"] == "user",
+                f"a Responses body: {str(body)[:200]}")
     finally:
         rl.stop = True
 

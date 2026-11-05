@@ -4,8 +4,8 @@
 // thin: it uses the models of the computers connected to it, which
 // offer their settings (relay.offer) but never their URLs or keys. Each
 // offer becomes a layer of the configuration under the user's file
-// (cfgload), its endpoints at relay://NAME (relay+anthropic://NAME for
-// kind anthropic), and a request to one of those goes to a computer
+// (cfgload), its endpoints at relay://NAME (relay+KIND://NAME for kinds
+// other than openai), and a request to one of those goes to a computer
 // offering it as a relay record, which that computer makes with its own
 // key and answers part by part (relay.data). Records arrive for it just
 // as os_http's do, so a session cannot tell, but for its new failures:
@@ -51,7 +51,7 @@ static iz relaybasemax()  // bytes of bases kept, each side
 
 struct RelayEp {
     Str        name;
-    b32        anthropic;
+    i32        kind;    // EP_*
     Slice<Str> models;  // as its listing gave them, none for any
 };
 
@@ -97,7 +97,7 @@ struct RelayCall {
     Str        accept;
     Str        model;
     i32        readms;
-    b32        anthropic;
+    i32        kind;     // its endpoint's, EP_*
     b32        keep;     // a turn body, the base of the next
     u64        base;     // the base's hash, with data a delta, else 0
     iz         len;      // of the body
@@ -302,17 +302,18 @@ static void relayparse(RelayPeer *p, Arena *a, Json *o)
     Buf eps(a, 1024);
     for (Json *x = jsonget(o, "endpoints")->child; x; x = x->next) {
         Str  name = jsonstr(jsonget(x, "name"));
-        b32  an   = jsonstr(jsonget(x, "kind")) == "anthropic";
+        Str  kn   = jsonstr(jsonget(x, "kind"));
+        i32  kind = epkindof(kn);
         b32  dup  = 0;
         for (iz i = 0; i < p->eps.len; i++) {
             dup |= p->eps[i].name == name;
         }
-        if (!relayname(name) || dup) {
-            continue;
+        if (!relayname(name) || dup || (kn.len && epkindname(kind)!=kn)) {
+            continue;  // a kind not known here is not usable
         }
         RelayEp ep = {};
-        ep.name      = clone(a, name);
-        ep.anthropic = an;
+        ep.name = clone(a, name);
+        ep.kind = kind;
         i32 n = 0;
         for (Json *m = jsonget(x, "models")->child; m && n<RELAY_MODELS; m = m->next) {
             Str id = jsonstr(m);
@@ -325,9 +326,11 @@ static void relayparse(RelayPeer *p, Arena *a, Json *o)
 
         print(&eps, "[endpoint ");
         print(&eps, name);
-        print(&eps, an ? Str("]\nurl = relay+anthropic://") : Str("]\nurl = relay://"));
-        print(&eps, name);
-        print(&eps, an ? Str("\nkind = anthropic\n") : Str("\nkind = openai\n"));
+        print(&eps, "]\nurl = ");
+        print(&eps, relayurlof(a, kind, name));
+        print(&eps, "\nkind = ");
+        print(&eps, epkindname(kind));
+        putbyte(&eps, '\n');
         for (iz i = 0; i < countof(relayepkeys); i++) {
             Str v = trim(jsonstr(jsonget(x, relayepkeys[i])));
             if (v.len && relayvalue(v)) {
@@ -556,10 +559,9 @@ static void relaykeep(Engine *e, Str key, i64 peer, Str body)
 // A computer's offer of ep, by name and kind, or null.
 static RelayEp *relayepof(RelayPeer *p, Endpoint *ep)
 {
-    b32 an = ep->kind == EP_ANTHROPIC;
     for (iz i = 0; i < p->eps.len; i++) {
         RelayEp *x = &p->eps[i];
-        if (x->name==ep->relay && x->anthropic==an) {
+        if (x->name==ep->relay && x->kind==ep->kind) {
             return x;
         }
     }
@@ -592,7 +594,6 @@ static b32 relayeligible(RelayPeer *p, Endpoint *ep, Str own)
 static b32 relaylisting(Engine *e, Buf *b, Endpoint *ep)
 {
     b32 any = 0;
-    b32 an  = ep->kind == EP_ANTHROPIC;
     JsonOut w = {b};
     putobject(&w);
     putkey(&w, "data");
@@ -601,7 +602,7 @@ static b32 relaylisting(Engine *e, Buf *b, Endpoint *ep)
     for (RelayPeer *p = e->relay->peers; p; p = p->next) {
         for (iz i = 0; !p->gone && i < p->eps.len; i++) {
             RelayEp *x = &p->eps[i];
-            if (!(x->name==ep->relay) || x->anthropic!=an) {
+            if (!(x->name==ep->relay) || x->kind!=ep->kind) {
                 continue;
             }
             any = 1;
@@ -763,7 +764,7 @@ static RelayCall *relaystart(Engine *e, Endpoint *ep, HttpReq *req,
                                  find(req->headers, "Accept: ")+8), '\r').head, '\n').head);
     c->model     = s && ep ? clone(&a, reqmc(s)->name) : Str{};
     c->readms    = req->readms;
-    c->anthropic = ep && ep->kind==EP_ANTHROPIC;
+    c->kind      = ep ? ep->kind : EP_OPENAI;
     c->keep      = keep && sid.len;
     c->base      = base;
     c->len       = body.len;
@@ -1064,7 +1065,7 @@ static b32 relaypath(Str path, Str method)
     Str p = cut(path, '?').head;
     if (method=="POST") {
         return p=="v1/messages" || p=="v1/chat/completions" ||
-               p=="v1/chat/completions/control";
+               p=="v1/chat/completions/control" || p=="v1/responses";
     } else if (method=="GET") {
         return p=="v1/models" || p=="props";
     }
@@ -1299,8 +1300,12 @@ static void relayserve(Engine *e, Arena scratch, Json *j, i64 cid, Str origin,
 
         // Only its own endpoints, of the kind asked, at their API's paths,
         // or a web search, with its own service
+        // An older thin engine names no kind, only whether anthropic
         Str name = jsonstr(jsonget(j, "endpoint"));
-        b32 an   = jsonflag(jsonget(j, "anthropic"), 0);
+        Str kn   = jsonstr(jsonget(j, "kind"));
+        i32 kind = kn.len ? epkindof(kn) :
+                   jsonflag(jsonget(j, "anthropic"), 0) ? EP_ANTHROPIC : EP_OPENAI;
+        b32 known = !kn.len || epkindname(kind)==kn;
         b32 ok   = relayname(name) && endpointconf(e, &v->arena, name, &v->ep) &&
                    v->ep.name==name && !v->ep.relay.len;
         i32 svc  = websearchservice(e);
@@ -1313,7 +1318,7 @@ static void relayserve(Engine *e, Arena scratch, Json *j, i64 cid, Str origin,
             }
         } else if (!ok) {
             relayfinish(v, "connect", concat(&scratch, "no endpoint here is named ", name));
-        } else if ((v->ep.kind==EP_ANTHROPIC) != an) {
+        } else if (!known || v->ep.kind!=kind) {
             relayfinish(v, "connect", concat(&scratch, name, " is of another kind here"));
         } else if (!relaypath(v->path, v->method)) {
             relayfinish(v, "connect", "not a call relayed calls may make");
@@ -1344,7 +1349,7 @@ static void relayserve(Engine *e, Arena scratch, Json *j, i64 cid, Str origin,
         return;
     }
     Str p = cut(v->path, '?').head;
-    v->admits = p=="v1/messages" || p=="v1/chat/completions";
+    v->admits = p=="v1/messages" || p=="v1/chat/completions" || p=="v1/responses";
     if (v->admits) {
         relayadmit(e, scratch, v);
     } else {
@@ -1460,7 +1465,8 @@ static Str relaypart(Engine *e, Arena *a, RelayCall *c)
     if (!c->sent) {
         putstrkey(&w.json, "session", c->sid);
         putstrkey(&w.json, "endpoint", c->endpoint);
-        putintkey(&w.json, "anthropic", c->anthropic);
+        putintkey(&w.json, "anthropic", c->kind==EP_ANTHROPIC);  // older engines'
+        putstrkey(&w.json, "kind", epkindname(c->kind));
         putstrkey(&w.json, "path", c->path);
         putstrkey(&w.json, "method", c->method);
         putstrkey(&w.json, "accept", c->accept);
@@ -1732,7 +1738,7 @@ static void relayofferput(Engine *e, JsonOut *w, Arena scratch, Str own)
         named |= s->name == dep;
         putobject(w);
         putstrkey(w, "name", s->name);
-        putstrkey(w, "kind", ep.kind==EP_ANTHROPIC ? Str("anthropic") : Str("openai"));
+        putstrkey(w, "kind", epkindname(ep.kind));
         for (iz i = 0; i < countof(relayepkeys); i++) {
             putstrkey(w, relayepkeys[i],
                       trim(cfgget(cfg, "endpoint", s->name, relayepkeys[i], local)));
