@@ -3605,7 +3605,8 @@ def hello_caps(t):
                                                    "relay.more", "relay.peer",
                                                    "relay.call", "offer", "ask.touch",
                                                    "shell.env", "call.stop", "cut", "uncut",
-                                                   "approve"]
+                                                   "approve", "endpoint.auth",
+                                                   "endpoint.logout"]
         t.check(cmds == want, f"cmds: {cmds}")
         caps = hello.get("caps", [])
         t.check(isinstance(caps, list) and all(isinstance(c, str) for c in caps) and
@@ -3615,7 +3616,7 @@ def hello_caps(t):
                  "fork", "answer.always.desktop", "skills", "plan", "queue",
                  "message", "bypass", "nofolder", "dir", "config.create", "side", "background", "models",
                  "mcp", "mcp.auth", "task.remote", "task.host", "memory", "shell",
-                 "git", "answer.trust", "trash", "cut"} <= set(caps)
+                 "git", "answer.trust", "trash", "cut", "endpoint.auth"} <= set(caps)
                 and "host" not in caps,
                 f"caps: {caps}")
 
@@ -6873,6 +6874,182 @@ def rs_compaction(t):
     after = [rsinput(x) for x in t.requests()]
     t.check(any("<conversation-checkpoint>" in str(x[0]) for x in after),
             "a request begins at the checkpoint")
+
+
+# ChatGPT (kind chatgpt): signed in through prospero endpoint auth
+# against the fake's issuer, and its Codex backend, which takes only
+# the tokens it gave
+
+CG = {"kind": "chatgpt", "_path": "chatgpt/backend-api/codex/responses"}
+
+
+def cgenv(t):
+    return {"PROSPERO_TEST_CHATGPT_AUTH": t.host.url + "/chatgpt"}
+
+
+def cgfiles(t):
+    d = os.path.join(t.state, "endpoints", "auth")
+    names = sorted(os.listdir(d)) if os.path.isdir(d) else []
+    return [os.path.join(d, n) for n in names]
+
+
+def cgsignin(t):
+    """prospero endpoint auth fake, the browser's part done as a browser
+    would: the tokens kept."""
+    import urllib.request
+    p = t.host.popen(["endpoint", "auth", "fake", "--state", t.state, "-c", t.config],
+                     t.work, env=dict(t.tmpenv, **cgenv(t)))
+    killer = threading.Timer(30, p.kill)
+    killer.start()
+    try:
+        out = []
+        for line in p.stdout:
+            out.append(line)
+            m = re.search(r"(https?://\S+/oauth/authorize\?\S+)", line)
+            if m:
+                urllib.request.urlopen(m.group(1), timeout=10).read()
+                break
+        rest, err = p.communicate()
+    finally:
+        killer.cancel()
+    out = "".join(out) + rest
+    t.check(p.returncode == 0 and "Signed in to fake." in out,
+            f"signed in: {p.returncode} {out} {err}")
+    files = cgfiles(t)
+    t.check(len(files) == 1, f"the tokens kept: {files}")
+    return files[0]
+
+
+def cgcalls(t):
+    """The scenario's model calls, refused or not."""
+    with fake_provider.STATE.lock:
+        return [e for e in fake_provider.STATE.cg["log"]
+                if "_call" in e and e.get("model") == t.model]
+
+
+def cgedit(path, **kv):
+    keep = json.loads(open(path).read())
+    keep.update(kv)
+    with open(path, "w") as f:
+        f.write(json.dumps(keep))
+    return keep
+
+
+@scenario(conf=CG, bound=30)
+def cg_signin(t):
+    """Signing in to ChatGPT for an endpoint: the Codex CLI's client and
+    flow with PKCE, the account read from the id_token, the tokens kept
+    privately; each request with the token, the account's id and the
+    Codex headers, and the backend's listing read; signed out, a turn
+    ends before any request, saying how to sign in."""
+    path = cgsignin(t)
+    if os.name != "nt":
+        mode = os.stat(path).st_mode & 0o777
+        t.check(mode == 0o600, f"privately: {oct(mode)}")
+    keep = json.loads(open(path).read())
+    t.check(keep.get("account_id") == "acct-fake" and keep.get("email") == "me@example.com" and
+            keep.get("plan") == "plus" and keep.get("refresh_token", "").startswith("rt-") and
+            keep.get("expires_at", 0) > time.time(), f"kept {keep}")
+    with fake_provider.STATE.lock:
+        auth = [e for e in fake_provider.STATE.cg["log"]
+                if e.get("_oauth") == "/chatgpt/oauth/authorize"]
+    t.check(auth and auth[-1].get("originator") == "prospero" and
+            auth[-1].get("redirect_uri", "").startswith("http://127.0.0.1:"),
+            f"authorized {auth[-1:]}")
+    r = t.run(env=cgenv(t))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.last('turn.end')} {r.stderr}")
+    t.check(r.text() == "Hello! This is a plain answer.", f"text {r.text()!r}")
+    reqs = t.requests()
+    t.check(len(reqs) == 1, f"one request {len(reqs)}")
+    h = reqs[0]["headers"]
+    t.check(h.get("authorization") == "Bearer " + keep["access_token"] and
+            h.get("chatgpt-account-id") == "acct-fake" and
+            h.get("openai-beta") == "responses=experimental" and
+            h.get("originator") == "prospero" and
+            h.get("session_id") == r.events[0].get("sid"), f"headers {h}")
+    body = reqs[0]["body"]
+    t.check("max_output_tokens" not in body and "chat_template_kwargs" not in body and
+            body.get("store") is False, f"the Codex request {str(body)[:300]}")
+    with fake_provider.STATE.lock:
+        listed = [e for e in fake_provider.STATE.cg["log"] if "_models" in e]
+    t.check(listed and "client_version=" in listed[-1]["_models"] and
+            listed[-1]["auth"] is None, f"listed {listed[-1:]}")
+
+    rc, out, err = prun(t, ["endpoint", "logout", "fake", "--state", t.state, "-c", t.config],
+                        env=cgenv(t))
+    t.check(rc == 0 and "Signed out of fake." in out, f"signed out: {rc} {out} {err}")
+    t.check(not cgfiles(t), "forgotten")
+    n = len(cgcalls(t))
+    r = t.run(env=cgenv(t))
+    end = r.last("turn.end")
+    t.check(end.get("why") == "error" and "not signed in to ChatGPT" in end.get("err", "") and
+            "prospero endpoint auth fake" in end.get("err", ""), f"ended {end}")
+    t.check(len(cgcalls(t)) == n, "no request made")
+
+
+@scenario(conf=CG, bound=30)
+def cg_refresh(t):
+    """An access token expired is refreshed before the request, and one
+    the backend refused (401) is refreshed and the request sent again at
+    no cost, once; the refresh tokens rotate, and the file keeps the
+    account a refresh did not name again."""
+    path = cgsignin(t)
+    first = cgedit(path, expires_at=int(time.time()) - 10)
+    r = t.run(env=cgenv(t))
+    t.check(r.rc == 0 and r.text() == "Hello! This is a plain answer.",
+            f"exit {r.rc}: {r.last('turn.end')} {r.stderr}")
+    t.check(not r.all("retry"), f"no retries {r.all('retry')}")
+    second = json.loads(open(path).read())
+    t.check(second["access_token"] != first["access_token"] and
+            second["refresh_token"] != first["refresh_token"] and
+            second.get("account_id") == "acct-fake" and second.get("email") == "me@example.com",
+            f"refreshed {second}")
+    with fake_provider.STATE.lock:
+        grants = [e for e in fake_provider.STATE.cg["log"]
+                  if e.get("refresh_token") == first["refresh_token"]]
+    t.check(len(grants) == 1 and grants[0].get("grant_type") == "refresh_token",
+            f"refreshed once with its refresh token: {grants}")
+    t.check(t.requests()[0]["headers"].get("authorization") == "Bearer " + second["access_token"],
+            "the new token sent")
+
+    fake_provider.cg_revoke(access=second["access_token"])
+    r = t.run(env=cgenv(t))
+    t.check(r.rc == 0 and r.text() == "Hello! This is a plain answer.",
+            f"exit {r.rc}: {r.last('turn.end')} {r.stderr}")
+    rt = r.all("retry")
+    t.check(len(rt) == 1 and "refreshed" in rt[0].get("msg", ""), f"one retry {rt}")
+    third = json.loads(open(path).read())
+    t.check(third["access_token"] != second["access_token"], "refreshed again")
+    calls = cgcalls(t)
+    t.check([c["auth"] is None for c in calls[-2:]] == [False, True], f"calls {calls[-2:]}")
+
+
+@scenario(conf=CG, bound=30)
+def cg_refused(t):
+    """A refresh the issuer refuses forgets the tokens, and the turn ends
+    saying to sign in again, with no model call made."""
+    path = cgsignin(t)
+    keep = cgedit(path, expires_at=int(time.time()) - 10)
+    fake_provider.cg_revoke(access=keep["access_token"], refresh=keep["refresh_token"])
+    n = len(cgcalls(t))
+    r = t.run(env=cgenv(t))
+    end = r.last("turn.end")
+    t.check(end.get("why") == "error" and "sign in again" in end.get("err", "") and
+            "prospero endpoint auth fake" in end.get("err", ""), f"ended {end}")
+    t.check(not cgfiles(t), f"forgotten: {cgfiles(t)}")
+    t.check(len(cgcalls(t)) == n, "no model call")
+
+
+@scenario(conf=CG, bound=30)
+def cg_limit(t):
+    """ChatGPT's usage limit ends the turn at once, saying when it
+    resets, rather than waiting hours in slow retries."""
+    cgsignin(t)
+    r = t.run(env=cgenv(t))
+    end = r.last("turn.end")
+    t.check(end.get("why") == "error" and "usage limit was reached" in end.get("err", "") and
+            "2 h 5 min" in end.get("err", ""), f"ended {end}")
+    t.check(len(t.requests()) == 1, f"one request {len(t.requests())}")
 
 
 # M8: session operations, on a session open here, parked, closed, or

@@ -719,6 +719,9 @@ static i32 climain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs, b32 
 //   prospero mcp list            the servers the configuration names
 //   prospero mcp auth NAME       sign in, through a browser
 //   prospero mcp logout NAME     forget its tokens
+//   prospero endpoint auth NAME  sign in to ChatGPT for an endpoint of
+//                                kind chatgpt, through a browser
+//   prospero endpoint logout NAME  forget its tokens
 //   prospero approve             what waits for approval: credentials for
 //                                urls of web includes (see "Approvals")
 //   prospero approve URL         approve what waits for that url
@@ -734,6 +737,8 @@ static Str mcpusage =
 "usage: prospero mcp list [options]\n"
 "       prospero mcp auth NAME [options]\n"
 "       prospero mcp logout NAME [options]\n"
+"       prospero endpoint auth NAME [options]\n"
+"       prospero endpoint logout NAME [options]\n"
 "       prospero approve [URL] [options]\n"
 "options:\n"
 "  -c FILE       configuration file\n"
@@ -787,6 +792,7 @@ static i32 mcpmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
     Cli c = {};
     c.os = os;
     b32 top  = args[1] == "approve";  // prospero approve, not under mcp
+    b32 ep   = args[1] == "endpoint";  // an endpoint's ChatGPT sign-in
     Str verb = top ? Str("approve") : nargs>2 ? args[2] : Str{};
     Str name = {}, url = {}, config = {}, state = {};
     for (i32 i = top ? 2 : 3; i < nargs; i++) {
@@ -805,7 +811,7 @@ static i32 mcpmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
         }
     }
     if ((verb!="list" && verb!="auth" && verb!="logout" && verb!="approve") ||
-            ((verb=="auth" || verb=="logout") && !name.len)) {
+            ((verb=="auth" || verb=="logout") && !name.len) || (ep && verb=="list")) {
         os_print(os, 2, mcpusage);
         return 2;
     }
@@ -913,7 +919,8 @@ static i32 mcpmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
         }
     } else if (verb == "logout") {
         Arena a = scratch;
-        Json *r = mcpcliwait(&c, &a, mcpcmdline(&a, CMD_MCPLOGOUT, 1, name), 1, 0);
+        Json *r = mcpcliwait(&c, &a, mcpcmdline(&a, ep ? CMD_EPLOGOUT : CMD_MCPLOGOUT,
+                                                1, name), 1, 0);
         if (!jsonint(jsonget(r, "ok"), 0)) {
             print(&out, "prospero: ");
             print(&out, jsonstr(jsonget(r, "err")));
@@ -928,10 +935,18 @@ static i32 mcpmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
         }
     } else {
         Arena a    = scratch;
-        Str   uri  = trim(cfgget(cfg, "mcp", name, "redirect_uri", 0));
+        Str   uri  = ep ? Str{} : trim(cfgget(cfg, "mcp", name, "redirect_uri", 0));
         Url   at   = loopbackuri(uri);
         i32   port = at.ok ? at.port : 0;
-        if (uri.len && !at.ok) {
+        Str   back = ep ? chatgptloopback(os, &a, c.out, MCPCLI_LOOP, 0) : Str{};
+        if (ep && !back.len) {
+            os_print(os, 2, "prospero: cannot listen on the loopback at port 1455 or 1457, "
+                            "where ChatGPT's sign-in comes back: is another sign-in "
+                            "waiting there?\n");
+            return 1;
+        } else if (ep) {
+            // Listening already
+        } else if (uri.len && !at.ok) {
             os_print(os, 2, "prospero: its redirect_uri is not http://127.0.0.1:PORT/PATH "
                             "or http://localhost:PORT/PATH\n");
             return 1;
@@ -943,8 +958,10 @@ static i32 mcpmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
             os_print(os, 2, finish(&out));
             return 1;
         }
-        Buf rb(&a, 64 + uri.len);
-        if (at.ok) {
+        Buf rb(&a, 64 + uri.len + back.len);
+        if (ep) {
+            print(&rb, back);
+        } else if (at.ok) {
             print(&rb, uri);
         } else {
             print(&rb, "http://127.0.0.1:");
@@ -957,7 +974,8 @@ static i32 mcpmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
         putstrkey(&w, "redirect", finish(&rb));
         putend(&w);
         Json *more = jsonparse(&a, finish(&mb)).root;
-        Json *r    = mcpcliwait(&c, &a, mcpcmdline(&a, CMD_MCPAUTH, 1, name, more), 1, 0);
+        Json *r    = mcpcliwait(&c, &a, mcpcmdline(&a, ep ? CMD_EPAUTH : CMD_MCPAUTH,
+                                                   1, name, more), 1, 0);
         Str   url  = jsonstr(jsonget(r, "url"));
         if (!jsonint(jsonget(r, "ok"), 0) || !url.len) {
             print(&out, "prospero: ");
@@ -966,7 +984,7 @@ static i32 mcpmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
             os_print(os, 2, finish(&out));
             code = 1;
         } else {
-            print(&out, "To sign in to ");
+            print(&out, ep ? Str("To sign in to ChatGPT for endpoint ") : Str("To sign in to "));
             print(&out, name);
             print(&out, ", visit this in a browser on this machine:\n\n  ");
             print(&out, url);
@@ -979,6 +997,9 @@ static i32 mcpmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
             Buf cb(&a, 256 + q.len);
             JsonOut cw = {&cb};
             putobject(&cw);
+            if (ep) {
+                putintkey(&cw, "endpoint", 1);
+            }
             Str keys[] = {"code", "state", "error", "error_description"};
             for (iz i = 0; i < countof(keys); i++) {
                 Str v = mcpquery(&a, q, keys[i]);

@@ -138,6 +138,15 @@ static Str eppath(i32 kind)
            epresponses(kind)  ? Str("responses") : Str("chat/completions");
 }
 
+// Its model listing's path: Anthropic's comes in pages, of at most 1000
+// models, and the Codex backend's lists what a client of that version
+// may use.
+static Str eplistpath(i32 kind)
+{
+    return kind==EP_ANTHROPIC ? Str("models?limit=1000") :
+           kind==EP_CHATGPT   ? Str("models?client_version=1.0.0") : Str("models");
+}
+
 // The URL of a kind's own service, which Settings fills in, or null for
 // a kind any server may speak.
 static Str epkindurl(i32 kind)

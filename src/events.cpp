@@ -196,6 +196,8 @@ enum : i32 {
     CMD_CUT,         // the conversation rewound to before a turn
     CMD_UNCUT,       // the latest such rewind undone
     CMD_APPROVE,     // credentials for urls of web includes: listed, approved
+    CMD_EPAUTH,      // sign in to ChatGPT for an endpoint: the browser's URL, late
+    CMD_EPLOGOUT,    // an endpoint's ChatGPT tokens forgotten
     CMD_COUNT,
 };
 
@@ -209,7 +211,7 @@ static Str cmdnames[] = {
     "mcp.logout", "mcp.restart", "shell", "shells", "git", "trash",
     "trash.empty", "relay.offer", "relay.data", "relay.more", "relay.peer",
     "relay.call", "offer", "ask.touch", "shell.env", "call.stop", "cut",
-    "uncut", "approve",
+    "uncut", "approve", "endpoint.auth", "endpoint.logout",
 };
 static_assert(countof(cmdnames) == CMD_COUNT);
 
@@ -329,6 +331,11 @@ static Str capnames[] = {
     "fork.cwd",        // fork {cwd}: a fork that works in another folder,
                        // moved_from on its session record, notices of
                        // kind "moved"
+    "endpoint.auth",   // endpoint kinds responses and chatgpt; endpoint.auth
+                       // and endpoint.logout, a chatgpt endpoint signed in
+                       // to (finished by mcp.code {endpoint:1}) and out,
+                       // and models' signedin, email and plan; the session
+                       // state "auth"
 };
 
 static Str evname(i32 ev)

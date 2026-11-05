@@ -49,6 +49,7 @@ import tempfile
 import threading
 import time
 import traceback
+import urllib.request
 import zlib
 
 sys.dont_write_bytecode = True
@@ -368,6 +369,7 @@ class T:
         self.env = dict(os.environ)
         self.env.update({"TMP": tmp, "TEMP": tmp} if os.name == "nt" else {"TMPDIR": tmp})
         self.procs = []
+        self.url = args.url
         self.write_config(args.url)
 
     def write_config(self, url, extra=""):
@@ -3495,7 +3497,8 @@ class Served:
         self.next = 0
 
     def call(self, body, path="v1/chat/completions", base=None, keep=1,
-             endpoint="fake", model=None, session="s1", deflate=False, parts=1):
+             endpoint="fake", model=None, session="s1", deflate=False, parts=1,
+             kind=None):
         self.next += 1
         cid = self.next
         data = body if base is None else simpledelta(base, body)
@@ -3514,6 +3517,8 @@ class Served:
                 obj.update(session=session, endpoint=endpoint, anthropic=0, path=path,
                            method="POST", accept="text/event-stream", model=model or "",
                            readms=0, keep=keep, len=len(body), size=size)
+                if kind:
+                    obj["kind"] = kind
                 if z is not None:
                     obj["zlen"] = len(z)
                 if base is not None:
@@ -3587,6 +3592,62 @@ def relay_serve(t):
     c.stream.command({"cmd": "relay.call", "cid": e, "origin": "thin", "cancel": 1})
     d = sv.done(e)
     t.check(d["err"] == "cancel", f"cancel: {d}")
+
+
+@scenario
+def relay_serve_chatgpt(t):
+    """A relayed call to an endpoint of kind chatgpt goes with this
+    engine's own sign-in: its expired token refreshed first, the call
+    then made with the new one, the account's id and the thin session's
+    id."""
+    t.write_config(t.url, f"[endpoint cg]\nkind = chatgpt\n"
+                          f"url = {t.url}/chatgpt/backend-api/codex/responses\n")
+    t.env["PROSPERO_TEST_CHATGPT_AUTH"] = t.url + "/chatgpt"
+    p = subprocess.Popen([t.prospero, "endpoint", "auth", "cg", "--state", t.state,
+                          "-c", t.config], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, env=t.env)
+    killer = threading.Timer(30, p.kill)
+    killer.start()
+    try:
+        for line in p.stdout:
+            m = re.search(r"(https?://\S+/oauth/authorize\?\S+)", line)
+            if m:
+                urllib.request.urlopen(m.group(1), timeout=10).read()
+                break
+        out, err = p.communicate()
+    finally:
+        killer.cancel()
+    t.check(p.returncode == 0 and "Signed in to cg." in out, f"signed in: {out} {err}")
+    d = os.path.join(t.state, "endpoints", "auth")
+    path = os.path.join(d, os.listdir(d)[0])
+    keep = json.loads(open(path).read())
+    keep["expires_at"] = int(time.time()) - 10
+    with open(path, "w") as f:
+        f.write(json.dumps(keep))
+
+    c = Client(t)
+    c.attach()
+    c.call("hello")
+    sv = Served(t, c)
+    model = t.model("remote_slow")
+    body = json.dumps({"model": model, "instructions": "Be brief.", "input": [
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+        "store": False, "stream": True, "include": ["reasoning.encrypted_content"]}).encode()
+    a = sv.call(body, path="v1/responses", endpoint="cg", model=model, kind="chatgpt",
+                session="thin-s1")
+    dn = sv.done(a)
+    t.check(dn["err"] == "ok", f"done: {dn}")
+    t.check("w39" in sv.text(a), f"the response {sv.text(a)[-200:]}")
+    now = json.loads(open(path).read())
+    t.check(now["access_token"] != keep["access_token"], "refreshed")
+    with fake_provider.STATE.lock:
+        grants = [e for e in fake_provider.STATE.cg["log"]
+                  if e.get("refresh_token") == keep["refresh_token"]]
+    t.check(len(grants) == 1, f"one refresh {grants}")
+    h = fake_provider.STATE.log(model)[-1]["headers"]
+    t.check(h.get("authorization") == "Bearer " + now["access_token"] and
+            h.get("chatgpt-account-id") == "acct-fake" and h.get("session_id") == "thin-s1",
+            f"headers {h}")
 
 
 @scenario

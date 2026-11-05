@@ -529,3 +529,68 @@ static Chunk rschunk(Partial *p, Json *j, Arena *scratch)
     // Types yet unknown change nothing
     return r;
 }
+
+
+// ChatGPT
+//
+// Kind chatgpt signs in as the Codex CLI does, with its public client
+// (engine.cpp, "Signing in"), and sends each request with the access
+// token, the account's id, and the Codex headers. Its model listing is
+// the Codex backend's own shape, and a usage limit is an error of its
+// own, which waits hours rather than seconds.
+
+static Str const chatgptissuer     = "https://auth.openai.com";
+static Str const chatgptclient     = "app_EMoamEEZ73f0CkXaXp7hrann";
+static Str const chatgptscope      = "openid profile email offline_access";
+static Str const chatgptoriginator = "prospero";
+
+// The Codex backend's listing, {models: [{slug, context_window}]}, as
+// a /v1/models listing: {data: [{id, max_input_tokens}]}. Any other
+// body is returned as it is. tmp is another arena than a's.
+static Str rslisting(Arena *a, Arena tmp, Str body)
+{
+    Json *ms = jsonget(jsonparse(&tmp, body).root, "models");
+    if (ms->type != JSON_ARRAY) {
+        return body;
+    }
+    Buf     b(a, 64 + body.len/4);
+    JsonOut w = {&b};
+    putobject(&w);
+    putstrkey(&w, "object", "list");
+    putkey(&w, "data");
+    putarray(&w);
+    for (Json *m = ms->child; m; m = m->next) {
+        Str id  = jsonstr(jsonget(m, "slug"));
+        i64 ctx = jsonint(jsonget(m, "context_window"), 0);
+        if (!id.len) {
+            continue;
+        }
+        putobject(&w);
+        putstrkey(&w, "id", id);
+        putstrkey(&w, "object", "model");
+        if (ctx > 0) {
+            putintkey(&w, "max_input_tokens", ctx);
+        }
+        putend(&w);
+    }
+    putend(&w);
+    putend(&w);
+    return finish(&b);
+}
+
+// An error response that says ChatGPT's usage limit was reached: the
+// seconds until it resets, 0 if it does not say, else -1 if it is not
+// one. now is Unix seconds.
+static i64 rsusagelimit(Arena scratch, Str body, i64 now)
+{
+    Json *e    = jsonget(jsonparse(&scratch, body).root, "error");
+    Str   type = jsonstr(jsonget(e, "type"));
+    Str   code = jsonstr(jsonget(e, "code"));
+    if (type!="usage_limit_reached" && code!="usage_limit_reached" &&
+            type!="usage_not_included" && code!="usage_not_included") {
+        return -1;
+    }
+    i64 in = jsonint(jsonget(e, "resets_in_seconds"), 0);
+    i64 at = jsonint(jsonget(e, "resets_at"), 0);
+    return in>0 ? in : at>now ? at-now : 0;
+}

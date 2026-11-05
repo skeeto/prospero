@@ -192,13 +192,15 @@ enum : i32 {
     LIVE_WORKTREE,    // waiting for git to make its worktree
     LIVE_COMPACTING,  // a summary request runs
     LIVE_RELAY,       // paused: no connected computer relays its calls
+    LIVE_AUTH,        // its endpoint's ChatGPT sign-in is refreshed
     LIVE_CLOSED,
     LIVE_COUNT,
 };
 
 static Str livenames[] = {
     "idle", "discover", "waiting", "streaming", "error", "backoff", "tool",
-    "ask", "queued", "task", "mcp", "worktree", "compacting", "relay", "closed",
+    "ask", "queued", "task", "mcp", "worktree", "compacting", "relay", "auth",
+    "closed",
 };
 static_assert(countof(livenames) == LIVE_COUNT);
 

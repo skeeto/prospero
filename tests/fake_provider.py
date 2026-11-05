@@ -96,6 +96,8 @@ class State:
         self.listings = []  # Anthropic: headers of /v1/models requests
         self.web = []       # web tools: requests to /web/ and /searxng/
         self.encs = {}      # Responses: encrypted_content -> its reasoning
+        self.cg = {"n": 0, "codes": {}, "access": set(), "refresh": set(),
+                   "log": []}  # ChatGPT's sign-in and backend
         self.stop = threading.Event()
 
     def register(self, model, **listing):
@@ -5421,6 +5423,153 @@ sc_rs_read_edit_shell = sc_read_edit_shell
 sc_rs_length_think = sc_length_think
 sc_rs_midstream_error = sc_midstream_error
 sc_rs_drop_args = sc_drop_args
+
+
+# ChatGPT: its sign-in (an issuer at /chatgpt, as auth.openai.com, which
+# PROSPERO_TEST_CHATGPT_AUTH names) and the Codex backend at
+# /chatgpt/backend-api/codex, which takes only the tokens it gave, the
+# account's id, and the Codex headers, then answers as Responses. Access
+# tokens are JWTs whose claims name the account; refresh tokens rotate.
+
+CG_CLIENT = "app_EMoamEEZ73f0CkXaXp7hrann"
+CG_ACCOUNT = "acct-fake"
+
+
+def cg_jwt(claims):
+    def b64(obj):
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
+    return f"{b64({'alg': 'none'})}.{b64(claims)}.sig"
+
+
+def cg_tokens(expires=3600):
+    """New tokens, known to the backend: access, refresh, id."""
+    with STATE.lock:
+        STATE.cg["n"] += 1
+        n = STATE.cg["n"]
+    auth = {"chatgpt_account_id": CG_ACCOUNT, "chatgpt_plan_type": "plus"}
+    access = cg_jwt({"n": n, "exp": int(time.time()) + expires,
+                     "https://api.openai.com/auth": auth})
+    idt = cg_jwt({"email": "me@example.com", "https://api.openai.com/auth": auth})
+    with STATE.lock:
+        STATE.cg["access"].add(access)
+        STATE.cg["refresh"].add(f"rt-{n}")
+    return {"access_token": access, "refresh_token": f"rt-{n}", "id_token": idt,
+            "token_type": "Bearer", "expires_in": expires}
+
+
+def cg_log(entry):
+    with STATE.lock:
+        STATE.cg["log"].append(entry)
+
+
+def cg_get(handler, url, path):
+    """GET /chatgpt/...: the authorize page, or the model listing."""
+    q = dict(urllib.parse.parse_qsl(url.query))
+    if path == "/chatgpt/oauth/authorize":
+        cg_log({"_oauth": path, **q})
+        redirect = q.get("redirect_uri", "")
+        if (q.get("client_id") != CG_CLIENT or q.get("response_type") != "code" or
+                q.get("code_challenge_method") != "S256" or not q.get("state") or
+                "resource" in q or "offline_access" not in q.get("scope", "") or
+                q.get("codex_cli_simplified_flow") != "true" or
+                not redirect.endswith("/auth/callback")):
+            handler.send_json(400, {"error": "invalid_request"})
+            return
+        with STATE.lock:
+            STATE.cg["n"] += 1
+            code = f"code-{STATE.cg['n']}"
+            STATE.cg["codes"][code] = {"redirect": redirect,
+                                       "challenge": q.get("code_challenge")}
+        to = redirect + "?" + urllib.parse.urlencode({"code": code, "state": q["state"]})
+        handler.send_response(302)
+        handler.send_header("Location", to)
+        handler.send_header("Content-Length", "0")
+        handler.end_headers()
+    elif path == "/chatgpt/backend-api/codex/models":
+        cg_log({"_models": url.query, "auth": cg_authorized(handler)})
+        if cg_authorized(handler):
+            handler.send_json(401, {"error": {"message": cg_authorized(handler)}})
+            return
+        handler.send_json(200, {"models": [
+            {"slug": m["id"], "context_window": 65536} for m in models()["data"]]})
+    else:
+        handler.send_json(404, {"error": {"message": "not found"}})
+
+
+def cg_authorized(handler):
+    """Why the backend refuses the request's credentials, or None."""
+    auth = handler.headers.get("Authorization", "")
+    with STATE.lock:
+        known = auth[7:] in STATE.cg["access"] if auth.startswith("Bearer ") else False
+    if not known:
+        return "invalid or revoked access token"
+    if handler.headers.get("chatgpt-account-id") != CG_ACCOUNT:
+        return "the account's id is missing"
+    return None
+
+
+def cg_post(handler, path, raw, prefix):
+    """POST /chatgpt/...: the token endpoint, or a model call."""
+    if path == "/chatgpt/oauth/token":
+        form = dict(urllib.parse.parse_qsl(raw.decode()))
+        cg_log({"_oauth": path, **form})
+        if form.get("client_id") != CG_CLIENT or "resource" in form:
+            handler.send_json(400, {"error": "invalid_client"})
+        elif form.get("grant_type") == "authorization_code":
+            with STATE.lock:
+                c = STATE.cg["codes"].pop(form.get("code"), None)
+            v = form.get("code_verifier", "").encode()
+            want = base64.urlsafe_b64encode(hashlib.sha256(v).digest()).rstrip(b"=").decode()
+            if not c or c["redirect"] != form.get("redirect_uri") or want != c["challenge"]:
+                handler.send_json(400, {"error": "invalid_grant"})
+                return
+            handler.send_json(200, cg_tokens())
+        elif form.get("grant_type") == "refresh_token":
+            with STATE.lock:
+                known = form.get("refresh_token") in STATE.cg["refresh"]
+                STATE.cg["refresh"].discard(form.get("refresh_token"))  # rotated
+            if not known:
+                handler.send_json(401, {"error": {"code": "refresh_token_expired",
+                                                  "message": "sign in again"}})
+                return
+            t = cg_tokens()
+            del t["id_token"]  # as a refresh may leave it out
+            handler.send_json(200, t)
+        else:
+            handler.send_json(400, {"error": "unsupported_grant_type"})
+    elif path == "/chatgpt/backend-api/codex/responses":
+        why = cg_authorized(handler)
+        try:
+            model = json.loads(raw).get("model", "")
+        except (ValueError, AttributeError):
+            model = ""
+        cg_log({"_call": path, "auth": why, "model": model})
+        if why:
+            handler.send_json(401, {"error": {"message": why, "type": "invalid_request_error"}})
+            return
+        rs_handle(handler, prefix, raw)
+    else:
+        handler.send_json(404, {"error": {"message": "not found"}})
+
+
+def cg_revoke(access=None, refresh=None):
+    """The backend forgets an access token, or the issuer a refresh
+    token, as after a sign-out elsewhere."""
+    with STATE.lock:
+        STATE.cg["access"].discard(access)
+        STATE.cg["refresh"].discard(refresh)
+
+
+def sc_cg_limit(model, n, req):
+    """ChatGPT's usage limit, which resets in 2 h 5 min."""
+    yield S.error(429, {"error": {
+        "type": "usage_limit_reached", "message": "The usage limit has been reached",
+        "plan_type": "plus", "resets_in_seconds": 7500}})
+
+
+sc_cg_signin = sc_plain
+sc_cg_refresh = sc_plain
+sc_cg_refused = sc_plain
 sc_rs_compaction = sc_compaction
 
 
@@ -5487,7 +5636,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         url, path, prefix = self.route()
         q = urllib.parse.parse_qs(url.query)
-        if path in ("/v1/models", "/models") and self.headers.get("anthropic-version"):
+        if path.startswith("/chatgpt/"):
+            cg_get(self, url, path)
+        elif path in ("/v1/models", "/models") and self.headers.get("anthropic-version"):
             with STATE.lock:
                 STATE.listings.append({"query": url.query,
                                        "version": self.headers.get("anthropic-version"),
@@ -5768,6 +5919,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/v1/messages":
             self.messages(prefix, raw)
+            return
+        if path.startswith("/chatgpt/"):
+            cg_post(self, path, raw, prefix)
             return
         if path in ("/v1/responses", "/responses"):
             rs_handle(self, prefix, raw)

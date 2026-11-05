@@ -763,13 +763,20 @@ enum : i32 {
     MCPAUTH_REFRESH,  // a refresh token exchanged for new ones
 };
 
-// A sign-in under way, or a refresh: in a region of its own.
+// A sign-in under way, or a refresh: in a region of its own. Its
+// target is an MCP server, or an endpoint of kind chatgpt, which signs
+// in to ChatGPT as the Codex CLI does: a fixed issuer and client, no
+// resource parameter, and the account's id from the id_token.
 struct McpAuth {
     McpAuth   *next;
     Region    *mem;
     Arena      arena;
-    Str        name;      // the server's
+    Str        name;      // the server's, or the endpoint's
     Str        resource;  // and its URL
+    b32        ep;        // an endpoint's, not a server's
+    Str        account;   // the endpoint's, refreshing: kept unless replaced
+    Str        email;
+    Str        plan;
     i32        stage;     // MCPAUTH_*
     Slice<Str> tries;     // metadata URLs to try, in order
     i32        at;
@@ -803,6 +810,28 @@ static Str base64url(Arena *a, Str s)
         r[i] = r[i]=='+' ? (u8)'-' : r[i]=='/' ? (u8)'_' : r[i];
     }
     return r;
+}
+
+// A JSON Web Token's claims, its payload unchecked (it came from the
+// issuer itself, over TLS), or null.
+static Json *jwtclaims(Arena *a, Str jwt)
+{
+    Cut head = cut(jwt, '.');
+    Cut body = cut(head.tail, '.');
+    if (!head.ok || !body.ok || !body.head.len) {
+        return 0;
+    }
+    Buf b(a, body.head.len + 4);
+    for (iz i = 0; i < body.head.len; i++) {
+        u8 c = body.head[i];
+        putbyte(&b, c=='-' ? (u8)'+' : c=='_' ? (u8)'/' : c);
+    }
+    while (b.len % 4) {
+        putbyte(&b, '=');
+    }
+    Unbase64 d = unbase64(a, finish(&b));
+    Json    *j = d.ok ? jsonparse(a, d.data).root : 0;
+    return j && j->type==JSON_OBJECT ? j : 0;
 }
 
 static i32 hexval(u8 c)  // -1 if not one
@@ -983,13 +1012,41 @@ static Str mcpauthurl(Arena *a, McpAuth *x, Str challenge)
     print(&b, challenge);
     print(&b, "&code_challenge_method=S256&state=");
     print(&b, pctencode(a, x->state));
-    print(&b, "&resource=");
-    print(&b, pctencode(a, x->resource));
+    if (x->ep) {
+        // As the Codex CLI asks, for a token the Codex backend takes
+        print(&b, "&id_token_add_organizations=true&codex_cli_simplified_flow=true");
+        print(&b, "&originator=");
+        print(&b, chatgptoriginator);
+    } else {
+        print(&b, "&resource=");
+        print(&b, pctencode(a, x->resource));
+    }
     if (x->scope.len) {
         print(&b, "&scope=");
         print(&b, pctencode(a, x->scope));
     }
     return finish(&b);
+}
+
+// Listen for the browser's return from ChatGPT's sign-in, which takes
+// only the Codex CLI's redirects: localhost at port 1455, else 1457.
+// With the test hook (PROSPERO_TEST_CHATGPT_AUTH) any port does, at
+// 127.0.0.1. The redirect, or null if neither port is free.
+static Str chatgptloopback(Os *os, Arena *a, Mailbox *mbox, u32 type, u64 id)
+{
+    b32 test    = os_getenv(os, a, "PROSPERO_TEST_CHATGPT_AUTH").len > 0;
+    i32 ports[] = {1455, 1457};
+    for (i32 i = 0; i < (test ? 1 : 2); i++) {
+        i32 port = test ? 0 : ports[i];
+        if (os_loopback(os, mbox, type, id, 10*60*1000, "/auth/callback", &port)) {
+            Buf b(a, 64);
+            print(&b, test ? Str("http://127.0.0.1:") : Str("http://localhost:"));
+            print(&b, (i64)port);
+            print(&b, "/auth/callback");
+            return finish(&b);
+        }
+    }
+    return {};
 }
 
 // The loopback listener's (os_loopback): the target of a request for

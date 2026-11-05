@@ -378,4 +378,59 @@ static void test_responses(Test *t)
         JsonDoc d5 = jsonparse(a, ev5[0]);
         expect(t, "rs.bad", istr(a, rschunk(newpartial(a), d5.root, a).bad), "1");
     }
+    // ChatGPT: the Codex backend's listing, its usage limit, the claims
+    // of its tokens, and the sign-in's URL
+    {
+        Arena tmp = *a;
+        tmp.beg += (tmp.end - tmp.beg) / 2;  // another arena's room
+        Str listing = rslisting(a, tmp, "{\"models\":[{\"slug\":\"gpt-5-codex\","
+                                "\"context_window\":272000},{\"display_name\":\"x\"},"
+                                "{\"slug\":\"gpt-5\"}]}");
+        expect(t, "cg.listing", listing,
+               "{\"object\":\"list\",\"data\":[{\"id\":\"gpt-5-codex\",\"object\":\"model\","
+               "\"max_input_tokens\":272000},{\"id\":\"gpt-5\",\"object\":\"model\"}]}");
+        ModelInfo mi = parsemodels(*a, listing, "gpt-5-codex", 0);
+        expect(t, "cg.listing.ctx", istr(a, mi.found ? mi.ctx : -1), "272000");
+        expect(t, "cg.listing.other", rslisting(a, tmp, "{\"data\":[]}"), "{\"data\":[]}");
+
+        Str lim = "{\"error\":{\"type\":\"usage_limit_reached\",\"message\":\"x\","
+                  "\"resets_in_seconds\":7500}}";
+        expect(t, "cg.limit.in", istr(a, rsusagelimit(*a, lim, 1000)), "7500");
+        Str at = "{\"error\":{\"type\":\"usage_limit_reached\",\"resets_at\":1600}}";
+        expect(t, "cg.limit.at", istr(a, rsusagelimit(*a, at, 1000)), "600");
+        Str no = "{\"error\":{\"type\":\"usage_limit_reached\"}}";
+        expect(t, "cg.limit.unsaid", istr(a, rsusagelimit(*a, no, 1000)), "0");
+        Str rate = "{\"error\":{\"type\":\"rate_limit_exceeded\",\"resets_in_seconds\":5}}";
+        expect(t, "cg.limit.not", istr(a, rsusagelimit(*a, rate, 1000)), "-1");
+        expect(t, "cg.limit.junk", istr(a, rsusagelimit(*a, "nope", 1000)), "-1");
+
+        // {"email":"me@example.com","https://api.openai.com/auth":
+        //  {"chatgpt_account_id":"acct-1"}}, unpadded, URL-safe
+        Str  jwt  = "eyJhbGciOiJub25lIn0.eyJlbWFpbCI6Im1lQGV4YW1wbGUuY29tIiwiaHR0cHM6Ly9hcGku"
+                    "b3BlbmFpLmNvbS9hdXRoIjp7ImNoYXRncHRfYWNjb3VudF9pZCI6ImFjY3QtMSJ9fQ.sig";
+        Json *c   = jwtclaims(a, jwt);
+        expect(t, "cg.jwt.email", jsonstr(jsonget(c, "email")), "me@example.com");
+        expect(t, "cg.jwt.account", jsonstr(jsonget(jsonget(c, "https://api.openai.com/auth"),
+                                                    "chatgpt_account_id")), "acct-1");
+        expect(t, "cg.jwt.bad", istr(a, jwtclaims(a, "notajwt")!=0), "0");
+        expect(t, "cg.jwt.junk", istr(a, jwtclaims(a, "a.!!!.b")!=0), "0");
+
+        McpAuth x = {};
+        x.ep       = 1;
+        x.authz    = "https://auth.openai.com/oauth/authorize";
+        x.client   = chatgptclient;
+        x.redirect = "http://localhost:1455/auth/callback";
+        x.state    = "st";
+        x.scope    = chatgptscope;
+        x.resource = "https://chatgpt.com/backend-api/codex/responses";
+        expect(t, "cg.authurl", mcpauthurl(a, &x, "CH"),
+               "https://auth.openai.com/oauth/authorize?response_type=code&client_id="
+               "app_EMoamEEZ73f0CkXaXp7hrann&redirect_uri=http%3A%2F%2Flocalhost%3A1455"
+               "%2Fauth%2Fcallback&code_challenge=CH&code_challenge_method=S256&state=st"
+               "&id_token_add_organizations=true&codex_cli_simplified_flow=true"
+               "&originator=prospero&scope=openid%20profile%20email%20offline_access");
+        expect(t, "cg.listpath", eplistpath(EP_CHATGPT), "models?client_version=1.0.0");
+        expect(t, "cg.form", mcpauthform(a, &x, "grant_type=refresh_token"),
+               "grant_type=refresh_token&client_id=app_EMoamEEZ73f0CkXaXp7hrann");
+    }
 }

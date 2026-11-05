@@ -400,6 +400,9 @@ struct GuiEndpoint {
     b32        ok;
     Str        err;     // why not, if not
     Slice<Str> models;  // ids, as listed
+    b32        signedin;  // kind chatgpt: signed in to ChatGPT, as whom
+    Str        email;
+    Str        plan;
 };
 
 // A shell a host's engine listed (shells), for the shell picker.
@@ -1549,6 +1552,8 @@ struct Gui {
     i64                apprlistid;
     i64                apprlistat;
     Str                mcpname;    // the server signing in, null if none
+    b32                mcpep;      // or rather the endpoint (ChatGPT's)
+    Str                eplistfor;  // the endpoint whose page asked for a listing
     i64                mcpcmd;     // its mcp.auth or mcp.code under way
     u64                mcpback;    // its loopback's records' id
     Str                mcpmsg;     // how its sign-in went, for its page
@@ -2483,6 +2488,41 @@ static Str mcpstatus(Gui *g, Arena *a, Str name, u32 *dot)
     return finish(&b);
 }
 
+// A chatgpt endpoint's sign-in, as its page puts it (and the checklist
+// reads it), as the main host's engine lists it, with its dot's color.
+static Str epstatus(Gui *g, Arena *a, Str name, u32 *dot)
+{
+    GuiHost     *h   = g->main;
+    b32          can = h && hostcan(h, "endpoint.auth");
+    GuiEndpoint *ep  = 0;
+    for (iz i = 0; can && i < h->eps.len; i++) {
+        ep = h->eps[i].name==name ? &h->eps[i] : ep;
+    }
+    *dot = g->pal->dim;
+    Buf b(a, 256);
+    if (!can) {
+        print(&b, "The engine is too old to sign in to ChatGPT");
+    } else if (!ep || h->listid) {
+        print(&b, "...");
+    } else if (ep->signedin) {
+        print(&b, "Signed in to ChatGPT");
+        if (ep->email.len) {
+            print(&b, " as ");
+            print(&b, ep->email);
+        }
+        if (ep->plan.len) {
+            print(&b, " (");
+            print(&b, ep->plan);
+            print(&b, ")");
+        }
+        *dot = g->pal->ok;
+    } else {
+        print(&b, "Not signed in to ChatGPT");
+        *dot = g->pal->amber;
+    }
+    return finish(&b);
+}
+
 static void mcpsay(Gui *g, Str name, Str msg, b32 bad)
 {
     g->mcpmsg    = clone(&g->perm, msg);
@@ -2499,6 +2539,10 @@ static void mcpsigned(Gui *g, Str msg, b32 bad)
     g->mcpname = {};
     g->mcpcmd  = 0;
     g->mcpback++;  // a late return is no longer this one's
+    if (g->mcpep) {
+        g->mcpep     = 0;
+        g->eplistfor = {};  // its page lists again, signed in or not
+    }
     if (g->mcpbrowser) {
         os_httpcancel(g->os, g->mcpbrowser);
         os_httpfree(g->os, g->mcpbrowser);
@@ -2526,6 +2570,35 @@ static void mcpbrowse(Gui *g, Str url)
     if (!g->mcpbrowser) {
         mcpsigned(g, "the checklist's browser could not fetch the page", 1);
     }
+}
+
+// Sign in to ChatGPT for an endpoint (endpoint.auth), as to a server,
+// but at the redirect ChatGPT takes.
+static void epsignin(Gui *g, Str name)
+{
+    if (g->mcpname.len) {
+        return;
+    }
+    Arena a        = newarena(g->cmdr);
+    u64   back     = ++g->mcpback;
+    Str   redirect = chatgptloopback(g->os, &a, g->tasks, TASK_MCPBACK, back);
+    if (!redirect.len) {
+        mcpsay(g, name, "Cannot listen on this computer's loopback at port 1455 or "
+                        "1457, where ChatGPT's sign-in comes back: is another "
+                        "sign-in, the Codex CLI's perhaps, waiting there?", 1);
+        return;
+    }
+    Buf   b(&a, 256);
+    EvOut w = cmdopen(g, &b, CMD_EPAUTH, 0, g->main);
+    putkey(&w.json, "name");
+    putstr(&w.json, name);
+    putkey(&w.json, "redirect");
+    putstr(&w.json, redirect);
+    g->mcpname = clone(&g->perm, name);
+    g->mcpep   = 1;
+    g->mcpcmd  = g->nextid;
+    mcpsay(g, name, "Asking where to sign in...", 0);
+    cmdsend(g, &w, a);
 }
 
 static void mcpsignin(Gui *g, Str name)
@@ -2601,6 +2674,9 @@ static void mcpback(Gui *g, Record r)
     EvOut w = cmdopen(g, &b, CMD_MCPCODE, 0, g->main);
     putkey(&w.json, "name");
     putstr(&w.json, g->mcpname);
+    if (g->mcpep) {
+        putintkey(&w.json, "endpoint", 1);
+    }
     Str keys[] = {"code", "state", "error", "error_description"};
     for (iz i = 0; i < countof(keys); i++) {
         Str v = mcpquery(&a, q, keys[i]);
@@ -2679,6 +2755,9 @@ static void onhostlist(Gui *g, GuiHost *h, Arena scratch, Json *j, b32 ok)
         putbyte(&sig, 0);
         print(&sig, jsonint(jsonget(e, "ok"), 0));
         print(&sig, jsonstr(jsonget(e, "err")));
+        print(&sig, jsonint(jsonget(e, "signedin"), 0));
+        print(&sig, jsonstr(jsonget(e, "email")));
+        print(&sig, jsonstr(jsonget(e, "plan")));
         for (Json *m = jsonget(e, "models")->child; m; m = m->next) {
             putbyte(&sig, 0);
             print(&sig, jsonstr(m));
@@ -2701,6 +2780,9 @@ static void onhostlist(Gui *g, GuiHost *h, Arena scratch, Json *j, b32 ok)
         ep.url  = clone(a, jsonstr(jsonget(e, "url")));
         ep.ok   = jsonint(jsonget(e, "ok"), 0) != 0;
         ep.err  = clone(a, jsonstr(jsonget(e, "err")));
+        ep.signedin = jsonint(jsonget(e, "signedin"), 0) != 0;
+        ep.email    = clone(a, jsonstr(jsonget(e, "email")));
+        ep.plan     = clone(a, jsonstr(jsonget(e, "plan")));
         for (Json *m = jsonget(e, "models")->child; m; m = m->next) {
             Str id = jsonstr(m);
             if (id.len) {
@@ -5652,6 +5734,7 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
         }
         return;
     case CMD_MCPAUTH:
+    case CMD_EPAUTH:
         if (id==g->mcpcmd && g->mcpname.len) {
             onmcpauth(g, j, ok, err);
         }
@@ -5674,10 +5757,12 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
         return;
     case CMD_MCPLOGOUT:
     case CMD_MCPRESTART:
+    case CMD_EPLOGOUT:
         if (!ok) {
             mcpsay(g, g->mcpmsgfor, err, 1);
         }
         g->mcplistat = 0;
+        g->eplistfor = {};
         scheddirty(&g->sched);
         return;
 
@@ -12731,6 +12816,7 @@ enum : i32 {
                       // of that host's: ~, or where a session there works
     CHK_MCPSTATE,     // the MCP server web's page says text
     CHK_MCPSIGNED,    // the sign-in to web succeeded, once, through the browser
+    CHK_EPSIGNED,     // the sign-in to ChatGPT for gpt succeeded, after web's
     CHK_MCPCALL,      // the session's call to web's echo tool came back
     CHK_FARKID,       // the latest task's subagent is open on far, under its
                       // parent in the sidebar, marked away, the row on far
@@ -13021,6 +13107,7 @@ static Str chknames[] = {
     "a Windows path typed for a WSL distro became the distro's",
     "the new session's directory, turned to a remote, is one of its own",
     "the MCP server's page says what it is", "signed in through the browser",
+    "signed in to ChatGPT through the browser",
     "the MCP server's tool answered the session",
     "the subagent on far was opened here, under its parent, its row on far",
     "its ask, answered here, let it write there, and the parent heard",
@@ -13116,6 +13203,8 @@ enum : i32 {
     W_NAMEDUPDATED,// the remote named by text is updated, or failed to be
     W_MCPSTATE,   // the MCP server web's page says what text begins
     W_MCPSIGNED,  // a sign-in to an MCP server ended
+    W_EPSTATE,    // the endpoint gpt's page says what text begins
+    W_EPSIGNED,   // a sign-in to ChatGPT for endpoint gpt ended
     W_FARKID,     // the latest subagent on far is open here, at work
     W_FARSHOWN,   // a session on far is shown, open, its replay applied
     W_TOAST,      // a toast since OP_TOASTMARK
@@ -13146,6 +13235,7 @@ static Str waitnames[] = {
     "the WSL distro's section", "the dialog's host's models",
     "the named remote to come up", "the named remote to close",
     "the named remote's update", "the MCP server's state", "the MCP sign-in",
+    "the endpoint's ChatGPT state", "the ChatGPT sign-in",
     "the subagent on far", "the subagent on far shown", "a toast",
     "the changes", "the folder's probe", "the worktree's branch",
     "the thin remote", "a relayed stream", "the container",
@@ -16567,6 +16657,30 @@ static DriveOp mcpops[] = {
     {OP_UP, 0, 0, 0, 100, ""},
     {OP_WAIT, W_MCPSTATE, 0, 0, 10000, "web: needs you to sign in"},
     {OP_SHOT, 0, 0, 0, 300, "mcp-3-signedout"},
+    // An endpoint of kind chatgpt signs in to ChatGPT likewise, at the
+    // fake's issuer (PROSPERO_TEST_CHATGPT_AUTH), and out
+    {OP_SHOWPAGE, 0, 0, 0, 300, "endpoint gpt"},
+    {OP_MOVE, T_PAGEITEM, 0, 0, 100, "endpoint gpt"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_SHOWPAGE, 0, 0, 0, 300, "endpoint gpt"},
+    {OP_MOVE, T_PAGEITEM, 0, 0, 100, "endpoint gpt"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PAGE, 0, 0, 0, "endpoint gpt"},
+    {OP_WAIT, W_EPSTATE, 0, 0, 10000, "Not signed in to ChatGPT"},
+    {OP_SHOT, 0, 0, 0, 300, "chatgpt-1-page"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "endpoint signin gpt"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 100, ""},
+    {OP_WAIT, W_EPSIGNED, 0, 0, 30000, ""},
+    {OP_CHECK, CHK_EPSIGNED, 0, 0, 0, ""},
+    {OP_WAIT, W_EPSTATE, 0, 0, 10000, "Signed in to ChatGPT as me@example.com (plus)"},
+    {OP_SHOT, 0, 0, 0, 300, "chatgpt-2-signed"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "endpoint signout gpt"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 100, ""},
+    {OP_WAIT, W_EPSTATE, 0, 0, 10000, "Not signed in to ChatGPT"},
     {OP_SUMMARY, 0, 0, 0, 0, ""},
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
@@ -18694,6 +18808,12 @@ static b32 drivewaitdone(Gui *g)
     }
     case W_MCPSIGNED:
         return !g->mcpname.len && g->mcpmsgfor=="web" && g->mcpmsg.len;
+    case W_EPSTATE: {
+        u32 dot = 0;
+        return startswith(epstatus(g, &g->frame, "gpt", &dot), g->ops[g->drivepc-1].text);
+    }
+    case W_EPSIGNED:
+        return !g->mcpname.len && g->mcpmsgfor=="gpt" && g->mcpmsg.len;
     case W_NAMEDUPDATED: {
         GuiHost *h = findhost(g, GH_REMOTE, g->ops[g->drivepc-1].text);
         return h && (h->updating==UPD_FAILED ||
@@ -20935,6 +21055,9 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_MCPSIGNED:
         return g->mcpsignins==1 && g->mcpmsg=="Signed in" && !g->mcpbad;
+    case CHK_EPSIGNED:
+        return g->mcpsignins==2 && g->mcpmsgfor=="gpt" && g->mcpmsg=="Signed in" &&
+               !g->mcpbad;
     case CHK_MCPCALL: {
         GuiSession *s = g->sess;
         View       *v = s ? s->view : 0;
@@ -21736,7 +21859,7 @@ static b32 guiwanted(Str *args, i32 nargs)
 {
     static Str const cmds[] = {
         "run", "serve", "attach", "hosts", "connect", "deploy", "eval", "mcp",
-        "approve",
+        "approve", "endpoint",
     };
     if (nargs<2 || args[1]=="gui") {
         return 1;

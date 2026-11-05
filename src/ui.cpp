@@ -760,7 +760,8 @@ static Str livelabel(View *v, i32 state)
     return state==LIVE_TASK     ? Str("subagents") :
            state==LIVE_MCP      ? Str("starting MCP servers") :
            state==LIVE_WORKTREE ? Str("making the worktree") :
-           state==LIVE_RELAY    ? Str("paused: no relay") : livenames[state];
+           state==LIVE_RELAY    ? Str("paused: no relay") :
+           state==LIVE_AUTH     ? Str("signing in again") : livenames[state];
 }
 
 // A whole number with thousands separated: 12,345.
@@ -11630,6 +11631,71 @@ static void drawmcp(Gui *g, Arena a, Str name)
     ImGui::PopID();
 }
 
+// A chatgpt endpoint's sign-in, on its page: who is signed in, as the
+// main host's engine lists it (models, asked as the page shows), with
+// Sign in and Sign out.
+static void drawchatgpt(Gui *g, Arena a, Str name)
+{
+    f32         sc  = g->scale;
+    ImGuiStyle &st  = ImGui::GetStyle();
+    GuiHost    *h   = g->main;
+    b32         can = h && hostcan(h, "endpoint.auth");
+    if (can && g->eplistfor!=name && !h->listid && hostlist(g, h)) {
+        g->eplistfor = clone(&g->perm, name);
+    }
+    GuiEndpoint *ep = 0;
+    for (iz i = 0; can && i < h->eps.len; i++) {
+        ep = h->eps[i].name==name ? &h->eps[i] : ep;
+    }
+    u32 dot  = 0;
+    Str line = epstatus(g, &a, name, &dot);
+    pushstr(concat(&a, "chatgpt ", name));
+    ImVec2 p  = ImGui::GetCursorScreenPos();
+    f32    lh = ImGui::GetTextLineHeight();
+    drawdot(ImGui::GetWindowDrawList(), v2(p.x + 4*sc, p.y + lh/2 + st.FramePadding.y),
+            3.5f*sc, dot);
+    ImGui::Dummy(v2(10*sc, 0));
+    ImGui::SameLine();
+    ImGui::AlignTextToFramePadding();
+    ImGui::PushTextWrapPos(0);
+    text(line);
+    ImGui::PopTextWrapPos();
+    itemnamed(g, concat(&a, "endpoint state ", name));
+
+    b32 signed_ = ep && ep->signedin;
+    Str why     = !can ? Str("The engine is too old to sign in") :
+                  g->mcpname.len ? concat(&a, concat(&a, "Signing in to ", g->mcpname),
+                                          Str(" already")) : Str{};
+    ImGui::BeginDisabled(why.len > 0);
+    b32 in = ImGui::SmallButton(signed_ ? "Sign in again" : "Sign in");
+    ImGui::EndDisabled();
+    itemnamed(g, concat(&a, "endpoint signin ", name));
+    if (why.len) {
+        whytip(why);
+    } else {
+        itemtip("Sign in through the browser with the ChatGPT account whose "
+                "subscription it uses, for tokens kept in the state directory");
+    }
+    if (in) {
+        epsignin(g, name);
+    }
+    if (signed_) {
+        ImGui::SameLine();
+        b32 out = ImGui::SmallButton("Sign out");
+        itemnamed(g, concat(&a, "endpoint signout ", name));
+        itemtip("Forget the ChatGPT tokens");
+        if (out) {
+            mcpcmd(g, CMD_EPLOGOUT, name);
+        }
+    }
+    if (g->mcpmsg.len && g->mcpmsgfor==name) {
+        ImGui::PushStyleColor(ImGuiCol_Text, g->mcpbad ? g->pal->bad : g->pal->dim);
+        ImGui::TextWrapped("%s", cstr0(&a, g->mcpmsg));
+        ImGui::PopStyleColor();
+    }
+    ImGui::PopID();
+}
+
 // The page shown: its section's name and what it is for, Delete for a
 // named one of the user's own file, Connect for a remote, an MCP
 // server's state and sign-in, its settings, and a model's template
@@ -11721,6 +11787,15 @@ static void drawcfgpage(Gui *g)
         drawmcp(g, a, name);
     } else if (kind=="endpoint" && name.len) {
         drawapprove(g, a, kind, name);
+        b32 chatgpt = 0;
+        for (iz i = 0; i < g->cfgrows.len; i++) {
+            CfgRow *r = &g->cfgrows[i];
+            chatgpt |= r->kind=="endpoint" && r->name==name && r->key=="kind" &&
+                       trim(r->value)=="chatgpt";
+        }
+        if (chatgpt) {
+            drawchatgpt(g, a, name);
+        }
     }
     ImGui::Spacing();
     if (named && !cfghas(g, kind, name)) {

@@ -502,7 +502,8 @@ static HostCmd *hostforward(Host *h, Arena scratch, Json *j, i32 cmd, i32 kind,
                             i64 from, i32 attended)
 {
     HostCmd *q = 0;
-    if (cmd==CMD_MODELS || cmd==CMD_MCPAUTH || cmd==CMD_MCPCODE || cmd==CMD_GIT) {
+    if (cmd==CMD_MODELS || cmd==CMD_MCPAUTH || cmd==CMD_MCPCODE || cmd==CMD_GIT ||
+            cmd==CMD_EPAUTH) {
         if (h->latelen == HOST_LATE) {
             HostCmd old = h->late[0];
             if (old.client) {

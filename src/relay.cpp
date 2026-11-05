@@ -127,6 +127,8 @@ struct RelayServe {
     b32         dropped;  // whose end is gone: nothing more is sent
     Str         session;
     Endpoint    ep;
+    b32         authwait;  // for a chatgpt endpoint's refresh (epauth)
+    b32         authtried; // once: then sent as it is
     Str         path;
     Str         method;
     Str         accept;
@@ -1033,10 +1035,30 @@ static void relayadmit(Engine *e, Arena scratch, RelayServe *v)
     pump(e, p);
 }
 
+// A chatgpt endpoint's refresh ended: its served calls that waited go
+// at the next pass, refreshed or not.
+static void relayauthwake(Engine *e, Str name)
+{
+    for (RelayServe *v = e->relay ? e->relay->serves : 0; v; v = v->next) {
+        if (v->authwait && v->ep.name==name) {
+            v->authwait = 0;
+            v->go       = 1;
+        }
+    }
+}
+
 // Its request, to its endpoint, with this engine's key.
 static void relaysend(Engine *e, Arena scratch, RelayServe *v)
 {
     v->go = 0;
+    if (v->ep.kind==EP_CHATGPT && !v->search && !v->authtried) {
+        Str why = {};
+        v->authtried = 1;
+        if (epauth(e, scratch, &v->ep, 0, &why) == EPAUTH_WAIT) {
+            v->authwait = 1;  // relayauthwake goes on
+            return;
+        }
+    }
     Str path = v->path;
     Str url  = startswith(path, "v1/") ? apiurl(&scratch, v->ep.url, cuthead(path, 3))
                                        : rooturl(&scratch, v->ep.url, path);
@@ -1044,6 +1066,10 @@ static void relaysend(Engine *e, Arena scratch, RelayServe *v)
     r.method    = v->method;
     r.url       = url;
     r.headers   = authheaders(&scratch, &v->ep, v->accept);
+    if (v->ep.kind == EP_CHATGPT) {
+        r.headers = concat(&scratch, r.headers,
+                           chatgptheaders(e, &scratch, &v->ep, v->session, 0));
+    }
     r.body      = v->body;
     r.connectms = v->ep.connectms;
     r.readms    = v->readms;
