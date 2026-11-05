@@ -37,6 +37,8 @@ set(PROSPERO_EDITION community CACHE STRING "Edition: community or itch")
 set_property(CACHE PROSPERO_EDITION PROPERTY STRINGS community itch)
 set(PROSPERO_ENGINES_ZIP "" CACHE FILEPATH
     "For the itch edition: prospero-engines-VERSION.zip, embedded")
+# The cached value may name variables, as ${PROJECT_VERSION}, expanded here
+string(CONFIGURE "${PROSPERO_ENGINES_ZIP}" PROSPERO_ENGINES_ZIP)
 if(PROSPERO_EDITION STREQUAL "community")
   set(prospero_display_name "Prospero Community Edition")
 elseif(PROSPERO_EDITION STREQUAL "itch")
@@ -46,7 +48,7 @@ elseif(PROSPERO_EDITION STREQUAL "itch")
   endif()
   if(NOT IS_ABSOLUTE "${PROSPERO_ENGINES_ZIP}" OR NOT EXISTS "${PROSPERO_ENGINES_ZIP}")
     message(FATAL_ERROR "the itch edition needs PROSPERO_ENGINES_ZIP, the "
-                        "engines zip's absolute path")
+                        "engines zip's absolute path, not \"${PROSPERO_ENGINES_ZIP}\"")
   endif()
 else()
   message(FATAL_ERROR "PROSPERO_EDITION is community or itch, not ${PROSPERO_EDITION}")

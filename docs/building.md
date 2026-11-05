@@ -61,7 +61,9 @@ its window title says so, and an empty transcript asks those who use
 Prospero professionally to buy the [itch.io][itch] build. That build,
 `-DPROSPERO_EDITION=itch`, is plain Prospero, and needs
 `-DPROSPERO_ENGINES_ZIP=PATH`, the engines zip (below), which it
-carries built in, so that deploy needs no engines directory.
+carries built in, so that deploy needs no engines directory. PATH may
+name `${PROJECT_VERSION}`, quoted from the shell, so that it follows
+version bumps: `'-DPROSPERO_ENGINES_ZIP=.../prospero-engines-${PROJECT_VERSION}.zip'`.
 
 ## Releases
 
