@@ -32,6 +32,9 @@ static Str siderows(Arena *a, SideIn *in, Slice<SideRow> rows)
         case SROW_TRASH:
             print(&b, "T");
             break;
+        case SROW_DONE:
+            print(&b, "D");
+            break;
         }
         if (r->kind != SROW_SESSION) {
             putbyte(&b, ' ');
@@ -100,6 +103,43 @@ static void test_sidebar(Test *t)
     expect(t, "sidebar.selfactive", siderows(&a, &in, sidetree(&a, &in)),
            "S s3\nS s2+\nS s1\n");
     in.sess[3].active = 0;
+
+    // Three or more finished subagents fold into a row of their own,
+    // folded unless opened, after those at work, asking or in view; a
+    // finished one's own subagents go with it
+    {
+        SideIn d = {};
+        d.hosts = push(&a, d.hosts, SideHost{"this", 1, 0});
+        d.sess  = push(&a, d.sess, sidesess(0, "k5", "p", {}, 0));
+        d.sess  = push(&a, d.sess, sidesess(0, "k4", "p", {}, 0));
+        d.sess  = push(&a, d.sess, sidesess(0, "k3x", "k3", {}, 0));
+        d.sess  = push(&a, d.sess, sidesess(0, "k3", "p", {}, 0));
+        d.sess  = push(&a, d.sess, sidesess(0, "k2", "p", {}, 0));
+        d.sess  = push(&a, d.sess, sidesess(0, "k1", "p", {}, 0));
+        d.sess  = push(&a, d.sess, sidesess(0, "p", {}, {}, 0));
+        d.sess[1].active = 1;  // k4
+        d.sess[4].active = 1;  // k2
+        d.sess[5].asks   = 1;  // k1
+        expect(t, "sidebar.donefew", siderows(&a, &d, sidetree(&a, &d)),
+               "S p!\n S k1\n S k2\n S k3\n  S k3x\n S k4\n S k5\n");
+        d.sess[1].active = 0;
+        d.sess[4].active = 0;
+        Slice<SideRow> rows = sidetree(&a, &d);
+        expect(t, "sidebar.done", siderows(&a, &d, rows), "S p!\n S k1\n D 5+\n");
+        expect(t, "sidebar.donekey", rows[2].key, "d:this:p");
+        d.sess[4].shown = 1;  // k2, in view, stays out
+        expect(t, "sidebar.doneshown", siderows(&a, &d, sidetree(&a, &d)),
+               "S p!\n S k1\n S k2\n D 4+\n");
+        d.sess[4].shown = 0;
+        d.sess[2].active = 1;  // k3x keeps k3 out
+        expect(t, "sidebar.donedeep", siderows(&a, &d, sidetree(&a, &d)),
+               "S p!\n S k1\n S k3!\n  S k3x\n D 3+\n");
+        d.sess[2].active = 0;
+        d.sess[5].asks   = 0;
+        *upsert(&d.folds, "d:this:p", &a) = 0;
+        expect(t, "sidebar.doneopen", siderows(&a, &d, sidetree(&a, &d)),
+               "S p\n D 6\n  S k1\n  S k2\n  S k3\n   S k3x\n  S k4\n  S k5\n");
+    }
 
     // Two hosts: headings, every host listed always even if empty, a
     // group merged across hosts, its subagents following their root,

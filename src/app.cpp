@@ -15131,6 +15131,27 @@ static DriveOp sessionsops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_SIDE, 0, 0, 0, "S Start subagents.\n  S "},
+    // Three finished subagents fold into a row of their own, folded
+    // until opened; two do not
+    {OP_NEWSESSION, 0, 0, 0, 500, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_PROMPT, 0, 0, 0, 100, "Start more subagents."},
+    {OP_WAIT, W_SAID, 0, 0, 20000, "All three"},
+    {OP_MOVE, T_EMPTY, 0, 0, 1500, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, " S Start more subagents.\n  D 3+\n S "},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "S Start subagents.\n  S "},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-finished"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "head d:this:"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, " S Start more subagents.\n  D 3\n   S "},
+    {OP_CHECK, CHK_SIDEINI, 0, 0, 0, "Opened=d:this:"},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-finished-open"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "head d:this:"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, " S Start more subagents.\n  D 3+\n"},
+    {OP_TOASTMARK, 0, 0, 0, 0, ""},  // its turn's end was news, rightly
     // A terminal in its folder, from its context menu (noted, not opened)
     {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Say hello."},
     {OP_RDOWN, 0, 0, 0, 60, ""},

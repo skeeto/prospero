@@ -22,6 +22,12 @@
 // anything below it asks, so that nothing waiting for the user is ever
 // hidden. A folded row's sessions are left out of the rows.
 //
+// A subagent cannot be resumed, so one whose task is over is done for
+// good. A session with SIDE_DONEMIN or more such subagents lists the
+// rest, those at work, asking, or in view (and those above them), then
+// a "finished" row over the done ones, folded unless opened, so that
+// dozens of done subagents do not bury the few still at work.
+//
 // Fold keys:
 //   g:NAME            a group
 //   h:HOST            a host's heading at the top level
@@ -31,6 +37,7 @@
 //   t                 the Trash heading
 //   t|h:HOST          a host's heading under it
 //   s:HOST:SID        a session with subagents
+//   d:HOST:SID        its finished subagents
 //
 // This is free and unencumbered software released into the public domain.
 
@@ -40,6 +47,7 @@ enum : i32 {
     SROW_SESSION,
     SROW_ARCHIVED,  // the Archived heading
     SROW_TRASH,     // the Trash heading
+    SROW_DONE,      // a session's finished subagents
 };
 
 // The sections a root can be in (sidein).
@@ -50,7 +58,8 @@ enum : i32 {
 };
 
 enum : i32 {
-    SIDE_DEPTH = 16,  // levels of subagents placed under their parents
+    SIDE_DEPTH   = 16,  // levels of subagents placed under their parents
+    SIDE_DONEMIN = 3,   // finished subagents that fold into a row of their own
 };
 
 // A session as the sidebar sees it.
@@ -64,6 +73,7 @@ struct SideSess {
     b32  trashed;   // in the Trash: only a root's counts
     b32  active;    // runs a turn
     b32  asks;      // waits for the user
+    b32  shown;     // the session in view
 };
 
 struct SideHost {
@@ -110,6 +120,8 @@ struct SideTree {
     i32                      *size;     // sessions in its subtree
     b32                      *active;   // something in its subtree runs or asks
     b32                      *asks;     // something in its subtree asks
+    b32                      *keep;     // something in its subtree runs, asks
+                                        // or is in view: not finished
 };
 
 static Str sidekey(Arena *a, Str prefix, Str tail)
@@ -132,6 +144,7 @@ static void sideplace(SideTree *t, i32 i, i32 root, i32 depth)
     t->size[i]   = 1;
     t->active[i] = s->active || s->asks;
     t->asks[i]   = s->asks;
+    t->keep[i]   = s->active || s->asks || s->shown;
     Slice<i32> k = t->kids[i];
     for (iz n = 0; n < k.len; n++) {
         i32 c = k[n];
@@ -143,6 +156,7 @@ static void sideplace(SideTree *t, i32 i, i32 root, i32 depth)
         t->size[i]   += t->size[c];
         t->active[i] |= t->active[c];
         t->asks[i]   |= t->asks[c];
+        t->keep[i]   |= t->keep[c];
     }
 }
 
@@ -179,10 +193,39 @@ static void sideemit(SideTree *t, i32 i, i32 depth, Str group, i32 aside, i32 le
     if (!r.kids || r.folded) {
         return;
     }
-    Slice<i32> k = t->kids[i];
+    Slice<i32> k    = t->kids[i];
+    i32        done = 0;  // finished subagents
+    i32        size = 0;  // and the sessions under them
     for (iz n = 0; n < k.len; n++) {
-        if (t->under[k[n]] == i) {
+        if (t->under[k[n]]==i && !t->keep[k[n]]) {
+            done++;
+            size += t->size[k[n]];
+        }
+    }
+    b32 fold = done >= SIDE_DONEMIN;
+    for (iz n = 0; n < k.len; n++) {
+        if (t->under[k[n]]==i && (!fold || t->keep[k[n]])) {
             sideemit(t, k[n], depth+1, group, aside, level+1);
+        }
+    }
+    if (!fold) {
+        return;
+    }
+    SideRow f = {};
+    f.kind     = SROW_DONE;
+    f.depth    = depth + 1;
+    f.host     = s->host;
+    f.sess     = -1;
+    f.group    = group;
+    f.archived = r.archived;
+    f.trashed  = r.trashed;
+    f.key      = concat(t->a, "d", Str(r.key.data+1, r.key.len-1));
+    f.count    = size;
+    f.folded   = sidefolded(t->in, f.key, 1);
+    t->rows = push(t->a, t->rows, f);
+    for (iz n = 0; !f.folded && n < k.len; n++) {
+        if (t->under[k[n]]==i && !t->keep[k[n]]) {
+            sideemit(t, k[n], depth+2, group, aside, level+1);
         }
     }
 }
@@ -309,6 +352,7 @@ static Slice<SideRow> sidetree(Arena *a, SideIn *in)
     t.size   = alloc<i32>(a, n ? n : 1);
     t.active = alloc<b32>(a, n ? n : 1);
     t.asks   = alloc<b32>(a, n ? n : 1);
+    t.keep   = alloc<b32>(a, n ? n : 1);
     for (iz i = 0; i < n; i++) {
         t.kids    = push(a, t.kids, Slice<i32>{});
         t.root[i]  = -1;

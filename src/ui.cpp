@@ -7650,6 +7650,10 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
             guilistall(g);
         }
     }
+    if (r->kind == SROW_DONE) {
+        itemtip("Subagents whose tasks are over, kept here out of the way of those "
+                "still at work");
+    }
     if (r->kind == SROW_TRASH) {
         itemtip("Deleted sessions, each removed for good after the "
                               "days its host keeps them ([sessions] trash_days)");
@@ -7669,7 +7673,8 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
         }
         break;
     }
-    b32 menu = r->kind!=SROW_ARCHIVED && ImGui::BeginPopupContextItem("##headmenu");
+    b32 menu = r->kind!=SROW_ARCHIVED && r->kind!=SROW_DONE &&
+               ImGui::BeginPopupContextItem("##headmenu");
     if (menu) {
         if (r->kind == SROW_GROUP) {
             groupitems(g, a, r->group);
@@ -7706,6 +7711,12 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
         break;
     case SROW_TRASH:
         pen(&t, "Trash", STYLE_BOLD, g->pal->dim);
+        pen(&t, finish(&c), 0, g->pal->dim);
+        break;
+    case SROW_DONE:
+        c.len = 0;
+        print(&c, (i64)r->count);
+        print(&c, " finished");
         pen(&t, finish(&c), 0, g->pal->dim);
         break;
     case SROW_HOST: {
@@ -8195,6 +8206,7 @@ static void drawsessions(Gui *g)
             e.asks     = v && v->asks && !s->readonly;
             e.active   = v ? v->busy && !s->readonly
                            : s->state!=LIVE_IDLE && s->state!=LIVE_CLOSED;
+            e.shown    = s == g->sess;
             in.sess = push(&a, in.sess, e);
             sess    = push(&a, sess, s);
         }
@@ -8218,6 +8230,7 @@ static void drawsessions(Gui *g)
             case SROW_SESSION: print(&d, "S "); print(&d, sesstitle(sess[r->sess])); break;
             case SROW_ARCHIVED: print(&d, "A"); break;
             case SROW_TRASH:    print(&d, "T"); break;
+            case SROW_DONE:     print(&d, "D "); print(&d, (i64)r->count); break;
             }
             print(&d, r->away ? Str("@") : Str(""));
             print(&d, r->folded ? Str("+\n") : Str("\n"));

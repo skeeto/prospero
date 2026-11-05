@@ -2727,7 +2727,8 @@ def sc_mcp_http_timeout(model, n, req):
 GUI_PROMPTS = ("Stream slowly", "Run the tools", "be allowed", "wait for nobody",
                "Steer me", "Cancel me", "Close me", "Stream fast", "Stream at 100",
                "Say hello", "Stall for", "Fail once", "Hold me", "Show the themes",
-               "Start subagents", "Report as a subagent", "Plan it with a todo list",
+               "Start subagents", "Start more subagents", "Report as a subagent",
+               "Plan it with a todo list",
                "Start background jobs", "Start a subagent that asks",
                "Write outside as a subagent", "Make undoable changes",
                "Read the big files", "Fail over", "Stream in the background",
@@ -2996,6 +2997,13 @@ def sc_gui(model, n, req):
         # conversation to compact on request
         words = " ".join(f"word{i}" for i in range(6000))
         yield from real_answer(model, req, "A long answer: " + words)
+    elif "Start more subagents" in prompt:
+        if step == 0:
+            yield from calls(model, n, [
+                ("task", {"description": f"Look {w}", "prompt": f"Report as a subagent: {w}."})
+                for w in ("one", "two", "three")])
+        else:
+            yield from answer(model, "All three subagents reported.")
     elif "Start subagents" in prompt:
         if step == 0:
             yield from calls(model, n, [

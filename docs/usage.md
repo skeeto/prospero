@@ -88,7 +88,9 @@ icon) does the same. A folder dropped on the window fills the New
 session dialog with it.
 
 The sidebar is a tree: groups, then hosts, then sessions with their
-subagents, and archived sessions folded away at the end. A session's
+subagents, and archived sessions folded away at the end. Three or more
+finished subagents under one parent fold into a "finished" row of
+their own, after those still at work, asking, or in view. A session's
 context menu, and the Session menu, rename it, move it to a group,
 fork it, compact it now, switch its model, export it (Markdown or the
 raw log), archive it, or move it to the Trash (with its subagents),
