@@ -2053,14 +2053,16 @@ def main():
         want += ("\n[ui]\ntheme = light\nnotify = allow\n"
                  "\n[model fresh]\nreasoning = reasoning_content\n"
                  "\n[remote box]\nssh = me@box.example\npath = ~/bin/prospero\n"
-                 "\n[endpoint gpt]\nkind = anthropic\nurl = http://gpt.example/v1\n")
+                 "\n[endpoint gpt]\nkind = anthropic\nurl = http://gpt.example/v1\n"
+                 "\n[endpoint oa]\nkind = chatgpt\n"
+                 "url = https://chatgpt.com/backend-api/codex/responses\n")
         if after != want:
             diff = difflib.unified_diff(want.splitlines(), after.splitlines(),
                                         "expected", "saved", lineterm="", n=1)
             problems.append("the configuration is not the edits alone:\n" + "\n".join(diff))
         else:
             print("configuration: the long value, the theme, notify, the roots, a section "
-                  "deleted and three added, nothing else")
+                  "deleted and four added, nothing else")
         if host.read(host.path("team.ini")) != "# Shared\n[model shared]\ntemperature = 0.1\n":
             problems.append("the included file changed")
         if args.shots and not args.host:

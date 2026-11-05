@@ -2961,8 +2961,9 @@ static void guiconfigset(Gui *g, Str kind, Str name, Str key, Str value)
 }
 
 // An endpoint's kind was just set to kind: its url follows, to the new
-// kind's own service (epkindurl), when it is unset or still another
-// kind's own. A url the user wrote stays.
+// kind's own service (epkindurl), when it is unset, still another
+// kind's own, or the placeholder a new section gets (cfgseed's). A url
+// the user wrote stays.
 static void epurlfollow(Gui *g, Str name, Str kind)
 {
     Str to  = epkindurl(epkindof(kind));
@@ -2973,7 +2974,7 @@ static void epurlfollow(Gui *g, Str name, Str kind)
             cur = trim(r->value);
         }
     }
-    b32 stock = !cur.len;
+    b32 stock = !cur.len || cur=="http://localhost/";
     for (i32 k = 0; k < (i32)countof(epkinds); k++) {
         stock |= cur.len && cur==epkindurl(k);
     }
@@ -15184,6 +15185,36 @@ static DriveOp settingsops[] = {
     {OP_CHECK, CHK_CFGVAL, 0, 0, 0, "endpoint gpt kind=anthropic"},
     {OP_CHECK, CHK_CFGVAL, 0, 0, 0, "endpoint gpt url=http://gpt.example/v1"},
     {OP_SHOT, 0, 0, 0, 300, "endpoint-kind"},
+    // One added as openai, its URL the placeholder, then given another
+    // kind: the placeholder goes for the kind's URL
+    {OP_SNAPCFG, 0, 0, 0, 100, ""},
+    {OP_SHOWPAGE, 0, 0, 0, 300, "add endpoint"},
+    {OP_MOVE, T_ADDOPEN, 0, 0, 100, "endpoint"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_MOVE, T_ADDNAME, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 200, ""},
+    {OP_TEXT, 0, 0, 0, 200, "oa"},
+    {OP_MOVE, T_ADDBTN, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_CONFIGSET, 0, 0, 5000, ""},
+    {OP_WAIT, W_CONFIG, 0, 0, 5000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_CFGVAL, 0, 0, 0, "endpoint oa url=http://localhost/"},
+    {OP_SNAPCFG, 0, 0, 0, 100, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "cfg endpoint oa kind"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "cfg endpoint oa kind=chatgpt"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_CONFIGSET, 0, 0, 5000, ""},
+    {OP_WAIT, W_CONFIG, 0, 0, 5000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_CFGVAL, 0, 0, 0, "endpoint oa kind=chatgpt"},
+    {OP_CHECK, CHK_CFGVAL, 0, 0, 0, "endpoint oa url=https://chatgpt.com/backend-api/codex/responses"},
     // A remote's page
     {OP_SHOWPAGE, 0, 0, 0, 300, "remote far"},
     {OP_MOVE, T_PAGEITEM, 0, 0, 100, "remote far"},
