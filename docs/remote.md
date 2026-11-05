@@ -154,13 +154,17 @@ the id it sends), its defaults, whether it searches,
 and its machine name, but never a URL, key or `max_*` setting. The
 thin engine keeps up to eight offers, a gone client's too, as layers
 of its configuration under the user's file, each endpoint at
-`relay://NAME` (`relay+anthropic://NAME` for kind anthropic). A model
+`relay://NAME` (`relay+KIND://NAME` for another kind than openai:
+`relay+anthropic://`, `relay+responses://`, `relay+chatgpt://`). A model
 call to one of them goes back as `relay` records, part by part as the
 host makes room, to a client that offers that endpoint with that kind:
 the session's last, else the newest whose listing has the model, else
 the newest (a server may take names it does not list). The client's own
 engine makes it (`relay.call`), admitted in line with its own
-sessions, at the API's paths alone, and answers with `relay.data`. A
+sessions, at the API's paths alone, with its own key or, for kind
+chatgpt, its own ChatGPT sign-in (so a thin engine uses the
+subscription of the computer that relays for it, and needs no sign-in
+of its own), and answers with `relay.data`. A
 turn's body goes as a delta against the session's last one to the
 same client, deflated when that is smaller. With no client to relay,
 the session waits in state `relay` for at most the endpoint's

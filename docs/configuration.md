@@ -102,6 +102,43 @@ system prompt and the conversation carry cache breakpoints, so cache
 reads grow turn over turn. A `[model NAME]` section sets `thinking`
 (adaptive by default), `thinking_display`, `effort` and `max_tokens`.
 
+`kind = responses` speaks OpenAI's Responses API (whose whole URL ends
+in `/responses`), with its key, at OpenAI or at a server that serves
+it, as llama-server does:
+
+    [endpoint openai]
+    kind = responses
+    url = https://api.openai.com/v1
+    key = env:OPENAI_API_KEY
+
+Nothing is stored at the server: each request carries the whole
+conversation, its reasoning going back encrypted as the server gave
+it, so the prompt cache keeps hitting, with the session as its key.
+`[model NAME] effort` sets the reasoning effort (`none` through
+`xhigh`), and `max_tokens` the output's limit.
+
+`kind = chatgpt` is the same API at ChatGPT's Codex backend, billed to
+a ChatGPT subscription rather than by the token. It takes no key: you
+sign in once with your ChatGPT account, on the endpoint's page in
+Settings (Sign in), or with `prospero endpoint auth NAME`, which
+prints the page to visit. The browser comes back to this computer at
+`localhost:1455` (else 1457), as for OpenAI's own Codex CLI, so sign
+in on the computer that runs the engine. The tokens are kept in the
+state directory's `endpoints/auth`, readable only by you, refreshed as
+they expire, and forgotten by Sign out or `prospero endpoint logout
+NAME`. Its URL is filled in for you:
+
+    [endpoint chatgpt]
+    kind = chatgpt
+    url = https://chatgpt.com/backend-api/codex/responses
+
+The models are those your plan includes, such as `gpt-5-codex`. A
+usage limit reached ends the turn, saying when it resets, rather than
+waiting hours in retries, or moves to a `fallback` if the model has
+one. In Settings, adding an endpoint asks its kind first, and fills in
+the kind's URL; changing the kind later moves a URL that is still
+another kind's own, but keeps one you typed.
+
 For an OpenAI-compatible server, `template.NAME = VALUE` in a
 `[model NAME]` section is an argument of the model's chat template,
 sent in `chat_template_kwargs` (as llama.cpp and vLLM take it): `true`

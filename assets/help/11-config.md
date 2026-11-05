@@ -97,6 +97,28 @@ directory's `approvals.json`. Bypass mode does not approve them.
 
 A url from a local include, or from your own file, needs no approval.
 
+## Signing in with ChatGPT
+
+A ChatGPT subscription can run Prospero's sessions, billed to the plan
+rather than by the token. In Settings, at Endpoints, choose Add
+endpoint..., name it, and pick **chatgpt: ChatGPT, signed in to your
+account**: its URL is filled in. On its page, **Sign in** opens the
+browser at ChatGPT's sign-in; once you sign in there, the browser comes
+back to Prospero, and the page says who is signed in and on which plan.
+Then pick its models, such as `gpt-5-codex`, as any others.
+
+The browser returns to this computer at `localhost:1455` (else 1457),
+as for OpenAI's Codex CLI, so sign in on the computer that runs the
+engine; `prospero endpoint auth NAME` does the same from a terminal.
+The tokens are kept in the state directory, readable only by you, and
+refreshed as they expire. **Sign out** forgets them. A remote host that
+relays its model calls through this computer uses this sign-in, and
+needs none of its own. When the plan's usage limit is reached, the turn
+ends saying when it resets.
+
+`kind = responses` is the same API with an OpenAI API key instead,
+billed by the token.
+
 ## Settings worth knowing
 
 - **API keys** never go in the file: `key = env:NAME` reads one from
