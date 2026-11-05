@@ -1063,6 +1063,15 @@ def sc_skill_prompt(model, n, req):
     yield from answer(model, f"Answer number {n}.")
 
 
+def sc_skills_config(model, n, req):
+    # "use NAME" calls the skill tool once; anything else is answered
+    u = last_user_text(req) or ""
+    if u.startswith("use ") and since_user(req) == 0:
+        yield from tool(model, n, "skill", {"name": u[4:]})
+    else:
+        yield from answer(model, f"Answer number {n}.")
+
+
 def sc_prospero_skill(model, n, req):
     # The built-in skill: its instructions, then each topic the prompt
     # names, separated by |; a prompt invoking a skill is just answered

@@ -498,6 +498,12 @@ static CfgKey cfgschema[] = {
     {"skills", "paths", CFG_PATHS, "", {}, {}, "skills",
      "More directories of skills, each holding NAME/SKILL.md, separated "
      "by ;, after the project's and before the user's"},
+    {"skills", "hidden", CFG_STRING, "", {}, {}, "skills",
+     "Names of skills for /NAME alone, kept from the agent as "
+     "disable-model-invocation would, separated by blanks"},
+    {"skills", "disabled", CFG_STRING, "", {}, {}, "skills",
+     "Names of skills left out altogether, from the agent and from "
+     "/NAME, separated by blanks; prospero is Prospero's own"},
 
     {"memory", "enabled", CFG_BOOL, "true", {}, {}, "memory",
      "Give new sessions in a project the memory tool and the project's "

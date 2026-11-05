@@ -106,3 +106,19 @@ Type `/NAME args` in the prompt box to use a skill yourself: its
 `disable-model-invocation: true` in its frontmatter is for that alone,
 and is not offered to the agent. The Info button lists the session's
 skills. `[skills] enabled = false` turns skills off.
+
+To change a skill without editing its `SKILL.md`, which may be another
+repository's, name it in your configuration. `[skills] hidden` makes
+skills yours alone, as `disable-model-invocation` would, and
+`[skills] disabled` leaves them out altogether, `prospero` too. Each
+takes names separated by blanks, and covers every skill of a name, so
+that a disabled skill's name does not fall to one further away:
+
+```ini
+[skills]
+hidden = deploy release
+disabled = frontend-design
+```
+
+A change applies to running sessions from their next request, and the
+agent is told of the skills it lost.

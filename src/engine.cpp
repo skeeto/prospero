@@ -8519,9 +8519,24 @@ static Slice<SkillDir> skilldirs(Session *s, Arena *a)
     return r;
 }
 
+// Whether a list of names, separated by blanks or commas, has one.
+static b32 skillnamed(Arena scratch, Str list, Str name)
+{
+    Slice<Str> names = instrnames(&scratch, list);
+    for (iz i = 0; i < names.len; i++) {
+        if (names[i] == name) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 // A session's skills as they are now: none while [skills] is off. The
 // built-in one too, unless one of the user's own has its name, or the
-// session follows only its project's instructions.
+// session follows only its project's instructions. Those [skills]
+// disabled names are left out, every one of the name, so that none
+// further away takes its place; those [skills] hidden names are the
+// user's alone, as with disable-model-invocation.
 static Skills sessskills(Session *s, Arena *a)
 {
     if (skilldeny(s->e)) {
@@ -8531,6 +8546,19 @@ static Skills sessskills(Session *s, Arena *a)
     if (!s->projinstr && !skillbyname(r.list, skillbuiltin)) {
         r.list = push(a, r.list, helpskill(a));
         sort(r.list.data, r.list.len, skillless, *a);
+    }
+    Str off  = cfgget(s->e->cfg, "skills", "", "disabled", 0);
+    Str hide = cfgget(s->e->cfg, "skills", "", "hidden", 0);
+    if (trim(off).len || trim(hide).len) {
+        iz n = 0;
+        for (iz i = 0; i < r.list.len; i++) {
+            Skill k = r.list[i];
+            if (!skillnamed(*a, off, k.name)) {
+                k.hidden |= skillnamed(*a, hide, k.name);
+                r.list[n++] = k;
+            }
+        }
+        r.list.len = n;
     }
     return r;
 }

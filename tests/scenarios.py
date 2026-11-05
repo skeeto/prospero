@@ -2982,6 +2982,72 @@ def skill_prompt(t):
 
 
 @scenario(bound=20)
+def skills_config(t):
+    """[skills] hidden and disabled, by name: a hidden skill is the
+    user's alone, a disabled one gone everywhere, every one of its name
+    and the built-in one too; a change in the configuration reaches the
+    agent of a running session as a notice."""
+    env = skillhome(t)
+    t.host.mkdir(t.host.join(t.work, ".git"))
+    proj = t.host.join(t.work, ".claude", "skills")
+    skillput(t, proj, "review", "---\ndescription: Review a change\n---\nREVIEW-BODY\n")
+    skillput(t, proj, "old", "---\ndescription: Project old\n---\n")
+    skillput(t, proj, "pdf", "---\ndescription: Read PDFs\n---\n")
+    user = t.host.join(env["XDG_CONFIG_HOME"], "prospero", "skills")
+    skillput(t, user, "old", "---\ndescription: User old\n---\n")
+    t.host.write(t.config, t.host.read(t.config) +
+                 "[skills]\nhidden = review\ndisabled = old, prospero\n")
+    told = "The skills changed"
+    h = t.headless(env)
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        sk = h.call("skills", sid=sid)
+        got = [(k["name"], k["hidden"]) for k in sk.get("skills", [])]
+        t.check(got == [("pdf", False), ("review", True)], f"skills {sk}")
+        bad = h.call("prompt", sid=sid, text="x", skill="old")
+        t.check(bad.get("ok") == 0 and "no such skill" in bad.get("err", ""), f"old {bad}")
+
+        h.send("prompt", sid=sid, text="use review")
+        t.check(ended(h, sid, 1)["why"] == "done", "the turn ends")
+        ends = h.all("tool.end", sid)
+        t.check(len(ends) == 1 and ends[0]["status"] == "error" and
+                "No skill is named \"review\"" in ends[0]["text"] and
+                "The skills are: pdf." in ends[0]["text"], f"hidden {ends}")
+        system = fake_provider.system_of(t.requests()[0]["body"])
+        listed = [x for x in system.split("\n") if x.startswith("- ")]
+        t.check("- pdf: Read PDFs" in listed and
+                not [x for x in listed if x.startswith(("- review:", "- old:", "- prospero:"))],
+                f"listed {listed}")
+
+        # /review still works: the user's alone
+        h.send("prompt", sid=sid, text="a.c", skill="review")
+        t.check(ended(h, sid, 2)["why"] == "done", "the skill's turn ends")
+        last = t.requests()[-1]["body"]["messages"][-1]["content"]
+        t.check(isinstance(last, str) and "REVIEW-BODY" in last, f"invoked {last!r}")
+
+        # Hiding pdf too, then enabling the disabled: notices
+        r = h.call("config.set", kind="skills", key="hidden", value="review pdf")
+        t.check(r.get("ok") == 1, f"config.set {r}")
+        h.send("prompt", sid=sid, text="third")
+        t.check(ended(h, sid, 3)["why"] == "done", "the third turn ends")
+        msgs = [str(m.get("content")) for m in t.requests()[-1]["body"]["messages"]
+                if told in str(m.get("content"))]
+        t.check(len(msgs) == 1 and msgs[0].endswith("\n- pdf (removed)"), f"hid {msgs}")
+
+        r = h.call("config.set", kind="skills", key="disabled", value="")
+        t.check(r.get("ok") == 1, f"config.set {r}")
+        h.send("prompt", sid=sid, text="fourth")
+        t.check(ended(h, sid, 4)["why"] == "done", "the fourth turn ends")
+        msgs = [str(m.get("content")) for m in t.requests()[-1]["body"]["messages"]
+                if told in str(m.get("content"))]
+        t.check(len(msgs) == 2 and "\n- old: Project old (new)" in msgs[1] and
+                "\n- prospero: " in msgs[1], f"back {msgs}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=20)
 def prospero_skill(t):
     """The built-in prospero skill, in every session: its instructions
     name this engine's configuration file, its args the Help topics and

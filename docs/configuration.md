@@ -183,7 +183,12 @@ skill's name and description, loads one with its skill tool, which
 also lets it read the skill's directory, and hears of skills added or
 changed as it works. `/NAME args` in the prompt box uses a skill
 directly, and one with `disable-model-invocation: true` is for that
-alone. `[skills] enabled = false` turns them off.
+alone. `[skills] enabled = false` turns them off. Without editing a
+`SKILL.md`, `[skills] hidden = NAME…` makes skills the user's alone in
+the same way, and `[skills] disabled = NAME…` leaves them out
+altogether, from the agent and from `/NAME`; each takes names
+separated by blanks, and covers every skill of a name, so none further
+away takes its place. Either may name `prospero`.
 
 One skill is built in: `prospero`, Prospero's Help and every setting,
 served by the engine itself, so that the agent can answer questions

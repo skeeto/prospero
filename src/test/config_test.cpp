@@ -1071,6 +1071,8 @@ static void testcfgjson(Test *t)
         "instructions//files=AGENTS.md CLAUDE.md*\n"
         "skills//enabled=true*\n"
         "skills//paths=*\n"
+        "skills//hidden=*\n"
+        "skills//disabled=*\n"
         "memory//enabled=true*\n"
         "memory//path=*\n"
         "worktree//branch_prefix=prospero/*\n"
