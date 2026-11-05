@@ -119,6 +119,23 @@ ends saying when it resets.
 `kind = responses` is the same API with an OpenAI API key instead,
 billed by the token.
 
+## Signing in with GitHub Copilot
+
+A GitHub Copilot plan, Copilot Free included, can run sessions too.
+Add an endpoint and pick **copilot: GitHub Copilot, signed in to your
+account**. On its page, **Sign in** shows a code and opens GitHub's
+page, where you enter it and authorize Prospero; the page then says who
+is signed in and on which plan. The code can be entered in a browser on
+any computer, and `prospero endpoint auth NAME` prints it in a
+terminal, so this works for an engine over ssh as well.
+
+GitHub gives each app its own models, and Prospero's own app gets only
+the older ones, such as `gpt-4o`, `gpt-4o-mini` and `gpt-4.1`, not the
+newer models your plan offers on github.com. The endpoint's
+`client_id` setting signs in as another OAuth app instead, at your own
+risk. If the account has no Copilot, the sign-in fails with a link to
+sign up for Copilot Free.
+
 ## Settings worth knowing
 
 - **API keys** never go in the file: `key = env:NAME` reads one from

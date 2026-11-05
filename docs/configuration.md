@@ -139,6 +139,35 @@ one. In Settings, adding an endpoint asks its kind first, and fills in
 the kind's URL; changing the kind later moves a URL that is still
 another kind's own, but keeps one you typed.
 
+`kind = copilot` is GitHub Copilot, billed to your Copilot plan
+(Copilot Free included). It takes no key either: Sign in, or
+`prospero endpoint auth NAME`, shows a code to enter at GitHub's page,
+github.com/login/device, in any browser on any computer, so it suits
+an engine over ssh as well. The token is kept as ChatGPT's is, needs no
+refreshing, and is forgotten the same ways. Its URL is filled in:
+
+    [endpoint copilot]
+    kind = copilot
+    url = https://api.githubcopilot.com
+
+While the URL is that one, requests go to the API your account's
+sign-in names (such as `api.individual.githubcopilot.com`); a URL you
+typed is used as it is. Copilot serves each model by one of three
+APIs, and Prospero speaks to each in the one its listing names:
+Anthropic's Messages API for Claude, the Responses API for newer GPT
+models, Chat Completions for the rest. Each request says whether you
+or the agent began it (a tool's results, compaction, a subagent), as
+Copilot bills only the first as a premium request.
+
+GitHub gives each app that signs in its own set of models. Prospero
+signs in as its own GitHub app, which GitHub gives only its older
+models (such as `gpt-4o`, `gpt-4o-mini` and `gpt-4.1`, as
+`gpt-41-copilot`), not those of your plan's model picker. `client_id`
+in the endpoint's section signs in as another OAuth app instead, at
+your own risk: GitHub's terms are for you to weigh, and a token for
+another app is kept apart, so changing it asks for a new sign-in. For
+kind chatgpt it likewise replaces the Codex CLI's client.
+
 For an OpenAI-compatible server, `template.NAME = VALUE` in a
 `[model NAME]` section is an argument of the model's chat template,
 sent in `chat_template_kwargs` (as llama.cpp and vLLM take it): `true`
