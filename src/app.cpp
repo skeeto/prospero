@@ -1347,6 +1347,7 @@ struct Gui {
     char              *remdest;    // a new remote's ssh destination, or exec command
     b32                remexec;    // which
     char              *rempath;    // and its prospero, all New section's
+    i32                addepkind;  // a new endpoint's kind, EP_*
     GuiHost           *newhost;    // the new session's host
     OutFile            out;        // the Output window's file
     PlanFile           plan;       // the Plan window's
@@ -2875,6 +2876,28 @@ static void guiconfigset(Gui *g, Str kind, Str name, Str key, Str value)
     }
     g->cfgset = g->nextid;
     cmdsend(g, &w, a);
+}
+
+// An endpoint's kind was just set to kind: its url follows, to the new
+// kind's own service (epkindurl), when it is unset or still another
+// kind's own. A url the user wrote stays.
+static void epurlfollow(Gui *g, Str name, Str kind)
+{
+    Str to  = epkindurl(epkindof(kind));
+    Str cur = {};
+    for (iz i = 0; i < g->cfgrows.len; i++) {
+        CfgRow *r = &g->cfgrows[i];
+        if (r->kind=="endpoint" && r->name==name && r->key=="url" && !r->isdflt) {
+            cur = trim(r->value);
+        }
+    }
+    b32 stock = !cur.len;
+    for (i32 k = 0; k < (i32)countof(epkinds); k++) {
+        stock |= cur.len && cur==epkindurl(k);
+    }
+    if (to.len && stock && cur!=to) {
+        guiconfigset(g, "endpoint", name, "url", to);
+    }
 }
 
 // Delete a section of the user's file.
@@ -12570,6 +12593,7 @@ enum : i32 {
     CHK_TWOPANE,
     CHK_NOHSCROLL,
     CHK_PAGE,
+    CHK_CFGVAL,   // text "KIND NAME KEY=VALUE": that row's value in effect
     CHK_ROOTS,
     CHK_DELINCLUDE,
     CHK_DELMODAL,
@@ -12878,6 +12902,7 @@ static Str chknames[] = {
     "wide, the settings' pages are a list beside the page",
     "the settings have nothing to scroll to sideways",
     "the settings page picked is shown",
+    "the setting has the value given",
     "the roots, one a line, were saved joined by \"; \"",
     "a section only an include defines cannot be deleted, which says where it is",
     "Delete asks first",
@@ -15007,6 +15032,68 @@ static DriveOp settingsops[] = {
     {OP_WAIT, W_CONFIGSET, 0, 0, 5000, ""},
     {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
     {OP_CHECK, CHK_PAGE, 0, 0, 0, "remote box"},
+    // A new endpoint of a kind picked as it is named: the kind written,
+    // and the kind's URL
+    {OP_SNAPCFG, 0, 0, 0, 100, ""},
+    {OP_SHOWPAGE, 0, 0, 0, 300, "add endpoint"},
+    {OP_MOVE, T_ADDOPEN, 0, 0, 100, "endpoint"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_MOVE, T_ADDNAME, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 200, ""},
+    {OP_TEXT, 0, 0, 0, 200, "gpt"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "addkind"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "addkind chatgpt"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_SHOT, 0, 0, 0, 300, "add-endpoint"},
+    {OP_MOVE, T_ADDBTN, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_CONFIGSET, 0, 0, 5000, ""},
+    {OP_WAIT, W_CONFIG, 0, 0, 5000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PAGE, 0, 0, 0, "endpoint gpt"},
+    {OP_CHECK, CHK_CFGVAL, 0, 0, 0, "endpoint gpt kind=chatgpt"},
+    {OP_CHECK, CHK_CFGVAL, 0, 0, 0, "endpoint gpt url=https://chatgpt.com/backend-api/codex/responses"},
+    // Its kind changed, the URL still the old kind's follows
+    {OP_SNAPCFG, 0, 0, 0, 100, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "cfg endpoint gpt kind"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "cfg endpoint gpt kind=responses"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_CONFIGSET, 0, 0, 5000, ""},
+    {OP_WAIT, W_CONFIG, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_CFGVAL, 0, 0, 0, "endpoint gpt kind=responses"},
+    {OP_CHECK, CHK_CFGVAL, 0, 0, 0, "endpoint gpt url=https://api.openai.com/v1"},
+    // A URL typed stays through another change of kind
+    {OP_SNAPCFG, 0, 0, 0, 100, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "cfg endpoint gpt url"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 200, ""},
+    {OP_TEXT, 0, 0, 0, 200, "http://gpt.example/v1"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_CONFIGSET, 0, 0, 5000, ""},
+    {OP_WAIT, W_CONFIG, 0, 0, 5000, ""},
+    {OP_SNAPCFG, 0, 0, 0, 100, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "cfg endpoint gpt kind"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "cfg endpoint gpt kind=anthropic"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_CONFIGSET, 0, 0, 5000, ""},
+    {OP_WAIT, W_CONFIG, 0, 0, 5000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_CFGVAL, 0, 0, 0, "endpoint gpt kind=anthropic"},
+    {OP_CHECK, CHK_CFGVAL, 0, 0, 0, "endpoint gpt url=http://gpt.example/v1"},
+    {OP_SHOT, 0, 0, 0, 300, "endpoint-kind"},
     // A remote's page
     {OP_SHOWPAGE, 0, 0, 0, 300, "remote far"},
     {OP_MOVE, T_PAGEITEM, 0, 0, 100, "remote far"},
@@ -19929,6 +20016,18 @@ static b32 drivecheck(Gui *g, i32 chk)
         Str   want = g->ops[g->drivepc-1].text;
         Str   page = g->cfgdiag ? Str("diagnostics") : cfgpagekey(&a, g->cfgpkind, g->cfgpname);
         return page == want;
+    }
+    case CHK_CFGVAL: {
+        Cut kind = cut(g->ops[g->drivepc-1].text, ' ');
+        Cut name = cut(kind.tail, ' ');
+        Cut key  = cut(name.tail, '=');
+        for (iz i = 0; i < g->cfgrows.len; i++) {
+            CfgRow *r = &g->cfgrows[i];
+            if (r->kind==kind.head && r->name==name.head && r->key==key.head) {
+                return r->value == key.tail;
+            }
+        }
+        return 0;
     }
     case CHK_ROOTS:
         for (iz i = 0; i < g->cfgrows.len; i++) {

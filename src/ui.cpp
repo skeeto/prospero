@@ -10882,6 +10882,11 @@ static void drawcfgrow(Gui *g, CfgRow *r, i32 target, b32 wide)
         Str    pick  = {};
         i32    yes   = r->type=="bool" ? cfgbool(trim(r->value)) : -1;
         Str    shown = yes==1 ? Str("true") : yes==0 ? Str("false") : r->value;
+        // Named for the checklist: "cfg KIND NAME KEY", and its choices
+        // "cfg KIND NAME KEY=CHOICE"
+        Str    named = concat(&a, concat(&a, concat(&a, "cfg ", r->kind), " "),
+                              concat(&a, concat(&a, r->name, " "), r->key));
+        f32    fw    = ImGui::GetContentRegionAvail().x;
         if (ImGui::BeginCombo("##v", cstr0(&a, shown))) {
             for (iz i = 0; i < r->choices.len; i++) {
                 Str c = r->choices[i];
@@ -10891,9 +10896,11 @@ static void drawcfgrow(Gui *g, CfgRow *r, i32 target, b32 wide)
                 if (theme && i<THEME_COUNT) {
                     itemrect(g, RECT_THEME0+(i32)i);
                 }
+                itemnamed(g, concat(&a, concat(&a, named, "="), c));
             }
             ImGui::EndCombo();
         }
+        namedrect(g, named, at, v2(at.x+fw, at.y+ImGui::GetFrameHeight()));
         if (target >= 0) {
             f32 w = ImGui::GetContentRegionAvail().x;
             g->rects[target] = {at.x, at.y, at.x+w, at.y+ImGui::GetFrameHeight()};
@@ -10911,6 +10918,9 @@ static void drawcfgrow(Gui *g, CfgRow *r, i32 target, b32 wide)
             r->sent    = 1;
             r->sentval = clone(&g->cfgmem, pick);
             guiconfigset(g, r->kind, r->name, r->key, pick);
+            if (r->kind=="endpoint" && r->key=="kind" && r->name.len) {
+                epurlfollow(g, r->name, pick);
+            }
         }
     } else if (r->type == "paths") {
         // One a line, as many lines as there are and one more, saved
@@ -10945,6 +10955,8 @@ static void drawcfgrow(Gui *g, CfgRow *r, i32 target, b32 wide)
         Str hint  = r->isdflt || r->like.len ? r->value : Str{};
         b32 enter = ImGui::InputTextWithHint("##v", hint.len ? cstr0(&a, hint) : "", r->buf, (uz)r->cap,
                                              ImGuiInputTextFlags_EnterReturnsTrue|ImGuiInputTextFlags_AutoSelectAll);
+        itemnamed(g, concat(&a, concat(&a, concat(&a, "cfg ", r->kind), " "),
+                            concat(&a, concat(&a, r->name, " "), r->key)));
         r->typed |= ImGui::IsItemEdited();
         r->active = ImGui::IsItemActive();
         if (target >= 0) {
@@ -11749,6 +11761,7 @@ static void drawcfgadd(Gui *g)
         g->openadd    = 0;
         g->addname[0] = g->remdest[0] = g->rempath[0] = 0;
         g->adderr     = {};
+        g->addepkind  = EP_OPENAI;
     }
     ImGui::SetNextWindowSize(v2(380*sc, 0));
     if (!ImGui::BeginPopupModal("New section", 0, ImGuiWindowFlags_AlwaysAutoResize)) {
@@ -11756,6 +11769,7 @@ static void drawcfgadd(Gui *g)
     }
     Str kind = g->addkind;
     b32 rem  = kind == "remote";
+    b32 ep   = kind == "endpoint";
     Str key  = {};
     Str val  = {};
     cfgseed(kind, "NAME", &key, &val);
@@ -11763,6 +11777,9 @@ static void drawcfgadd(Gui *g)
     if (rem) {
         ImGui::TextUnformatted("A new [remote NAME] section: a machine reached "
                                "over ssh, or by a command that runs another there");
+    } else if (ep) {
+        ImGui::TextUnformatted("A new [endpoint NAME] section: the API it speaks, "
+                               "which fills in the URL of a service of its own");
     } else {
         ImGui::Text("A new [%s NAME] section, which starts as %s = %s:",
                     cstr0(&a, kind), cstr0(&a, key), cstr0(&a, val));
@@ -11775,6 +11792,38 @@ static void drawcfgadd(Gui *g)
     b32 enter = ImGui::InputTextWithHint("##addname", "NAME", g->addname, FIELD_MAX,
                                          ImGuiInputTextFlags_EnterReturnsTrue);
     itemrect(g, RECT_ADDNAME);
+    if (ep) {
+        // By kind (EP_*)
+        static char const *kinds[] = {
+            "openai: Chat Completions (llama.cpp, most servers)",
+            "anthropic: Anthropic's Messages API",
+            "responses: OpenAI's Responses API",
+            "chatgpt: ChatGPT, signed in to your account",
+        };
+        static_assert(countof(kinds) == countof(epkinds), "a label for each kind");
+        i32 k = g->addepkind>=0 && g->addepkind<(i32)countof(kinds) ? g->addepkind : 0;
+        ImGui::SetNextItemWidth(-1);
+        ImVec2 at = ImGui::GetCursorScreenPos();
+        f32    cw = ImGui::GetContentRegionAvail().x;
+        if (ImGui::BeginCombo("##addkind", kinds[k])) {
+            for (i32 i = 0; i < (i32)countof(kinds); i++) {
+                if (ImGui::Selectable(kinds[i], i==k)) {
+                    g->addepkind = i;
+                }
+                itemnamed(g, concat(&a, "addkind ", epkindname(i)));
+            }
+            ImGui::EndCombo();
+        }
+        namedrect(g, "addkind", at, v2(at.x+cw, at.y+ImGui::GetFrameHeight()));
+        Str url = epkindurl(g->addepkind);
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextDisabled("%s", cstr0(&a, g->addepkind==EP_CHATGPT ?
+            concat(&a, concat(&a, "URL ", url), ": then Sign in on its page, with "
+                   "the account whose subscription it uses") :
+            url.len ? concat(&a, "URL ", url) :
+            Str("URL http://localhost/, which you then set to the server's")));
+        ImGui::PopTextWrapPos();
+    }
     if (rem) {
         static char const *how[] = {"ssh", "command"};
         i32 hw = g->remexec;
@@ -11850,6 +11899,14 @@ static void drawcfgadd(Gui *g)
                 g->cfgshowsel = 1;
                 ImGui::CloseCurrentPopup();
             }
+        } else if (ep) {
+            // The kind first, then its URL, so the file reads in that order
+            Str url = epkindurl(g->addepkind);
+            guiconfigset(g, kind, name, "kind", epkindname(g->addepkind));
+            guiconfigset(g, kind, name, "url", url.len ? url : val);
+            cfgselect(g, kind, name);
+            g->cfgshowsel = 1;
+            ImGui::CloseCurrentPopup();
         } else {
             cfgseed(kind, name, &key, &val);
             guiconfigset(g, kind, name, key, val);

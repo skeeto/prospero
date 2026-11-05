@@ -233,7 +233,7 @@ struct CfgKind {
 
 static CfgKind cfgkinds[] = {
     {"",         0, "Defaults for new sessions"},
-    {"endpoint", 1, "A server of models: OpenAI-compatible, or Anthropic's"},
+    {"endpoint", 1, "A server of models: OpenAI-compatible, Anthropic's, OpenAI's Responses API, or ChatGPT's"},
     {"model",    1, "Settings for one model, named as its endpoint lists it"},
     {"role",     1, "Instructions, a model and tools for one kind of work"},
     {"guard",    0, "Where the file tools may go without asking"},
