@@ -878,6 +878,19 @@ static SDL_Surface *appicon(Arena scratch, i32 n)
     return s;
 }
 
+// Why the window could not open, as SDL says, before the caller's
+// "could not open a window": which step failed, and its reason.
+static b32 sdlfailed(Os *os, Arena t, Str what)
+{
+    char const *why = SDL_GetError();
+    Str         s   = concat(&t, "prospero: ", what);
+    if (*why) {
+        s = concat(&t, concat(&t, s, ": "), Str{(u8 *)why, (iz)__builtin_strlen(why)});
+    }
+    os_print(os, 2, concat(&t, s, "\n"));
+    return 0;
+}
+
 static b32 os_guiopen(Os *os, Gui *g, Str title)
 {
     GuiSdl *p = (GuiSdl *)os->gui;
@@ -918,7 +931,7 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
     nopersist();
     #endif
     if (!SDL_Init(SDL_INIT_VIDEO)) {
-        return 0;
+        return sdlfailed(os, g->frame, "no display (Wayland or X11)");
     }
     p->wakeevent  = SDL_RegisterEvents(3);
     p->trayevent  = p->wakeevent + 1;
@@ -970,7 +983,7 @@ static b32 sdlwindow(Os *os, Gui *g, GuiSdl *p, Str title)
     Arena t = g->frame;
     p->window = SDL_CreateWindow(cstr0(&t, title), w, h, flags);
     if (!p->window) {
-        return 0;
+        return sdlfailed(os, t, "no OpenGL window");
     }
     #ifndef __APPLE__
     // On macOS the window's icon would replace the Dock's, which is the
@@ -996,6 +1009,7 @@ static b32 sdlwindow(Os *os, Gui *g, GuiSdl *p, Str title)
     }
     p->gl = SDL_GL_CreateContext(p->window);
     if (!p->gl) {
+        sdlfailed(os, t, "no OpenGL 3.2 core context");
         SDL_DestroyWindow(p->window);
         p->window = 0;
         return 0;
@@ -1011,6 +1025,8 @@ static b32 sdlwindow(Os *os, Gui *g, GuiSdl *p, Str title)
     p->glclear      = (GlClear)SDL_GL_GetProcAddress("glClear");
     p->glreadpixels = (GlReadPixels)SDL_GL_GetProcAddress("glReadPixels");
     if (!p->glviewport || !p->glclearcolor || !p->glclear) {
+        SDL_ClearError();
+        sdlfailed(os, t, "OpenGL lacks glViewport, glClearColor or glClear");
         SDL_GL_DestroyContext(p->gl);
         SDL_DestroyWindow(p->window);
         p->window = 0;
