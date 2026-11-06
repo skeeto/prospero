@@ -5256,17 +5256,35 @@ def rs_tochat(req):
 
 
 class RsStream:
-    """Chat Completions chunks as Responses events."""
+    """Chat Completions chunks as Responses events. With rotate, as
+    Copilot sends them: each event with its item's output_index, and the
+    item under a new id each time."""
 
-    def __init__(self, model):
+    def __init__(self, model, rotate=False):
         self.model = model
         self.items = {}   # key -> item, by first sight
         self.order = []
         self.finish = None
         self.usage = None
         self.ended = False
+        self.rotate = rotate
+        self.rotated = 0
+
+    def fresh(self):
+        self.rotated += 1
+        return f"rot_{self.rotated}"
 
     def ev(self, obj):
+        if self.rotate:
+            ids = [it["id"] for it in (self.items[k] for k in self.order)]
+            if "item_id" in obj:
+                obj["output_index"] = ids.index(obj["item_id"])
+                obj["item_id"] = self.fresh()
+            if "item" in obj:
+                obj["item"] = dict(obj["item"], id=self.fresh())
+            if isinstance(obj.get("response", {}).get("output"), list):
+                obj["response"]["output"] = [dict(it, id=self.fresh())
+                                             for it in obj["response"]["output"]]
         return S.raw(f"event: {obj['type']}\ndata: {json.dumps(obj)}\n\n")
 
     def item(self, key, made):
@@ -5383,8 +5401,9 @@ class RsStream:
                 yield a
 
 
-def rs_handle(handler, prefix, raw):
-    """POST /v1/responses: checked, run, and answered."""
+def rs_handle(handler, prefix, raw, rotate=False):
+    """POST /v1/responses: checked, run, and answered, its items' ids
+    rotated as Copilot's are if asked."""
     def fail(status, message, code="invalid_request_error"):
         handler.send_json(status, {"error": {"message": message, "type": code,
                                              "code": None}})
@@ -5413,7 +5432,7 @@ def rs_handle(handler, prefix, raw):
         if err:
             fail(400, err)
         else:
-            handler.perform(RsStream(model).actions(fn(model, n, chat)))
+            handler.perform(RsStream(model, rotate).actions(fn(model, n, chat)))
     finally:
         STATE.end(prefix, model)
         STATE.finished(key, n)
@@ -6048,7 +6067,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         url, path, prefix = self.route()
         raw = self.body()
-        if path.startswith("/copilot-gh/") or path.startswith("/copilot/"):
+        copilot = path.startswith("/copilot/")
+        if path.startswith("/copilot-gh/") or copilot:
             path = cp_post(self, path, raw)
             if not path:
                 return
@@ -6079,7 +6099,7 @@ class Handler(BaseHTTPRequestHandler):
             cg_post(self, path, raw, prefix)
             return
         if path in ("/v1/responses", "/responses"):
-            rs_handle(self, prefix, raw)
+            rs_handle(self, prefix, raw, rotate=copilot)
             return
         if path not in ("/v1/chat/completions", "/chat/completions"):
             self.send_json(404, {"error": {"message": "not found"}})

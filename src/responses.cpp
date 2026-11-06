@@ -32,8 +32,10 @@
 // the output by output_item.added, their deltas (output_text,
 // reasoning_summary_text, reasoning_text, function_call_arguments), and
 // output_item.done with each whole, then completed, incomplete or
-// failed with the usage. llama.cpp names items by item_id alone, with
-// no output_index, so items are numbered as their ids first appear. A
+// failed with the usage. Items are told apart by output_index, except
+// that llama.cpp names them by item_id alone, so then they are numbered
+// as their ids first appear; Copilot changes an item's id from one
+// event to the next, so the id is not used where there is an index. A
 // whole item at its end fills in only what did not stream, so a server
 // that sends items only whole is read alike, as is a response not
 // streamed at all (object "response").
@@ -295,34 +297,62 @@ static Str rsencode(Arena *a, Arena tmp, ChatReq *r, b32 codex)
 
 // Streamed responses
 
-// The number of an output item, by its id as first seen, else by its
-// output_index n. Items are told apart by id across servers that send
-// one or the other.
-static i64 rsindexof(Partial *p, Str id, i64 n)
+// An output item's key: "#N" for output_index N.
+static Str rsat(Arena *a, i64 n)
 {
-    Buf b(p->a, 24);
-    if (!id.len) {
-        putbyte(&b, '#');
-        print(&b, n);
-        id = finish(&b);
-    }
+    Buf b(a, 24);
+    putbyte(&b, '#');
+    print(&b, n);
+    return finish(&b);
+}
+
+// The number of an output item by its key, or by an id it was seen
+// with, if seen, else -1.
+static i64 rsfind(Partial *p, Str key)
+{
     for (iz i = 0; i < p->items.len; i++) {
-        if (p->items[i] == id) {
+        if (p->items[i] == key) {
             return i;
         }
     }
-    p->items = push(p->a, p->items, clone(p->a, id));
-    return p->items.len - 1;
+    for (iz i = 0; i < p->itemids.len; i++) {
+        if (p->itemids[i] == key) {
+            return p->itemidat[i];
+        }
+    }
+    return -1;
 }
 
-// The number of an event's item.
+// The number of an output item by its key, numbered as first seen.
+static i64 rsindexof(Partial *p, Str key)
+{
+    i64 i = rsfind(p, key);
+    if (i < 0) {
+        p->items = push(p->a, p->items, clone(p->a, key));
+        i = p->items.len - 1;
+    }
+    return i;
+}
+
+// The number of an event's item: by its output_index, else (llama.cpp)
+// by its id. Not by id first, as Copilot gives an item a new id at
+// each of its events. The id an item comes with whole (added, done) is
+// kept for events that give only an id.
 static i64 rsindex(Partial *p, Json *j)
 {
-    Str id = jsonstr(jsonget(j, "item_id"));
-    if (!id.len) {
-        id = jsonstr(jsonget(jsonget(j, "item"), "id"));
+    Json *item = jsonget(j, "item");
+    Str   id   = jsonstr(jsonget(j, "item_id"));
+    id = id.len ? id : jsonstr(jsonget(item, "id"));
+    Json *n = jsonget(j, "output_index");
+    if (n->type == JSON_NUMBER) {
+        i64 index = rsindexof(p, rsat(p->a, jsonint(n, 0)));
+        if (item->type==JSON_OBJECT && id.len && rsfind(p, id)<0) {
+            p->itemids  = push(p->a, p->itemids, clone(p->a, id));
+            p->itemidat = push(p->a, p->itemidat, index);
+        }
+        return index;
     }
-    return rsindexof(p, id, jsonint(jsonget(j, "output_index"), 0));
+    return rsindexof(p, id.len ? id : rsat(p->a, 0));
 }
 
 // An error object as text, "CODE: MESSAGE", whose code classify reads.
@@ -429,7 +459,10 @@ static void rsend(Partial *p, Chunk *r, Arena *scratch, Json *resp)
 {
     i64 n = 0;
     for (Json *item = jsonget(resp, "output")->child; item; item = item->next, n++) {
-        i64 index = rsindexof(p, jsonstr(jsonget(item, "id")), n);
+        // As its id streamed, else by its place
+        Str id    = jsonstr(jsonget(item, "id"));
+        i64 index = id.len ? rsfind(p, id) : -1;
+        index = index>=0 ? index : rsindexof(p, rsat(p->a, n));
         rsitem(p, r, scratch, index, item, 1);
     }
     rsusage(p, jsonget(resp, "usage"));

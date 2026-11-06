@@ -908,8 +908,10 @@ struct Partial {
     i32              nblocks;
     Slice<PartCall>  calls;
     Slice<PartBlock> parts;       // blocks numbered by the server
-    Slice<Str>       items;       // the Responses API's item ids, whose
+    Slice<Str>       items;       // the Responses API's item keys, whose
                                   // positions number its blocks
+    Slice<Str>       itemids;     // ids of items keyed by output_index,
+    Slice<i64>       itemidat;    // and those items' numbers
     b32              indexed;     // so numbered: parts, not think and text
     Str              finish;      // finish_reason, null until one arrives
     Str              id;          // the completion's, null until one arrives

@@ -326,6 +326,51 @@ static void test_responses(Test *t)
         expect(t, "rs.llama finish", p->finish, "tool_calls");
     }
 
+    // Copilot's stream: each event names its item by a new id, so items
+    // go by output_index, and the response's output, by its place
+    {
+        Str ev[] = {
+            "{\"type\":\"response.output_item.added\",\"output_index\":0,"
+            "\"item\":{\"id\":\"r1\",\"type\":\"reasoning\",\"summary\":[]}}",
+            "{\"type\":\"response.reasoning_summary_text.delta\",\"item_id\":\"r2\","
+            "\"output_index\":0,\"summary_index\":0,\"delta\":\"Hm.\"}",
+            "{\"type\":\"response.output_item.done\",\"output_index\":0,"
+            "\"item\":{\"id\":\"r3\",\"type\":\"reasoning\",\"summary\":[{\"type\":"
+            "\"summary_text\",\"text\":\"Hm.\"}],\"encrypted_content\":\"ENC\"}}",
+            "{\"type\":\"response.output_item.added\",\"output_index\":1,"
+            "\"item\":{\"id\":\"m1\",\"type\":\"message\",\"content\":[]}}",
+            "{\"type\":\"response.output_text.delta\",\"item_id\":\"m2\","
+            "\"output_index\":1,\"delta\":\"I'll\"}",
+            "{\"type\":\"response.output_text.delta\",\"item_id\":\"m3\","
+            "\"output_index\":1,\"delta\":\" check.\"}",
+            "{\"type\":\"response.output_item.done\",\"output_index\":1,"
+            "\"item\":{\"id\":\"m4\",\"type\":\"message\",\"content\":[{\"type\":"
+            "\"output_text\",\"text\":\"I'll check.\"}]}}",
+            "{\"type\":\"response.output_item.added\",\"output_index\":2,"
+            "\"item\":{\"id\":\"f1\",\"type\":\"function_call\",\"call_id\":\"call_c\","
+            "\"name\":\"shell\",\"arguments\":\"\"}}",
+            "{\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"f2\","
+            "\"output_index\":2,\"delta\":\"{}\"}",
+            "{\"type\":\"response.output_item.done\",\"output_index\":2,"
+            "\"item\":{\"id\":\"f3\",\"type\":\"function_call\",\"call_id\":\"call_c\","
+            "\"name\":\"shell\",\"arguments\":\"{}\"}}",
+            "{\"type\":\"response.completed\",\"response\":{\"id\":\"resp_c\","
+            "\"status\":\"completed\",\"output\":[{\"id\":\"r9\",\"type\":\"reasoning\","
+            "\"summary\":[{\"type\":\"summary_text\",\"text\":\"Hm.\"}],"
+            "\"encrypted_content\":\"ENC\"},{\"id\":\"m9\",\"type\":\"message\","
+            "\"content\":[{\"type\":\"output_text\",\"text\":\"I'll check.\"}]},"
+            "{\"id\":\"f9\",\"type\":\"function_call\",\"call_id\":\"call_c\","
+            "\"name\":\"shell\",\"arguments\":\"{}\"}]}}",
+        };
+        Str      deltas = {};
+        Partial *p      = rsfeed(a, ev, countof(ev), &deltas);
+        expect(t, "rs.copilot deltas", deltas,
+               "0:think:Hm. 1:text:I'll 1:text: check. 2:args:call_c/shell/ 2:args:{}");
+        Finished f = finishpartial(a, p, 0, 1, 1);
+        expect(t, "rs.copilot blocks", anblocks(a, f.blocks),
+               "think:Hm.#ENC|text:I'll check.|call:call_c,shell,{}");
+    }
+
     // A response not streamed, and one whose items came only whole
     {
         Str ev[] = {

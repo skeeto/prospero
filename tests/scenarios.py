@@ -7158,7 +7158,8 @@ def cp_wire(t):
     """Each model in the format Copilot's listing says it takes: Messages
     at /v1/messages, Responses at /responses, Chat Completions, and with
     no endpoints listed, by its name; the steps after the first, a
-    tool's, are the agent's."""
+    tool's, are the agent's. Responses comes as Copilot sends it, each
+    event naming its item by a new id: each call runs once."""
     cpsignin(t)
     t.put("hello.txt", "hello world\n")
     want = {"+msg": "/v1/messages", "+rs": "/responses", "+guess": "/chat/completions",
@@ -7180,6 +7181,8 @@ def cp_wire(t):
             t.check(all(c["headers"].get("anthropic-version") for c in calls),
                     "Messages with its version")
         t.check(t.file("hello.txt") == "hello there\n", f"{suffix}: the edit landed")
+        ends = [e["status"] for e in r.all("tool.end")]
+        t.check(ends == ["ok"] * 3, f"{suffix}: the calls, once each: {ends}")
         t.put("hello.txt", "hello world\n")
 
 
