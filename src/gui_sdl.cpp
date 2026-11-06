@@ -1697,7 +1697,8 @@ static Slice<FontFile> os_guifonts(Os *os, Arena *a, Arena scratch, Str statedir
             break;
         }
     }
-    Str lang = takehead(loc, 2);
+    // Often unset, or C: no language
+    Str lang = loc.len>=2 ? takehead(loc, 2) : Str{};
     Str first = lang=="ja" ? Str("ja") : lang=="ko" ? Str("ko") :
                 lang!="zh" ? Str{} :
                 find(loc, "TW")>=0 || find(loc, "HK")>=0 || find(loc, "MO")>=0 ||
