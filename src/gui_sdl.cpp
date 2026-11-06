@@ -161,6 +161,7 @@ struct GuiSdl {
     SDL_Window   *window;      // null while shed (os_guished)
     SDL_Window   *waiter;      // hidden, while shed: SDL waits on it
     SDL_GLContext gl;
+    b32           gles;        // gl is OpenGL ES 3.0, not 3.2 core
     SDL_Tray     *tray;
     TrayItem      items[3];
     u32           wakeevent;
@@ -878,14 +879,21 @@ static SDL_Surface *appicon(Arena scratch, i32 n)
     return s;
 }
 
-// Why the window could not open, as SDL says, before the caller's
-// "could not open a window": which step failed, and its reason.
-static b32 sdlfailed(Os *os, Arena t, Str what)
+// SDL's last error, kept: the next call may replace it.
+static Str sdlerror(Arena *a)
 {
     char const *why = SDL_GetError();
-    Str         s   = concat(&t, "prospero: ", what);
-    if (*why) {
-        s = concat(&t, concat(&t, s, ": "), Str{(u8 *)why, (iz)__builtin_strlen(why)});
+    return clone(a, Str{(u8 *)why, (iz)__builtin_strlen(why)});
+}
+
+// Why the window could not open, as SDL says, before the caller's
+// "could not open a window": which step failed, and its reason.
+static b32 sdlfailed(Os *os, Arena t, Str what, Str why = {})
+{
+    why   = why.len ? why : sdlerror(&t);
+    Str s = concat(&t, "prospero: ", what);
+    if (why.len) {
+        s = concat(&t, concat(&t, s, ": "), why);
     }
     os_print(os, 2, concat(&t, s, "\n"));
     return 0;
@@ -951,16 +959,23 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
     return 1;
 }
 
+// The context a window is made for: OpenGL 3.2 core, which every GPU of
+// the last fifteen years has, or OpenGL ES 3.0, which some virtual GPUs
+// give alone (UTM's accelerated one: desktop OpenGL only to 2.1).
+static void glattrs(b32 es)
+{
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, es ? 0 : SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
+                        es ? SDL_GL_CONTEXT_PROFILE_ES : SDL_GL_CONTEXT_PROFILE_CORE);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, es ? 0 : 2);
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+}
+
 // The window, its GL context, and ImGui's backends for them, which
 // os_guished takes down again.
 static b32 sdlwindow(Os *os, Gui *g, GuiSdl *p, Str title)
 {
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 2);
-    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
-
     SDL_WindowFlags flags = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE |
                             SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_HIDDEN;
     // Where it was last, if anywhere, fitted to the displays once it
@@ -981,9 +996,38 @@ static b32 sdlwindow(Os *os, Gui *g, GuiSdl *p, Str title)
     i32 h = geom.box.h;
     flags |= geom.max ? SDL_WINDOW_MAXIMIZED : 0;
     Arena t = g->frame;
+    glattrs(0);
+    p->gles   = 0;
     p->window = SDL_CreateWindow(cstr0(&t, title), w, h, flags);
     if (!p->window) {
         return sdlfailed(os, t, "no OpenGL window");
+    }
+    p->gl = SDL_GL_CreateContext(p->window);
+    if (!p->gl) {
+        Str core = sdlerror(&t);
+        SDL_DestroyWindow(p->window);
+        p->window = 0;
+        #ifndef __APPLE__
+        // Made again for ES: the window's framebuffer is chosen for the
+        // kind of context it will have
+        glattrs(1);
+        p->window = SDL_CreateWindow(cstr0(&t, title), w, h, flags);
+        p->gl     = p->window ? SDL_GL_CreateContext(p->window) : 0;
+        if (p->gl) {
+            p->gles = 1;
+            guilog(g, concat(&t, "OpenGL ES 3.0, as OpenGL 3.2 core is not here: ", core));
+        } else {
+            Str es = sdlerror(&t);
+            if (p->window) {
+                SDL_DestroyWindow(p->window);
+                p->window = 0;
+            }
+            sdlfailed(os, t, "no OpenGL 3.2 core context", core);
+            return sdlfailed(os, t, "nor OpenGL ES 3.0", es);
+        }
+        #else
+        return sdlfailed(os, t, "no OpenGL 3.2 core context", core);
+        #endif
     }
     #ifndef __APPLE__
     // On macOS the window's icon would replace the Dock's, which is the
@@ -1006,13 +1050,6 @@ static b32 sdlwindow(Os *os, Gui *g, GuiSdl *p, Str title)
     p->max = geom.max;
     if (geom.ok && geom.full) {
         SDL_SetWindowFullscreen(p->window, 1);  // as it shows
-    }
-    p->gl = SDL_GL_CreateContext(p->window);
-    if (!p->gl) {
-        sdlfailed(os, t, "no OpenGL 3.2 core context");
-        SDL_DestroyWindow(p->window);
-        p->window = 0;
-        return 0;
     }
     SDL_GL_MakeCurrent(p->window, p->gl);
     // The scheduler paces frames to the display. SDL's own vsync on macOS
@@ -1039,7 +1076,7 @@ static b32 sdlwindow(Os *os, Gui *g, GuiSdl *p, Str title)
     #endif
 
     ImGui_ImplSDL3_InitForOpenGL(p->window, p->gl);
-    ImGui_ImplOpenGL3_Init("#version 150");
+    ImGui_ImplOpenGL3_Init(p->gles ? "#version 300 es" : "#version 150");
     gui_scale(g, contentscale(p->window));
 
     os->gui = p;  // before any thread can wake it
