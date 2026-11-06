@@ -168,6 +168,12 @@ your own risk: GitHub's terms are for you to weigh, and a token for
 another app is kept apart, so changing it asks for a new sign-in. For
 kind chatgpt it likewise replaces the Codex CLI's client.
 
+Copilot may refuse a model with "not available for integrator", as it
+takes requests for the product (the integration) of the app signed in
+as, or of the request's `Copilot-Integration-Id`. `integration_id` in
+the endpoint's section sends that header, naming the product, likewise
+at your own risk. Prospero sends none of its own.
+
 For an OpenAI-compatible server, `template.NAME = VALUE` in a
 `[model NAME]` section is an argument of the model's chat template,
 sent in `chat_template_kwargs` (as llama.cpp and vLLM take it): `true`

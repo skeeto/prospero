@@ -7138,8 +7138,10 @@ def cp_signin(t):
             h.get("x-initiator") == "user" and
             h.get("x-interaction-type") == "conversation-agent" and
             h.get("x-interaction-id") == r.events[0].get("sid") and
-            "copilot-vision-request" not in h, f"headers {h}")
-    listed = cplog(t, "_models")
+            "copilot-vision-request" not in h and
+            "copilot-integration-id" not in h, f"headers {h}")
+    listed = [e for e in cplog(t, "_models")
+              if e["headers"].get("Authorization") == "Bearer " + keep["access_token"]]
     t.check(listed and listed[-1]["_models"] == fake_provider.CP_CLIENT, "listed, signed in")
 
     rc, out, err = prun(t, ["endpoint", "logout", "fake", "--state", t.state, "-c", t.config],
@@ -7194,10 +7196,12 @@ def cp_unlicensed(t):
     t.check("sign up for Copilot Free" in out and path is None, f"refused: {out} {path}")
 
 
-@scenario(conf=dict(CP, client_id=fake_provider.CP_OTHER), bound=30)
+@scenario(conf=dict(CP, client_id=fake_provider.CP_OTHER, integration_id="some-chat"),
+          bound=30)
 def cp_clientid(t):
     """[endpoint] client_id signs in as that client, and its token is
-    kept apart: without it, the endpoint is not signed in."""
+    kept apart: without it, the endpoint is not signed in. [endpoint]
+    integration_id goes with each request, the listing's too."""
     out, path = cpsignin(t)
     keep = json.loads(open(path).read())
     dev = [e for e in cplog(t, "_device")
@@ -7206,6 +7210,13 @@ def cp_clientid(t):
     t.check(keep.get("client_id") == fake_provider.CP_OTHER, f"kept {keep}")
     r = t.run(env=cpenv(t))
     t.check(r.rc == 0, f"exit {r.rc}: {r.last('turn.end')} {r.stderr}")
+    calls = cplog(t, "_call", t.model)
+    lists = [{k.lower(): v for k, v in e["headers"].items()} for e in cplog(t, "_models")
+             if e.get("_models") == fake_provider.CP_OTHER]
+    t.check(calls and lists and
+            all(c["headers"].get("copilot-integration-id") == "some-chat" for c in calls) and
+            all(h.get("copilot-integration-id") == "some-chat" for h in lists),
+            f"the integration named: {[c['headers'] for c in calls]} {lists}")
     conf = t.host.read(t.config).replace(f"client_id = {fake_provider.CP_OTHER}\n", "")
     t.host.write(t.config, conf)
     r = t.run(env=cpenv(t))

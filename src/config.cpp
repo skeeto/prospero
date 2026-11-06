@@ -295,6 +295,11 @@ static CfgKey cfgschema[] = {
      "in as, by default the Codex CLI's for chatgpt, and Prospero's own "
      "GitHub app for copilot, which GitHub gives only its older models. "
      "Another client's id is used at your own risk"},
+    {"endpoint", "integration_id", CFG_STRING, "", {}, {}, "endpoint",
+     "For kind copilot: the Copilot-Integration-Id to send, the product "
+     "GitHub then takes the requests for and gives the models of. By "
+     "default none, so GitHub goes by the client signed in as. Another "
+     "product's is used at your own risk"},
     {"endpoint", "connect_timeout", CFG_SECONDS, "15", "5", {}, "timeouts",
      "Seconds to connect"},
     {"endpoint", "first_byte_timeout", CFG_SECONDS, "300", "1800", {},
@@ -1131,6 +1136,8 @@ static i32 cfgjudge(CfgKey *k, Str v, b32 shared)
         return cfgrefprefix(v) ? CFG_OK : CFG_BAD;
     } else if (k->kind=="mcp" && k->key=="redirect_uri") {
         return loopbackuri(v).ok ? CFG_OK : CFG_BAD;
+    } else if (k->kind=="endpoint" && k->key=="integration_id") {
+        return relayname(v) ? CFG_OK : CFG_BAD;
     } else if (k->kind=="sessions" && k->key=="trash_days") {
         Int n = parseint(v);
         return n.ok && n.val>=0 && n.val<=36500 ? CFG_OK : CFG_BAD;
@@ -1244,6 +1251,8 @@ static Str cfgproblem(Arena *a, CfgKey *k, Str v, b32 shared)
     }
     if (k->kind=="mcp" && k->key=="redirect_uri") {
         return "expected http://127.0.0.1:PORT/PATH or http://localhost:PORT/PATH";
+    } else if (k->kind=="endpoint" && k->key=="integration_id") {
+        return "expected a name of letters, digits, '.', '_' and '-', at most 64";
     } else if (k->kind=="sessions" && k->key=="trash_days") {
         return "expected days, 0 or more (at most 36500): 0 turns the Trash off";
     }

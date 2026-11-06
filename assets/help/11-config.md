@@ -133,8 +133,10 @@ GitHub gives each app its own models, and Prospero's own app gets only
 the older ones, such as `gpt-4o`, `gpt-4o-mini` and `gpt-4.1`, not the
 newer models your plan offers on github.com. The endpoint's
 `client_id` setting signs in as another OAuth app instead, at your own
-risk. If the account has no Copilot, the sign-in fails with a link to
-sign up for Copilot Free.
+risk, and `integration_id` names the product the requests are for (the
+`Copilot-Integration-Id` header), when Copilot says a model "is not
+available for integrator". If the account has no Copilot, the sign-in
+fails with a link to sign up for Copilot Free.
 
 ## Settings worth knowing
 

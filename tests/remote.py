@@ -3685,8 +3685,10 @@ def relay_serve_copilot(t):
     """A relayed call to an endpoint of kind copilot goes with this
     engine's own GitHub sign-in, to the path its format takes under the
     API's root, with who began it and what it is as the thin engine
-    said; words not Copilot's are dropped."""
-    t.write_config(t.url, f"[endpoint cop]\nkind = copilot\nurl = {t.url}/copilot\n")
+    said, and the integration this engine's configuration names; words
+    not Copilot's are dropped."""
+    t.write_config(t.url, f"[endpoint cop]\nkind = copilot\nurl = {t.url}/copilot\n"
+                          "integration_id = some-chat\n")
     t.env["PROSPERO_TEST_COPILOT_AUTH"] = t.url + "/copilot-gh"
     p = subprocess.Popen([t.prospero, "endpoint", "auth", "cop", "--state", t.state,
                           "-c", t.config], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -3734,6 +3736,7 @@ def relay_serve_copilot(t):
             h.get("x-interaction-type") == "conversation-subagent" and
             h.get("x-interaction-id") == "thin-s1" and
             h.get("copilot-vision-request") == "true" and
+            h.get("copilot-integration-id") == "some-chat" and
             h.get("x-github-api-version"), f"call {e}")
 
     an = t.model("remote_an")

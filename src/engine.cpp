@@ -12260,9 +12260,9 @@ static Str chatgptheaders(Engine *e, Arena *a, Endpoint *ep, Str sid, u64 *sent)
 }
 
 // A copilot endpoint's request headers, beyond authheaders': its token,
-// the API's version, and what the request is (CpHint, none for a
-// listing). Nothing of the token if it is not signed in, which the
-// server then refuses.
+// the API's version, what the request is (CpHint, none for a listing),
+// and the product [endpoint] integration_id names, if it does. Nothing
+// of the token if it is not signed in, which the server then refuses.
 static Str copilotheaders(Engine *e, Arena *a, Endpoint *ep, Str sid, CpHint h)
 {
     McpTokens t = mcptokens(e, a, ep->name, epauthurl(e, a, ep), 1);
@@ -12289,6 +12289,13 @@ static Str copilotheaders(Engine *e, Arena *a, Endpoint *ep, Str sid, CpHint h)
     }
     if (h.vision) {
         print(&b, "Copilot-Vision-Request: true\r\n");
+    }
+    // As the user names it, at their own risk: never one of our own
+    Str product = trim(cfgget(e->cfg, "endpoint", ep->name, "integration_id", 0));
+    if (relayname(product)) {
+        print(&b, "Copilot-Integration-Id: ");
+        print(&b, product);
+        print(&b, "\r\n");
     }
     return finish(&b);
 }

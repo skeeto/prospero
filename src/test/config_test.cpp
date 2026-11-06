@@ -79,6 +79,9 @@ static void testcfgschema(Test *t)
         {"endpoint", "key", "env:A-B", CFG_BAD, 0},
         {"endpoint", "key", "sk-123", CFG_ODD, 0},
         {"endpoint", "key", "sk-123", CFG_BAD, 1},
+        {"endpoint", "integration_id", "some-chat", CFG_OK, 1},
+        {"endpoint", "integration_id", "a b", CFG_BAD, 0},
+        {"endpoint", "integration_id", "a\r\nX-Evil: 1", CFG_BAD, 0},
         {"model", "context", "32768", CFG_OK, 0},
         {"model", "context", "32k", CFG_BAD, 0},
         {"model", "temperature", "0.7", CFG_OK, 0},
@@ -1006,6 +1009,7 @@ static void testcfgjson(Test *t)
         "endpoint/team/url=https://t/@/c/team.ini:2\n"
         "endpoint/team/key=(hidden)@/c/team.ini:3!\n"
         "endpoint/team/client_id=*\n"
+        "endpoint/team/integration_id=*\n"
         "endpoint/team/connect_timeout=15*\n"
         "endpoint/team/first_byte_timeout=300*\n"
         "endpoint/team/idle_timeout=90*\n"
@@ -1018,6 +1022,7 @@ static void testcfgjson(Test *t)
         "endpoint/local/url=http://127.0.0.1:8080/@/c/h.ini:3\n"
         "endpoint/local/key=env:KEY@/c/h.ini:5\n"
         "endpoint/local/client_id=*\n"
+        "endpoint/local/integration_id=*\n"
         "endpoint/local/connect_timeout=5*\n"
         "endpoint/local/first_byte_timeout=1800*\n"
         "endpoint/local/idle_timeout=30@/c/h.ini:4\n"
