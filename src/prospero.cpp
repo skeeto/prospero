@@ -605,6 +605,11 @@ enum {
                     // flags alone, through AppKit; out, SDL's modifiers
                     // (KEY_*) in x after the press and y after the
                     // release, or x -1 where there is no such path
+    GEV_CLIPRACE,   // macOS: the window becomes key again and again while
+                    // another process changes the pasteboard, a private
+                    // one, as fast as it can; out, x the times it became
+                    // key and y the pasteboard's changes seen, or x -1
+                    // where there is no such path
 };
 enum {
     GKEY_TAB,

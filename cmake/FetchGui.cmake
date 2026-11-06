@@ -77,8 +77,17 @@ if(NOT WIN32 AND PROSPERO_DEPS STREQUAL "FETCH")
   FetchContent_Declare(SDL3
     URL https://github.com/libsdl-org/SDL/releases/download/release-3.4.18/SDL3-3.4.18.tar.gz
     URL_HASH SHA256=9c75cf16330322c217dedd2e0609f1124f1b54b8633e763467b4684d0f4334a3
+    # A fix of its own to the macOS clipboard, downloaded or bundled
+    PATCH_COMMAND ${CMAKE_COMMAND} -DSRC=<SOURCE_DIR>
+                  -P ${CMAKE_CURRENT_LIST_DIR}/patches/sdl3-clipboard.cmake
     SYSTEM
   )
+  if(FETCHCONTENT_SOURCE_DIR_SDL3)
+    execute_process(
+      COMMAND ${CMAKE_COMMAND} -DSRC=${FETCHCONTENT_SOURCE_DIR_SDL3}
+              -P ${CMAKE_CURRENT_LIST_DIR}/patches/sdl3-clipboard.cmake
+      COMMAND_ERROR_IS_FATAL ANY)
+  endif()
   # Video and events only, and the tray icon of a GUI kept running in the
   # background. X11, Wayland, GL and the Linux tray's libraries
   # (appindicator, GTK) stay dlopened, so one Linux binary still runs

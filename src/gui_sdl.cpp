@@ -783,6 +783,80 @@ static void macflagpaste(GuiEvent *ge)
     objc_autoreleasePoolPop(pool);
 }
 
+// The checklist's clipboard race (GEV_CLIPRACE). As the window becomes
+// key, SDL reads the pasteboard's types, which 3.4.18 did twice, and a
+// pasteboard changed between the two crashed it (cmake/patches/
+// sdl3-clipboard.cmake): as when a dictation app pastes and puts the
+// clipboard back. Here osascript changes a pasteboard of this process's
+// own as fast as it can, which the general one stands for meanwhile, so
+// that the user's clipboard is untouched, and the window's becoming key
+// is posted, as AppKit posts it, many times over. Unpatched, this
+// crashed within a few hundred.
+static void *macracepb;
+static void *macracegeneral(void *, void *)
+{
+    return macracepb;
+}
+
+extern "C" void *class_getClassMethod(void *, void *);
+
+static void macliprace(SDL_Window *w, GuiEvent *ge)
+{
+    enum { TIMES = 3000 };
+    void *pool  = objc_autoreleasePoolPush();
+    void *win   = SDL_GetPointerProperty(SDL_GetWindowProperties(w),
+                                         SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, 0);
+    char  name[64];
+    snprintf(name, sizeof(name), "com.nullprogram.prospero.cliprace.%d", (int)getpid());
+    macracepb = objcsend<void *>(objc_getClass("NSPasteboard"), "pasteboardWithName:",
+                                 nsstring(name));
+    char js[1024];
+    snprintf(js, sizeof(js),
+        "ObjC.import('AppKit');"
+        "var pb = $.NSPasteboard.pasteboardWithName('%s');"
+        "for (var i = 0; i < 200000; i++) {"
+        "  pb.clearContents;"
+        "  pb.setStringForType('a', $.NSPasteboardTypeString);"
+        "  if (i & 1) {"
+        "    pb.setStringForType('<b>a</b>', $.NSPasteboardTypeHTML);"
+        "    pb.setStringForType('{\\rtf1 a}', $.NSPasteboardTypeRTF);"
+        "  }"
+        "}", name);
+    char const *argv[] = {"/usr/bin/osascript", "-l", "JavaScript", "-e", js, 0};
+    pid_t pid = 0;
+    if (!win || !macracepb ||
+            posix_spawn(&pid, argv[0], 0, 0, (char *const *)argv, environ)) {
+        ge->x = 0;
+        objc_autoreleasePoolPop(pool);
+        return;
+    }
+
+    void *m   = class_getClassMethod(objc_getClass("NSPasteboard"),
+                                     sel_registerName("generalPasteboard"));
+    void *was = method_setImplementation(m, (void *)macracegeneral);
+    i64 first = objcsend<i64>(macracepb, "changeCount");
+    for (i32 i = 0; i<300 && objcsend<i64>(macracepb, "changeCount")==first; i++) {
+        SDL_Delay(10);  // osascript starting
+    }
+    void *center = objcsend<void *>(objc_getClass("NSNotificationCenter"), "defaultCenter");
+    void *key    = nsstring("NSWindowDidBecomeKeyNotification");
+    i32   n      = 0;
+    for (; n < TIMES; n++) {
+        void *p = objc_autoreleasePoolPush();
+        objcsend<void>(center, "postNotificationName:object:", key, win);
+        objc_autoreleasePoolPop(p);
+    }
+    i64 last = objcsend<i64>(macracepb, "changeCount");
+    method_setImplementation(m, was);
+    kill(pid, SIGTERM);
+    waitpid(pid, 0, 0);
+    objcsend<void>(macracepb, "releaseGlobally");
+    macracepb = 0;
+    ge->x = (f32)n;
+    ge->y = (f32)(last - first);
+    objc_autoreleasePoolPop(pool);
+}
+
 static void macwillpresent(void *, void *, void *, void *, void (^done)(uz))
 {
     done(2|8|16);  // sound, list, banner
@@ -1472,6 +1546,13 @@ static void os_guiinject(Os *os, GuiEvent *ge)
     } else if (ge->kind == GEV_FLAGPASTE) {
         #ifdef __APPLE__
         macflagpaste(ge);
+        #else
+        ge->x = -1;
+        #endif
+        return;
+    } else if (ge->kind == GEV_CLIPRACE) {
+        #ifdef __APPLE__
+        macliprace(p->window, ge);
         #else
         ge->x = -1;
         #endif
