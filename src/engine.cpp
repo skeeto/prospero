@@ -10313,7 +10313,8 @@ static b32 approvegate(Session *s, Arena scratch)
         }
     }
     if (!want.len && epno) {
-        endturn(s, scratch, "error", epheldmsg(&scratch, &s->ep));
+        Str why = epheldmsg(&scratch, &s->ep);
+        endturn(s, scratch, "error", why);
         return 0;
     } else if (!want.len) {
         return 1;
@@ -11508,14 +11509,17 @@ static void mcpauthfail(Engine *e, Arena scratch, McpAuth *x, Str why)
         // endpoint shows as signed out
         b32 refused = x->status==400 || x->status==401;
         if (refused) {
-            os_remove(e->os, scratch, mcpauthpath(e, &scratch, x->name, x->resource, 1));
+            Str path = mcpauthpath(e, &scratch, x->name, x->resource, 1);
+            os_remove(e->os, scratch, path);
         }
-        Buf b(&scratch, 256 + why.len + 2*x->name.len);
+        // All that it allocates before the buffer, which holds the rest
+        Str again = refused ? epsigninmsg(&scratch, x->name) : Str("try again");
+        Str name  = clone(&scratch, x->name);
+        Buf b(&scratch, 256 + why.len + again.len);
         print(&b, "ChatGPT's sign-in could not be refreshed (");
         print(&b, why);
         print(&b, refused ? Str("), so it needs you to sign in again: ") : Str("); "));
-        print(&b, refused ? epsigninmsg(&scratch, x->name) : Str("try again"));
-        Str name = clone(&scratch, x->name);
+        print(&b, again);
         mcpauthfree(e, x);
         epauthwake(e, scratch, name, finish(&b));
         return;
@@ -12168,16 +12172,16 @@ static McpAuth *eprefreshing(Engine *e, Str name)
 // else EPAUTH_WAIT with a refresh under way (begun if need be), else
 // EPAUTH_NONE with *why saying so. stale is the hash of an access token
 // refused, to be refreshed unless another has replaced it already.
-static i32 epauth(Engine *e, Arena scratch, Endpoint *ep, u64 stale, Str *why)
+static i32 epauth(Engine *e, Arena *a, Endpoint *ep, u64 stale, Str *why)
 {
-    Str       key = epauthurl(e, &scratch, ep);
-    McpTokens t   = mcptokens(e, &scratch, ep->name, key, 1);
+    Str       key = epauthurl(e, a, ep);
+    McpTokens t   = mcptokens(e, a, ep->name, key, 1);
     if (!t.access.len) {
-        Str msg = concat(&scratch, "endpoint ", ep->name);
-        msg  = concat(&scratch, msg, " is not signed in to ");
-        msg  = concat(&scratch, msg, epservice(ep->kind));
-        *why = concat(&scratch, msg, concat(&scratch, ": sign in ",
-                                            epsigninmsg(&scratch, ep->name)));
+        Str msg = concat(a, "endpoint ", ep->name);
+        msg  = concat(a, msg, " is not signed in to ");
+        msg  = concat(a, msg, epservice(ep->kind));
+        *why = concat(a, msg, concat(a, ": sign in ",
+                                            epsigninmsg(a, ep->name)));
         return EPAUTH_NONE;
     } else if (ep->kind == EP_COPILOT) {
         return EPAUTH_OK;  // never expires; refused, it is signed in again
@@ -12190,9 +12194,9 @@ static i32 epauth(Engine *e, Arena scratch, Endpoint *ep, u64 stale, Str *why)
     } else if (eprefreshing(e, ep->name)) {
         return EPAUTH_WAIT;
     } else if (!t.refresh.len) {
-        Str msg = concat(&scratch, "endpoint ", ep->name);
-        msg  = concat(&scratch, msg, "'s ChatGPT sign-in expired: sign in again ");
-        *why = concat(&scratch, msg, epsigninmsg(&scratch, ep->name));
+        Str msg = concat(a, "endpoint ", ep->name);
+        msg  = concat(a, msg, "'s ChatGPT sign-in expired: sign in again ");
+        *why = concat(a, msg, epsigninmsg(a, ep->name));
         return EPAUTH_NONE;
     }
     for (McpAuth *x = e->mcpauths; x; x = x->next) {
@@ -12202,7 +12206,7 @@ static i32 epauth(Engine *e, Arena scratch, Endpoint *ep, u64 stale, Str *why)
             return EPAUTH_NONE;
         }
     }
-    McpAuth *x = mcpauthnew(e, scratch, ep->name, key, 1);
+    McpAuth *x = mcpauthnew(e, *a, ep->name, key, 1);
     if (!x) {
         *why = "out of memory";
         return EPAUTH_NONE;
@@ -12210,17 +12214,17 @@ static i32 epauth(Engine *e, Arena scratch, Endpoint *ep, u64 stale, Str *why)
     x->stage    = MCPAUTH_REFRESH;
     x->by       = os_ticks(e->os) + 60*SEC;
     x->issuer   = clone(&x->arena, e->chatgptauth);
-    x->tokenurl = clone(&x->arena, concat(&scratch, e->chatgptauth, "/oauth/token"));
+    x->tokenurl = clone(&x->arena, concat(a, e->chatgptauth, "/oauth/token"));
     x->client   = clone(&x->arena, epclient(e, ep));
     x->refresh  = clone(&x->arena, t.refresh);
     x->account  = clone(&x->arena, t.account);
     x->email    = clone(&x->arena, t.email);
     x->plan     = clone(&x->arena, t.plan);
-    Str grant   = concat(&scratch, "grant_type=refresh_token&refresh_token=",
-                         pctencode(&scratch, t.refresh));
-    grant = concat(&scratch, grant, "&scope=openid%20profile%20email");
-    Str form    = mcpauthform(&scratch, x, grant);
-    if (!mcpauthhttp(e, scratch, x, "POST", x->tokenurl,
+    Str grant   = concat(a, "grant_type=refresh_token&refresh_token=",
+                         pctencode(a, t.refresh));
+    grant = concat(a, grant, "&scope=openid%20profile%20email");
+    Str form    = mcpauthform(a, x, grant);
+    if (!mcpauthhttp(e, *a, x, "POST", x->tokenurl,
                      "application/x-www-form-urlencoded", form)) {
         mcpauthfree(e, x);
         *why = "ChatGPT's sign-in could not be refreshed: the token request "
@@ -12327,7 +12331,7 @@ static b32 authgate(Session *s, Arena scratch, Endpoint *ep)
         return 1;
     }
     Str why = {};
-    switch (epauth(s->e, scratch, ep, s->authstale, &why)) {
+    switch (epauth(s->e, &scratch, ep, s->authstale, &why)) {
     case EPAUTH_OK:
         s->authstale = 0;
         return 1;
@@ -12391,7 +12395,8 @@ static void epdeviceend(Engine *e, Arena scratch, McpAuth *x, Str err)
 {
     if (x->cmd) {
         if (err.len) {
-            reply(e, scratch, x->cmd, 0, concat(&scratch, "signing in failed: ", err), {});
+            Str msg = concat(&scratch, "signing in failed: ", err);
+            reply(e, scratch, x->cmd, 0, msg, {});
         } else {
             reply(e, scratch, x->cmd, 1, {}, {});
         }
@@ -12518,7 +12523,8 @@ static void cmdepauth(Engine *e, Arena scratch, i64 id, Json *j)
         reply(e, scratch, id, 0, "no redirect was given", {});
         return;
     }
-    McpAuth *x = mcpauthnew(e, scratch, name, epauthurl(e, &scratch, &ep), 1);
+    Str      key = epauthurl(e, &scratch, &ep);
+    McpAuth *x   = mcpauthnew(e, scratch, name, key, 1);
     if (!x) {
         reply(e, scratch, id, 0, "out of memory", {});
         return;
@@ -16057,7 +16063,8 @@ static i64 trashedat(Engine *e, Arena scratch, Str sid)
     if (t.ok && t.val>0) {
         return t.val;
     }
-    Stat st = os_stat(e->os, scratch, sidecarpath(&scratch, e, sid, "trashed"));
+    Str  path = sidecarpath(&scratch, e, sid, "trashed");
+    Stat st   = os_stat(e->os, scratch, path);
     return st.mtime>0 ? st.mtime : 1;
 }
 
@@ -20662,7 +20669,7 @@ static void cmdmodels(Engine *e, Arena scratch, i64 id)
         r.headers   = authheaders(&t, &ep, "application/json");
         if (epsigned(ep.kind) && !ep.relay.len) {
             Str why = {};
-            if (epauth(e, t, &ep, 0, &why) == EPAUTH_NONE) {
+            if (epauth(e, &t, &ep, 0, &why) == EPAUTH_NONE) {
                 p->err  = clone(&l->arena, why);
                 p->done = 1;
                 continue;

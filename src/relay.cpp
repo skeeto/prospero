@@ -1063,7 +1063,7 @@ static void relaysend(Engine *e, Arena scratch, RelayServe *v)
     if (v->ep.kind==EP_CHATGPT && !v->search && !v->authtried) {
         Str why = {};
         v->authtried = 1;
-        if (epauth(e, scratch, &v->ep, 0, &why) == EPAUTH_WAIT) {
+        if (epauth(e, &scratch, &v->ep, 0, &why) == EPAUTH_WAIT) {
             v->authwait = 1;  // relayauthwake goes on
             return;
         }
