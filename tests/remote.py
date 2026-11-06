@@ -2474,7 +2474,10 @@ elif args[:1] == ["create"]:
     binds = {}
     for i, a in enumerate(args):
         if a == "-v" and ":" in args[i + 1]:
-            here, there = args[i + 1].rsplit(":", 1)
+            spec = args[i + 1]
+            if spec.endswith((":z", ":Z")):  # SELinux's labels
+                spec = spec[:-2]
+            here, there = spec.rsplit(":", 1)
             binds[there] = here
     labels = [args[i + 1] for i, a in enumerate(args) if a == "--label"]
     with open(rec(name), "w") as f:

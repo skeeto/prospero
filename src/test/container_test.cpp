@@ -53,6 +53,15 @@ static void test_container(Test *t)
     argv = ctrcreateargv(&a, &c, "f00d", "/s/state", {}, {}, {});
     expect(t, "ctrcreate copy, a volume", istr(&a, find(joinwords(&a, argv), "|-v|/work|-w|")>0),
            "1");
+    // Under SELinux: its state labelled its own, the user's folder shared
+    c.workspace = CTR_MOUNT;
+    c.selinux   = 1;
+    argv = ctrcreateargv(&a, &c, "f00d", "/s/state", {}, {}, {});
+    expect(t, "ctrcreate selinux", istr(&a, find(joinwords(&a, argv),
+           "|-v|/s/state:/prospero/state:Z|--tmpfs|/prospero/state/run|"
+           "-v|/h/src:/work:z|-w|")>0), "1");
+    c.workspace = CTR_COPY;
+    c.selinux   = 0;
 
     // Reached as an exec remote, its words quoted
     expect(t, "ctrexec", ctrexec(&a, &c), "\"/d/bin/docker\" exec -i prospero-p-0011aabb");
@@ -107,6 +116,11 @@ static void test_container(Test *t)
            "-v|/s/state:/prospero/state|--tmpfs|/prospero/state/run|-v|/work|"
            "-v|/sc/containers/t-00c0ffee:/out|-w|/work|--entrypoint|sleep|alpine|"
            "2147483647");
+    k.selinux = 1;
+    argv = ctrcreateargv(&a, &k, "f00d", "/s/state", {}, {}, {});
+    expect(t, "ctrcreate task selinux", istr(&a, find(joinwords(&a, argv),
+           "|-v|/work|-v|/sc/containers/t-00c0ffee:/out:Z|")>0), "1");
+    k.selinux = 0;
     expect(t, "ctrsave task", istr(&a, ctrsave(v.os, v.scratch, "/st", &k)), "1");
     expect(t, "ctrini out", istr(&a, find(cfgfile(v.os, "/st/containers/t-00c0ffee/container.ini"),
                                           "\nout = /sc/containers/t-00c0ffee\n")>0), "1");

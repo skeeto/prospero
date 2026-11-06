@@ -45,10 +45,15 @@ directory, a folder copied into it with `cp` before it starts), and its
 state directory here,
 `STATE/containers/NAME/state`, bound at `/prospero/state` with a tmpfs
 over its `run` so that the host's socket never lands on a shared
-mount. `container.ini` beside it keeps the image, workspace, network
-and the sessions last listed, for the Trash while it is stopped. The
-window reaches it as the exec remote `ctr:NAME`, `RUNTIME exec -i
-prospero-NAME`, deployed as any exec remote is, its model calls
+mount. Where this machine runs SELinux (`/sys/fs/selinux` exists, as on
+RHEL, Rocky, AlmaLinux and Fedora), a container may write no bound
+folder that isn't labelled for it, so the state and `/out` get `:Z`, a
+label of that container's own, and a bound folder `:z`, which the
+runtime relabels `container_file_t` once, shared, so that the user's own
+programs and other containers still use it. `container.ini` beside it
+keeps the image, workspace, network and the sessions last listed, for
+the Trash while it is stopped. The window reaches it as the exec
+remote `ctr:NAME`, `RUNTIME exec -i prospero-NAME`, deployed as any exec remote is, its model calls
 relayed, and starts it first when it is stopped. Its Trash is the
 window's: the last session there stops it (`stop -t 5`), restoring one
 starts it, and Delete, emptying the Trash or the purge after the main

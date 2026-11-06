@@ -89,6 +89,8 @@ struct Ctr {
     Str user;       // whom Prospero is there: 0, or UID:GID (ctruser); null
                     // in one made before, as the image says
     b32 network;
+    b32 selinux;    // this host labels files for SELinux: its mounts are
+                    // relabelled, else it cannot write them (not kept)
     i64 created;    // Unix epoch ms
     i64 trashed;    // Unix epoch ms it was stopped for the Trash, else 0
     Slice<CtrSess> sessions;
@@ -430,24 +432,31 @@ static Slice<Str> ctrcreateargv(Arena *a, Ctr *c, Str owner, Str state, Str cpus
     for (iz i = 0; i < args.len; i++) {
         r = push(a, r, args[i]);
     }
+    // Under SELinux, each mount gets a label containers may write: Z, for
+    // this container alone, where it is Prospero's own, and z, shared,
+    // where it is the user's folder, which the user's programs and other
+    // containers go on using
+    Str own = c->selinux ? Str(":Z") : Str{};
+    Str shared = c->selinux ? Str(":z") : Str{};
     r = push(a, r, Str("-v"));
-    r = push(a, r, concat(a, state, concat(a, ":", ctrstate)));
+    r = push(a, r, concat(a, concat(a, state, concat(a, ":", ctrstate)), own));
     r = push(a, r, Str("--tmpfs"));
     if (c->user.len && c->user!="0") {
         // Its run directory and HOME, this user's, as the rest it writes
         Cut ids = cut(c->user, ':');
-        Str own = concat(a, concat(a, ":uid=", ids.head), concat(a, ",gid=", ids.tail));
-        r = push(a, r, concat(a, concat(a, ctrstate, "/run"), concat(a, own, ",mode=0700")));
+        Str who = concat(a, concat(a, ":uid=", ids.head), concat(a, ",gid=", ids.tail));
+        r = push(a, r, concat(a, concat(a, ctrstate, "/run"), concat(a, who, ",mode=0700")));
         r = push(a, r, Str("--tmpfs"));
-        r = push(a, r, concat(a, ctrhome, concat(a, own, ",mode=0700,exec")));
+        r = push(a, r, concat(a, ctrhome, concat(a, who, ",mode=0700,exec")));
     } else {
         r = push(a, r, concat(a, ctrstate, "/run"));
     }
     r = push(a, r, Str("-v"));
-    r = push(a, r, c->workspace==CTR_MOUNT ? concat(a, c->folder, ":/work") : Str("/work"));
+    r = push(a, r, c->workspace==CTR_MOUNT ? concat(a, concat(a, c->folder, ":/work"), shared)
+                                           : Str("/work"));
     if (c->out.len) {
         r = push(a, r, Str("-v"));
-        r = push(a, r, concat(a, c->out, ":/out"));
+        r = push(a, r, concat(a, concat(a, c->out, ":/out"), own));
     }
     r = push(a, r, Str("-w"));
     r = push(a, r, Str("/work"));
@@ -781,6 +790,8 @@ static Str ctrcreate(CtrRun *run, Arena *perm, Arena scratch, Ctr *c, Str cpus,
     }
     Str real = os_realpath(os, &scratch, state);
     Str own  = ctrowner(&scratch, localstate);
+    // Linux's selinuxfs, there only while SELinux is on (RHEL, Fedora)
+    c->selinux = os_stat(os, scratch, "/sys/fs/selinux/enforce").type != STAT_MISSING;
     argv = ctrcreateargv(&scratch, c, own, real.len ? real : state, cpus, memory, args);
     r    = ctrrun(run, &scratch, argv, CTR_STEPTIME);
     if (r.code != 0) {
