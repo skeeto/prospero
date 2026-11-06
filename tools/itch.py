@@ -5,7 +5,8 @@
 # ///
 """Build the itch.io edition of Prospero, for macOS, Windows and Linux.
 
-  uv run tools/itch.py [--commit REV] [--out DIR] [--notary-profile NAME] [--push]
+  uv run tools/itch.py [--commit REV] [--out DIR] [--notary-profile NAME]
+                       [--only PLATFORM]... [--push]
 
 The itch.io builds are plain "Prospero" (not the Community Edition of
 a source build), with the engines zip embedded, so that deploy needs no
@@ -40,8 +41,16 @@ prospero-VERSION-linux-x86_64.tar.gz,
 prospero-VERSION-linux-aarch64.tar.gz and the engines zip, with .sha256
 files. --push then uploads the dmg, the Windows zip, kept a zip, and
 the Linux tarballs with butler, to the channels mac, windows, linux
-and linux-arm64 of skeeto/prospero, at the version; without it, the commands that would are printed. It needs an itch.io API key,
-from "butler login" or in BUTLER_API_KEY, checked before the build.
+and linux-arm64 of skeeto/prospero, at the version; without it, the
+commands that would are printed. It needs an itch.io API key, from
+"butler login" or in BUTLER_API_KEY, checked before the build.
+
+--only builds just the platforms named (macos, windows, linux-x86_64,
+linux-aarch64; repeated for more), for a test, never pushed, into
+build-itch-test unless --out says otherwise, apart from the release's
+files of the same names. Without macos or windows, nothing signs, so
+nothing about signing is checked: the engines zip it embeds is then
+unsigned, and is not put in DIR.
 """
 
 import argparse
@@ -62,6 +71,7 @@ BUNDLE_ID = "com.nullprogram.prospero"
 SIGNER = "CN=Christopher Wellons"
 GAME = "skeeto/prospero"
 IMAGE = "prospero-toolchain"
+PLATFORMS = ["macos", "windows", "linux-x86_64", "linux-aarch64"]
 # notarytool keeps a profile where it can be read only while the Mac is
 # unlocked, and says a locked one is not there
 LOCKED = ("itch: \"No Keychain password item found\" also means the screen is "
@@ -84,23 +94,14 @@ def sha256(path):
 
 def checks(args):
     """What signing needs, before anything is built."""
-    if not shutil.which("aas-sign"):
-        sys.exit("itch: no aas-sign on PATH, to sign the Windows programs")
     if not shutil.which("docker"):
         sys.exit("itch: no docker, for the engines, Windows and Linux builds")
-    ids = subprocess.run(["security", "find-identity", "-v", "-p", "codesigning"],
-                         capture_output=True, text=True).stdout
-    if f'"{args.identity}"' not in ids:
-        sys.exit(f"itch: no codesigning identity \"{args.identity}\" in the keychain")
-    if not args.notary_profile and not os.environ.get("PROSPERO_NOTARY_KEY"):
-        sys.exit("itch: no notary credentials: --notary-profile NAME, or "
-                 "PROSPERO_NOTARY_KEY, PROSPERO_NOTARY_KEY_ID and PROSPERO_NOTARY_ISSUER")
-    if args.notary_profile:
-        r = subprocess.run(["xcrun", "notarytool", "history", "-p", args.notary_profile],
-                           capture_output=True, text=True)
-        if r.returncode != 0:
-            sys.exit(f"itch: notary profile {args.notary_profile}: "
-                     f"{(r.stdout + r.stderr).strip()}\n{LOCKED}")
+    if args.push and args.only:
+        sys.exit("itch: --only builds are for tests, never pushed")
+    if args.signs:
+        if not shutil.which("aas-sign"):
+            sys.exit("itch: no aas-sign on PATH, to sign the Windows programs")
+        signchecks(args)
     if args.push:
         if not shutil.which("butler"):
             sys.exit("itch: --push needs butler (https://itch.io/docs/butler/)")
@@ -114,6 +115,23 @@ def checks(args):
                                capture_output=True, text=True, check=True).stdout
         if dirty.strip():
             sys.exit("itch: uncommitted changes, which a build of HEAD would leave out")
+
+
+def signchecks(args):
+    """The Developer ID and the notary's credentials."""
+    ids = subprocess.run(["security", "find-identity", "-v", "-p", "codesigning"],
+                         capture_output=True, text=True).stdout
+    if f'"{args.identity}"' not in ids:
+        sys.exit(f"itch: no codesigning identity \"{args.identity}\" in the keychain")
+    if not args.notary_profile and not os.environ.get("PROSPERO_NOTARY_KEY"):
+        sys.exit("itch: no notary credentials: --notary-profile NAME, or "
+                 "PROSPERO_NOTARY_KEY, PROSPERO_NOTARY_KEY_ID and PROSPERO_NOTARY_ISSUER")
+    if args.notary_profile:
+        r = subprocess.run(["xcrun", "notarytool", "history", "-p", args.notary_profile],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            sys.exit(f"itch: notary profile {args.notary_profile}: "
+                     f"{(r.stdout + r.stderr).strip()}\n{LOCKED}")
 
 
 def source(args):
@@ -163,11 +181,14 @@ def engines(args, src, ver):
         shutil.rmtree(work)
     run(["uv", "run", os.path.join(src, "tools", "engines.py"), "--docker",
          "--out", out, "--work", work])
-    aassign(src, sorted(glob.glob(os.path.join(out, f"prospero-engine-{ver}-windows-*.exe"))))
-    mac = os.path.join(out, f"prospero-engine-{ver}-macos-arm64")
-    run(["codesign", "--force", "--options", "runtime", "--timestamp",
-         "--identifier", f"{BUNDLE_ID}.engine", "--sign", args.identity, mac])
-    run(["codesign", "--verify", "--strict", mac])
+    if args.signs:
+        aassign(src, sorted(glob.glob(os.path.join(out, f"prospero-engine-{ver}-windows-*.exe"))))
+        mac = os.path.join(out, f"prospero-engine-{ver}-macos-arm64")
+        run(["codesign", "--force", "--options", "runtime", "--timestamp",
+             "--identifier", f"{BUNDLE_ID}.engine", "--sign", args.identity, mac])
+        run(["codesign", "--verify", "--strict", mac])
+    else:
+        say("the engines are unsigned: a test build")
     run(["uv", "run", os.path.join(src, "tools", "engines.py"), "--pack", "--out", out,
          "--licenses", os.path.join(work, "docker", "out", "LICENSES")])
     return os.path.join(out, f"prospero-engines-{ver}.zip")
@@ -263,16 +284,23 @@ def linux(args, src, ver, zip, arch):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--commit", default="HEAD", help="what to build (default: HEAD)")
-    ap.add_argument("--out", default=os.path.join(ROOT, "build-itch"))
+    ap.add_argument("--out", help="where it puts them (default: build-itch, "
+                                  "or build-itch-test with --only)")
     ap.add_argument("--work", default=os.path.join(ROOT, "build-itch-work"),
                     help="where it builds (default: build-itch-work)")
     ap.add_argument("--identity", default=IDENTITY, help="the Developer ID")
     ap.add_argument("--notary-profile", default=os.environ.get("PROSPERO_NOTARY_PROFILE"),
                     help="notarytool keychain profile (default: $PROSPERO_NOTARY_PROFILE)")
     ap.add_argument("--push", action="store_true", help="upload with butler")
+    ap.add_argument("--only", action="append", choices=PLATFORMS, metavar="PLATFORM",
+                    help=f"build just this one, for a test: {', '.join(PLATFORMS)}")
     args = ap.parse_args()
-    args.out = os.path.abspath(args.out)
+    # A test's own, never over the release's of the same version
+    args.out = os.path.abspath(args.out or os.path.join(
+        ROOT, "build-itch-test" if args.only else "build-itch"))
     args.work = os.path.abspath(args.work)
+    plats = args.only or PLATFORMS
+    args.signs = "macos" in plats or "windows" in plats
 
     checks(args)
     # The display kept awake until this exits, so that the screen does not
@@ -282,13 +310,20 @@ def main():
     os.makedirs(args.work, exist_ok=True)
     src, ver = source(args)
     zip = engines(args, src, ver)
-    dmg = macos(args, src, ver, zip)
-    win = windows(args, src, ver, zip)
-    lin = [linux(args, src, ver, zip, arch) for arch in ("x86_64", "aarch64")]
+    built = {}
+    if "macos" in plats:
+        built["macos"] = macos(args, src, ver, zip)
+    if "windows" in plats:
+        built["windows"] = windows(args, src, ver, zip)
+    for arch in ("x86_64", "aarch64"):
+        if f"linux-{arch}" in plats:
+            built[f"linux-{arch}"] = linux(args, src, ver, zip, arch)
 
+    # An unsigned engines zip stays in the work directory, apart from
+    # the release's signed one
     os.makedirs(args.out, exist_ok=True)
     made = []
-    for path in (dmg, win, *lin, zip):
+    for path in (*built.values(), *([zip] if args.signs else [])):
         dst = os.path.join(args.out, os.path.basename(path))
         shutil.copyfile(path, dst)
         name = os.path.basename(dst)
@@ -296,6 +331,9 @@ def main():
             f.write(f"{sha256(dst)}  {name}\n")
         made.append(dst)
         say(f"{name}: {os.path.getsize(dst)} bytes, sha256 {sha256(dst)}")
+    if args.only:
+        say(f"done: {args.out}")
+        return
 
     # The Windows zip as a zip: butler unpacks a pushed .zip, or a
     # directory of just one, into its files, unless --no-auto-unzip
