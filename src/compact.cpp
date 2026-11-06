@@ -18,8 +18,10 @@
 //    for text only, which writes a summary in fixed sections; a later
 //    compaction updates the previous summary. The newest 20k tokens
 //    stay verbatim, cut at a message that is not a tool result, so that
-//    a call keeps its result. The summary, capped at 16384 tokens, ends
-//    with the files the calls read and wrote, kept by the harness.
+//    a call keeps its result. The summary ends with the files the calls
+//    read and wrote, kept by the harness. One over 16384 tokens, or
+//    without its Goal section, fails the compaction: cut short, it would
+//    lose its last sections, and the history it stands for with them.
 //
 // The transcript then becomes [system][a checkpoint user message with
 // the summary][the messages kept]. This is the one deliberate break of
@@ -344,15 +346,45 @@ static Str summaryprompt(Arena *a, Str prev, Str convo, i64 words, Str focus)
     print(&u, "\n<conversation>\n");
     print(&u, convo);
     print(&u, "</conversation>\n");
+    // Restated last: after a long conversation, what came first is what
+    // a model most easily loses, and it may copy the conversation out
+    print(&u, "\nWrite the summary of the conversation above now, in the "
+              "sections given before it, under ");
+    print(&u, words);
+    print(&u, " words");
     if (focus.len) {
-        // Restated last: after a long conversation, what came first is
-        // what a model most easily loses
-        print(&u, "\nWrite the summary now, keeping more detail about the "
-                  "user's focus:\n\n<focus>\n");
+        print(&u, ", keeping more detail about the user's focus:\n\n"
+                  "<focus>\n");
         print(&u, focus);
         print(&u, "\n</focus>\n");
+    } else {
+        print(&u, ".\n");
     }
     return finish(&u);
+}
+
+// Whether a summary has its Goal section, the first of those asked for:
+// a heading of "#"s, or a line in bold, that begins with "Goal". Its
+// absence means the summarizer wrote something else, as when it copies
+// the conversation out instead.
+static b32 hasgoal(Str summary)
+{
+    for (Str rest = summary; rest.len;) {
+        Cut c    = cut(rest, '\n');
+        Str line = trim(c.head);
+        rest = c.tail;
+        iz  n    = 0;
+        if (startswith(line, "**")) {
+            n = 2;
+        } else {
+            while (n<line.len && line[n]=='#') n++;
+        }
+        Str name = trim(cuthead(line, n));
+        if (n && name.len>=4 && equalfold(takehead(name, 4), "goal")) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 // The summarizer's request: no tools offered, text only.

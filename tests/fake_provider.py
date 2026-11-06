@@ -1328,11 +1328,39 @@ def sc_compact_guard(model, n, req):
 
 
 def sc_compact_guard_compact(model, n, req):
-    # A summary far too long to leave any room
+    # A summary far too long to leave any room, but not over its limit
     yield S.head()
-    for i in range(40):
+    yield from text(model, "## Goal\nRead the files.\n\n## Critical context\n")
+    for i in range(29):
         yield from text(model, "".join(f"Detail {i}.{j}: file f{j}.txt has line "
                                        f"{i*j} of the data. " for j in range(40)))
+    yield from finish(model, prompt=ptok(req))
+
+
+def sc_compact_echo(model, n, req):
+    yield from sc_compaction(model, n, req)
+
+
+def sc_compact_echo_compact(model, n, req):
+    # The summarizer copies the conversation out instead (issue #17)
+    yield S.head()
+    yield from text(model, "user: Read the files.\n\nassistant: Reading f0.txt.\n\n"
+                           "user: Your goal is to read them all.", 3)
+    yield from finish(model, prompt=ptok(req))
+
+
+def sc_compact_long(model, n, req):
+    yield from sc_compaction(model, n, req)
+
+
+def sc_compact_long_compact(model, n, req):
+    # As an instruction file asked: every message copied out, then the
+    # summary, over 16384 tokens in all (issue #17)
+    yield S.head()
+    for i in range(40):
+        yield from text(model, "".join(f"user: line {i}.{j} of file f{j}.txt, "
+                                       f"copied out verbatim. " for j in range(50)))
+    yield from text(model, "\n\n## Goal\nRead the files.\n\n## Next steps\nRead the rest.")
     yield from finish(model, prompt=ptok(req))
 
 

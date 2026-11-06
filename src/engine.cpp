@@ -13166,8 +13166,9 @@ static void sendcompact(Session *s, Arena scratch)
 // compaction at the threshold (the progress guard): compacting again
 // would make no headway, so the turn ends instead. A compaction the
 // user asked for is its turn's whole work, which ends. A summary declined
-// (refusal) or cut off (length) is never used, since the history it
-// stands for would be gone for good, and asking again would end alike.
+// (refusal), cut off (length), over COMPACT_SUMMAX or without its Goal
+// (hasgoal) is never used, since the history it stands for would be gone
+// for good, and asking again would most likely end alike.
 static void compacted(Session *s, Arena scratch, Partial *p)
 {
     Engine *e    = s->e;
@@ -13202,8 +13203,34 @@ static void compacted(Session *s, Arena scratch, Partial *p)
         failcompact(s, scratch, CLASS_TRANSIENT, 0, "the summary was empty", -1);
         return;
     }
-    iz most = (iz)bytesof(s->rate, COMPACT_SUMMAX);
-    text = text.len>most ? utf8head(text, most) : text;
+    i64 size = tokensof(s->rate, text.len);
+    if (size>COMPACT_SUMMAX || !hasgoal(text)) {
+        // Not cut to fit, which would drop its last sections, nor taken
+        // without them: the history it stands for would be gone for good
+        b32 big = size > COMPACT_SUMMAX;
+        Buf b(&scratch, 768);
+        print(&b, "The summarizer, ");
+        print(&b, cp.model);
+        if (big) {
+            print(&b, ", wrote about ");
+            print(&b, size);
+            print(&b, " tokens, over the ");
+            print(&b, (i64)COMPACT_SUMMAX);
+            print(&b, " a summary may have");
+        } else {
+            print(&b, ", wrote no summary in the sections it was asked for "
+                      "(it has no Goal)");
+        }
+        print(&b, ", so the conversation was not compacted and the turn "
+                  "ends here. An instruction file that asks summaries for "
+                  "more, such as copies of messages, can cause this; else "
+                  "set [model] compactor to another model.");
+        note(s, scratch, "error", finish(&b));
+        Str why = big ? Str("the summary was too long")
+                      : Str("the summary had no Goal section");
+        failcompact(s, scratch, CLASS_DETERMINISTIC, 0, why, -1);
+        return;
+    }
     Files f = summaryfiles(&scratch, s->summary);
     f = addfiles(&scratch, f, s->history, cp.start, cp.cut);
     Str summary = withfiles(&s->perm, text, f);

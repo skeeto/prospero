@@ -4308,6 +4308,40 @@ def compact_guard(t):
     t.check(not any(checkpointed(chat(x)) for x in reqs), "no request after it")
 
 
+def compact_unused(t, why, said):
+    """A summary the turn ends on, never used: the history intact, and
+    the note saying why."""
+    bigfiles(t, 8, 160)
+    r = t.run()
+    t.check(r.rc == 1, f"exit {r.rc}: {r.stderr}")
+    end = r.last("turn.end")
+    t.check(end.get("why") == "error" and why in end.get("err", ""),
+            f"turn end: {end}")
+    notes = [n["text"] for n in r.all("note") if n.get("level") == "error"]
+    t.check(any(said in n and "not compacted" in n for n in notes),
+            f"explained: {[n['text'] for n in r.all('note')]}")
+    t.check(not r.all("compact") and not r.all("retry") and len(t.compactions()) == 1,
+            f"no summary, no retry: {r.all('compact')} {r.all('retry')}")
+    t.check(not any(checkpointed(chat(x)) for x in t.requests()), "no checkpoint")
+    return r
+
+
+@scenario(conf=SMALL, bound=20, alone=True)
+def compact_echo(t):
+    """A summarizer that copies the conversation out, with none of the
+    sections it was asked for, ends the turn rather than replace the
+    history with that (issue #17)."""
+    compact_unused(t, "no Goal section", "no Goal")
+
+
+@scenario(conf=SMALL, bound=20, alone=True)
+def compact_long(t):
+    """A summary over its 16384 tokens ends the turn rather than be cut to
+    fit, which lost its sections, written last after copies of messages
+    as an instruction file asked (issue #17)."""
+    compact_unused(t, "summary was too long", "over the 16384")
+
+
 @scenario(conf={"_listing": {"meta": {"n_ctx": 200000, "n_ctx_train": 262144}}},
           bound=30, alone=True)
 def compact_prune_short(t):
