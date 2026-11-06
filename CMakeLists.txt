@@ -436,7 +436,8 @@ if(WIN32 AND NOT PROSPERO_GUI AND UV)
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/imports.py $<TARGET_FILE:prospero>)
 endif()
 
-if(NOT CMAKE_CROSSCOMPILING)
+# PROSPERO_CROSS_TESTS: a cross toolchain whose programs run here
+if(NOT CMAKE_CROSSCOMPILING OR PROSPERO_CROSS_TESTS)
   enable_testing()
   add_executable(prospero_test src/main_test.cpp)
   target_link_libraries(prospero_test PRIVATE prospero_core_flags wuffs)

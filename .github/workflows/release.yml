@@ -173,11 +173,11 @@ jobs:
           if-no-files-found: error
 
   # Built in Ubuntu 22.04, pinned by digest, as tools/linuxgui's scripts
-  # do it (install.sh, then build.sh), which tools/itch.py runs too, so
-  # that both editions have the same tools and the same floor: glibc's
-  # own libraries and nothing past GLIBC_2.34 (checked), for Ubuntu
-  # 22.04, Debian 12, Fedora 35 and RHEL 10, and later. The source is
-  # the build job's tarball.
+  # do it (install.sh, then build.sh), so that it needs glibc's own
+  # libraries and nothing past GLIBC_2.34 (checked), for Ubuntu 22.04,
+  # Debian 12, Fedora 35 and RHEL 9, and later. (tools/itch.py builds
+  # the itch.io edition's with the same build.sh, but in the toolchain
+  # image against glibc 2.28.) The source is the build job's tarball.
   linux-gui:
     name: Linux GUI ${{ matrix.arch }}
     needs: build

@@ -88,7 +88,7 @@ Each release on GitHub carries five files:
   in a directory with a `.desktop` file, its icon, and a README.txt. It
   is built in an Ubuntu 22.04 container, with everything but glibc
   linked statically, so it needs glibc 2.34 or later (Ubuntu 22.04,
-  Debian 12, Fedora 35, RHEL 10), and shows its window through Wayland
+  Debian 12, Fedora 35, RHEL 9), and shows its window through Wayland
   or X11, which it loads at run time.
 
 Each program is its own engine, so `prospero deploy` from a release
@@ -135,9 +135,15 @@ one with the Developer ID, packed, then embedded in `Prospero.app`
 (signed, tested, on a notarized disk image), in the Windows program
 (built in the toolchain image, signed with `aas-sign`, as `Prospero.exe`
 in a zip), and in the Linux GUI for x86_64 and aarch64. Those are built
-in Ubuntu 22.04 images from `tools/linuxgui`, x86_64 emulated, by the
-same scripts the release's Linux builds use, so they have the same
-glibc floor. Without
+in the toolchain image too, by its glibc 2.28 cross compilers and the
+same `tools/linuxgui/build.sh` the release's Linux builds use, so they
+need only glibc 2.28 or later: RHEL 8 and its rebuilds (Rocky,
+AlmaLinux), Debian 10 and Ubuntu 18.10 too. SDL builds there against
+Debian 12's X11, Wayland, libdecor and D-Bus headers, unpacked into the
+sysroots from a snapshot (`tools/toolchain/sysroot.py`), and loads
+those libraries at run time, so they set no floor. The x86_64 build's
+tests run through Docker's emulation, with the sysroot's loader and
+libraries. Without
 `aas-sign`, the Developer ID in the keychain, or notary credentials
 (`--notary-profile`, from `xcrun notarytool store-credentials`), it
 builds nothing. `--push` uploads the four with [butler][], which needs

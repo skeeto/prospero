@@ -11,7 +11,8 @@
 #   /opt/mingw64/bin/x86_64-w64-mingw32-*   the Windows engines
 #   /opt/mingw32/bin/i686-w64-mingw32-*     (the XP engine)
 #   /opt/glibc/bin/x86_64-linux-gnu-*       glibc 2.28, the Linux desktop
-#   /opt/glibc/bin/aarch64-linux-gnu-*      helpers
+#   /opt/glibc/bin/aarch64-linux-gnu-*      helpers, and the itch.io
+#                                           edition's Linux GUI
 
 FROM debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad AS base
 RUN apt-get update && apt-get install --yes --no-install-recommends \
@@ -82,6 +83,34 @@ COPY glibc.sh /dl/
 RUN sh /dl/glibc.sh aarch64-linux-gnu /opt/glibc deb/*_arm64.deb \
         -- --enable-fix-cortex-a53-843419
 
+# What SDL builds the itch.io edition's Linux GUI against, in the glibc
+# 2.28 sysroots: the X11, Wayland, xkbcommon, libdecor, EGL, GL and
+# D-Bus headers, and the libraries whose sonames SDL reads, all of which
+# it loads at run time, so they set no floor. Debian 12's, of its last
+# point release, as snapshot.debian.org keeps it, through its signed
+# InRelease's hashes of the indexes: sysroot.py checks each package
+# against them, from whichever mirror has it.
+FROM base AS gui
+ARG SNAP=https://snapshot.debian.org/archive/debian/20261101T000000Z \
+    MIRRORS=https://deb.debian.org/debian,https://archive.debian.org/debian \
+    GUIDEBS="libx11-dev libx11-6 libxext-dev libxext6 libxrandr-dev libxrandr2 \
+      libxcursor-dev libxcursor1 libxi-dev libxi6 libxfixes-dev libxfixes3 \
+      libxss-dev libxss1 libxtst-dev libxtst6 libxrender-dev libxrender1 \
+      x11proto-dev libxcb1-dev libxcb1 libxau-dev libxau6 libxdmcp-dev \
+      libxdmcp6 libpthread-stubs0-dev libwayland-dev libwayland-client0 \
+      libwayland-cursor0 libwayland-egl1 libwayland-server0 \
+      libxkbcommon-dev libxkbcommon0 libdecor-0-dev libdecor-0-0 libegl-dev \
+      libegl1 libgl-dev libgl1 libglx-dev libglx0 libglvnd0 libdbus-1-dev \
+      libdbus-1-3 libffi-dev libffi8"
+WORKDIR /dl/gui
+ADD --checksum=sha256:9e0b5aabb2465b3d2e7a7fe27f9913846277833f7a2826e7767acccff5b588c5 \
+    $SNAP/dists/bookworm/main/binary-amd64/Packages.xz amd64.xz
+ADD --checksum=sha256:2ddb1737692e8c45c53e8d57c0ce4cd21c78c5703b830c3226b1423566a06c00 \
+    $SNAP/dists/bookworm/main/binary-arm64/Packages.xz arm64.xz
+COPY sysroot.py ./
+RUN python3 sysroot.py amd64.xz $MIRRORS,$SNAP /opt/glibc/x86_64-linux-gnu $GUIDEBS \
+ && python3 sysroot.py arm64.xz $MIRRORS,$SNAP /opt/glibc/aarch64-linux-gnu $GUIDEBS
+
 # The same GCC and binutils, with w64devkit's patch queues (v2.10.1),
 # and mingw-w64 as w64devkit builds it
 FROM dl AS dl-mingw
@@ -121,6 +150,12 @@ COPY --from=mingw-x86_64 /opt/mingw64 /opt/mingw64
 COPY --from=mingw-i686 /opt/mingw32 /opt/mingw32
 COPY --from=glibc-x86_64 /opt/glibc /opt/glibc
 COPY --from=glibc-aarch64 /opt/glibc /opt/glibc
+COPY --from=gui /opt/glibc /opt/glibc
+# SDL's build runs these here: pkg-config, and wayland-scanner, which
+# writes the Wayland protocols' code
+RUN apt-get update && apt-get install --yes --no-install-recommends \
+  libwayland-bin pkgconf \
+ && rm -rf /var/lib/apt/lists/*
 # What the engines link statically: musl, and GCC's runtime (libgcc,
 # libstdc++) under its exception to the GPL
 COPY --from=dl /dl/musl/COPYRIGHT /opt/licenses/musl.txt

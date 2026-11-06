@@ -23,9 +23,12 @@ whose tracked files must be committed), as the GitHub release is:
   3. the Windows program with it embedded, built in the toolchain image
      (tools/toolchain), signed with aas-sign, as Prospero.exe in a zip
      (tools/winzip.py), as the GitHub release has it;
-  4. the Linux GUI with it embedded, for x86_64 and aarch64, each in an
-     image from tools/linuxgui (x86_64 emulated here), built, checked
-     and packed by its build.sh, as the GitHub release's are.
+  4. the Linux GUI with it embedded, for x86_64 and aarch64, built in
+     the toolchain image by its glibc 2.28 cross compilers, so that it
+     runs on glibc 2.28 and later (RHEL 8 and its rebuilds among them,
+     which the GitHub release's 2.34 leaves out), then checked, tested
+     (x86_64's through Docker's emulation here) and packed by
+     tools/linuxgui's build.sh, as the GitHub release's are.
 
 Everything that signs must work: no aas-sign, no Developer ID identity
 in the keychain, or no notary credentials, and nothing is built. The display is kept
@@ -59,7 +62,6 @@ BUNDLE_ID = "com.nullprogram.prospero"
 SIGNER = "CN=Christopher Wellons"
 GAME = "skeeto/prospero"
 IMAGE = "prospero-toolchain"
-LINUXIMAGE = "prospero-linuxgui"
 # notarytool keeps a profile where it can be read only while the Mac is
 # unlocked, and says a locked one is not there
 LOCKED = ("itch: \"No Keychain password item found\" also means the screen is "
@@ -227,23 +229,34 @@ def windows(args, src, ver, zip):
 
 
 def linux(args, src, ver, zip, arch):
-    """The Linux GUI for arch, in the image tools/linuxgui makes for it."""
+    """The Linux GUI for arch, in the toolchain image (engines.py built
+    it), against glibc 2.28."""
     w = os.path.join(args.work, f"linux-{arch}")
     if os.path.exists(w):
         shutil.rmtree(w)
     os.makedirs(w)
     shutil.copy2(zip, os.path.join(w, "engines.zip"))
-    plat = {"x86_64": "linux/amd64", "aarch64": "linux/arm64"}[arch]
-    image = f"{LINUXIMAGE}:{arch}"
-    run(["docker", "build", "--platform", plat, "-t", image,
-         os.path.join(src, "tools", "linuxgui")])
-    # Emulated, selftest's spawn timing measures the emulator
+    env = {"LINUXGUI_ARCH": arch, "LINUXGUI_GLIBC": "2.28"}
+    # The image is this Mac's architecture. The other's programs, the
+    # selftest's own children among them, run through Docker's emulation
+    # (binfmt_misc), given the sysroot's loader and libraries at their
+    # paths, as its multiarch packages would put them. Its spawn timing
+    # is the emulator's, which the selftest would measure.
+    setup = ""
     host = platform.machine().replace("arm64", "aarch64")
-    bench = [] if arch == host else ["-e", "PROSPERO_SELFTEST_NOBENCH=1"]
-    run(["docker", "run", "--rm", "--platform", plat, *bench,
+    if arch != host:
+        sysroot = f"/opt/glibc/{arch}-linux-gnu"
+        setup = (f"for d in lib64 lib/ld-linux-aarch64.so.1 lib/{arch}-linux-gnu "
+                 f"usr/lib/{arch}-linux-gnu; do "
+                 f"[ -e /$d ] || [ ! -e {sysroot}/$d ] || ln -s {sysroot}/$d /$d; done && ")
+        env["PROSPERO_SELFTEST_NOBENCH"] = "1"
+    build = shlex.join(["sh", "/src/tools/linuxgui/build.sh", "/src", "/tmp/b", "/w/out",
+                        "-DCMAKE_TOOLCHAIN_FILE=/src/cmake/Toolchain-Linux-cross.cmake",
+                        f"-DPROSPERO_TARGET={arch}-linux-gnu",
+                        "-DPROSPERO_EDITION=itch", "-DPROSPERO_ENGINES_ZIP=/w/engines.zip"])
+    run(["docker", "run", "--rm", *[a for k, v in env.items() for a in ("-e", f"{k}={v}")],
          "-v", f"{os.path.abspath(src)}:/src:ro", "-v", f"{os.path.abspath(w)}:/w",
-         image, "sh", "/src/tools/linuxgui/build.sh", "/src", "/tmp/b", "/w/out",
-         "-DPROSPERO_EDITION=itch", "-DPROSPERO_ENGINES_ZIP=/w/engines.zip"])
+         IMAGE, "sh", "-c", setup + build])
     return os.path.join(w, "out", f"prospero-{ver}-linux-{arch}.tar.gz")
 
 

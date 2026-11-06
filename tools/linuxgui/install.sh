@@ -1,7 +1,7 @@
 #!/bin/sh
 # Install what the Linux GUI builds with (build.sh) into Ubuntu 22.04,
-# as root: the release's linux-gui job runs it in its container, and
-# the Dockerfile here bakes it into an image for tools/itch.py.
+# as root: the release's linux-gui job runs it in its container. (The
+# itch.io edition's builds in the toolchain image, tools/toolchain.)
 #
 #   sh tools/linuxgui/install.sh
 #
