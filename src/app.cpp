@@ -1710,6 +1710,7 @@ struct Gui {
     i32                infoshown;    // instruction files the info listed
     i32                infoagents;   // of them AGENTS.md
     i32                infomems;     // memories the info listed
+    b32                infowork;     // the info had the work's rows
     i32                bgbadge;      // the session shown was badged background
     b32                outshown;     // the Output window showed text
     i32                thumbsdrawn;  // thumbnails drawn with their image
@@ -1722,6 +1723,7 @@ struct Gui {
     b32                thinkhidshown; // the strip said reasoning is hidden
     b32                copiedshown;  // a code block's button said Copied
     b32                clockshown;   // a message's time, under the mouse
+    b32                workedshown;  // a turn's work, in its last message's header
     i32                railfold;     // the message the fold rail last folded, plus one
     b32                railseen;     //   its header drawn in view this frame
     i32                gaugeshown;   // the gauge drew: 1, 2 if amber
@@ -12638,6 +12640,7 @@ enum : i32 {
     CHK_ETASHOWN,
     CHK_STRIPFIT,     // the status line gave way, brief or below, within the pane
     CHK_CLOCKSHOWN,
+    CHK_WORKED,
     CHK_RAILFOLD,
     CHK_RAILOPEN,
     CHK_DIAGS,
@@ -12949,6 +12952,7 @@ static Str chknames[] = {
     "amber after 15 s without data", "a retry's countdown shown",
     "the prompt's time left and rate shown",
     "a cramped status line gave way within the pane", "a message's time shown under the mouse",
+    "a turn's work shown in its last message's header",
     "the fold rail folded its message, its header in view",
     "the fold rail opened the folded message again",
     "configuration diagnostics listed with file and line",
@@ -13888,6 +13892,7 @@ static DriveOp m3ops[] = {
     {OP_CHECK, CHK_ETASHOWN, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "1-eta"},
     {OP_WAIT, W_IDLE, 0, 0, 20000, ""},
+    {OP_CHECK, CHK_WORKED, 0, 0, 0, ""},  // that turn's, a few seconds
     {OP_MAXIMIZE, 0, 0, 0, 1500, ""},
     // When that message was sent, shown under the mouse
     {OP_MOVE, T_USERMSG, 0, 0, 300, ""},
@@ -20119,6 +20124,8 @@ static b32 drivecheck(Gui *g, i32 chk)
         return g->stripcramped && !g->stripover && !g->stripbob && g->etashown;
     case CHK_CLOCKSHOWN:
         return g->clockshown;
+    case CHK_WORKED:
+        return g->workedshown;
     case CHK_RAILFOLD:
         return g->railfold>0 && g->railfold<=v->msgs.len &&
                v->msgs[g->railfold-1].collapsed && g->railseen;
@@ -20648,7 +20655,7 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_INFO:
         return c.OpenPopupStack.Size>0 && g->infoshown>=1 && g->infoagents>=1 &&
-               g->infomems>=1;
+               g->infomems>=1 && g->infowork;
     case CHK_QUEUED:
         return g->queuedshown && v->state==LIVE_QUEUED && v->queuepos==1;
     case CHK_FALLBACK:

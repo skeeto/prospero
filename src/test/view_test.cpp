@@ -1608,6 +1608,64 @@ static void test_viewwords(Test *t)
     }
 }
 
+// The work's numbers, and each agent message's turn work
+static Str workshow(Arena *a, View *v)
+{
+    ViewWork *w = &v->work;
+    i64 n[] = {w->model, w->first, w->genms, w->genout, w->tools, w->tasks,
+               w->compact, w->in, w->out, w->cached, w->requests};
+    Buf b(a, 256);
+    for (iz i = 0; i < countof(n); i++) {
+        print(&b, i ? Str("/") : Str(""));
+        print(&b, n[i]);
+    }
+    for (iz i = 0; i < v->msgs.len; i++) {
+        if (v->msgs[i].role == VIEW_ASSISTANT) {
+            print(&b, " A");
+            print(&b, v->msgs[i].worked);
+        }
+    }
+    return finish(&b);
+}
+
+static void test_viewwork(Test *t)
+{
+    Arena perm = t->perm;
+    // Two subagents at once, then a read after a 100 s ask: the calls
+    // that overlap count once, the ask not at all; the requests by their
+    // ms, before and after the first token
+    Str recs[] = {
+        R"({"sid":"s","seq":1,"ts":0,"ev":"user","text":"go"})",
+        R"({"sid":"s","seq":2,"ts":0,"ev":"turn","n":1})",
+        R"({"sid":"s","seq":3,"ts":3000,"ev":"assistant","turn":1,"attempt":1,)"
+        R"("blocks":[{"t":"text","text":"On it."},)"
+        R"({"t":"call","id":"c1","name":"task","args":"{}"},)"
+        R"({"t":"call","id":"c2","name":"task","args":"{}"},)"
+        R"({"t":"call","id":"c3","name":"read","args":"{}"}],)"
+        R"("usage":{"in":1000,"out":100,"cached":800},"ms":3000,"first_ms":1000})",
+        R"({"sid":"s","seq":4,"ts":13000,"ev":"tool.end","call":"c2","status":"ok","text":"b","ms":10000})",
+        R"({"sid":"s","seq":5,"ts":23000,"ev":"tool.end","call":"c1","status":"ok","text":"a","ms":20000})",
+        R"({"sid":"s","seq":6,"ts":125000,"ev":"tool.end","call":"c3","status":"ok","text":"r","ms":2000})",
+        R"({"sid":"s","seq":7,"ts":130000,"ev":"assistant","turn":1,"attempt":1,)"
+        R"("blocks":[{"t":"text","text":"Done."}],)"
+        R"("usage":{"in":2000,"out":300,"cached":1500},"ms":5000,"first_ms":2000})",
+        R"({"sid":"s","seq":8,"ts":130000,"ev":"turn.end","turn":1,"why":"done"})",
+        // A second turn, logged before first_ms: no split, no rate
+        R"({"sid":"s","seq":9,"ts":200000,"ev":"user","text":"again"})",
+        R"({"sid":"s","seq":10,"ts":200000,"ev":"turn","n":2})",
+        R"({"sid":"s","seq":11,"ts":204000,"ev":"assistant","turn":2,"attempt":1,)"
+        R"("blocks":[{"t":"text","text":"Again."}],"usage":{"in":10,"out":5,"cached":0},"ms":4000})",
+        R"({"sid":"s","seq":12,"ts":204000,"ev":"turn.end","turn":2,"why":"done"})",
+    };
+    Arena a = perm;
+    View *v = testview(&a);
+    for (Str r : recs) {
+        apply(v, a, r);
+    }
+    expect(t, "work", workshow(&a, v),
+           "12000/3000/5000/400/22000/20000/0/3010/405/2300/3 A0 A30000 A4000");
+}
+
 static void test_viewthinking(Test *t)
 {
     Arena perm = t->perm;

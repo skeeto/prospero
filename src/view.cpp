@@ -437,6 +437,33 @@ struct ViewImage {
     i32 h;
 };
 
+// What a session spent working, as its records' own times say: in
+// requests that answered, in tool calls, and compacting. Waits on the
+// user, for the endpoint's line, and backing off between attempts are
+// left out, as no record's time holds them: a call's clock starts once
+// it is allowed. Calls that ran at once (subagents) count once.
+struct ViewWork {
+    i64 model;     // ms in requests that answered
+    i64 first;     //   of which before their first token, where known
+    i64 genms;     // and after it, where known,
+    i64 genout;    //   and those requests' output tokens
+    i64 tools;     // ms in tool calls
+    i64 tasks;     //   of which in subagents' (task)
+    i64 compact;   // ms compacting
+    i64 in;        // tokens: every prompt's,
+    i64 out;       //   every reply's,
+    i64 cached;    //   the prompts' read from the cache,
+    i64 written;   //   and written to it (Anthropic)
+    i32 requests;
+};
+
+// A tool call's span, epoch ms
+struct ViewSpan {
+    i64 beg;
+    i64 end;
+    b32 task;
+};
+
 struct ViewMsg {
     Str       text;       // source, in the text arena
     i32       role;
@@ -460,6 +487,7 @@ struct ViewMsg {
     i64       ts1;        //   ms, or 0 where it did not stream
     i64       ts;         // the user's taken in, the agent's finished:
                           //   epoch ms, 0 if not known
+    i64       worked;     // the agent's last of a turn: the turn's work, ms
     Str       label;      // the header, if not the role's name
     Str       from;       // a message's sender, a session's id, or the
                           // endpoint's URL of a mark of a model, or the
@@ -643,6 +671,13 @@ struct View {
     b32             endresume;   // the next turn began by itself
     b32             endcompact;  // a compaction's turn (compact) ended
     b32             turncompact; // the running turn is one
+
+    // Its work (viewwork), the session's and the running turn's
+    ViewWork        work;
+    i64             turnwork;    // ms in the running turn
+    iz              turnmsg;     // its first message's index
+    ViewSpan        spans[32];   // the step's tool calls, not yet merged
+    i32             nspans;
 };
 
 static ViewCache *newviewcache(Arena *perm, Region *r, iz max)
@@ -2016,6 +2051,86 @@ static i32 livestate(Str s)
     return LIVE_IDLE;
 }
 
+// The step's tool calls, merged, into the work: a call's span ends at
+// its record, and calls that overlap (subagents at once) count once.
+static void workflush(View *v)
+{
+    ViewSpan *sp = v->spans;
+    i32       n  = v->nspans;
+    for (i32 i = 1; i < n; i++) {  // by start, a few at most
+        for (i32 k = i; k>0 && sp[k].beg<sp[k-1].beg; k--) {
+            ViewSpan t = sp[k];
+            sp[k]   = sp[k-1];
+            sp[k-1] = t;
+        }
+    }
+    for (i32 pass = 0; pass < 2; pass++) {
+        i64 sum = 0, beg = 0, end = 0;
+        b32 any = 0;
+        for (i32 i = 0; i < n; i++) {
+            if (pass && !sp[i].task) {
+                continue;
+            }
+            if (any && sp[i].beg<=end) {
+                end = sp[i].end>end ? sp[i].end : end;
+                continue;
+            }
+            sum += any ? end-beg : 0;
+            beg  = sp[i].beg;
+            end  = sp[i].end;
+            any  = 1;
+        }
+        sum += any ? end-beg : 0;
+        if (pass) {
+            v->work.tasks += sum;
+        } else {
+            v->work.tools += sum;
+            v->turnwork   += sum;
+        }
+    }
+    v->nspans = 0;
+}
+
+static void workspan(View *v, i64 end, i64 ms, b32 task)
+{
+    if (ms <= 0) {
+        return;
+    }
+    if (v->nspans == countof(v->spans)) {
+        workflush(v);
+    }
+    v->spans[v->nspans++] = {end - ms, end, task};
+}
+
+// A request that answered, from its assistant record.
+static void workrequest(View *v, Json *j)
+{
+    workflush(v);
+    i64   ms    = jsonint(jsonget(j, "ms"), 0);
+    Json *first = jsonget(j, "first_ms");
+    Json *u     = jsonget(j, "usage");
+    i64   out   = jsonint(jsonget(u, "out"), 0);
+    ms = ms<0 ? 0 : ms;
+    v->work.model += ms;
+    v->turnwork   += ms;
+    v->work.requests++;
+    if (first->type == JSON_NUMBER) {
+        i64 f = jsonint(first, 0);
+        f = f<0 ? 0 : f>ms ? ms : f;
+        v->work.first += f;
+        if (out > 0) {
+            v->work.genms  += ms - f;
+            v->work.genout += out;
+        }
+    }
+    if (u->type == JSON_OBJECT) {
+        v->work.in      += jsonint(jsonget(u, "in"), 0);
+        v->work.out     += out;
+        v->work.cached  += jsonint(jsonget(u, "cached"), 0);
+        v->work.written += jsonint(jsonget(u, "written"), 0);
+    }
+}
+
 // Apply one parsed record. Returns 1 if what the view shows changed.
 static b32 viewrecord(View *v, Arena scratch, EvRec *r)
 {
@@ -2220,6 +2335,9 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         v->attempt = 0;
         v->busy    = 1;
         v->turnts  = r->ts;
+        workflush(v);
+        v->turnwork = 0;
+        v->turnmsg  = v->msgs.len;
         v->pdone   = v->ptotal = 0;
         v->turncompact = jsonstr(jsonget(j, "via")) == "compact";
         // The message that began it: a prompt just before, or, for a
@@ -2313,6 +2431,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         dropprov(v);
         // Its usage: what the context holds after it, the prompt and the
         // reply, and how much of the prompt the server had cached
+        workrequest(v, j);
         Json *u = jsonget(j, "usage");
         if (u->type == JSON_OBJECT) {
             i64 in  = jsonint(jsonget(u, "in"), 0);
@@ -2431,6 +2550,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         t->hasexit = ex->type == JSON_NUMBER;
         t->exit    = (i32)jsonint(ex, 0);
         t->ms      = jsonint(jsonget(j, "ms"), 0);
+        workspan(v, r->ts, t->ms, t->name=="task");
         t->spill   = clone(&v->aux, jsonstr(jsonget(j, "spill")));
         t->bytes   = jsonint(jsonget(j, "bytes"), 0);
         t->job     = jsonint(jsonget(j, "job"), t->job);
@@ -2676,6 +2796,9 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         c->after  = jsonint(jsonget(j, "after"), 0);
         c->model  = clone(&v->aux, jsonstr(jsonget(j, "model")));
         c->ms     = jsonint(jsonget(j, "ms"), 0);
+        workflush(v);
+        v->work.compact += c->ms>0 ? c->ms : 0;
+        v->turnwork     += c->ms>0 ? c->ms : 0;
         Str text  = {};
         if (kind == "summary") {
             i64 cut = jsonint(jsonget(j, "cutseq"), v->cutseq);
@@ -3067,6 +3190,16 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         v->endresume  = jsonflag(jsonget(j, "resume"), 0);
         v->endcompact = v->turncompact;
         v->turncompact = 0;
+        // Its work, on the agent's last message of it
+        workflush(v);
+        for (iz i = v->msgs.len-1; i>=v->turnmsg && i>=0; i--) {
+            if (v->msgs[i].role == VIEW_ASSISTANT) {
+                v->msgs[i].worked = v->turnwork;
+                v->msgs[i].ver++;
+                break;
+            }
+        }
+        v->turnwork = 0;
         if (why != "done") {
             Arena a = scratch;
             Buf   b(&a, 128 + err.len);

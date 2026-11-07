@@ -73,6 +73,17 @@ context they are, and the estimate allows for that as more batches
 come. After one long prompt, the next on the same model, in any
 session, has an estimate from the start.
 
+Once a turn ends, the agent's last message of it says how long the turn
+worked: the time in requests the model answered, in tool calls and
+compacting. Waiting for you (an ask, a question, a plan to approve), for
+the endpoint's line, and between attempts is left out, and subagents
+that ran at once count once. The Info button (the circled i) adds up
+the session's work: the time, how much of the model's was before its
+first tokens (reading the prompt), the tools' and the subagents', the
+tokens sent, read from the cache and received, the requests, and the
+output's rate after the first token. Once a session was opened, its
+tooltip in the sidebar gives its time too.
+
 Attach adds files to the message: drop them on the window, paste them,
 or pick them with the paper clip. Images go to a model that takes
 them, as pictures. Any other file goes as text, as `read` shows it:

@@ -1411,6 +1411,14 @@ static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
             p->dl->AddLine(v2(p->x + 6*sc, mid), v2(p->right, mid), rule, sc);
         }
     } break;
+    case VIEW_ASSISTANT:
+        pen(p, m->label.len ? m->label : rolename(m->role), STYLE_BOLD, dim);
+        if (m->worked >= 1000) {
+            // The last of a turn: how long the turn worked (viewwork)
+            pen(p, concat(&a, "  worked ", secstext(&a, (m->worked + 500)/1000)), 0, dim);
+            g->workedshown = 1;
+        }
+        break;
     default:
         pen(p, m->label.len ? m->label : rolename(m->role), STYLE_BOLD, dim);
     }
@@ -2580,6 +2588,8 @@ static void inforow(char const *key, Str value)
     text(value.len ? value : Str("(none)"));
 }
 
+static b32  workrows(Arena, View *);
+
 // The session's details: what it is, where it works, which model and
 // role, and the instruction files the agent was given.
 static void drawinfo(Gui *g, GuiSession *s, View *v)
@@ -2624,6 +2634,7 @@ static void drawinfo(Gui *g, GuiSession *s, View *v)
         if (s->host->kind != GH_ENGINE) {
             inforow("Host", hostlabel(g, &a, s->host));
         }
+        g->infowork = workrows(a, v);
         ImGui::EndTable();
     }
     ImGui::Separator();
@@ -2751,6 +2762,76 @@ static b32 gaugebar(Gui *g, ImDrawList *dl, View *v, f32 x, f32 y, f32 w, f32 bh
         dl->AddLine(v2(tx, y-tick), v2(tx, y+bh+tick), pal->dim, 1.5f*g->scale);
     }
     return near;
+}
+
+// The session's work (viewwork): ms in all, and whether there is any.
+static i64 worktotal(View *v)
+{
+    ViewWork *w = &v->work;
+    return w->model + w->tools + w->compact;
+}
+
+static void printwork(Buf *b, i64 ms)
+{
+    printsecs(b, (ms + 500)/1000);
+}
+
+// The info pane's rows of it: the time, the tokens and the rate.
+// Returns whether there were any.
+static b32 workrows(Arena a, View *v)
+{
+    ViewWork *w = &v->work;
+    if (!w->requests && worktotal(v)<1000) {
+        return 0;
+    }
+    Buf b(&a, 256);
+    printwork(&b, worktotal(v));
+    print(&b, ": the model ");
+    printwork(&b, w->model);
+    if (w->first >= 1000) {
+        print(&b, " (");
+        printwork(&b, w->first);
+        print(&b, " before its first tokens)");
+    }
+    if (w->tools >= 1000) {
+        print(&b, ", tools ");
+        printwork(&b, w->tools);
+        if (w->tasks >= 1000) {
+            print(&b, " (subagents ");
+            printwork(&b, w->tasks);
+            putbyte(&b, ')');
+        }
+    }
+    if (w->compact >= 1000) {
+        print(&b, ", compacting ");
+        printwork(&b, w->compact);
+    }
+    inforow("Worked", finish(&b));
+
+    Buf t(&a, 256);
+    printgrouped(&t, w->in);
+    print(&t, " in");
+    if (w->in > 0) {
+        print(&t, ", ");
+        printgrouped(&t, w->cached);
+        print(&t, " of them cached (");
+        print(&t, w->cached*100/w->in);
+        print(&t, "%)");
+    }
+    print(&t, ", ");
+    printgrouped(&t, w->out);
+    print(&t, " out, in ");
+    printgrouped(&t, w->requests);
+    print(&t, w->requests==1 ? Str(" request") : Str(" requests"));
+    inforow("Tokens", finish(&t));
+
+    if (w->genms>0 && w->genout>0) {
+        Buf r(&a, 64);
+        printfloat(&r, (f64)w->genout*1000/(f64)w->genms, 1);
+        print(&r, " tok/s, from the first token on");
+        inforow("Output", finish(&r));
+    }
+    return 1;
 }
 
 // The gauge's numbers, for a tooltip.
@@ -7871,6 +7952,10 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other, 
         }
         if (sessremote(s) && !sessup(g, s)) {
             print(&tip, "\nA subagent of a session on another host");
+        }
+        if (v && worktotal(v)>=1000) {
+            print(&tip, "\nWorked ");
+            printwork(&tip, worktotal(v));
         }
         if (v && gaugewidth(g, v)>0) {
             putbyte(&tip, '\n');

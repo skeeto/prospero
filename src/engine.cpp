@@ -1480,6 +1480,10 @@ static void logassistant(Session *s, Arena scratch, Slice<Block> blocks,
         putend(&w.json);
     }
     putintkey(&w.json, "ms", (os_ticks(s->e->os) - s->sent)/MS);
+    if (s->firstout > s->sent) {
+        // Its first token: before it, the prompt was read
+        putintkey(&w.json, "first_ms", (s->firstout - s->sent)/MS);
+    }
     ssend(s, &w);
     if (u && u->in && s->sentbytes) {
         // The server's count calibrates the estimates
