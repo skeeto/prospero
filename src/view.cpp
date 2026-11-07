@@ -53,10 +53,14 @@
 // (viewfoldshell) folds every shell row, over the tools toggle too,
 // each until turned off, leaving the configuration alone.
 //
-// A search (ViewSearch) finds text in the messages' sources, ignoring
-// ASCII case, folded rows included but not hidden reasoning. It keeps up
-// with the view a budget of bytes at a time, searching again only from
-// the first message that changed, which while streaming is at the end.
+// A search (ViewSearch) finds text in what the messages show, as copied
+// text has it, not in their markdown, so that text copied from the
+// transcript finds itself: ASCII case ignored, and any run of whitespace
+// matching any other. Hits are kept as the source ranges they cover.
+// Only rows that show are searched, not folded ones nor hidden
+// reasoning. It keeps up with the view a budget of bytes at a time,
+// searching again only from the first message that changed, which while
+// streaming is at the end.
 //
 // A change of width keeps what is at the top edge there (viewanchor,
 // anchory): the message, the source offset its line there begins at, and
@@ -3829,6 +3833,25 @@ static Str blocksep(DocBlock *prev, DocBlock *b)
     return "\n\n";
 }
 
+// What copied text has for a block's own marker, if it has one: a list
+// item's, indented by its depth, or a rule.
+static void blockmarker(Buf *b, DocBlock *k)
+{
+    if (k->item) {
+        for (i32 n = 1; n < k->depth; n++) print(b, "  ");
+        if (k->task) {
+            print(b, k->task==2 ? Str("- [x] ") : Str("- [ ] "));
+        } else if (k->number < 0) {
+            print(b, "- ");
+        } else {
+            print(b, (i64)k->number);
+            print(b, ". ");
+        }
+    } else if (k->type == DOC_HR) {
+        print(b, "---");
+    }
+}
+
 // The selected part [s, e) of a message as plain text: piece texts, code
 // byte-exact, with list markers and block separators restored.
 static void copytext(Buf *b, Doc *d, i32 s, i32 e)
@@ -3849,20 +3872,8 @@ static void copytext(Buf *b, Doc *d, i32 s, i32 e)
             print(b, sep);
         }
         b32 any = 0;
-        if (k->item && starts) {
-            for (i32 n = 1; n < k->depth; n++) print(b, "  ");
-            if (k->task) {
-                print(b, k->task==2 ? Str("- [x] ") : Str("- [ ] "));
-            } else if (k->number < 0) {
-                print(b, "- ");
-            } else {
-                print(b, (i64)k->number);
-                print(b, ". ");
-            }
-            any = 1;
-        }
-        if (k->type==DOC_HR && starts) {
-            print(b, "---");
+        if ((k->item || k->type==DOC_HR) && starts) {
+            blockmarker(b, k);
             any = 1;
         }
         if (!k->npiece && starts) {
@@ -3986,6 +3997,10 @@ static Str copyblock(View *v, Arena *perm, i32 msg, i32 block)
 
 // Searching
 
+enum : i32 {
+    FIND_PARSECOST = 4,  // parsing a document, per byte, as bytes searched
+};
+
 struct FindHit {
     i32 msg;
     i32 off;
@@ -4003,7 +4018,7 @@ struct FindSeen {
 
 struct ViewSearch {
     View            *v;
-    Str              q;         // lowercase ASCII
+    Str              q;         // findnorm'd: lowercase ASCII, spaces one
     iz               qmax;
     Arena            hitmem;    // each alone in its arena, to grow in place
     byte            *hitbase;
@@ -4027,14 +4042,31 @@ static ViewSearch *newsearch(Arena *perm, Region *hits, Region *seen, iz qmax)
     return s;
 }
 
+// Text as a search compares it: ASCII lowercase, every run of whitespace
+// a single space. A byte at a time, after prev, the byte last kept (0 if
+// none): it is normalized in place, and returns whether to keep it.
+static b32 findnorm(u8 *c, u8 prev)
+{
+    if (whitespace(*c)) {
+        *c = ' ';
+        return prev != ' ';
+    }
+    *c = lowercase(*c);
+    return 1;
+}
+
 // Search a view for q from the start, as searchstep goes on to.
 static void searchreset(ViewSearch *s, View *v, Str q)
 {
     q = q.len>s->qmax ? takehead(q, s->qmax) : q;
+    iz n = 0;
     for (iz i = 0; i < q.len; i++) {
-        s->q.data[i] = lowercase(q[i]);
+        u8 c = q[i];
+        if (findnorm(&c, n ? s->q.data[n-1] : 0)) {
+            s->q.data[n++] = c;
+        }
     }
-    s->q.len      = q.len;
+    s->q.len      = n;
     s->v          = v;
     s->hitmem.beg = s->hitbase;
     s->seenmem.beg = s->seenbase;
@@ -4054,12 +4086,79 @@ static b32 seeneq(FindSeen a, FindSeen b)
            a.hidden==b.hidden && a.folded==b.folded;
 }
 
+// A message's text as a search sees it: what it shows, as copied text
+// has it (piece texts, list markers, blocks apart), findnorm'd, so that
+// text copied from the transcript finds itself however its markdown
+// was written. Each byte keeps the source range it came from: one byte
+// of source, an entity's whole, or none (at a place) for text made up.
+struct FindText {
+    u8  *text;
+    i32 *beg;
+    i32 *end;
+    iz   len;
+};
+
+static void findput(FindText *f, u8 c, i32 beg, i32 end)
+{
+    if (findnorm(&c, f->len ? f->text[f->len-1] : 0)) {
+        f->text[f->len] = c;
+        f->beg[f->len]  = beg;
+        f->end[f->len]  = end;
+        f->len++;
+    }
+}
+
+static FindText findtext(Arena *a, Doc *d)
+{
+    iz cap = 0;
+    for (iz i = 0; i < d->blocks.len; i++) {
+        cap += 1 + 2*DOC_MAXDEPTH + 16;  // separator and marker, at most
+    }
+    for (iz i = 0; i < d->pieces.len; i++) {
+        cap += d->pieces[i].text.len;
+    }
+    FindText f = {};
+    f.text = alloc<u8>(a, cap);
+    f.beg  = alloc<i32>(a, cap);
+    f.end  = alloc<i32>(a, cap);
+    for (iz i = 0; i < d->blocks.len; i++) {
+        DocBlock *k = &d->blocks[i];
+        if (i) {
+            findput(&f, ' ', k->off0, k->off0);
+        }
+        u8  mem[2*DOC_MAXDEPTH + 16];
+        Buf mb = {};
+        mb.data = mem;
+        mb.cap  = countof(mem);
+        blockmarker(&mb, k);
+        for (iz j = 0; j < mb.len; j++) {
+            findput(&f, mb.data[j], k->off0, k->off0);
+        }
+        for (i32 j = 0; j < k->npiece; j++) {
+            Piece *p = &d->pieces[k->piece0+j];
+            for (iz c = 0; c < p->text.len; c++) {
+                if (p->flags & PIECE_SYNTH) {
+                    findput(&f, p->text[c], p->off, p->off);
+                } else if (p->len != p->text.len) {
+                    findput(&f, p->text[c], p->off, p->off+p->len);
+                } else {
+                    findput(&f, p->text[c], p->off+(i32)c, p->off+(i32)c+1);
+                }
+            }
+        }
+    }
+    return f;
+}
+
 // Bring the hits up to date with the view: searched again from the first
 // message that changed, at most about budget bytes of text at a time.
 // Only what shows is searched: not hidden reasoning, nor a folded row,
 // whose text (reasoning above all) would bury the matches wanted.
+// A message is searched in what it shows (findtext), from its document,
+// which stays in the cache for the next search, a text typed further,
+// and for showing it; one not made yet costs its parse too.
 // Returns whether they are, else it goes on from there next call.
-static b32 searchstep(ViewSearch *s, iz budget)
+static b32 searchstep(ViewSearch *s, Arena scratch, iz budget)
 {
     View *v = s->v;
     iz    n = s->seen.len<v->msgs.len ? s->seen.len : v->msgs.len;
@@ -4084,21 +4183,25 @@ static b32 searchstep(ViewSearch *s, iz budget)
             return 0;
         }
         ViewMsg *m = &v->msgs[i];
-        Str      t = m->text;
         s->seen = push(&s->seenmem, s->seen, seenof(v, m));
         if (!q.len || msghidden(v, m) || m->collapsed) {
             continue;
         }
-        budget -= t.len + 1;
-        u8 q0 = q[0];
+        b32 cached = m->doc && m->docver==m->ver && m->docgen==v->c->gen;
+        budget -= (cached ? 1 : FIND_PARSECOST)*m->text.len + 1;
+        Arena    a = scratch;
+        FindText t = findtext(&a, msgdoc(v, (i32)i));
+        u8       q0 = q[0];
         for (iz at = 0; at+q.len <= t.len; at++) {
-            if (lowercase(t[at]) != q0) {
+            if (t.text[at] != q0) {
                 continue;
             }
             iz k = 1;
-            for (; k<q.len && lowercase(t[at+k])==q[k]; k++) {}
+            for (; k<q.len && t.text[at+k]==q[k]; k++) {}
             if (k == q.len) {
-                FindHit h = {(i32)i, (i32)at, (i32)q.len};
+                i32 beg = t.beg[at];
+                i32 end = t.end[at+q.len-1];
+                FindHit h = {(i32)i, beg, end>beg ? end-beg : 0};
                 s->hits = push(&s->hitmem, s->hits, h);
                 at += q.len - 1;
             }

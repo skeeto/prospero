@@ -86,8 +86,10 @@ which, folding, scrolls back to its header if that was above the view.
 In the find bar, **Enter** or **Ctrl+G** goes to the next match, and
 **Shift+Enter** or **Ctrl+Shift+G** to the previous. Only what shows is
 searched, not folded tool output or reasoning: Ctrl+Shift+T or
-Ctrl+Shift+R opens them all to search them too. **Esc** closes the
-bar.
+Ctrl+Shift+R opens them all to search them too. The search is in the
+text as shown, not its Markdown, ignoring case and how spaces and line
+breaks fall, so text copied from the transcript finds itself. **Esc**
+closes the bar.
 
 ## Dialogs
 

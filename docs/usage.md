@@ -27,7 +27,7 @@ them with `[ui] tools = fold` or `open`. Above the transcript, a session's
 Shell output button (the Bash logo) folds every shell command's output,
 short ones too, and its Tool output and Reasoning buttons (a wrench and
 screwdriver, a light bulb) open everything, each for that session alone. Cmd/Ctrl+F finds text
-in what the transcript shows, not in folded rows, and a code block's Copy button
+in what the transcript shows, as shown rather than its Markdown, not in folded rows, and a code block's Copy button
 copies its code exactly. A bar above the transcript shows how full the
 context is. A file tool that goes outside the session's working directory,
 or the roots the configuration adds, asks first, and an answer not given

@@ -343,6 +343,7 @@ static void test_view(Test *t)
         expect(t, "view.mdall", copysel(v, &a, COPY_MARKDOWN),
                "# Head\n\nSome **bold** text.\n\n```sh\necho hi\n```\n\n> quoted");
     }
+
     // Tool rows: arguments streaming, the committed calls, a running
     // command's output, its end with the output file, and an edit's diff
     {
@@ -1941,36 +1942,67 @@ static void test_viewtranscript(Test *t)
         ViewSearch *s = testsearch(&a);
         for (iz i = 0; i < countof(recs); i++) apply(v, a, recs[i]);
         searchreset(s, v, "needle");
-        expect(t, "find.done", istr(&a, searchstep(s, 1<<20)), "1");
+        expect(t, "find.done", istr(&a, searchstep(s, a, 1<<20)), "1");
         expect(t, "find.folded", hitshow(&a, s), "");
         apply(v, a, end2);
         apply(v, a, end3);
-        searchstep(s, 1<<20);
+        searchstep(s, a, 1<<20);
         expect(t, "find.more", hitshow(&a, s), "4:4;");
         togglemsg(v, 2);
-        searchstep(s, 1<<20);
+        searchstep(s, a, 1<<20);
         expect(t, "find.opened", hitshow(&a, s), "2:2;4:4;");
         viewshowthink(v, 1);
-        searchstep(s, 1<<20);
+        searchstep(s, a, 1<<20);
         expect(t, "find.toggled", hitshow(&a, s), "1:0;2:2;4:4;");
         viewthink(v, THINK_HIDE);
         viewshowthink(v, 0);
-        searchstep(s, 1<<20);
+        searchstep(s, a, 1<<20);
         expect(t, "find.hidden", hitshow(&a, s), "2:2;4:4;");
         viewthink(v, THINK_FOLD);
         viewshowthink(v, 1);
         searchreset(s, v, "NEEDLE");
-        expect(t, "find.budget", istr(&a, searchstep(s, 10)), "0");
+        expect(t, "find.budget", istr(&a, searchstep(s, a, 10)), "0");
         expect(t, "find.partial", hitshow(&a, s), "1:0;");
-        while (!searchstep(s, 10)) {}
+        while (!searchstep(s, a, 10)) {}
         expect(t, "find.rest", hitshow(&a, s), "1:0;2:2;4:4;");
         expect(t, "find.from", istr(&a, searchfrom(s, 3, 0)), "2");
         togglemsg(v, 2);
-        searchstep(s, 1<<20);
+        searchstep(s, a, 1<<20);
         expect(t, "find.refolded", hitshow(&a, s), "1:0;4:4;");
         searchreset(s, v, "");
-        searchstep(s, 1<<20);
+        searchstep(s, a, 1<<20);
         expect(t, "find.empty", istr(&a, s->hits.len), "0");
+    }
+
+    // Find: in what messages show, as copied text has it, whatever the
+    // markdown, case and spacing; hits are the source they cover
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        addmsg(v, VIEW_ASSISTANT,
+               "Use **`foo`** and [the docs](http://x) &amp; more.\n\n- one\n- two\n");
+        addmsg(v, VIEW_USER, "Line A\nline  B");
+        ViewSearch *s = testsearch(&a);
+        auto hits = [&](Str q) {
+            searchreset(s, v, q);
+            searchstep(s, a, 1<<20);
+            Buf b(&a, 256);
+            for (iz i = 0; i < s->hits.len; i++) {
+                FindHit *h = &s->hits[i];
+                Str      t = v->msgs[h->msg].text;
+                print(&b, (i64)h->msg);
+                putbyte(&b, ':');
+                print(&b, span(t.data+h->off, t.data+h->off+h->len));
+                putbyte(&b, ';');
+            }
+            return finish(&b);
+        };
+        expect(t, "view.findmd", hits("foo and the DOCS & more"),
+               "0:foo`** and [the docs](http://x) &amp; more;");
+        expect(t, "view.findlist", hits("more. - one - two"), "0:more.\n\n- one\n- two;");
+        expect(t, "view.findspace", hits("line a line b"), "1:Line A\nline  B;");
+        expect(t, "view.findmarkup", hits("**"), "");
+        expect(t, "view.findmany", hits("O"), "0:o;0:o;0:o;0:o;0:o;0:o;");
     }
 
     // The context gauge: usage, then the engine's own numbers

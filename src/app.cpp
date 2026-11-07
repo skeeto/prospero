@@ -89,7 +89,7 @@ enum : iz {
     INBOX_CAP  = 1<<21,   // bytes per inbox buffer
     FIELD_MAX  = 1<<10,   // bytes of a settings or dialog field
     REQ_MAX    = 64,      // commands awaiting replies
-    FIND_BUDGET = 4<<20,  // bytes of text a frame searches at most
+    FIND_BUDGET = 2<<20,  // bytes of text a frame searches at most
 };
 
 enum : i64 {

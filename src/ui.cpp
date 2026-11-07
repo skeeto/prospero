@@ -4014,7 +4014,7 @@ static void drawfind(Gui *g, View *v, f64 scrolly)
         searchreset(s, v, q);
         g->findfrom = viewfind(v, scrolly);
     }
-    b32 done = searchstep(s, FIND_BUDGET);
+    b32 done = searchstep(s, a, FIND_BUDGET);
     if (!done) {
         scheddirty(&g->sched);  // more next frame
     }
