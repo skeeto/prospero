@@ -127,7 +127,20 @@ static void test_tools(Test *t)
         }
         expect(t, "glob pattern", argsshow(a, TOOL_GLOB, "{\"pattern\":\" \"}"),
                "pattern: must not be empty; ");
-        expect(t, "todo missing", argsshow(a, TOOL_TODO, "{}"), "todos: required array is missing; ");
+        expect(t, "todo missing", argsshow(a, TOOL_TODO, "{}"),
+               "todos: give todos, the whole list, or the changes to it: done, start, "
+               "add or remove; ");
+        expect(t, "todo bad names", argsshow(a, TOOL_TODO, "{\"done\":[\"\",3],\"start\":\" \"}"),
+               "done[0]: must name an item by its text; done[1]: must name an item by "
+               "its text; start: must name an item by its text; ");
+        {
+            Args d = parseargs(a, TOOL_TODO, "{\"done\":\"x\",\"add\":\"[\\\"y\\\",\\\"z\\\"]\","
+                                             "\"remove\":[{\"content\":\"w\"}],\"start\":\"v\"}",
+                               EDIT_REPLACE);
+            expect(t, "todo changes", istr(a, !d.issues.len && !d.haslist && d.tdone.len==1 &&
+                                              d.tadd.len==2 && d.tadd[1]=="z" &&
+                                              d.tremove[0]=="w" && d.tstart=="v"), "1");
+        }
         expect(t, "todo not array", argsshow(a, TOOL_TODO, "{\"todos\":5}"),
                "todos: must be an array of {content, status} objects; ");
         expect(t, "todo bad items",
@@ -800,6 +813,7 @@ static void test_tools(Test *t)
         Json *todo = jsonget(jsonget(jsonat(d.root, TOOL_TODO), "function"), "parameters");
         Json *item = jsonget(jsonget(jsonget(todo, "properties"), "todos"), "items");
         expect(t, "todo schema", jsonstr(jsonget(item, "type")), "object");
+        expect(t, "todo nothing required", istr(a, jsonlen(jsonget(todo, "required"))), "0");
 
         // The edit tool in each format: its own parameters
         static Str const want[] = {
@@ -1010,7 +1024,7 @@ static void test_tools(Test *t)
         old = push(a, old, x);
         old = push(a, old, y);
         expect(t, "todoshow", todoshow(a, old),
-               "Todo list, 0 of 2 done:\n[>] write (in progress)\n[ ] test\n");
+               "Todo list, 0 of 2 done, left:\n[>] write (in progress)\n[ ] test\n");
         expect(t, "todoleft", todoleft(a, old), "[>] write\n[ ] test\n");
         expect(t, "todoshow empty", todoshow(a, now), "The todo list is empty now.");
         expect(t, "todo same", istr(a, todoprogress(old, old)), "0");
@@ -1028,6 +1042,66 @@ static void test_tools(Test *t)
         swapped = push(a, swapped, w);
         swapped = push(a, swapped, z);
         expect(t, "todo new active", istr(a, todoprogress(old, swapped)), "1");
+        Slice<TodoItem> alldone = {};
+        TodoItem d1 = {"write", TODO_DONE}, d2 = {"test", TODO_DONE};
+        alldone = push(a, alldone, d1);
+        alldone = push(a, alldone, d2);
+        expect(t, "todoshow all done", todoshow(a, alldone), "Todo list, 2 of 2 done.\n");
+
+        // Changes applied to a list, by name
+        auto apply = [&](Slice<TodoItem> cur, Str json) -> Str {
+            Args r   = parseargs(a, TOOL_TODO, json, EDIT_REPLACE);
+            Str  err = {};
+            Slice<TodoItem> l = todoapply(a, cur, &r, &err);
+            return err.data ? concat(a, "error: ", err) : todolist(a, l);
+        };
+        Slice<TodoItem> three = {};
+        TodoItem p = {"Read the parser", TODO_ACTIVE}, q = {"Fix the bug", TODO_PENDING},
+                 u = {"Run tests", TODO_PENDING};
+        three = push(a, three, p);
+        three = push(a, three, q);
+        three = push(a, three, u);
+        expect(t, "todo done starts next", apply(three, "{\"done\":[\"Read the parser\"]}"),
+               "[x] Read the parser\n[>] Fix the bug (in progress)\n[ ] Run tests\n");
+        expect(t, "todo start demotes", apply(three, "{\"start\":\"run tests\"}"),
+               "[ ] Read the parser\n[ ] Fix the bug\n[>] Run tests (in progress)\n");
+        expect(t, "todo by part", apply(three, "{\"done\":[\"parser\",\"BUG\"]}"),
+               "[x] Read the parser\n[x] Fix the bug\n[>] Run tests (in progress)\n");
+        expect(t, "todo add remove", apply(three, "{\"add\":[\"Ship\",\"fix  THE bug\"],"
+                                                  "\"remove\":\"Run tests\"}"),
+               "[>] Read the parser (in progress)\n[ ] Fix the bug\n[ ] Ship\n");
+        expect(t, "todo unknown", apply(three, "{\"done\":[\"parser\",\"deploy\"],\"start\":\"the\"}"),
+               "error: done: no item \"deploy\"\nstart: more than one item matches \"the\"\n"
+               "The list is unchanged:\n[>] Read the parser (in progress)\n[ ] Fix the bug\n"
+               "[ ] Run tests\nName items by their text, as listed.");
+        expect(t, "todo whole then done",
+               apply(three, "{\"todos\":[{\"content\":\"a1\",\"status\":\"pending\"},"
+                            "{\"content\":\"b2\",\"status\":\"in_progress\"},"
+                            "{\"content\":\"c3\",\"status\":\"in_progress\"}],\"done\":\"b2\"}"),
+               "[ ] a1\n[x] b2\n[>] c3 (in progress)\n");
+        {
+            // An item quoting a command, its name with backslashes doubled
+            Slice<TodoItem> q1 = {};
+            TodoItem c1 = {"Check printf \"a b\\n\" | ./wc", TODO_ACTIVE};
+            q1 = push(a, q1, c1);
+            expect(t, "todo extra backslashes",
+                   apply(q1, "{\"done\":\"Check printf \\\\\\\"a b\\\\\\\\n\\\\\\\" | ./wc\"}"),
+                   "[x] Check printf \"a b\\n\" | ./wc\n");
+        }
+        {
+            Args w = parseargs(a, TOOL_TODO, "{\"todos\":[{\"content\":\"Read the parser\","
+                "\"status\":\"done\"},{\"content\":\"Fix the bug\",\"status\":\"pending\"},"
+                "{\"content\":\"Run tests\",\"status\":\"pending\"}]}", EDIT_REPLACE);
+            Args d = parseargs(a, TOOL_TODO, "{\"done\":\"Run tests\"}", EDIT_REPLACE);
+            expect(t, "todo resent", istr(a, todoresent(three, &w)*100 + todoresent({}, &w)*10 +
+                                             todoresent(three, &d)), "100");
+        }
+        expect(t, "todo first pending starts",
+               apply({}, "{\"todos\":[{\"content\":\"a1\",\"status\":\"pending\"}]}"),
+               "[>] a1 (in progress)\n");
+        expect(t, "todo on empty", apply({}, "{\"done\":\"x\"}"),
+               "error: done: no item \"x\"\nThe list is unchanged:\nThe todo list is empty.\n"
+               "Name items by their text, as listed.");
     }
 
     // Job output

@@ -2272,6 +2272,35 @@ def todo_job(t):
 
 
 @scenario(bound=10)
+def todo_ops(t):
+    """The list goes with other calls, then changes by name: done starts
+    the next item, and a name that matches none fails and changes
+    nothing."""
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    lists = [[(i["content"], i["status"]) for i in x["items"]] for x in r.all("todo")]
+    t.check(lists == [
+        [("write a", "in_progress"), ("write b", "pending")],
+        [("write a", "done"), ("write b", "in_progress")],
+        [("write a", "done"), ("write b", "done"), ("check", "in_progress")],
+        [("write a", "done"), ("write b", "done")],
+        [("write a", "done"), ("write b", "in_progress")],
+        [("write a", "done"), ("write b", "done")],
+    ], f"lists {lists}")
+    ends = [(e["status"], e["text"]) for e in r.all("tool.end")]
+    t.check(ends[2] == ("ok", "Todo list, 1 of 2 done, left:\n[>] write b (in progress)\n"),
+            f"after done {ends[2]!r}")
+    t.check(ends[4][0] == "error" and 'no item "write z"' in ends[4][1], f"bad name {ends[4]!r}")
+    t.check(ends[-1] == ("ok", "Todo list, 2 of 2 done.\n"), f"the end {ends[-1]!r}")
+    hint = "Next time, send todo_write in the same response"
+    t.check(hint not in ends[0][1] and hint in ends[5][1],
+            "the hint only for a list alone in its response, with items left")
+    t.check(ends[7][1].endswith("Next time, mark items with done and start instead "
+                                "of sending the whole list again."), f"resent {ends[7]!r}")
+    t.check(not r.all("nudge"), "no nudges")
+
+
+@scenario(bound=10)
 def todo_cap(t):
     """Never finishing the list: three nudges, then the turn ends."""
     r = t.run()

@@ -4619,7 +4619,8 @@ static void planresolve(Session *s, Arena scratch, b32 allow, i32 by, Str note,
                   "it out now. ");
         if (tooloffered(&s->te, TOOL_TODO)) {
             print(&b, "If it has several steps, begin with a todo list of "
-                      "them (todo_write), and keep it up to date. ");
+                      "them (todo_write), sent with your first tool call, and "
+                      "keep it up to date. ");
         }
         if (plan.err.len) {
             // The user emptied it, or made it too long, since the ask
@@ -6506,14 +6507,19 @@ static void finishshell(Session *s, Arena scratch, b32 cancelled, b32 stopped = 
 
 static void tooltodo(Session *s, Arena scratch, Args *args)
 {
-    Block          *c     = &s->calls[s->callidx];
+    Block          *c      = &s->calls[s->callidx];
+    Str             err    = {};
+    b32             resent = todoresent(s->todos, args);
+    Slice<TodoItem> now    = todoapply(&scratch, s->todos, args, &err);
+    if (err.data) {
+        toolend(s, scratch, "error", err, 0, 0, {}, 0);
+        return;
+    }
     Slice<TodoItem> items = {};
-    i32             active = 0;
-    for (iz i = 0; i < args->todos.len; i++) {
-        TodoItem t = args->todos[i];
+    for (iz i = 0; i < now.len; i++) {
+        TodoItem t = now[i];
         t.content = clone(&s->perm, t.content);
-        items  = push(&s->perm, items, t);
-        active += t.status == TODO_ACTIVE;
+        items = push(&s->perm, items, t);
     }
     if (todoprogress(s->todos, items)) {
         s->nudges[N_TODO] = 0;
@@ -6536,11 +6542,25 @@ static void tooltodo(Session *s, Arena scratch, Args *args)
         putend(&w.json);
         ssend(s, &w);
     }
-    Str text = todoshow(&scratch, items);
-    if (active > 1) {
-        text = concat(&scratch, text, "Note: more than one item is in "
-                      "progress. Finish one at a time, marking each done as "
-                      "soon as it is.");
+    // The slow habits, said here, where the agent reads them, since the
+    // description alone didn't stop some models: the whole list sent
+    // again, and a response with nothing but the list, a round trip of
+    // its own. Neither for a list now finished, as there's nothing left
+    // to send with it.
+    Str  text  = todoshow(&scratch, items);
+    b32  alone = s->calls.len == 1;
+    if ((resent || alone) && todoleft(&scratch, items).data) {
+        text = concat(&scratch, text,
+            resent && alone ? Str("Next time, mark items with done and start "
+                                  "instead of sending the whole list, and send "
+                                  "todo_write in the same response as your "
+                                  "other tool calls, not in one of its own.") :
+            resent          ? Str("Next time, mark items with done and start "
+                                  "instead of sending the whole list again.") :
+                              Str("Next time, send todo_write in the same "
+                                  "response as your other tool calls, such as "
+                                  "the first call of the next step, not in a "
+                                  "response of its own."));
     }
     toolend(s, scratch, "ok", text, 0, 0, {}, 0);
 }
@@ -6558,8 +6578,8 @@ static b32 todonudge(Session *s, Arena scratch)
     print(&b, "Your todo list still has items that are not done:\n");
     print(&b, left);
     print(&b, "Continue with them now. If some are finished already, or "
-              "will not be done, update the list with todo_write first, "
-              "then end your turn.");
+              "will not be done, mark them with todo_write (done, or remove) "
+              "first, then end your turn.");
     Str text = finish(&b);
     if (!nudge(s, scratch, N_TODO, text)) {
         return 0;
@@ -6577,8 +6597,9 @@ static void todoremind(Session *s, Arena scratch)
     }
     s->mutations = 0;
     nudge(s, scratch, N_REMIND, "You have made 12 changes since your todo "
-          "list last changed. Update it with todo_write, so that it shows "
-          "what is done and what comes next.");
+          "list last changed. Update it with todo_write (done, start, add or "
+          "remove), in the same response as your next tool call, so that it "
+          "shows what is done and what comes next.");
 }
 
 

@@ -131,6 +131,10 @@ static void test_view(Test *t)
                "{\"query\":\"zlib 1.3 release\"}", "/w"), "\"zlib 1.3 release\"");
         expect(t, "view.web_fetch summary", toolsummary(&a, tmp, "web_fetch",
                "{\"url\":\"https://zlib.net/\",\"offset\":10}", "/w"), "https://zlib.net/");
+        expect(t, "view.todo changes summary", toolsummary(&a, tmp, "todo_write",
+               "{\"done\":[\"Read it\",\"Fix it\"],\"start\":\"Test it\",\"add\":\"Ship\","
+               "\"remove\":\"[\\\"Old\\\"]\"}", "/w"),
+               "done 2 items; start Test it; add Ship; remove Old");
         expect(t, "view.patch diff", tooldiff(&a, "edit", patch, "ok"),
                "```diff\n--- a.c\n+++ a.c\n@@ f\n-x\n+y\n--- b.c\n+++ /dev/null\n```\n");
         Str lines = "{\"path\":\"a.c\",\"tag\":\"AB12\",\"edits\":[{\"op\":\"replace\",\"line\":2,"

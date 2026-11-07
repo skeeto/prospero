@@ -1277,6 +1277,35 @@ static Str toolsummary(Arena *perm, Arena scratch, Str name, Str args, Str cwd)
         return concat(perm, concat(&scratch, "in ", shell), concat(&scratch, ": ", oneline(&scratch, cmd)));
     } else if (name=="shell" && cmd.data) {
         return oneline(perm, cmd);
+    } else if (name=="todo_write" && jsonget(j, "todos")->type==JSON_MISSING) {
+        // Changes to the list: "done write it; start test it; add 2"
+        Buf b(&scratch, 256);
+        static Str const keys[] = {"done", "start", "add", "remove"};
+        for (i32 k = 0; k < countof(keys); k++) {
+            Json *v = jsonget(j, keys[k]);
+            if (v->type == JSON_STRING && v->str.len && v->str[0]=='[') {
+                v = jsonparse(&scratch, v->str).root;
+            }
+            i64 n = 0;
+            Str one = v->type==JSON_STRING ? v->str : Str{};
+            for (Json *e = v->type==JSON_ARRAY ? v->child : 0; e; e = e->next, n++) {
+                one = e->type==JSON_STRING ? e->str : jsonstr(jsonget(e, "content"));
+            }
+            n = v->type==JSON_STRING ? 1 : n;
+            if (!n) {
+                continue;
+            }
+            print(&b, b.len ? Str("; ") : Str{});
+            print(&b, keys[k]);
+            putbyte(&b, ' ');
+            if (n == 1) {
+                print(&b, oneline(&scratch, one));
+            } else {
+                print(&b, n);
+                print(&b, " items");
+            }
+        }
+        return clone(perm, finish(&b));
     } else if (name == "todo_write") {
         // The list may come as a string holding JSON
         Json *t = jsonget(j, "todos");

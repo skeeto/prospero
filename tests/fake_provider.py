@@ -789,6 +789,36 @@ def sc_todo(model, n, req):
         yield from answer(model, "All done.")
 
 
+def sc_todo_ops(model, n, req):
+    # The list sent with other calls, then changed item by item: done
+    # starts the next, a bad name changes nothing, add and remove
+    pend = lambda c: {"content": c, "status": "pending"}
+    if n == 0:
+        yield from calls(model, n, [
+            ("todo_write", {"todos": [pend("write a"), pend("write b")]}),
+            ("write", {"path": "a.txt", "content": "a\n"})])
+    elif n == 1:
+        yield from calls(model, n, [
+            ("todo_write", {"done": ["write a"]}),
+            ("write", {"path": "b.txt", "content": "b\n"})])
+    elif n == 2:
+        yield from tool(model, n, "todo_write", {"done": "write z"})
+    elif n == 3:
+        yield from tool(model, n, "todo_write", {"done": ["WRITE  b"], "add": ["check"]})
+    elif n == 4:
+        yield from tool(model, n, "todo_write", {"remove": ["check"]})
+    elif n == 5:
+        # The whole list again, only a status changed
+        yield from calls(model, n, [
+            ("todo_write", {"todos": [{"content": "write a", "status": "done"},
+                                      {"content": "write b", "status": "pending"}]}),
+            ("write", {"path": "c.txt", "content": "c\n"})])
+    elif n == 6:
+        yield from tool(model, n, "todo_write", {"done": ["write b"]})
+    else:
+        yield from answer(model, "Both written.")
+
+
 def sc_todo_job(model, n, req):
     # Waiting for a job with items left: no nudge, since the job's end
     # brings the agent back
