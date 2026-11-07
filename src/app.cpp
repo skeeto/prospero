@@ -244,6 +244,7 @@ enum : i32 {
     RECT_TOOLSBTN,
     RECT_THINKBTN,
     RECT_FINDFIELD,  // the find bar's field
+    RECT_FINDNEXT,   // and its next arrow
     RECT_GAUGE,      // the context gauge
     RECT_PAGECOMBO,  // its pages as a combo, when narrow
     RECT_DIAGPAGE,   // its Diagnostics page in the list
@@ -1387,6 +1388,7 @@ struct Gui {
     b32                findopen;
     b32                findfocus;  // focus its field next frame
     b32                findactive; // its field had the keyboard
+    b32                findheld;   // the bar had the focus last frame
     b32                askactive;  // a question form's field had it
     f32                qformdrawn; // the latest question form's height, drawn
     b32                findjump;   // scroll to the current hit
@@ -12748,6 +12750,7 @@ enum : i32 {
     T_SHELLBTN,    // the session bar's toggles
     T_TOOLSBTN,
     T_THINKBTN,
+    T_FINDNEXT,    // the find bar's next arrow
     T_GAUGE,       // the context gauge
     T_PAGECOMBO,   // the settings' pages as a combo, when narrow
     T_PAGEITEM,    // the settings page text names ("endpoint fake", "ui",
@@ -12930,6 +12933,7 @@ enum : i32 {
     CHK_FINDQUIET,
     CHK_FINDHIDDEN,
     CHK_FINDCLOSED,
+    CHK_FINDARROWESC,
     CHK_GAUGEREAL,
     CHK_GAUGE,
     CHK_GAUGEAMBER,
@@ -13243,6 +13247,7 @@ static Str chknames[] = {
     "no frames while the find bar shows its matches",
     "hidden reasoning is not searched",
     "Esc closed the find bar, and left the session alone",
+    "Esc closed the find bar after a click on its arrow",
     "the context gauge drew from the engine's own numbers",
     "the context gauge drew from a record's numbers",
     "the gauge turned amber near where compaction begins",
@@ -14300,6 +14305,19 @@ static DriveOp m3ops[] = {
     {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
     {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
     {OP_CHECK, CHK_FINDCLOSED, 0, 0, 0, ""},
+    // Opened again, its arrow clicked, which takes the keyboard from
+    // its field: Esc still closes it
+    {OP_KEYDOWN, 0, GKEY_CMD, KEY_CMD, 50, ""},
+    {OP_KEYDOWN, 0, GKEY_F, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_F, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_CMD, 0, 300, ""},
+    {OP_MOVE, T_FINDNEXT, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_CHECK, CHK_FINDARROWESC, 0, 0, 0, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 100, ""},
     // The context gauge, from the engine's records, then from a live
     // record's numbers near where compaction begins, and its tooltip
     {OP_CHECK, CHK_GAUGEREAL, 0, 0, 0, ""},
@@ -18374,6 +18392,7 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_SHELLBTN:      return rectcenter(g->rects[RECT_SHELLBTN]);
     case T_TOOLSBTN:      return rectcenter(g->rects[RECT_TOOLSBTN]);
     case T_THINKBTN:      return rectcenter(g->rects[RECT_THINKBTN]);
+    case T_FINDNEXT:      return rectcenter(g->rects[RECT_FINDNEXT]);
     case T_GAUGE:         return rectcenter(g->rects[RECT_GAUGE]);
     case T_PAGECOMBO:     return rectcenter(g->rects[RECT_PAGECOMBO]);
     case T_DELETE:        return rectcenter(g->rects[RECT_DELETE]);
@@ -19849,6 +19868,7 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_FINDHIDDEN:
         return g->findopen && !g->search->hits.len;
     case CHK_FINDCLOSED:
+    case CHK_FINDARROWESC:
         return !g->findopen && !g->findactive && !v->busy;
     case CHK_GAUGEREAL: {
         Arena a = g->frame;

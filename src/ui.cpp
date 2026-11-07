@@ -651,6 +651,7 @@ static void gui_find_close(Gui *g)
 {
     g->findopen   = 0;
     g->findactive = 0;
+    g->findheld   = 0;
     scheddirty(&g->sched);
 }
 
@@ -3981,11 +3982,14 @@ static Str drawdoc(Gui *g, DocView *d, char const *id, f32 fit = 0)
     return link;
 }
 
-// The find bar, open over the transcript: the text to find, the hits
-// counted, and the buttons to go between them. A new text or session
-// searches again, a budget of bytes a frame, and the first hit at or
-// below the top of the screen becomes the current one.
-static void drawfind(Gui *g, View *v, f64 scrolly)
+// The find bar, floating over the top right of the transcript (r0 to
+// r1) as the toasts do over its foot, so that opening and closing it
+// moves nothing: the text to find, the hits counted, and the buttons to
+// go between them. A new text or session searches again, a budget of
+// bytes a frame, and the first hit at or below the top of the screen
+// becomes the current one. Drawn after the transcript, to be over it,
+// so a jump it asks for lands next frame.
+static void drawfind(Gui *g, View *v, f64 scrolly, ImVec2 r0, ImVec2 r1)
 {
     ViewSearch *s  = g->search;
     f32         sc = g->scale;
@@ -3993,17 +3997,55 @@ static void drawfind(Gui *g, View *v, f64 scrolly)
     if (!g->findopen) {
         return;
     }
+    // Esc while the bar has the focus but its field does not, as after
+    // a click on an arrow. ImGui's own Esc (keyboard navigation) has by
+    // now moved the focus out of the bar, to the window around it, so
+    // it goes by last frame's.
+    b32 held = g->findheld;
+    g->findheld = 0;
+    ImGuiStyle &st     = ImGui::GetStyle();
+    f32         pad    = 6*sc;
+    f32         fh     = ImGui::GetFrameHeight();
+    f32         sp     = st.ItemSpacing.x;
+    f32         countw = ImGui::CalcTextSize("No matches").x;
+    f32         countm = ImGui::CalcTextSize("8888 of 8888+").x;
+    countw = countm>countw ? countm : countw;
+    f32 fieldw = 260*sc;
+    f32 rest   = 2*fh + countw + iconw() + 4*sp + 2*pad;
+    f32 room   = r1.x - r0.x - st.ScrollbarSize - 24*sc;
+    if (fieldw+rest > room) {
+        fieldw = room - rest;
+    }
+    if (fieldw < 60*sc) {
+        fieldw = 60*sc;  // narrower than this, let it overhang the left
+    }
+    f32 w = fieldw + rest;
+    f32 h = fh + 2*pad;
+
+    ImGuiWindow *pw   = ImGui::GetCurrentWindow();
+    ImVec2       maxp = pw->DC.CursorMaxPos;
+    ImGui::SetCursorScreenPos(v2(r1.x - st.ScrollbarSize - 12*sc - w, r0.y + 8*sc));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, g->pal->frame);
+    ImGui::PushStyleColor(ImGuiCol_Border, g->pal->rule);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6*sc);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, v2(pad, pad));
+    ImGui::BeginChild("##findbar", v2(w, h), ImGuiChildFlags_Borders,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+                      ImGuiWindowFlags_NoSavedSettings);
+    ImGui::SetCursorPos(v2(pad, pad));
+
     if (g->findfocus) {
         ImGui::SetKeyboardFocusHere();
         g->findfocus = 0;
     }
-    ImGui::SetNextItemWidth(260*sc);
+    ImGui::SetNextItemWidth(fieldw);
     b32 enter = ImGui::InputTextWithHint("##find", "Find in the transcript", g->findbuf,
                                          FIELD_MAX, ImGuiInputTextFlags_EnterReturnsTrue|
                                                     ImGuiInputTextFlags_AutoSelectAll);
     itemrect(g, RECT_FINDFIELD);
     b32 again = ImGui::IsItemEdited() || s->v!=v;
-    b32 esc   = ImGui::IsItemDeactivated() && ImGui::IsKeyPressed(ImGuiKey_Escape, false);
+    b32 esc   = ImGui::IsKeyPressed(ImGuiKey_Escape, false) &&
+                (ImGui::IsItemDeactivated() || held);
     g->findactive = ImGui::IsItemActive();
     if (enter) {
         g->findfocus = 1;  // Enter lets go of the field: take it back
@@ -4037,6 +4079,7 @@ static void drawfind(Gui *g, View *v, f64 scrolly)
     itemtip("The previous match (Shift+Enter)");
     ImGui::SameLine();
     b32 next = ImGui::ArrowButton("##findnext", ImGuiDir_Down);
+    itemrect(g, RECT_FINDNEXT);
     itemtip("The next match (Enter)");
     ImGui::SameLine();
     Buf b(&a, 64);
@@ -4048,16 +4091,29 @@ static void drawfind(Gui *g, View *v, f64 scrolly)
         print(&b, (i64)s->hits.len);
         print(&b, done ? Str("") : Str("+"));
     }
+    // In a column as wide as its widest, so that the bar never changes
+    // width as the count does
+    f32 x = ImGui::GetCursorPosX();
     ImGui::AlignTextToFramePadding();
     ImGui::TextDisabled("%s", cstr0(&a, finish(&b)));
-    ImGui::SameLine();
+    ImGui::SameLine(x + countw + sp);
     b32 close = iconbutton(ICON_CLOSE "##findclose");
     itemnamed(g, "find close");
     itemtip("Close the find bar (Esc)");
+    g->findheld = ImGui::IsWindowFocused();
+
+    ImGui::EndChild();
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor(2);
+    pw->DC.CursorMaxPos = maxp;  // over the transcript, extending nothing
+
     if (esc || close) {
         gui_find_close(g);
     } else if (enter || next || prev) {
         gui_find_next(g, enter ? (ImGui::GetIO().KeyShift ? -1 : 1) : prev ? -1 : 1);
+    }
+    if (g->findjump) {
+        scheddirty(&g->sched);  // the layout, before the child, goes there
     }
 }
 
@@ -4568,7 +4624,6 @@ static void drawtranscript(Gui *g)
     if (g->findopen && ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_G)) {
         gui_find_next(g, -1);
     }
-    drawfind(g, v, gs->win ? gs->win->Scroll.y : 0);
 
     // Layout comes first, before the child window begins, so that its
     // content size and scroll take effect this very frame: a scroll set
@@ -4972,8 +5027,11 @@ static void drawtranscript(Gui *g)
     gs->stick = scrolly >= ImGui::GetScrollMaxY()-2 || total<=winh;
     ImGui::EndChild();
     ImGui::PopID();
+    ImVec2 tr0 = ImGui::GetItemRectMin();
+    ImVec2 tr1 = ImGui::GetItemRectMax();
+    drawfind(g, v, scrolly, tr0, tr1);
     if (g->sess == gs) {
-        drawtoast(g, gs, ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+        drawtoast(g, gs, tr0, tr1);
     }
 
     if (g->opendeny) {
@@ -5018,10 +5076,10 @@ static void drawtranscript(Gui *g)
 // the session while one has focus: there it goes ahead of the prompt
 // box, which would otherwise take it to undo the typing, while a field
 // elsewhere (Settings) keeps Esc to abandon its edit, and so does the
-// find bar's, where it closes the bar.
+// find bar, where it closes the bar.
 static void escapecancel(Gui *g)
 {
-    if (!ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId) && !g->findactive &&
+    if (!ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId) && !g->findactive && !g->findheld &&
             !g->askactive && ImGui::Shortcut(ImGuiKey_Escape, ImGuiInputFlags_RouteFocused|ImGuiInputFlags_RouteOverActive)) {
         guicancel(g, g->sess);
     }
