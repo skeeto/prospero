@@ -1550,7 +1550,6 @@ struct Gui {
     // held until a config.get asked after it comes back
     Region            *mcptmem;    // made anew each time, sized to the reply
     Json              *mcptlist;   // its entries, null until they came
-    Str                mcptwhy;    // why List tools started nothing
     char               mcptbuf[FIELD_MAX];
     Str                mcptfor;    // the name they are for (mcptbuf)
     i64                mcptid;
@@ -2419,7 +2418,6 @@ static void mcptlisting(Gui *g, Str name)
         copybytes(g->mcptbuf, name.data, name.len);
         g->mcptfor   = {(u8 *)g->mcptbuf, name.len};
         g->mcptlist  = 0;
-        g->mcptwhy   = {};
         g->mcptid    = 0;  // a reply to the last one is dropped
         g->mcptat    = 0;
         g->mcptstart = g->mcptsent = 0;
@@ -2445,6 +2443,8 @@ static void mcptlisting(Gui *g, Str name)
     cmdsend(g, &w, a);
 }
 
+static void mcpsay(Gui *, Str, Str, b32);
+
 static void onmcptlist(Gui *g, Str line, b32 ok)
 {
     g->mcptid = 0;
@@ -2465,7 +2465,9 @@ static void onmcptlist(Gui *g, Str line, b32 ok)
     g->mcptmem  = mem;
     g->mcptlist = jsonget(root, "servers");
     Str why = jsonstr(jsonget(root, "why"));
-    g->mcptwhy = why.len ? why : g->mcptwhy;
+    if (why.len) {
+        mcpsay(g, g->mcptfor, concat(&g->frame, "Not started: ", why), 1);
+    }
     scheddirty(&g->sched);
 }
 
@@ -2727,13 +2729,19 @@ static Str epstatus(Gui *g, Arena *a, Str name, u32 *dot, b32 copilot)
     return finish(&b);
 }
 
+static void cfgsay(Gui *, Str, b32);
+
+// How a sign-in or a server's command went, as Settings' toast says it
+// (cfgsay), over the foot of the page, which then moves nothing: an
+// error stays until dismissed or replaced. Kept for the checklist too.
 static void mcpsay(Gui *g, Str name, Str msg, b32 bad)
 {
     g->mcpmsg    = clone(&g->perm, msg);
     g->mcpmsgfor = clone(&g->perm, name);
     g->mcpbad    = bad;
-    guilog(g, concat(&g->frame, concat(&g->frame, name, ": "), msg));
-    scheddirty(&g->sched);
+    Str line = concat(&g->frame, concat(&g->frame, name, ": "), msg);
+    guilog(g, line);
+    cfgsay(g, line, !bad);
 }
 
 // A sign-in that ended, however it went.

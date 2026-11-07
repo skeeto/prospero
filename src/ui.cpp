@@ -11787,15 +11787,7 @@ static void drawmcptools(Gui *g, Arena a, Str name, Json *m)
         }
         if (go) {
             g->mcptstart = 1;
-            g->mcptwhy   = {};
             mcptlisting(g, name);
-        }
-        if (g->mcptwhy.len) {
-            ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
-            ImGui::PushTextWrapPos(0);
-            text(g->mcptwhy);
-            ImGui::PopTextWrapPos();
-            ImGui::PopStyleColor();
         }
         return;
     }
@@ -11989,11 +11981,6 @@ static void drawmcp(Gui *g, Arena a, Str name)
         ImGui::TextWrapped("%s", cstr0(&a, err));
         ImGui::PopStyleColor();
     }
-    if (g->mcpmsg.len && g->mcpmsgfor==name) {
-        ImGui::PushStyleColor(ImGuiCol_Text, g->mcpbad ? g->pal->bad : g->pal->dim);
-        ImGui::TextWrapped("%s", cstr0(&a, g->mcpmsg));
-        ImGui::PopStyleColor();
-    }
     drawmcptools(g, a, name, m);
     ImGui::PopID();
 }
@@ -12079,11 +12066,6 @@ static void drawsignin(Gui *g, Arena a, Str name, b32 copilot)
         if (ImGui::SmallButton("Open GitHub")) {
             os_guiopenurl(g->os, a, g->mcpcodeurl);
         }
-    }
-    if (g->mcpmsg.len && g->mcpmsgfor==name) {
-        ImGui::PushStyleColor(ImGuiCol_Text, g->mcpbad ? g->pal->bad : g->pal->dim);
-        ImGui::TextWrapped("%s", cstr0(&a, g->mcpmsg));
-        ImGui::PopStyleColor();
     }
     ImGui::PopID();
 }
