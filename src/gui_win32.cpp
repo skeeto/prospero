@@ -351,6 +351,8 @@ struct W32Gui {
     ID3D11DeviceContext    *context;
     IDXGISwapChain         *swapchain;
     ID3D11RenderTargetView *rtv;
+    int                     warp;        // the hardware device failed: WARP
+    int                     presented;   // this device has shown a frame
     LONG                    wakeflag;    // a wake message is queued
     int                     occluded;
     int                     inmodal;     // inside a move, size or menu loop
@@ -387,15 +389,18 @@ static int systemdark(W32Gui *w)
     return r==ERROR_SUCCESS && v==0;
 }
 
-static void makertv(W32Gui *w)
+static int makertv(W32Gui *w)
 {
     ID3D11Texture2D *back = 0;
-    w->swapchain->GetBuffer(0, IID_PPV_ARGS(&back));
-    if (back) {
-        w->device->CreateRenderTargetView(back, 0, &w->rtv);
-        back->Release();
+    if (FAILED(w->swapchain->GetBuffer(0, IID_PPV_ARGS(&back)))) {
+        return 0;
     }
+    HRESULT r = w->device->CreateRenderTargetView(back, 0, &w->rtv);
+    back->Release();
+    return SUCCEEDED(r);
 }
+
+static void resetdevice(W32Gui *w);
 
 static void resize(W32Gui *w, int width, int height)
 {
@@ -409,10 +414,13 @@ static void resize(W32Gui *w, int width, int height)
         w->rtv->Release();
         w->rtv = 0;
     }
-    w->swapchain->ResizeBuffers(0, (UINT)width, (UINT)height, DXGI_FORMAT_UNKNOWN, 0);
-    makertv(w);
     w->width  = width;
     w->height = height;
+    HRESULT r = w->swapchain->ResizeBuffers(0, (UINT)width, (UINT)height,
+                                            DXGI_FORMAT_UNKNOWN, 0);
+    if (FAILED(r) || !makertv(w)) {
+        resetdevice(w);
+    }
 }
 
 static int inputkind(UINT msg)
@@ -709,6 +717,69 @@ static int makedevice(W32Gui *w, D3D_DRIVER_TYPE type)
     return r == S_OK;
 }
 
+static void dropdevice(W32Gui *w)
+{
+    if (w->rtv)       w->rtv->Release();
+    if (w->swapchain) w->swapchain->Release();
+    if (w->context)   w->context->Release();
+    if (w->device)    w->device->Release();
+    w->rtv       = 0;
+    w->swapchain = 0;
+    w->context   = 0;
+    w->device    = 0;
+}
+
+// The device, swap chain and render target: hardware, else WARP, as a
+// VM or a remote session may have no GPU.
+static int makedevices(W32Gui *w)
+{
+    int ok = 0;
+    if (!w->warp) {
+        ok = makedevice(w, D3D_DRIVER_TYPE_HARDWARE) && makertv(w);
+        if (!ok) {
+            dropdevice(w);
+            w->warp = 1;
+        }
+    }
+    if (!ok) {
+        ok = makedevice(w, D3D_DRIVER_TYPE_WARP) && makertv(w);
+        if (!ok) {
+            dropdevice(w);
+            return 0;
+        }
+    }
+    IDXGIFactory *factory = 0;
+    if (SUCCEEDED(w->swapchain->GetParent(IID_PPV_ARGS(&factory)))) {
+        factory->MakeWindowAssociation(w->hwnd, DXGI_MWA_NO_ALT_ENTER);
+        factory->Release();
+    }
+    w->presented = 0;
+    return 1;
+}
+
+// A new device for one removed or reset. Some drivers (VirtualBox's on
+// Windows 7) make a hardware device whose first Present already fails,
+// so one lost before it ever showed a frame gives way to WARP for good.
+// The DX11 backend's shutdown destroys every viewport's platform data,
+// the main window's too, so both backends go round.
+static void resetdevice(W32Gui *w)
+{
+    if (!w->presented) {
+        w->warp = 1;
+    }
+    ImGui_ImplDX11_Shutdown();
+    ImGui_ImplWin32_Shutdown();
+    dropdevice(w);
+    if (!makedevices(w)) {
+        MessageBoxW(w->hwnd, L"Could not create a Direct3D 11 device.",
+                    L"Prospero", MB_ICONERROR);
+        ExitProcess(2);
+    }
+    ImGui_ImplWin32_Init(w->hwnd);
+    ImGui_ImplDX11_Init(w->device, w->context);
+    w->hooks.force(w->hooks.gui);
+}
+
 static int makewindow(W32Gui *w, unsigned short const *title, int const *geom);
 
 extern "C" void *w32gui_open(W32Hooks *hooks, unsigned short const *title,
@@ -801,19 +872,11 @@ static int makewindow(W32Gui *w, unsigned short const *title, int const *geom)
     DragAcceptFiles(w->hwnd, TRUE);
     float scale = ImGui_ImplWin32_GetDpiScaleForHwnd(w->hwnd);
 
-    // Hardware, else WARP: a VM or a remote session may have no GPU.
-    if (!makedevice(w, D3D_DRIVER_TYPE_HARDWARE) &&
-            !makedevice(w, D3D_DRIVER_TYPE_WARP)) {
+    if (!makedevices(w)) {
         DestroyWindow(w->hwnd);
         w->hwnd = 0;
         return 0;
     }
-    IDXGIFactory *factory = 0;
-    if (SUCCEEDED(w->swapchain->GetParent(IID_PPV_ARGS(&factory)))) {
-        factory->MakeWindowAssociation(w->hwnd, DXGI_MWA_NO_ALT_ENTER);
-        factory->Release();
-    }
-    makertv(w);
     RECT cr;
     GetClientRect(w->hwnd, &cr);
     w->width  = cr.right;
@@ -839,14 +902,7 @@ extern "C" void w32gui_shed(void *p)
     SetWindowLongPtrW(w->hwnd, GWLP_USERDATA, 0);
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
-    if (w->rtv)       w->rtv->Release();
-    if (w->swapchain) w->swapchain->Release();
-    if (w->context)   w->context->Release();
-    if (w->device)    w->device->Release();
-    w->rtv       = 0;
-    w->swapchain = 0;
-    w->context   = 0;
-    w->device    = 0;
+    dropdevice(w);
     DestroyWindow(w->hwnd);
     w->hwnd     = 0;
     w->occluded = 0;
@@ -1113,6 +1169,10 @@ extern "C" void w32gui_present(void *p, int present, unsigned clear)
         // Nothing shows: rest until painted or activated again.
         w->occluded = 1;
         w->hooks.minimized(w->hooks.gui, 1);
+    } else if (FAILED(r)) {
+        resetdevice(w);
+    } else {
+        w->presented = 1;
     }
 }
 
