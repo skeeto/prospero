@@ -23,6 +23,7 @@ After notifications/initialized it sends the client a ping and a
 roots/list request, and logs the responses. Every message it reads, and
 those responses, is appended as a JSON line to the file FAKE_MCP_LOG
 names, if set. FAKE_MCP_VERSION sets the protocol version it answers.
+FAKE_MCP_EXTRA, a JSON list of tool definitions, adds them to its own.
 
 With --http it serves Streamable HTTP instead, on 127.0.0.1 at a port
 it picks and prints as its first line: a POST for each message, JSON
@@ -86,6 +87,9 @@ HTTP_TOOLS = [
     {"name": "flaky", "description": "Fail once.", "inputSchema": {}},
 ]
 PAGE = 2
+# More tools, as a JSON list, for scenarios of odd names and descriptions
+if os.environ.get("FAKE_MCP_EXTRA"):
+    TOOLS = TOOLS + json.loads(os.environ["FAKE_MCP_EXTRA"])
 
 
 def log(obj):

@@ -136,6 +136,7 @@ struct McpServer {
     Str               cursor;    // tools/list's next page
     i32               pages;
     b32               truncated; // more pages than MCP_PAGES: some unlisted
+    b32               forlist;   // started to list its tools, by no session
     i64               startedat; // ticks
     i64               readyby;   // ticks: failed if not ready then
     i64               lastuse;   // ticks: a session offered it

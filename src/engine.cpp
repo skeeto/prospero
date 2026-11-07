@@ -9742,7 +9742,7 @@ static void mcpstart(Engine *e, Arena scratch, McpServer *m, Session *s)
     }
 
     Config  *c    = e->cfg;
-    b32      win  = s->te.windows;
+    b32      win  = s ? s->te.windows : e->te.windows;  // none: listing it
     McpWords w    = {};
     if (m->project.len) {
         w.words = m->argv;
@@ -9809,7 +9809,7 @@ static void mcpstart(Engine *e, Arena scratch, McpServer *m, Session *s)
     os_mkdirs(e->os, scratch, logdir);
     Buf lb(&scratch, 128);
     print(&lb, mcpident(&scratch, m->name));
-    putbyte(&lb, '-');
+    print(&lb, m->forlist ? Str("-list-") : Str("-"));  // another process's, maybe
     printhex(&lb, hash(m->cwd), 8);
     print(&lb, ".log");
     m->log = clone(&e->perm, join(&scratch, logdir, finish(&lb)));
@@ -12782,7 +12782,10 @@ static Str mcpstatename(McpServer *m)
     return "stopped";
 }
 
-static void putmcpserver(Engine *e, Arena scratch, JsonOut *w, Str name, McpServer *m)
+static void putmcptools(Engine *, Arena, JsonOut *, McpServer *);
+
+static void putmcpserver(Engine *e, Arena scratch, JsonOut *w, Str name, McpServer *m,
+                         b32 tools)
 {
     Str url = m ? m->url : trim(cfgget(e->cfg, "mcp", name, "url", 0));
     putobject(w);
@@ -12813,10 +12816,27 @@ static void putmcpserver(Engine *e, Arena scratch, JsonOut *w, Str name, McpServ
     }
     putstrkey(w, "state", mcpstatename(m));
     i32 kept = 0;
-    for (iz i = 0; m && m->state==MCP_READY && i < m->tools.len; i++) {
+    for (iz i = 0; m && i < m->tools.len; i++) {
         kept += mcpkept(e, m->name, m->tools[i].tool);
     }
-    putintkey(w, "tools", kept);  // what sessions get
+    putintkey(w, "tools", m && m->state==MCP_READY ? kept : 0);  // what sessions get
+    if (m && m->tools.len) {
+        // Its tools as last listed, by this or an earlier start
+        putintkey(w, "kept", kept);
+        putintkey(w, "listed", m->tools.len);
+        if (m->state != MCP_READY) {
+            putintkey(w, "aslisted", 1);
+        }
+        if (m->truncated) {
+            putintkey(w, "truncated", 1);
+        }
+    }
+    if (cfgbool(trim(cfgget(e->cfg, "mcp", name, "enabled", 0))) == 0) {
+        putintkey(w, "enabled", 0);
+    }
+    if (tools && m && m->tools.len && m->state!=MCP_STARTING && m->state!=MCP_LISTING) {
+        putmcptools(e, scratch, w, m);
+    }
     if (m && m->state==MCP_FAILED && m->err.len) {
         putstrkey(w, "err", m->err);
     }
@@ -12826,31 +12846,231 @@ static void putmcpserver(Engine *e, Arena scratch, JsonOut *w, Str name, McpServ
     putend(w);
 }
 
-// mcp: the servers, those of the configuration first, each once by
-// name, then any of projects', as they are now.
-static void cmdmcp(Engine *e, Arena scratch, i64 id)
+static i32 mcprank(McpServer *m)
 {
+    switch (m->state) {
+    case MCP_READY:    return 4;
+    case MCP_STARTING:
+    case MCP_LISTING:  return 3;
+    case MCP_FAILED:   return 2;
+    }
+    return 1;
+}
+
+// The instance of the configuration's server by that name to show:
+// running, else starting, else failed, else stopped, the most recently
+// used first. Null if none.
+static McpServer *mcpbest(Engine *e, Str name)
+{
+    McpServer *best = 0;
+    for (McpServer *m = e->mcp; m; m = m->next) {
+        if (m->name!=name || m->project.len) {
+            continue;
+        }
+        i32 r = mcprank(m);
+        i32 b = best ? mcprank(best) : 0;
+        if (r>b || (r==b && m->lastuse>best->lastuse)) {
+            best = m;
+        }
+    }
+    return best;
+}
+
+// Whether a server's own name for a tool can go in its tools key: words
+// there are split at blanks and commas, so only these.
+static b32 mcpfilterable(Str tool)
+{
+    for (iz i = 0; i < tool.len; i++) {
+        u8 c = tool[i];
+        if (!(letter(c) || digit(c) || c=='_' || c=='.' || c=='-')) {
+            return 0;
+        }
+    }
+    return tool.len>0 && !(tool.len>1 && tool[0]=='-');
+}
+
+// A tool's parameters, briefly, for a person: "name: type, name?: type"
+// from its schema, cut.
+static Str mcpparams(Arena *a, Str schema)
+{
+    Json *root  = jsonparse(a, schema).root;
+    Json *props = jsonget(root, "properties");
+    Json *req   = jsonget(root, "required");
+    Buf   b(a, 256);
+    for (Json *k = props->child; k && b.len<1000; k = k->next) {
+        b32 must = 0;
+        for (Json *r = req->child; r; r = r->next) {
+            must |= r->str == k->key;
+        }
+        print(&b, b.len ? Str(", ") : Str(""));
+        print(&b, utf8head(k->key, 64));
+        print(&b, must ? Str(": ") : Str("?: "));
+        Str type = jsonstr(jsonget(k, "type"));
+        print(&b, type.len ? utf8head(type, 32) : Str("any"));
+    }
+    return finish(&b);
+}
+
+// Why a server's tool i is not offered though kept: its name for the
+// APIs is a built-in tool's, or an earlier kept tool's (mcpident makes
+// "a.b" and "a_b" one name). Null if neither.
+static Str mcptaken(Engine *e, Arena *a, McpServer *m, iz i)
+{
+    Str name = m->tools[i].name;
+    if (toolfind(name) != TOOL_NONE) {
+        return "its name is a built-in tool's";
+    }
+    for (iz k = 0; k < i; k++) {
+        McpTool *o = &m->tools[k];
+        if (o->name==name && mcpkept(e, m->name, o->tool)) {
+            return concat(a, "its name is taken by ", utf8head(o->tool, 128));
+        }
+    }
+    return {};
+}
+
+// A server's tools, for its page or the CLI: each as the server names
+// it, and whether sessions get it (kept, and offered under a name no
+// other tool has).
+static void putmcptools(Engine *e, Arena scratch, JsonOut *w, McpServer *m)
+{
+    iz most = 512;  // a server may list any number: the page needs no more
+    putkey(w, "toollist");
+    putarray(w);
+    for (iz i = 0; m && i < m->tools.len && i < most; i++) {
+        Arena    tmp  = scratch;  // each tool's own
+        McpTool *t    = &m->tools[i];
+        b32      kept = mcpkept(e, m->name, t->tool);
+        Str      why  = mcptaken(e, &tmp, m, i);
+        putobject(w);
+        putstrkey(w, "tool", utf8head(t->tool, 128));
+        if (t->desc.len) {
+            putstrkey(w, "desc", t->desc);
+        }
+        putintkey(w, "ro", t->ro != 0);
+        putintkey(w, "kept", kept);
+        putintkey(w, "filterable", mcpfilterable(t->tool));
+        putintkey(w, "offered", kept && !why.len);
+        if (kept && why.len) {
+            putstrkey(w, "why", why);
+        }
+        Str params = mcpparams(&tmp, t->schema);
+        if (params.len) {
+            putstrkey(w, "params", params);
+        }
+        putend(w);
+    }
+    putend(w);
+    if (m && m->tools.len>most) {
+        putintkey(w, "toolsmore", m->tools.len - most);
+    }
+}
+
+// A server of the configuration, started for its page or the CLI to see
+// its tools (mcp {start}), by no session: in its section's cwd, else the
+// home directory, unless an instance is there already. Null, with why,
+// if it may not start now: not the configuration's, turned off, its url
+// not approved, waiting for a sign-in, or failed and not to be tried
+// again yet.
+static McpServer *mcpstartlist(Engine *e, Arena *a, Str name, Str *why)
+{
+    Arena scratch = *a;
+    Str url = trim(cfgget(e->cfg, "mcp", name, "url", 0));
+    Str cmd = trim(cfgget(e->cfg, "mcp", name, "command", 0));
+    if (!url.len && !cmd.len) {
+        *why = "the configuration defines no server by that name";
+        return 0;
+    } else if (cfgbool(trim(cfgget(e->cfg, "mcp", name, "enabled", 0))) == 0) {
+        *why = "it is turned off (enabled = no)";
+        return 0;
+    } else if (url.len && apprpending(e, &scratch, "mcp", name, url).len) {
+        *why = mcpapprovemsg(a, name);
+        return 0;
+    }
+    McpServer *m   = mcpbest(e, name);
+    i64        now = os_ticks(e->os);
+    if (!m) {
+        Str dir = trim(cfgget(e->cfg, "mcp", name, "cwd", 0));
+        b32 win = e->te.windows;
+        Str cwd = url.len ? url : !dir.len ? e->home
+                : normpath(&scratch, e->home, expandhome(&scratch, dir, e->home, win), win);
+        m = alloc<McpServer>(&e->perm);
+        m->name    = clone(&e->perm, name);
+        m->cwd     = clone(&e->perm, cwd);
+        m->origin  = "config";
+        m->def     = clone(&e->perm, concat(&scratch, concat(&scratch, url, "\n"), cmd));
+        m->forlist = 1;
+        m->next    = e->mcp;
+        e->mcp     = m;
+    }
+    m->lastuse = now;
+    if (m->needauth) {
+        *why = "it needs you to sign in";
+        return 0;
+    } else if (m->state==MCP_FAILED && now<m->retryat) {
+        *why = m->err;
+        return 0;
+    } else if (m->state==MCP_STOPPED || m->state==MCP_FAILED) {
+        mcpstart(e, scratch, m, 0);
+    }
+    if (m->state == MCP_FAILED) {
+        *why = m->err;
+    }
+    return m;
+}
+
+// mcp: the servers, those of the configuration first, each once by
+// name, then any of projects', as they are now. With a name, only that
+// name's; with tools, each one's tools too, which keeps them up a while
+// longer; with start, the configuration's server started first if it
+// may be (mcpstartlist), its why if it may not.
+static void cmdmcp(Engine *e, Arena scratch, i64 id, Json *j)
+{
+    Str only  = jsonstr(jsonget(j, "name"));
+    b32 tools = only.len && jsonflag(jsonget(j, "tools"), 0);
+    Str why   = {};
+    if (only.len && jsonflag(jsonget(j, "start"), 0)) {
+        mcpstartlist(e, &scratch, only, &why);
+    }
+    // What each server's entry needs for a while, apart from the reply,
+    // which grows at the end of scratch
+    Arena tmp = carve(&scratch, 1<<20);
     Buf   b(&scratch, 1<<14);
     EvOut w = evbegin(&b, {}, 0, os_time(e->os), EV_REPLY);
     putintkey(&w.json, "id", id);
     putintkey(&w.json, "ok", 1);
+    if (why.len) {
+        putstrkey(&w.json, "why", why);
+    }
     putkey(&w.json, "servers");
     putarray(&w.json);
+    i64 now = os_ticks(e->os);
     for (IniSection *s = inifirst(e->ini, "mcp"); s; s = ininext(s)) {
-        if (!s->name.len) {
+        if (!s->name.len || (only.len && s->name!=only)) {
+            continue;
+        } else if (!mcpdefines(e, s->name)) {
+            // Only settings for projects' servers of its name
+            putobject(&w.json);
+            putstrkey(&w.json, "name", s->name);
+            putstrkey(&w.json, "source", "overlay");
+            if (cfgbool(trim(cfgget(e->cfg, "mcp", s->name, "enabled", 0))) == 0) {
+                putintkey(&w.json, "enabled", 0);
+            }
+            putend(&w.json);
             continue;
         }
-        McpServer *best = 0;
-        for (McpServer *m = e->mcp; m; m = m->next) {
-            if (m->name==s->name && !m->project.len) {
-                best = !best || m->state>best->state ? m : best;
+        McpServer *best = mcpbest(e, s->name);
+        if (tools) {
+            for (McpServer *m = e->mcp; m; m = m->next) {
+                m->lastuse = m->name==only && m->state==MCP_READY ? now : m->lastuse;
             }
         }
-        putmcpserver(e, scratch, &w.json, s->name, best);
+        putmcpserver(e, tmp, &w.json, s->name, best, tools);
     }
     for (McpServer *m = e->mcp; m; m = m->next) {
-        if (m->project.len) {
-            putmcpserver(e, scratch, &w.json, m->name, m);
+        if (m->project.len && (!only.len || m->name==only)) {
+            m->lastuse = tools && m->state==MCP_READY ? now : m->lastuse;
+            putmcpserver(e, tmp, &w.json, m->name, m, tools);
         }
     }
     putend(&w.json);
@@ -21320,7 +21540,7 @@ static void command(Engine *e, Arena scratch, Str line)
         cmdshellenv(e, scratch, id, j);
         return;
     case CMD_MCP:
-        cmdmcp(e, scratch, id);
+        cmdmcp(e, scratch, id, j);
         return;
     case CMD_MCPAUTH:
         cmdmcpauth(e, scratch, id, j);

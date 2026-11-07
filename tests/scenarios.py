@@ -11671,6 +11671,93 @@ def mcp_untick(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+EXTRA_TOOLS = [
+    {"name": "a.b", "description": "Dotted.", "inputSchema": {"type": "object"}},
+    {"name": "a_b", "description": "Taken.", "inputSchema": {"type": "object"}},
+    {"name": "odd name", "description": "Line one\x1b[31m red\nline two",
+     "inputSchema": {"type": "object"}},
+]
+
+
+@scenario(conf=mcpconf(tools="-where, -big"), bound=30)
+def mcp_toollist(t):
+    """mcp {name, tools, start}: a server of the configuration started by
+    no session, its every tool listed with whether sessions get it,
+    which tools may be named in its tools key, and which name another
+    has taken; the list kept once it stops, as last listed. A section
+    that defines no server, one turned off, and an unknown name are not
+    started, and say why."""
+    env = mcpenv(t, FAKE_MCP_EXTRA=json.dumps(EXTRA_TOOLS))
+    addconf(t, "[mcp proj]\ntools = -x\n[mcp off]\ncommand = nothing-at-all\nenabled = no\n")
+    h = t.headless(env=dict(env, PROSPERO_TEST_MINUTE_MS="300"))
+    try:
+        r = h.call("mcp", name="fake", tools=1, start=1)
+        t.check(r.get("ok") == 1 and "why" not in r, f"started {r}")
+        srv = r["servers"][0]
+        t.check(srv["state"] == "starting" and "toollist" not in srv, f"no list yet {srv}")
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            srv = h.call("mcp", name="fake", tools=1)["servers"][0]
+            if srv["state"] != "starting":
+                break
+            time.sleep(0.1)
+        t.check(srv["state"] == "ready" and srv["listed"] == 12 and srv["kept"] == 10 and
+                srv["tools"] == 10, f"ready {srv}")
+        tl = {x["tool"]: x for x in srv["toollist"]}
+        t.check([x["tool"] for x in srv["toollist"]][:3] == ["echo", "image", "big"],
+                "in the server's order")
+        t.check(tl["echo"]["kept"] == 1 and tl["echo"]["ro"] == 1 and
+                tl["echo"]["params"] == "text: string" and tl["echo"]["offered"] == 1,
+                f"echo {tl['echo']}")
+        t.check(tl["where"]["kept"] == 0 and tl["where"]["offered"] == 0, f"where {tl['where']}")
+        t.check(tl["a_b"]["offered"] == 0 and tl["a_b"]["why"] == "its name is taken by a.b",
+                f"a_b {tl['a_b']}")
+        t.check(tl["odd name"]["filterable"] == 0 and tl["a.b"]["filterable"] == 1,
+                "filterable names")
+        t.check(not any(s["source"] == "project" for s in r["servers"]), "no project rows")
+
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            srv = h.call("mcp", name="fake")["servers"][0]
+            if srv["state"] == "stopped":
+                break
+            time.sleep(0.2)
+        t.check(srv["state"] == "stopped" and srv.get("aslisted") == 1 and
+                srv["listed"] == 12 and srv["tools"] == 0, f"stopped, as last listed {srv}")
+        srv = h.call("mcp", name="fake", tools=1)["servers"][0]
+        t.check(len(srv.get("toollist", [])) == 12, "its list still")
+
+        for name, why in (("proj", "defines no server"), ("off", "turned off"),
+                          ("nope", "defines no server")):
+            r = h.call("mcp", name=name, tools=1, start=1)
+            t.check(why in r.get("why", ""), f"{name}: {r}")
+        r = h.call("mcp", name="proj")
+        t.check(r["servers"] == [{"name": "proj", "source": "overlay"}], f"overlay {r}")
+        starts = [m for m in mcplog(t) if m.get("method") == "initialize"]
+        t.check(len(starts) == 1, f"started once: {len(starts)}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+    # The command line: the same, for a terminal, escapes taken out
+    rc, out, err = prun(t, ["mcp", "tools", "fake", "--state", t.state, "-c", t.config],
+                        env=env)
+    lines = out.splitlines()
+    t.check(rc == 0 and lines[0] == "fake: 10 of 12 tools offered", f"cli {rc} {out!r} {err!r}")
+    t.check(any(x.startswith("  [x] echo") and "read-only  Repeat the text." in x
+                for x in lines) and any(x.startswith("  [ ] where") for x in lines) and
+            any(x.startswith("  [!] a_b") and "taken by a.b" in x for x in lines),
+            f"rows {lines}")
+    t.check("\x1b" not in out and "line two" not in out and "Line one [31m red" in out,
+            f"escapes and later lines out: {out!r}")
+    rc, out, err = prun(t, ["mcp", "tools", "proj", "--state", t.state, "-c", t.config])
+    t.check(rc == 0 and "settings for projects' servers" in out, f"overlay {rc} {out} {err}")
+    rc, out, err = prun(t, ["mcp", "tools", "off", "--state", t.state, "-c", t.config])
+    t.check(rc == 1 and "turned off" in err, f"off {rc} {out} {err}")
+    rc, out, err = prun(t, ["mcp", "list", "--state", t.state, "-c", t.config])
+    t.check("proj: settings for projects' servers of that name" in out, f"list {out}")
+
+
 class McpHttpServer:
     """tests/fake_mcp.py --http, run for a scenario, logging to t.mcplog."""
 
