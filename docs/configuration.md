@@ -292,7 +292,10 @@ runs without a shell. Begin it with `'`, since a value beginning with
 started for the sessions that use it, and stops a minute after the
 last one has gone. Its standard error is logged in the state
 directory's `mcp/logs`. `tools` keeps only some of a server's tools,
-`trust = yes` runs them without asking, and a role with a tools list
+read left to right (`-NAME` leaves one out, and a list beginning with
+one starts from all), which the server's page in Settings edits with a
+checkbox each, and `prospero mcp tools NAME` lists; a tool left out
+mid-session is refused. `trust = yes` runs them without asking, and a role with a tools list
 names them as `mcp__NAME` or `mcp__NAME__TOOL`. Otherwise each call
 asks first, with an "always" for all of that server's tools, which for
 a server over HTTP holds only while its url stays the same. An included
@@ -309,7 +312,10 @@ folder up to the repository's root. Its servers start only once you
 allow them, for the session or always for that project until their
 definitions change. A call to one may also trust its server in that
 project, from then on, under the same condition. Your own section of
-the same name wins.
+the same name wins if it has a `command` or `url`. One with neither
+adjusts projects' servers of that name instead, with `tools`,
+`enabled`, `timeout` and `startup_timeout` only: never `trust`, a
+`token`, headers, `cwd`, `env.NAME` or the sign-in's client keys.
 
 A server over HTTP may take a bearer `token` (as `env:NAME`) or
 `header.NAME` values, or want you to sign in with OAuth. Settings, on

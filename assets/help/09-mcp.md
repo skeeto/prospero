@@ -28,8 +28,10 @@ explain a failure. A program starts for the sessions that use it and
 stops a minute after the last one has gone; one that crashes starts
 again at the next call.
 
-`tools` keeps only some of a server's tools, `enabled = no` leaves it
-out, and `timeout` limits each call. A role with a tools list gets MCP
+`tools` keeps only some of a server's tools, read left to right: a
+name keeps a tool, `-NAME` leaves one out, and a list that begins with
+`-NAME` starts from all of them, as `tools = -delete -move` does.
+`enabled = no` leaves the server out, and `timeout` limits each call. A role with a tools list gets MCP
 tools only by naming them: `mcp__NAME` for all of a server's, or
 `mcp__NAME__TOOL`. Subagents get their parent's.
 
@@ -65,7 +67,19 @@ the repository's root, names servers as Claude Code's does:
 
 `${VAR}` and `${VAR:-default}` take values from the environment. A
 program runs in the folder of the `.mcp.json` that names it. A
-section of your own by the same name wins.
+section of your own by the same name, with a `command` or a `url`,
+wins.
+
+A section with neither only adjusts projects' servers of its name, in
+every project: its `tools`, `enabled`, `timeout` and
+`startup_timeout` apply to them, so `enabled = no` leaves them out
+without asking, and nothing else does. A project chooses where its
+servers run and what they are sent, so such a section never gives
+them `trust`, a `token`, headers, `cwd`, `env.NAME` or a sign-in's
+client, which are warned about in Diagnostics:
+
+    [mcp web]
+    tools = -delete
 
 Since such a file comes with the project, a session asks before it
 starts any of them: "Start the MCP servers of PATH?", listing each
@@ -99,3 +113,27 @@ and path rather than on one the system picks.
 
 The page also shows whether a server is running and with how many
 tools, or why it failed; **Restart** starts it again.
+
+## Its tools
+
+A server's page in Settings lists its tools, each with whether it is
+read-only and what it says it does, its parameters in the tooltip.
+Unticking one writes it to `tools` as `-NAME` in your own file, and
+ticking it again takes it out; once all are ticked the key goes. When
+`tools` lists the tools to keep instead, ticking adds a name and
+unticking takes it away, and the last one stays: to leave the whole
+server out, set `enabled = no`. A tool whose name a list can't hold,
+with blanks or commas, is always offered.
+
+The list is the server's as it last started: a server that changes
+its tools while running shows the change after **Restart**. A server
+that is not running shows its last list; one that never started has
+**List tools**, which starts it now. A project's servers show under
+"In projects" while a session runs one, and their page writes a
+section that only adjusts them. Without a window, `prospero mcp tools
+NAME` prints a server's tools, starting it if it must.
+
+A tool left out while a session runs is still declared to it, which
+keeps its cached prompt, but each call is refused, even under
+`trust = yes` or in Bypass mode. One ticked again joins open sessions
+at their next request.
