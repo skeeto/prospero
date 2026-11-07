@@ -179,6 +179,19 @@ if(PROSPERO_GUI)
   include(FetchGui)
 endif()
 
+# ariel, the terminal emulator behind the Terminal pane (ariel/), a C
+# library kept self-contained so it can move out of this repository. Only
+# the GUI and the unit tests link it. Its assertions trap in every build,
+# since it parses untrusted bytes in the process holding every session.
+if(PROSPERO_GUI)
+  if(NOT CMAKE_CROSSCOMPILING OR PROSPERO_CROSS_TESTS)
+    set(ARIEL_TESTS ON CACHE BOOL "" FORCE)
+  endif()
+  set(ARIEL_TOOLS OFF CACHE BOOL "")
+  add_subdirectory(ariel)
+  target_compile_definitions(ariel PRIVATE ARIEL_TRAP)
+endif()
+
 if(WIN32 AND PROSPERO_GUI)
   # The GUI build has CRT startup, since FreeType, md4c and ImGui need a
   # CRT, though the core still never calls it. windows.h, D3D11 and the
@@ -224,7 +237,7 @@ if(WIN32 AND PROSPERO_GUI)
   # in a translation unit of its own (src/deskwin32.cpp)
   add_executable(prospero WIN32 src/main_win32.cpp src/deskwin32.cpp)
   target_link_libraries(prospero PRIVATE
-    prospero_gui imgui md4c kernel32 advapi32 winhttp comdlg32 ole32
+    prospero_gui imgui md4c ariel kernel32 advapi32 winhttp comdlg32 ole32
     user32 gdi32
   )
   target_link_options(prospero PRIVATE -static -municode)
@@ -248,7 +261,7 @@ else()
   add_executable(prospero src/main_posix.cpp)
   target_link_libraries(prospero PRIVATE httpedge Threads::Threads)
   if(PROSPERO_GUI)
-    target_link_libraries(prospero PRIVATE imgui md4c)
+    target_link_libraries(prospero PRIVATE imgui md4c ariel)
   endif()
   # Every tool process starts under a reaper, this executable, so its
   # startup is on the critical path: loading libstdc++ dynamically costs
@@ -459,7 +472,7 @@ if(NOT CMAKE_CROSSCOMPILING OR PROSPERO_CROSS_TESTS)
   target_compile_definitions(prospero_test PRIVATE PROSPERO_ARENACHECK=1)
   if(PROSPERO_GUI)
     # The GUI's pure modules: scheduler, markdown, layout, view model.
-    target_link_libraries(prospero_test PRIVATE md4c)
+    target_link_libraries(prospero_test PRIVATE md4c ariel)
     target_compile_definitions(prospero_test PRIVATE PROSPERO_GUI=1)
   endif()
   if(PROSPERO_HAS_NOSTDLIBXX)

@@ -1,0 +1,355 @@
+# Core behavior: printing, wrap, cursor motion, erasing, scrolling,
+# modes, replies, titles and the encoders.
+
+INIT 5,10
+
+!Print and wrap
+PUSH "hello"
+  ?cursor = 0,5
+  ?screen_row 0 = "hello"
+PUSH "world"
+  ?cursor = 0,9
+  ?screen_row 0 = "helloworld"
+  ?lineinfo 0 = -
+PUSH "!"
+  ?cursor = 1,1
+  ?screen_row 1 = "!"
+  ?lineinfo 0 = wrapped
+
+!Pending wrap cleared by CR, kept by HT
+RESET
+PUSH "0123456789\r"
+  ?cursor = 0,0
+RESET
+PUSH "0123456789\tX"
+  ?cursor = 1,1
+  ?screen_row 1 = "X"
+
+!Autowrap off overwrites the margin
+RESET
+PUSH "\e[?7l0123456789AB"
+  ?screen_row 0 = "012345678B"
+  ?cursor = 0,9
+PUSH "\e[!p"
+  ?mode cols = 10
+
+!Wide characters
+RESET
+PUSH "\xe4\xb8\xad"
+  ?cursor = 0,2
+  ?screen_cell 0,0 = {0x4e2d} width=2
+  ?screen_cell 0,1 = {} width=0
+PUSH "\e[1;10H\xe4\xb8\xad"
+  ?cursor = 1,2
+  ?screen_row 1 = "中"
+  ?lineinfo 0 = wrapped
+PUSH "\e[1;1HA"
+  ?screen_row 0 = "A"
+  ?screen_cell 0,1 = {} width=1
+
+!Combining and clusters
+RESET
+PUSH "e\xcc\x81x"
+  ?cursor = 0,2
+  ?screen_cell 0,0 = {0x65,0x301} width=1
+PUSH "\xe2\x9d\xa4\xef\xb8\x8f"
+  ?cursor = 0,4
+  ?screen_cell 0,2 = {0x2764,0xfe0f} width=2
+PUSH "\xf0\x9f\x87\xba\xf0\x9f\x87\xb8"
+  ?cursor = 0,6
+  ?screen_cell 0,4 = {0x1f1fa,0x1f1f8} width=2
+
+!Legacy width (mode 2027 reset)
+RESET
+PUSH "\e[?2027l\xe2\x9d\xa4\xef\xb8\x8f"
+  ?cursor = 0,1
+  ?screen_cell 0,0 = {0x2764,0xfe0f} width=1
+PUSH "\e[?2027$p"
+  output "\e[?2027;2$y"
+
+!Malformed UTF-8
+RESET
+PUSH "a\xffb\xe4\xb8c\xed\xa0\x80"
+  ?screen_text 0,0,1,10 = 0x61,0xfffd,0x62,0xfffd,0x63,0xfffd,0xfffd,0xfffd
+
+!Cursor motion
+RESET
+PUSH "\e[3;4H"
+  ?cursor = 2,3
+PUSH "\e[A"
+  ?cursor = 1,3
+PUSH "\e[10B"
+  ?cursor = 4,3
+PUSH "\e[2D"
+  ?cursor = 4,1
+PUSH "\e[20C"
+  ?cursor = 4,9
+PUSH "\e[5G"
+  ?cursor = 4,4
+PUSH "\e[2d"
+  ?cursor = 1,4
+PUSH "\e[H"
+  ?cursor = 0,0
+PUSH "\e[3E"
+  ?cursor = 3,0
+PUSH "\e[F"
+  ?cursor = 2,0
+
+!Erasing
+RESET
+PUSH "abcdefghij\r\nklmnopqrst\e[1;5H\e[K"
+  ?screen_row 0 = "abcd"
+PUSH "\e[2;3H\e[1K"
+  ?screen_row 1 = "   nopqrst"
+PUSH "\e[2;5H\e[2X"
+  ?screen_row 1 = "   n  qrst"
+PUSH "\e[J"
+  ?screen_row 1 = "   n"
+PUSH "\e[2J"
+  ?screen_row 0 = ""
+  ?cursor = 1,4
+
+!Insert and delete characters
+RESET
+PUSH "abcdef\e[1;3H\e[2@"
+  ?screen_row 0 = "ab  cdef"
+PUSH "\e[3P"
+  ?screen_row 0 = "abdef"
+PUSH "\e[4hXY\e[4l"
+  ?screen_row 0 = "abXYdef"
+
+!Scrolling regions
+RESET
+PUSH "1\r\n2\r\n3\r\n4\r\n5"
+PUSH "\e[2;4r"
+  ?cursor = 0,0
+PUSH "\e[4;1H\n"
+  ?screen_row 0 = "1"
+  ?screen_row 1 = "3"
+  ?screen_row 2 = "4"
+  ?screen_row 3 = ""
+  ?screen_row 4 = "5"
+PUSH "\e[2;1H\eM"
+  ?screen_row 1 = ""
+  ?screen_row 2 = "3"
+PUSH "\e[r\e[S"
+  ?screen_row 0 = ""
+  ?screen_row 1 = "3"
+PUSH "\e[2;1H\e[L"
+  ?screen_row 1 = ""
+  ?screen_row 2 = "3"
+PUSH "\e[M"
+  ?screen_row 1 = "3"
+
+!Origin mode
+RESET
+PUSH "\e[2;4r\e[?6h\e[1;1H"
+  ?cursor = 1,0
+PUSH "\e[10;1H"
+  ?cursor = 3,0
+PUSH "\e[6n"
+  output "\e[3;1R"
+PUSH "\e[?6l\e[r"
+
+!Tabs
+RESET
+PUSH "\t"
+  ?cursor = 0,8
+PUSH "\e[3g\e[1;3H\eH\r\t"
+  ?cursor = 0,2
+PUSH "\e[Z"
+  ?cursor = 0,0
+
+!Save and restore
+RESET
+PUSH "\e[2;3H\e[1m\e7\e[H\e[0m\e8x"
+  ?cursor = 1,3
+  ?screen_cell 1,2 = {0x78} attrs={B}
+
+!SGR
+RESET
+PUSH "\e[1;3;4;31;42mA\e[0m"
+  ?screen_cell 0,0 = {0x41} attrs={B,I,U1} fg=rgb(205,0,0) bg=rgb(0,205,0)
+PUSH "\e[38;5;196;48;2;1;2;3mB"
+  ?screen_cell 0,1 = {0x42} fg=rgb(255,0,0) bg=rgb(1,2,3)
+PUSH "\e[38:2::10:20:30;4:3mC"
+  ?screen_cell 0,2 = {0x43} attrs={U3} fg=rgb(10,20,30)
+PUSH "\e[0;7mD"
+  ?screen_cell 0,3 = {0x44} fg=rgb(0,0,0) bg=rgb(229,229,229)
+PUSH "\e[0;94;105mE"
+  ?screen_cell 0,4 = {0x45} fg=rgb(92,92,255) bg=rgb(255,0,255)
+PUSH "\e[0;1;31m\eP$qm\e\\"
+  output "\eP1$r0;1;31m\e\\"
+
+!Background color erase
+RESET
+PUSH "\e[44m\e[2J\e[0m"
+  ?screen_cell 2,5 = {} bg=rgb(0,0,238)
+
+!REP
+RESET
+PUSH "x\e[3b"
+  ?screen_row 0 = "xxxx"
+
+!DEC special graphics
+RESET
+PUSH "\e(0qx\e(Bq"
+  ?screen_text 0,0,1,10 = 0x2500,0x2502,0x71
+
+!Alternate screen
+RESET
+PUSH "main\e[?1049h"
+  ?mode altscreen = 1
+  ?screen_row 0 = ""
+PUSH "alt"
+  ?screen_row 0 = "    alt"
+PUSH "\e[?1049l"
+  ?mode altscreen = 0
+  ?screen_row 0 = "main"
+  ?cursor = 0,4
+
+!Replies
+RESET
+PUSH "\e[c"
+  output "\e[?62;22;52c"
+PUSH "\e[>c"
+  output "\e[>1;277;0c"
+PUSH "\e[>q"
+  output "\eP>|ariel(0.1.0)\e\\"
+PUSH "\e[5n"
+  output "\e[0n"
+PUSH "\e[?25$p"
+  output "\e[?25;1$y"
+PUSH "\e[?1004$p"
+  output "\e[?1004;2$y"
+PUSH "\e[?9999$p"
+  output "\e[?9999;0$y"
+PUSH "\e[18t"
+  output "\e[8;5;10t"
+PUSH "\e]4;1;?\a"
+  output "\e]4;1;rgb:cdcd/0000/0000\a"
+PUSH "\e]11;?\e\\"
+  output "\e]11;rgb:0000/0000/0000\e\\"
+PUSH "\e]4;1;#123456\e\\\e]4;1;?\e\\"
+  output "\e]4;1;rgb:1212/3434/5656\e\\"
+PUSH "\e[?996n"
+  output "\e[?997;1n"
+PUSH "\e[c\e[5n"
+  output "\e[?62;22;52c"
+  output "\e[0n"
+PUSH "\e[?u"
+  output "\e[?0u"
+PUSH "\e[>5u\e[?u"
+  output "\e[?5u"
+
+!Titles and events
+RESET
+PUSH "\e]2;hello\a"
+  event "title 0 hello"
+  ?title = "hello"
+PUSH "\e]1;icon\e\\"
+  event "title 1 icon"
+  ?icon = "icon"
+  ?title = "hello"
+PUSH "\e[22t\e]2;other\a\e[23t"
+  event "title 0 other"
+  event "title 0 hello"
+  ?title = "hello"
+PUSH "\a"
+  event "bell"
+PUSH "\e]7;file://host/tmp\a"
+  event "cwd file://host/tmp"
+PUSH "\e]133;A\a"
+  event "mark A -1"
+  ?lineinfo 0 = prompt
+PUSH "\e]133;D;2\a"
+  event "mark D 2"
+PUSH "\e]9;4;1;50\a"
+  event "progress 1 50"
+PUSH "\e]777;notify;T;body\a"
+  event "notify T|body"
+PUSH "\e[?2026h"
+  event "sync 1"
+  ?mode sync = 1
+PUSH "\e[?2026l"
+  event "sync 0"
+PUSH "\e_ignored\e\\\eP1;2|junk\e\\\e]9999;x\a"
+  noevent
+
+!Strings abort on CAN
+RESET
+PUSH "\e]2;abc\x18def"
+  noevent
+  ?screen_row 0 = "def"
+
+!Keys
+RESET
+KEY UP
+  encoded "\e[A"
+KEY UP ctrl
+  encoded "\e[1;5A"
+PUSH "\e[?1h"
+KEY UP
+  encoded "\eOA"
+KEY F1
+  encoded "\eOP"
+KEY F5 shift
+  encoded "\e[15;2~"
+KEY DELETE
+  encoded "\e[3~"
+KEY 'a' ctrl
+  encoded "\x01"
+KEY 'a' alt
+  encoded "\ea"
+KEY BACKSPACE
+  encoded "\x7f"
+KEY TAB shift
+  encoded "\e[Z"
+KEY ENTER
+  encoded "\r"
+PUSH "\e[>4;2m"
+KEY 'a' ctrl
+  encoded "\e[27;5;97~"
+PUSH "\e[>4m"
+
+!Mouse
+RESET
+MOUSE press 1 0,0
+  encoded ""
+PUSH "\e[?1000h"
+MOUSE press 1 2,3
+  encoded "\e[M $#"
+MOUSE release 1 2,3
+  encoded "\e[M#$#"
+PUSH "\e[?1006h"
+MOUSE press 3 2,3 ctrl
+  encoded "\e[<18;4;3M"
+MOUSE release 3 2,3
+  encoded "\e[<2;4;3m"
+MOUSE motion 0 3,3
+  encoded ""
+PUSH "\e[?1002h"
+MOUSE press 1 0,0
+MOUSE motion 0 0,1
+  encoded "\e[<32;2;1M"
+MOUSE press 4 0,1
+  encoded "\e[<64;2;1M"
+
+!Paste
+RESET
+PASTE "a\r\nb\nc\x1b[201~"
+  encoded "a\rb\rc[201~"
+PUSH "\e[?2004h"
+PASTE "x"
+  encoded "\e[200~x\e[201~"
+
+!Resize
+RESET
+PUSH "12345\r\nabcde\e[5;3H"
+RESIZE 3,8
+  ?cursor = 2,2
+  ?screen_row 0 = ""
+RESIZE 6,12
+  ?mode rows = 6
+  ?mode cols = 12
+  ?screen_row 5 = ""
