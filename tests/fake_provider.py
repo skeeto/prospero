@@ -2720,6 +2720,19 @@ def sc_mcp_project(model, n, req):
         "Done again."])
 
 
+def sc_mcp_identity(model, n, req):
+    # The configuration's "fake", then, its section gone, the project's
+    yield from mcp_steps(model, n, req, [
+        ("mcp__fake__echo", {"text": "cfg"}),
+        "Turn one.",
+        ("mcp__fake__where", {}),
+        "Turn two."])
+
+
+def sc_mcp_http_two(model, n, req):
+    yield from mcp_steps(model, n, req, [("mcp__docs__where", {}), "Done."])
+
+
 sc_mcp_project_policy = sc_mcp_project
 sc_mcp_project_always = sc_mcp_project
 sc_mcp_project_trust = sc_mcp_project

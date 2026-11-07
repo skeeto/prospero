@@ -11555,6 +11555,41 @@ def mcp_project_config(t):
     t.check("mcp__fake__echo" in names, f"the configuration's server {names}")
 
 
+@scenario(conf=mcpconf(trust="yes"), bound=30)
+def mcp_identity(t):
+    """A session's MCP tool holds to the server it came from: the
+    configuration's "fake" gone, a project's "fake" by the same name
+    does not take its calls, its trust or its grants."""
+    servers = {"fake": {"command": sys.executable, "args": [FAKE_MCP],
+                        "env": {"FAKE_MCP_WORD": "project"}}}
+    t.put(".mcp.json", json.dumps({"mcpServers": servers}))
+    h = t.headless(env=mcpenv(t))
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.send("prompt", sid=sid, text="go")
+        t.check(ended(h, sid, 1)["why"] == "done", "the first turn ends")
+        t.check(not h.all("ask", sid), f"the configuration's, trusted: {h.all('ask', sid)}")
+        t.check([e["status"] for e in h.all("tool.end", sid)] == ["ok"], "echo ran")
+
+        r = h.call("config.set", kind="mcp", name="fake", delete=1)
+        t.check(r.get("ok") == 1, f"deleted {r}")
+        h.send("prompt", sid=sid, text="again")
+        ask = nextask(h, sid)
+        t.check(ask["kind"] == "mcp.project", f"the project's server asks to start: {ask}")
+        h.call("answer", sid=sid, req=ask["req"], decision="allow")
+        t.check(ended(h, sid, 2)["why"] == "done", "the second turn ends")
+        end = h.all("tool.end", sid)[-1]
+        t.check(end["status"] == "denied" and "not the one this tool came from" in end["text"],
+                f"refused {end}")
+        t.check([c["name"] for c in mcpcalls(t)] == ["echo"], f"calls {mcpcalls(t)}")
+        rec = [e for e in logged(t, sid) if e["ev"] == "prefix" and e.get("mcp")]
+        t.check(rec and all(x.get("origin") == "config" for x in rec[-1]["mcp"]),
+                f"origins logged {rec[-1:]}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 class McpHttpServer:
     """tests/fake_mcp.py --http, run for a scenario, logging to t.mcplog."""
 
@@ -12050,6 +12085,45 @@ def mcp_project_http(t):
         srv.close()
     t.check(all(m["_http"]["X-Extra"] == "from env" for m in mcplog(t) if "_http" in m),
             "the file's header")
+
+
+@scenario(bound=40)
+def mcp_http_two(t):
+    """Two projects' HTTP servers of one name, at two urls, never share
+    one connection: each session's call goes to its own project's."""
+    env = mcpenv(t)
+    a = McpHttpServer(t, FAKE_MCP_WORD="first")
+    b = McpHttpServer(t, FAKE_MCP_WORD="second")
+    try:
+        dirs = []
+        for k, srv in (("one", a), ("two", b)):
+            d = t.host.join(t.work, k)
+            t.host.mkdir(d)
+            t.host.write(t.host.join(d, ".mcp.json"), json.dumps(
+                {"mcpServers": {"docs": {"type": "http", "url": srv.url}}}))
+            dirs.append(d)
+        h = t.headless(env=env)
+        try:
+            words = []
+            for d in dirs:
+                sid = h.call("new", cwd=d, model=t.model, endpoint="fake", attended=1)["sid"]
+                h.send("prompt", sid=sid, text="go")
+                ask = nextask(h, sid)
+                t.check(ask["kind"] == "mcp.project", f"start asked {ask}")
+                h.call("answer", sid=sid, req=ask["req"], decision="allow")
+                call = nextask(h, sid, ask["seq"])
+                h.call("answer", sid=sid, req=call["req"], decision="allow")
+                t.check(ended(h, sid, 1)["why"] == "done", "the turn ends")
+                end = h.all("tool.end", sid)[-1]
+                t.check(end["status"] == "ok", f"called {end}")
+                words.append(end["text"].split("\n")[1])
+            t.check(words == ["first", "second"], f"each its own: {words}")
+        finally:
+            rc = h.close()
+        t.check(rc == 0, f"headless exit {rc}")
+    finally:
+        a.close()
+        b.close()
 
 
 # The web tools, against the fake: PROSPERO_TEST_WEB sends

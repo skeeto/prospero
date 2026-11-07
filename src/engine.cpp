@@ -9834,18 +9834,33 @@ static void mcpstart(Engine *e, Arena scratch, McpServer *m, Session *s)
 // be. Null if the configuration has no such server.
 static McpDef *mcpdefof(Session *s, Arena scratch, Str name);
 
+static Str mcpprojkey(Arena *, McpDef *);
+
+// Whose a server of that name is for a session, as a call must find it
+// still: "config", a project's key (mcpprojkey), or null for none.
+static Str mcporigin(Session *s, Arena *a, Str name)
+{
+    Engine *e   = s->e;
+    b32     cfg = trim(cfgget(e->cfg, "mcp", name, "url", 0)).len ||
+                  trim(cfgget(e->cfg, "mcp", name, "command", 0)).len;
+    McpDef *d   = cfg ? 0 : mcpdefof(s, *a, name);
+    return cfg ? Str("config") : d ? mcpprojkey(a, d) : Str{};
+}
+
 static McpServer *mcpserver(Session *s, Arena scratch, Str name)
 {
     Engine    *e   = s->e;
     Str        url = trim(cfgget(e->cfg, "mcp", name, "url", 0));
-    b32        cfg = url.len || trim(cfgget(e->cfg, "mcp", name, "command", 0)).len;
+    Str        cmd = trim(cfgget(e->cfg, "mcp", name, "command", 0));
+    b32        cfg = url.len || cmd.len;
     McpDef    *d   = cfg ? 0 : mcpdefof(s, scratch, name);
     if (!cfg && !d) {
         return 0;
     }
-    // An HTTP server is one for every folder
-    Str        cwd = d ? (d->url.len ? Str("") : d->dir) :
-                     url.len ? Str("") : mcpcwd(s, &scratch, name);
+    // An HTTP server is one for every folder, by its url, so that no two
+    // urls (two projects', or a project's and the configuration's) share
+    Str        cwd = d ? (d->url.len ? d->url : d->dir) :
+                     url.len ? url : mcpcwd(s, &scratch, name);
     McpServer *m   = mcpfind(e, name, cwd);
     if (!m) {
         m = alloc<McpServer>(&e->perm);
@@ -9853,6 +9868,28 @@ static McpServer *mcpserver(Session *s, Arena scratch, Str name)
         m->cwd  = clone(&e->perm, cwd);
         m->next = e->mcp;
         e->mcp  = m;
+    }
+
+    // What it is defined as: changed, it starts afresh, and never runs
+    // on as another's (a project's process with the configuration's
+    // trust, say)
+    Str origin = d ? mcpprojkey(&scratch, d) : Str("config");
+    Str def    = d ? concat(&scratch, concat(&scratch, origin, "\n"), d->raw)
+                   : concat(&scratch, concat(&scratch, url, "\n"), cmd);
+    if (m->def.data && m->def!=def) {
+        if (m->state != MCP_STOPPED) {
+            Str why = concat(&scratch, concat(&scratch, "The MCP server ", name),
+                             Str(" started again, as its definition changed."));
+            mcpstop(e, scratch, m, why);
+            m->state = MCP_STOPPED;
+        }
+        m->approve  = 0;
+        m->needauth = 0;
+        m->tools    = {};
+    }
+    if (m->def != def) {
+        m->def    = clone(&e->perm, def);
+        m->origin = clone(&e->perm, origin);
     }
     if (d && (m->project!=d->file || m->raw!=d->raw)) {
         // Its definition, kept apart from any session's (and from those
@@ -9911,6 +9948,9 @@ static void mcpoffer(Session *s, Arena scratch)
         McpServer *m = mcpserver(s, scratch, names[i]);
         b32        have = !m;
         for (iz k = 0; m && k < s->mcpsrvs.len; k++) {
+            if (s->mcpsrvs[k]!=m && s->mcpsrvs[k]->name==m->name) {
+                s->mcpsrvs[k] = m;  // another instance now: its url changed
+            }
             have |= s->mcpsrvs[k] == m;
         }
         if (!have) {
@@ -10522,6 +10562,7 @@ static b32 mcpgate(Session *s, Arena scratch)
             c.tool   = clone(&s->perm, t->tool);
             c.desc   = clone(&s->perm, t->desc);
             c.schema = clone(&s->perm, t->schema);
+            c.origin = clone(&s->perm, m->origin);
             add      = push(&scratch, add, c);
             any      = 1;
         }
@@ -10646,9 +10687,14 @@ static void mcpcallsend(Session *s, Arena scratch)
 
 // Run the current call, allowed: sent to its server, or once it is
 // ready. Returns 1 if it ended already, 0 if it waits.
+static b32 mcpmoved(Session *, Arena, McpTool *, b32 started);
+
 static b32 mcprun(Session *s, Arena scratch, McpTool *t)
 {
     Engine    *e = s->e;
+    if (mcpmoved(s, scratch, t, 1)) {
+        return 1;  // while it asked, say
+    }
     McpServer *m = mcpserver(s, scratch, t->server);
     if (!m) {
         Str why = concat(&scratch, concat(&scratch, "The MCP server ", t->server),
@@ -10658,6 +10704,9 @@ static b32 mcprun(Session *s, Arena scratch, McpTool *t)
     }
     b32 have = 0;
     for (iz i = 0; i < s->mcpsrvs.len; i++) {
+        if (s->mcpsrvs[i]!=m && s->mcpsrvs[i]->name==m->name) {
+            s->mcpsrvs[i] = m;
+        }
         have |= s->mcpsrvs[i] == m;
     }
     if (!have) {
@@ -10882,6 +10931,11 @@ static Str mcpwhat(Arena *a, McpTool *t, Str args)
 // define the server. Null for a server that runs a command.
 static Str mcpurlkey(Arena *a, McpServer *m)
 {
+    if (m->project.len) {
+        // A project's, by its definition, so that a grant for it never
+        // holds for the configuration's server of the same name
+        return concat(a, "project:", m->origin);
+    }
     return m->url.len ? cfgsha256(a, m->url) : Str{};
 }
 
@@ -10908,6 +10962,29 @@ static void mcpprojtrust(Session *s, Arena scratch, Str server)
     mcpprojremember(s->e, scratch, defs, keys, 1);
 }
 
+// Whether a tool's server is no longer the one it came from (a
+// project's now, where the configuration's was, say), its call ended
+// unrun: its schema, its grants and its trust were another's. A tool
+// logged before origins were has none, and is not checked.
+static b32 mcpmoved(Session *s, Arena scratch, McpTool *t, b32 started)
+{
+    if (!t->origin.len) {
+        return 0;
+    }
+    Str now = mcporigin(s, &scratch, t->server);
+    if (!now.len || now==t->origin) {
+        return 0;  // gone: the call says so where it would run
+    }
+    Str why = concat(&scratch, concat(&scratch, "Not run: the MCP server ", t->server),
+                     Str(" is not the one this tool came from any more (its "
+                         "definition changed); a new session gets its tools."));
+    if (!started) {
+        toolstart(s, scratch);
+    }
+    toolend(s, scratch, "denied", why, 0, 0, {}, 0);
+    return 1;
+}
+
 // A call to an MCP tool: refused in plan mode unless it only reads,
 // asked about unless its server is trusted (by its section, or a
 // project's for good), a grant covers it or its server, or the session
@@ -10928,6 +11005,8 @@ static b32 mcpcall(Session *s, Arena scratch, McpTool *t)
         toolstart(s, scratch);
         toolend(s, scratch, "denied", "Not run: plan mode is on, and this MCP tool "
                 "does not say that it only reads.", 0, 0, {}, 0);
+        return 1;
+    } else if (mcpmoved(s, scratch, t, 0)) {
         return 1;
     }
     if (m) {
@@ -12668,7 +12747,7 @@ static void putmcpserver(Engine *e, Arena scratch, JsonOut *w, Str name, McpServ
     if (m && m->project.len) {
         putstrkey(w, "file", m->project);
     }
-    if (m && m->cwd.len) {
+    if (m && m->cwd.len && !url.len) {
         putstrkey(w, "cwd", m->cwd);
     }
     putstrkey(w, "transport", url.len ? Str("http") : Str("stdio"));
@@ -14715,6 +14794,9 @@ static void logprefix(Session *s, Arena scratch)
             putstrkey(&w.json, "tool", t->tool);
             if (t->ro) {
                 putintkey(&w.json, "ro", 1);
+            }
+            if (t->origin.len) {
+                putstrkey(&w.json, "origin", t->origin);
             }
             putend(&w.json);
         }
@@ -17548,6 +17630,7 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
                 t.server = clone(&s->perm, jsonstr(jsonget(k, "server")));
                 t.tool   = clone(&s->perm, jsonstr(jsonget(k, "tool")));
                 t.ro     = jsonflag(jsonget(k, "ro"), 0);
+                t.origin = clone(&s->perm, jsonstr(jsonget(k, "origin")));
                 if (t.name.len && t.server.len && t.tool.len) {
                     s->mcptools = push(&s->perm, s->mcptools, t);
                 }

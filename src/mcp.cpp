@@ -69,6 +69,7 @@ struct McpTool {
     Str desc;
     Str schema;  // parameters, as raw JSON
     b32 ro;      // readOnlyHint
+    Str origin;  // a session's: whose server it came from (McpServer)
 };
 
 enum : i32 {
@@ -108,7 +109,12 @@ struct McpPending {
 struct McpServer {
     McpServer        *next;
     Str               name;
-    Str               cwd;       // where it runs: its key, with name
+    Str               cwd;       // where it runs, or an HTTP server's
+                                 // url: its key, with name
+    Str               origin;    // "config", or a project's key
+                                 // (mcpprojkey): calls hold to it
+    Str               def;       // what it was defined as: a change
+                                 // starts it afresh (mcpserver)
     Slice<Str>        argv;
     Slice<Str>        env;       // NAME=value, added to the engine's
     b32               trust;
