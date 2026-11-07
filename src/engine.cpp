@@ -9100,6 +9100,15 @@ enum : i64 {
     MCP_REGION = (i64)1 << (sizeof(void *)==8 ? 28 : 26),
 };
 
+// Whether the configuration defines a server by that name, with a
+// command or a url: a section that defines none only adjusts projects'
+// servers of that name (tools, enabled, timeout, startup_timeout).
+static b32 mcpdefines(Engine *e, Str name)
+{
+    return trim(cfgget(e->cfg, "mcp", name, "command", 0)).len ||
+           trim(cfgget(e->cfg, "mcp", name, "url", 0)).len;
+}
+
 // Where a server runs for a session: its section's cwd, from the
 // session's folder or the home directory, else the session's folder.
 static Str mcpcwd(Session *s, Arena *a, Str name)
@@ -9651,7 +9660,7 @@ static void mcpconf(Engine *e, McpServer *m)
     Config *c  = e->cfg;
     m->startms = cfgms(c, "mcp", m->name, "startup_timeout", 0);
     m->callms  = cfgms(c, "mcp", m->name, "timeout", 0);
-    m->config  = inisection(e->ini, "mcp", m->name) != 0;
+    m->config  = mcpdefines(e, m->name);
 }
 
 // Start a server: its command, its environment, then initialize. A
@@ -10096,11 +10105,13 @@ static i32 mcpprojdecided(Session *s, Arena scratch, Str key)
 }
 
 // The project's server of a name that the session may start: the
-// nearest file's, approved, when no section of the configuration has
-// that name. Null if none.
+// nearest file's, approved, when the configuration defines no server of
+// that name (mcpdefines), nor turns it off. Null if none.
 static McpDef *mcpdefof(Session *s, Arena scratch, Str name)
 {
-    if (inisection(s->e->ini, "mcp", name)) {
+    Engine *e = s->e;
+    if (mcpdefines(e, name) ||
+            cfgbool(trim(cfgget(e->cfg, "mcp", name, "enabled", 0)))==0) {
         return 0;
     }
     for (iz i = 0; i < s->mcpdefs.len; i++) {
@@ -10179,8 +10190,10 @@ static b32 mcpprojgate(Session *s, Arena scratch)
     Slice<Str>      keys = {};
     for (iz i = 0; i < s->mcpdefs.len; i++) {
         McpDef *d = &s->mcpdefs[i];
-        if (inisection(e->ini, "mcp", d->name)) {
+        if (mcpdefines(e, d->name)) {
             continue;  // the configuration's own
+        } else if (cfgbool(trim(cfgget(e->cfg, "mcp", d->name, "enabled", 0))) == 0) {
+            continue;  // turned off, never asked about
         } else if (d->err.len) {
             Str  what = concat(&scratch, "project:", d->name);
             b32  told = 0;
@@ -12070,12 +12083,13 @@ static void mcpunauthorized(Engine *e, Arena scratch, McpServer *m, McpHttp *q)
     }
 }
 
-// The URL of a server by name: its section's, else that of a project's
-// server running by that name. Null if it has none.
+// The URL of a server by name: its section's, where that defines it,
+// else that of a project's server running by that name. Null if it has
+// none.
 static Str mcpurlof(Engine *e, Str name)
 {
     Str url = trim(cfgget(e->cfg, "mcp", name, "url", 0));
-    if (url.len || inisection(e->ini, "mcp", name)) {
+    if (mcpdefines(e, name)) {
         return url;
     }
     for (McpServer *m = e->mcp; m; m = m->next) {
@@ -12114,10 +12128,13 @@ static void cmdmcpauth(Engine *e, Arena scratch, i64 id, Json *j)
     }
     x->cmd      = id;
     x->redirect = clone(&x->arena, redirect);
-    Str client  = trim(cfgget(e->cfg, "mcp", name, "client_id", 0));
-    Str secret  = cfgsecret(e->cfg, &scratch, "mcp", name, "client_secret");
-    Str scope   = trim(cfgget(e->cfg, "mcp", name, "scope", 0));
-    Str cname   = trim(cfgget(e->cfg, "mcp", name, "client_name", 0));
+    // The section's client only for its own url: never for a project's
+    // server of the same name, whose url the project chose
+    b32 own     = url == trim(cfgget(e->cfg, "mcp", name, "url", 0));
+    Str client  = own ? trim(cfgget(e->cfg, "mcp", name, "client_id", 0)) : Str{};
+    Str secret  = own ? cfgsecret(e->cfg, &scratch, "mcp", name, "client_secret") : Str{};
+    Str scope   = own ? trim(cfgget(e->cfg, "mcp", name, "scope", 0)) : Str{};
+    Str cname   = own ? trim(cfgget(e->cfg, "mcp", name, "client_name", 0)) : Str{};
     Str said    = {};
     for (McpServer *m = e->mcp; m; m = m->next) {
         if (m->name==name && m->url==url) {

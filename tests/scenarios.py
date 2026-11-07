@@ -11590,6 +11590,52 @@ def mcp_identity(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+@scenario(conf={"_mcp proj": {"tools": "-where", "trust": "yes",
+                               "header.X-Mine": "env:MINE"}}, bound=30)
+def mcp_overlay(t):
+    """A section with no command or url adjusts a project's server of its
+    name rather than hiding it: its tools apply, its trust and headers
+    never do (a warning says so), and enabled = no leaves the server
+    out, never asked about."""
+    mcpproject(t)
+    env = mcpenv(t, MCP_WORD="w", MINE="secret-mine")
+    h = t.headless(env=env)
+    try:
+        cfg = h.call("config.get")
+        diags = [d["message"] for d in cfg.get("diags", [])]
+        t.check(any("never get trust" in d for d in diags) and
+                any("never get header.X-Mine" in d for d in diags) and
+                not any("neither a command nor a url" in d for d in diags), f"diags {diags}")
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.send("prompt", sid=sid, text="go")
+        ask = nextask(h, sid)
+        t.check(ask["kind"] == "mcp.project", f"the project's server asks: {ask}")
+        h.call("answer", sid=sid, req=ask["req"], decision="allow")
+        call = nextask(h, sid, ask["seq"])
+        t.check(call["kind"] == "mcp" and call["server"] == "proj",
+                f"its call asks, the section's trust not given: {call}")
+        h.call("answer", sid=sid, req=call["req"], decision="allow")
+        t.check(ended(h, sid, 1)["why"] == "done", "the turn ends")
+        names = [x for x in fake_provider.tool_names(t.requests()[-1]["body"])
+                 if x.startswith("mcp__")]
+        t.check("mcp__proj__echo" in names and "mcp__proj__where" not in names,
+                f"the section's tools apply: {names}")
+        t.check("secret-mine" not in t.host.read(t.mcplog), "the section's header not sent")
+
+        r = h.call("config.set", kind="mcp", name="proj", key="enabled", value="no")
+        t.check(r.get("ok") == 1, f"disabled {r}")
+        n = len(t.requests())
+        s2 = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.send("prompt", sid=s2, text="go")
+        t.check(ended(h, s2, 1)["why"] == "done", "a later session's turn ends")
+        t.check(not h.all("ask", s2), f"nothing asked: {h.all('ask', s2)}")
+        names = fake_provider.tool_names(t.requests()[n]["body"])
+        t.check(not [x for x in names if x.startswith("mcp__")], f"none offered {names}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 @scenario(conf=mcpconf(trust="yes", tools="echo"), bound=30)
 def mcp_untick(t):
     """A tools key read as it is now: a tool turned off mid-session stays
@@ -11887,6 +11933,41 @@ def mcp_oauth_client(t):
     tok = [m for m in log if m.get("_oauth") == "/as/token"]
     t.check(tok and tok[0].get("client_secret") == "sh!" and
             tok[0].get("redirect_uri") == redirect, "the token request")
+
+
+@scenario(bound=40)
+def mcp_overlay_auth(t):
+    """Signing in to a project's HTTP server that a section of the same
+    name adjusts registers a client of its own: the section's client_id
+    and client_secret are never sent to a url the project chose."""
+    env = mcpenv(t, WEB_SECRET="sh!")
+    client = {"client_id": "pre-1", "client_secret": "sh!",
+              "redirect_uris": ["http://127.0.0.1:9/callback"]}
+    srv = McpHttpServer(t, oauth=True, FAKE_MCP_CLIENT=json.dumps(client))
+    try:
+        t.put(".mcp.json", json.dumps({"mcpServers": {"docs": {"type": "http",
+                                                               "url": srv.url}}}))
+        addconf(t, "[mcp docs]\ntools = -where\nclient_id = pre-1\n"
+                   "client_secret = env:WEB_SECRET\n")
+        h = t.headless(env=env)
+        try:
+            sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+            h.send("prompt", sid=sid, text="go")
+            ask = nextask(h, sid)
+            h.call("answer", sid=sid, req=ask["req"], decision="allow")
+            ended(h, sid, 1)
+            r = h.call("mcp.auth", name="docs", redirect="http://127.0.0.1:9/callback")
+            t.check(r.get("ok") == 1 and "pre-1" not in json.dumps(r), f"auth {r}")
+        finally:
+            rc = h.close()
+        t.check(rc == 0, f"headless exit {rc}")
+    finally:
+        srv.close()
+    log = mcplog(t)
+    oauth = [m["_oauth"] for m in log if "_oauth" in m]
+    t.check("/as/register" in oauth, f"a client of its own registered: {oauth}")
+    t.check(not any(m.get("client_secret") == "sh!" or m.get("client_id") == "pre-1"
+                    for m in log), "the section's client never sent")
 
 
 @scenario(bound=30)

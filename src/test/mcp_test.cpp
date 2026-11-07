@@ -270,7 +270,10 @@ static void test_mcp(Test *t)
             "token = file:~/t.key\n"
             "trust = yes\n"
             "[web]\n"
-            "key = file:~/w.key\n");          // 15
+            "key = file:~/w.key\n"            // 15
+            "[mcp proj]\n"
+            "tools = -x\n"
+            "token = env:HOME\n");
         os_write(v.os, b, "/home/u/t.key", "tk\n");
         os_write(v.os, b, "/home/u/w.key", "wk\n");
         os_write(v.os, b, "/c/team.ini",
@@ -295,10 +298,14 @@ static void test_mcp(Test *t)
         expect(t, "mcp sections", inidiags(&b, c->ini),
             "/c/prospero.ini:2:2: warning: mcp both has both a command and a url: "
             "set one of them\n"
-            "/c/prospero.ini:5:2: warning: mcp none has neither a command nor a url\n"
+            "/c/prospero.ini:5:2: warning: mcp none has neither a command nor a url, "
+            "so it only adjusts projects' servers of that name, with tools, enabled, "
+            "timeout or startup_timeout\n"
             "/c/prospero.ini:10:9: warning: a plaintext secret: write env:NAME and "
             "set the variable, or file:PATH, so that this file can be shared\n"
-            "/c/team.ini:1:2: warning: mcp shared has neither a command nor a url\n"
+            "/c/team.ini:1:2: warning: mcp shared has neither a command nor a url, "
+            "so it only adjusts projects' servers of that name, with tools, enabled, "
+            "timeout or startup_timeout\n"
             "/c/team.ini:2:11: error: [mcp] command in an included file is ignored, "
             "since it chooses what runs: set it in your own file (an included file "
             "may give a server by its url)\n"
@@ -317,7 +324,10 @@ static void test_mcp(Test *t)
             "by its url or command, which an included file cannot change\n"
             "/c/team.ini:16:7: error: [web] ask = false in an included file is "
             "ignored, since it lets the agent search and read unasked: set it in "
-            "your own file");
+            "your own file\n"
+            "/c/prospero.ini:18:1: warning: [mcp proj] has no command or url, so it "
+            "only adjusts projects' servers of that name, which never get token: a "
+            "project chooses where they run");
         expect(t, "mcp shared command", cfgget(c, "mcp", "shared", "command", 0), "");
         expect(t, "mcp remote url", cfgget(c, "mcp", "remote", "url", 0), "https://team/mcp");
         expect(t, "mcp remote trust", cfgget(c, "mcp", "remote", "trust", 0), "yes");  // ours

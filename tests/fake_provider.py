@@ -2729,6 +2729,14 @@ def sc_mcp_identity(model, n, req):
         "Turn two."])
 
 
+def sc_mcp_overlay(model, n, req):
+    yield from mcp_steps(model, n, req, [("mcp__proj__echo", {"text": "x"}), "Done."])
+
+
+def sc_mcp_overlay_auth(model, n, req):
+    yield from mcp_steps(model, n, req, ["Nothing to call."])
+
+
 def sc_mcp_untick(model, n, req):
     yield from mcp_steps(model, n, req, [
         ("mcp__fake__echo", {"text": "a"}), "One.",

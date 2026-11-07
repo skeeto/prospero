@@ -981,7 +981,10 @@ static i32 mcpmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
         }
     } else {
         Arena a    = scratch;
-        Str   uri  = ep ? Str{} : trim(cfgget(cfg, "mcp", name, "redirect_uri", 0));
+        // A section's redirect_uri only for a server it defines by url,
+        // not a project's of the same name
+        b32   own  = trim(cfgget(cfg, "mcp", name, "url", 0)).len > 0;
+        Str   uri  = ep || !own ? Str{} : trim(cfgget(cfg, "mcp", name, "redirect_uri", 0));
         Url   at   = loopbackuri(uri);
         i32   port = at.ok ? at.port : 0;
         Str   back = ep ? chatgptloopback(os, &a, c.out, MCPCLI_LOOP, 0) : Str{};

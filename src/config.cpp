@@ -2050,7 +2050,14 @@ static void cfgsectionline(Ini *ini, Arena *perm, IniFile *f, IniFile *user,
                        !inientry(l->section, "url");
     b32      mcpcmd  = k && l->key=="mcp" && cfgheeded(user, l->section, "command");
     b32      mcpurl  = k && l->key=="mcp" && cfgheeded(user, l->section, "url");
-    b32      mcpbad  = k && l->key=="mcp" && l->value.len && mcpcmd==mcpurl;
+    // A section of neither only adjusts projects' servers of its name:
+    // odd only when it adjusts nothing
+    b32      mcpadj  = k && l->key=="mcp" &&
+                       (inientry(l->section, "tools") || inientry(l->section, "enabled") ||
+                        inientry(l->section, "timeout") ||
+                        inientry(l->section, "startup_timeout"));
+    b32      mcpbad  = k && l->key=="mcp" && l->value.len && mcpcmd==mcpurl &&
+                       (mcpcmd || !mcpadj);
     IniEntry *search = k && l->key=="web" ? inientry(l->section, "search") : 0;
     b32      webbad  = search && trim(search->value)=="searxng" &&
                        !inientry(l->section, "url");
@@ -2082,7 +2089,9 @@ static void cfgsectionline(Ini *ini, Arena *perm, IniFile *f, IniFile *user,
         print(&b, "mcp ");
         print(&b, l->value);
         print(&b, mcpcmd ? Str(" has both a command and a url: set one of them")
-                         : Str(" has neither a command nor a url"));
+                         : Str(" has neither a command nor a url, so it only "
+                               "adjusts projects' servers of that name, with tools, "
+                               "enabled, timeout or startup_timeout"));
     } else if (webbad) {
         print(&b, "[web] search is searxng but has no url: set it to the "
                   "instance's URL");
@@ -2233,6 +2242,17 @@ static void cfglikecheck(Ini *ini, Arena *perm, Str name, IniEntry *e)
 
 // Check a load against the schema, adding diagnostics to it. The user's
 // file may be null.
+// Whether an [mcp] key is one a section with no command or url never
+// gives a project's server of its name, which that name alone matches
+// (any project may name a server after one of the user's).
+static b32 cfgnotoverlay(Str key)
+{
+    return key=="trust" || key=="token" || key=="client_id" ||
+           key=="client_secret" || key=="scope" || key=="client_name" ||
+           key=="redirect_uri" || key=="cwd" || startswith(key, "header.") ||
+           startswith(key, "env.");
+}
+
 static void cfgvalidate(Config *c, Ini *ini, IniFile *user, Arena *perm)
 {
     for (IniFile *f = ini->files; f; f = f->next) {
@@ -2293,6 +2313,24 @@ static void cfgvalidate(Config *c, Ini *ini, IniFile *user, Arena *perm)
                     cfgreport(ini, perm, e->file, e->line, INI_WARNING,
                               e->line->valbeg, msg);
                 }
+            }
+            b32 adjusts = inientry(s, "tools") || inientry(s, "enabled") ||
+                          inientry(s, "timeout") || inientry(s, "startup_timeout");
+            if (s->kind=="mcp" && s->name.len && v.len && cfgnotoverlay(e->key) && adjusts &&
+                    !(inientry(s, "command") && trim(inientry(s, "command")->value).len) &&
+                    !(inientry(s, "url") && trim(inientry(s, "url")->value).len)) {
+                Str msg = {};
+                if (!cfgmuted(e->file)) {
+                    Buf b(perm, 256);
+                    print(&b, "[mcp ");
+                    print(&b, s->name);
+                    print(&b, "] has no command or url, so it only adjusts "
+                              "projects' servers of that name, which never get ");
+                    print(&b, e->key);
+                    print(&b, ": a project chooses where they run");
+                    msg = finish(&b);
+                }
+                cfgreport(ini, perm, e->file, e->line, INI_WARNING, e->line->keybeg, msg);
             }
             if (s->kind=="role" && e->key=="prompt_file" && v.len &&
                     !cfgfromweb(e->file)) {

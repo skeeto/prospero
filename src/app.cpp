@@ -2636,7 +2636,9 @@ static void mcpsignin(Gui *g, Str name)
     if (g->mcpname.len) {
         return;
     }
-    Str uri  = trim(mcprow(g, name, "redirect_uri"));
+    // Only for a server the section defines by url, not a project's
+    Str uri  = trim(mcprow(g, name, "url")).len ? trim(mcprow(g, name, "redirect_uri"))
+                                                 : Str{};
     Url at   = loopbackuri(uri);
     i32 port = at.ok ? at.port : 0;
     u64 back = ++g->mcpback;
