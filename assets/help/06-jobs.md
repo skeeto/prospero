@@ -51,6 +51,12 @@ those a role has when it names none (every tool but desktop), and
 tool, and `tools = * -shell` gives every tool but the shell. The New
 session dialog's Role starts a session in a role, too.
 
+A role's `prompt` is added to the system prompt. A longer one can go
+in a file, `prompt_file = roles/writer.md`, relative to the
+configuration file that sets it (or absolute, or under `~`), added
+after `prompt`. It is read as each session starts, so an edit counts
+from the next session on. An include by URL cannot set it.
+
 A subagent shows under its parent in the sidebar, folded away by its
 arrow. A subagent cannot be resumed, so once three or more under one
 parent are finished, they gather in a "finished" row of their own

@@ -19,7 +19,8 @@
 // key = env:NAME or key = file:PATH, resolved when used. A plaintext
 // secret in the user's own file is used, with a warning; in an included
 // (shared) file it is an error and ignored, as is file:PATH there,
-// which could send any of the user's files, and any setting of a
+// which could send any of the user's files (as could a role's
+// prompt_file, refused in a file from the web), and any setting of a
 // [remote] section, which chooses a program to run and where (ssh,
 // path, state, config, deploy), of a [shell] section, which chooses a
 // program to run, or of the [desktop] section, which lets the agent use
@@ -414,6 +415,10 @@ static CfgKey cfgschema[] = {
      "What the role is for, for an agent choosing one for a subagent"},
     {"role", "prompt", CFG_STRING, "", {}, {}, "role",
      "Instructions added to the system prompt"},
+    {"role", "prompt_file", CFG_STRING, "", {}, {}, "role",
+     "A file of instructions added to the system prompt after prompt, read "
+     "when a session starts: absolute, under ~, or relative to the file "
+     "that sets it, at most 256 KiB; not from an include by URL"},
     {"role", "endpoint", CFG_STRING, "", {}, {}, "role",
      "Endpoint for the role, by default the session's, or a subagent's parent's"},
     {"role", "model", CFG_STRING, "", {}, {}, "role",
@@ -1792,6 +1797,37 @@ static b32 cfgfromweb(IniFile *f)
     return 0;
 }
 
+#define CFG_PROMPTMAX (256<<10)
+
+// The file a role's prompt_file names, e: ~ the home directory, and a
+// relative path against the directory of the file that sets it. Null
+// when unset, or when it comes from the web, which could otherwise send
+// any of the user's files to the model.
+static Str cfgpromptpath(Config *c, Arena *perm, IniEntry *e)
+{
+    Str p = e ? trim(e->value) : Str{};
+    if (!p.len || cfgfromweb(e->file)) {
+        return {};
+    } else if (cfgtilde(p)) {
+        Str home = userhome(c->os, perm);
+        return home.len ? concat(perm, home, cuthead(p, 1)) : Str{};
+    }
+    return inipath(perm, inidir(e->file->path), p);
+}
+
+// A role's prompt_file, read and trimmed: null when unset, unreadable,
+// or over CFG_PROMPTMAX.
+static Str cfgrolepromptfile(Config *c, Arena *perm, Str name)
+{
+    IniEntry *e    = name.len ? inilookup(c->ini, "role", name, "prompt_file") : 0;
+    Str       path = cfgpromptpath(c, perm, e);
+    if (!path.len) {
+        return {};
+    }
+    Read r = os_read(c->os, perm, path, CFG_PROMPTMAX);
+    return r.err==READ_OK ? trim(r.data) : Str{};
+}
+
 // A credential's item, by its value: env:NAME, whoever wrote it, or
 // the setting itself when the user's own file gives the secret (as
 // file:PATH or written out), else null.
@@ -2135,6 +2171,15 @@ static void cfgkeyline(Ini *ini, Arena *perm, IniFile *f, IniFile *user,
         cfgreport(ini, perm, f, l, INI_ERROR, l->keybeg, msg);
         return;
     }
+    if (s->kind=="role" && l->key=="prompt_file" && trim(l->value).len &&
+            cfgfromweb(f)) {
+        cfgreport(ini, perm, f, l, INI_ERROR, l->valbeg,
+                  cfgmuted(f) ? Str{} :
+                  Str("a prompt file in an include by URL is ignored, since "
+                      "it could send any of your files to the model: set it "
+                      "in your own file or a local include"));
+        return;
+    }
     i32 j = cfgjudge(key, l->value, shared);
     if (j != CFG_OK) {
         Str msg = {};
@@ -2242,6 +2287,27 @@ static void cfgvalidate(Config *c, Ini *ini, IniFile *user, Arena *perm)
                         msg = concat(perm, path.len ? path : trim(cuthead(v, 5)),
                                      path.len ? Str(" cannot be read, or is empty")
                                               : Str(": no home directory is known"));
+                    }
+                    cfgreport(ini, perm, e->file, e->line, INI_WARNING,
+                              e->line->valbeg, msg);
+                }
+            }
+            if (s->kind=="role" && e->key=="prompt_file" && v.len &&
+                    !cfgfromweb(e->file)) {
+                Str   path = cfgpromptpath(c, perm, e);
+                Arena tmp  = *perm;
+                Read  r    = {};
+                r.err = READ_NOTFOUND;
+                if (path.len) {
+                    r = os_read(c->os, &tmp, path, CFG_PROMPTMAX);
+                }
+                if (r.err != READ_OK) {
+                    Str msg = {};
+                    if (!cfgmuted(e->file)) {
+                        msg = !path.len ? Str("no home directory is known")
+                            : r.err==READ_TOOBIG
+                            ? concat(perm, path, " is over 256 KiB, so it is ignored")
+                            : concat(perm, path, " cannot be read, so it is ignored");
                     }
                     cfgreport(ini, perm, e->file, e->line, INI_WARNING,
                               e->line->valbeg, msg);

@@ -4931,6 +4931,45 @@ def role_tools(t):
             f"nope {ends[2]}")
 
 
+PROMPTFILES = """[role filed]
+prompt = Inline first. INLINE-MARK
+prompt_file = roles/filed.md
+[role onlyfile]
+description = Has only a file
+prompt_file = ~/child.md
+"""
+
+
+@scenario(conf={"_extra": PROMPTFILES}, bound=20)
+def role_prompt_file(t):
+    """A role's prompt_file, relative to the configuration file or under
+    ~, follows its prompt in the system prompt, read as each session
+    starts, a subagent's too."""
+    t.host.mkdir(t.host.join(t.base, "roles"))
+    t.host.write(t.host.join(t.base, "roles", "filed.md"), "\nFrom the file. FILE-MARK\n")
+    t.host.write(t.host.join(t.home, "child.md"), "Child's own. CHILD-MARK\n")
+    r = t.run(extra=["-r", "filed"])
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    own, kids = r.sessions()
+    rec = r.all("session", own)[0]
+    t.check(rec["prompt"] == "Inline first. INLINE-MARK\n\nFrom the file. FILE-MARK",
+            f"record {rec}")
+    t.check(len(kids) == 1 and kids[0]["role"] == "onlyfile", f"kids {kids}")
+    sysps = [fake_provider.system_of(q["body"]) for q in t.requests()]
+    parent = [x for x in sysps if "# Your role: filed" in x]
+    child = [x for x in sysps if "# Your role: onlyfile" in x]
+    t.check(parent and "INLINE-MARK" in parent[0] and "FILE-MARK" in parent[0] and
+            parent[0].index("INLINE-MARK") < parent[0].index("FILE-MARK"), "parent's prompt")
+    t.check(child and "CHILD-MARK" in child[0], "child's prompt")
+
+    t.host.write(t.host.join(t.base, "roles", "filed.md"), "Changed. NEW-MARK")
+    r = t.run(extra=["-r", "filed"])
+    own, _ = r.sessions()
+    rec = r.all("session", own)[0]
+    t.check(rec["prompt"] == "Inline first. INLINE-MARK\n\nChanged. NEW-MARK",
+            f"read again {rec}")
+
+
 PARK = {"PROSPERO_TEST_MINUTE_MS": "20"}  # parked after 140 ms idle
 
 

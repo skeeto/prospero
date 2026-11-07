@@ -15019,6 +15019,20 @@ static Role findrole(Engine *e, Str name)
     return r;
 }
 
+// A role's instructions, in perm: its prompt, then its prompt_file's
+// contents, read now so that the session keeps them as they were.
+static Str roleprompt(Engine *e, Arena *perm, Arena scratch, Role r)
+{
+    Str file = cfgrolepromptfile(e->cfg, &scratch, r.name);
+    if (!file.len) {
+        return clone(perm, r.prompt);
+    } else if (!r.prompt.len) {
+        return clone(perm, file);
+    }
+    Str p = concat(perm, r.prompt, "\n\n");
+    return concat(perm, p, file);
+}
+
 // The roles there are: the built-in ones, then the configuration's in
 // its order.
 static Slice<Str> rolenames(Engine *e, Arena *a)
@@ -15232,7 +15246,7 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err)
     modelconf(e, &s->perm, s->ep.name, s->model, &s->mc);
     s->te.edit = s->mc.edit;
     s->role    = clone(&s->perm, r.name);
-    s->rolepr  = clone(&s->perm, r.prompt);
+    s->rolepr  = roleprompt(e, &s->perm, scratch, r);
     s->depth   = p->depth + 1;
     s->te.deny = r.deny | (s->depth>=TASK_DEPTH ? (u32)1<<TOOL_TASK : 0) |
                  deskdeny(e, scratch, 1) | skilldeny(e) | webdeny(e) |
@@ -16962,7 +16976,7 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
     s->model      = clone(&s->perm, model);
     s->attended   = jsonflag(jsonget(j, "attended"), 0);
     s->role       = clone(&s->perm, role.name);
-    s->rolepr     = clone(&s->perm, role.prompt);
+    s->rolepr     = roleprompt(e, &s->perm, scratch, role);
     s->te.deny    = role.deny | (tools.data ? tooldeny(tools) : 0) |
                     deskdeny(e, scratch, role.ok) | skilldeny(e) | webdeny(e);
     if (task.ok) {

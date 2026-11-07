@@ -659,6 +659,29 @@ def remote_shared(t):
         t.same((s["file"], s["valid"]), (url, 0), k)
 
 
+@case()
+def prompt_file(t):
+    """A role's prompt_file resolves against the file that sets it; one
+    from an include by URL is refused, since it could send any of the
+    user's files to the model, and one that cannot be read is named."""
+    t.page("team.ini", body="[role team]\nprompt_file = /etc/passwd\n")
+    url = f"{t.url}/team.ini"
+    sub = t.host.join(t.base, "sub")
+    t.host.mkdir(sub)
+    t.host.write(t.host.join(sub, "local.ini"), "[role local]\nprompt_file = local.md\n")
+    t.host.write(t.host.join(sub, "local.md"), "Local instructions.\n")
+    t.write(f"include = {url}\ninclude = sub/local.ini\n"
+            "[role mine]\nprompt_file = missing.md\n")
+    c = t.run()
+    missing = t.host.join(t.base, "missing.md")
+    t.same(c.diags(), [
+        f"{url}:2:15: error: a prompt file in an include by URL is ignored, since "
+        f"it could send any of your files to the model: set it in your own file "
+        f"or a local include",
+        f"{t.config}:4:15: warning: {missing} cannot be read, so it is ignored",
+    ], "diagnostics")
+
+
 @case(bound=40)
 def serve_nowait(t):
     """A host never waits for a URL include with no cached copy: with its

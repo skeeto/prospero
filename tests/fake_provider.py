@@ -1761,6 +1761,17 @@ def sc_role_tools_b(model, n, req):
     yield from answer(model, "Fast report.")
 
 
+def sc_role_prompt_file(model, n, req):
+    sysp = system_of(req)
+    if "# Your role: onlyfile" in sysp:
+        yield from answer(model, "Child read its file.")
+    elif step(req) == 0:
+        yield from tool(model, n, "task", {"description": "File", "prompt": "Go.",
+                                           "role": "onlyfile"})
+    else:
+        yield from answer(model, "Done.")
+
+
 def sc_park_revive(model, n, req):
     if step(req) == 0:
         yield from answer(model, "First answer.")
