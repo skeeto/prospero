@@ -1,0 +1,201 @@
+[?1049h[24;1H[?1h=ariel recording input: plain text, colors, wide characters, long lines[m
+     1  The quick brown fox jumps over the lazy dog.[m
+     2  Ünïcödé: café, naïve, résumé, 中文字符, 日本語, 한국어[m
+     3  Emoji: 👍 🎉 🇺🇸 👨‍👩‍👧[m
+     4  A long line that goes on and on past the edge of the terminal so that le[m ss has to wrap it onto the next row, and then some more words to be sure it wrap[m s twice at eighty columns.[m
+     5  Tabs:   one     two     three   end[m
+     6  line 6 of the test input, ......[m
+     7  line 7 of the test input, .......[m
+     8  line 8 of the test input, ........[m
+     9  line 9 of the test input, .........[m
+    10  line 10 of the test input, ..........[m
+    11  line 11 of the test input, ...........[m
+    12  line 12 of the test input, ............[m
+    13  line 13 of the test input, .............[m
+    14  line 14 of the test input, ..............[m
+    15  line 15 of the test input, ...............[m
+    16  line 16 of the test input, ................[m
+    17  line 17 of the test input, .................[m
+    18  line 18 of the test input, ..................[m
+    19  line 19 of the test input, ...................[m
+    20  line 20 of the test input, ....................[m
+[7mns/src/harness/.claude/worktrees/issue-9-review-605a72/ariel/tests/rec/input.txt[27m[K[K    21  line 21 of the test input, .....................[m
+    22  line 22 of the test input, ......................[m
+    23  line 23 of the test input, .......................[m
+    24  line 24 of the test input, ........................[m
+    25  line 25 of the test input, .........................[m
+    26  line 26 of the test input, ..........................[m
+    27  line 27 of the test input, ...........................[m
+    28  line 28 of the test input, ............................[m
+    29  line 29 of the test input, .............................[m
+    30  line 30 of the test input, [m
+    31  line 31 of the test input, .[m
+    32  line 32 of the test input, ..[m
+    33  line 33 of the test input, ...[m
+    34  line 34 of the test input, ....[m
+    35  line 35 of the test input, .....[m
+    36  line 36 of the test input, ......[m
+    37  line 37 of the test input, .......[m
+    38  line 38 of the test input, ........[m
+    39  line 39 of the test input, .........[m
+    40  line 40 of the test input, ..........[m
+    41  line 41 of the test input, ...........[m
+    42  line 42 of the test input, ............[m
+    43  line 43 of the test input, .............[m
+:[K[K    44  line 44 of the test input, ..............[m
+    45  line 45 of the test input, ...............[m
+    46  line 46 of the test input, ................[m
+    47  line 47 of the test input, .................[m
+    48  line 48 of the test input, ..................[m
+    49  line 49 of the test input, ...................[m
+    50  line 50 of the test input, ....................[m
+    51  line 51 of the test input, .....................[m
+    52  line 52 of the test input, ......................[m
+    53  line 53 of the test input, .......................[m
+    54  line 54 of the test input, ........................[m
+    55  line 55 of the test input, .........................[m
+    56  line 56 of the test input, ..........................[m
+    57  line 57 of the test input, ...........................[m
+    58  line 58 of the test input, ............................[m
+    59  line 59 of the test input, .............................[m
+    60  line 60 of the test input, [m
+    61  line 61 of the test input, .[m
+    62  line 62 of the test input, ..[m
+    63  line 63 of the test input, ...[m
+    64  line 64 of the test input, ....[m
+    65  line 65 of the test input, .....[m
+    66  line 66 of the test input, ......[m
+:[K[K[HM    43  line 43 of the test input, .............[m
+[HM    42  line 42 of the test input, ............[m
+[HM    41  line 41 of the test input, ...........[m
+[HM    40  line 40 of the test input, ..........[m
+[HM    39  line 39 of the test input, .........[m
+[HM    38  line 38 of the test input, ........[m
+[HM    37  line 37 of the test input, .......[m
+[HM    36  line 36 of the test input, ......[m
+[HM    35  line 35 of the test input, .....[m
+[HM    34  line 34 of the test input, ....[m
+[HM    33  line 33 of the test input, ...[m
+[HM    32  line 32 of the test input, ..[m
+[HM    31  line 31 of the test input, .[m
+[HM    30  line 30 of the test input, [m
+[HM    29  line 29 of the test input, .............................[m
+[HM    28  line 28 of the test input, ............................[m
+[HM    27  line 27 of the test input, ...........................[m
+[HM    26  line 26 of the test input, ..........................[m
+[HM    25  line 25 of the test input, .........................[m
+[HM    24  line 24 of the test input, ........................[m
+[HM    23  line 23 of the test input, .......................[m
+[HM    22  line 22 of the test input, ......................[m
+[HM    21  line 21 of the test input, .....................[m
+[24;1H[K:[K[K/[Kll[Kii[Knn[Kee[K  [K44[K00[K[1;1H[K    21  line 21 of the test input, .....................[m
+[2;1H[K    22  line 22 of the test input, ......................[m
+[3;1H[K    23  line 23 of the test input, .......................[m
+[4;1H[K    24  line 24 of the test input, ........................[m
+[5;1H[K    25  line 25 of the test input, .........................[m
+[6;1H[K    26  line 26 of the test input, ..........................[m
+[7;1H[K    27  line 27 of the test input, ...........................[m
+[8;1H[K    28  line 28 of the test input, ............................[m
+[9;1H[K    29  line 29 of the test input, .............................[m
+[10;1H[K    30  line 30 of the test input, [m
+[11;1H[K    31  line 31 of the test input, .[m
+[12;1H[K    32  line 32 of the test input, ..[m
+[13;1H[K    33  line 33 of the test input, ...[m
+[14;1H[K    34  line 34 of the test input, ....[m
+[15;1H[K    35  line 35 of the test input, .....[m
+[16;1H[K    36  line 36 of the test input, ......[m
+[17;1H[K    37  line 37 of the test input, .......[m
+[18;1H[K    38  line 38 of the test input, ........[m
+[19;1H[K    39  line 39 of the test input, .........[m
+[20;1H[K    40  line 40 of the test input, ..........[m
+[21;1H[K    41  line 41 of the test input, ...........[m
+[22;1H[K    42  line 42 of the test input, ............[m
+[23;1H[K    43  line 43 of the test input, .............[m
+[24;1H[1;1H[K    21  line 21 of the test input, .....................[m
+[2;1H[K    22  line 22 of the test input, ......................[m
+[3;1H[K    23  line 23 of the test input, .......................[m
+[4;1H[K    24  line 24 of the test input, ........................[m
+[5;1H[K    25  line 25 of the test input, .........................[m
+[6;1H[K    26  line 26 of the test input, ..........................[m
+[7;1H[K    27  line 27 of the test input, ...........................[m
+[8;1H[K    28  line 28 of the test input, ............................[m
+[9;1H[K    29  line 29 of the test input, .............................[m
+[10;1H[K    30  line 30 of the test input, [m
+[11;1H[K    31  line 31 of the test input, .[m
+[12;1H[K    32  line 32 of the test input, ..[m
+[13;1H[K    33  line 33 of the test input, ...[m
+[14;1H[K    34  line 34 of the test input, ....[m
+[15;1H[K    35  line 35 of the test input, .....[m
+[16;1H[K    36  line 36 of the test input, ......[m
+[17;1H[K    37  line 37 of the test input, .......[m
+[18;1H[K    38  line 38 of the test input, ........[m
+[19;1H[K    39  line 39 of the test input, .........[m
+[20;1H[K    40  [7mline 40[27m of the test input, ..........[m
+[21;1H[K    41  line 41 of the test input, ...........[m
+[22;1H[K    42  line 42 of the test input, ............[m
+[23;1H[K    43  line 43 of the test input, .............[m
+[24;1H    44  line 44 of the test input, ..............[m
+    45  line 45 of the test input, ...............[m
+    46  line 46 of the test input, ................[m
+    47  line 47 of the test input, .................[m
+    48  line 48 of the test input, ..................[m
+    49  line 49 of the test input, ...................[m
+    50  line 50 of the test input, ....................[m
+    51  line 51 of the test input, .....................[m
+    52  line 52 of the test input, ......................[m
+    53  line 53 of the test input, .......................[m
+    54  line 54 of the test input, ........................[m
+    55  line 55 of the test input, .........................[m
+    56  line 56 of the test input, ..........................[m
+    57  line 57 of the test input, ...........................[m
+    58  line 58 of the test input, ............................[m
+    59  line 59 of the test input, .............................[m
+    60  line 60 of the test input, [m
+    61  line 61 of the test input, .[m
+    62  line 62 of the test input, ..[m
+:[K[K/[K[K[7mPattern not found  (press RETURN)[27m[24;1H[K[K...skipping...
+    98  line 98 of the test input, ........[m
+    99  line 99 of the test input, .........[m
+   100  line 100 of the test input, ..........[m
+   101  line 101 of the test input, ...........[m
+   102  line 102 of the test input, ............[m
+   103  line 103 of the test input, .............[m
+   104  line 104 of the test input, ..............[m
+   105  line 105 of the test input, ...............[m
+   106  line 106 of the test input, ................[m
+   107  line 107 of the test input, .................[m
+   108  line 108 of the test input, ..................[m
+   109  line 109 of the test input, ...................[m
+   110  line 110 of the test input, ....................[m
+   111  line 111 of the test input, .....................[m
+   112  line 112 of the test input, ......................[m
+   113  line 113 of the test input, .......................[m
+   114  line 114 of the test input, ........................[m
+   115  line 115 of the test input, .........................[m
+   116  line 116 of the test input, ..........................[m
+   117  line 117 of the test input, ...........................[m
+   118  line 118 of the test input, ............................[m
+   119  line 119 of the test input, .............................[m
+   120  line 120 of the test input, [m
+[7m(END)[27m[K[K[H[2J[HM    20  line 20 of the test input, ....................[m
+[HM    19  line 19 of the test input, ...................[m
+[HM    18  line 18 of the test input, ..................[m
+[HM    17  line 17 of the test input, .................[m
+[HM    16  line 16 of the test input, ................[m
+[HM    15  line 15 of the test input, ...............[m
+[HM    14  line 14 of the test input, ..............[m
+[HM    13  line 13 of the test input, .............[m
+[HM    12  line 12 of the test input, ............[m
+[HM    11  line 11 of the test input, ...........[m
+[HM    10  line 10 of the test input, ..........[m
+[HM     9  line 9 of the test input, .........[m
+[HM     8  line 8 of the test input, ........[m
+[HM     7  line 7 of the test input, .......[m
+[HM     6  line 6 of the test input, ......[m
+[HM     5  Tabs:   one     two     three   end[m
+[HMs twice at eighty columns.[m
+[HMss has to wrap it onto the next row, and then some more words to be sure it wrap[m[HM     4  A long line that goes on and on past the edge of the terminal so that le[m[HM     3  Emoji: 👍 🎉 🇺🇸 👨‍👩‍👧[m
+[HM     2  Ünïcödé: café, naïve, résumé, 中文字符, 日本語, 한국어[m
+[HM     1  The quick brown fox jumps over the lazy dog.[m
+[HMariel recording input: plain text, colors, wide characters, long lines[m
+[24;1H[K:[K

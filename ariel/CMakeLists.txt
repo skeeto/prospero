@@ -51,15 +51,26 @@ if(ARIEL_TESTS)
   target_compile_options(ariel_test PRIVATE -Wno-conversion)
   file(GLOB ARIEL_SCRIPTS CONFIGURE_DEPENDS
     RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}/tests
-    ${CMAKE_CURRENT_SOURCE_DIR}/tests/*.test)
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/*.test
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/vterm/*.test)
+  file(GLOB ARIEL_RECORDINGS CONFIGURE_DEPENDS
+    RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}/tests
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/rec/*.vt)
   add_test(NAME ariel_unit
-    COMMAND ariel_test grapheme.txt emoji.txt ${ARIEL_SCRIPTS}
+    COMMAND ariel_test grapheme.txt emoji.txt ${ARIEL_SCRIPTS} ${ARIEL_RECORDINGS}
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 endif()
 
 if(ARIEL_TOOLS)
   add_executable(ariel-replay tools/replay.c)
   ariel_flags(ariel-replay)
+  # forkpty, and POSIX declarations beside strict C11
+  if(NOT WIN32)
+    target_compile_definitions(ariel-replay PRIVATE _DEFAULT_SOURCE _DARWIN_C_SOURCE)
+    if(NOT APPLE)
+      target_link_libraries(ariel-replay PRIVATE util)
+    endif()
+  endif()
   add_executable(ariel-fuzz tests/fuzz.c)
   ariel_flags(ariel-fuzz)
 endif()

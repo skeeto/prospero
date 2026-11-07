@@ -1,0 +1,17 @@
+[?2004hbash%echo one two three
+[?2004lone two three
+[?2004hbash%printf '\e[1;31mred\e[0m \e[4mul\e[0m \e[38;5;208morange\e[0m\n'
+[?2004l[1;31mred[0m [4mul[0m [38;5;208morange[0m
+[?2004hbash%echo abc[C[C[C[C[C[2@: [C[C[C[C[C[C[C[C def
+[?2004l[?2004hbash%: echo abc def[C[C[C[C[C[Kfalse; echo status $?
+[?2004lstatus 1
+[?2004hbash%printf '中文 wide\n'; echo café
+[?2004l中文 wide
+café
+[?2004hbash%for i in 1 2 3; do echo "row $i"; done
+[?2004lrow 1
+row 2
+row 3
+[?2004hbash%echo partial[K[Ktyped again
+[?2004lbash: typed: command not found
+[?2004hbash%

@@ -1,0 +1,9 @@
+# bash: prompt, editing, history, a colored command
+echo one two three\r
+printf '\\e[1;31mred\\e[0m \\e[4mul\\e[0m \\e[38;5;208morange\\e[0m\\n'\r
+echo abc\x01: \x05 def\r
+\e[A
+\x01\x0bfalse; echo status $?\r
+printf '中文 wide\\n'; echo café\r
+for i in 1 2 3; do echo "row $i"; done\r
+echo partial\x17\x17typed again\r

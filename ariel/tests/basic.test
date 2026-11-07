@@ -70,7 +70,7 @@ PUSH "\e[?2027$p"
 !Malformed UTF-8
 RESET
 PUSH "a\xffb\xe4\xb8c\xed\xa0\x80"
-  ?screen_text 0,0,1,10 = 0x61,0xfffd,0x62,0xfffd,0x63,0xfffd,0xfffd,0xfffd
+  ?screen_chars 0,0,1,10 = 0x61,0xfffd,0x62,0xfffd,0x63,0xfffd,0xfffd,0xfffd
 
 !Cursor motion
 RESET
@@ -194,7 +194,7 @@ PUSH "x\e[3b"
 !DEC special graphics
 RESET
 PUSH "\e(0qx\e(Bq"
-  ?screen_text 0,0,1,10 = 0x2500,0x2502,0x71
+  ?screen_chars 0,0,1,10 = 0x2500,0x2502,0x71
 
 !Alternate screen
 RESET

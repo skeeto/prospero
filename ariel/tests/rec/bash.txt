@@ -1,0 +1,28 @@
+size 80x24 cursor 16,5
+bash%echo one two three
+one two three
+bash%printf '\e[1;31mred\e[0m \e[4mul\e[0m \e[38;5;208morange\e[0m\n'
+red ul orange
+	0-2 sgr 0;1;31
+	4-5 sgr 0;4
+	7-12 sgr 0;38:5:208
+bash%: echo abc def
+bash%false; echo status $?
+status 1
+bash%printf '中文 wide\n'; echo café
+中文 wide
+café
+bash%for i in 1 2 3; do echo "row $i"; done
+row 1
+row 2
+row 3
+bash%typed again
+bash: typed: command not found
+bash%
+
+
+
+
+
+
+

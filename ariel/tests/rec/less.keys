@@ -1,0 +1,8 @@
+# less: page down, back, search, top and end, then stay on screen
+ 
+ 
+b
+/line 40\r
+n
+G
+g

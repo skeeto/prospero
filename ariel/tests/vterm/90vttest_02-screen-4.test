@@ -1,0 +1,20 @@
+# Ported from libvterm t/90vttest_02-screen-4.test (MIT, Copyright (c) 2008 Paul Evans,
+# see LICENSE here). Deliberate differences are marked "ariel:".
+PALETTE vterm
+# Origin mode (2)
+INIT
+WANTSCREEN
+
+RESET
+
+PUSH "\e[?6l"
+PUSH "\e[23;24r"
+PUSH "\e[24;1H"
+PUSH "Bottom"
+PUSH "\e[1;1H"
+PUSH "Top"
+
+!Output
+?screen_row 23 = "Bottom"
+?screen_row 0  = "Top"
+

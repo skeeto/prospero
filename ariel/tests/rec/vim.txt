@@ -1,0 +1,50 @@
+size 80x24 cursor 17,4 alt
+  2              1  The quick brown cat jumps over the lazy dog.
+	0-3 sgr 0;93
+  3              2  Ünïcödé: café, naïve, résumé, 中文字符, 日本語, 한국어 appen
+	0-3 sgr 0;93
+    ded          
+	0-3 sgr 0;93
+  4              3  Emoji: 👍 🎉 🇺🇸 👨<200d>👩<200d>👧
+	0-3 sgr 0;93
+	40-45 sgr 0;38:5:81
+	48-53 sgr 0;38:5:81
+  5      4  A long line that goes on and on past the edge of the terminal so tha
+	0-3 sgr 0;93
+    t less has to wrap it onto the next row, and then some more words to be sure
+	0-3 sgr 0;93
+     it wraps twice at eighty columns.
+	0-3 sgr 0;93
+  6      5  Tabs:   one     two     three   end
+	0-3 sgr 0;93
+  7      6  line 6 of the test input, ......
+	0-3 sgr 0;93
+  8      7  line 7 of the test input, .......
+	0-3 sgr 0;93
+  9      8  line 8 of the test input, ........
+	0-3 sgr 0;93
+input.txt [+]                                                 2,7-14          0%
+	0-79 sgr 0;7
+ 46     45  line 45 of the test input, ............... 
+	0-3 sgr 0;93
+ 47     46  line 46 of the test input, ................ 
+	0-3 sgr 0;93
+ 48     47  line 47 of the test input, .................
+	0-3 sgr 0;93
+ 49     48  line 48 of the test input, ..................
+	0-3 sgr 0;93
+ 50     inserted line
+	0-3 sgr 0;93
+ 51 49      line 49 of the test input, ...................
+	0-3 sgr 0;93
+ 52     50  line 50 of the test input, ....................
+	0-3 sgr 0;93
+ 53     51  line 51 of the test input, .....................
+	0-3 sgr 0;93
+ 54     52  line 52 of the test input, ......................
+	0-3 sgr 0;93
+ 55     53  line 53 of the test input, .......................
+	0-3 sgr 0;93
+input.txt [+]                                                 51,1           40%
+	0-79 sgr 0;1;7
+

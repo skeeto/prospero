@@ -150,6 +150,10 @@ def build(cache):
             w = WIDTH["zero"]
         elif 0x1160 <= c <= 0x11FF or 0xD7B0 <= c <= 0xD7FF:
             w = WIDTH["zero"]
+        elif gcb[c] == GCB.index("Regional_Indicator"):
+            # Emoji_Presentation, though East Asian Width says N: wide
+            # alone, as vim and kitty have it; a pair is one wide flag
+            w = WIDTH["wide"]
         elif eaw[c] in ("W", "F"):
             w = WIDTH["wide"]
         elif eaw[c] == "A" and g != "Co":

@@ -1,0 +1,65 @@
+# Ported from libvterm t/26state_query.test (MIT, Copyright (c) 2008 Paul Evans,
+# see LICENSE here). Deliberate differences are marked "ariel:".
+PALETTE vterm
+INIT
+WANTSTATE
+
+!DA
+RESET
+PUSH "\e[c"
+# ariel: DA1 says VT220 class with ANSI color (22) and clipboard (52)
+  output "\e[?62;22;52c"
+
+!DSR
+RESET
+PUSH "\e[5n"
+  output "\e[0n"
+
+!CPR
+PUSH "\e[6n"
+  output "\e[1;1R"
+PUSH "\e[10;10H\e[6n"
+  output "\e[10;10R"
+
+!DECCPR
+PUSH "\e[?6n"
+# ariel: with the page, as xterm answers
+  output "\e[?10;10;1R"
+
+!DECRQSS on DECSCUSR
+PUSH "\e[3 q"
+PUSH "\eP\$q q\e\\"
+  output "\eP1\$r3 q\e\\"
+
+!DECRQSS on SGR
+# ariel: SGR reports start with 0 and use 38:2::R:G:B, as xterm's do
+PUSH "\e[1;5;7m"
+PUSH "\eP\$qm\e\\"
+  output "\eP1\$r0;1;5;7m\e\\"
+
+!DECRQSS on SGR ANSI colours
+PUSH "\e[0;31;42m"
+PUSH "\eP\$qm\e\\"
+  output "\eP1\$r0;31;42m\e\\"
+
+!DECRQSS on SGR ANSI hi-bright colours
+PUSH "\e[0;93;104m"
+PUSH "\eP\$qm\e\\"
+  output "\eP1\$r0;93;104m\e\\"
+
+##!DECRQSS on SGR 256-palette colours
+#PUSH "\e[0;38:5:56;48:5:78m"
+#PUSH "\eP\$qm\e\\"
+#  output "\eP1\$r38:5:56;48:5:78m\e\\"
+
+!DECRQSS on SGR RGB8 colours
+PUSH "\e[0;38:2:24:68:112;48:2:13:57:101m"
+PUSH "\eP\$qm\e\\"
+  output "\eP1\$r0;38:2::24:68:112;48:2::13:57:101m\e\\"
+
+# ariel: 7-bit controls only, so no S8C1T
+
+!Truncation on attempted buffer overflow
+PUSH "\e[6n" x 30
+# ariel: replies queue up to 16 KB, so all of them come
+  output "\e[10;10R" x 30

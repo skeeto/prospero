@@ -60,7 +60,7 @@ enum {
 };
 static u16 const uniprops[33] = {
     12, 8, 4, 1, 513, 3, 577, 13, 579, 400, 29, 33, 257, 144, 401, 38, 36, 40,
-    44, 145, 129, 16, 404, 578, 2, 402, 0, 50, 54, 41, 65, 66, 25,
+    44, 145, 129, 16, 404, 578, 2, 402, 0, 50, 54, 41, 65, 66, 26,
 };
 static u8 const unistage0[272] = {
     0, 1, 2, 3, 4, 4, 4, 4, 4, 4, 5, 6, 7, 8, 9, 10, 11, 12, 9, 13, 9, 9, 14,
@@ -2064,6 +2064,16 @@ static void resetstate(ariel_Term *t)
     t->dirty   = 1;
 }
 
+// Nothing visible: no characters, default background
+static b32 rowblank(ariel_Term *t, i32 y)
+{
+    Cell *r = row(t, y);
+    for (i32 x = 0; x < t->cols; x++) {
+        if (r[x].cp || r[x].bg) return 0;
+    }
+    return 1;
+}
+
 static void touchall(ariel_Term *t)
 {
     for (i32 y = 0; y < t->rows; y++) {
@@ -2258,26 +2268,23 @@ static void wrapline(ariel_Term *t)
 }
 
 // Whether joining cp to a narrow cluster makes it wide
-static b32 widens(ariel_Term *t, Cell *c, u32 cp, u32 p)
+static b32 widens(Cell *c, u32 cp)
 {
     u32 base = cellcp(c);
     if (cp == 0xfe0f) {
         return !c->ext && propvs16(uniprop(base));
     } else if (cp>=0x1f3fb && cp<=0x1f3ff) {
         return proppict(uniprop(base));         // skin tone
-    } else if (propgcb(p) == GB_RI) {
-        return !c->ext;                         // a flag
     }
-    (void)t;
     return 0;
 }
 
-static void joinlast(ariel_Term *t, u32 cp, u32 p)
+static void joinlast(ariel_Term *t, u32 cp)
 {
     Cell *r = row(t, t->segy);
     i32   x = t->segx;
     Cell *c = r + x;
-    b32 wide = t->grapheme && cellkind(c)==KIND_NARROW && widens(t, c, cp, p);
+    b32 wide = t->grapheme && cellkind(c)==KIND_NARROW && widens(c, cp);
     celljoin(t, c, cp);
     touch(t, t->segy);
     if (wide && x+1<t->cols && t->c.y==t->segy && t->c.x==x+1 && !t->c.wrapnext) {
@@ -2289,7 +2296,6 @@ static void joinlast(ariel_Term *t, u32 cp, u32 p)
         r[x+1] = tail;
         advance(t, 1);
     }
-    t->lastcp = 0;
 }
 
 static void print(ariel_Term *t, u32 cp)
@@ -2305,7 +2311,7 @@ static void print(ariel_Term *t, u32 cp)
     if (t->segy >= 0) {
         b32 join = t->grapheme ? !segbreak(&t->seg, p) : w==0;
         if (join) {
-            joinlast(t, cp, p);
+            joinlast(t, cp);
             return;
         }
     }
@@ -2960,8 +2966,8 @@ static i32 decmode(ariel_Term *t, i32 mode, i32 on)
 
     case 9: case 1000: case 1002: case 1003:
         if (on == 1) {
-            t->mouse    = mode;
-            t->mousebtn = 0;
+            if (t->mouse != mode) t->mousebtn = 0;
+            t->mouse = mode;
         } else if (!on && t->mouse==mode) {
             t->mouse = 0;
         }
@@ -3283,12 +3289,7 @@ static void ed(ariel_Term *t, i32 mode)
         if (!t->scr) {
             // Keep the used rows in history, as VTE and others do
             i32 used = t->rows;
-            for (; used > 0; used--) {
-                Cell *r = row(t, used-1);
-                i32   i = 0;
-                for (; i<t->cols && !r[i].cp && !r[i].bg; i++) {}
-                if (i < t->cols) break;
-            }
+            for (; used>0 && rowblank(t, used-1); used--) {}
             scrollup(t, 0, t->rows-1, used, 1);
         }
         for (i32 i = 0; i < t->rows; i++) erase(t, i, 0, t->cols);
@@ -3404,7 +3405,7 @@ static void csidispatch(ariel_Term *t, u8 final)
     case 'C': case 'a':
         setcursor(t, x+n, y);
         break;
-    case 'D':
+    case 'D': case 'j':
         setcursor(t, x-n, y);
         break;
     case 'E':
@@ -3456,12 +3457,18 @@ static void csidispatch(ariel_Term *t, u8 final)
         backtab(t, n);
         break;
     case 'b':
-        if (t->lastcp) {
-            u32 cp = t->lastcp;
+        if (t->lastcp && t->segy>=0) {
+            u32 cps[1+POOLN];
+            Cell *c = row(t, t->segy) + t->segx;
+            i32  nc = 1 + cellextra(t, c, cps+1, POOLN);
+            cps[0]  = t->lastcp;
             n = imin(n, t->cols*t->rows);
             for (i32 i = 0; i < n; i++) {
                 t->segy = -1;   // each repeat stands alone
-                print(t, cp);
+                print(t, cps[0]);
+                for (i32 k = 1; k < nc && t->segy>=0; k++) {
+                    joinlast(t, cps[k]);
+                }
             }
         }
         break;
@@ -3470,6 +3477,9 @@ static void csidispatch(ariel_Term *t, u8 final)
         break;
     case 'd':
         gotoxy(t, x, n-1);
+        break;
+    case 'k':
+        setcursor(t, x, y-n);
         break;
     case 'g':
         switch (arg0(t, 0)) {
@@ -4469,15 +4479,19 @@ ptrdiff_t ariel_copy(ariel_Term *t, uint8_t *out, ptrdiff_t cap)
 
 // Control
 
-// Change one screen's height, keeping the cursor row (y) in view
+// Shrink one screen to rows, keeping its cursor row (y) in view: blank
+// rows below the cursor go first, then rows leave the top for history.
 static void resizerows(ariel_Term *t, i32 scr, i32 rows, i32 *y)
 {
+    i32 drop = t->rows - rows;
+    if (drop <= 0) return;
     i32 save = t->scr;
     t->scr = scr;
-    i32 shift = *y - (rows - 1);
-    if (shift > 0) {
-        scrollup(t, 0, t->rows-1, shift, 1);
-        *y -= shift;
+    i32 r = t->rows - 1;
+    for (; drop>0 && r>*y && rowblank(t, r); r--, drop--) {}
+    if (drop > 0) {
+        scrollup(t, 0, t->rows-1, drop, 1);
+        *y = imax(*y - drop, 0);
     }
     t->scr = save;
 }
@@ -4495,6 +4509,7 @@ int32_t ariel_resize(ariel_Term *t, int32_t cols, int32_t rows, int32_t cellw, i
     }
 
     i32 oldcols = t->cols, oldrows = t->rows;
+    b32 stepright = t->c.wrapnext && cols>oldcols;
     i32 y = t->c.y;
     resizerows(t, t->scr, rows, &y);
     t->c.y = y;
@@ -4529,7 +4544,7 @@ int32_t ariel_resize(ariel_Term *t, int32_t cols, int32_t rows, int32_t cellw, i
 
     t->top = 0;
     t->bot = rows - 1;
-    t->c.x = imin(t->c.x, cols-1);
+    t->c.x = imin(t->c.x + stepright, cols-1);
     t->c.y = imin(t->c.y, rows-1);
     t->c.wrapnext = 0;
     for (i32 s = 0; s < 2; s++) {
@@ -4658,7 +4673,7 @@ ptrdiff_t ariel_dump(ariel_Term *t, int32_t flags, uint8_t *out, ptrdiff_t cap)
                    r[e].ul==c->ul && r[e].attr==c->attr; e++) {}
             if (c->fg || c->bg || c->ul || c->attr) {
                 Out o = newout(buf, countof(buf));
-                outs(&o, S("  "));
+                outc(&o, '\t');    // never in a row's text
                 outi(&o, x);
                 outc(&o, '-');
                 outi(&o, e-1);

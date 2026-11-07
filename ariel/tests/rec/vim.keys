@@ -1,0 +1,12 @@
+# vim: edit, undo, visual, split, then stay on screen
+:set nu ls=2 ruler\r
+jjA appended\e
+3Gdd
+u
+/fox\r
+cwcat\e
+Vjj>
+:split\r
+\x17j
+50G
+iinserted line\r\e

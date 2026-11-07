@@ -65,6 +65,71 @@ static void check(ariel_Term *t)
     }
 }
 
+static ariel_Term *newterm(ariel_Config *cfg, iz size)
+{
+    void *mem = aligned_alloc(16, (size_t)size);
+    memset(mem, 0xa5, (size_t)size);
+    ariel_Term *t = ariel_init(mem, size, cfg);
+    affirm(t);
+    return t;
+}
+
+static void feedall(ariel_Term *t, u8 *p, iz n)
+{
+    ariel_Str in = {p, n};
+    for (;;) {
+        ariel_Fed f = ariel_feed(t, in);
+        if (!f.ev.kind) break;
+        in = f.rest;
+    }
+}
+
+static u8 *dumpof(ariel_Term *t, iz *len)
+{
+    int flags = ARIEL_DUMP_ATTRS | ARIEL_DUMP_STATE;
+    *len = ariel_dump(t, flags, 0, 0);
+    u8 *d = malloc((size_t)*len + 1);
+    ariel_dump(t, flags, d, *len);
+    return d;
+}
+
+// Everything a host would read
+static void render(ariel_Term *t)
+{
+    static ariel_Cell cells[MAXDIM];
+    ariel_gen(t);
+    ariel_Modes m = ariel_modes(t);
+    for (i32 y = 0; y < m.rows; y++) {
+        i32 n = ariel_row(t, y, cells, countof(cells));
+        ariel_rowinfo(t, y);
+        for (i32 x = 0; x < n; x++) {
+            if (cells[x].extra) {
+                u32 cps[16];
+                affirm(ariel_cluster(t, x, y, cps, countof(cps)) == 1+cells[x].extra);
+            }
+        }
+    }
+    ariel_cursor(t);
+    ariel_title(t, 0);
+}
+
+static void encode(ariel_Term *t, u8 b)
+{
+    ariel_Key k = {0};
+    k.key  = b % 80;
+    k.mods = b >> 4;
+    k.cp   = k.key ? 0 : 'a' + b%26;
+    ariel_key(t, &k);
+    ariel_Mouse m = {0};
+    m.action = 1 + b%4;
+    m.button = b % 12;
+    m.x = b % 300;
+    m.y = b / 3;
+    m.mods = b >> 5;
+    ariel_mouse(t, &m);
+    ariel_focus(t, b & 1);
+}
+
 int main(void)
 {
     __AFL_INIT();
@@ -82,21 +147,48 @@ int main(void)
         cfg.histbytes = 1<<14;
         i32 split = 1 + (buf[3]>>5)*7;
         iz  size  = ariel_size(&cfg);
-        void *mem = aligned_alloc(16, (size_t)size);
-        memset(mem, 0xa5, (size_t)size);
-        ariel_Term *t = ariel_init(mem, size, &cfg);
-        affirm(t);
-        for (iz i = 4; i < len; i += split) {
-            ariel_Str in = {buf+i, len-i < split ? len-i : split};
-            for (;;) {
-                ariel_Fed f = ariel_feed(t, in);
-                if (!f.ev.kind) break;
-                in = f.rest;
-            }
-            check(t);
-            ariel_gen(t);
+        u8 *data  = buf + 4;
+        iz  n     = len - 4;
+        iz  every = 1 + n/split/32;     // about 32 checks per pass
+
+        // Split invariance: pieces and the whole give the same terminal
+        ariel_Term *a = newterm(&cfg, size);
+        ariel_Term *b = newterm(&cfg, size);
+        for (iz i = 0, k = 0; i < n; i += split, k++) {
+            feedall(a, data+i, n-i < split ? n-i : split);
+            if (!(k % every)) check(a);
         }
-        free(mem);
+        check(a);
+        feedall(b, data, n);
+        iz alen, blen;
+        u8 *ad = dumpof(a, &alen);
+        u8 *bd = dumpof(b, &blen);
+        affirm(alen==blen && !memcmp(ad, bd, (size_t)alen));
+        free(ad);
+        free(bd);
+        free(b);
+
+        // Interleaved operations: resize, encoders, rendering
+        ariel_reset(a, ARIEL_RESET_FULL);
+        for (iz i = 0, k = 0; i < n; i += split, k++) {
+            feedall(a, data+i, n-i < split ? n-i : split);
+            u8 op = data[i];
+            switch (k % 5) {
+            case 1:
+                ariel_resize(a, 2 + op%cfg.capcols, 1 + data[n-1-i]%cfg.caprows, 8, 16);
+                break;
+            case 2:
+                encode(a, op);
+                break;
+            case 3:
+                if (!(k % every)) render(a);
+                break;
+            }
+            if (!(k % every)) check(a);
+        }
+        check(a);
+        render(a);
+        free(a);
     }
     return 0;
 }

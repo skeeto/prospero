@@ -1,0 +1,20 @@
+# Ported from libvterm t/68screen_termprops.test (MIT, Copyright (c) 2008 Paul Evans,
+# see LICENSE here). Deliberate differences are marked "ariel:".
+PALETTE vterm
+INIT
+WANTSCREEN p
+
+RESET
+  settermprop 1 true
+  settermprop 2 true
+  settermprop 7 1
+
+!Cursor visibility
+PUSH "\e[?25h"
+  settermprop 1 true
+PUSH "\e[?25l"
+  settermprop 1 false
+
+!Title
+PUSH "\e]2;Here is my title\a"
+  settermprop 4 ["Here is my title"]
