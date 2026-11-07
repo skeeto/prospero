@@ -1602,6 +1602,13 @@ static Cell blank(ariel_Term *t)
     return c;
 }
 
+// Forget the last printed cell: its cell is about to change or move
+static void segclear(ariel_Term *t)
+{
+    t->segy   = -1;
+    t->lastcp = 0;
+}
+
 static void fillcells(Cell *c, iz n, Cell v)
 {
     for (iz i = 0; i < n; i++) {
@@ -1615,6 +1622,7 @@ static void clearslot(ariel_Term *t, i32 g, i32 s, Cell v)
     Cell *c = gridcells(t, g) + (iz)s*t->capcols;
     fillcells(c, t->cols, v);
     Head *h  = gridheads(t, g) + s;
+    segclear(t);
     h->id    = t->nextid++;
     h->gen   = t->gen + 1;
     h->flags = 0;
@@ -1746,12 +1754,6 @@ static void tabsreset(ariel_Term *t, i32 from)
 
 static b32 istab(ariel_Term *t, i32 x) { return t->tabs[x>>3]>>(x&7) & 1; }
 
-static void segclear(ariel_Term *t)
-{
-    t->segy   = -1;
-    t->lastcp = 0;
-}
-
 static void setcursor(ariel_Term *t, i32 x, i32 y)
 {
     t->c.x = clamp(x, 0, t->cols-1);
@@ -1785,6 +1787,7 @@ static void erase(ariel_Term *t, i32 y, i32 x0, i32 x1)
         r[x1] = b;
     }
     fillcells(r+x0, x1-x0, b);
+    segclear(t);
     if (x1 == t->cols) {
         head(t, y)->flags &= ~(u32)ARIEL_R_WRAPPED;
     }
@@ -1890,6 +1893,7 @@ static void insertcells(ariel_Term *t, i32 n)
     }
     xmov(r+x+n, r+x, (iz)(t->cols-x-n)*(iz)sizeof(Cell));
     fillcells(r+x, n, b);
+    segclear(t);
     if (cellkind(r+t->cols-1) == KIND_WIDE) {
         r[t->cols-1] = b;   // its tail fell off
     }
@@ -1912,6 +1916,7 @@ static void deletecells(ariel_Term *t, i32 n)
     }
     xmov(r+x, r+x+n, (iz)(t->cols-x-n)*(iz)sizeof(Cell));
     fillcells(r+t->cols-n, n, b);
+    segclear(t);
     head(t, t->c.y)->flags &= ~(u32)ARIEL_R_WRAPPED;
     touch(t, t->c.y);
 }
@@ -2284,6 +2289,7 @@ static void joinlast(ariel_Term *t, u32 cp)
     Cell *r = row(t, t->segy);
     i32   x = t->segx;
     Cell *c = r + x;
+    affirm(cellcp(c) && cellkind(c)!=KIND_TAIL && cellkind(c)!=KIND_SPACER);
     b32 wide = t->grapheme && cellkind(c)==KIND_NARROW && widens(c, cp);
     celljoin(t, c, cp);
     touch(t, t->segy);

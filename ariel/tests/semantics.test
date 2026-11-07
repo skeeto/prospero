@@ -172,3 +172,14 @@ PUSH "\xc2\xb1\xee\x80\x80"
 RESET
 PUSH "\xe2\x8c\x9a\xef\xb8\x8e"
   ?cursor = 0,2
+
+!A mark joins nothing once its base character moved or was erased
+RESET
+PUSH "0\e[S\xe2\x80\x8d"
+  ?screen_row 0 = ""
+  ?screen_cell 0,0 = {} width=1
+  ?cursor = 0,1
+RESET
+PUSH "e\e[1K\xcc\x81"
+  ?screen_cell 0,0 = {} width=1
+  ?cursor = 0,1
