@@ -9680,8 +9680,7 @@ static void mcpstart(Engine *e, Arena scratch, McpServer *m, Session *s)
     m->approve  = 0;
     m->trust    = 0;
     mcpconf(e, m);
-    Str only    = m->project.len ? Str{} : trim(cfgget(e->cfg, "mcp", m->name, "tools", 0));
-    m->only     = only.len ? clone(&m->arena, only) : Str{};
+    m->truncated = 0;
     i64 now     = os_ticks(e->os);
     m->startedat = now;
     m->readyby  = now + m->startms*MS;
@@ -10499,6 +10498,18 @@ static void logprefix(Session *, Arena);
 // are not fixed, waited for (S_MCP) until each is ready or failed. Then
 // the tools of those ready that it lacks join its prefix, logged anew.
 // Returns 0 while it waits: mcpwake goes on, through prepare.
+// Whether the configuration keeps a server's tool, by the server's name
+// for it, as it says now: the server's section enabled, and its tools
+// key (mcponly) offering it. A session's tool turned off since is not
+// taken away, as its tools stay as they began, but its calls are
+// refused (mcpcall).
+static b32 mcpkept(Engine *e, Str server, Str tool)
+{
+    Config *c = e->cfg;
+    return cfgbool(trim(cfgget(c, "mcp", server, "enabled", 0)))!=0 &&
+           mcponly(trim(cfgget(c, "mcp", server, "tools", 0)), tool);
+}
+
 static b32 mcpgate(Session *s, Arena scratch)
 {
     if (s->readonly) {
@@ -10543,7 +10554,8 @@ static b32 mcpgate(Session *s, Arena scratch)
         b32 any = 0;
         for (iz k = 0; k < m->tools.len; k++) {
             McpTool *t = &m->tools[k];
-            if (!mcpallowed(s->mcpfilter, m->name, t->name) || mcptoolof(s, t->name)) {
+            if (!mcpallowed(s->mcpfilter, m->name, t->name) ||
+                    !mcpkept(s->e, m->name, t->tool) || mcptoolof(s, t->name)) {
                 continue;
             }
             b32 clash = toolfind(t->name) != TOOL_NONE;
@@ -11008,6 +11020,19 @@ static b32 mcpcall(Session *s, Arena scratch, McpTool *t)
         return 1;
     } else if (mcpmoved(s, scratch, t, 0)) {
         return 1;
+    } else if (!mcpkept(e, t->server, t->tool)) {
+        // Turned off since the session got it: refused, whoever trusts it
+        b32 off = cfgbool(trim(cfgget(e->cfg, "mcp", t->server, "enabled", 0))) == 0;
+        Buf b(&scratch, 256);
+        print(&b, "Not run: the MCP server ");
+        print(&b, t->server);
+        print(&b, off ? Str(" is turned off in the settings ([mcp ")
+                      : Str("'s tool is turned off in the settings (tools of [mcp "));
+        print(&b, t->server);
+        print(&b, "]).");
+        toolstart(s, scratch);
+        toolend(s, scratch, "denied", finish(&b), 0, 0, {}, 0);
+        return 1;
     }
     if (m) {
         mcpconf(e, m);  // trust as the configuration says now
@@ -11076,11 +11101,12 @@ static void mcplisted(Engine *e, Arena scratch, McpServer *m, Json *res)
 {
     for (Json *t = jsonget(res, "tools")->child; t; t = t->next) {
         McpTool x = mcptool(&m->arena, m->name, t);
-        if (x.tool.len && mcponly(m->only, x.tool)) {
-            m->tools = push(&m->arena, m->tools, x);
+        if (x.tool.len) {
+            m->tools = push(&m->arena, m->tools, x);  // kept or not (mcpkept)
         }
     }
     Str next = jsonstr(jsonget(res, "nextCursor"));
+    m->truncated = next.len && m->pages+1>=MCP_PAGES;
     if (next.len && ++m->pages<MCP_PAGES) {
         Buf     b(&scratch, 64 + next.len);
         JsonOut w = {&b};
@@ -11094,7 +11120,8 @@ static void mcplisted(Engine *e, Arena scratch, McpServer *m, Json *res)
     }
     m->state     = MCP_READY;
     m->refreshed = 0;
-    mcpwake(e, scratch, m);
+    m->lastuse   = os_ticks(e->os);  // its idle minute from now, however
+    mcpwake(e, scratch, m);          // long it took to start
 }
 
 // One message from a server: a response to one of ours, a request of
@@ -12768,7 +12795,11 @@ static void putmcpserver(Engine *e, Arena scratch, JsonOut *w, Str name, McpServ
         }
     }
     putstrkey(w, "state", mcpstatename(m));
-    putintkey(w, "tools", m && m->state==MCP_READY ? m->tools.len : 0);
+    i32 kept = 0;
+    for (iz i = 0; m && m->state==MCP_READY && i < m->tools.len; i++) {
+        kept += mcpkept(e, m->name, m->tools[i].tool);
+    }
+    putintkey(w, "tools", kept);  // what sessions get
     if (m && m->state==MCP_FAILED && m->err.len) {
         putstrkey(w, "err", m->err);
     }

@@ -11590,6 +11590,41 @@ def mcp_identity(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+@scenario(conf=mcpconf(trust="yes", tools="echo"), bound=30)
+def mcp_untick(t):
+    """A tools key read as it is now: a tool turned off mid-session stays
+    declared, but its calls are refused, trusted or not; one turned on
+    joins the session at its next request, which is told."""
+    h = t.headless(env=mcpenv(t))
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.send("prompt", sid=sid, text="go")
+        t.check(ended(h, sid, 1)["why"] == "done", "the first turn ends")
+        first = [q["body"] for q in t.requests()][0]
+        names = [x for x in fake_provider.tool_names(first) if x.startswith("mcp__")]
+        t.check(names == ["mcp__fake__echo"], f"only echo at first: {names}")
+
+        r = h.call("config.set", kind="mcp", name="fake", key="tools", value="-echo")
+        t.check(r.get("ok") == 1, f"set {r}")
+        n = len(t.requests())
+        h.send("prompt", sid=sid, text="again")
+        t.check(ended(h, sid, 2)["why"] == "done", "the second turn ends")
+        ends = h.all("tool.end", sid)
+        t.check([e["status"] for e in ends] == ["ok", "denied"] and
+                "turned off in the settings" in ends[1]["text"], f"refused {ends}")
+        t.check([c["name"] for c in mcpcalls(t)] == ["echo"], f"calls {mcpcalls(t)}")
+        body = t.requests()[n]["body"]
+        names = fake_provider.tool_names(body)
+        t.check("mcp__fake__echo" in names and "mcp__fake__image" in names,
+                f"echo still declared, image joined: {names}")
+        told = json.dumps(body["messages"])
+        t.check("New tools from MCP servers are available now" in told and
+                "mcp__fake__image" in told, "told of the new tools")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 class McpHttpServer:
     """tests/fake_mcp.py --http, run for a scenario, logging to t.mcplog."""
 

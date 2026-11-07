@@ -70,6 +70,24 @@ static void test_mcp(Test *t)
     expect(t, "mcp only null", mcponly({}, "x") ? Str("yes") : Str("no"), "yes");
     expect(t, "mcp only", mcponly("echo, image", "image") ? Str("yes") : Str("no"), "yes");
     expect(t, "mcp only not", mcponly("echo, image", "ima") ? Str("yes") : Str("no"), "no");
+    {
+        // Left to right: a first exclusion starts from all, "-" alone
+        // is a name, and a value of no words keeps everything
+        static struct { Str only, tool; b32 want; } const cases[] = {
+            {"-echo", "echo", 0}, {"-echo", "image", 1},
+            {"-echo -image", "image", 0}, {"-echo, -image", "where", 1},
+            {"echo -echo", "echo", 0}, {"-echo echo", "echo", 1},
+            {"echo", "where", 0}, {"echo -image", "image", 0},
+            {"-", "-", 1}, {"-", "echo", 0}, {",", "echo", 1}, {" , ", "x", 1},
+            {"", "x", 1}, {"-e-x", "e-x", 0}, {"-e-x", "-e-x", 1},
+        };
+        for (iz i = 0; i < countof(cases); i++) {
+            Str what = concat(&a, concat(&a, "mcp only \"", cases[i].only),
+                              concat(&a, "\" ", cases[i].tool));
+            expect(t, what, mcponly(cases[i].only, cases[i].tool) ? Str("yes") : Str("no"),
+                   cases[i].want ? Str("yes") : Str("no"));
+        }
+    }
 
     // Command words
     expect(t, "mcp words", mcpwordsshow(&a, "  npx -y  @scope/server "), "npx|-y|@scope/server");

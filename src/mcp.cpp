@@ -118,7 +118,6 @@ struct McpServer {
     Slice<Str>        argv;
     Slice<Str>        env;       // NAME=value, added to the engine's
     b32               trust;
-    Str               only;      // its section's tools, null for all
     i64               startms;   // startup_timeout
     i64               callms;    // timeout
     i32               state;     // MCP_*
@@ -136,6 +135,7 @@ struct McpServer {
     Str               version;   // the protocol it answered
     Str               cursor;    // tools/list's next page
     i32               pages;
+    b32               truncated; // more pages than MCP_PAGES: some unlisted
     i64               startedat; // ticks
     i64               readyby;   // ticks: failed if not ready then
     i64               lastuse;   // ticks: a session offered it
@@ -224,23 +224,33 @@ static b32 mcpallowed(Str list, Str server, Str fname)
 }
 
 // Whether a server's own tools key offers a tool, by the server's name
-// for it: all when null.
+// for it, read left to right as a role's list is: a word keeps a tool,
+// "-word" takes it away again, and a first word that takes away starts
+// from all of them. All when null, or when it has no words.
 static b32 mcponly(Str only, Str tool)
 {
-    if (!only.data) {
-        return 1;
-    }
+    b32 have  = 1;
+    b32 first = 1;
     for (Str rest = only; rest.len;) {
         iz i = 0;
         for (; i<rest.len && (whitespace(rest[i]) || rest[i]==','); i++) {}
         rest = cuthead(rest, i);
         for (i = 0; i<rest.len && !whitespace(rest[i]) && rest[i]!=','; i++) {}
-        if (takehead(rest, i) == tool) {
-            return 1;
+        Str word = takehead(rest, i);
+        rest     = cuthead(rest, i);
+        if (!word.len) {
+            break;
         }
-        rest = cuthead(rest, i);
+        b32 less = word.len>1 && word[0]=='-';
+        if (first) {
+            have  = less;
+            first = 0;
+        }
+        if ((less ? cuthead(word, 1) : word) == tool) {
+            have = !less;
+        }
     }
-    return 0;
+    return have;
 }
 
 

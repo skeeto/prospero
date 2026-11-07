@@ -2729,6 +2729,12 @@ def sc_mcp_identity(model, n, req):
         "Turn two."])
 
 
+def sc_mcp_untick(model, n, req):
+    yield from mcp_steps(model, n, req, [
+        ("mcp__fake__echo", {"text": "a"}), "One.",
+        ("mcp__fake__echo", {"text": "b"}), "Two."])
+
+
 def sc_mcp_http_two(model, n, req):
     yield from mcp_steps(model, n, req, [("mcp__docs__where", {}), "Done."])
 

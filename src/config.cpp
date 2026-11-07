@@ -736,8 +736,10 @@ static CfgKey cfgschema[] = {
     {"mcp", "trust", CFG_BOOL, "false", {}, {}, "mcp",
      "Let the agent use the server's tools without asking first"},
     {"mcp", "tools", CFG_STRING, "", {}, {}, "mcp",
-     "Only these of the server's tools, by its names for them, separated "
-     "by blanks; by default all"},
+     "The server's tools sessions get, by its names for them, read left "
+     "to right: a name keeps a tool and -NAME leaves one out, and a list "
+     "that begins with -NAME starts from all of them, as in \"-delete\"; "
+     "by default all"},
     {"mcp", "enabled", CFG_BOOL, "true", {}, {}, "mcp",
      "Offer the server's tools to new sessions"},
     {"mcp", "startup_timeout", CFG_SECONDS, "30", {}, {}, "mcp",
