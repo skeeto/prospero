@@ -181,6 +181,11 @@ static b32   os_procwrite(Os *, Proc *, Str) { return 0; }
 static void  os_kill(Os *, Proc *, b32) {}
 static void  os_letgo(Os *, Proc *) {}
 static void  os_procfree(Os *, Proc *) {}
+static Proc *os_ptyspawn(Os *, Spawn *, PtySize, iz, Arena) { return 0; }
+static Str   os_ptypeek(Os *, Proc *) { return {}; }
+static void  os_ptytake(Os *, Proc *, iz) {}
+static b32   os_ptyresize(Os *, Proc *, PtySize) { return 0; }
+static b32   os_ptybusy(Os *, Proc *) { return 0; }
 static iz    os_lockfile(Os *, Arena, Str) { return -1; }
 static void  os_unlockfile(Os *, iz) {}
 static b32   os_lockheld(Os *, Arena, Str) { return 0; }

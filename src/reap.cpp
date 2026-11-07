@@ -134,14 +134,18 @@ static ReapProc reapstat(Str s)
 }
 
 // Whether a reaper may signal a process its scan found: never itself,
-// nor a pid that signalable refuses; a descendant of its own; or, if it
-// leads a session (group, from reapgroup), a member of that session.
-static b32 reapmine(ReapProc *p, i32 self, i32 group, b32 descendant)
+// nor a pid that signalable refuses; a descendant of its own; if it
+// leads a session (group, from reapgroup), a member of that session;
+// or a member of the session a terminal's tool leads (toolsid, 0 for
+// none), which is the tool's only while the tool lives, unreaped, its
+// pid and so that id held.
+static b32 reapmine(ReapProc *p, i32 self, i32 group, i32 toolsid, b32 descendant)
 {
     if (!signalable(p->pid) || p->pid==self) {
         return 0;
     }
-    return descendant || (group && p->sid==group);
+    b32 tool = signalable(toolsid) && p->sid==toolsid;
+    return descendant || (group && p->sid==group) || tool;
 }
 
 // macOS: what a process keeps of where it came from, whatever became of

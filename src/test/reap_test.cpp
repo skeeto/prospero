@@ -112,22 +112,32 @@ static void test_reap(Test *t)
         ReapProc me    = {4242, 4000, 4242, 4242, 3};
         ReapProc none  = {0, 0, 0, 0, 0};
         ReapProc every = {-1, 0, 0, 0, 0};
-        expect(t, "reapmine, a descendant", istr(a, reapmine(&tool, self, self, 1)), "1");
-        expect(t, "reapmine, in its session", istr(a, reapmine(&tool, self, self, 0)), "1");
-        expect(t, "reapmine, an escapee found", istr(a, reapmine(&away, self, self, 1)), "1");
-        expect(t, "reapmine, another session", istr(a, reapmine(&away, self, self, 0)), "0");
-        expect(t, "reapmine, itself", istr(a, reapmine(&me, self, self, 1)), "0");
-        expect(t, "reapmine, init", istr(a, reapmine(&init, self, self, 1)), "0");
-        expect(t, "reapmine, pid 0", istr(a, reapmine(&none, self, self, 1)), "0");
-        expect(t, "reapmine, pid -1", istr(a, reapmine(&every, self, self, 1)), "0");
-        expect(t, "reapmine, the parent's", istr(a, reapmine(&sib, self, self, 0)), "0");
+        expect(t, "reapmine, a descendant", istr(a, reapmine(&tool, self, self, 0, 1)), "1");
+        expect(t, "reapmine, in its session", istr(a, reapmine(&tool, self, self, 0, 0)), "1");
+        expect(t, "reapmine, an escapee found", istr(a, reapmine(&away, self, self, 0, 1)), "1");
+        expect(t, "reapmine, another session", istr(a, reapmine(&away, self, self, 0, 0)), "0");
+        expect(t, "reapmine, itself", istr(a, reapmine(&me, self, self, 0, 1)), "0");
+        expect(t, "reapmine, init", istr(a, reapmine(&init, self, self, 0, 1)), "0");
+        expect(t, "reapmine, pid 0", istr(a, reapmine(&none, self, self, 0, 1)), "0");
+        expect(t, "reapmine, pid -1", istr(a, reapmine(&every, self, self, 0, 1)), "0");
+        expect(t, "reapmine, the parent's", istr(a, reapmine(&sib, self, self, 0, 0)), "0");
         // With a failed setsid (no group of its own), sessions say nothing
         expect(t, "reapmine, no session, the parent's",
-               istr(a, reapmine(&sib, self, 0, 0)), "0");
+               istr(a, reapmine(&sib, self, 0, 0, 0)), "0");
         expect(t, "reapmine, no session, session 0",
-               istr(a, reapmine(&kern, self, 0, 0)), "0");
+               istr(a, reapmine(&kern, self, 0, 0, 0)), "0");
         expect(t, "reapmine, no session, a descendant",
-               istr(a, reapmine(&tool, self, 0, 1)), "1");
+               istr(a, reapmine(&tool, self, 0, 0, 1)), "1");
+        // A terminal's tool leads its own session, its jobs in it
+        ReapProc job = {4400, 4300, 4400, 4300, 11};
+        expect(t, "reapmine, in the tool's session",
+               istr(a, reapmine(&job, self, self, 4300, 0)), "1");
+        expect(t, "reapmine, the tool's session once it is gone",
+               istr(a, reapmine(&job, self, self, 0, 0)), "0");
+        expect(t, "reapmine, another tool's session",
+               istr(a, reapmine(&job, self, self, 4301, 0)), "0");
+        expect(t, "reapmine, a tool session of 1",
+               istr(a, reapmine(&init, self, self, 1, 0)), "0");
     }
 
     // macOS: reapers are disclaimed only for a harness that answers for

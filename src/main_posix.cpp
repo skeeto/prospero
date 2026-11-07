@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>  // strerror_r
 #include <sys/file.h>  // flock
+#include <sys/ioctl.h>  // TIOCSCTTY, TIOCSWINSZ
 #include <sys/mman.h>
 #include <sys/random.h>
 #include <sys/socket.h>
@@ -32,6 +33,7 @@
 #include <sys/syscall.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 #ifdef __APPLE__
@@ -1162,9 +1164,39 @@ static Str os_lasterr(Os *, Arena *a)
 // its reader passes output on as records instead of into a file, and
 // its errors go into the file directly.
 //
+// A terminal's tool (os_ptyspawn) runs under "prospero --reap-tty",
+// with the terminal's slave on fds 0-2. That reaper forks the tool into
+// a session of its own, with the slave as its controlling terminal, so
+// that closing the master, the hang-up, sends it SIGHUP; its sweep
+// takes the tool's session too, while the tool lives. At lifeline EOF
+// it only ends: the master closed with the harness, which is the
+// hang-up. The harness side has no output pipe: a reader thread fills a
+// ring from the non-blocking master, and the writer waits on it for
+// room. The master closes once the caller, the reader and the writer
+// have all let go of it.
+//
 // Every signal goes out through sendsignal, which refuses a pid or a
 // group id that would reach more than meant (reap.cpp). A reaper signals
 // its own group only if setsid made it the group's leader.
+
+// The reaper's first argument: for a tool or a terminal's tool, each
+// spawned disclaimed or not (macOS).
+static char const *reapmodes[] = {
+    "--reap", "--reap-disclaimed", "--reap-tty", "--reap-tty-disclaimed",
+};
+
+static i32 reapmode(char const *arg)  // 1 + its index, or 0 if none
+{
+    for (i32 i = 0; i < (i32)countof(reapmodes); i++) {
+        if (!__builtin_strcmp(arg, reapmodes[i])) {
+            return 1 + i;
+        }
+    }
+    return 0;
+}
+
+static b32 reapdisclaimed(char const *arg) { return reapmode(arg) % 2 == 0; }
+static b32 reaptty(char const *arg)        { return reapmode(arg) > 2; }
 
 // Signal one process, or with group one process group, by its positive
 // id: never the caller's own group (0), every process (-1), or init.
@@ -1214,6 +1246,19 @@ struct Proc {
     iz         queued;    // under lock: bytes in the queue
     b32        closing;   // under lock: close the input after the queue
     b32        broken;    // under lock: the input is closed
+    // os_ptyspawn: the master, the reader's ring
+    b32        pty;
+    i32        master;    // closed when the last of mrefs is dropped
+    i32        mrefs;     // atomic: the caller, the reader, the writer
+    Event      stop;      // for the reader: a hang-up, room, an exit
+    b32        hangup;    // under lock: os_procfree closed the terminal
+    b32        exited;    // under lock: the child's status is in
+    b32        full;      // under lock: the reader waits for room
+    b32        told;      // under lock: PROC_READY sent, not re-armed
+    u8        *ring;
+    iz         ringcap;
+    i64        rpos;      // under lock: bytes taken
+    i64        wpos;      // under lock: bytes read into the ring
     u8         tail[PROC_TAILMAX];
     u8         msg[8+PROC_TAILMAX];
     u8         buf[PROC_BUFLEN];
@@ -1222,6 +1267,11 @@ struct Proc {
 static void procrelease(Proc *p)
 {
     if (!__atomic_sub_fetch(&p->refs, 1, __ATOMIC_ACQ_REL)) {
+        if (p->pty) {
+            close((i32)p->stop.h[0]);
+            close((i32)p->stop.h[1]);
+            free(p->ring);
+        }
         pthread_mutex_destroy((pthread_mutex_t *)p->lock.opaque);
         free(p);
     }
@@ -1313,6 +1363,117 @@ static void procpipe(void *arg)
     procrelease(p);
 }
 
+// A holder of a terminal's master is done with it, and the last closes
+// it: a hang-up, should anything still hold the terminal.
+static void ptydrop(Proc *p)
+{
+    if (!__atomic_sub_fetch(&p->mrefs, 1, __ATOMIC_ACQ_REL)) {
+        close(p->master);
+    }
+}
+
+// The reader of a terminal: output into the ring while it has room,
+// PROC_READY when none was waiting to be told of. It ends at EOF (EIO
+// on Linux), when nothing holds the terminal; at a hang-up; or 200 ms
+// after the child exited, from the last output, should what it left
+// behind still hold the terminal. A full ring never times out.
+static void ptyreader(void *arg)
+{
+    Proc *p     = (Proc *)arg;
+    i64   quiet = 0;  // the child exited: the end of the wait for EOF
+    for (;;) {
+        os_lock(&p->lock);
+        b32 hangup = p->hangup;
+        b32 exited = p->exited;
+        i64 wpos   = p->wpos;
+        iz  room   = p->ringcap - (iz)(p->wpos - p->rpos);
+        p->full    = !room;
+        os_unlock(&p->lock);
+        i64 now = monotonic();
+        quiet = exited && !quiet ? now+200000 : quiet;
+        if (hangup || (room && quiet && now>=quiet)) {
+            break;
+        }
+
+        struct pollfd fds[2] = {};
+        fds[0].fd     = room ? p->master : -1;
+        fds[0].events = POLLIN;
+        fds[1].fd     = (i32)p->stop.h[0];
+        fds[1].events = POLLIN;
+        i32 ms = room && quiet ? (i32)((quiet - now + 999)/1000) : -1;
+        if (poll(fds, 2, ms) < 0) {
+            continue;  // EINTR
+        }
+        if (fds[1].revents) {
+            u8 drain[64];
+            while (read((i32)p->stop.h[0], drain, sizeof(drain)) > 0) {}
+        }
+        if (!fds[0].revents) {
+            continue;
+        }
+
+        iz at  = (iz)(wpos % p->ringcap);
+        iz len = room<p->ringcap-at ? room : p->ringcap-at;
+        iz got = read(p->master, p->ring+at, (uz)len);
+        if (got<0 && (errno==EINTR || errno==EAGAIN)) {
+            continue;
+        } else if (got <= 0) {
+            break;  // nothing holds the terminal
+        }
+        p->total += got;
+        quiet = quiet ? monotonic()+200000 : 0;
+        os_lock(&p->lock);
+        p->wpos += got;
+        b32 tell = !p->told;
+        p->told  = 1;
+        os_unlock(&p->lock);
+        if (tell) {
+            u8 msg[8];
+            put64(msg, p->total);
+            mailpost(p->mbox, PROC_READY, p->id, {msg, 8}, 1);
+        }
+    }
+    u8 msg[8];
+    put64(msg, p->total);
+    mailpost(p->mbox, PROC_EOF, p->id, {msg, 8}, 1);
+    ptydrop(p);
+    procrelease(p);
+}
+
+// Write to a terminal's master, which is non-blocking, waiting for room
+// on the writer's event too: 0 once it broke, or was hung up.
+static b32 ptywrite(Proc *p, Str data)
+{
+    while (data.len) {
+        iz n = write(p->master, data.data, (uz)data.len);
+        if (n > 0) {
+            data = cuthead(data, n);
+            continue;
+        } else if (n<0 && errno==EINTR) {
+            continue;
+        } else if (n==0 || errno!=EAGAIN) {
+            return 0;
+        }
+        struct pollfd fds[2] = {};
+        fds[0].fd     = p->master;
+        fds[0].events = POLLOUT;
+        fds[1].fd     = (i32)p->wake.h[0];
+        fds[1].events = POLLIN;
+        poll(fds, 2, -1);
+        if (fds[1].revents) {
+            u8 drain[64];
+            while (read((i32)p->wake.h[0], drain, sizeof(drain)) > 0) {}
+        }
+        os_lock(&p->lock);
+        b32 hangup = p->hangup;
+        os_unlock(&p->lock);
+        if (hangup) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static void freequeue(Proc *p)  // under lock
 {
     for (ProcChunk *c = p->head; c;) {
@@ -1348,7 +1509,8 @@ static void procwriter(void *arg)
             continue;
         }
 
-        b32 ok = writeall(p->infd, {(u8 *)(c + 1), c->len});
+        Str data = {(u8 *)(c + 1), c->len};
+        b32 ok   = p->pty ? ptywrite(p, data) : writeall(p->infd, data);
         os_lock(&p->lock);
         p->queued -= c->len;
         if (!ok) {
@@ -1361,10 +1523,25 @@ static void procwriter(void *arg)
             break;
         }
     }
-    close(p->infd);
+    if (p->pty) {
+        ptydrop(p);
+    } else {
+        close(p->infd);
+    }
     close((i32)p->wake.h[0]);
     close((i32)p->wake.h[1]);
     procrelease(p);
+}
+
+// The child's status is in: a terminal's reader stops waiting for EOF
+static void ptyexited(Proc *p)
+{
+    if (p->pty) {
+        os_lock(&p->lock);
+        p->exited = 1;
+        os_unlock(&p->lock);
+        os_signal(&p->stop);
+    }
 }
 
 static void procwaiter(void *arg)
@@ -1383,6 +1560,7 @@ static void procwaiter(void *arg)
     }
     if (got == 8) {
         mailpost(p->mbox, PROC_EXIT, p->id, {st, 8}, 1);
+        ptyexited(p);
     }
     close(p->statfd);
 
@@ -1407,6 +1585,7 @@ static void procwaiter(void *arg)
         put32(st, -1);
         put32(st+4, sig);
         mailpost(p->mbox, PROC_EXIT, p->id, {st, 8}, 1);
+        ptyexited(p);
     }
     procrelease(p);
 }
@@ -1524,57 +1703,171 @@ static b32 sameexe(Os *os)
            now.ctime==os->exeid.ctime;
 }
 
-// Spawn under a reaper. With io, input is a pipe from the writer
+// Close a terminal from the caller's side, dropping input not yet
+// written: its reader and writer stop, and the last hold on the master
+// closes it. Also drops extra holds, those of threads that never ran.
+static void ptyhangup(Proc *p, i32 extra)
+{
+    os_lock(&p->lock);
+    if (!p->closing && !p->broken) {
+        os_signal(&p->wake);
+    }
+    p->closing = 1;
+    p->hangup  = 1;
+    freequeue(p);
+    os_unlock(&p->lock);
+    os_signal(&p->stop);
+    for (i32 i = 0; i < extra; i++) {
+        ptydrop(p);
+    }
+    ptydrop(p);  // the caller's
+}
+
+// A terminal: its master, non-blocking, and its slave, to become the
+// child's, both close-on-exec, the slave not this process's controlling
+// terminal. UTF-8 input, DEL erasing, and the size given. Returns 0 on
+// failure, with errno, closing what it opened.
+struct Pty {
+    i32 master;
+    i32 slave;
+};
+
+static unsigned short ptydim(i32 v, i32 lo)
+{
+    return (unsigned short)(v<lo ? lo : v>0xffff ? 0xffff : v);
+}
+
+static b32 ptysize(i32 master, PtySize z)
+{
+    struct winsize ws = {};
+    ws.ws_row    = ptydim(z.rows, 1);
+    ws.ws_col    = ptydim(z.cols, 1);
+    ws.ws_xpixel = ptydim(z.xpx, 0);
+    ws.ws_ypixel = ptydim(z.ypx, 0);
+    return !ioctl(master, TIOCSWINSZ, &ws);
+}
+
+static Pty openpty(PtySize z)
+{
+    Pty  r    = {-1, -1};
+    char name[128];
+    #ifdef __linux__
+    r.master = posix_openpt(O_RDWR|O_NOCTTY|O_CLOEXEC);
+    #else
+    r.master = posix_openpt(O_RDWR|O_NOCTTY);
+    if (r.master >= 0) {
+        fcntl(r.master, F_SETFD, FD_CLOEXEC);
+    }
+    #endif
+    b32 ok = r.master>=0 && !grantpt(r.master) && !unlockpt(r.master) &&
+             !ptsname_r(r.master, name, sizeof(name));
+    if (ok) {
+        r.slave = open(name, O_RDWR|O_NOCTTY|O_CLOEXEC);
+        ok = r.slave >= 0;
+    }
+    struct termios tio;
+    if (ok && !tcgetattr(r.slave, &tio)) {
+        tio.c_iflag |= IUTF8;
+        tio.c_cc[VERASE] = 0x7f;
+        tcsetattr(r.slave, TCSANOW, &tio);
+    }
+    ok = ok && ptysize(r.master, z) &&
+         !fcntl(r.master, F_SETFL, fcntl(r.master, F_GETFL) | O_NONBLOCK);
+    if (!ok) {
+        i32 save = errno;
+        i32 fds[] = {r.master, r.slave};
+        closeall(fds, countof(fds));
+        errno = save;
+        r.master = r.slave = -1;
+    }
+    return r;
+}
+
+enum : i32 {
+    SPAWN_FILE,  // os_spawn: null input, output into a file
+    SPAWN_IO,    // os_spawnio: an input pipe, output as records
+    SPAWN_PTY,   // os_ptyspawn: a terminal, output into a ring
+};
+
+// Spawn under a reaper. With SPAWN_IO, input is a pipe from the writer
 // thread, errors go to outpath (or /dev/null) directly, and the reader
-// passes output on as records instead of into the file. On macOS the
+// passes output on as records instead of into the file. With SPAWN_PTY
+// the terminal's slave is all three, the writer types on its master,
+// and the reaper runs the tool in a session of its own. On macOS the
 // reaper is spawned disclaimed, its tool's responsible process, only
 // while that changes nothing privacy grants answer to (reapdisclaim).
-static Proc *spawnproc(Os *os, Spawn *sp, Arena scratch, b32 io)
+static Proc *spawnproc(Os *os, Spawn *sp, Arena scratch, i32 mode, PtySize z, iz ring)
 {
-    if (!sp->argv.len || hasnul(sp->cwd) || hasnul(sp->outpath)) {
+    b32 io  = mode == SPAWN_IO;
+    b32 pty = mode == SPAWN_PTY;
+    if (!sp->argv.len || hasnul(sp->cwd) || hasnul(sp->outpath) ||
+            (pty && ring<=0)) {
         errno = EINVAL;
         return 0;
     }
 
-    // Child-side descriptors: input (null, or a pipe's read end), output
-    // write end, errors (the same, or the file), status write end
+    // Child-side descriptors: input (null, a pipe's read end, or the
+    // slave), output write end (or the slave), errors (the same, the
+    // file, or the slave), status write end
     i32   in[2]  = {-1, -1};
     i32   out[2] = {-1, -1};
     i32   st[2]  = {-1, -1};
     Event wake   = {{-1, -1}};
+    Event stop   = {{-1, -1}};
+    Pty   tty    = {-1, -1};
     i32   null   = open("/dev/null", O_RDWR|O_CLOEXEC);
     i32   file   = -1;
     b32   ok     = null >= 0;
-    if (ok && (!io || sp->outpath.len)) {
+    if (ok && mode==SPAWN_FILE) {
+        file = open(cstr(&scratch, sp->outpath),
+                    O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC, 0644);
+        ok   = file >= 0;
+    } else if (ok && io && sp->outpath.len) {
         file = open(cstr(&scratch, sp->outpath),
                     O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC, 0644);
         ok   = file >= 0;
     }
-    ok = ok && cloexecpipe(out) && cloexecpipe(st) &&
-         (!io || (cloexecpipe(in) && os_eventinit(&wake)));
+    if (ok && pty) {
+        tty = openpty(z);
+        ok  = tty.master>=0 && cloexecpipe(st) && os_eventinit(&wake) &&
+              os_eventinit(&stop);
+    } else if (ok) {
+        ok = cloexecpipe(out) && cloexecpipe(st) &&
+             (!io || (cloexecpipe(in) && os_eventinit(&wake)));
+    }
+    u8 *buf = ok && pty ? (u8 *)malloc((uz)ring) : 0;
+    ok = ok && (!pty || buf);
     if (!ok) {
-        i32 save = errno;
-        i32 fds[] = {null, file, in[0], in[1], out[0], out[1], st[0], st[1]};
+        i32 save = errno ? errno : ENOMEM;
+        i32 fds[] = {null, file, in[0], in[1], out[0], out[1], st[0], st[1],
+                     (i32)wake.h[0], (i32)wake.h[1], (i32)stop.h[0],
+                     (i32)stop.h[1], tty.master, tty.slave};
         closeall(fds, countof(fds));
+        free(buf);
         errno = save;
         return 0;
     }
     null   = highfd(null);
-    out[1] = highfd(out[1]);
     st[1]  = highfd(st[1]);
+    if (pty) {
+        tty.slave = highfd(tty.slave);
+        out[1]    = tty.slave;
+    } else {
+        out[1] = highfd(out[1]);
+    }
     if (io) {
         in[0] = highfd(in[0]);
         file  = highfd(file);
     }
-    i32 fd0 = io ? in[0] : null;
-    i32 fd2 = !io ? out[1] : sp->outpath.len ? file : null;
+    i32 fd0 = pty ? tty.slave : io ? in[0] : null;
+    i32 fd2 = pty ? tty.slave : !io ? out[1] : sp->outpath.len ? file : null;
     b32 disclaim = os->resp.disclaim &&
                    reapdisclaim(getpid(), os->respself, sameexe(os));
 
     iz     argc = 3 + sp->argv.len;
     char **argv = alloc<char *>(&scratch, argc+1);
     argv[0] = os->exe;
-    argv[1] = disclaim ? (char *)"--reap-disclaimed" : (char *)"--reap";
+    argv[1] = (char *)reapmodes[2*pty + disclaim];
     argv[2] = cstr(&scratch, sp->cwd);
     for (iz i = 0; i < sp->argv.len; i++) {
         argv[3+i] = cstr(&scratch, sp->argv[i]);
@@ -1608,9 +1901,11 @@ static Proc *spawnproc(Os *os, Spawn *sp, Arena scratch, b32 io)
     i32 child[] = {null, out[1], st[1], in[0], io ? file : -1};
     closeall(child, countof(child));
     file = io ? -1 : file;
-    i32 mine[] = {file, out[0], st[0], in[1], (i32)wake.h[0], (i32)wake.h[1]};
+    i32 mine[] = {file, out[0], st[0], in[1], (i32)wake.h[0], (i32)wake.h[1],
+                  (i32)stop.h[0], (i32)stop.h[1], tty.master};
     if (err) {
         closeall(mine, countof(mine));
+        free(buf);
         errno = err;
         return 0;
     }
@@ -1620,12 +1915,13 @@ static Proc *spawnproc(Os *os, Spawn *sp, Arena scratch, b32 io)
         spawnkill(pid, 0);
         while (waitpid(pid, 0, 0)<0 && errno==EINTR) {}
         closeall(mine, countof(mine));
+        free(buf);
         errno = ENOMEM;
         return 0;
     }
     __builtin_memset(p, 0, __builtin_offsetof(Proc, tail));
     os_lockinit(&p->lock);
-    p->refs     = io ? 4 : 3;
+    p->refs     = io||pty ? 4 : 3;
     p->pid      = pid;
     p->mbox     = sp->mbox;
     p->id       = sp->id;
@@ -1633,14 +1929,22 @@ static Proc *spawnproc(Os *os, Spawn *sp, Arena scratch, b32 io)
     p->statfd   = st[0];
     p->filefd   = file;
     p->maxbytes = sp->maxbytes;
-    p->io       = io;
+    p->io       = io || pty;
     p->infd     = in[1];
     p->wake     = wake;
+    p->pty      = pty;
+    p->master   = tty.master;
+    p->mrefs    = 3;
+    p->stop     = stop;
+    p->ring     = buf;
+    p->ringcap  = ring;
 
-    if (!os_thread(os, io ? procpipe : procreader, p)) {
+    void (*reader)(void *) = pty ? ptyreader : io ? procpipe : procreader;
+    if (!os_thread(os, reader, p)) {
         spawnkill(pid, 0);
         while (waitpid(pid, 0, 0)<0 && errno==EINTR) {}
         closeall(mine, countof(mine));
+        free(buf);
         pthread_mutex_destroy((pthread_mutex_t *)p->lock.opaque);
         free(p);
         errno = EAGAIN;
@@ -1648,19 +1952,25 @@ static Proc *spawnproc(Os *os, Spawn *sp, Arena scratch, b32 io)
     }
     i32 input[] = {in[1], (i32)wake.h[0], (i32)wake.h[1]};
     if (!os_thread(os, procwaiter, p)) {
-        // The reader finishes once the group is dead
+        // The reader finishes once the group is dead, or at the hang-up
         spawnkill(pid, 0);  // no waiter
         while (waitpid(pid, 0, 0)<0 && errno==EINTR) {}
         close(st[0]);
+        if (pty) {
+            ptyhangup(p, 1);  // the caller's hold, and the writer's
+        }
         closeall(input, countof(input));
-        if (io) procrelease(p);  // the writer's
+        if (p->io) procrelease(p);  // the writer's
         procrelease(p);  // the waiter's
         procrelease(p);  // the caller's
         errno = EAGAIN;
         return 0;
     }
-    if (io && !os_thread(os, procwriter, p)) {
+    if (p->io && !os_thread(os, procwriter, p)) {
         spawnkill(pid, p);  // the reader and waiter then finish
+        if (pty) {
+            ptyhangup(p, 1);  // the caller's hold, and the writer's
+        }
         closeall(input, countof(input));
         procrelease(p);  // the writer's
         procrelease(p);  // the caller's
@@ -1672,12 +1982,17 @@ static Proc *spawnproc(Os *os, Spawn *sp, Arena scratch, b32 io)
 
 static Proc *os_spawn(Os *os, Spawn *sp, Arena scratch)
 {
-    return spawnproc(os, sp, scratch, 0);
+    return spawnproc(os, sp, scratch, SPAWN_FILE, {}, 0);
 }
 
 static Proc *os_spawnio(Os *os, Spawn *sp, Arena scratch)
 {
-    return spawnproc(os, sp, scratch, 1);
+    return spawnproc(os, sp, scratch, SPAWN_IO, {}, 0);
+}
+
+static Proc *os_ptyspawn(Os *os, Spawn *sp, PtySize z, iz ring, Arena scratch)
+{
+    return spawnproc(os, sp, scratch, SPAWN_PTY, z, ring);
 }
 
 // A grandchild, so nothing waits for it and no reaper sweeps it: the
@@ -1756,6 +2071,8 @@ static b32 os_procwrite(Os *, Proc *p, Str data)
 {
     if (!p->io || data.len>PROC_QUEUEMAX) {
         return 0;
+    } else if (p->pty && !data.data) {
+        return 1;  // a terminal's input closes only with a hang-up
     }
     ProcChunk *c = 0;
     if (data.len) {
@@ -1828,10 +2145,49 @@ static void os_letgo(Os *, Proc *p)
 
 static void os_procfree(Os *os, Proc *p)
 {
-    if (p->io) {
+    if (p->pty) {
+        ptyhangup(p, 0);
+    } else if (p->io) {
         os_procwrite(os, p, {});  // close the input after the queue
     }
     procrelease(p);
+}
+
+static Str os_ptypeek(Os *, Proc *p)
+{
+    os_lock(&p->lock);
+    iz avail = (iz)(p->wpos - p->rpos);
+    iz at    = (iz)(p->rpos % p->ringcap);
+    iz len   = avail<p->ringcap-at ? avail : p->ringcap-at;
+    p->told  = p->told && avail;
+    os_unlock(&p->lock);
+    return {p->ring+at, len};
+}
+
+static void os_ptytake(Os *, Proc *p, iz len)
+{
+    os_lock(&p->lock);
+    assert(len>=0 && len<=p->wpos-p->rpos);
+    p->rpos += len;
+    b32 full = p->full;
+    os_unlock(&p->lock);
+    if (full && len) {
+        os_signal(&p->stop);
+    }
+}
+
+static b32 os_ptyresize(Os *, Proc *p, PtySize z)
+{
+    return ptysize(p->master, z);
+}
+
+// The foreground group is the shell's own while it waits at a prompt,
+// and the shell leads the session, so its pid is the session's id
+static b32 os_ptybusy(Os *, Proc *p)
+{
+    pid_t fg  = tcgetpgrp(p->master);
+    pid_t sid = tcgetsid(p->master);
+    return fg>0 && sid>0 && fg!=sid;
 }
 
 // Reaper only: the self-pipe's write end, for SIGCHLD, SIGUSR1 and
@@ -1893,6 +2249,7 @@ struct Reaper {
     i32      self;
     i32      group;     // its own group, to signal at the end, or 0 (reapgroup)
     i32      tool;
+    i32      toolsid;   // a terminal's tool, its session while unreaped, or 0
     b32      reported;  // the tool's status went out on fd 4
     ReapProc seen[REAP_SEEN];
     iz       nseen;
@@ -1921,7 +2278,11 @@ static void reapchildren(Reaper *r)
         i32 pid    = waitpid(-1, &status, WNOHANG);
         if (pid <= 0) {
             return;
-        } else if (pid==r->tool && !r->reported) {
+        }
+        if (pid == r->tool) {
+            r->toolsid = 0;  // its pid, and so its session's id, is free
+        }
+        if (pid==r->tool && !r->reported) {
             r->reported = 1;
             if (WIFSIGNALED(status)) {
                 reapstatus(-1, WTERMSIG(status));
@@ -2057,7 +2418,7 @@ static iz reapsignal(Reaper *r, i32 sig)
 
     iz count = 0;
     for (iz i = 0; i < n; i++) {
-        if (reapmine(&procs[i], r->self, r->group, mine[i])) {
+        if (reapmine(&procs[i], r->self, r->group, r->toolsid, mine[i])) {
             reapsignalone(&procs[i], sig);
             count++;
         }
@@ -2241,7 +2602,7 @@ static iz reapsignal(Reaper *r, i32 sig)
     for (iz i = 0; i < r->nseen; i++) {
         ReapProc *p = &r->seen[i];
         if (p->start && reapstart(p->pid)==p->start &&
-                reapmine(p, r->self, r->group, 1)) {
+                reapmine(p, r->self, r->group, r->toolsid, 1)) {
             sendsignal(p->pid, sig, 0);
             count++;
             r->seen[live++] = *p;
@@ -2267,7 +2628,7 @@ static iz reapsignal(Reaper *r, i32 sig)
     r->nids = reaporigin(procs, n, mine, r->ids, r->nids, r->idcap, r->resp);
     for (iz i = 0; i < n; i++) {
         ReapProc *p = &procs[i];
-        if (mine[i] && reapmine(p, r->self, r->group, 1) &&
+        if (mine[i] && reapmine(p, r->self, r->group, r->toolsid, 1) &&
                 reapstart(p->pid)==p->start) {
             sendsignal(p->pid, sig, 0);
             count++;
@@ -2278,7 +2639,7 @@ static iz reapsignal(Reaper *r, i32 sig)
         }
     }
 
-    if (!r->group) {
+    if (!r->group && !r->toolsid) {
         return count;
     }
     i32 mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_UID, (i32)getuid()};
@@ -2298,7 +2659,7 @@ static iz reapsignal(Reaper *r, i32 sig)
                 continue;
             }
             p.sid = getsid(p.pid);
-            if (reapmine(&p, r->self, r->group, 0) && reapstart(p.pid)==p.start) {
+            if (reapmine(&p, r->self, r->group, r->toolsid, 0) && reapstart(p.pid)==p.start) {
                 sendsignal(p.pid, sig, 0);
                 count++;
             }
@@ -2331,6 +2692,56 @@ static iz   reapsignal(Reaper *, i32) { return 0; }
         sendsignal(r->group, SIGKILL, 1);
     }
     _exit(1);
+}
+
+// A terminal's tool, forked rather than spawned, since posix_spawn can
+// neither start a session nor take a controlling terminal: it leads a
+// session of its own, the terminal on its standard descriptors its
+// controlling one, with every signal at its default and none blocked.
+// Returns its pid, or -1 with errno, the child's own if it could not
+// start, which it tells through a pipe that its exec closes.
+static i32 reapfork(char **argv)
+{
+    i32 errp[2];
+    if (!cloexecpipe(errp)) {
+        return -1;
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        i32 save = errno;
+        close(errp[0]);
+        close(errp[1]);
+        errno = save;
+        return -1;
+    } else if (!pid) {
+        i32 sigs[] = {SIGTERM, SIGINT, SIGHUP, SIGPIPE, SIGCHLD, SIGUSR1, SIGUSR2};
+        for (iz i = 0; i < countof(sigs); i++) {
+            signal(sigs[i], SIG_DFL);
+        }
+        sigset_t none;
+        sigemptyset(&none);
+        sigprocmask(SIG_SETMASK, &none, 0);
+        i32 err = 0;
+        if (setsid()<0 || ioctl(0, TIOCSCTTY, 0)<0) {
+            err = errno;
+        } else {
+            execvp(argv[0], argv);
+            err = errno;
+        }
+        while (write(errp[1], &err, sizeof(err))<0 && errno==EINTR) {}
+        _exit(127);
+    }
+    close(errp[1]);
+    i32 err = 0;
+    iz  n   = 0;
+    while ((n = read(errp[0], &err, sizeof(err)))<0 && errno==EINTR) {}
+    close(errp[0]);
+    if (n == (iz)sizeof(err)) {
+        while (waitpid(pid, 0, 0)<0 && errno==EINTR) {}
+        errno = err;
+        return -1;
+    }
+    return pid;
 }
 
 // The reaper process: see "Processes" above. Never returns.
@@ -2398,7 +2809,7 @@ static iz   reapsignal(Reaper *, i32) { return 0; }
     // find what left the tree: no fork watch, and no forking parents.
     r.kq = -1;
     #ifdef __APPLE__
-    if (!__builtin_strcmp(argv[1], "--reap-disclaimed")) {
+    if (reapdisclaimed(argv[1])) {
         r.spi = respspi();
     }
     char *hook   = getenv("PROSPERO_TEST_REAP");
@@ -2422,8 +2833,17 @@ static iz   reapsignal(Reaper *, i32) { return 0; }
     }
     #endif
     childsignals(&attr, flags, 1);
+    b32   tty = reaptty(argv[1]);
     pid_t pid = 0;
-    i32   err = posix_spawnp(&pid, argv[3], &fa, &attr, argv+3, environ);
+    i32   err = 0;
+    if (tty) {
+        pid = reapfork(argv+3);
+        err = pid<0 ? errno : 0;
+    } else {
+        err = posix_spawnp(&pid, argv[3], &fa, &attr, argv+3, environ);
+    }
+    posix_spawn_file_actions_destroy(&fa);
+    posix_spawnattr_destroy(&attr);
     if (err) {
         errno = err;
         reapsay("cannot run", argv[3]);
@@ -2438,7 +2858,8 @@ static iz   reapsignal(Reaper *, i32) { return 0; }
     dup2(null, 1);
     dup2(null, 2);
 
-    r.tool = pid;
+    r.tool    = pid;
+    r.toolsid = tty ? pid : 0;
     reapsnapshot(&r);  // the tool, watched from now on
     #ifdef __APPLE__
     i64 every = 250000;  // µs between snapshots of the tree
@@ -2478,6 +2899,10 @@ static iz   reapsignal(Reaper *, i32) { return 0; }
             u8 b;
             iz got = read(3, &b, 1);
             if (got==0 || (got<0 && errno!=EINTR && errno!=EAGAIN)) {
+                if (tty) {
+                    // Its terminal closed with the harness: a hang-up
+                    _exit(0);
+                }
                 break;  // the harness is gone
             }
         }
@@ -3635,8 +4060,7 @@ extern "C" int prospero_desktop(int argc, char **argv);
 
 int main(int argc, char **argv)
 {
-    if (argc>1 && (!__builtin_strcmp(argv[1], "--reap") ||
-                   !__builtin_strcmp(argv[1], "--reap-disclaimed"))) {
+    if (argc>1 && reapmode(argv[1])) {
         reap(argc, argv);
     }
     #if PROSPERO_DESKTOP

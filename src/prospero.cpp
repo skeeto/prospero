@@ -201,6 +201,7 @@ enum : u32 {
     CONN_NEW,       // (M5) os_listen: a Conn pointer, a connection made
     CONN_DATA,      // (M5) bytes a connection received, in order
     CONN_EOF,       // (M5) the connection's input ended or broke
+    PROC_READY,     // (term) os_ptyspawn: output waits in the ring
 };
 
 enum : i32 {
@@ -300,6 +301,40 @@ static Proc   *os_spawnio(Os *, Spawn *, Arena scratch);
 // os_procfree. Returns 0 if the input is closed or broken (the child
 // stopped reading), or too much is queued already.
 static b32     os_procwrite(Os *, Proc *, Str);
+// (term) A child on a pseudo-terminal, a shell for a terminal tab. It
+// runs under a reaper as with os_spawn, but leads a session of its own,
+// the terminal its controlling one and its standard descriptors, every
+// signal at its default. Output fills a ring of ring bytes, and a full
+// ring stops reading it, holding the child back in time. PROC_READY,
+// which waits for room in the mailbox, says output arrived while none
+// was waiting to be told of: take it with os_ptypeek and os_ptytake
+// until the ring is empty, which alone re-arms PROC_READY. PROC_EOF
+// comes once nothing holds the terminal, or once the child exited and
+// 200 ms passed with nothing to read, whatever it left holding it
+// (bytes may still wait in the ring). PROC_EXIT as with os_spawn.
+// os_procwrite types input, and a null string does nothing. Closing is
+// a hang-up: os_procfree closes the terminal, dropping input not yet
+// written, and the kernel sends the child SIGHUP. Then os_letgo lets
+// its reaper end once the child exits, leaving what ignored the hang-up
+// (nohup) to the system, or os_kill (hard) sweeps the tree.
+struct PtySize {
+    i32 cols;
+    i32 rows;
+    i32 xpx;   // the whole grid in pixels, 0 if unknown
+    i32 ypx;
+};
+// Null on failure, explained by os_lasterr.
+static Proc   *os_ptyspawn(Os *, Spawn *, PtySize, iz ring, Arena scratch);
+// The oldest output in the ring, perhaps not all of it, valid until
+// os_ptytake; empty when there is none, re-arming PROC_READY.
+static Str     os_ptypeek(Os *, Proc *);
+static void    os_ptytake(Os *, Proc *, iz len);  // drop len peeked bytes
+// The kernel tells the foreground programs (SIGWINCH). 0 on failure.
+static b32     os_ptyresize(Os *, Proc *, PtySize);
+// Whether a program other than the child runs in the foreground, as when
+// a shell runs a command.
+static b32     os_ptybusy(Os *, Proc *);
+
 // A program started apart from this one, to outlive it, as a terminal
 // window is: neither waited for nor killed with it, its output nowhere,
 // in its own session (POSIX) or console (Windows). argv[0] is found on
