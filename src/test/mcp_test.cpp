@@ -89,6 +89,50 @@ static void test_mcp(Test *t)
         }
     }
 
+    {
+        // Settings' checkbox: the value written, "<drop>" for none,
+        // "<incl>" for "" (an include sets it), or the error's start
+        static struct { Str cur, tool; b32 on, incl; Str want; } const cases[] = {
+            {"", "echo", 0, 0, "-echo"},
+            {"", "echo", 1, 0, "<drop>"},
+            {"-echo", "echo", 1, 0, "<drop>"},
+            {"-echo", "echo", 1, 1, "<incl>"},
+            {"-echo", "image", 0, 0, "-echo -image"},
+            {"-echo, -image", "echo", 1, 0, "-image"},
+            {"-echo echo -x", "image", 0, 0, "-x -image"},
+            {"-x a", "x", 1, 0, "<drop>"},
+            {"echo, image", "image", 0, 0, "echo"},
+            {"echo, image", "where", 1, 0, "echo image where"},
+            {"echo gone", "echo", 0, 0, "gone"},
+            {"echo", "echo", 0, 0, "it is the last"},
+            {"echo -echo image", "echo", 1, 0, "image echo"},
+            {"echo image", "echo", 1, 0, "image echo"},
+            {",", "echo", 0, 0, "-echo"},
+            {"-", "-", 0, 0, "it is the last"},
+            {"", "-", 0, 0, "--"},
+        };
+        for (iz i = 0; i < countof(cases); i++) {
+            Str what = concat(&a, concat(&a, "mcp toggle \"", cases[i].cur),
+                              concat(&a, "\" ", cases[i].tool));
+            McpToggle r = mcptoggle(&a, cases[i].cur, cases[i].tool, cases[i].on,
+                                    cases[i].incl);
+            Str got = r.err.len ? takehead(r.err, cases[i].want.len) :
+                      r.drop ? Str("<drop>") : !r.value.len ? Str("<incl>") : r.value;
+            expect(t, what, got, cases[i].want);
+            if (!r.err.len && !r.drop && r.value.len) {
+                // The meaning holds but for the tool
+                Str names[] = {"echo", "image", "where", "x", "a", "gone", "-"};
+                for (iz k = 0; k < countof(names); k++) {
+                    b32 want = names[k]==cases[i].tool ? cases[i].on
+                                                        : mcponly(cases[i].cur, names[k]);
+                    expect(t, concat(&a, what, concat(&a, " keeps ", names[k])),
+                           mcponly(r.value, names[k]) ? Str("yes") : Str("no"),
+                           want ? Str("yes") : Str("no"));
+                }
+            }
+        }
+    }
+
     // Command words
     expect(t, "mcp words", mcpwordsshow(&a, "  npx -y  @scope/server "), "npx|-y|@scope/server");
     expect(t, "mcp words single", mcpwordsshow(&a, "'/a b/python' x'y z'"), "/a b/python|xy z");

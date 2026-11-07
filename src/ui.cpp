@@ -11247,6 +11247,38 @@ static void drawcfglist(Gui *g, b32 combo)
             cfgreveal(g, cfgpagekey(&a, kind, r->name), sel);
             ImGui::PopID();
         }
+        if (kind == "mcp") {
+            // Projects' servers no section names yet, each name once
+            if (hostcan(g->main, "mcp.auth")) {
+                mcplisting(g);
+            }
+            b32 head = 0;
+            for (Json *s = g->mcplist ? g->mcplist->child : 0; s; s = s->next) {
+                Str  pn  = jsonstr(jsonget(s, "name"));
+                b32  dup = jsonstr(jsonget(s, "source"))!="project" || !pn.len ||
+                           cfghas(g, kind, pn);
+                for (Json *o = g->mcplist->child; !dup && o != s; o = o->next) {
+                    dup = jsonstr(jsonget(o, "source"))=="project" &&
+                          jsonstr(jsonget(o, "name"))==pn;
+                }
+                if (dup) {
+                    continue;
+                }
+                if (!head && !combo) {
+                    ImGui::TextDisabled("In projects");
+                }
+                head = 1;
+                b32 sel = !g->cfgdiag && g->cfgpkind==kind && g->cfgpname==pn;
+                pushstr(concat(&a, "project ", pn));
+                if (cfgitem(g, a, combo, pn, sel, "A server of projects' .mcp.json: "
+                            "its page turns its tools on or off, for every "
+                            "project's server of this name", 0, 0)) {
+                    cfgselect(g, kind, pn);
+                }
+                cfgreveal(g, cfgpagekey(&a, kind, pn), sel);
+                ImGui::PopID();
+            }
+        }
         Buf ab(&a, 64);
         print(&ab, "Add ");
         print(&ab, kind=="mcp" ? Str("MCP server") : kind);
@@ -11632,6 +11664,255 @@ static b32 drawapprove(Gui *g, Arena a, Str kind, Str name)
     return any;
 }
 
+// Server NAME's tools on its page, as the engine last listed them
+// (mcptlisting): the configuration's server's, or with only settings for
+// projects' servers of the name, each running one's under its file.
+// A checkbox turns one on or off, rewriting [mcp NAME] tools (mcptset);
+// List tools starts a server of the configuration that never listed.
+static void drawmcptools(Gui *g, Arena a, Str name, Json *m)
+{
+    if (!hostcan(g->main, "mcp.auth")) {
+        return;
+    }
+    mcptlisting(g, name);
+    b32 proj = !m || jsonstr(jsonget(m, "source"))=="overlay";
+    b32 word = iniword(name, 0);
+
+    // The entries with tools, and the names over all of them
+    Slice<Json *> ents  = {};
+    Slice<Str>    names = {};
+    i64           kept  = 0;
+    b32           stale = 0;
+    b32           trunc = 0;
+    i64           more  = 0;
+    b32           incl  = 0;
+    Str           cur   = mcptoolsnow(g, name, &incl);
+    for (Json *s = g->mcptlist ? g->mcptlist->child : 0; s; s = s->next) {
+        Str src = jsonstr(jsonget(s, "source"));
+        if (jsonstr(jsonget(s, "name"))!=name || src!=(proj ? Str("project") : Str("config"))
+                || !jsonlen(jsonget(s, "toollist"))) {
+            continue;
+        }
+        ents   = push(&a, ents, s);
+        stale |= jsonflag(jsonget(s, "aslisted"), 0);
+        trunc |= jsonflag(jsonget(s, "truncated"), 0);
+        more  += jsonint(jsonget(s, "toolsmore"), 0);
+        for (Json *t = jsonget(s, "toollist")->child; t; t = t->next) {
+            Str  tool = jsonstr(jsonget(t, "tool"));
+            b32 seen = 0;
+            for (iz k = 0; k < names.len; k++) {
+                seen |= names[k] == tool;
+            }
+            if (!seen) {
+                names = push(&a, names, tool);
+                kept += mcponly(cur, tool);
+            }
+        }
+    }
+
+    ImGui::Spacing();
+    Buf hb(&a, 64);
+    print(&hb, "Tools");
+    if (names.len) {
+        print(&hb, " (");
+        print(&hb, kept);
+        print(&hb, " of ");
+        print(&hb, (i64)names.len + more);
+        putbyte(&hb, ')');
+    }
+    print(&hb, "###mcptools");
+    b32 open = ImGui::CollapsingHeader(cstr0(&a, finish(&hb)), ImGuiTreeNodeFlags_DefaultOpen);
+    itemnamed(g, concat(&a, "mcp tools ", name));
+    if (!open) {
+        return;
+    }
+
+    // What the list is, and what a checkbox changes
+    ImGui::PushStyleColor(ImGuiCol_Text, g->pal->dim);
+    ImGui::PushTextWrapPos(0);
+    Buf nb(&a, 256);
+    if (proj) {
+        print(&nb, "These settings apply to the server named ");
+        print(&nb, name);
+        print(&nb, " in every project's .mcp.json; nothing else of this section does.");
+    }
+    if (stale) {
+        print(&nb, nb.len ? Str(" ") : Str(""));
+        print(&nb, "As last listed: it is not running now.");
+    }
+    if (trunc || more) {
+        print(&nb, nb.len ? Str(" ") : Str(""));
+        print(&nb, "It lists more tools than show here.");
+    }
+    if (incl) {
+        print(&nb, nb.len ? Str(" ") : Str(""));
+        print(&nb, "An included file sets its tools: a change here goes in your own file.");
+    }
+    // A list of those kept, so new tools stay off: one it never names is
+    b32 allow = !mcponly(cur, "\x01");
+    if (allow) {
+        print(&nb, nb.len ? Str(" ") : Str(""));
+        print(&nb, "Only the ticked tools are offered, so any the server adds later stay off.");
+    }
+    if (nb.len) {
+        text(finish(&nb));
+    }
+    ImGui::PopTextWrapPos();
+    ImGui::PopStyleColor();
+
+    if (!names.len) {
+        Str state = jsonstr(jsonget(m, "state"));
+        if (proj) {
+            ImGui::TextDisabled("None runs now: their tools show while a "
+                                "session runs one.");
+            return;
+        }
+        Str why = jsonflag(jsonget(m, "enabled"), 1)==0 ? Str("It is turned off (enabled = no)") :
+                  state=="approve" || jsonget(m, "approve")->child ? Str("Approve its url first") :
+                  state=="auth" ? Str("Sign in first") :
+                  state=="starting" ? Str("Starting...") :
+                  g->mcptsent ? Str("Asked once already: Restart, then try again") : Str{};
+        if (state == "ready") {
+            ImGui::TextDisabled("Listing...");
+            return;
+        }
+        ImGui::BeginDisabled(why.len > 0);
+        b32 go = ImGui::SmallButton("List tools");
+        ImGui::EndDisabled();
+        itemnamed(g, concat(&a, "mcp list ", name));
+        if (why.len) {
+            whytip(why);
+        } else {
+            itemtip("Start the server now, as a session would, to see its tools");
+        }
+        if (go) {
+            g->mcptstart = 1;
+            g->mcptwhy   = {};
+            mcptlisting(g, name);
+        }
+        if (g->mcptwhy.len) {
+            ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
+            ImGui::PushTextWrapPos(0);
+            text(g->mcptwhy);
+            ImGui::PopTextWrapPos();
+            ImGui::PopStyleColor();
+        }
+        return;
+    }
+
+    // One row a tool: checkbox, name, read-only, the description's head
+    Str editwhy = !word ? Str("The name can't be a section's in the file: set "
+                              "its tools there by hand") : Str{};
+    pushstr("mcptools");
+    i32 row = 0;
+    for (iz e = 0; e < ents.len; e++) {
+        Json *s = ents[e];
+        if (proj) {
+            ImGui::PushStyleColor(ImGuiCol_Text, g->pal->dim);
+            textfit(a, concat(&a, "in ", jsonstr(jsonget(s, "file"))),
+                    ImGui::GetContentRegionAvail().x, 0);
+            ImGui::PopStyleColor();
+        }
+        for (Json *t = jsonget(s, "toollist")->child; t; t = t->next, row++) {
+            Arena tmp  = a;
+            Str   tool = jsonstr(jsonget(t, "tool"));
+            Str   desc = jsonstr(jsonget(t, "desc"));
+            Str   prm  = jsonstr(jsonget(t, "params"));
+            b32   on   = mcponly(cur, tool);
+            b32   fil  = jsonflag(jsonget(t, "filterable"), 0);
+            Str   why  = jsonstr(jsonget(t, "why"));
+            ImGui::PushID(row);
+            bool  box  = on;
+            Str   bwhy = editwhy.len ? editwhy : !fil ?
+                         Str("Its name has characters a tools list can't hold: "
+                             "it is always offered") : Str{};
+            ImGui::BeginDisabled(bwhy.len > 0);
+            b32 hit = ImGui::Checkbox("##on", &box);
+            ImGui::EndDisabled();
+            itemnamed(g, concat(&tmp, "mcp tool ", tool));
+            if (bwhy.len) {
+                whytip(bwhy);
+            }
+            if (hit) {
+                Str err = mcptset(g, &tmp, name, tool, box);
+                if (err.len) {
+                    mcpsay(g, name, concat(&tmp, concat(&tmp, tool, ": "), err), 1);
+                }
+            }
+            ImGui::SameLine();
+            ImGui::AlignTextToFramePadding();
+            Buf tb(&tmp, 256);
+            print(&tb, desc);
+            if (prm.len) {
+                print(&tb, desc.len ? Str("\n\n") : Str(""));
+                print(&tb, "Parameters: ");
+                print(&tb, prm);
+            }
+            Str tip = finish(&tb);
+            text(tool);
+            if (tip.len) {
+                itemtip("%s", cstr0(&tmp, tip));
+            }
+            if (jsonflag(jsonget(t, "ro"), 0)) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("read-only");
+            }
+            if (on && why.len) {
+                ImGui::SameLine();
+                ImGui::PushStyleColor(ImGuiCol_Text, g->pal->amber);
+                textfit(tmp, concat(&tmp, "not offered: ", why),
+                        ImGui::GetContentRegionAvail().x, 0);
+                ImGui::PopStyleColor();
+            } else if (desc.len) {
+                ImGui::SameLine();
+                Str head = cut(desc, '\n').head;
+                textfit(tmp, head, ImGui::GetContentRegionAvail().x,
+                        ImGui::GetColorU32(ImGuiCol_TextDisabled), tip);
+            }
+            ImGui::PopID();
+        }
+    }
+
+    // Names a list keeps that no server lists, to take out again
+    if (allow) {
+        for (Str rest = cur; rest.len;) {
+            iz i = 0;
+            for (; i<rest.len && (whitespace(rest[i]) || rest[i]==','); i++) {}
+            rest = cuthead(rest, i);
+            for (i = 0; i<rest.len && !whitespace(rest[i]) && rest[i]!=','; i++) {}
+            Str w = takehead(rest, i);
+            rest  = cuthead(rest, i);
+            b32 listed = !w.len || (w.len>1 && w[0]=='-') || !mcponly(cur, w);
+            for (iz k = 0; !listed && k < names.len; k++) {
+                listed = names[k] == w;
+            }
+            if (listed) {
+                continue;
+            }
+            Arena tmp = a;
+            ImGui::PushID(row++);
+            bool box = 1;
+            ImGui::BeginDisabled(editwhy.len > 0);
+            b32 hit = ImGui::Checkbox("##on", &box);
+            ImGui::EndDisabled();
+            itemnamed(g, concat(&tmp, "mcp tool ", w));
+            if (hit) {
+                Str err = mcptset(g, &tmp, name, w, box);
+                if (err.len) {
+                    mcpsay(g, name, concat(&tmp, concat(&tmp, w, ": "), err), 1);
+                }
+            }
+            ImGui::SameLine();
+            ImGui::AlignTextToFramePadding();
+            text(w);
+            ImGui::SameLine();
+            ImGui::TextDisabled("not listed by the server");
+            ImGui::PopID();
+        }
+    }
+    ImGui::PopID();
+}
+
 // An MCP server's state, on its page: as the main host's engine has it,
 // with Sign in and Sign out for one over HTTP, and Restart.
 static void drawmcp(Gui *g, Arena a, Str name)
@@ -11713,6 +11994,7 @@ static void drawmcp(Gui *g, Arena a, Str name)
         ImGui::TextWrapped("%s", cstr0(&a, g->mcpmsg));
         ImGui::PopStyleColor();
     }
+    drawmcptools(g, a, name, m);
     ImGui::PopID();
 }
 
@@ -11903,7 +12185,18 @@ static void drawcfgpage(Gui *g)
         }
     }
     ImGui::Spacing();
-    if (named && !cfghas(g, kind, name)) {
+    b32 projonly = 0;  // a project's server only
+    for (Json *s = kind=="mcp" && g->mcplist ? g->mcplist->child : 0; s; s = s->next) {
+        projonly |= jsonstr(jsonget(s, "name"))==name && jsonstr(jsonget(s, "source"))=="project";
+    }
+    if (named && !cfghas(g, kind, name) && projonly && name.len && !cfghead(g, kind, name, 0)) {
+        // A project's server: a checkbox above writes the section
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextDisabled("No [mcp %s] section yet: turning a tool off above "
+                            "writes one in your file.", cstr0(&a, name));
+        ImGui::PopTextWrapPos();
+        return;
+    } else if (named && !cfghas(g, kind, name)) {
         ImGui::TextDisabled("Loading...");
         return;
     }

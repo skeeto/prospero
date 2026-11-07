@@ -1545,6 +1545,25 @@ struct Gui {
     Json              *mcplist;    // its servers, null until one came
     i64                mcplistid;  // a listing under way
     i64                mcplistat;  // ms: the last one asked then
+    // The tools of the server whose page shows (mcp {name, tools}),
+    // asked as the listing is, and a tools value its checkboxes sent,
+    // held until a config.get asked after it comes back
+    Region            *mcptmem;    // made anew each time, sized to the reply
+    Json              *mcptlist;   // its entries, null until they came
+    Str                mcptwhy;    // why List tools started nothing
+    char               mcptbuf[FIELD_MAX];
+    Str                mcptfor;    // the name they are for (mcptbuf)
+    i64                mcptid;
+    i64                mcptat;
+    b32                mcptstart;  // List tools: the next ask starts it,
+    b32                mcptsent;   //   once a visit
+    char               mcppbuf[1<<13];
+    Str                mcppend;    // the value sent, null to remove it
+    Str                mcppendfor; // the server's, null if none held
+    i64                mcppendid;  // its config.set
+    char               mcppfor[FIELD_MAX];
+    char               mcpmbuf[FIELD_MAX];
+    Str                mcpmade;    // a section a checkbox wrote anew, null if none
     // What waits for approval (approve), for the pages of [mcp] and
     // [endpoint] sections a web include gives the url of, listed as the
     // servers are
@@ -2387,6 +2406,138 @@ static void onmcplist(Gui *g, Str line, b32 ok)
     scheddirty(&g->sched);
 }
 
+// The tools of server NAME, for its page, asked as the listing is, and
+// once a visit with start when List tools was pressed. Another name's
+// page drops what came for the last one.
+static void mcptlisting(Gui *g, Str name)
+{
+    i64 now = os_time(g->os);
+    if (name != g->mcptfor) {
+        if (name.len > countof(g->mcptbuf)) {
+            return;
+        }
+        copybytes(g->mcptbuf, name.data, name.len);
+        g->mcptfor   = {(u8 *)g->mcptbuf, name.len};
+        g->mcptlist  = 0;
+        g->mcptwhy   = {};
+        g->mcptid    = 0;  // a reply to the last one is dropped
+        g->mcptat    = 0;
+        g->mcptstart = g->mcptsent = 0;
+    }
+    if (g->mcptid || !engineup(g) || !hostcan(g->main, "mcp.auth")) {
+        return;
+    } else if (!g->mcptstart && g->mcptlist && now-g->mcptat < 2000) {
+        schedat(&g->sched, g->sched.now + (2000 - (now-g->mcptat))*1000, DUE_CLOCK);
+        return;
+    }
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 128 + name.len);
+    EvOut w = cmdopen(g, &b, CMD_MCP, 0, g->main);
+    putstrkey(&w.json, "name", name);
+    putintkey(&w.json, "tools", 1);
+    if (g->mcptstart) {
+        putintkey(&w.json, "start", 1);
+        g->mcptstart = 0;
+        g->mcptsent  = 1;
+    }
+    g->mcptid = g->nextid;
+    g->mcptat = now;
+    cmdsend(g, &w, a);
+}
+
+static void onmcptlist(Gui *g, Str line, b32 ok)
+{
+    g->mcptid = 0;
+    if (!ok) {
+        return;
+    }
+    // Room for the copy and its nodes, at most one for each two bytes
+    iz      cap = line.len + (line.len/2 + 64)*(iz)sizeof(Json) + ((iz)1<<16);
+    Region *mem = os_reserve(g->os, cap);
+    if (!mem) {
+        return;
+    }
+    if (g->mcptmem) {
+        os_release(g->os, g->mcptmem);
+    }
+    Arena a = newarena(mem);
+    Json *root = jsonparse(&a, clone(&a, line)).root;
+    g->mcptmem  = mem;
+    g->mcptlist = jsonget(root, "servers");
+    Str why = jsonstr(jsonget(root, "why"));
+    g->mcptwhy = why.len ? why : g->mcptwhy;
+    scheddirty(&g->sched);
+}
+
+static void guiconfigset(Gui *, Str, Str, Str, Str);
+static void guiconfigdelete(Gui *, Str, Str);
+
+// The tools value a server's checkboxes go by: the one sent, while held,
+// else the one in effect, null if unset. With incl, whether a file other
+// than the user's own sets it.
+static Str mcptoolsnow(Gui *g, Str name, b32 *incl)
+{
+    *incl = 0;
+    if (g->mcppendfor.data && g->mcppendfor==name) {
+        return g->mcppend;
+    }
+    Str own = {};
+    for (iz i = 0; i < g->cfgheads.len; i++) {
+        CfgHead *h = &g->cfgheads[i];
+        own = h->own ? h->file : own;
+    }
+    for (iz i = 0; i < g->cfgrows.len; i++) {
+        CfgRow *r = &g->cfgrows[i];
+        if (r->kind=="mcp" && r->name==name && r->key=="tools" && !r->isdflt) {
+            *incl = r->file.len && r->file!=own;
+            return r->value;
+        }
+    }
+    return {};
+}
+
+// A checkbox of server NAME's turned tool on or off: its tools key
+// rewritten (mcptoggle), held as sent until the configuration has it.
+// An error, null if none.
+static Str mcptset(Gui *g, Arena *a, Str name, Str tool, b32 on)
+{
+    b32       incl = 0;
+    Str       cur  = mcptoolsnow(g, name, &incl);
+    McpToggle t    = mcptoggle(a, cur, tool, on, incl);
+    if (t.err.len) {
+        return t.err;
+    } else if (t.value.len>countof(g->mcppbuf) || name.len>countof(g->mcppfor)) {
+        return "the list is too long to change here: edit the file";
+    }
+    // A section a checkbox made goes again once it holds nothing else
+    b32 own   = 0;
+    b32 other = 0;
+    for (iz i = 0; i < g->cfgheads.len; i++) {
+        CfgHead *h = &g->cfgheads[i];
+        own |= h->kind=="mcp" && h->name==name && h->own;
+    }
+    for (iz i = 0; i < g->cfgrows.len; i++) {
+        CfgRow *r = &g->cfgrows[i];
+        other |= r->kind=="mcp" && r->name==name && r->key!="tools" && !r->isdflt;
+    }
+    if (!own && !incl) {
+        copybytes(g->mcpmbuf, name.data, name.len);
+        g->mcpmade = {(u8 *)g->mcpmbuf, name.len};
+    }
+    if (t.drop && own && !other && g->mcpmade.data && g->mcpmade==name) {
+        guiconfigdelete(g, "mcp", name);
+        g->mcpmade = {};
+    } else {
+        guiconfigset(g, "mcp", name, "tools", t.drop ? Str{} : t.value);
+    }
+    copybytes(g->mcppbuf, t.value.data, t.value.len);
+    copybytes(g->mcppfor, name.data, name.len);
+    g->mcppend    = {(u8 *)g->mcppbuf, t.value.len};
+    g->mcppendfor = {(u8 *)g->mcppfor, name.len};
+    g->mcppendid  = g->cfgset;
+    return {};
+}
+
 // What waits for approval, listed at most every 2 s while a page that
 // shows it does.
 static void apprlisting(Gui *g)
@@ -2425,11 +2576,13 @@ static void onapprlist(Gui *g, Str line, b32 ok)
     scheddirty(&g->sched);
 }
 
-// A server of the listing, by name, or null.
+// A server of the configuration in the listing, by name, or only its
+// settings for projects' servers of that name (source overlay), or null.
 static Json *mcpof(Gui *g, Str name)
 {
     for (Json *s = g->mcplist ? g->mcplist->child : 0; s; s = s->next) {
-        if (jsonstr(jsonget(s, "name"))==name && jsonstr(jsonget(s, "source"))=="config") {
+        Str src = jsonstr(jsonget(s, "source"));
+        if (jsonstr(jsonget(s, "name"))==name && (src=="config" || src=="overlay")) {
             return s;
         }
     }
@@ -2461,6 +2614,34 @@ static Str mcpstatus(Gui *g, Arena *a, Str name, u32 *dot)
     print(&b, name);
     print(&b, ": ");
     *dot = g->pal->dim;
+    i32 proj[4] = {};  // projects' servers by name: ready, starting, failed, else
+    for (Json *s = g->mcplist ? g->mcplist->child : 0; s; s = s->next) {
+        if (jsonstr(jsonget(s, "name"))==name && jsonstr(jsonget(s, "source"))=="project") {
+            Str ps = jsonstr(jsonget(s, "state"));
+            proj[ps=="ready" ? 0 : ps=="starting" ? 1 : ps=="stopped" ? 3 : 2]++;
+        }
+    }
+    b32 overlay = jsonstr(jsonget(m, "source")) == "overlay";
+    if (hostcan(g->main, "mcp.auth") && (overlay || (!m && proj[0]+proj[1]+proj[2]+proj[3]))) {
+        // Settings for projects' servers of the name, each where it runs
+        print(&b, overlay && !jsonflag(jsonget(m, "enabled"), 1)
+                  ? Str("turned off for projects' servers of this name")
+                  : Str("projects' servers of this name"));
+        Str words[] = {" running", " starting", " failed", " not running"};
+        b32 any = 0;
+        for (i32 i = 0; i < 4; i++) {
+            if (proj[i]) {
+                print(&b, any ? Str(", ") : Str(": "));
+                print(&b, proj[i]);
+                print(&b, words[i]);
+                any = 1;
+            }
+        }
+        print(&b, any ? Str("") : Str(": none running"));
+        *dot = proj[2] ? g->pal->bad : proj[1] ? g->pal->amber :
+               proj[0] ? g->pal->ok  : g->pal->dim;
+        return finish(&b);
+    }
     if (!hostcan(g->main, "mcp.auth")) {
         print(&b, "the engine is too old to show it");
     } else if (!m) {
@@ -5793,6 +5974,8 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
     case CMD_MCP:
         if (id == g->mcplistid) {
             onmcplist(g, line, ok);
+        } else if (id == g->mcptid) {
+            onmcptlist(g, line, ok);
         }
         return;
     case CMD_MCPAUTH:
@@ -5843,6 +6026,11 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
         }
         if (ok) {
             loadcfg(g, line);
+        }
+        if (g->mcppendfor.data && id>g->mcppendid) {
+            g->mcppendfor = {};
+        } else if (g->mcppendfor.data && !g->cfgset) {
+            guiconfigget(g);  // asked before the set: ask again
         }
         return;
 
@@ -12881,6 +13069,8 @@ enum : i32 {
     CHK_MCPSIGNED,    // the sign-in to web succeeded, once, through the browser
     CHK_EPSIGNED,     // a sign-in for an endpoint succeeded, the count as text says
     CHK_MCPCALL,      // the session's call to web's echo tool came back
+    CHK_MCPTOOLSET,   // [mcp web] tools is text, null for unset, the page
+                      // shows echo ticked as that says, and the file has it
     CHK_FARKID,       // the latest task's subagent is open on far, under its
                       // parent in the sidebar, marked away, the row on far
     CHK_FARREPORT,    // its ask allowed from here, the file written there,
@@ -13173,6 +13363,7 @@ static Str chknames[] = {
     "the MCP server's page says what it is", "signed in through the browser",
     "signed in for an endpoint, the count as given",
     "the MCP server's tool answered the session",
+    "the MCP server's tools key, as its checkbox wrote it",
     "the subagent on far was opened here, under its parent, its row on far",
     "its ask, answered here, let it write there, and the parent heard",
     "a host the user disconnected stays so, the task row saying so",
@@ -13267,6 +13458,8 @@ enum : i32 {
     W_NAMEDUPDATED,// the remote named by text is updated, or failed to be
     W_MCPSTATE,   // the MCP server web's page says what text begins
     W_MCPSIGNED,  // a sign-in to an MCP server ended
+    W_MCPTOOLS,   // the MCP server web's page lists its tool text
+    W_MCPTOOLSET, // [mcp web] tools is text, null for unset, nothing held
     W_EPSTATE,    // endpoint gpt's page, or text "NAME|STATUS" NAME's, says what it begins
     W_EPSIGNED,   // a sign-in for endpoint gpt, or text NAME, ended
     W_FARKID,     // the latest subagent on far is open here, at work
@@ -13299,6 +13492,7 @@ static Str waitnames[] = {
     "the WSL distro's section", "the dialog's host's models",
     "the named remote to come up", "the named remote to close",
     "the named remote's update", "the MCP server's state", "the MCP sign-in",
+    "the MCP server's tool listed", "the MCP server's tools key",
     "the endpoint's ChatGPT state", "the ChatGPT sign-in",
     "the subagent on far", "the subagent on far shown", "a toast",
     "the changes", "the folder's probe", "the worktree's branch",
@@ -16761,6 +16955,21 @@ static DriveOp mcpops[] = {
     {OP_MARK, 0, 0, 0, 300, ""},
     {OP_CHECK, CHK_MCPCALL, 0, 0, 0, ""},
     {OP_WAIT, W_MCPSTATE, 0, 0, 10000, "web: running, "},
+    // Its Tools list: echo unticked writes tools = -echo to the user's
+    // file, ticked again takes the key away
+    {OP_WAIT, W_MCPTOOLS, 0, 0, 10000, "echo"},
+    {OP_SHOT, 0, 0, 0, 300, "mcp-tools-0"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "mcp tool echo"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 100, ""},
+    {OP_WAIT, W_MCPTOOLSET, 0, 0, 10000, "-echo"},
+    {OP_CHECK, CHK_MCPTOOLSET, 0, 0, 0, "-echo"},
+    {OP_SHOT, 0, 0, 0, 300, "mcp-tools-1-unticked"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "mcp tool echo"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 100, ""},
+    {OP_WAIT, W_MCPTOOLSET, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_MCPTOOLSET, 0, 0, 0, ""},
     {OP_MOVE, T_NAMED, 0, 0, 100, "mcp signout web"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 100, ""},
@@ -18944,6 +19153,19 @@ static b32 drivewaitdone(Gui *g)
     }
     case W_MCPSIGNED:
         return !g->mcpname.len && g->mcpmsgfor=="web" && g->mcpmsg.len;
+    case W_MCPTOOLS:
+        for (Json *s = g->mcptfor=="web" && g->mcptlist ? g->mcptlist->child : 0; s;
+             s = s->next) {
+            for (Json *t = jsonget(s, "toollist")->child; t; t = t->next) {
+                if (jsonstr(jsonget(t, "tool")) == g->ops[g->drivepc-1].text) {
+                    return 1;
+                }
+            }
+        }
+        return 0;
+    case W_MCPTOOLSET:
+        return !g->mcppendfor.data && !g->cfgset && !g->cfgget &&
+               mcprow(g, "web", "tools")==g->ops[g->drivepc-1].text;
     case W_EPSTATE: {
         // Its text: "NAME|STATUS", or the status of endpoint gpt
         u32 dot  = 0;
@@ -21210,6 +21432,15 @@ static b32 drivecheck(Gui *g, i32 chk)
         Int n    = parseint(t.len ? cut(t, '|').tail : Str("2"));
         return n.ok && g->mcpsignins==n.val && g->mcpmsgfor==name &&
                g->mcpmsg=="Signed in" && !g->mcpbad;
+    }
+    case CHK_MCPTOOLSET: {
+        Arena a    = g->frame;
+        Str   want = g->ops[g->drivepc-1].text;
+        b32   incl = 0;
+        Read  rd   = os_read(g->os, &a, cfgfile(g, &a), 1<<20);
+        b32   file = rd.err==READ_OK && (find(rd.data, "tools = -echo")>=0) == (want=="-echo");
+        return file && mcprow(g, "web", "tools")==want &&
+               mcponly(mcptoolsnow(g, "web", &incl), "echo") == !want.len;
     }
     case CHK_MCPCALL: {
         GuiSession *s = g->sess;

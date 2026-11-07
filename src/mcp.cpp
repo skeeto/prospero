@@ -254,6 +254,83 @@ static b32 mcponly(Str only, Str tool)
     return have;
 }
 
+// A tools key's value with one tool turned on or off, as Settings'
+// checkbox writes it. The value is first put plainly, with its meaning
+// kept: a list of tools taken away ("-a -b") when it is unset or starts
+// by taking one away, else the tools it keeps, unknown names too, each
+// named once in the order first named. Drop when nothing is taken away
+// any more, so the key can go; if an included file sets it too, it is
+// "", which counts as unset, with drop clear. An error when the last
+// tool a list keeps would go, which would mean all of them.
+struct McpToggle {
+    Str value;
+    b32 drop;
+    Str err;
+};
+
+static McpToggle mcptoggle(Arena *a, Str cur, Str tool, b32 on, b32 incl)
+{
+    McpToggle r = {};
+    Slice<Str> names = {};
+    b32 less = 0;  // a list of those taken away
+    b32 first = 1;
+    for (Str rest = cur; rest.len;) {
+        iz i = 0;
+        for (; i<rest.len && (whitespace(rest[i]) || rest[i]==','); i++) {}
+        rest = cuthead(rest, i);
+        for (i = 0; i<rest.len && !whitespace(rest[i]) && rest[i]!=','; i++) {}
+        Str word = takehead(rest, i);
+        rest     = cuthead(rest, i);
+        if (!word.len) {
+            break;
+        }
+        b32 minus = word.len>1 && word[0]=='-';
+        less  = first ? minus : less;
+        first = 0;
+        Str name = minus ? cuthead(word, 1) : word;
+        b32 seen = 0;
+        for (iz k = 0; k < names.len; k++) {
+            seen |= names[k] == name;
+        }
+        if (!seen) {
+            names = push(a, names, name);
+        }
+    }
+    if (first) {
+        less = 1;  // unset: all, so far none taken away
+    }
+
+    // Those named the list keeps (or with less, takes away), then tool
+    Slice<Str> out = {};
+    for (iz k = 0; k < names.len; k++) {
+        b32 kept = mcponly(cur, names[k]);
+        if (names[k]!=tool && kept!=less) {
+            out = push(a, out, names[k]);
+        }
+    }
+    if (on != less) {
+        out = push(a, out, tool);
+    }
+
+    if (!out.len && !less) {
+        r.err = "it is the last tool the list keeps: to turn off the server, "
+                "set enabled = no";
+        return r;
+    } else if (!out.len) {
+        r.drop  = !incl;
+        r.value = "";
+        return r;
+    }
+    Buf b(a, 64);
+    for (iz k = 0; k < out.len; k++) {
+        print(&b, k ? Str(" ") : Str(""));
+        print(&b, less ? Str("-") : Str(""));
+        print(&b, out[k]);
+    }
+    r.value = finish(&b);
+    return r;
+}
+
 
 // Commands
 
