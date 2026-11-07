@@ -42,10 +42,12 @@ v=$(cache CMAKE_PROJECT_VERSION)
 edition=$(cache PROSPERO_EDITION)
 exe=$build/prospero
 said=$("$exe" --version)
-if [ "$said" != "prospero $v" ]; then
-    echo "build.sh: $exe --version says \"$said\"" >&2
-    exit 1
-fi
+# A build of an untagged commit adds " (git describe)"
+case "$said" in
+    "prospero $v"|"prospero $v ("*) ;;
+    *) echo "build.sh: $exe --version says \"$said\"" >&2
+       exit 1;;
+esac
 
 for lib in libwayland-client.so.0 libdecor-0.so.0 libX11.so.6; do
     if ! grep -qF "$lib" "$exe"; then

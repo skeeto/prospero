@@ -137,7 +137,8 @@ def macos(args, ver):
                    "-DCMAKE_OSX_DEPLOYMENT_TARGET=11.0"] + size + depsargs(args.deps))
     exe = os.path.join(b, "prospero")
     out = subprocess.run([exe, "--version"], capture_output=True, text=True).stdout
-    if out.strip() != f"prospero {ver}":
+    # A build of an untagged commit adds " (git describe)"
+    if out.split()[:2] != ["prospero", ver]:
         sys.exit(f"engines: {exe} --version says {out!r}")
     publish(args.out, ver, "macos-arm64", exe)
 

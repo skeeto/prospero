@@ -209,7 +209,8 @@ def macos(args, src, ver, zip):
     app = os.path.join(b, "Prospero.app")
     exe = os.path.join(app, "Contents", "MacOS", "prospero")
     said = subprocess.run([exe, "--version"], capture_output=True, text=True).stdout.strip()
-    if said != f"prospero {ver}":
+    # A build of an untagged commit adds " (git describe)"
+    if said.split()[:2] != ["prospero", ver]:
         sys.exit(f"itch: {exe} --version says {said!r}")
     run(["codesign", "--verify", "--deep", "--strict", app])
     run(["cmake", "--build", b, "--target", "package"])
