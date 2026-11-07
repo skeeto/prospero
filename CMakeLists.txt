@@ -77,6 +77,21 @@ target_compile_definitions(prospero_core_flags INTERFACE
   PROSPERO_VERSION="${PROJECT_VERSION}"
 )
 
+# What tree a build is of, as git describe says, for --version and
+# About: worked out at each build, since the commit moves without a new
+# configure, and written only when it changes (cmake/GitDescribe.cmake).
+# Empty for a release, and for a tree with neither git nor .describe.
+# Each target with the core flags waits for it.
+set(PROSPERO_GEN "${CMAKE_CURRENT_BINARY_DIR}/gen")
+add_custom_target(prospero_describe
+  COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_CURRENT_SOURCE_DIR}
+    -DOUT=${PROSPERO_GEN}/describe.h -DVERSION=${PROJECT_VERSION}
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/GitDescribe.cmake
+  BYPRODUCTS ${PROSPERO_GEN}/describe.h
+  VERBATIM)
+target_include_directories(prospero_core_flags INTERFACE ${PROSPERO_GEN})
+add_dependencies(prospero_core_flags prospero_describe)
+
 # Debug builds trap on undefined behavior, which includes failed asserts,
 # and optimize the core a little (-Og), for speed nearer Release's on
 # slow machines, at some cost in a debugger.

@@ -13846,7 +13846,7 @@ static void drawdialogs(Gui *g)
     }
     if (ImGui::BeginPopupModal("About Prospero", 0, ImGuiWindowFlags_AlwaysAutoResize)) {
         b32 enter = modalenter();
-        ImGui::Text("Prospero %s", PROSPERO_VERSION);
+        ImGui::TextUnformatted("Prospero " PROSPERO_VERSION PROSPERO_DESCRIBE);
         ImGui::TextUnformatted("A coding harness: the agent's turns, tools and sessions.");
         ImGui::Spacing();
         ImGui::SeparatorText("Third-party software");

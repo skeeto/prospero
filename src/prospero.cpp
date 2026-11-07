@@ -13,6 +13,17 @@
 #  define PROSPERO_VERSION "0.0.0"
 #endif
 
+// What the build is of beyond its version, for people (--version,
+// About), as " (v0.15.0-9-ga38cb70)", or "" for a release or without
+// the build's describe.h (cmake/GitDescribe.cmake). Never compared, as
+// PROSPERO_VERSION is, between programs.
+#if __has_include("describe.h")
+#  include "describe.h"
+#endif
+#ifndef PROSPERO_DESCRIBE
+#  define PROSPERO_DESCRIBE ""
+#endif
+
 // The edition (CMakeLists.txt): the itch.io builds are plain Prospero,
 // and source builds, as the GitHub releases, the Community Edition
 #if PROSPERO_ITCH
@@ -765,7 +776,7 @@ static i32 app_main(Os *os, Arena mem, Str *args, i32 nargs)
     for (i32 i = 1; i < nargs; i++) {
         Str a = args[i];
         if (a == "--version") {
-            os_print(os, 1, "prospero " PROSPERO_VERSION "\n");
+            os_print(os, 1, "prospero " PROSPERO_VERSION PROSPERO_DESCRIBE "\n");
             return 0;
         } else if (a == "--selftest") {
             Str url = i+1<nargs ? args[i+1] : Str{};

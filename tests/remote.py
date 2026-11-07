@@ -2611,7 +2611,7 @@ class Box:
         os.makedirs(self.cwork)
         arch = "arm64" if platform.machine().lower() in ("arm64", "aarch64") else "amd64"
         ver = subprocess.run([t.prospero, "--version"], capture_output=True,
-                             text=True).stdout.split()[-1]
+                             text=True).stdout.split()[1]
         xdg = os.path.join(t.root, "config")
         engines = os.path.join(xdg, "prospero", "engines")
         os.makedirs(engines)

@@ -33,6 +33,11 @@ commit and the same zlib make the same bytes. Like git archive's, it
 starts with a pax global header naming the commit (git
 get-tar-commit-id). Uncommitted changes are left out, since it comes
 from COMMIT alone.
+
+A COMMIT other than tag vVERSION also gets a .describe, its one line
+what git describe names COMMIT, which a build of the tree then shows
+in --version and About, as a checkout's build shows its own
+(cmake/GitDescribe.cmake). A release's tree has none.
 """
 
 import argparse
@@ -206,6 +211,13 @@ def build(commit, cache):
             if parts[0] == "deps":
                 sys.exit("dist: the commit has a deps/ of its own")
             add(entries, parts, m, data)
+
+    # Which tree it is, past the release, for a build with no git
+    desc = git("describe", "--tags", "--match", "v*", "--always", commit).decode().strip()
+    if desc != f"v{ver}":
+        info = tarfile.TarInfo(".describe")
+        info.mode = 0o644
+        add(entries, [".describe"], info, (desc + "\n").encode())
 
     cached = index(cache)
     for dep in pins(commit):
