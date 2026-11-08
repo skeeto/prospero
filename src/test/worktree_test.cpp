@@ -63,6 +63,8 @@ static void test_worktree(Test *t)
         Str x = "1111111111111111111111111111111111111111";
         Str y = "2222222222222222222222222222222222222222";
         Os *os = newos(a, 1<<20);
+        Str xl = concat(a, x, "\n");
+        Str yl = concat(a, y, "\n");
         // A main checkout on main, with a subdirectory
         os_mkdirs(os, *a, "/r");
         os_mkdirs(os, *a, "/r/.git");
@@ -71,24 +73,24 @@ static void test_worktree(Test *t)
         os_mkdirs(os, *a, "/r/src");
         os_mkdirs(os, *a, "/r/src/deep");
         os_write(os, *a, "/r/.git/HEAD", "ref: refs/heads/main\n");
-        os_write(os, *a, "/r/.git/refs/heads/main", concat(a, x, "\n"));
+        os_write(os, *a, "/r/.git/refs/heads/main", xl);
         // Its worktree, detached
         os_mkdirs(os, *a, "/r/.git/worktrees/w");
         os_mkdirs(os, *a, "/w/sub");
-        os_write(os, *a, "/r/.git/worktrees/w/HEAD", concat(a, y, "\n"));
+        os_write(os, *a, "/r/.git/worktrees/w/HEAD", yl);
         os_write(os, *a, "/r/.git/worktrees/w/commondir", "../..\n");
         os_write(os, *a, "/w/.git", "gitdir: /r/.git/worktrees/w\n");
         // A submodule, with no commondir
         os_mkdirs(os, *a, "/r/.git/modules/m");
         os_mkdirs(os, *a, "/r/m");
-        os_write(os, *a, "/r/.git/modules/m/HEAD", concat(a, x, "\n"));
+        os_write(os, *a, "/r/.git/modules/m/HEAD", xl);
         os_write(os, *a, "/r/m/.git", "gitdir: ../.git/modules/m\n");
         // An unborn branch, and a rebase under way
         os_mkdirs(os, *a, "/u/.git");
         os_write(os, *a, "/u/.git/HEAD", "ref: refs/heads/main\n");
         os_mkdirs(os, *a, "/b/.git");
         os_mkdirs(os, *a, "/b/.git/rebase-merge");
-        os_write(os, *a, "/b/.git/HEAD", concat(a, x, "\n"));
+        os_write(os, *a, "/b/.git/HEAD", xl);
         os_mkdirs(os, *a, "/n");
 
         expect(t, "place root", wtplacestr(os, a, "/r"),

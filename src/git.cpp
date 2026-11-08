@@ -177,7 +177,8 @@ static void gitop(Os *os, Arena *a, GitHead *h)
         gitsteps(os, a, h, merge, "msgnum", "end");
         gitrebased(os, a, h, merge);
     } else if (os_stat(os, *a, apply).type == STAT_DIR) {
-        b32 am = os_stat(os, *a, join(a, apply, "applying")).type != STAT_MISSING;
+        Str applying = join(a, apply, "applying");
+        b32 am = os_stat(os, *a, applying).type != STAT_MISSING;
         h->op = am ? Str("am") : Str("rebase");
         gitsteps(os, a, h, apply, "next", "last");
         if (!am) {

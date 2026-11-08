@@ -66,7 +66,8 @@ static void makesessions(Os *os, Arena *a, Slice<MadeSession> made)
         print(&b, "}\n");
         Str dir = concat(a, "/s/sessions/", made[i].sid);
         os_mkdirs(os, *a, dir);
-        os_write(os, *a, concat(a, dir, "/events.jsonl"), finish(&b));
+        Str log = concat(a, dir, "/events.jsonl");
+        os_write(os, *a, log, finish(&b));
     }
 }
 
@@ -282,14 +283,15 @@ static void testtrash(Test *t)
     command(e, v.scratch, "{\"cmd\":\"trash\",\"id\":2,\"sid\":\"20260101-000000-aaaa\"}");
     os_unlockfile(v.os, held);
     command(e, v.scratch, "{\"cmd\":\"trash\",\"id\":3,\"sid\":\"20260101-000000-aaaa\"}");
-    b32 marked = os_stat(v.os, a, concat(&a, root, "/trashed")).type == STAT_FILE;
+    Str trashed = concat(&a, root, "/trashed");
+    b32 marked = os_stat(v.os, a, trashed).type == STAT_FILE;
     b32 kidmark = os_stat(v.os, a, "/s/sessions/20260101-000001-bbbb/trashed").type == STAT_FILE;
     command(e, v.scratch, "{\"cmd\":\"list\",\"id\":4}");
     command(e, v.scratch, "{\"cmd\":\"list\",\"id\":5,\"trash\":1}");
     command(e, v.scratch, "{\"cmd\":\"open\",\"id\":6,\"sid\":\"20260101-000000-aaaa\"}");
     command(e, v.scratch, "{\"cmd\":\"open\",\"id\":7,\"sid\":\"20260101-000001-bbbb\"}");
     command(e, v.scratch, "{\"cmd\":\"trash\",\"id\":8,\"sid\":\"20260101-000000-aaaa\",\"on\":false}");
-    b32 restored = os_stat(v.os, a, concat(&a, root, "/trashed")).type == STAT_MISSING;
+    b32 restored = os_stat(v.os, a, trashed).type == STAT_MISSING;
     command(e, v.scratch, "{\"cmd\":\"list\",\"id\":9}");
 
     Buf  got(&a, 2048);
@@ -336,7 +338,7 @@ static void testtrash(Test *t)
     // dddd, only just in, stays for trash.empty
     command(e, v.scratch, "{\"cmd\":\"trash\",\"id\":10,\"sid\":\"20260101-000000-aaaa\"}");
     command(e, v.scratch, "{\"cmd\":\"trash\",\"id\":11,\"sid\":\"20260101-000003-dddd\"}");
-    os_write(v.os, a, concat(&a, root, "/trashed"), "1000");
+    os_write(v.os, a, trashed, "1000");
     Slice<Str> gone = {};
     Str        err  = trashpurge(e, &a, 30*DAY_MS, &gone);
     Buf        left(&a, 256);

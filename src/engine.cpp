@@ -6940,7 +6940,8 @@ static b32 *pdfskeep(Session *s, Arena *a, i64 drop)
         if (!m->image.len || --n<drop || !m->pages || m->pdfbad.len) {
             continue;
         }
-        i64 size = os_stat(s->e->os, *a, join(a, s->dir, m->image)).size;
+        Str path = join(a, s->dir, m->image);
+        i64 size = os_stat(s->e->os, *a, path).size;
         if (pages+m->pages<=max && bytes+size<=PDF_BYTES) {
             keep[i] = 1;
             pages += m->pages;
@@ -17645,8 +17646,8 @@ static void replaytools(Session *s, Arena scratch, EvRec *r)
         m.text = clone(&s->perm, jsonstr(jsonget(j, "text")));
         m.seq  = r->seq;  // a later compaction's cut keeps it or not
         addmsg(s, m);
-        webnotenotice(s, scratch, jsonstr(jsonget(j, "kind")), m.text,
-                      geturls(&scratch, jsonget(j, "urls")));
+        Slice<Str> urls = geturls(&scratch, jsonget(j, "urls"));
+        webnotenotice(s, scratch, jsonstr(jsonget(j, "kind")), m.text, urls);
         Job *jb = jobfind(s, jsonint(jsonget(j, "job"), 0));
         if (jb && jsonstr(jsonget(j, "kind"))=="job") {
             jb->quiet = 1;
@@ -18024,8 +18025,11 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
                 s->desk.shot = sh.ok ? sh : s->desk.shot;
             }
             addmsg(s, m);
-            webnotetool(s, t, callname(s, m.callid), jsonstr(jsonget(j, "status")),
-                        m.text, geturls(&t, jsonget(j, "urls")));
+            {
+                Slice<Str> urls = geturls(&t, jsonget(j, "urls"));
+                webnotetool(s, t, callname(s, m.callid), jsonstr(jsonget(j, "status")),
+                            m.text, urls);
+            }
             break;
         case EV_PREFIX:
             // As it began, rather than as the configuration has it now

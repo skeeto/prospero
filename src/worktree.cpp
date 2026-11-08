@@ -1277,7 +1277,8 @@ static void wtmade(Engine *e, Arena scratch, Str sid, Str path, b32 ok, Str err)
             turnready(s, a);  // through the gate again, as it may be gone
         } else {
             setstate(s, S_IDLE);
-            endturn(s, a, "error", concat(&a, "the worktree cannot be made: ", err));
+            Str why = concat(&a, "the worktree cannot be made: ", err);
+            endturn(s, a, "error", why);
         }
     }
 }

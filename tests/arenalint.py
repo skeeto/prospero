@@ -8,7 +8,9 @@
 A callee taking (Arena *perm, Arena scratch) and given one arena as
 both, f(&a, a) or f(p, *p), starts its scratch where its results go, so
 its first allocation in scratch writes over results it made before (as
-3814c05 fixed). A Buf in a struct bound to a local arena that is then
+3814c05 fixed). Likewise f(*p, g(p, ...)) or f(a, g(&a, ...)): the order
+of arguments is unspecified, so the copy may be taken before g
+allocates, and the callee's scratch then writes over what g returned. A Buf in a struct bound to a local arena that is then
 copied into that struct grows, once past its first block, through the
 dead local (base.cpp's reserve). Each such call in src/ and src/test/ is
 printed, as FILE:LINE: and why, and any fails the check. Nothing is
@@ -121,6 +123,33 @@ def balanced(s):
     return depth == 0
 
 
+def toplevel(args):
+    """Split an argument list at its top-level commas, blanks removed."""
+    out, depth, cur = [], 0, ""
+    for c in args:
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        if c == "," and depth == 0:
+            out.append(cur)
+            cur = ""
+        else:
+            cur += c
+    out.append(cur)
+    return [unparen(a) for a in out]
+
+
+NESTED = re.compile(r"([A-Za-z_]\w*)(?:<[^<>()]*>)?\((.*)\)((?:\.|->)[A-Za-z_]\w*)*")
+
+
+def allocates(arg, given):
+    """Whether arg is a call given the arena as given: its result lives
+    in that arena."""
+    m = NESTED.fullmatch(arg)
+    return bool(m) and balanced(m.group(2)) and given in toplevel(m.group(2))
+
+
 def last(path):
     return re.split(r"\.|->", path)[-1]
 
@@ -149,6 +178,14 @@ def lint(text, values, pointers):
                 if PATH.fullmatch(p) and last(p) in pointers:
                     found.append((line(open_), f"{callee(s, open_)}() is given {p} both "
                                   f"as {p} and as *{p}"))
+            if a.startswith("*") and PATH.fullmatch(a[1:]) and last(a[1:]) in pointers:
+                if any(allocates(b, a[1:]) for b in args if b != a):
+                    found.append((line(open_), f"{callee(s, open_)}() is given *{a[1:]} "
+                                  f"beside an argument allocated in {a[1:]}"))
+            elif PATH.fullmatch(a) and last(a) in values:
+                if any(allocates(b, "&" + a) for b in args if b != a):
+                    found.append((line(open_), f"{callee(s, open_)}() is given {a} "
+                                  f"beside an argument allocated in &{a}"))
     for m in BUFSET.finditer(s):
         local = m.group(1)
         if local not in values:
@@ -174,6 +211,11 @@ SNIPPETS = [
     ("Arena *a; g(b->a, *b->a);", 1),
     ("Arena a; f((&a), (a));", 1),
     ("Arena x; farhosts(&x, o, farwsl(e, x));", 0),
+    ("Arena *a; i64 n = os_stat(os, *a, join(a, dir, name)).size;", 1),
+    ("Arena s; f(os, s, concat(&s, x, y));", 1),
+    ("Arena *a; f(os, *a, join(a, d,\n    n).data);", 1),
+    ("Arena *a; Str p = join(a, d, n); f(os, *a, p);", 0),
+    ("Arena *a; f(os, *a, g(b, join(a, d, n)));", 0),
     ("Arena scratch; shellat(os, scratch, clone(perm, concat(&scratch, s)));", 0),
     ("i32 n; parse(&n, n);", 0),
     ("Arena a; // f(&a, a);\n/* f(&a, a); */", 0),

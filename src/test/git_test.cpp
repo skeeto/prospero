@@ -580,11 +580,12 @@ static void testgitrefs(Test *t)
     {
         Os *os = newos(a, 1<<20);
         os_mkdirs(os, *a, "/r/.git/refs/heads/prospero");
-        os_write(os, *a, "/r/.git/refs/heads/prospero/a", concat(a, x, "\n"));
-        os_write(os, *a, "/r/.git/packed-refs",
-                 concat(a, concat(a, concat(a, concat(a,
-                 "# pack-refs with: peeled fully-peeled sorted\r\n", y),
-                 " refs/heads/prospero/a\n"), z), " refs/heads/b\n^4444\n"));
+        Str loose  = concat(a, x, "\n");
+        Str packed = concat(a, concat(a, concat(a, concat(a,
+                     "# pack-refs with: peeled fully-peeled sorted\r\n", y),
+                     " refs/heads/prospero/a\n"), z), " refs/heads/b\n^4444\n");
+        os_write(os, *a, "/r/.git/refs/heads/prospero/a", loose);
+        os_write(os, *a, "/r/.git/packed-refs", packed);
         os_mkdirs(os, *a, "/r/.git/worktrees/w");
         os_write(os, *a, "/r/.git/worktrees/w/commondir", "../..\n");
         expect(t, "refoid loose first", gitrefoid(os, a, "/r/.git", "refs/heads/prospero/a"), x);

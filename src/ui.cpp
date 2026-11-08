@@ -11867,8 +11867,8 @@ static void drawmcptools(Gui *g, Arena a, Str name, Json *m)
         Json *s = ents[e];
         if (proj) {
             ImGui::PushStyleColor(ImGuiCol_Text, g->pal->dim);
-            textfit(a, concat(&a, "in ", jsonstr(jsonget(s, "file"))),
-                    ImGui::GetContentRegionAvail().x, 0);
+            Str in = concat(&a, "in ", jsonstr(jsonget(s, "file")));
+            textfit(a, in, ImGui::GetContentRegionAvail().x, 0);
             ImGui::PopStyleColor();
         }
         for (Json *t = jsonget(s, "toollist")->child; t; t = t->next, row++) {
@@ -11918,8 +11918,8 @@ static void drawmcptools(Gui *g, Arena a, Str name, Json *m)
             if (on && why.len) {
                 ImGui::SameLine();
                 ImGui::PushStyleColor(ImGuiCol_Text, g->pal->amber);
-                textfit(tmp, concat(&tmp, "not offered: ", why),
-                        ImGui::GetContentRegionAvail().x, 0);
+                Str note = concat(&tmp, "not offered: ", why);
+                textfit(tmp, note, ImGui::GetContentRegionAvail().x, 0);
                 ImGui::PopStyleColor();
             } else if (desc.len) {
                 ImGui::SameLine();

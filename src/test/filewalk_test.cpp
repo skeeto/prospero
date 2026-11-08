@@ -85,7 +85,8 @@ static void test_filewalk(Test *t)
         // The mtimes are the tree's own
         iz same = 0;
         for (iz i = 0; i < w.paths.len; i++) {
-            Stat s = os_stat(os, *a, join(a, "/w", w.paths[i]));
+            Str  p = join(a, "/w", w.paths[i]);
+            Stat s = os_stat(os, *a, p);
             same += s.mtime == w.mtimes[i];
         }
         expect(t, "walk.files.mtime", istr(a, same), istr(a, w.paths.len));

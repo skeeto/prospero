@@ -202,23 +202,31 @@ static void test_container(Test *t)
                   "/20261102-120001-dupe", "/.part", "/20261102-120002-kid0",
                   "/20261102-120003-orph", "/20261102-120004-kid1"};
     for (i32 i = 0; i < countof(dirs); i++) {
-        os_mkdirs(v.os, a, concat(&a, kept, dirs[i]));
+        Str dir = concat(&a, kept, dirs[i]);
+        os_mkdirs(v.os, a, dir);
     }
     os_mkdirs(v.os, a, "/st/sessions/20261102-120001-dupe");
     os_mkdirs(v.os, a, "/st/sessions/20261102-110000-0001");
-    os_write(v.os, a, concat(&a, kept, "/20261102-120002-kid0/events.jsonl"),
+    Str path = concat(&a, kept, "/20261102-120002-kid0/events.jsonl");
+    os_write(v.os, a, path,
              "{\"ev\":\"session\",\"parent\":\"20261102-120000-abcd\"}\n");
-    os_write(v.os, a, concat(&a, kept, "/20261102-120003-orph/events.jsonl"),
+    path = concat(&a, kept, "/20261102-120003-orph/events.jsonl");
+    os_write(v.os, a, path,
              "{\"ev\":\"session\",\"parent\":\"20261102-100000-gone\",\"remote\":1}\n");
-    os_write(v.os, a, concat(&a, kept, "/20261102-120004-kid1/events.jsonl"),
+    path = concat(&a, kept, "/20261102-120004-kid1/events.jsonl");
+    os_write(v.os, a, path,
              "{\"ev\":\"session\",\"parent\":\"20261102-120003-orph\"}\n");
-    os_write(v.os, a, concat(&a, kept, "/20261102-120000-abcd/events.jsonl"),
+    path = concat(&a, kept, "/20261102-120000-abcd/events.jsonl");
+    os_write(v.os, a, path,
              "{\"sid\":\"20261102-120000-abcd\",\"ev\":\"session\",\"cwd\":\"/work\","
              "\"parent\":\"20261102-110000-0001\",\"call\":\"c1\",\"depth\":1,"
              "\"remote\":1,\"via\":\"exec\",\"relay\":\"ab\"}\n{\"ev\":\"turn.end\"}\n");
-    os_write(v.os, a, concat(&a, kept, "/20261102-120000-abcd/out/x.txt"), "x");
-    os_write(v.os, a, concat(&a, kept, "/20261102-120001-dupe/events.jsonl"), "theirs\n");
-    os_write(v.os, a, concat(&a, kept, "/.part/events.jsonl"), "{}\n");
+    path = concat(&a, kept, "/20261102-120000-abcd/out/x.txt");
+    os_write(v.os, a, path, "x");
+    path = concat(&a, kept, "/20261102-120001-dupe/events.jsonl");
+    os_write(v.os, a, path, "theirs\n");
+    path = concat(&a, kept, "/.part/events.jsonl");
+    os_write(v.os, a, path, "{}\n");
     os_write(v.os, a, "/st/sessions/20261102-120001-dupe/events.jsonl", "mine\n");
     ctrkeep(v.os, v.scratch, "/st", "t-0000beef");
     expect(t, "ctrkeep log", cfgfile(v.os, "/st/sessions/20261102-120000-abcd/events.jsonl"),
