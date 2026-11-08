@@ -143,6 +143,21 @@ static void test_view(Test *t)
         expect(t, "view.hashline diff", tooldiff(&a, "edit", lines, "ok"),
                "```diff\n--- a.c\n+++ a.c\n@@ replace lines 2-3 @@\n+z\n@@ insert after line 0 @@\n"
                "+t\n@@ delete lines 9 @@\n```\n");
+
+        // replace_all: the first place, then how many more there were
+        Str all = "{\"path\":\"f.lua\",\"old_string\":\"\\n\",\"new_string\":\"\\nT = {}\\n\","
+                  "\"replace_all\":true}";
+        expect(t, "view.replace_all diff", tooldiff(&a, "edit", all,
+               "Edited f.lua: replaced 600 matches, the first at line 1."),
+               "```diff\n--- f.lua\n+++ f.lua\n@@ -1,1 +1,2 @@\n-\n+\n+T = {}\n"
+               "\\ the same change in 599 more places\n```\n");
+        expect(t, "view.replace_all two", tooldiff(&a, "edit", all,
+               "Edited f.lua: replaced 2 matches, the first at line 7."),
+               "```diff\n--- f.lua\n+++ f.lua\n@@ -7,1 +7,2 @@\n-\n+\n+T = {}\n"
+               "\\ the same change in 1 more place\n```\n");
+        expect(t, "view.replace one", tooldiff(&a, "edit", all,
+               "Edited f.lua: replaced 1 match at line 3 (matched ignoring indentation)."),
+               "```diff\n--- f.lua\n+++ f.lua\n@@ -3,1 +3,2 @@\n-\n+\n+T = {}\n```\n");
     }
 
     // A turn: deltas grow provisional messages, which the committed

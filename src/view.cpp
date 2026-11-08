@@ -1433,8 +1433,23 @@ static i64 linecount(Str s)
     return countnl(s) + (s[s.len-1] != '\n');
 }
 
+// The number in result just after mark, as in "line 12." or "line 12
+// (...)": the digits only. Not ok if mark is missing.
+static Int numafter(Str result, Str mark)
+{
+    iz at = find(result, mark);
+    if (at < 0) {
+        return {};
+    }
+    iz b = at + mark.len;
+    iz e = b;
+    for (; e<result.len && result[e]>='0' && result[e]<='9'; e++) {}
+    return parseint(span(result.data+b, result.data+e));
+}
+
 // A finished edit or write as a fenced unified diff (markdown), from its
-// arguments and the line its result names; null if not one. Its
+// arguments and what its result says; null if not one. A replace_all
+// edit shows its first place, and how many more there were. Its
 // temporaries are left in the arena too.
 static Str tooldiff(Arena *a, Str name, Str args, Str result)
 {
@@ -1497,16 +1512,11 @@ static Str tooldiff(Arena *a, Str name, Str args, Str result)
             difflines(&d, '+', jsonstr(jsonget(e, "text")));
         }
     } else if (name == "edit") {
-        Str olds = jsonstr(jsonget(j, "old_string"));
-        Str news = jsonstr(jsonget(j, "new_string"));
-        iz  at   = find(result, "line ");
-        Int line = at<0 ? Int{} : parseint(cuthead(result, at+5));
-        if (!line.ok) {  // "line 12." or "line 12 (...)": the digits only
-            iz e = at + 5;
-            for (; e<result.len && result[e]>='0' && result[e]<='9'; e++) {}
-            line = at<0 ? Int{} : parseint(span(result.data+at+5, result.data+e));
-        }
-        i64 n = line.ok ? line.val : 1;
+        Str olds  = jsonstr(jsonget(j, "old_string"));
+        Str news  = jsonstr(jsonget(j, "new_string"));
+        Int line  = numafter(result, "line ");
+        Int count = numafter(result, ": replaced ");
+        i64 n     = line.ok ? line.val : 1;
         print(&d, "--- ");
         print(&d, path);
         print(&d, "\n+++ ");
@@ -1522,6 +1532,13 @@ static Str tooldiff(Arena *a, Str name, Str args, Str result)
         print(&d, " @@\n");
         difflines(&d, '-', olds);
         difflines(&d, '+', news);
+        if (count.ok && count.val>1) {
+            // replace_all made the same change elsewhere too
+            i64 more = count.val - 1;
+            print(&d, "\\ the same change in ");
+            print(&d, more);
+            print(&d, more==1 ? Str(" more place\n") : Str(" more places\n"));
+        }
     } else if (name == "write") {
         Str content = jsonstr(jsonget(j, "content"));
         i64 lines   = linecount(content);
