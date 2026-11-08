@@ -1670,6 +1670,9 @@ struct Gui {
     b32                termfocus;    // focus the terminal when next drawn
     b32                termfocused;  // it has the keyboard, as last drawn
     ImGuiID            termid;       // its grid's item
+    i32                termforcecols;  // the checklist's grid size, past
+    i32                termforcerows;  // its pane's, else 0
+    i32                termverts;    // its window's vertices, as last drawn
 
     // Files and log
     Str                statedir;
@@ -5696,6 +5699,7 @@ static void termapply(Gui *, GuiHost *, Arena, EvRec *);
 static void termcloseall(Gui *);
 static void drawterm(Gui *);
 static void termhotkeys(Gui *);
+static void termgrab(Gui *);
 static Str  termscreen(Gui *, Arena *);
 static b32  termsizecheck(Gui *);
 
@@ -13186,6 +13190,10 @@ enum : i32 {
     CHK_TERMSIZE,     // the terminal fills its pane, the engine told its size
     CHK_TERMNONE,     // the session shown has no terminal
     CHK_TERMQUIET,    // no frames while idle, the terminal shown
+    CHK_TERMFORCE,    // sets the grid to dx by dy, clipped to its pane
+                      // (0 by 0: its pane's), and passes
+    CHK_TERMGRID,     // the terminal is dx by dy, drawn in over 64K
+                      // vertices (32-bit indices)
     CHK_COUNT,
 };
 
@@ -13470,6 +13478,7 @@ static Str chknames[] = {
     "the terminal has the keyboard", "the terminal shows the text",
     "the terminal fills its pane", "the terminal is closed",
     "no frames while idle, the terminal shown",
+    "the terminal's grid is set", "the terminal is that size, in 32-bit indices",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -17414,8 +17423,9 @@ static DriveOp termops[] = {
     {OP_CHECK, CHK_TERMSIZE, 0, 0, 0, ""},
     {OP_RESIZE, 0, 0, 0, 1000, ""},
     {OP_CHECK, CHK_TERMSIZE, 0, 0, 0, ""},
-    // Quiet once its output stops
-    {OP_MOVE, T_EMPTY, 0, 0, 1000, ""},  // its tooltip's timers run out
+    // Quiet once its output stops: past its tooltip's timers, and past the
+    // layout's save, 4 s after the last input, which the move is
+    {OP_MOVE, T_EMPTY, 0, 0, 4500, ""},
     {OP_MARK, 0, 0, 0, 3000, ""},
     {OP_CHECK, CHK_TERMQUIET, 0, 0, 0, ""},
     // Hidden from the terminal, then back as it was, with the keyboard
@@ -17452,6 +17462,17 @@ static DriveOp termops[] = {
     {OP_WAIT, W_TERM, 0, 0, 5000, "\n500\n"},
     {OP_TEXT, 0, 0, 0, 300, "q"},
     {OP_WAIT, W_TERM, 0, 0, 5000, "\nhello vim\n"},
+    // 300x80 filled, past 64K vertices: 32-bit indices, which GLES 3.0
+    // needs, having no VtxOffset to split a draw list by
+    {OP_CHECK, CHK_TERMFORCE, 300, 80, 1000, ""},
+    {OP_TEXT, 0, 0, 0, 100, "seq 6000 | tr '\\n' x; echo end"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "x6000xend\n"},
+    {OP_MARK, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_TERMGRID, 300, 80, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "terminal-big"},
+    {OP_CHECK, CHK_TERMFORCE, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_TERMSIZE, 0, 0, 0, ""},
     // exit closes it; a failing exit leaves its screen under a banner,
     // and Enter starts another shell
     {OP_TEXT, 0, 0, 0, 100, "exit"},
@@ -17471,8 +17492,11 @@ static DriveOp termops[] = {
     TERMKEY(GKEY_ENTER, 100),
     {OP_WAIT, W_TERM, 0, 0, 5000, "\nfresh"},
     // Quitting hangs up the shell, whose trap leaves a file (gui.py)
-    {OP_TEXT, 0, 0, 0, 100, "trap 'echo hup >hup.txt; exit' HUP"},
-    TERMKEY(GKEY_ENTER, 300),
+    // bash 5 in readline takes the hang-up as EOF and exits without its
+    // HUP trap, so EXIT too: either way an ending, not a SIGKILL
+    {OP_TEXT, 0, 0, 0, 100, "trap 'echo hup >hup.txt; exit' HUP EXIT"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "EXIT\ntty$ "},  // set, at the next prompt
     {OP_SUMMARY, 0, 0, 0, 0, ""},
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
@@ -21222,6 +21246,32 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_TERMQUIET:
         return g->panes[PANE_TERMINAL] && drivequiet(g, "idle with the terminal shown", 2);
+    case CHK_TERMFORCE: {
+        DriveOp *op = &g->ops[g->drivepc-1];
+        g->termforcecols = (i32)op->dx;
+        g->termforcerows = (i32)op->dy;
+        return 1;
+    }
+    case CHK_TERMGRID: {
+        DriveOp    *op = &g->ops[g->drivepc-1];
+        GuiSession *s  = g->sess ? sessroot(g, g->sess) : 0;
+        TermTab    *tt = s ? s->term : 0;
+        if (!tt || !tt->t) {
+            return 0;
+        }
+        ariel_Modes mo = ariel_modes(tt->t);
+        Arena a = g->frame;
+        Buf   b(&a, 128);
+        print(&b, "drive: the terminal is ");
+        print(&b, (i64)mo.cols);
+        print(&b, "x");
+        print(&b, (i64)mo.rows);
+        print(&b, " in ");
+        print(&b, (i64)g->termverts);
+        print(&b, " vertices");
+        guilog(g, finish(&b));
+        return mo.cols==(i32)op->dx && mo.rows==(i32)op->dy && g->termverts>0xffff;
+    }
     case CHK_PLANTEXT:
         return tabselected("Plan") && g->planshown>0 && g->plan.doc &&
                find(g->plan.doc->v->msgs[0].text, g->ops[g->drivepc-1].text)>=0;

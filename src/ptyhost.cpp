@@ -42,10 +42,11 @@
 // blanks; else the session's shell, unless it is a POSIX system's
 // default (termshell); else $SHELL; else that default; else /bin/sh. A
 // POSIX sh starts as a login shell, but in the GUI's own engine on
-// Linux, whose desktop session ran the profile already. Its environment is the session
-// shell's (shellover), with TERM (xterm-256color, or xterm where the
-// system lacks that terminfo), COLORTERM, TERM_PROGRAM and its version,
-// without another terminal's variables, nor COLUMNS and LINES.
+// Linux, whose desktop session ran the profile already. Its environment
+// is the session shell's (shellover), with TERM (xterm-256color, or
+// xterm where the system lacks that terminfo), COLORTERM, TERM_PROGRAM
+// and its version, without another terminal's variables, nor COLUMNS
+// and LINES.
 //
 // This is free and unencumbered software released into the public domain.
 

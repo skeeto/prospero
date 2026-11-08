@@ -560,6 +560,17 @@ enum {
 static void    os_guiflash(Os *, i32 how);
 // Whether the window has the keyboard focus, and is not minimized.
 static b32     os_guifocused(Os *);
+// The code point an ImGuiKey's key types under the current keyboard
+// layout, with Shift if shift and with AltGr if held, else 0: what a
+// terminal's Ctrl and Alt chords send, which bring no text. Asked
+// afresh each press, so a layout switch counts at once.
+static u32     os_guikeycp(Os *, i32 imguikey, b32 shift);
+// Drop any half-typed composition, such as a dead key pressed as part
+// of a chord the app took.
+static void    os_guiimereset(Os *);
+// Whether AltGr is held where the platform tells it apart from Ctrl+Alt
+// (ImGui sees neither Ctrl nor Alt from it there).
+static b32     os_guialtgr(Os *);
 
 // Synthetic input for the scripted checklist (gui --drive), posted to
 // the window's own event queue so that it takes the path real input

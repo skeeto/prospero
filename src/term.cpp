@@ -46,6 +46,9 @@ struct TermTab {
     i32         wantrows;
     i64         wantat;    // when it last changed, sched µs
     i64         fed;       // output offset fed to ariel
+    u32         mheld;     // mouse buttons whose press went to the app
+    f32         wheel;     // wheel notches not yet sent, fractions kept
+    b32         pasteins;  // Insert, held since it pasted with Shift
     b32         busy;      // a program runs in the shell
     Palette    *pal;       // the colors given ariel
     i32         code;      // the end's exit code, or -1
@@ -220,8 +223,8 @@ static void termsize(Gui *g, TermTab *tt, i32 cols, i32 rows, f32 cw, f32 ch)
     EvOut w = termbegin(g, &b, CMD_TERMRESIZE, tt);
     putintkey(&w.json, "cols", cols);
     putintkey(&w.json, "rows", rows);
-    putintkey(&w.json, "xpx", (i64)((f32)cols*cw));
-    putintkey(&w.json, "ypx", (i64)((f32)rows*ch));
+    putintkey(&w.json, "xpx", (i64)roundf((f32)cols*cw));
+    putintkey(&w.json, "ypx", (i64)roundf((f32)rows*ch));
     cmdsend(g, &w, a);
 }
 
@@ -597,8 +600,8 @@ static i32 termnamed(ImGuiKey k)
     }
 }
 
-// A text key's code point on a US layout, else 0: what a Ctrl chord
-// sends, which gives no text.
+// A text key's code point on a US layout, by its position, else 0: the
+// fallback for Ctrl and Alt chords, which bring no text.
 static u32 termtextkey(ImGuiKey k)
 {
     if (k>=ImGuiKey_A && k<=ImGuiKey_Z) {
@@ -619,6 +622,7 @@ static u32 termtextkey(ImGuiKey k)
     case ImGuiKey_Backslash:    return '\\';
     case ImGuiKey_RightBracket: return ']';
     case ImGuiKey_GraveAccent:  return '`';
+    case ImGuiKey_Oem102:       return '\\';  // ISO's extra key: \ in UK
     default:                    return 0;
     }
 }
@@ -631,12 +635,24 @@ static void termpress(Gui *g, TermTab *tt, ImGuiKey k, b32 repeat)
     key.action = repeat ? ARIEL_REPEAT : ARIEL_PRESS;
     key.key    = termnamed(k);
     if (!key.key) {
-        // Text keys go as their text, but for Ctrl chords, which have none
-        u32 cp = termtextkey(k);
-        if (!cp || !(key.mods & ARIEL_CTRL) || k==ImGuiKey_GraveAccent) {
+        // Text keys go as their text, but for Ctrl and Alt chords, which
+        // have none: as the key's code point under the layout, AltGr
+        // included, so Ctrl+AltGr+8 is Ctrl+[ on a German layout. Where
+        // that isn't ASCII (ü, Cyrillic) Ctrl goes by the US position,
+        // so Ctrl+ü is Ctrl+[, as in VTE. On macOS, Option composes.
+        b32 ctrl = key.mods & ARIEL_CTRL;
+        b32 alt  = !g->mac && (key.mods & ARIEL_ALT);
+        u32 us   = termtextkey(k);
+        if (!(ctrl || alt) || !us || (ctrl && k==ImGuiKey_GraveAccent)) {
             return;
         }
-        key.cp = cp;
+        key.cp      = os_guikeycp(g->os, k, 0);
+        key.shifted = os_guikeycp(g->os, k, 1);
+        if (!key.cp) {
+            key.cp = us;
+        } else if (ctrl && key.cp>=0x80) {
+            key.base = us;
+        }
     }
     ariel_Str s = ariel_key(tt->t, &key);
     terminput(g, tt, {s.data, s.len});
@@ -659,6 +675,141 @@ static void termpaste(Gui *g, TermTab *tt, Arena a)
     }
 }
 
+// Whether a chord on Windows and Linux is the app's, not the terminal's:
+// Ctrl+` and Ctrl+Shift+`, copy and paste, zoom, and the menus' Ctrl+Shift
+// chords (menukeys), which route over the terminal. Every other Ctrl
+// chord goes to the terminal: Ctrl+N, Ctrl+F, Ctrl+1 and the rest, and
+// every chord with AltGr, which types (German Ctrl+AltGr+ß is Ctrl+\).
+static b32 termkept(Gui *g, ImGuiKey k)
+{
+    ImGuiIO &io = ImGui::GetIO();
+    if (g->mac || !io.KeyCtrl || io.KeyAlt || os_guialtgr(g->os)) {
+        return 0;
+    }
+    switch (k) {
+    case ImGuiKey_GraveAccent:
+    case ImGuiKey_Equal:      // Ctrl++ is Ctrl+Shift+= on US layouts
+        return 1;
+    case ImGuiKey_KeypadAdd:
+    case ImGuiKey_Minus:
+    case ImGuiKey_0:
+    case ImGuiKey_KeypadSubtract:
+    case ImGuiKey_Keypad0:
+        return !io.KeyShift;
+    case ImGuiKey_C: case ImGuiKey_V: case ImGuiKey_N:
+    case ImGuiKey_S: case ImGuiKey_T: case ImGuiKey_R:
+        return io.KeyShift;
+    default:
+        return 0;
+    }
+}
+
+// Whether one of the app's chords (termkept) was pressed this frame.
+static b32 termkeptpressed(Gui *g)
+{
+    static ImGuiKey const keys[] = {
+        ImGuiKey_GraveAccent, ImGuiKey_Equal, ImGuiKey_KeypadAdd,
+        ImGuiKey_Minus, ImGuiKey_0, ImGuiKey_KeypadSubtract, ImGuiKey_Keypad0,
+        ImGuiKey_C, ImGuiKey_V, ImGuiKey_N, ImGuiKey_S, ImGuiKey_T, ImGuiKey_R,
+    };
+    for (iz i = 0; i < countof(keys); i++) {
+        if (ImGui::IsKeyPressed(keys[i], false) && termkept(g, keys[i])) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// The mouse over the grid, or holding a button pressed there: reported
+// when the app asks (mouse modes), unless Shift is held, which keeps it
+// local for selection (I6). The wheel, also when reported, otherwise
+// sends arrows on the alternate screen (mode 1007, on by default), and
+// later scrolls history (L3). Ctrl+wheel stays the app's zoom.
+static void termmouse(Gui *g, TermTab *tt, TermMetrics *m, ImVec2 pos, ImGuiID id, b32 hovered)
+{
+    ImGuiIO    &io  = ImGui::GetIO();
+    ariel_Modes mo  = ariel_modes(tt->t);
+    b32         rep = mo.mouse && !io.KeyShift;
+    if (!rep && tt->mheld) {
+        // Shift came down mid-drag, or the app stopped asking: the
+        // releases still go, so it sees no button stuck
+        rep = mo.mouse != 0;
+    }
+    // Clamped to the grid as floats first: off the window, the position
+    // is -FLT_MAX, and a drag or the slack past the last cell goes beyond
+    ImVec2 at = io.MousePos;
+    f32    w  = (f32)mo.cols * m->cw;
+    f32    h  = (f32)mo.rows * m->ch;
+    f32    dx = at.x - pos.x;
+    f32    dy = at.y - pos.y;
+    dx = dx>0 ? (dx<w ? dx : w) : 0;
+    dy = dy>0 ? (dy<h ? dy : h) : 0;
+    ariel_Mouse e = {};
+    e.mods = termmods(g) & ~ARIEL_SHIFT;
+    e.x    = (i32)(dx / m->cw);
+    e.y    = (i32)(dy / m->ch);
+    e.x    = e.x<mo.cols ? e.x : mo.cols-1;
+    e.y    = e.y<mo.rows ? e.y : mo.rows-1;
+    e.px   = (i32)(dx * m->density);
+    e.py   = (i32)(dy * m->density);
+    i32 pw = (i32)roundf(w * m->density);
+    i32 ph = (i32)roundf(h * m->density);
+    e.px   = e.px<pw ? e.px : pw-1;
+    e.py   = e.py<ph ? e.py : ph-1;
+
+    if (rep && ImGui::IsMousePosValid()) {
+        static i32 const buttons[] = {1, 3, 2};  // ImGui's left, right, middle
+        for (i32 b = 0; b < 3; b++) {
+            u32 bit = 1u << b;
+            if (hovered && !io.KeyShift && ImGui::IsMouseClicked(b)) {
+                e.action = ARIEL_PRESS;
+                e.button = buttons[b];
+                tt->mheld |= bit;
+                ariel_Str s = ariel_mouse(tt->t, &e);
+                terminput(g, tt, {s.data, s.len});
+            } else if ((tt->mheld & bit) && !io.MouseDown[b]) {
+                e.action = ARIEL_RELEASE;
+                e.button = buttons[b];
+                tt->mheld &= ~bit;
+                ariel_Str s = ariel_mouse(tt->t, &e);
+                terminput(g, tt, {s.data, s.len});
+            }
+        }
+        if ((hovered || tt->mheld) && (io.MouseDelta.x!=0 || io.MouseDelta.y!=0)) {
+            e.action = ARIEL_MOTION;
+            e.button = 0;  // ariel knows which are held
+            ariel_Str s = ariel_mouse(tt->t, &e);
+            terminput(g, tt, {s.data, s.len});
+        }
+    } else if (!mo.mouse) {
+        tt->mheld = 0;
+    }
+
+    if (!hovered || io.KeyCtrl) {
+        tt->wheel = 0;
+        return;
+    }
+    ImGui::SetKeyOwner(ImGuiKey_MouseWheelY, id);
+    tt->wheel += io.MouseWheel;
+    i32 notches = (i32)tt->wheel;
+    tt->wheel -= (f32)notches;
+    for (; notches; notches -= notches>0 ? 1 : -1) {
+        if (rep) {
+            e.action = ARIEL_PRESS;
+            e.button = notches>0 ? 4 : 5;
+            ariel_Str s = ariel_mouse(tt->t, &e);
+            terminput(g, tt, {s.data, s.len});
+        } else if (mo.altscreen && mo.altscroll) {
+            ariel_Key k = {};
+            k.key = notches>0 ? ARIEL_K_UP : ARIEL_K_DOWN;
+            for (i32 i = 0; i < 3; i++) {
+                ariel_Str s = ariel_key(tt->t, &k);
+                terminput(g, tt, {s.data, s.len});
+            }
+        }
+    }
+}
+
 // The keys of a frame, in order: text as typed, named keys and Ctrl
 // chords through ariel's encoder. ImGui keeps no key repeats in its
 // trail, so those come from its repeat timing.
@@ -673,11 +824,15 @@ static void termkeys(Gui *g, TermTab *tt, Arena a)
             termpaste(g, tt, a);
         }
         return;
-    } else if (!g->mac && io.KeyCtrl && io.KeyShift) {
-        if (ImGui::IsKeyPressed(ImGuiKey_V, false)) {
-            termpaste(g, tt, a);
-        }
-        return;
+    }
+    // Paste: Ctrl+Shift+V, and Shift+Insert as in GNOME Terminal and
+    // Konsole (the clipboard, not the primary selection). It doesn't
+    // repeat, and the Insert it took stays the paste's until let go.
+    b32 shiftins = !g->mac && io.KeyShift && !io.KeyCtrl && !io.KeyAlt &&
+                   ImGui::IsKeyPressed(ImGuiKey_Insert, false);
+    tt->pasteins = shiftins || (tt->pasteins && ImGui::IsKeyDown(ImGuiKey_Insert));
+    if (shiftins || (termkept(g, ImGuiKey_V) && ImGui::IsKeyPressed(ImGuiKey_V, false))) {
+        termpaste(g, tt, a);
     }
 
     b32 pressed[ImGuiKey_NamedKey_COUNT] = {};
@@ -686,7 +841,9 @@ static void termkeys(Gui *g, TermTab *tt, Arena a)
         if (e->Type==ImGuiInputEventType_Key && e->Key.Down &&
                 ImGui::IsNamedKey(e->Key.Key) && !(e->Key.Key & ImGuiMod_Mask_)) {
             pressed[e->Key.Key - ImGuiKey_NamedKey_BEGIN] = 1;
-            termpress(g, tt, e->Key.Key, 0);
+            if (!termkept(g, e->Key.Key) && !(tt->pasteins && e->Key.Key==ImGuiKey_Insert)) {
+                termpress(g, tt, e->Key.Key, 0);
+            }
         } else if (e->Type==ImGuiInputEventType_Text && !ctrl) {
             u32 cp = e->Text.Char;
             if (cp>=0x20 && cp!=0x7f) {
@@ -700,6 +857,7 @@ static void termkeys(Gui *g, TermTab *tt, Arena a)
     for (i32 k = ImGuiKey_NamedKey_BEGIN; k < ImGuiKey_NamedKey_END; k++) {
         ImGuiKey key = (ImGuiKey)k;
         if (!pressed[k - ImGuiKey_NamedKey_BEGIN] && (termnamed(key) || termtextkey(key)) &&
+                !termkept(g, key) && !(tt->pasteins && key==ImGuiKey_Insert) &&
                 ImGui::GetKeyData(key)->DownDuration>0 &&
                 ImGui::IsKeyPressed(key, ImGuiInputFlags_Repeat, ImGuiKeyOwner_Any)) {
             termpress(g, tt, key, 1);
@@ -709,14 +867,17 @@ static void termkeys(Gui *g, TermTab *tt, Arena a)
 
 // Ctrl+`, at the top of the frame, before any shortcut: shows the pane
 // and focuses the terminal, or from the terminal, hides the pane. While
-// the terminal has the keyboard, so that the app keeps its shortcuts,
-// it lets go of it with Cmd held on macOS, or with Ctrl+Shift elsewhere.
+// the terminal has the keyboard on macOS, it lets go of it with Cmd held,
+// so the app keeps every Cmd chord. Elsewhere it keeps the keyboard but
+// for the app's few chords (termkept): on the frame one is pressed it
+// lets go until termgrab, after menukeys, since with the keyboard held no
+// Shortcut() fires, RouteOverActive or not (its owner isn't the item).
 static void termhotkeys(Gui *g)
 {
     ImGuiIO      &io = ImGui::GetIO();
     ImGuiContext &c  = *GImGui;
     if (c.ActiveId && c.ActiveId==g->termid) {
-        b32 app = g->mac ? io.KeyCtrl : io.KeyCtrl&&io.KeyShift;
+        b32 app = g->mac ? io.KeyCtrl : termkeptpressed(g);
         if (!app) {
             ImGui::SetActiveIdUsingAllKeyboardKeys();
         } else {
@@ -727,6 +888,7 @@ static void termhotkeys(Gui *g)
     if (!termctrl(g) || io.KeyShift || !ImGui::IsKeyPressed(ImGuiKey_GraveAccent, false)) {
         return;
     }
+    os_guiimereset(g->os);  // on German, ^ is a dead key
     if (g->panes[PANE_TERMINAL] && g->termfocused) {
         setpane(g, PANE_TERMINAL, 0);
         g->promptfocus = 1;
@@ -738,6 +900,17 @@ static void termhotkeys(Gui *g)
         g->termfocus = 1;
     }
     scheddirty(&g->sched);
+}
+
+
+// Takes back the keyboard termhotkeys let go of for an app chord, once
+// menukeys has seen it.
+static void termgrab(Gui *g)
+{
+    ImGuiContext &c = *GImGui;
+    if (!g->mac && c.ActiveId && c.ActiveId==g->termid) {
+        ImGui::SetActiveIdUsingAllKeyboardKeys();
+    }
 }
 
 
@@ -794,6 +967,10 @@ static void drawterm(Gui *g)
     i32         rows  = (i32)(avail.y / m.ch);
     cols = cols<2 ? 2 : cols;
     rows = rows<1 ? 1 : rows;
+    if (g->termforcecols) {
+        cols = g->termforcecols;
+        rows = g->termforcerows;
+    }
 
     Str why = termwhy(g, s);
     if (!tt || tt->state==TT_NONE) {
@@ -862,8 +1039,8 @@ static void drawterm(Gui *g)
             if (g->sched.now >= at) {
                 b32 fits = cols<=tt->capcols && rows<=tt->caprows;
                 if (fits || termblock(g, tt, cols, rows)) {
-                    if (ariel_resize(tt->t, cols, rows, (i32)(m.cw*m.density),
-                                     (i32)(m.ch*m.density))) {
+                    if (ariel_resize(tt->t, cols, rows, (i32)roundf(m.cw*m.density),
+                                     (i32)roundf(m.ch*m.density))) {
                         tt->cols = cols;
                         tt->rows = rows;
                         if (tt->tid) {
@@ -882,6 +1059,10 @@ static void drawterm(Gui *g)
     u32         bg = termimcolor(ariel_color(tt->t, ARIEL_C_BG));
     dl->AddRectFilled(bb.Min, bb.Max, bg);
     termcells(g, tt, &m, pos, active, a);
+    g->termverts = dl->VtxBuffer.Size;
+    if (tt->state == TT_LIVE) {
+        termmouse(g, tt, &m, pos, id, hovered);
+    }
 
     if (active) {
         termkeys(g, tt, a);

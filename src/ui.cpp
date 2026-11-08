@@ -13115,28 +13115,35 @@ static void newfree(Gui *g)
 // focused field's own use of a key goes ahead of): a new session, zoom
 // by key or by Ctrl+wheel (Cmd on macOS), find and the session's
 // folding toggles, Settings, up to a parent, and quitting on Linux, where
-// no system shortcut does (macOS has Cmd+Q, Windows Alt+F4).
+// no system shortcut does (macOS has Cmd+Q, Windows Alt+F4). While the
+// terminal holds the keyboard, which culls global routes, the ones it
+// leaves the app (termkept) route over it; the rest are its.
 static void menukeys(Gui *g)
 {
     ImGuiInputFlags glob = ImGuiInputFlags_RouteGlobal;
     ImGuiKeyChord   ctrl = ImGuiMod_Ctrl;
+    ImGuiContext   &c    = *GImGui;
+    ImGuiInputFlags keep = glob;
+    if (c.ActiveId && c.ActiveId==g->termid) {
+        keep |= ImGuiInputFlags_RouteOverActive;
+    }
     if (cannew(g) && ImGui::Shortcut(ctrl|ImGuiKey_N, glob)) {
         newsession(g);
     }
-    if (ImGui::Shortcut(ctrl|ImGuiMod_Shift|ImGuiKey_N, glob)) {
+    if (ImGui::Shortcut(ctrl|ImGuiMod_Shift|ImGuiKey_N, keep)) {
         newfree(g);
     }
-    if (ImGui::Shortcut(ctrl|ImGuiKey_Equal, glob) ||
-            ImGui::Shortcut(ctrl|ImGuiMod_Shift|ImGuiKey_Equal, glob) ||
-            ImGui::Shortcut(ctrl|ImGuiKey_KeypadAdd, glob)) {
+    if (ImGui::Shortcut(ctrl|ImGuiKey_Equal, keep) ||
+            ImGui::Shortcut(ctrl|ImGuiMod_Shift|ImGuiKey_Equal, keep) ||
+            ImGui::Shortcut(ctrl|ImGuiKey_KeypadAdd, keep)) {
         zoomby(g, 1);
     }
-    if (ImGui::Shortcut(ctrl|ImGuiKey_Minus, glob) ||
-            ImGui::Shortcut(ctrl|ImGuiKey_KeypadSubtract, glob)) {
+    if (ImGui::Shortcut(ctrl|ImGuiKey_Minus, keep) ||
+            ImGui::Shortcut(ctrl|ImGuiKey_KeypadSubtract, keep)) {
         zoomby(g, -1);
     }
-    if (ImGui::Shortcut(ctrl|ImGuiKey_0, glob) ||
-            ImGui::Shortcut(ctrl|ImGuiKey_Keypad0, glob)) {
+    if (ImGui::Shortcut(ctrl|ImGuiKey_0, keep) ||
+            ImGui::Shortcut(ctrl|ImGuiKey_Keypad0, keep)) {
         setzoom(g, 1);
     }
     // Find, and the session's toggles of its tool output and reasoning
@@ -13156,13 +13163,13 @@ static void menukeys(Gui *g)
         goup(g, g->sess);
     }
     #endif
-    if (ImGui::Shortcut(ctrl|ImGuiMod_Shift|ImGuiKey_S, glob)) {
+    if (ImGui::Shortcut(ctrl|ImGuiMod_Shift|ImGuiKey_S, keep)) {
         setsessionshell(g, 0, !sessionshell(g));
     }
-    if (ImGui::Shortcut(ctrl|ImGuiMod_Shift|ImGuiKey_T, glob)) {
+    if (ImGui::Shortcut(ctrl|ImGuiMod_Shift|ImGuiKey_T, keep)) {
         setsessiontools(g, 0, !sessiontools(g));
     }
-    if (ImGui::Shortcut(ctrl|ImGuiMod_Shift|ImGuiKey_R, glob)) {
+    if (ImGui::Shortcut(ctrl|ImGuiMod_Shift|ImGuiKey_R, keep)) {
         setsessionthink(g, 0, !sessionthink(g));
     }
     // Layouts by number, as the View menu's Layout lists them
@@ -14007,6 +14014,7 @@ static void dockwindows(Gui *g)
 {
     termhotkeys(g);
     menukeys(g);
+    termgrab(g);
     drawmenubar(g);
     ImGuiViewportP *vp   = (ImGuiViewportP *)ImGui::GetMainViewport();
     ImRect          work = vp->GetBuildWorkRect();

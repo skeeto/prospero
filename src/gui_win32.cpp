@@ -1976,6 +1976,22 @@ static b32 os_guifocused(Os *os)
     return os->gui && w32gui_focused(os->gui);
 }
 
+// Until I5: the terminal falls back to keys' US code points
+static u32 os_guikeycp(Os *, i32, b32)
+{
+    return 0;
+}
+
+static void os_guiimereset(Os *)
+{
+}
+
+// AltGr is Ctrl+Alt on Windows
+static b32 os_guialtgr(Os *)
+{
+    return 0;
+}
+
 static Str os_guitoastprep(Os *, Arena *)
 {
     return {};

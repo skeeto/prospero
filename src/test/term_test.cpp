@@ -16,7 +16,10 @@ static Str termwords(Arena *a, Slice<Str> s)
 static Slice<Str> termlist(Arena *a, Str words)
 {
     Slice<Str> r = {};
-    for (Cut c = {.tail=words, .ok=words.len>0}; c.ok;) {
+    Cut c = {};
+    c.tail = words;
+    c.ok   = words.len > 0;
+    while (c.ok) {
         c = cut(c.tail, '|');
         r = push(a, r, c.head);
     }

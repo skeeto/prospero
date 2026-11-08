@@ -19,7 +19,8 @@
 //   PUSH "bytes"              C escapes: \e \n \r \t \a \b \0 \xHH \\ \"
 //   $REP N: PUSH "bytes"      N times
 //   $SEQ A B: PUSH "..\#.."   once per number from A to B, put at \#
-//   KEY NAME [MOD...]         encode a key (NAME: UP, F1... or 'c')
+//   KEY NAME [MOD...]         encode a key (NAME: UP, F1... or 'c', with
+//                             /'s' for its shifted, @'b' for its US base)
 //   MOUSE ACTION BTN R,C [px X,Y] [MOD...]   encode a mouse event
 //   PASTE "text"              encode a paste in one piece
 //
@@ -465,7 +466,14 @@ static int keyname(char *name, ariel_Key *k)
         {"KPENTER", ARIEL_K_KPENTER}, {"KPADD", ARIEL_K_KPADD},
     };
     if (name[0]=='\'' && name[1] && name[2]=='\'') {
+        // 'c', then optionally /'s' its shifted, and @'b' its US base
         k->cp = (u8)name[1];
+        for (char *q = name+3; *q; q += 4) {
+            if ((q[0]!='/' && q[0]!='@') || q[1]!='\'' || !q[2] || q[3]!='\'') {
+                return 0;
+            }
+            *(q[0]=='/' ? &k->shifted : &k->base) = (u8)q[2];
+        }
         return 1;
     }
     if (name[0]=='F' && name[1]>='1' && name[1]<='9') {
@@ -803,7 +811,7 @@ static void runline(Script *sc, Tester *s, char *p)
         ariel_Key k = {0};
         if (!keyname(name, &k)) goto syntax;
         k.mods = mods(&p);
-        if (k.cp && !(k.mods & (ARIEL_CTRL))) {
+        if (k.cp && !(k.mods & (ARIEL_CTRL|ARIEL_ALT))) {  // as SDL
             k.text.data = (u8 *)name + 1;
             k.text.len  = 1;
         }

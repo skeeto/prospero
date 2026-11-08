@@ -301,6 +301,21 @@ KEY 'a' ctrl
   encoded "\x01"
 KEY 'a' alt
   encoded "\ea"
+# Ctrl prefers the shifted character's control code, as xterm
+KEY '-'/'_' ctrl shift
+  encoded "\x1f"
+KEY '/'/'?' ctrl shift
+  encoded "\x7f"
+KEY '['/'{' ctrl shift
+  encoded "\e"
+KEY '-'/'_' ctrl
+  encoded "-"
+# A layout's key with no control code goes by its US base (Ctrl+ü)
+KEY '#'@'[' ctrl
+  encoded "\e"
+# Alt sends the shifted character after ESC
+KEY '.'/'>' alt shift
+  encoded "\e>"
 KEY BACKSPACE
   encoded "\x7f"
 KEY TAB shift

@@ -151,6 +151,9 @@ enum : i32 {
     FILL_SLACK = 16,  // points between a filling window's edge and its display's
 };
 
+// imgui_impl_sdl3.cpp's, which it leaves out of its header
+ImGuiKey ImGui_ImplSDL3_KeyEventToImGuiKey(SDL_Keycode, SDL_Scancode);
+
 struct TrayItem {
     GuiSdl *p;
     i32     item;  // TRAY_*
@@ -162,6 +165,8 @@ struct GuiSdl {
     SDL_Window   *waiter;      // hidden, while shed: SDL waits on it
     SDL_GLContext gl;
     b32           gles;        // gl is OpenGL ES 3.0, not 3.2 core
+    i32           keysc[ImGuiKey_NamedKey_COUNT];  // each key's scancode,
+                                                   // as last pressed
     SDL_Tray     *tray;
     TrayItem      items[3];
     u32           wakeevent;
@@ -1180,6 +1185,12 @@ static void dispatch(Os *os, GuiSdl *p, SDL_Event *e)
             e->type==SDL_EVENT_WINDOW_LEAVE_FULLSCREEN) {
         sdlplaced(os, p);
     }
+    if (e->type == SDL_EVENT_KEY_DOWN) {
+        ImGuiKey k = ImGui_ImplSDL3_KeyEventToImGuiKey(e->key.key, e->key.scancode);
+        if (ImGui::IsNamedKey(k)) {
+            p->keysc[k - ImGuiKey_NamedKey_BEGIN] = (i32)e->key.scancode;
+        }
+    }
     if (ImGui_ImplSDL3_ProcessEvent(e)) {
         gui_input(g, inputkind(e));
     } else {
@@ -1287,6 +1298,40 @@ static void os_guiflash(Os *os, i32 how)
     SDL_FlashWindow(p->window, how==FLASH_CANCEL  ? SDL_FLASH_CANCEL :
                                how==FLASH_BRIEFLY ? SDL_FLASH_BRIEFLY :
                                                     SDL_FLASH_UNTIL_FOCUSED);
+}
+
+static u32 os_guikeycp(Os *os, i32 key, b32 shift)
+{
+    GuiSdl *p = (GuiSdl *)os->gui;
+    if (!p || key<ImGuiKey_NamedKey_BEGIN || key>=ImGuiKey_NamedKey_END) {
+        return 0;
+    }
+    SDL_Scancode sc = (SDL_Scancode)p->keysc[key - ImGuiKey_NamedKey_BEGIN];
+    if (!sc) {
+        return 0;
+    }
+    SDL_Keymod  mod = (shift ? SDL_KMOD_SHIFT : 0) | (SDL_GetModState() & SDL_KMOD_MODE);
+    SDL_Keycode cp  = SDL_GetKeyFromScancode(sc, mod, 0);  // 1 drops mod
+    return cp>=0x20 && cp!=0x7f && cp<0x110000 ? cp : 0;
+}
+
+// Wayland has no SDL_ClearComposition, and its xkb compose state takes
+// a dead key even with Ctrl held, but restarting text input resets it,
+// along with the input method's own state.
+static void os_guiimereset(Os *os)
+{
+    GuiSdl *p = (GuiSdl *)os->gui;
+    if (!p || !p->window || !SDL_TextInputActive(p->window)) {
+        return;
+    }
+    SDL_ClearComposition(p->window);
+    SDL_StopTextInput(p->window);
+    SDL_StartTextInput(p->window);
+}
+
+static b32 os_guialtgr(Os *)
+{
+    return (SDL_GetModState() & SDL_KMOD_MODE) != 0;
 }
 
 static b32 os_guifocused(Os *os)

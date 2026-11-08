@@ -4264,7 +4264,10 @@ ariel_Str ariel_key(ariel_Term *t, ariel_Key *k)
             }
         }
         if (ctrl) {
-            i32 cc = ctrlchar(c);
+            // Shifted first, as xterm: Ctrl+Shift+- is Ctrl+_ (US), and
+            // Ctrl+Shift+/ is Ctrl+? (DEL)
+            i32 cc = (mods & ARIEL_SHIFT) && k->shifted ? ctrlchar(k->shifted) : -1;
+            cc = cc>=0 ? cc : ctrlchar(c);
             if (cc >= 0) {
                 if (alt) outc(&o, 0x1b);
                 outc(&o, (u8)cc);

@@ -72,7 +72,13 @@ a file changed and one new: the session bar shows the branch, cut in
 its middle, and a click on it the Changes pane, which lists both, with
 no frames while idle; a file
 made while the window is away shows once it is back, and another
-click hides the pane. Without git it is skipped.
+click hides the pane. Without git it is skipped. The terminal mode's
+shell is bash without rc files where there is one (dash, Ubuntu's sh,
+edits no lines), else sh: Ctrl+` opens the Terminal pane, then a probe
+echo, a cat -v key round trip, a resize, less and vim, no frames once
+output stops, a forced 300x80 grid past 64K vertices (an imgui
+assertion fails the run), the shell's exit, and a quit that hangs up
+the next shell, which a HUP trap writes down.
 
 Every checklist starts as a first run, its state directory fresh: the
 window at its first size, and Help in front, then View → Layout → Standard. The
@@ -1863,9 +1869,12 @@ def main():
         gitrepo(work)
         before = config(curl, model)
     elif args.mode == "terminal":
-        # A plain sh, with a known prompt, whatever the user's shell
-        before = config(curl, model) + "\n[terminal]\nshell = /bin/sh\n"
+        # bash without the user's rc files, for its line editing (Ubuntu's
+        # /bin/sh, dash, has none), with a known prompt; else a plain sh
+        shell = "/bin/bash --norc --noprofile" if os.path.exists("/bin/bash") else "/bin/sh"
+        before = config(curl, model) + f"\n[terminal]\nshell = {shell}\n"
         os.environ["PS1"] = "tty$ "
+        os.environ["HISTFILE"] = ""  # not the user's history
     elif args.mode == "drive" and not args.fake:
         before = config(curl, model, extra=m4config(curl, nonce))
         if not args.host:
@@ -2054,6 +2063,9 @@ def main():
                 problems.append("checklist: " + s.strip())
         if "STALE" in out:
             problems.append("stale frames reported")
+    if "imgui assertion failed" in out:
+        problems.append("an ImGui assertion failed: " +
+                        [l for l in lines if "imgui assertion failed" in l][0].strip())
     if args.mode == "settings":
         after = host.read(ini) or ""
         # Enter saved "!", and leaving by Tab the rest; what was typed in the
@@ -2097,7 +2109,8 @@ def main():
         else:
             print("terminal: quitting hung up the shell")
     if args.mode == "terminal" and args.shots:
-        for name in ("terminal", "terminal-small", "terminal-vim", "terminal-ended"):
+        for name in ("terminal", "terminal-small", "terminal-vim", "terminal-big",
+                     "terminal-ended"):
             if not os.path.exists(os.path.join(args.shots, name + ".png")):
                 problems.append(f"no {name}.png")
     if args.mode == "changes" and args.shots:

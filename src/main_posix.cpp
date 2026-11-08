@@ -4143,7 +4143,7 @@ static void probenap(i64 ms)
 // Byte i of a flood: lines of 64 bytes, letters shifting by line.
 static u8 floodbyte(i64 i)
 {
-    return i%64==63 ? '\n' : (u8)('a' + (i/64 + i%64)%26);
+    return (u8)(i%64==63 ? '\n' : 'a' + (i/64 + i%64)%26);
 }
 
 static void ttyprobe(char **argv)

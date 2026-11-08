@@ -643,7 +643,9 @@ static CfgKey cfgschema[] = {
     {"terminal", "shell", CFG_STRING, "", {}, {}, "terminal",
      "The program a terminal tab runs, with its arguments, a \"quoted\" "
      "one holding blanks. Empty: the session's shell, unless it is the "
-     "system's sh, else $SHELL, a POSIX shell as a login shell"},
+     "system's sh, else $SHELL. A POSIX shell starts as a login shell, "
+     "except on Linux for this computer's sessions, whose desktop login "
+     "ran the profile already"},
 
     {"host", "idle_exit", CFG_SECONDS, "600", {}, {}, "host",
      "Seconds a host waits with no client connected and nothing running, "
