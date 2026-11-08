@@ -2,11 +2,17 @@
 //
 // $ cc -std=c11 -O2 -o ariel-replay replay.c
 // $ ariel-replay [-s COLSxROWS] [-a] [-b SECONDS] FILE
+// $ ariel-replay --bench [-b SECONDS] [-x SLACK]
 // $ ariel-replay --pty [-s COLSxROWS] [-a] [-k KEYS] [-o OUT] -- CMD [ARG...]
 //
 //   -s  terminal size (80x24)
 //   -a  dump attributes and state too
 //   -b  benchmark: feed the file repeatedly for this long, report MB/s
+//
+// With --bench, run the synthetic suite against the performance targets:
+// plain text with scrolling, SGR-dense text, fetching every row of
+// 200x60, and resize steps. Each part runs about -b seconds (1). Debug
+// builds meet the targets loosened by -x 3.
 //
 // With --pty (POSIX), run CMD under a pseudo-terminal with ariel as its
 // terminal: replies go back to CMD, its output is saved to OUT (a .vt
@@ -24,17 +30,42 @@
 #include <string.h>
 #include <time.h>
 
+#ifdef _WIN32
+__declspec(dllimport) int __stdcall QueryPerformanceCounter(long long *);
+__declspec(dllimport) int __stdcall QueryPerformanceFrequency(long long *);
+
+static double now(void)
+{
+    long long c, f;
+    QueryPerformanceCounter(&c);
+    QueryPerformanceFrequency(&f);
+    return (double)c / (double)f;
+}
+#else
 static double now(void)
 {
     struct timespec ts;
     timespec_get(&ts, TIME_UTC);
     return (double)ts.tv_sec + (double)ts.tv_nsec/1e9;
 }
+#endif
+
+// A terminal's block, never freed (msvcrt has no aligned_alloc)
+static void *alloc16(ptrdiff_t size)
+{
+    char *p = malloc((size_t)size + 15);
+    if (!p) {
+        fprintf(stderr, "ariel-replay: out of memory\n");
+        exit(1);
+    }
+    return p + (-(uintptr_t)p & 15);
+}
 
 static void usage(void)
 {
     fprintf(stderr,
         "usage: ariel-replay [-s COLSxROWS] [-a] [-b SECONDS] FILE\n"
+        "       ariel-replay --bench [-b SECONDS] [-x SLACK]\n"
         "       ariel-replay --pty [-s COLSxROWS] [-a] [-k KEYS] [-o OUT] -- CMD...\n");
     exit(2);
 }
@@ -212,14 +243,206 @@ static int record(ariel_Term *t, int cols, int rows, char *keys, char *out, char
 }
 #endif
 
+// Benchmarks
+
+static unsigned long long rng = 0x9e3779b97f4a7c15;
+
+static unsigned rand32(void)
+{
+    rng = rng*0x3243f6a8885a308d + 1;
+    return (unsigned)(rng >> 32);
+}
+
+typedef struct {
+    unsigned char *data;
+    size_t         len, cap;
+} Gen;
+
+static void genput(Gen *g, char *s, size_t n)
+{
+    if (g->cap-g->len < n) {
+        g->cap  = g->cap ? g->cap*2 : 1<<20;
+        g->data = realloc(g->data, g->cap);
+    }
+    memcpy(g->data+g->len, s, n);
+    g->len += n;
+}
+
+static void gens(Gen *g, char *s)
+{
+    genput(g, s, strlen(s));
+}
+
+// Log-like lines of words, 10 to 130 columns, so the screen scrolls
+static Gen genplain(size_t len)
+{
+    Gen g = {0};
+    while (g.len < len) {
+        int  n = 10 + (int)(rand32()%120);
+        char line[160];
+        for (int i = 0; i < n; i++) {
+            unsigned r = rand32();
+            line[i] = r%7 ? (char)('a' + r%26) : ' ';
+        }
+        line[n] = '\r';
+        line[n+1] = '\n';
+        genput(&g, line, (size_t)n+2);
+    }
+    return g;
+}
+
+// Short words, each with its own colors and attributes, as from a
+// syntax highlighter or a coloured ls
+static Gen gensgr(size_t len)
+{
+    Gen g = {0};
+    int col = 0;
+    while (g.len < len) {
+        char buf[64];
+        unsigned r = rand32();
+        switch (r % 6) {
+        case 0: snprintf(buf, sizeof(buf), "\x1b[%um", 30+(r>>8)%8); break;
+        case 1: snprintf(buf, sizeof(buf), "\x1b[1;%um", 90+(r>>8)%8); break;
+        case 2: snprintf(buf, sizeof(buf), "\x1b[38;5;%um", (r>>8)%256); break;
+        case 3: snprintf(buf, sizeof(buf), "\x1b[38;2;%u;%u;%um",
+                         (r>>8)&255, (r>>16)&255, (r>>24)&255); break;
+        case 4: snprintf(buf, sizeof(buf), "\x1b[0;4;48;5;%um", (r>>8)%256); break;
+        case 5: snprintf(buf, sizeof(buf), "\x1b[m"); break;
+        }
+        gens(&g, buf);
+        int n = 2 + (int)(rand32()%7);
+        for (int i = 0; i < n; i++) buf[i] = (char)('a' + rand32()%26);
+        buf[n] = ' ';
+        genput(&g, buf, (size_t)n+1);
+        col += n + 1;
+        if (col > 100) {
+            gens(&g, "\x1b[m\r\n");
+            col = 0;
+        }
+    }
+    return g;
+}
+
+static ariel_Term *benchterm(int cols, int rows, int capcols, int caprows)
+{
+    ariel_Config cfg = {0};
+    cfg.cols    = cols;
+    cfg.rows    = rows;
+    cfg.capcols = capcols;
+    cfg.caprows = caprows;
+    ptrdiff_t size = ariel_size(&cfg);
+    ariel_Term *t = ariel_init(alloc16(size), size, &cfg);
+    ariel_resize(t, cols, rows, 8, 16);
+    return t;
+}
+
+static void feedgen(ariel_Term *t, Gen *g)
+{
+    ariel_Str in = {g->data, (ptrdiff_t)g->len};
+    for (;;) {
+        ariel_Fed r = ariel_feed(t, in);
+        if (!r.ev.kind) break;
+        in = r.rest;
+    }
+}
+
+// MB/s feeding g into a 120x40 terminal for about secs seconds
+static double benchfeed(Gen *g, double secs)
+{
+    ariel_Term *t = benchterm(120, 40, 0, 0);
+    double start = now(), elapsed = 0;
+    long long total = 0;
+    do {
+        feedgen(t, g);
+        total += (long long)g->len;
+        elapsed = now() - start;
+    } while (elapsed < secs);
+    return (double)total/elapsed/1e6;
+}
+
+static double slack = 1;   // -x: targets loosened by this factor
+
+static int verdict(char *name, double v, char *unit, double target, int below)
+{
+    target = below ? target*slack : target/slack;
+    int ok = below ? v<target : v>=target;
+    printf("%-14s %10.2f %-5s  target %s %g  %s\n",
+           name, v, unit, below ? "<" : ">=", target, ok ? "ok" : "MISS");
+    return ok;
+}
+
+static int benchsuite(double secs)
+{
+    int ok = 1;
+
+    Gen plain = genplain(8<<20);
+    ok &= verdict("plain", benchfeed(&plain, secs), "MB/s", 100, 0);
+
+    Gen sgr = gensgr(8<<20);
+    ok &= verdict("sgr", benchfeed(&sgr, secs), "MB/s", 40, 0);
+
+    // Every row of a full, coloured 200x60 screen
+    {
+        ariel_Term *t = benchterm(200, 60, 0, 0);
+        feedgen(t, &sgr);
+        static ariel_Cell cells[200];
+        long long n = 0;
+        unsigned sink = 0;
+        double start = now(), elapsed = 0;
+        do {
+            for (int i = 0; i < 100; i++, n++) {
+                for (int y = 0; y < 60; y++) {
+                    ariel_row(t, y, cells, 200);
+                    sink += cells[y].fg;
+                }
+            }
+            elapsed = now() - start;
+        } while (elapsed < secs);
+        ok &= verdict("rows 200x60", elapsed/(double)n*1e6, "us", 50, 1);
+        if (sink == 1) puts("");   // keep the loop
+    }
+
+    // Resize steps on a full 200x60 screen with history, back and forth
+    // across 160x40 to 200x60 inside a 256x96 capacity
+    {
+        ariel_Term *t = benchterm(200, 60, 256, 96);
+        feedgen(t, &sgr);
+        for (int i = 0; i < 80; i++) {
+            int d = i<40 ? i : 79-i;   // warm up: touch the whole capacity
+            ariel_resize(t, 200-d, 60-d/2, 8, 16);
+        }
+        long long n = 0;
+        double start = now(), elapsed = 0, worst = 0;
+        do {
+            for (int i = 0; i < 40; i++, n++) {
+                int    k  = (int)(n % 80);
+                int    d  = k<40 ? k : 79-k;
+                double t0 = now();
+                ariel_resize(t, 200-d, 60-d/2, 8, 16);
+                double dt = now() - t0;
+                worst = dt>worst ? dt : worst;
+            }
+            elapsed = now() - start;
+        } while (elapsed < secs);
+        ok &= verdict("resize step", elapsed/(double)n*1e3, "ms", 1, 1);
+        printf("%-14s %10.2f ms     (preemption shows here)\n", "resize worst", worst*1e3);
+    }
+
+    free(plain.data);
+    free(sgr.data);
+    return !ok;
+}
+
 int main(int argc, char **argv)
 {
-    int    cols = 80, rows = 24, attrs = 0, pty = 0;
+    int    cols = 80, rows = 24, attrs = 0, pty = 0, suite = 0;
     double bench = 0;
     char  *path = 0, *keys = 0, *out = 0, **cmd = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--pty")) {
             pty = 1;
+        } else if (!strcmp(argv[i], "--bench")) {
+            suite = 1;
         } else if (!strcmp(argv[i], "--")) {
             cmd = argv + i + 1;
             break;
@@ -231,6 +454,9 @@ int main(int argc, char **argv)
             if (sscanf(argv[++i], "%dx%d", &cols, &rows) != 2) usage();
         } else if (!strcmp(argv[i], "-a")) {
             attrs = 1;
+        } else if (!strcmp(argv[i], "-x") && i+1 < argc) {
+            slack = atof(argv[++i]);
+            if (!(slack >= 1)) usage();
         } else if (!strcmp(argv[i], "-b") && i+1 < argc) {
             bench = atof(argv[++i]);
         } else if (argv[i][0]=='-' && argv[i][1]) {
@@ -239,6 +465,7 @@ int main(int argc, char **argv)
             path = argv[i];
         }
     }
+    if (suite) return benchsuite(bench>0 ? bench : 1);
     if (pty ? !cmd || !*cmd : !path) usage();
 
     if (pty) {
@@ -247,7 +474,7 @@ int main(int argc, char **argv)
         cfg.rows = rows;
         ptrdiff_t size = ariel_size(&cfg);
         if (!size) usage();
-        ariel_Term *t = ariel_init(aligned_alloc(16, (size_t)size), size, &cfg);
+        ariel_Term *t = ariel_init(alloc16(size), size, &cfg);
         ariel_resize(t, cols, rows, 8, 16);
         int r = record(t, cols, rows, keys, out, cmd);
         dump(t, attrs);
@@ -275,7 +502,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "ariel-replay: invalid size %dx%d\n", cols, rows);
         return 1;
     }
-    void *mem = aligned_alloc(16, (size_t)size);
+    void *mem = alloc16(size);
     ariel_Term *t = ariel_init(mem, size, &cfg);
 
     double start = now(), elapsed = 0;

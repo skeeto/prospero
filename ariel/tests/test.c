@@ -20,7 +20,7 @@
 //   $REP N: PUSH "bytes"      N times
 //   $SEQ A B: PUSH "..\#.."   once per number from A to B, put at \#
 //   KEY NAME [MOD...]         encode a key (NAME: UP, F1... or 'c')
-//   MOUSE ACTION BTN R,C [MOD...]   encode a mouse event
+//   MOUSE ACTION BTN R,C [px X,Y] [MOD...]   encode a mouse event
 //   PASTE "text"              encode a paste in one piece
 //
 // Checks, each against the latest PUSH, KEY, MOUSE or PASTE:
@@ -820,6 +820,11 @@ static void runline(Script *sc, Tester *s, char *p)
         m.y = (int)number(&p);
         comma(&p);
         m.x = (int)number(&p);
+        if (word(&p, "px")) {
+            m.px = (int)number(&p);
+            comma(&p);
+            m.py = (int)number(&p);
+        }
         m.mods = mods(&p);
         setenc(s, ariel_mouse(s->t, &m));
         return;
@@ -1245,8 +1250,87 @@ static void rectest(char *path)
     free(txt);
 }
 
+static u8 *dumpall(ariel_Term *t, iz *len)
+{
+    int flags = ARIEL_DUMP_ATTRS | ARIEL_DUMP_STATE;
+    *len = ariel_dump(t, flags, 0, 0);
+    u8 *d = malloc((size_t)*len);
+    ariel_dump(t, flags, d, *len);
+    return d;
+}
+
+static void feedstr(ariel_Term *t, char *s)
+{
+    ariel_Str in = {(u8 *)s, (iz)strlen(s)};
+    while (in.len) {
+        in = ariel_feed(t, in).rest;
+    }
+}
+
+// ariel_move compacts the cluster pool: live slots sitting past the new
+// pool's size survive, and with too few slots a cluster keeps its first
+// extra code point.
+static void movetest(void)
+{
+    for (int alt = 0; alt < 2; alt++) {
+        checks++;
+        ariel_Config cfg = {0};
+        cfg.cols    = 20;
+        cfg.rows    = 10;
+        cfg.caprows = 20;   // a pool of 100 slots
+        iz    size = ariel_size(&cfg);
+        void *mem  = alignedalloc((size_t)size);
+        ariel_Term *t = ariel_init(mem, size, &cfg);
+
+        // 90 clusters, two marks each, then the first 60 deleted: the 30
+        // left use slots 60-89
+        for (int i = 0; i < 90; i++) {
+            feedstr(t, "e\xcc\x81\xcc\x81");
+        }
+        feedstr(t, "\x1b[H\x1b[3M");
+        if (alt) {
+            // 40 more on the alternate screen: 70 live
+            feedstr(t, "\x1b[?1049h");
+            for (int i = 0; i < 40; i++) {
+                feedstr(t, "o\xcc\x88\xcc\x88");
+            }
+        }
+
+        ariel_Config c = cfg;
+        c.caprows = 10;     // a pool of 64
+        iz    msize = ariel_size(&c);
+        void *mem2  = alignedalloc((size_t)msize);
+        iz    blen, alen;
+        u8   *before = dumpall(t, &blen);
+        ariel_Term *n = ariel_move(t, mem2, msize, &c);
+        u8   *after  = dumpall(n, &alen);
+        if (!alt && (alen!=blen || memcmp(before, after, (size_t)alen))) {
+            failures++;
+            fprintf(stderr, "movetest: clusters lost in a move\n");
+        }
+        if (alt) {
+            // Main screen first, so the last 6 alternate clusters degrade
+            u32 cps[4];
+            i32 fits  = (i32)ariel_cluster(n, 13, 1, cps, 4);    // 34th
+            i32 last  = (i32)ariel_cluster(n, 19, 1, cps, 4);    // 40th
+            feedstr(n, "\x1b[?1049l");
+            i32 first = (i32)ariel_cluster(n, 0, 0, cps, 4);
+            if (fits!=3 || last!=2 || first!=3 || cps[0]!='e') {
+                failures++;
+                fprintf(stderr, "movetest: degraded to %d, %d and %d\n",
+                        fits, last, first);
+            }
+        }
+        free(before);
+        free(after);
+        alignedfree(mem);
+        alignedfree(mem2);
+    }
+}
+
 int main(int argc, char **argv)
 {
+    movetest();
     for (int i = 1; i < argc; i++) {
         char *name = argv[i];
         size_t n = strlen(name);

@@ -183,3 +183,121 @@ RESET
 PUSH "e\e[1K\xcc\x81"
   ?screen_cell 0,0 = {} width=1
   ?cursor = 0,1
+
+!Mouse 9 reports presses alone, without modifiers
+RESET
+PUSH "\e[?9h"
+MOUSE press 1 0,0 ctrl
+  encoded "\e[M !!"
+MOUSE release 1 0,0
+  encoded ""
+MOUSE motion 0 0,1
+  encoded ""
+MOUSE press 4 0,0
+  encoded "\e[M`!!"
+
+!Mouse 1000 reports presses and releases, not motion
+RESET
+PUSH "\e[?1000h"
+MOUSE press 2 1,1 shift alt
+  encoded "\e[M-\"\""
+MOUSE motion 0 1,2
+  encoded ""
+MOUSE release 2 1,2
+  encoded "\e[M##\""
+MOUSE press 0 1,1
+  encoded ""
+
+!Mouse 1002 reports motion with a button held, once per cell
+RESET
+PUSH "\e[?1002h\e[?1006h"
+MOUSE motion 0 0,0
+  encoded ""
+MOUSE press 1 0,0
+  encoded "\e[<0;1;1M"
+MOUSE motion 0 0,0
+  encoded ""
+MOUSE motion 0 0,1
+  encoded "\e[<32;2;1M"
+MOUSE motion 0 0,1
+  encoded ""
+MOUSE motion 0 0,2 ctrl
+  encoded "\e[<48;3;1M"
+MOUSE release 1 0,2
+  encoded "\e[<0;3;1m"
+MOUSE motion 0 0,3
+  encoded ""
+
+!Held buttons: motion reports the lowest, until each is released
+RESET
+PUSH "\e[?1002h\e[?1006h"
+MOUSE press 3 0,0
+MOUSE press 1 0,0
+MOUSE motion 0 1,0
+  encoded "\e[<32;1;2M"
+MOUSE release 1 1,0
+  encoded "\e[<0;1;2m"
+MOUSE motion 0 2,0
+  encoded "\e[<34;1;3M"
+MOUSE release 3 2,0
+MOUSE motion 0 3,0
+  encoded ""
+
+!Mouse 1003 reports motion without a button
+RESET
+PUSH "\e[?1003h\e[?1006h"
+MOUSE motion 0 4,5
+  encoded "\e[<35;6;5M"
+MOUSE motion 0 4,5
+  encoded ""
+PUSH "\e[?1006l"
+MOUSE motion 0 4,6
+  encoded "\e[MC'%"
+
+!The wheel has no release; buttons 8-11 report as 128+
+RESET
+PUSH "\e[?1000h\e[?1006h"
+MOUSE press 5 0,0
+  encoded "\e[<65;1;1M"
+MOUSE release 5 0,0
+  encoded ""
+MOUSE press 7 0,0
+  encoded "\e[<67;1;1M"
+MOUSE press 8 0,0
+  encoded "\e[<128;1;1M"
+MOUSE release 8 0,0
+  encoded "\e[<128;1;1m"
+
+!Switching modes forgets held buttons; leaving one off stops reports
+RESET
+PUSH "\e[?1002h\e[?1006h"
+MOUSE press 1 0,0
+PUSH "\e[?1003h"
+MOUSE motion 0 0,1
+  encoded "\e[<35;2;1M"
+PUSH "\e[?1003l"
+  ?mode mouse = 0
+MOUSE press 1 0,0
+  encoded ""
+PUSH "\e[?1000h\e[?1002l"
+  ?mode mouse = 1000
+
+!X10 reaches column 223 and no further; positions left of the grid clamp
+RESET
+PUSH "\e[?1000h"
+MOUSE press 1 0,222
+  encoded "\e[M \xff!"
+MOUSE press 1 0,223
+  encoded ""
+MOUSE press 1 -3,-1
+  encoded "\e[M !!"
+
+!Mouse 1016 reports pixels, once per pixel
+RESET
+PUSH "\e[?1003h\e[?1016h"
+MOUSE motion 0 0,0 px 5,7
+  encoded "\e[<35;6;8M"
+MOUSE motion 0 0,0 px 6,7
+  encoded "\e[<35;7;8M"
+MOUSE motion 0 0,0 px 6,7
+  encoded ""

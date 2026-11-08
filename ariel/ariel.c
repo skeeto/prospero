@@ -1455,7 +1455,7 @@ struct ariel_Term {
     u8   insert, newline, appkeypad, backarrow, focus, altscroll;
     u8   paste, sync, grapheme, themereport, inband, pad0;
     i32  mouse, mouseenc;
-    i32  mousebtn;              // held button, 0 if none
+    u32  mouseheld;             // held buttons, a mask by number
     i32  mlastx, mlasty;        // last motion report
     b32  pastecr;               // the last paste piece ended in CR
     i32  modkeys;               // modifyOtherKeys level
@@ -2040,6 +2040,9 @@ static void resetmodes(ariel_Term *t)
     t->inband        = 0;
     t->mouse         = 0;
     t->mouseenc      = 0;
+    t->mouseheld     = 0;
+    t->mlastx        = -1;
+    t->mlasty        = -1;
     t->modkeys       = 0;
     t->nkitty[0]     = 0;
     t->nkitty[1]     = 0;
@@ -2363,6 +2366,49 @@ static void print(ariel_Term *t, u32 cp)
     t->segy = c->y;
     t->lastcp = cp;
     advance(t, w);
+}
+
+
+// A run of printable ASCII in the ground state, placed as print would
+// one at a time: the first through print, which settles joins and single
+// shifts, the rest a row at a time, since ASCII after ASCII always breaks
+static void printascii(ariel_Term *t, u8 *s, iz n)
+{
+    print(t, s[0]);
+    u8 set = t->c.g[t->c.gl];
+    if (t->insert || !t->autowrap || set=='0' || set=='A') {
+        for (iz i = 1; i < n; i++) {
+            print(t, s[i]);
+        }
+        return;
+    }
+
+    Cursor *c   = &t->c;
+    Cell    pen = pencell(t, 0, KIND_NARROW);
+    for (iz i = 1; i < n;) {
+        if (c->wrapnext) {
+            wrapline(t);
+            c->wrapnext = 0;
+        }
+        i32   len = (i32)izmin(n-i, t->cols-c->x);
+        Cell *r   = row(t, c->y) + c->x;
+        mend(t, r-c->x, c->x, len);
+        for (i32 k = 0; k < len; k++) {
+            r[k]    = pen;
+            r[k].cp = s[i+k] | (u32)KIND_NARROW<<21;
+        }
+        touch(t, c->y);
+        t->segx = c->x + len - 1;
+        t->segy = c->y;
+        advance(t, len);
+        i += len;
+    }
+    if (n > 1) {
+        Seg z = {0};
+        t->seg = z;
+        segbreak(&t->seg, uniprop(s[n-1]));
+        t->lastcp = s[n-1];
+    }
 }
 
 
@@ -2972,7 +3018,10 @@ static i32 decmode(ariel_Term *t, i32 mode, i32 on)
 
     case 9: case 1000: case 1002: case 1003:
         if (on == 1) {
-            if (t->mouse != mode) t->mousebtn = 0;
+            if (t->mouse != mode) {
+                t->mouseheld = 0;
+                t->mlastx = t->mlasty = -1;
+            }
             t->mouse = mode;
         } else if (!on && t->mouse==mode) {
             t->mouse = 0;
@@ -3887,10 +3936,18 @@ ariel_Term *ariel_move(ariel_Term *t, void *mem, ptrdiff_t len, ariel_Config *cf
     }
     affirm((u8 *)mem+len<=(u8 *)t || (u8 *)t+t->len<=(u8 *)mem);
 
+    // Live pool slots are compacted into the new pool, in first-use
+    // order. While copying, bits 8-30 of an old slot's header hold its
+    // new index plus one, cleared afterward. A cluster without room keeps
+    // its first extra code point.
     poolgc(t);
     ariel_Term *n = mem;
     *n = *t;
     applylayout(n, &l, len);
+    n->poolused = 0;
+    n->poolfree = -1;
+    u32 *oldpool = at(t, t->pool);
+    u32 *newpool = at(n, n->pool);
     for (i32 g = 0; g < 2; g++) {
         u16  *map = gridmap(n, g);
         Head *nh  = gridheads(n, g);
@@ -3904,15 +3961,21 @@ ariel_Term *ariel_move(ariel_Term *t, void *mem, ptrdiff_t len, ariel_Config *cf
             xcpy(dst, src, (iz)t->cols*(iz)sizeof(Cell));
             nh[y] = gridheads(t, g)[slot];
             for (i32 x = 0; x < t->cols; x++) {
-                if (dst[x].ext >= EXT_POOL+(u32)n->npool) {
-                    dst[x].ext = 0;
+                if (dst[x].ext < EXT_POOL) continue;
+                u32 *s = oldpool + (iz)(dst[x].ext - EXT_POOL)*(POOLN+1);
+                u32  k = s[0]>>8 & 0x7fffff;
+                if (!k && n->poolused<n->npool) {
+                    k = (u32)++n->poolused;
+                    xcpy(newpool + (iz)(k-1)*(POOLN+1), s, (POOLN+1)*4);
+                    s[0] |= k << 8;
                 }
+                dst[x].ext = k ? EXT_POOL+k-1 : s[1];
             }
         }
     }
-    n->poolused = imin(t->poolused, n->npool);
-    xcpy(at(n, n->pool), at(t, t->pool), (iz)n->poolused*(POOLN+1)*4);
-    poolgc(n);  // rebuild the free list within the new bounds
+    for (i32 i = 0; i < t->poolused; i++) {
+        oldpool[(iz)i*(POOLN+1)] &= 0x800000ffu;
+    }
     n->dirty = 1;
     return n;
 }
@@ -3935,6 +3998,14 @@ ariel_Fed ariel_feed(ariel_Term *t, ariel_Str in)
 
     iz i = 0;
     while (i < in.len) {
+        u8 b = in.data[i];
+        if (b>=0x20 && b<0x7f && t->state==ST_GROUND && !t->uneed) {
+            iz j = i + 1;
+            for (; j<in.len && in.data[j]>=0x20 && in.data[j]<0x7f; j++) {}
+            printascii(t, in.data+i, j-i);
+            i = j;
+            continue;
+        }
         step(t, in.data[i++]);
         if (t->ev.kind || t->rqpos<t->rqlen) break;
     }
@@ -4011,7 +4082,19 @@ int32_t ariel_row(ariel_Term *t, int32_t y, ariel_Cell *out, int32_t cap)
     Cell *r = row(t, y);
     i32   n = imin(cap, t->cols);
     for (i32 x = 0; x < n; x++) {
-        out[x] = outcell(t, r+x);
+        Cell *c = r + x;
+        if (x && c->fg==c[-1].fg && c->bg==c[-1].bg && c->ul==c[-1].ul &&
+            c->attr==c[-1].attr && c->link==c[-1].link) {
+            // Styled as its neighbour: only the character differs
+            ariel_Cell o    = out[x-1];
+            u32        kind = c->cp>>21 & 3;
+            o.cp    = kind>=KIND_TAIL ? 0 : c->cp&CP_MASK;
+            o.width = kind==KIND_WIDE ? 2 : kind==KIND_TAIL ? 0 : 1;
+            o.extra = c->ext ? (u8)cellextra(t, c, 0, 0) : 0;
+            out[x]  = o;
+        } else {
+            out[x] = outcell(t, c);
+        }
     }
     return t->cols;
 }
@@ -4275,6 +4358,12 @@ static void mousecoord(Out *o, i32 v, i32 enc)
     }
 }
 
+// Held buttons are a mask: bits 1-3 and 8-11. Motion reports the lowest.
+static i32 heldbutton(u32 held)
+{
+    return held ? __builtin_ctz(held) : 0;
+}
+
 ariel_Str ariel_mouse(ariel_Term *t, ariel_Mouse *m)
 {
     affirm(t->magic == MAGIC);
@@ -4285,20 +4374,32 @@ ariel_Str ariel_mouse(ariel_Term *t, ariel_Mouse *m)
     i32 action = m->action ? m->action : ARIEL_PRESS;
     i32 btn    = m->button;
     b32 wheel  = btn>=4 && btn<=7;
-    if (action == ARIEL_PRESS && !wheel) {
-        t->mousebtn = btn;
+    b32 real   = (btn>=1 && btn<=3) || (btn>=8 && btn<=11);
+    if (action!=ARIEL_MOTION && !real && !wheel) return outstr(t, &o);
+
+    // A drag may leave the grid: the host clamps it to its view, and
+    // a position left or above the grid becomes its edge
+    i32 x  = imax(m->x, 0);
+    i32 y  = imax(m->y, 0);
+    i32 px = imax(m->px, 0);
+    i32 py = imax(m->py, 0);
+    b32 pixels = t->mouseenc == 1016;
+    i32 at[2]  = {pixels ? px : x, pixels ? py : y};
+
+    if (action == ARIEL_PRESS) {
+        if (real) t->mouseheld |= 1u << btn;
     } else if (action == ARIEL_RELEASE) {
         if (wheel) return outstr(t, &o);
-        t->mousebtn = 0;
+        t->mouseheld &= ~(1u << btn);
     } else if (action == ARIEL_MOTION) {
         if (mode==9 || mode==1000) return outstr(t, &o);
-        if (mode==1002 && !t->mousebtn) return outstr(t, &o);
-        if (m->x==t->mlastx && m->y==t->mlasty) return outstr(t, &o);
-        btn = t->mousebtn;
+        if (mode==1002 && !t->mouseheld) return outstr(t, &o);
+        if (at[0]==t->mlastx && at[1]==t->mlasty) return outstr(t, &o);
+        btn = heldbutton(t->mouseheld);
     }
     if (mode==9 && action!=ARIEL_PRESS) return outstr(t, &o);
-    t->mlastx = m->x;
-    t->mlasty = m->y;
+    t->mlastx = at[0];
+    t->mlasty = at[1];
 
     i32 code;
     if (btn>=1 && btn<=3) {
@@ -4319,8 +4420,8 @@ ariel_Str ariel_mouse(ariel_Term *t, ariel_Mouse *m)
         if (m->mods & ARIEL_CTRL)  code += 16;
     }
 
-    i32 x = t->mouseenc==1016 ? m->px : m->x;
-    i32 y = t->mouseenc==1016 ? m->py : m->y;
+    x = at[0];
+    y = at[1];
     switch (t->mouseenc) {
     case 1006: case 1016:
         outs(&o, S("\x1b[<"));

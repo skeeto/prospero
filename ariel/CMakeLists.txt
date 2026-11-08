@@ -17,10 +17,14 @@ if(PROJECT_IS_TOP_LEVEL AND NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYP
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# Debug builds trap on undefined behavior, failed assertions included,
+# and optimize a little (-Og) to stay within a few times Release's speed.
 set(ARIEL_WARNINGS "")
 set(ARIEL_DEBUG "")
+set(ARIEL_DEBUGOPT "")
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
   set(ARIEL_WARNINGS -Wall -Wextra -Wconversion -Wno-sign-conversion -Wvla)
+  set(ARIEL_DEBUGOPT -Og)
   include(CheckCCompilerFlag)
   check_c_compiler_flag(-fsanitize-trap ARIEL_HAS_TRAP)
   if(ARIEL_HAS_TRAP)
@@ -35,7 +39,7 @@ function(ariel_flags target)
   set_target_properties(${target} PROPERTIES
     C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
   target_compile_options(${target} PRIVATE ${ARIEL_WARNINGS}
-    "$<$<CONFIG:Debug>:${ARIEL_DEBUG}>")
+    "$<$<CONFIG:Debug>:${ARIEL_DEBUGOPT};${ARIEL_DEBUG}>")
   target_link_options(${target} PRIVATE "$<$<CONFIG:Debug>:${ARIEL_DEBUG}>")
 endfunction()
 
