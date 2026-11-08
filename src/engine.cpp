@@ -21677,7 +21677,7 @@ static void command(Engine *e, Arena scratch, Str line)
         if (e->home.len) {
             putstrkey(&w.json, "home", e->home);  // where ~ is
         }
-        putintkey(&w.json, "pty", PTY_ABLE);  // whether term.open can work
+        putintkey(&w.json, "pty", os_ptyable(e->os));  // whether term.open can work
         emit(e, evend(&w));
         reply(e, scratch, id, 1, {}, {});
     } return;

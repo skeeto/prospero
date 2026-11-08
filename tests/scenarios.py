@@ -3651,7 +3651,8 @@ def hello_caps(t):
                  "endpoint.copilot", "term"} <= set(caps)
                 and "host" not in caps,
                 f"caps: {caps}")
-        t.check(hello.get("pty") == (0 if t.host.windows else 1), f"pty: {hello.get('pty')}")
+        want = 0 if isinstance(t.host, XpHost) else 1  # ConPTY, from 10 1809
+        t.check(hello.get("pty") == want, f"pty: {hello.get('pty')}")
 
         sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
         local = isinstance(t.host, LocalHost)
@@ -15511,13 +15512,44 @@ def worktree_quit(t):
 
 TERM_WINDOW = 256 << 10
 
+# ConPTY renders what a program writes anew, as escapes over a screen, so
+# on Windows output compares as text: without escape sequences or CR.
+VT_ESCAPE = re.compile(rb"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[^\[\]])|\r")
+
+
+def vtplain(data):
+    """The text of data and where its unfinished escape, if any, starts."""
+    end = len(data)
+    esc = data.rfind(b"\x1b", max(0, end - 4096))
+    if esc >= 0 and not VT_ESCAPE.match(data, esc):
+        end = esc
+    return VT_ESCAPE.sub(b"", data[:end]), end
+
 
 def ttyprobe(t):
-    """[terminal] shell set to this harness's own --tty-probe."""
+    """[terminal] shell set to this harness's own --tty-probe. On Windows
+    it is a copy that runs as a console program, which ConPTY attaches,
+    as it never does a GUI program: the same image with its subsystem,
+    in the PE header (offset 0x3c, then 92), changed from 2 to 3."""
+    if isinstance(t.host, XpHost):
+        raise Skip("no ConPTY before Windows 10 1809 (term_refused)")
     exe = getattr(t.host, "exe", None) or t.host.prospero
-    with open(t.config, "a") as f:
-        # Quoted as a word of its own, and so the whole value too
-        f.write(f'[terminal]\nshell = "\\"{exe}\\" --tty-probe"\n')
+    if t.host.windows:
+        probe = t.host.join(t.base, "probe.exe")
+        if isinstance(t.host, LocalHost):
+            image = bytearray(open(exe, "rb").read())
+            at = int.from_bytes(image[0x3c:0x40], "little") + 92
+            image[at] = 3 if image[at] == 2 else image[at]
+            t.host.write(probe, bytes(image))
+        else:
+            t.host.sh(f"cp {shlex.quote(exe)} {probe} && "
+                      f"at=$(($(od -An -tu4 -j60 -N4 {probe}) + 92)) && "
+                      f"if [ \"$(od -An -tu1 -j$at -N1 {probe} | tr -d ' ')\" = 2 ]; then "
+                      f"printf '\\003' | dd of={probe} bs=1 seek=$at conv=notrunc 2>/dev/null; fi")
+        exe = probe
+    # Quoted as a word of its own, and so the whole value too
+    t.host.write(t.config, (t.host.read(t.config) or "") +
+                 f'[terminal]\nshell = "\\"{exe}\\" --tty-probe"\n')
 
 
 class Tty:
@@ -15549,6 +15581,18 @@ class Tty:
         self.hold = False
         self.dropafter = None
         self.dropped = 0
+        self.plainat = 0     # how much of data plain holds, on Windows
+        self.plainbuf = bytearray()
+
+    @property
+    def text(self):
+        """Output as lines are matched: as text on Windows (vtplain)."""
+        if not self.t.host.windows:
+            return self.data
+        got, end = vtplain(bytes(self.data[self.plainat:]))
+        self.plainbuf += got
+        self.plainat += end
+        return self.plainbuf
 
     def type(self, text):
         data = text.encode() if isinstance(text, str) else text
@@ -15622,11 +15666,12 @@ class Tty:
         found = []
 
         def has(tt):
+            text = tt.text
             while True:
-                nl = tt.data.find(b"\n", tt.cur)
+                nl = text.find(b"\n", tt.cur)
                 if nl < 0:
                     return False
-                line = bytes(tt.data[tt.cur:nl]).decode(errors="replace")
+                line = bytes(text[tt.cur:nl]).decode(errors="replace")
                 tt.cur = nl + 1
                 if line.startswith(prefix):
                     found.append(line)
@@ -15647,11 +15692,36 @@ def floodbytes(n):
     return bytes(out)
 
 
+def floodof(tt, start, n):
+    """The n bytes of a flood in output from start on: where it begins
+    on Windows, past whatever ConPTY drew before it."""
+    text = bytes(tt.text[start:])
+    at = max(text.find(floodbytes(64)), 0) if tt.t.host.windows else 0
+    return text[at:at + n]
+
+
+def samedir(t, a, b):
+    if t.host.windows:
+        return (a or "").replace("\\", "/").rstrip("/").lower() == \
+               (b or "").replace("\\", "/").rstrip("/").lower()
+    return os.path.realpath(a or "") == os.path.realpath(b)
+
+
+def waitfile(t, path, within=5):
+    """A file's contents once it exists, or None after within seconds."""
+    deadline = time.monotonic() + within
+    while True:
+        got = t.host.read(path)
+        if got is not None or time.monotonic() >= deadline:
+            return got
+        time.sleep(0.05)
+
+
 def termsession(t, h):
     return h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
 
 
-@scenario(bound=30, posix=True)
+@scenario(bound=30)
 def term_basic(t):
     """A terminal's shell gets its size, its folder, the terminal's
     environment without another terminal's, a resize, and term.busy while
@@ -15665,15 +15735,15 @@ def term_basic(t):
         tt = Tty(t, h, sid, cols=100, rows=30, xpx=800, ypx=600)
         argv = tt.reply.get("argv")
         t.check(argv and argv[-1] == "--tty-probe", f"argv {argv}")
-        t.check(os.path.realpath(tt.reply.get("cwd")) == os.path.realpath(t.work),
-                f"cwd {tt.reply.get('cwd')}")
+        t.check(samedir(t, tt.reply.get("cwd"), t.work), f"cwd {tt.reply.get('cwd')}")
         tt.line("probe ready")
         tt.type("size\n")
         got = tt.line("size ")
-        t.check(got == "size 100x30 800x600", got)
+        px = "0x0" if t.host.windows else "800x600"  # a console has no pixels
+        t.check(got == f"size 100x30 {px}", got)
         tt.type("cwd\n")
         got = tt.line("cwd ")
-        t.check(os.path.realpath(got[4:]) == os.path.realpath(t.work), got)
+        t.check(samedir(t, got[4:], t.work), got)
         for name, want in [("TERM", None), ("COLORTERM", "truecolor"),
                            ("TERM_PROGRAM", "Prospero"), ("COLUMNS", "unset"),
                            ("LINES", "unset"), ("TERM_SESSION_ID", "unset"),
@@ -15700,7 +15770,7 @@ def term_basic(t):
         t.check(end.get("code") == 3 and end.get("signal") == 0, f"term.end {end}")
         t.check(end.get("off") == len(tt.data), f"end at {end.get('off')}, "
                 f"had {len(tt.data)}")
-        t.check(tt.data.endswith(b"bye\n"), f"the last output {bytes(tt.data[-20:])!r}")
+        t.check(tt.text.rstrip(b" \n").endswith(b"bye"), f"the last output {bytes(tt.data[-80:])!r}")
         deadline = time.monotonic() + 5
         while h.call("status").get("terms") and time.monotonic() < deadline:
             time.sleep(0.1)
@@ -15709,7 +15779,7 @@ def term_basic(t):
         h.close()
 
 
-@scenario(bound=90, posix=True, alone=True)
+@scenario(bound=90, alone=True)
 def term_flood(t):
     """10 MiB through a terminal to a slow acker arrive byte for byte,
     with no more than the window unacked at any time."""
@@ -15722,16 +15792,19 @@ def term_flood(t):
         n = 10 << 20
         tt.ackevery = 1 << 20  # past the window: acks only once it stops
         tt.slow = 0.02
-        start = len(tt.data)
+        start = len(tt.text)
         tt.type(f"flood {n}\n")
-        tt.pump(lambda x: len(x.data) >= start + n + len(b"flood end\n"), 80,
+        tt.pump(lambda x: x.text.find(b"flood end\n", start + n) >= 0, 80,
                 "the flood")
-        got = bytes(tt.data[start:start + n])
-        if got != floodbytes(n):
-            bad = next(i for i in range(n) if got[i] != floodbytes(i + 1)[i])
+        got = floodof(tt, start, n)
+        want = floodbytes(n)
+        if got != want:
+            bad = next((i for i in range(min(len(got), n)) if got[i] != want[i]),
+                       len(got))
             raise Failure(f"the flood differs at byte {bad}")
-        t.check(bytes(tt.data[start + n:]) == b"flood end\n",
-                f"after the flood {bytes(tt.data[start + n:start + n + 40])!r}")
+        text = bytes(tt.text[start:])
+        after = text[text.find(got) + n:]
+        t.check(after == b"flood end\n", f"after the flood {after[:40]!r}")
         t.check(tt.window <= TERM_WINDOW, f"{tt.window} bytes unacked at once")
         t.check(tt.dups == 0 and tt.resends == 0,
                 f"{tt.dups} records again, {tt.resends} resends")
@@ -15743,7 +15816,7 @@ def term_flood(t):
         h.close()
 
 
-@scenario(bound=40, posix=True)
+@scenario(bound=40)
 def term_resend(t):
     """Output lost on the way is sent again from where a resend asks, and
     output never acked is sent again after a stall."""
@@ -15754,17 +15827,17 @@ def term_resend(t):
         tt = Tty(t, h, sid)
         tt.line("probe ready")
         n = 1 << 20
-        start = len(tt.data)
-        tt.dropafter = start + 100000
+        start = len(tt.text)
+        tt.dropafter = len(tt.data) + 100000
         tt.type(f"flood {n}\n")
         tt.line("flood end", 20)
         t.check(tt.dropped == 1 and tt.resends == 1,
                 f"dropped {tt.dropped}, resends {tt.resends}")
-        t.check(bytes(tt.data[start:start + n]) == floodbytes(n), "the flood is whole")
+        t.check(floodof(tt, start, n) == floodbytes(n), "the flood is whole")
 
         # A stall: nothing acked for longer than TERM_STALL (3 s)
         tt.hold = True
-        start = len(tt.data)
+        start = len(tt.text)
         tt.type(f"flood {n}\n")
         tt.pump(lambda x: len(x.data) - x.acked >= TERM_WINDOW, 10, "a full window")
         before = tt.dups
@@ -15773,14 +15846,14 @@ def term_resend(t):
         tt.hold = False
         tt.ack()
         tt.line("flood end", 20)
-        t.check(bytes(tt.data[start:start + n]) == floodbytes(n), "the flood is whole")
+        t.check(floodof(tt, start, n) == floodbytes(n), "the flood is whole")
         t.check(tt.window <= TERM_WINDOW, f"{tt.window} bytes unacked at once")
         t.check(tt.end is None, f"no end: {tt.end}")
     finally:
         h.close()
 
 
-@scenario(bound=30, posix=True)
+@scenario(bound=30)
 def term_close(t):
     """term.close hangs up: the shell gets SIGHUP, and what ignores it
     lives on; with kill, the shell's whole tree goes."""
@@ -15795,10 +15868,7 @@ def term_close(t):
         tt.line("hup set")
         pid = int(tt.line("nohup ")[6:])
         h.send("term.close", tid=tt.tid)
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline and not os.path.exists(hup):
-            time.sleep(0.05)
-        t.check(os.path.exists(hup) and open(hup).read() == "hup\n", "the shell got SIGHUP")
+        t.check(waitfile(t, hup) == "hup\n", "the shell got SIGHUP")
         t.check(t.host.alive(pid), "what ignored the hang-up lives on")
         t.host.killpid(pid)
         count = tt.records
@@ -15828,7 +15898,7 @@ def term_close(t):
         h.close()
 
 
-@scenario(bound=30, posix=True)
+@scenario(bound=30)
 def term_quit(t):
     """A quit hangs up every terminal, and a deleted session's."""
     ttyprobe(t)
@@ -15846,10 +15916,7 @@ def term_quit(t):
         h.call("close", sid=other)
         r = h.call("delete", sid=other)
         t.check(r.get("ok"), f"delete: {r}")
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline and not os.path.exists(hup):
-            time.sleep(0.05)
-        t.check(os.path.exists(hup), "deleting its session hung the terminal up")
+        t.check(waitfile(t, hup) is not None, "deleting its session hung the terminal up")
         keep.type("echo still\n")
         keep.line("still")
 
@@ -15860,12 +15927,12 @@ def term_quit(t):
         t.check(r.get("ok"), f"a second terminal: {r}")
         h.call("quit")
         h.exit()
-        t.check(os.path.exists(hup), "the quit hung the terminal up")
+        t.check(waitfile(t, hup) is not None, "the quit hung the terminal up")
     finally:
         h.close()
 
 
-@scenario(bound=15, posix=True)
+@scenario(bound=15)
 def term_errors(t):
     """term.open refuses a bad or unknown session; the other commands
     drop what names no terminal; an ack past what was sent is ignored."""
@@ -15887,8 +15954,28 @@ def term_errors(t):
         h.send("term.input", tid=tt.tid, data="not base64!")
         h.send("term.input", tid=tt.tid, peer=7, data="ZWNobyB4Cg==")  # not its frontend's
         tt.type("echo ok\n")
-        t.check(tt.line("") == "ok", "the terminal works on")
+        # Nothing but ok may come, and the blank lines ConPTY repaints:
+        # neither the foreign input (x) nor the bad base64 reached it.
+        while (ln := tt.line("").strip()) != "ok":
+            t.check(ln == "", f"dropped input reached the shell: {ln!r}")
         t.check(h.call("status").get("terms") == 1, "one terminal")
+    finally:
+        h.close()
+
+
+@scenario(bound=15)
+def term_refused(t):
+    """Where there is no pseudo-terminal, Windows before 10 1809 and so
+    XP, term.open says why; elsewhere it opens."""
+    h = t.headless()
+    try:
+        sid = termsession(t, h)
+        r = h.call("term.open", sid=sid, cols=80, rows=24)
+        if isinstance(t.host, XpHost):
+            t.check(not r.get("ok") and "1809" in r.get("err", ""), f"term.open: {r}")
+        else:
+            t.check(r.get("ok"), f"term.open: {r}")
+            h.send("term.close", tid=r.get("tid"), kill=True)
     finally:
         h.close()
 

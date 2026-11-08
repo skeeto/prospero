@@ -1668,6 +1668,8 @@ struct Gui {
     // The Terminal pane (term.cpp)
     b32                termhome;     // it has no home in the dock space yet
     b32                termfocus;    // focus the terminal when next drawn
+    i32                termlastcols; // the pane's size in cells last frame,
+    i32                termlastrows; //   before its shell starts
     b32                termfocused;  // it has the keyboard, as last drawn
     ImGuiID            termid;       // its grid's item
     i32                termforcecols;  // the checklist's grid size, past
@@ -17394,7 +17396,7 @@ static DriveOp termops[] = {
     {OP_CHECK, CHK_PANECLOSED, 0, 0, 0, "Terminal"},
     CTRLKEY(GKEY_GRAVE, 500),
     {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Terminal"},
-    {OP_WAIT, W_TERM, 0, 0, 10000, "tty$ "},
+    {OP_WAIT, W_TERM, 0, 0, 10000, "tty$"},
     {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
     {OP_CHECK, CHK_TERMSIZE, 0, 0, 0, ""},
     // Typed, in pieces, with a mistake taken back
@@ -17479,24 +17481,26 @@ static DriveOp termops[] = {
     TERMKEY(GKEY_ENTER, 1000),
     {OP_CHECK, CHK_TERMNONE, 0, 0, 0, ""},
     CTRLKEY(GKEY_GRAVE, 500),
-    {OP_WAIT, W_TERM, 0, 0, 10000, "tty$ "},
+    {OP_WAIT, W_TERM, 0, 0, 10000, "tty$"},
     {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
     {OP_TEXT, 0, 0, 0, 100, "exit 3"},
     TERMKEY(GKEY_ENTER, 1000),
     {OP_SHOT, 0, 0, 0, 300, "terminal-ended"},
     {OP_CHECK, CHK_TERMSCREEN, 0, 0, 0, "exit 3"},
     TERMKEY(GKEY_ENTER, 500),
-    {OP_WAIT, W_TERM, 0, 0, 10000, "tty$ "},
+    {OP_WAIT, W_TERM, 0, 0, 10000, "tty$"},
     {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
     {OP_TEXT, 0, 0, 0, 100, "echo fresh"},
     TERMKEY(GKEY_ENTER, 100),
     {OP_WAIT, W_TERM, 0, 0, 5000, "\nfresh"},
-    // Quitting hangs up the shell, whose trap leaves a file (gui.py)
+    // Quitting hangs up the shell, whose trap leaves a file (gui.py), but
+    // on Windows, where busybox's sh runs no trap for the hang-up (a
+    // CTRL_CLOSE_EVENT), it only ends: gui.py checks its pid is gone
     // bash 5 in readline takes the hang-up as EOF and exits without its
     // HUP trap, so EXIT too: either way an ending, not a SIGKILL
-    {OP_TEXT, 0, 0, 0, 100, "trap 'echo hup >hup.txt; exit' HUP EXIT"},
+    {OP_TEXT, 0, 0, 0, 100, "echo $$ >shell.pid; trap 'echo hup >hup.txt; exit' HUP EXIT"},
     TERMKEY(GKEY_ENTER, 100),
-    {OP_WAIT, W_TERM, 0, 0, 5000, "EXIT\ntty$ "},  // set, at the next prompt
+    {OP_WAIT, W_TERM, 0, 0, 5000, "EXIT\ntty$"},  // set, at the next prompt
     {OP_SUMMARY, 0, 0, 0, 0, ""},
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
@@ -21922,6 +21926,15 @@ static void drivestep(Gui *g)
             Buf   b(&a, 128);
             print(&b, "drive: FAIL gave up waiting for ");
             print(&b, waitnames[g->drivewait]);
+            Str text = g->ops[g->drivepc-1].text;
+            if (text.len) {
+                print(&b, ": ");
+                printjsonstr(&b, text);
+            }
+            if (g->drivewait == W_TERM) {
+                print(&b, "\ndrive: the terminal shows:\n");
+                print(&b, termscreen(g, &a));
+            }
             guilog(g, finish(&b));
             g->drivechecks++;
             g->drivefails++;

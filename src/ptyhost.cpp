@@ -489,7 +489,7 @@ static void termopen(Engine *e, Arena scratch, i64 id, Json *j)
     if (!validsid(sid)) {
         reply(e, scratch, id, 0, "invalid session id", {});
         return;
-    } else if (!PTY_ABLE) {
+    } else if (!os_ptyable(e->os)) {
         reply(e, scratch, id, 0, "terminals need Windows 10 version 1809 or later", sid);
         return;
     } else if (termcount(e, -1) >= TERM_MAX) {

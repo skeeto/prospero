@@ -186,6 +186,7 @@ static Str   os_ptypeek(Os *, Proc *, iz) { return {}; }
 static void  os_ptytake(Os *, Proc *, iz) {}
 static b32   os_ptyresize(Os *, Proc *, PtySize) { return 0; }
 static b32   os_ptybusy(Os *, Proc *) { return 0; }
+static b32   os_ptyable(Os *) { return 0; }
 static iz    os_lockfile(Os *, Arena, Str) { return -1; }
 static void  os_unlockfile(Os *, iz) {}
 static b32   os_lockheld(Os *, Arena, Str) { return 0; }

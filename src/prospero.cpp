@@ -335,14 +335,16 @@ static b32     os_ptyresize(Os *, Proc *, PtySize);
 // Whether a program other than the child runs in the foreground, as when
 // a shell runs a command.
 static b32     os_ptybusy(Os *, Proc *);
+// Whether os_ptyspawn can work here: on Windows, from 10 version 1809.
+static b32     os_ptyable(Os *);
 #if defined(_WIN32)
-enum { PTY_ABLE = 0, PTY_MAC = 0, PTY_LINUX = 0 };  // os_ptyspawn fails
+enum { PTY_MAC = 0, PTY_LINUX = 0 };
 #elif defined(__APPLE__)
-enum { PTY_ABLE = 1, PTY_MAC = 1, PTY_LINUX = 0 };
+enum { PTY_MAC = 1, PTY_LINUX = 0 };
 #elif defined(__linux__)
-enum { PTY_ABLE = 1, PTY_MAC = 0, PTY_LINUX = 1 };
+enum { PTY_MAC = 0, PTY_LINUX = 1 };
 #else
-enum { PTY_ABLE = 1, PTY_MAC = 0, PTY_LINUX = 0 };
+enum { PTY_MAC = 0, PTY_LINUX = 0 };
 #endif
 
 // A program started apart from this one, to outlive it, as a terminal

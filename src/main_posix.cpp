@@ -2185,6 +2185,11 @@ static b32 os_ptyresize(Os *, Proc *p, PtySize z)
 
 // The foreground group is the shell's own while it waits at a prompt,
 // and the shell leads the session, so its pid is the session's id
+static b32 os_ptyable(Os *)
+{
+    return 1;
+}
+
 static b32 os_ptybusy(Os *, Proc *p)
 {
     pid_t fg  = tcgetpgrp(p->master);

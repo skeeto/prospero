@@ -86,6 +86,7 @@ enum : i32 {
     CREATE_ALWAYS                     = 2,
     ERROR_BROKEN_PIPE                 = 109,
     ERROR_NOT_ENOUGH_MEMORY           = 8,
+    ERROR_NOT_SUPPORTED               = 50,
     FORMAT_MESSAGE_FROM_HMODULE       = 0x00000800,
     FORMAT_MESSAGE_FROM_SYSTEM        = 0x00001000,
     FORMAT_MESSAGE_IGNORE_INSERTS     = 0x00000200,
@@ -309,6 +310,7 @@ W32(b32,    WriteFile(uz, u8 *, i32, i32 *, Overlapped *));
 W32(void,   DeleteCriticalSection(CriticalSection *));
 W32(void *, GetProcAddress(uz, char *));
 W32(void,   Sleep(i32));
+W32(u32,    GetTickCount());
 W32(b32,    AttachConsole(i32));
 W32(b32,    FreeConsole());
 W32(b32,    GenerateConsoleCtrlEvent(i32, i32));
@@ -415,6 +417,12 @@ struct Os {
     void           *gui;    // GUI builds: the window's state (gui_win32.cpp)
     // GetFinalPathNameByHandleW, from Vista on, else null
     u32 (__stdcall *finalpath)(uz, c16 *, u32, u32);
+    // ConPTY, from Windows 10 1809 on, else null: Create, Resize, Close,
+    // and from 11 24H2 on, Release (ptyload). Sizes are COORDs, X low.
+    i32  (__stdcall *pcreate)(u32, uz, uz, u32, uz *);
+    i32  (__stdcall *presize)(uz, u32);
+    void (__stdcall *pclose)(uz);
+    i32  (__stdcall *prelease)(uz);
     i32             breakaway;  // a creation flag: tools leave our job
     b32             jobless;    // tools run without jobs (jobcheck)
     i32             warned;     // atomic: jobless was reported
@@ -1486,6 +1494,20 @@ struct Proc {
     iz         queued;    // under lock: bytes in the queue
     b32        closing;   // under lock: close the input after the queue
     b32        broken;    // under lock: the input is closed
+    // os_ptyspawn: the pseudoconsole, the reader's ring
+    b32        pty;
+    uz         hpc;       // under lock until pcdone, then the closer's
+    b32        pcdone;    // under lock: hpc closed, or being closed
+    Event      stop;      // wakes the reader: room, hang-up
+    b32        hangup;    // under lock: closed, output now discarded
+    b32        exited;    // under lock
+    b32        full;      // under lock: the reader waits for room
+    b32        told;      // under lock: PROC_READY sent, not re-armed
+    u32        lastread;  // under lock: GetTickCount at the last output
+    u8        *ring;
+    iz         ringcap;
+    i64        rpos;      // under lock
+    i64        wpos;      // under lock
     u8         tail[PROC_TAILMAX];
     u8         msg[8+PROC_TAILMAX];
     u8         buf[PROC_BUFLEN];
@@ -1549,6 +1571,10 @@ static void procrelease(Proc *p)
             DeleteCriticalSection((CriticalSection *)p->lock.opaque);
         } else if (p->input) {
             CloseHandle(p->input);  // held, so the child read no end before
+        }
+        if (p->pty) {
+            CloseHandle((uz)p->stop.h[0]);
+            HeapFree(GetProcessHeap(), 0, p->ring);
         }
         HeapFree(GetProcessHeap(), 0, p);
     }
@@ -1966,6 +1992,8 @@ static b32 os_procwrite(Os *, Proc *p, Str data)
 {
     if (!p->io || data.len>PROC_QUEUEMAX) {
         return 0;
+    } else if (p->pty && !data.data) {
+        return 1;  // a terminal's input closes with the terminal
     }
     uz         heap = GetProcessHeap();
     ProcChunk *c    = 0;
@@ -2059,24 +2087,462 @@ static void os_kill(Os *os, Proc *p, b32 hard)
 
 static void os_letgo(Os *, Proc *) {}  // the job closes with os_procfree
 
+// Pseudo-terminals: ConPTY
+//
+// A pseudoconsole (conhost, or OpenConsole) between two pipes renders
+// what its clients write as VT on the output pipe, and turns VT on the
+// input pipe into console input. Its clients are the child and whatever
+// attaches to its console after it. The child runs in a job that does
+// not kill on close, so a hang-up leaves detached programs running, and
+// only os_kill sweeps the tree.
+//
+// Before Windows 11 24H2, the output pipe never breaks while this side
+// holds the pseudoconsole, and ClosePseudoConsole waits until its
+// clients are gone, which takes reading its last output: so it runs on
+// a thread of its own, never the reader's, while the reader goes on,
+// discarding output once hung up. From 24H2, ReleasePseudoConsole right
+// after the child starts lets the output pipe break once the clients
+// have gone, and ClosePseudoConsole returns at once. Either way, Close
+// comes once: at a hang-up (os_procfree), or 200 ms after the child
+// exits with nothing to read, sending CTRL_CLOSE_EVENT to whatever is
+// left on its console. The output pipe then breaks: PROC_EOF.
+// PROSPERO_TEST_PTYCLOSE forces the path before 24H2.
+//
+// Threads: the reader (ring), the waiter (exit, then the quiet close),
+// the writer (input), and on a hang-up a closer, each with a ref.
+
+static void ptyload(Os *os, uz kernel32)
+{
+    os->pcreate  = (i32 (__stdcall *)(u32, uz, uz, u32, uz *))
+                   GetProcAddress(kernel32, (char *)"CreatePseudoConsole");
+    os->presize  = (i32 (__stdcall *)(uz, u32))
+                   GetProcAddress(kernel32, (char *)"ResizePseudoConsole");
+    os->pclose   = (void (__stdcall *)(uz))
+                   GetProcAddress(kernel32, (char *)"ClosePseudoConsole");
+    os->prelease = (i32 (__stdcall *)(uz))
+                   GetProcAddress(kernel32, (char *)"ReleasePseudoConsole");
+    if (!os->pcreate || !os->presize || !os->pclose) {
+        os->pcreate = 0;
+    }
+}
+
+static b32 os_ptyable(Os *os)
+{
+    return os->pcreate != 0;
+}
+
+static u32 ptycoord(PtySize z)
+{
+    i32 cols = z.cols<1 ? 1 : z.cols>0x7fff ? 0x7fff : z.cols;
+    i32 rows = z.rows<1 ? 1 : z.rows>0x7fff ? 0x7fff : z.rows;
+    return (u32)cols | (u32)rows<<16;
+}
+
+// Close the pseudoconsole, once, here: perhaps a long wait before 24H2.
+static void ptyclose(Os *os, Proc *p)
+{
+    os_lock(&p->lock);
+    uz hpc = p->pcdone ? 0 : p->hpc;
+    p->pcdone = 1;
+    os_unlock(&p->lock);
+    if (hpc) {
+        os->pclose(hpc);
+    }
+}
+
+struct PtyCloser {
+    Os   *os;
+    Proc *p;
+};
+
+static void ptycloser(void *arg)
+{
+    PtyCloser *c = (PtyCloser *)arg;
+    ptyclose(c->os, c->p);
+    procrelease(c->p);
+    HeapFree(GetProcessHeap(), 0, c);
+}
+
+// Output into the ring until the pipe breaks. A full ring waits for
+// room, holding the child back, except once hung up: then output is
+// read and dropped, so that closing can finish.
+static void ptyreader(void *arg)
+{
+    Proc *p = (Proc *)arg;
+    for (;;) {
+        os_lock(&p->lock);
+        b32 hang = p->hangup;
+        iz  room = p->ringcap - (iz)(p->wpos - p->rpos);
+        iz  at   = (iz)(p->wpos % p->ringcap);
+        p->full  = !hang && !room;
+        os_unlock(&p->lock);
+        if (!hang && !room) {
+            os_wait(&p->stop, -1);
+            continue;
+        }
+
+        u8 *dst = p->buf;
+        iz  max = PROC_BUFLEN;
+        if (!hang) {
+            dst = p->ring + at;
+            max = p->ringcap - at;
+            max = max<room ? max : room;
+        }
+        i32 got = 0;
+        if (!ReadFile(p->pipe, dst, (i32)max, &got, 0) || !got) {
+            break;
+        }
+        p->total += got;
+        os_lock(&p->lock);
+        b32 tell = 0;
+        if (!p->hangup) {  // else the bytes went past the ring's end
+            p->wpos    += got;
+            tell        = !p->told;
+            p->told     = 1;
+        }
+        p->lastread = GetTickCount();
+        os_unlock(&p->lock);
+        if (tell) {
+            u8 msg[8];
+            put64(msg, p->total);
+            mailpost(p->mbox, PROC_READY, p->id, {msg, 8}, 1);
+        }
+    }
+    CloseHandle(p->pipe);
+    u8 msg[8];
+    put64(msg, p->total);
+    mailpost(p->mbox, PROC_EOF, p->id, {msg, 8}, 1);
+    procrelease(p);
+}
+
+// The child's exit, then the close once its output has gone quiet for
+// 200 ms with room in the ring (a full ring waits for its reader).
+static void ptywaiter(void *arg)
+{
+    PtyCloser *c = (PtyCloser *)arg;
+    Proc      *p = c->p;
+    i32     code = -1;
+    WaitForSingleObject(p->process, INFINITE);
+    GetExitCodeProcess(p->process, &code);
+    u8 msg[8];
+    put32(msg, code);
+    put32(msg+4, 0);
+    mailpost(p->mbox, PROC_EXIT, p->id, {msg, 8}, 1);
+
+    os_lock(&p->lock);
+    p->exited   = 1;
+    p->lastread = GetTickCount();
+    os_unlock(&p->lock);
+    for (;;) {
+        os_lock(&p->lock);
+        b32 done = p->pcdone;
+        b32 full = p->wpos-p->rpos == p->ringcap;
+        u32 idle = GetTickCount() - p->lastread;
+        os_unlock(&p->lock);
+        if (done || (!full && idle>=200)) {
+            break;
+        }
+        Sleep(full || idle>=200 ? 50 : (i32)(200 - idle));
+    }
+    ptyclose(c->os, p);
+    procrelease(p);
+    HeapFree(GetProcessHeap(), 0, c);
+}
+
+// The hang-up: input dropped, output discarded, the pseudoconsole closed
+// on a thread of its own, since before 24H2 that waits.
+static void ptyhangup(Os *os, Proc *p)
+{
+    os_lock(&p->lock);
+    if (!p->closing && !p->broken) {
+        os_signal(&p->wake);
+    }
+    p->closing = 1;
+    p->hangup  = 1;
+    freequeue(p);
+    os_unlock(&p->lock);
+    os_signal(&p->stop);
+
+    PtyCloser *c = (PtyCloser *)HeapAlloc(GetProcessHeap(), 0, sizeof(PtyCloser));
+    if (c) {
+        c->os = os;
+        c->p  = p;
+        __atomic_add_fetch(&p->refs, 1, __ATOMIC_ACQ_REL);
+        if (os_thread(os, ptycloser, c)) {
+            return;
+        }
+        __atomic_sub_fetch(&p->refs, 1, __ATOMIC_ACQ_REL);
+        HeapFree(GetProcessHeap(), 0, c);
+    }
+    ptyclose(os, p);  // no thread: wait here, the reader draining
+}
+
 static void os_procfree(Os *os, Proc *p)
 {
-    if (p->io) {
+    if (p->pty) {
+        ptyhangup(os, p);
+    } else if (p->io) {
         os_procwrite(os, p, {});  // close the input after the queue
     }
     procrelease(p);
 }
 
-// Pseudo-terminals arrive with ConPTY (I5)
-static Proc *os_ptyspawn(Os *, Spawn *, PtySize, iz, Arena)
+enum : i32 {
+    EXTENDED_STARTUPINFO_PRESENT  = 0x00080000,
+};
+
+enum : uz {
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x20002,
+};
+
+struct StartupInfoEx {  // STARTUPINFOEXW
+    StartupInfo si;
+    void       *attrs;
+};
+
+// Vista's attribute lists, looked up at run time
+using InitAttrs   = b32  (__stdcall *)(void *, i32, i32, uz *);
+using UpdateAttr  = b32  (__stdcall *)(void *, i32, uz, void *, uz, void *, uz *);
+using DeleteAttrs = void (__stdcall *)(void *);
+
+struct JobAccounting {  // JOBOBJECT_BASIC_ACCOUNTING_INFORMATION
+    i64 user;
+    i64 kernel;
+    i64 thisuser;
+    i64 thiskernel;
+    u32 faults;
+    u32 total;
+    u32 active;
+    u32 terminated;
+};
+
+enum : uz {
+    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = 0x20016,
+};
+
+// The child on a new pseudoconsole, inheriting no handles: the console's
+// are its standard ones. In a job that doesn't kill on close.
+static Proc *os_ptyspawn(Os *os, Spawn *sp, PtySize z, iz ring, Arena scratch)
 {
-    SetLastError(50);  // ERROR_NOT_SUPPORTED
-    return 0;
+    if (!os->pcreate) {
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return 0;
+    } else if (!sp->argv.len || hasnul(sp->cwd) || ring<=0) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    uz k32 = GetModuleHandleW((c16 *)u"kernel32.dll");
+    InitAttrs   init   = (InitAttrs)GetProcAddress(k32, (char *)"InitializeProcThreadAttributeList");
+    UpdateAttr  update = (UpdateAttr)GetProcAddress(k32, (char *)"UpdateProcThreadAttribute");
+    DeleteAttrs del    = (DeleteAttrs)GetProcAddress(k32, (char *)"DeleteProcThreadAttributeList");
+    if (!init || !update || !del) {
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return 0;
+    }
+
+    Slice<Str> argv  = sp->argv;
+    Str        found = sp->cmdline.len ? Str{} : childpath(os, &scratch, sp->env, argv[0]);
+    if (found.len) {
+        Slice<Str> copy = {};
+        copy = push(&scratch, copy, found);
+        for (iz i = 1; i < argv.len; i++) {
+            copy = push(&scratch, copy, argv[i]);
+        }
+        argv = copy;
+    }
+    if (!sp->cmdline.len) {
+        // With Windows' own separators: cmd reads switches anywhere in
+        // its command line, its own name too, so C:/Windows/System32/
+        // cmd.exe is "cmd /c md.exe", and the shell is gone at once
+        Str exe = clone(&scratch, argv[0]);
+        for (iz i = 0; i < exe.len; i++) {
+            exe.data[i] = exe[i]=='/' ? '\\' : exe[i];
+        }
+        Slice<Str> copy = {};
+        copy = push(&scratch, copy, exe);
+        for (iz i = 1; i < argv.len; i++) {
+            copy = push(&scratch, copy, argv[i]);
+        }
+        argv = copy;
+    }
+    Str  line = sp->cmdline.len ? sp->cmdline : quoteargv(&scratch, argv);
+    c16 *cmd  = towide(&scratch, line).data;
+    c16 *cwd  = towide(&scratch, sp->cwd).data;
+    c16 *env  = envblock(&scratch, sp->env);
+
+    uz    heap = GetProcessHeap();
+    Proc *p    = (Proc *)HeapAlloc(heap, HEAP_ZERO_MEMORY, sizeof(Proc));
+    u8   *buf  = (u8 *)HeapAlloc(heap, 0, ring);
+    uz    job  = CreateJobObjectW(0, 0);
+    uz    ir = 0, iw = 0, pr = 0, pw = 0, hpc = 0;
+    Event wake = {}, stop = {};
+    b32   ok = p && buf && job &&
+               CreatePipe(&ir, &iw, 0, 1<<16) && CreatePipe(&pr, &pw, 0, 1<<16) &&
+               os_eventinit(&wake) && os_eventinit(&stop);
+    if (ok) {
+        JobLimits lim = {};
+        lim.flags = JOB_DIE_ON_UNHANDLED_EXCEPTION | (sp->breakaway ? JOB_BREAKAWAY_OK : 0);
+        ok = SetInformationJobObject(job, JobObjectExtendedLimitInformation,
+                                     &lim, sizeof(lim));
+    }
+    // CreatePseudoConsole briefly holds inheritable handles, which a
+    // concurrent spawnproc would hand on; and osexit must not leave the
+    // shell suspended. So, as spawnproc, under the spawn lock until the
+    // shell runs.
+    EnterCriticalSection(&os->spawn);
+    if (ok) {
+        i32 hr = os->pcreate(ptycoord(z), ir, pw, 0, &hpc);
+        ok = hr >= 0;
+        if (!ok) {
+            SetLastError((hr>>16 & 0x1fff)==7 ? hr&0xffff : ERROR_NOT_SUPPORTED);
+        }
+    }
+
+    // The pseudoconsole's attribute
+    uz            size = 0;
+    void         *list = 0;
+    StartupInfoEx six  = {};
+    if (ok) {
+        init(0, 1, 0, &size);
+        list = alloc<uz>(&scratch, (iz)(size/sizeof(uz) + 1));
+        ok   = size && init(list, 1, 0, &size);
+        if (ok && !update(list, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+                          (void *)hpc, sizeof(hpc), 0, 0)) {
+            del(list);
+            ok = 0;
+        }
+    }
+    ProcessInfo pi = {};
+    if (ok) {
+        six.si.cb    = sizeof(six);
+        six.si.flags = STARTF_USESTDHANDLES;  // none: the console's
+        six.attrs    = list;
+        i32 flags = (i32)EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED |
+                    CREATE_UNICODE_ENVIRONMENT | os->breakaway;
+        ok = CreateProcessW(0, cmd, 0, 0, 0, flags, env, cwd, &six.si, &pi);
+        i32 err = GetLastError();
+        del(list);
+        if (ok && !AssignProcessToJobObject(job, pi.process)) {
+            err = GetLastError();
+            TerminateProcess(pi.process, 1);
+            uz hs[] = {pi.thread, pi.process};
+            closeall(hs, countof(hs));
+            ok = 0;
+        }
+        SetLastError(err);
+    }
+    uz theirs[] = {ir, pw};  // the pseudoconsole has its own
+    closeall(theirs, countof(theirs));
+    if (!ok) {
+        i32 err = GetLastError();
+        LeaveCriticalSection(&os->spawn);
+        if (hpc) {
+            os->pclose(hpc);  // no client: it returns at once
+        }
+        uz mine[] = {iw, pr, job, (uz)wake.h[0], (uz)stop.h[0]};
+        closeall(mine, countof(mine));
+        if (buf) HeapFree(heap, 0, buf);
+        if (p) HeapFree(heap, 0, p);
+        SetLastError(err ? err : ERROR_NOT_ENOUGH_MEMORY);
+        return 0;
+    }
+    ResumeThread(pi.thread);
+    LeaveCriticalSection(&os->spawn);
+    CloseHandle(pi.thread);
+    Str test = os_getenv(os, &scratch, "PROSPERO_TEST_PTYCLOSE");
+    if (os->prelease && !test.len) {
+        os->prelease(hpc);
+    }
+
+    p->refs    = 4;  // caller, reader, waiter, writer
+    p->job     = job;
+    p->pid     = pi.pid;
+    p->process = pi.process;
+    p->pipe    = pr;
+    p->mbox    = sp->mbox;
+    p->id      = sp->id;
+    p->io      = 1;
+    p->input   = iw;
+    p->wake    = wake;
+    p->pty     = 1;
+    p->hpc     = hpc;
+    p->stop    = stop;
+    p->ring    = buf;
+    p->ringcap = ring;
+    os_lockinit(&p->lock);
+
+    // Without the threads, the child is killed and the pseudoconsole
+    // closed (no client left: at once), as the missing threads would
+    PtyCloser *wc = (PtyCloser *)HeapAlloc(heap, 0, sizeof(PtyCloser));
+    if (wc) {
+        wc->os = os;
+        wc->p  = p;
+    }
+    b32 reader = os_thread(os, ptyreader, p);
+    b32 waiter = reader && wc && os_thread(os, ptywaiter, wc);
+    b32 writer = waiter && os_thread(os, procwriter, p);
+    if (!writer) {
+        killproc(job, pi.process);
+        if (!reader) {
+            CloseHandle(pr);
+            procrelease(p);
+        }
+        if (!waiter) {
+            if (wc) HeapFree(heap, 0, wc);
+            ptyclose(os, p);
+            procrelease(p);
+        }
+        CloseHandle(iw);
+        CloseHandle((uz)wake.h[0]);
+        procrelease(p);  // the writer's
+        procrelease(p);  // the caller's
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return 0;
+    }
+    return p;
 }
-static Str  os_ptypeek(Os *, Proc *, iz) { return {}; }
-static void os_ptytake(Os *, Proc *, iz) {}
-static b32  os_ptyresize(Os *, Proc *, PtySize) { return 0; }
-static b32  os_ptybusy(Os *, Proc *) { return 0; }
+
+static Str os_ptypeek(Os *, Proc *p, iz off)
+{
+    os_lock(&p->lock);
+    iz avail = (iz)(p->wpos - p->rpos);
+    assert(off>=0 && off<=avail);
+    avail -= off;
+    iz at  = (iz)((p->rpos + off) % p->ringcap);
+    iz len = p->ringcap - at;
+    len = len<avail ? len : avail;
+    p->told = p->told && avail;
+    os_unlock(&p->lock);
+    return {p->ring + at, len};
+}
+
+static void os_ptytake(Os *, Proc *p, iz len)
+{
+    os_lock(&p->lock);
+    assert(len>=0 && len<=p->wpos-p->rpos);
+    p->rpos += len;
+    b32 full = p->full;
+    os_unlock(&p->lock);
+    if (full && len) {
+        os_signal(&p->stop);
+    }
+}
+
+static b32 os_ptyresize(Os *os, Proc *p, PtySize z)
+{
+    os_lock(&p->lock);
+    b32 ok = !p->pcdone && os->presize(p->hpc, ptycoord(z))>=0;
+    os_unlock(&p->lock);
+    return ok;
+}
+
+// Busy while the shell's job holds more than the shell.
+static b32 os_ptybusy(Os *, Proc *p)
+{
+    JobAccounting acct = {};
+    return QueryInformationJobObject(p->job, 1, &acct, sizeof(acct), 0) &&
+           acct.active > 1;
+}
 
 
 // Local endpoints: named pipes
@@ -2128,24 +2594,6 @@ enum : i32 {
     TOKEN_QUERY                   = 8,
     TokenUser                     = 1,
 };
-
-enum : i32 {
-    EXTENDED_STARTUPINFO_PRESENT  = 0x00080000,
-};
-
-enum : uz {
-    PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x20002,
-};
-
-struct StartupInfoEx {  // STARTUPINFOEXW
-    StartupInfo si;
-    void       *attrs;
-};
-
-// Vista's attribute lists, looked up at run time
-using InitAttrs   = b32  (__stdcall *)(void *, i32, i32, uz *);
-using UpdateAttr  = b32  (__stdcall *)(void *, i32, uz, void *, uz, void *, uz *);
-using DeleteAttrs = void (__stdcall *)(void *);
 
 struct SecurityAttributes {  // SECURITY_ATTRIBUTES
     i32   len;
@@ -3589,6 +4037,222 @@ extern "C" [[noreturn]] void prospero_desktop();
 
 // Exits once no spawn is under way, so that each child is in its job,
 // whose closing then ends it
+// prospero --tty-probe: a stand-in shell for testing terminals, as in
+// main_posix.cpp, on a console instead: it reads key events, so that a
+// resize arrives as an event too, and writes through the console, which
+// ConPTY renders anew, so tests match its text and not its bytes. A hang
+// up is CTRL_CLOSE_EVENT, and "busy" and "nohup" run "--tty-nap MS".
+
+enum : i32 {
+    PROBE_KEY_EVENT   = 1,
+    PROBE_SIZE_EVENT  = 4,
+    PROBE_INMODE      = 0x0008|0x0200,  // window events, VT input
+    PROBE_OUTMODE     = 0x0001|0x0004,  // processed, VT output
+};
+
+struct ProbeRecord {  // INPUT_RECORD, a key or a buffer size
+    c16 type;
+    c16 pad;
+    i32 down;   // the size's COORD in its own record
+    c16 repeat;
+    c16 vk;
+    c16 scan;
+    c16 ch;
+    u32 state;
+};
+static_assert(sizeof(ProbeRecord) == 20);
+
+struct ProbeScreen {  // CONSOLE_SCREEN_BUFFER_INFO
+    c16 size[2];
+    c16 cursor[2];
+    c16 attr;
+    c16 window[4];  // left, top, right, bottom, never negative
+    c16 most[2];
+};
+static_assert(sizeof(ProbeScreen) == 22);
+
+W32(b32, SetConsoleMode(uz, i32));
+W32(b32, GetConsoleScreenBufferInfo(uz, ProbeScreen *));
+W32(b32, ReadConsoleInputW(uz, ProbeRecord *, i32, i32 *));
+W32(i32, GetCurrentDirectoryW(i32, c16 *));
+
+static c16 probehup[1024];
+
+static b32 __stdcall probeonclose(u32 type)
+{
+    if (type == CTRL_CLOSE_EVENT) {
+        uz h = CreateFileW(probehup, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, 0, 0);
+        if (h != INVALID_HANDLE_VALUE) {
+            i32 n = 0;
+            WriteFile(h, (u8 *)"hup\n", 4, &n, 0);
+            CloseHandle(h);
+        }
+        ExitProcess(129);
+    }
+    return 0;
+}
+
+static void probeline(Os *os, Arena scratch, Str s)
+{
+    os_print(os, 1, concat(&scratch, s, "\n"));
+}
+
+static void probesize(Os *os, Arena scratch, Str what, b32 px)
+{
+    ProbeScreen sc = {};
+    GetConsoleScreenBufferInfo(os->std[1], &sc);
+    Buf b(&scratch, 64);
+    print(&b, what);
+    print(&b, (i64)sc.window[2] - sc.window[0] + 1);
+    print(&b, "x");
+    print(&b, (i64)sc.window[3] - sc.window[1] + 1);
+    if (px) {
+        print(&b, " 0x0");  // a console knows no pixels
+    }
+    probeline(os, scratch, finish(&b));
+}
+
+static u8 probefloodbyte(i64 i)  // as main_posix.cpp's floodbyte
+{
+    return (u8)(i%64==63 ? '\n' : 'a' + (i/64 + i%64)%26);
+}
+
+// Run this program again as "--tty-nap MS" on this console, or detached.
+static uz probenap(Os *os, Arena scratch, i64 ms, b32 detach)
+{
+    c16 exe[1024];
+    i32 len = GetModuleFileNameW(0, exe, countof(exe));
+    if (len<=0 || len>=countof(exe)) {
+        return 0;
+    }
+    Buf b(&scratch, 2048);
+    print(&b, "\"");
+    print(&b, fromwide(&scratch, exe, len));
+    print(&b, "\" --tty-nap ");
+    print(&b, ms);
+    Str16 line = towide(&scratch, finish(&b));
+    StartupInfo si = {};
+    si.cb = sizeof(si);
+    ProcessInfo pi = {};
+    i32 flags = detach ? DETACHED_PROCESS : 0;
+    if (!CreateProcessW(exe, line.data, 0, 0, 0, flags, 0, 0, &si, &pi)) {
+        return 0;
+    }
+    CloseHandle(pi.thread);
+    if (detach) {
+        CloseHandle(pi.process);
+        return (uz)(u32)pi.pid;
+    }
+    return pi.process;
+}
+
+[[noreturn]] static void ttyprobe(Os *os, Arena a)
+{
+    uz in  = os->std[0];
+    uz out = os->std[1];
+    SetConsoleMode(in, PROBE_INMODE);
+    SetConsoleMode(out, PROBE_OUTMODE);
+    probeline(os, a, "probe ready");
+
+    u8 line[4096];
+    iz len = 0;
+    for (;;) {
+        iz nl = 0;
+        for (; nl<len && line[nl]!='\n' && line[nl]!='\r'; nl++) {}
+        if (nl == len) {
+            len = len>countof(line)-8 ? 0 : len;
+            ProbeRecord r[64];
+            i32 n = 0;
+            if (!ReadConsoleInputW(in, r, countof(r), &n) || !n) {
+                ExitProcess(0);
+            }
+            for (i32 i = 0; i < n; i++) {
+                if (r[i].type == PROBE_SIZE_EVENT) {
+                    probesize(os, a, "winch ", 0);
+                } else if (r[i].type==PROBE_KEY_EVENT && r[i].down && r[i].ch) {
+                    for (i32 k = 0; k<(r[i].repeat ? r[i].repeat : 1); k++) {
+                        if (len <= countof(line)-4) {
+                            len += utf8encode(line+len, r[i].ch);
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
+        Arena scratch = a;
+        Str cmd = {line, nl};
+        Cut c   = cut(cmd, ' ');
+        Str arg = c.tail;
+        Int n   = parseint(arg);
+        if (c.head == "size") {
+            probesize(os, scratch, "size ", 1);
+        } else if (c.head == "echo") {
+            probeline(os, scratch, arg);
+        } else if (c.head=="flood" && n.ok && n.val>=0) {
+            u8 buf[4096];
+            for (i64 i = 0; i < n.val;) {
+                iz k = 0;
+                for (; k<countof(buf) && i<n.val; k++, i++) {
+                    buf[k] = probefloodbyte(i);
+                }
+                writeall(out, {buf, k});
+            }
+            probeline(os, scratch, "flood end");
+        } else if (c.head == "env") {
+            Str16 name = towide(&scratch, arg);
+            c16   val[4096];
+            i32   vlen = GetEnvironmentVariableW(name.data, val, countof(val));
+            Str   say  = concat(&scratch, "env ", arg);
+            if (vlen>0 && vlen<countof(val)) {
+                say = concat(&scratch, say, "=");
+                say = concat(&scratch, say, fromwide(&scratch, val, vlen));
+            } else if (!vlen) {
+                say = concat(&scratch, say, " unset");
+            }
+            probeline(os, scratch, say);
+        } else if (c.head == "cwd") {
+            c16 dir[1024];
+            i32 dlen = GetCurrentDirectoryW(countof(dir), dir);
+            dlen = dlen>0 && dlen<countof(dir) ? dlen : 0;
+            Str d   = fromwide(&scratch, dir, dlen);
+            Str say = concat(&scratch, "cwd ", d);
+            probeline(os, scratch, say);
+        } else if (c.head=="hup" && arg.len) {
+            Str16 path = towide(&scratch, arg);
+            if (path.len < countof(probehup)) {
+                __builtin_memcpy(probehup, path.data, (uz)(path.len+1)*sizeof(c16));
+                SetConsoleCtrlHandler((uz)probeonclose, 1);
+                probeline(os, scratch, "hup set");
+            }
+        } else if (c.head=="sleep" && n.ok) {
+            Sleep((i32)n.val);
+            probeline(os, scratch, "slept");
+        } else if (c.head=="busy" && n.ok) {
+            uz h = probenap(os, scratch, n.val, 0);
+            if (h) {
+                WaitForSingleObject(h, -1);
+                CloseHandle(h);
+            }
+            probeline(os, scratch, "busy done");
+        } else if (c.head=="nohup" && n.ok) {
+            Buf b(&scratch, 32);
+            print(&b, "nohup ");
+            print(&b, (i64)probenap(os, scratch, n.val*1000, 1));
+            probeline(os, scratch, finish(&b));
+        } else if (c.head=="exit" && n.ok) {
+            ExitProcess((i32)n.val);
+        } else if (cmd.len) {
+            Str say = concat(&scratch, "? ", cmd);
+            probeline(os, scratch, say);
+        }
+        iz rest = len - nl - 1;
+        __builtin_memmove(line, line+nl+1, (uz)rest);
+        len = rest;
+    }
+}
+
+
 [[noreturn]] static void osexit(Os *os, i32 code)
 {
     EnterCriticalSection(&os->spawn);
@@ -3613,6 +4277,7 @@ void mainCRTStartup()
     uz kernel32  = GetModuleHandleW((c16 *)u"kernel32.dll");
     os.finalpath = (u32 (__stdcall *)(uz, c16 *, u32, u32))
                    GetProcAddress(kernel32, (char *)"GetFinalPathNameByHandleW");
+    ptyload(&os, kernel32);
     jobcheck(&os);
 
     // No dialogs from a crashing child, or from a missing disk
@@ -3632,6 +4297,13 @@ void mainCRTStartup()
     iz   len = 0;
     for (; cmd[len]; len++) {}
     Slice<Str> args = splitcmdline(&a, fromwide(&a, cmd, len));
+
+    if (args.len>2 && args[1]=="--tty-nap") {
+        Sleep((i32)parseint(args[2]).val);
+        ExitProcess(0);
+    } else if (args.len>1 && args[1]=="--tty-probe") {
+        ttyprobe(&os, a);
+    }
 
     if (args.len>1 && args[1]=="desktop") {
         prospero_desktop();

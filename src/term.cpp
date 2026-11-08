@@ -49,6 +49,7 @@ struct TermTab {
     u32         mheld;     // mouse buttons whose press went to the app
     f32         wheel;     // wheel notches not yet sent, fractions kept
     b32         pasteins;  // Insert, held since it pasted with Shift
+    i32         textkey;   // a Ctrl+Alt key that typed (AltGr), while held
     b32         busy;      // a program runs in the shell
     Palette    *pal;       // the colors given ariel
     i32         code;      // the end's exit code, or -1
@@ -656,6 +657,11 @@ static void termpress(Gui *g, TermTab *tt, ImGuiKey k, b32 repeat)
     }
     ariel_Str s = ariel_key(tt->t, &key);
     terminput(g, tt, {s.data, s.len});
+    if (HOST_WINDOWS && !key.key) {
+        // Windows translated the chord's key too, and a dead key's stays
+        // pending (Alt+^ on German): the next key would compose with it.
+        os_guiimereset(g->os);
+    }
 }
 
 static void termpaste(Gui *g, TermTab *tt, Arena a)
@@ -696,7 +702,9 @@ static b32 termkept(Gui *g, ImGuiKey k)
     case ImGuiKey_KeypadSubtract:
     case ImGuiKey_Keypad0:
         return !io.KeyShift;
-    case ImGuiKey_C: case ImGuiKey_V: case ImGuiKey_N:
+    case ImGuiKey_V:          // Windows pastes with Ctrl+V too
+        return io.KeyShift || HOST_WINDOWS;
+    case ImGuiKey_C: case ImGuiKey_N:
     case ImGuiKey_S: case ImGuiKey_T: case ImGuiKey_R:
         return io.KeyShift;
     default:
@@ -810,6 +818,27 @@ static void termmouse(Gui *g, TermTab *tt, TermMetrics *m, ImVec2 pos, ImGuiID i
     }
 }
 
+// Whether the key event at i in the trail typed text: a character comes
+// after it, before another key goes down. The character may wait in the
+// queue for the next frame: ImGui trickles text that follows a modifier
+// change in the same frame, as Ctrl+Alt+key typed at once does.
+static b32 termtyped(ImGuiContext &c, i32 i)
+{
+    i32 trail = c.InputEventsTrail.Size;
+    i32 total = trail + c.InputEventsQueue.Size;
+    for (i++; i < total; i++) {
+        ImGuiInputEvent *e = i<trail ? &c.InputEventsTrail[i]
+                                     : &c.InputEventsQueue[i-trail];
+        if (e->Type==ImGuiInputEventType_Text) {
+            return e->Text.Char>=0x20 && e->Text.Char!=0x7f;
+        } else if (e->Type==ImGuiInputEventType_Key && e->Key.Down &&
+                   !(e->Key.Key & ImGuiMod_Mask_) && !ImGui::IsLRModKey(e->Key.Key)) {
+            return 0;
+        }
+    }
+    return 0;
+}
+
 // The keys of a frame, in order: text as typed, named keys and Ctrl
 // chords through ariel's encoder. ImGui keeps no key repeats in its
 // trail, so those come from its repeat timing.
@@ -835,16 +864,27 @@ static void termkeys(Gui *g, TermTab *tt, Arena a)
         termpaste(g, tt, a);
     }
 
+    // On Windows AltGr is Ctrl+Alt, as ImGui sees it, and so is Ctrl+Alt
+    // itself where the layout gives it a character: a Ctrl+Alt key whose
+    // text follows typed that text, its repeats too. So did an AltGr key
+    // with a character in the layout and none following: a dead key
+    // (~ is AltGr+1 on Croatian), whose text comes with the next key.
+    b32 alttext = !g->mac && io.KeyCtrl && io.KeyAlt;
+    tt->textkey = tt->textkey && ImGui::IsKeyDown((ImGuiKey)tt->textkey) ? tt->textkey : 0;
     b32 pressed[ImGuiKey_NamedKey_COUNT] = {};
     for (i32 i = 0; i < c.InputEventsTrail.Size; i++) {
         ImGuiInputEvent *e = &c.InputEventsTrail[i];
         if (e->Type==ImGuiInputEventType_Key && e->Key.Down &&
                 ImGui::IsNamedKey(e->Key.Key) && !(e->Key.Key & ImGuiMod_Mask_)) {
             pressed[e->Key.Key - ImGuiKey_NamedKey_BEGIN] = 1;
-            if (!termkept(g, e->Key.Key) && !(tt->pasteins && e->Key.Key==ImGuiKey_Insert)) {
+            if (alttext && termtextkey(e->Key.Key) &&
+                    (termtyped(c, i) || (os_guialtgr(g->os) &&
+                                         os_guikeycp(g->os, e->Key.Key, io.KeyShift)))) {
+                tt->textkey = e->Key.Key;
+            } else if (!termkept(g, e->Key.Key) && !(tt->pasteins && e->Key.Key==ImGuiKey_Insert)) {
                 termpress(g, tt, e->Key.Key, 0);
             }
-        } else if (e->Type==ImGuiInputEventType_Text && !ctrl) {
+        } else if (e->Type==ImGuiInputEventType_Text && (!ctrl || alttext)) {
             u32 cp = e->Text.Char;
             if (cp>=0x20 && cp!=0x7f) {
                 u8        buf[4];
@@ -858,6 +898,7 @@ static void termkeys(Gui *g, TermTab *tt, Arena a)
         ImGuiKey key = (ImGuiKey)k;
         if (!pressed[k - ImGuiKey_NamedKey_BEGIN] && (termnamed(key) || termtextkey(key)) &&
                 !termkept(g, key) && !(tt->pasteins && key==ImGuiKey_Insert) &&
+                key!=tt->textkey &&
                 ImGui::GetKeyData(key)->DownDuration>0 &&
                 ImGui::IsKeyPressed(key, ImGuiInputFlags_Repeat, ImGuiKeyOwner_Any)) {
             termpress(g, tt, key, 1);
@@ -978,8 +1019,19 @@ static void drawterm(Gui *g)
             ImGui::TextDisabled("%s", cstr0(&a, why));
             return;
         }
-        if (g->termfocus || ImGui::Button("Start a shell")) {
+        // The pane takes its place in the dock over frames, through a
+        // layout (drawpanes), and
+        // a shell started smaller loses what scrolled away, as ConPTY
+        // keeps no history: it starts once the size holds for a frame.
+        b32 held = !win->Appearing && !g->layoutpending && !g->layoutnow &&
+                   cols==g->termlastcols && rows==g->termlastrows;
+        g->termlastcols = cols;
+        g->termlastrows = rows;
+        if (g->termfocus && !held) {
+            return;
+        } else if (g->termfocus || ImGui::Button("Start a shell")) {
             termstart(g, s, cols, rows);
+            g->termfocus = 1;
             tt = s->term;
         } else {
             ImGui::TextDisabled("Ctrl+` starts one, and comes back to it");
@@ -1092,7 +1144,17 @@ static Str termscreen(Gui *g, Arena *a)
     iz  len = ariel_dump(tt->t, 0, 0, 0);
     u8 *buf = allocbytes(a, len);
     ariel_dump(tt->t, 0, buf, len);
-    return {buf, len};
+    // Without blanks at the ends of lines, which ConPTY writes or not
+    // as it repaints
+    iz n = 0;
+    for (iz i = 0; i < len; i++) {
+        if (buf[i] == '\n') {
+            for (; n>0 && buf[n-1]==' '; n--) {}
+        }
+        buf[n++] = buf[i];
+    }
+    for (; n>0 && buf[n-1]==' '; n--) {}
+    return {buf, n};
 }
 
 // Whether the terminal fills its pane, as last drawn, at the size the

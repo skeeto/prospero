@@ -490,6 +490,7 @@ static Str   os_ptypeek(Os *, Proc *, iz) { return {}; }
 static void  os_ptytake(Os *, Proc *, iz) {}
 static b32   os_ptyresize(Os *, Proc *, PtySize) { return 0; }
 static b32   os_ptybusy(Os *, Proc *) { return 0; }
+static b32   os_ptyable(Os *) { return 0; }
 static void  os_httpcancel(Os *, Http *) {}
 static void  os_httpfree(Os *, Http *) {}
 static Str   os_lasterr(Os *, Arena *) { return "not supported in tests"; }

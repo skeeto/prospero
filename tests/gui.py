@@ -74,11 +74,12 @@ no frames while idle; a file
 made while the window is away shows once it is back, and another
 click hides the pane. Without git it is skipped. The terminal mode's
 shell is bash without rc files where there is one (dash, Ubuntu's sh,
-edits no lines), else sh: Ctrl+` opens the Terminal pane, then a probe
+edits no lines), else sh, and on Windows busybox's sh: Ctrl+` opens the Terminal pane, then a probe
 echo, a cat -v key round trip, a resize, less and vim, no frames once
 output stops, a forced 300x80 grid past 64K vertices (an imgui
 assertion fails the run), the shell's exit, and a quit that hangs up
-the next shell, which a HUP trap writes down.
+the next shell, which a HUP trap writes down (on Windows, which busybox's
+sh traps no hang-up in, its pid is gone).
 
 Every checklist starts as a first run, its state directory fresh: the
 window at its first size, and Help in front, then View → Layout → Standard. The
@@ -1872,6 +1873,9 @@ def main():
         # bash without the user's rc files, for its line editing (Ubuntu's
         # /bin/sh, dash, has none), with a known prompt; else a plain sh
         shell = "/bin/bash --norc --noprofile" if os.path.exists("/bin/bash") else "/bin/sh"
+        if os.name == "nt":
+            # busybox's sh from w64devkit, with its vim, less, seq and tr
+            shell = shword(shutil.which("sh").replace("\\", "/"))
         before = config(curl, model) + f"\n[terminal]\nshell = {shell}\n"
         os.environ["PS1"] = "tty$ "
         os.environ["HISTFILE"] = ""  # not the user's history
@@ -2100,15 +2104,24 @@ def main():
                 if not os.path.exists(os.path.join(args.shots, name + ".png")):
                     problems.append(f"no {name}.png")
     if args.mode == "terminal":
-        # The shell's HUP trap, as quitting hung it up
+        # The shell's HUP trap, as quitting hung it up, or on Windows,
+        # where busybox's sh runs no trap for it, the shell gone
+        def hungup():
+            if os.name != "nt":
+                return os.path.exists(os.path.join(work, "hup.txt"))
+            try:
+                pid = int(open(os.path.join(work, "shell.pid")).read())
+            except (OSError, ValueError):
+                return False
+            return not alive(pid)
         deadline = time.monotonic() + 5
-        while not os.path.exists(os.path.join(work, "hup.txt")) and time.monotonic() < deadline:
+        while not hungup() and time.monotonic() < deadline:
             time.sleep(0.1)
-        if not os.path.exists(os.path.join(work, "hup.txt")):
+        if not hungup():
             problems.append("quitting did not hang up the terminal's shell")
         else:
             print("terminal: quitting hung up the shell")
-    if args.mode == "terminal" and args.shots:
+    if args.mode == "terminal" and args.shots and os.name != "nt":  # SDL's alone
         for name in ("terminal", "terminal-small", "terminal-vim", "terminal-big",
                      "terminal-ended"):
             if not os.path.exists(os.path.join(args.shots, name + ".png")):
