@@ -290,7 +290,7 @@ static void test_helpskill(Test *t)
     d = helpdest(a, "settings:nope/x#y");
     expect(t, "settings unknown", concat(a, istr(a, d.known), d.find), "0y");
     d = helpdest(a, "view:Hosts");
-    expect(t, "view", istr(a, d.kind==DEST_VIEW && d.pane==8), "1");
+    expect(t, "view", istr(a, d.kind==DEST_VIEW && d.pane==9), "1");  // PANE_HOSTS
     expect(t, "view none", istr(a, helpdest(a, "view:nope").pane), "-1");
     expect(t, "web", istr(a, helpdest(a, "HTTPS://example.com/").kind), istr(a, DEST_WEB));
     expect(t, "other", istr(a, helpdest(a, "file:///etc/passwd").kind), istr(a, DEST_NONE));

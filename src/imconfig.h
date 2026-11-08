@@ -12,6 +12,10 @@
 #define IMGUI_DISABLE_OBSOLETE_FUNCTIONS
 #define IMGUI_DISABLE_DEMO_WINDOWS  // imgui_demo.cpp: empty stubs only
 
+// 32-bit indices: a terminal's grid passes 64K vertices (300x80 cells),
+// and the GLES 3.0 renderer has no VtxOffset to split draw lists by.
+#define ImDrawIdx unsigned int
+
 // Places the IME's composition and candidate windows at the text cursor.
 // ImGui leaves this off for compilers other than MSVC; imm32 is linked.
 #define IMGUI_ENABLE_WIN32_DEFAULT_IME_FUNCTIONS

@@ -75,8 +75,9 @@ static void test_dock(Test *t)
            "Tabs=Prompt\n"
            "TabBar=Hidden\n");
 
-    // Every preset is whole, places every pane but the metrics once,
-    // and reads back as written; only Focus hides Help and the rest
+    // Every preset is whole, places every pane but the metrics and the
+    // terminal once, and reads back as written; only Focus hides Help
+    // and the rest, and every preset leaves the terminal as it is
     u32 all = (1u<<PANE_COUNT) - 1;
     for (i32 i = 0; i < PRESET_COUNT; i++) {
         DockLayout l    = dockpreset(i);
@@ -88,14 +89,58 @@ static void test_dock(Test *t)
         }
         expect(t, concat(&a, name, ".bad"), istr(&a, l.bad), "0");
         expect(t, concat(&a, name, ".placed"), istr(&a, dockplaced(&l)),
-               istr(&a, all & ~(1u<<PANE_METRICS)));
-        expect(t, concat(&a, name, ".once"), istr(&a, tabs), istr(&a, PANE_COUNT-1));
+               istr(&a, all & ~(1u<<PANE_METRICS | 1u<<PANE_TERMINAL)));
+        expect(t, concat(&a, name, ".once"), istr(&a, tabs), istr(&a, PANE_COUNT-2));
         expect(t, concat(&a, name, ".again"), dockagain(&a, text), text);
-        expect(t, concat(&a, name, ".keep"), istr(&a, !!l.keep),
-               i==PRESET_FOCUS ? Str("0") : Str("1"));
+        expect(t, concat(&a, name, ".keep"), istr(&a, l.keep==1u<<PANE_TERMINAL),
+               i==PRESET_FOCUS ? Str("1") : Str("0"));
+        expect(t, concat(&a, name, ".keepterm"), istr(&a, l.keep>>PANE_TERMINAL & 1), "1");
         b32 done = dockdone(&l);
         expect(t, concat(&a, name, ".done"), istr(&a, done), "1");
         expect(t, concat(&a, name, ".pruned"), dockstr(&a, &l), text);
+    }
+
+    // The terminal's home: under the transcript and prompt, once
+    DockLayout withterm = dockpreset(PRESET_STANDARD);
+    expect(t, "dock.addterm", istr(&a, dockaddterm(&withterm)), "1");
+    expect(t, "dock.addterm.again", istr(&a, dockaddterm(&withterm)), "0");
+    expect(t, "dock.addterm.standard", dockstr(&a, &withterm),
+           "Shown=Sessions,Transcript,Prompt,Todo,Plan,Jobs,Log\n"
+           "Split=X,0.75\n"
+           "Split=X,0.44\n"
+           "Split=Y,0.75\n"
+           "Tabs=Sessions\n"
+           "Tabs=Todo\n"
+           "Split=Y,0.6\n"
+           "Split=Y,0.72\n"
+           "Center=Transcript\n"
+           "Tabs=Prompt\n"
+           "Tabs=Terminal\n"
+           "Split=Y,0.5\n"
+           "Tabs=*Jobs,Log,Help,Settings,Hosts\n"
+           "Tabs=Plan,Changes\n");
+    withterm = dockpreset(PRESET_FOCUS);
+    dockaddterm(&withterm);
+    expect(t, "dock.addterm.focus", dockstr(&a, &withterm),
+           "Shown=Transcript,Prompt,Todo,Plan\n"
+           "Split=Y,0.6\n"
+           "Split=Y,0.72\n"
+           "Center=*Transcript,Todo,Plan,Changes,Sessions,Jobs,Log,Help,Settings,Hosts\n"
+           "Tabs=Prompt\n"
+           "TabBar=Hidden\n"
+           "Tabs=Terminal\n");
+    expect(t, "dock.addterm.done", istr(&a, dockdone(&withterm)), "1");
+    // With no prompt, under the center; one placed floating is left there
+    {
+        b32        ok = 0;
+        DockLayout l  = dockread("Shown=Terminal\nSplit=X,0.3\nTabs=Todo\n"
+                                 "Center=Transcript\nFloat=Terminal,0,0,0.5,0.5\n", &ok);
+        expect(t, "dock.addterm.floated", istr(&a, dockaddterm(&l)), "0");
+        l.floats = 0;
+        dockaddterm(&l);
+        expect(t, "dock.addterm.nocenter", dockstr(&a, &l),
+               "Shown=Terminal\nSplit=X,0.3\nTabs=Todo\nSplit=Y,0.6\n"
+               "Center=Transcript\nTabs=Terminal\n");
     }
 
     // A pane floating at its place, which is kept within the dock space

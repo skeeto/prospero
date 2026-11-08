@@ -72,7 +72,7 @@ static void test_theme(Test *t)
         P(text, rowpress), P(dim, rowpress), P(ok, rowpress),
         P(bad, rowpress), P(amber, rowpress), P(active, rowpress),
         P(paneltext, rowhover), P(paneltext, btn), P(paneltext, btnhover),
-        P(paneltext, btnpress),
+        P(paneltext, btnpress), P(termfg, termbg),
         #undef P
     };
     Palette *pals[] = {&themedark, &themelight};

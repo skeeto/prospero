@@ -1,0 +1,947 @@
+// The Terminal pane: a shell on a pseudo-terminal in the session's
+// engine (ptyhost.cpp), emulated here by ariel, one terminal per root
+// session, which subagents and side chats share.
+//
+// The engine streams the shell's output as term records, each at its
+// offset; the pane feeds them to ariel and acks the offset, which opens
+// the engine's window for more. A gap (a record lost) acks with resend,
+// and the engine sends again from there. Keys and pastes go out encoded
+// by ariel as term.input. Ctrl+` (physical Ctrl on macOS too) shows the
+// pane and focuses the terminal, starting one if there is none, and
+// hides it again from the terminal.
+//
+// For now only the local engine runs terminals: the routing of remote
+// hosts' term records comes later.
+//
+// This is free and unencumbered software released into the public domain.
+
+#include "../ariel/ariel.h"
+
+enum : i32 {
+    TT_NONE,      // not started
+    TT_OPENING,   // term.open in flight
+    TT_LIVE,
+    TT_ENDED,     // the shell exited, its screen kept under a banner
+    TT_FAILED,    // could not start
+};
+
+enum : i32 {
+    TERMTAB_TEXT   = 160,       // bytes kept of its shell's name and errors
+    TERMTAB_RESIZE = 100*1000,  // µs a new size waits to settle
+    TERMTAB_INPUT  = 16 << 10,  // bytes per term.input (ptyhost's TERM_INPUT)
+};
+
+struct TermTab {
+    GuiHost    *host;
+    i64         tid;       // the engine's, 0 until term.open's reply
+    i64         openid;    // term.open in flight, else 0
+    i32         state;     // TT_*
+    Region     *region;    // ariel's block, alone in it
+    ariel_Term *t;
+    i32         capcols;   // the block's capacity
+    i32         caprows;
+    i32         cols;      // its size, as the engine has it
+    i32         rows;
+    i32         wantcols;  // a new size, waiting to settle, else 0
+    i32         wantrows;
+    i64         wantat;    // when it last changed, sched µs
+    i64         fed;       // output offset fed to ariel
+    b32         busy;      // a program runs in the shell
+    Palette    *pal;       // the colors given ariel
+    i32         code;      // the end's exit code, or -1
+    i32         signal;
+    u8          shell[TERMTAB_TEXT];  // its shell's name
+    iz          shelllen;
+    u8          err[TERMTAB_TEXT];    // why it failed or ended
+    iz          errlen;
+};
+
+static iz termkeep(u8 *dst, Str s)
+{
+    iz n = s.len<TERMTAB_TEXT ? s.len : (iz)TERMTAB_TEXT;
+    copybytes(dst, s.data, n);
+    return n;
+}
+
+static Str termshellname(TermTab *tt)
+{
+    return {tt->shell, tt->shelllen};
+}
+
+static Str termerr(TermTab *tt)
+{
+    return {tt->err, tt->errlen};
+}
+
+// Why a session can have no terminal now, else empty.
+static Str termwhy(Gui *g, GuiSession *s)
+{
+    if (!s) {
+        return "No session is open";
+    } else if (s->host->kind != GH_ENGINE) {
+        return "Terminals run on this machine's sessions for now";
+    } else if (g->enginekind == ENGINE_FAKE) {
+        return "The fake agent has no terminals";
+    }
+    return hostwhy(g, s, "term");
+}
+
+// ariel's colors in its own form, 0xRRGGBB, from a palette's ABGR.
+static u32 termrgb(u32 abgr)
+{
+    return (abgr & 0xff)<<16 | (abgr & 0xff00) | (abgr>>16 & 0xff);
+}
+
+// ImGui's color, ABGR, from ariel's.
+static u32 termimcolor(u32 rgb)
+{
+    return 0xff000000u | (rgb & 0xff)<<16 | (rgb & 0xff00) | (rgb>>16 & 0xff);
+}
+
+static void termcolors(Gui *g, TermTab *tt)
+{
+    Palette *p = g->pal;
+    tt->pal = p;
+    for (i32 i = 0; i < 16; i++) {
+        ariel_setcolor(tt->t, i, termrgb(p->ansi[i]));
+    }
+    ariel_setcolor(tt->t, ARIEL_C_FG, termrgb(p->termfg));
+    ariel_setcolor(tt->t, ARIEL_C_BG, termrgb(p->termbg));
+    ariel_setcolor(tt->t, ARIEL_C_CURSOR, termrgb(p->termcursor));
+}
+
+static ariel_Config termconfig(i32 cols, i32 rows, i32 capcols, i32 caprows)
+{
+    static char name[] = "Prospero(" PROSPERO_VERSION ")";
+    ariel_Config c = {};
+    c.cols      = cols;
+    c.rows      = rows;
+    c.capcols   = capcols;
+    c.caprows   = caprows;
+    c.name.data = (u8 *)name;
+    c.name.len  = countof(name) - 1;
+    return c;
+}
+
+// The capacity for a size: some room to grow before a move.
+static i32 termcap(i32 n, i32 least)
+{
+    i32 r = n + n/2;
+    r = r<least ? least : r;
+    return r<4096 ? r : 4096;
+}
+
+// A block for the terminal, fresh or moved into from the one it had,
+// with the capacity for cols by rows. Returns 0 if it cannot be had.
+static b32 termblock(Gui *g, TermTab *tt, i32 cols, i32 rows)
+{
+    i32          capcols = termcap(cols, 200);
+    i32          caprows = termcap(rows, 80);
+    ariel_Config c       = termconfig(cols, rows, capcols, caprows);
+    iz           size    = ariel_size(&c);
+    if (!size) {
+        return 0;
+    }
+    Region *r = os_reserve(g->os, size + ((iz)1<<16));
+    if (!r) {
+        return 0;
+    }
+    Arena a = newarena(r);
+    allocbytes(&a, -(uz)a.beg & 15);
+    void       *mem = allocbytes(&a, size);
+    ariel_Term *t   = tt->t ? ariel_move(tt->t, mem, size, &c) : ariel_init(mem, size, &c);
+    if (!t) {
+        os_release(g->os, r);
+        return 0;
+    }
+    if (tt->region) {
+        os_release(g->os, tt->region);
+    }
+    tt->region  = r;
+    tt->t       = t;
+    tt->capcols = capcols;
+    tt->caprows = caprows;
+    return 1;
+}
+
+static void termfree(Gui *g, TermTab *tt)
+{
+    if (tt->region) {
+        os_release(g->os, tt->region);
+    }
+    GuiHost *h = tt->host;
+    *tt = {};
+    tt->host = h;
+}
+
+// Begin a terminal's command, which has no reply. Finish it with cmdsend.
+static EvOut termbegin(Gui *g, Buf *b, i32 cmd, TermTab *tt)
+{
+    EvOut w = cmdbegin(b, cmd, 0);
+    putintkey(&w.json, "tid", tt->tid);
+    g->cmdhost = tt->host;
+    return w;
+}
+
+static void termack(Gui *g, TermTab *tt, i64 off, b32 resend)
+{
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 128);
+    EvOut w = termbegin(g, &b, CMD_TERMACK, tt);
+    putintkey(&w.json, "off", off);
+    if (resend) {
+        putkey(&w.json, "resend");
+        putbool(&w.json, 1);
+    }
+    cmdsend(g, &w, a);
+}
+
+// Bytes for the shell, in as many term.input as they need.
+static void terminput(Gui *g, TermTab *tt, Str data)
+{
+    if (tt->state!=TT_LIVE || !tt->tid) {
+        return;
+    }
+    while (data.len) {
+        Str   part = takehead(data, data.len<TERMTAB_INPUT ? data.len : (iz)TERMTAB_INPUT);
+        Arena a    = newarena(g->cmdr);
+        Buf   b(&a, 128 + part.len/3*4 + 4);
+        EvOut w    = termbegin(g, &b, CMD_TERMINPUT, tt);
+        putstrkey(&w.json, "data", base64(&a, part));
+        cmdsend(g, &w, a);
+        data = cuthead(data, part.len);
+    }
+}
+
+static void termsize(Gui *g, TermTab *tt, i32 cols, i32 rows, f32 cw, f32 ch)
+{
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 128);
+    EvOut w = termbegin(g, &b, CMD_TERMRESIZE, tt);
+    putintkey(&w.json, "cols", cols);
+    putintkey(&w.json, "rows", rows);
+    putintkey(&w.json, "xpx", (i64)((f32)cols*cw));
+    putintkey(&w.json, "ypx", (i64)((f32)rows*ch));
+    cmdsend(g, &w, a);
+}
+
+// Hang up a terminal and forget it: its shell gets SIGHUP, as a closed
+// terminal window's would.
+static void termclose(Gui *g, TermTab *tt)
+{
+    if (tt->tid && (tt->state==TT_LIVE || tt->state==TT_OPENING)) {
+        Arena a = newarena(g->cmdr);
+        Buf   b(&a, 128);
+        EvOut w = termbegin(g, &b, CMD_TERMCLOSE, tt);
+        cmdsend(g, &w, a);
+    }
+    termfree(g, tt);
+    scheddirty(&g->sched);
+}
+
+// Hang up every terminal, as the window goes.
+static void termcloseall(Gui *g)
+{
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        if (s->term) {
+            termclose(g, s->term);
+        }
+    }
+}
+
+// Start a session's terminal at a size.
+static void termstart(Gui *g, GuiSession *s, i32 cols, i32 rows)
+{
+    if (termwhy(g, s).len) {
+        return;
+    }
+    if (!s->term) {
+        s->term = alloc<TermTab>(&g->perm);
+    }
+    TermTab *tt = s->term;
+    termfree(g, tt);
+    tt->host = s->host;
+    cols = cols>0 ? cols : 80;
+    rows = rows>0 ? rows : 24;
+    if (!termblock(g, tt, cols, rows)) {
+        tt->state  = TT_FAILED;
+        tt->errlen = termkeep(tt->err, "out of memory for the terminal");
+        return;
+    }
+    termcolors(g, tt);
+    tt->cols   = cols;
+    tt->rows   = rows;
+    tt->code   = -1;
+    tt->state  = TT_OPENING;
+
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 256);
+    EvOut w = cmdopen(g, &b, CMD_TERMOPEN, s);
+    putintkey(&w.json, "cols", cols);
+    putintkey(&w.json, "rows", rows);
+    tt->openid = g->nextid;
+    cmdsend(g, &w, a);
+    scheddirty(&g->sched);
+}
+
+// term.open's reply.
+static void termopened(Gui *g, GuiSession *s, i64 id, Json *j, b32 ok, Str err)
+{
+    TermTab *tt = s ? s->term : 0;
+    if (!tt || tt->openid!=id) {
+        // Abandoned while opening: hang it up
+        i64 tid = jsonint(jsonget(j, "tid"), 0);
+        if (ok && tid && s) {
+            TermTab gone = {};
+            gone.host  = s->host;
+            gone.tid   = tid;
+            gone.state = TT_LIVE;
+            termclose(g, &gone);
+        }
+        return;
+    }
+    tt->openid = 0;
+    if (!ok) {
+        tt->state  = TT_FAILED;
+        tt->errlen = termkeep(tt->err, err);
+        return;
+    }
+    tt->tid      = jsonint(jsonget(j, "tid"), 0);
+    tt->state    = TT_LIVE;
+    tt->shelllen = termkeep(tt->shell, jsonstr(jsonget(j, "shell")));
+    ariel_Modes m = ariel_modes(tt->t);
+    if (m.cols!=tt->cols || m.rows!=tt->rows) {
+        // Resized while opening
+        tt->cols = m.cols;
+        tt->rows = m.rows;
+        termsize(g, tt, m.cols, m.rows, 0, 0);
+    }
+}
+
+static TermTab *termbytid(Gui *g, GuiHost *h, i64 tid)
+{
+    for (GuiSession *s = g->sessions; tid && s; s = s->next) {
+        TermTab *tt = s->term;
+        if (tt && tt->host==h && tt->tid==tid) {
+            return tt;
+        }
+    }
+    return 0;
+}
+
+// Feed the shell's output to ariel, sending its replies back.
+static void termfeed(Gui *g, TermTab *tt, Str data)
+{
+    ariel_Str in = {data.data, data.len};
+    for (;;) {
+        ariel_Fed f = ariel_feed(tt->t, in);
+        in = f.rest;
+        switch (f.ev.kind) {
+        case ARIEL_EV_NONE:
+            return;
+        case ARIEL_EV_REPLY:
+            terminput(g, tt, {f.ev.data.data, f.ev.data.len});
+            break;
+        }
+    }
+}
+
+// A term, term.end or term.busy record from a host.
+static void termapply(Gui *g, GuiHost *h, Arena scratch, EvRec *r)
+{
+    Json    *j   = r->root;
+    i64      tid = jsonint(jsonget(j, "tid"), 0);
+    TermTab *tt  = termbytid(g, h, tid);
+    if (!tt) {
+        if (tid && r->ev!=EV_TERMBUSY) {
+            // A terminal not known here, say one of a window before
+            TermTab gone = {};
+            gone.host  = h;
+            gone.tid   = tid;
+            gone.state = TT_LIVE;
+            termclose(g, &gone);
+        }
+        return;
+    }
+
+    switch (r->ev) {
+    case EV_TERM: {
+        if (tt->state != TT_LIVE) {
+            return;
+        }
+        i64      off = jsonint(jsonget(j, "off"), -1);
+        Unbase64 u   = unbase64(&scratch, jsonstr(jsonget(j, "data")));
+        if (!u.ok || off<0) {
+            return;
+        } else if (off > tt->fed) {
+            termack(g, tt, tt->fed, 1);  // a gap: from where it was lost
+            return;
+        } else if (off+u.data.len <= tt->fed) {
+            return;  // sent again, already had
+        }
+        Str fresh = cuthead(u.data, (iz)(tt->fed - off));
+        termfeed(g, tt, fresh);
+        tt->fed += fresh.len;
+        termack(g, tt, tt->fed, 0);
+    } break;
+
+    case EV_TERMEND: {
+        i64 off = jsonint(jsonget(j, "off"), -1);
+        tt->code   = (i32)jsonint(jsonget(j, "code"), -1);
+        tt->signal = (i32)jsonint(jsonget(j, "signal"), 0);
+        tt->busy   = 0;
+        Str err    = jsonstr(jsonget(j, "err"));
+        if (off >= 0) {
+            termack(g, tt, off<tt->fed ? off : tt->fed, 0);
+        }
+        if (!tt->code && !tt->signal && !err.len && off==tt->fed) {
+            termfree(g, tt);  // a clean exit closes it
+            if (g->panes[PANE_TERMINAL] && g->termfocused) {
+                g->promptfocus = 1;
+            }
+            return;
+        }
+        tt->state  = TT_ENDED;
+        tt->errlen = termkeep(tt->err, err);
+    } break;
+
+    case EV_TERMBUSY:
+        tt->busy = jsonflag(jsonget(j, "busy"), 0);
+        break;
+    }
+}
+
+
+// Drawing
+
+struct TermMetrics {
+    ImFontBaked *regular;
+    ImFontBaked *bold;
+    f32          size;     // the font's
+    f32          cw, ch;   // a cell, in points, whole device pixels
+    f32          density;
+};
+
+static f32 termsnap(f32 v, f32 density)
+{
+    return roundf(v*density) / density;
+}
+
+static TermMetrics termmetrics(Gui *g)
+{
+    TermMetrics m = {};
+    f32 density = ImGui::GetIO().DisplayFramebufferScale.x;
+    m.density = density>0 ? density : 1;
+    m.regular = stylebaked(&g->fonts, STYLE_CODE);
+    m.bold    = stylebaked(&g->fonts, STYLE_CODE|STYLE_BOLD);
+    m.size    = stylesize(&g->fonts, STYLE_CODE);
+    f32 cw = termsnap(m.regular->GetCharAdvance('M'), m.density);
+    f32 ch = termsnap(m.size*1.25f, m.density);
+    m.cw = cw>0 ? cw : 1;
+    m.ch = ch>0 ? ch : 1;
+    return m;
+}
+
+// One glyph's quad, its top left at x, y.
+static void termglyph(ImDrawList *dl, ImFontBaked *f, f32 x, f32 y, u32 cp, u32 col)
+{
+    ImFontGlyph *glyph = f->FindGlyph((ImWchar)cp);
+    if (!glyph || !glyph->Visible) {
+        return;
+    }
+    col |= glyph->Colored ? ~IM_COL32_A_MASK : 0;
+    dl->PrimReserve(6, 4);
+    dl->PrimRectUV(v2(x + glyph->X0, y + glyph->Y0), v2(x + glyph->X1, y + glyph->Y1),
+                   v2(glyph->U0, glyph->V0), v2(glyph->U1, glyph->V1), col);
+}
+
+// The cells of the screen at o: backgrounds, glyphs, lines, cursor.
+static void termcells(Gui *g, TermTab *tt, TermMetrics *m, ImVec2 o, b32 focused, Arena a)
+{
+    ImDrawList *dl    = ImGui::GetWindowDrawList();
+    ariel_Modes modes = ariel_modes(tt->t);
+    i32         cols  = modes.cols;
+    ariel_Cell *cells = alloc<ariel_Cell>(&a, cols);
+    f32         cw = m->cw, ch = m->ch;
+    f32         top = termsnap((ch - m->size)/2, m->density);  // the glyphs' in a cell
+    dl->PushDrawFlag(ImDrawFlags_TextNoPixelSnap, true);
+
+    for (i32 y = 0; y < modes.rows; y++) {
+        i32 n  = ariel_row(tt->t, y, cells, cols);
+        f32 cy = o.y + (f32)y*ch;
+
+        // Backgrounds, in runs of one color, the default left as it is
+        for (i32 x = 0; x < n;) {
+            i32 end = x + 1;
+            for (; end<n && cells[end].bg==cells[x].bg &&
+                   (cells[end].attr&ARIEL_A_DEFBG)==(cells[x].attr&ARIEL_A_DEFBG); end++) {}
+            if (!(cells[x].attr & ARIEL_A_DEFBG)) {
+                dl->AddRectFilled(v2(o.x + (f32)x*cw, cy), v2(o.x + (f32)end*cw, cy + ch),
+                                  termimcolor(cells[x].bg));
+            }
+            x = end;
+        }
+
+        for (i32 x = 0; x < n; x++) {
+            ariel_Cell *c = cells + x;
+            if (!c->width) {
+                continue;  // the right half of a wide character
+            }
+            f32 cx  = o.x + (f32)x*cw;
+            u32 fg  = c->fg;
+            if (c->attr & ARIEL_A_FAINT) {
+                // Halfway to the background
+                u32 bg = c->bg;
+                fg = ((fg>>1 & 0x7f7f7f) + (bg>>1 & 0x7f7f7f));
+            }
+            u32 col = termimcolor(fg);
+            if (c->cp && c->cp!=' ' && !(c->attr & ARIEL_A_HIDDEN)) {
+                ImFontBaked *f = c->attr&ARIEL_A_BOLD ? m->bold : m->regular;
+                termglyph(dl, f, cx, cy + top, c->cp, col);
+            }
+            f32 w = (f32)c->width * cw;
+            f32 t = termsnap(m->size/14 > 1 ? m->size/14 : 1, m->density);
+            if (ARIEL_ULINE(c->attr)) {
+                f32 uy = termsnap(cy + top + m->regular->Ascent + t, m->density);
+                dl->AddRectFilled(v2(cx, uy), v2(cx + w, uy + t), termimcolor(c->ul));
+            }
+            if (c->attr & ARIEL_A_STRIKE) {
+                f32 sy = termsnap(cy + ch/2, m->density);
+                dl->AddRectFilled(v2(cx, sy), v2(cx + w, sy + t), col);
+            }
+        }
+    }
+
+    // The cursor: a block, else a bar or underline; hollow unfocused
+    ariel_Cursor cur = ariel_cursor(tt->t);
+    if (cur.visible && cur.y>=0 && cur.y<modes.rows && cur.x>=0 && cur.x<cols &&
+            tt->state==TT_LIVE) {
+        f32 cx  = o.x + (f32)cur.x*cw;
+        f32 cy  = o.y + (f32)cur.y*ch;
+        f32 w   = (cur.wide ? 2 : 1) * cw;
+        u32 col = termimcolor(cur.color);
+        f32 t   = termsnap(m->size/8 > 1 ? m->size/8 : 1, m->density);
+        if (!focused) {
+            dl->AddRect(v2(cx, cy), v2(cx + w, cy + ch), col, 0.0f, 1.0f);
+        } else if (cur.shape == ARIEL_CUR_BAR) {
+            dl->AddRectFilled(v2(cx, cy), v2(cx + t, cy + ch), col);
+        } else if (cur.shape == ARIEL_CUR_UNDERLINE) {
+            dl->AddRectFilled(v2(cx, cy + ch - t), v2(cx + w, cy + ch), col);
+        } else {
+            dl->AddRectFilled(v2(cx, cy), v2(cx + w, cy + ch), col);
+            ariel_row(tt->t, cur.y, cells, cols);
+            ariel_Cell *c = cells + cur.x;
+            if (c->cp && c->cp!=' ' && !(c->attr & ARIEL_A_HIDDEN)) {
+                ImFontBaked *f  = c->attr&ARIEL_A_BOLD ? m->bold : m->regular;
+                u32          bg = c->attr&ARIEL_A_DEFBG ? ariel_color(tt->t, ARIEL_C_BG) : c->bg;
+                termglyph(dl, f, cx, cy + top, c->cp, termimcolor(bg));
+            }
+        }
+    }
+    dl->PopDrawFlag();
+}
+
+
+// Input
+
+// The physical Ctrl key, which ImGui calls Super on macOS, swapping it
+// with Cmd.
+static b32 termctrl(Gui *g)
+{
+    ImGuiIO &io = ImGui::GetIO();
+    return g->mac ? io.KeySuper : io.KeyCtrl;
+}
+
+static i32 termmods(Gui *g)
+{
+    ImGuiIO &io = ImGui::GetIO();
+    i32      r  = 0;
+    r |= io.KeyShift ? ARIEL_SHIFT : 0;
+    r |= io.KeyAlt ? ARIEL_ALT : 0;
+    r |= termctrl(g) ? ARIEL_CTRL : 0;
+    return r;
+}
+
+// ariel's key for one of ImGui's named keys, else 0.
+static i32 termnamed(ImGuiKey k)
+{
+    if (k>=ImGuiKey_F1 && k<=ImGuiKey_F12) {
+        return ARIEL_K_F1 + (k - ImGuiKey_F1);
+    } else if (k>=ImGuiKey_Keypad0 && k<=ImGuiKey_Keypad9) {
+        return ARIEL_K_KP0 + (k - ImGuiKey_Keypad0);
+    }
+    switch (k) {
+    case ImGuiKey_Enter:          return ARIEL_K_ENTER;
+    case ImGuiKey_Tab:            return ARIEL_K_TAB;
+    case ImGuiKey_Backspace:      return ARIEL_K_BACKSPACE;
+    case ImGuiKey_Escape:         return ARIEL_K_ESCAPE;
+    case ImGuiKey_Insert:         return ARIEL_K_INSERT;
+    case ImGuiKey_Delete:         return ARIEL_K_DELETE;
+    case ImGuiKey_Home:           return ARIEL_K_HOME;
+    case ImGuiKey_End:            return ARIEL_K_END;
+    case ImGuiKey_PageUp:         return ARIEL_K_PAGEUP;
+    case ImGuiKey_PageDown:       return ARIEL_K_PAGEDOWN;
+    case ImGuiKey_UpArrow:        return ARIEL_K_UP;
+    case ImGuiKey_DownArrow:      return ARIEL_K_DOWN;
+    case ImGuiKey_LeftArrow:      return ARIEL_K_LEFT;
+    case ImGuiKey_RightArrow:     return ARIEL_K_RIGHT;
+    case ImGuiKey_KeypadDecimal:  return ARIEL_K_KPDECIMAL;
+    case ImGuiKey_KeypadDivide:   return ARIEL_K_KPDIVIDE;
+    case ImGuiKey_KeypadMultiply: return ARIEL_K_KPMULTIPLY;
+    case ImGuiKey_KeypadSubtract: return ARIEL_K_KPSUBTRACT;
+    case ImGuiKey_KeypadAdd:      return ARIEL_K_KPADD;
+    case ImGuiKey_KeypadEnter:    return ARIEL_K_KPENTER;
+    case ImGuiKey_KeypadEqual:    return ARIEL_K_KPEQUAL;
+    case ImGuiKey_Menu:           return ARIEL_K_MENU;
+    default:                      return 0;
+    }
+}
+
+// A text key's code point on a US layout, else 0: what a Ctrl chord
+// sends, which gives no text.
+static u32 termtextkey(ImGuiKey k)
+{
+    if (k>=ImGuiKey_A && k<=ImGuiKey_Z) {
+        return 'a' + (u32)(k - ImGuiKey_A);
+    } else if (k>=ImGuiKey_0 && k<=ImGuiKey_9) {
+        return '0' + (u32)(k - ImGuiKey_0);
+    }
+    switch (k) {
+    case ImGuiKey_Space:        return ' ';
+    case ImGuiKey_Apostrophe:   return '\'';
+    case ImGuiKey_Comma:        return ',';
+    case ImGuiKey_Minus:        return '-';
+    case ImGuiKey_Period:       return '.';
+    case ImGuiKey_Slash:        return '/';
+    case ImGuiKey_Semicolon:    return ';';
+    case ImGuiKey_Equal:        return '=';
+    case ImGuiKey_LeftBracket:  return '[';
+    case ImGuiKey_Backslash:    return '\\';
+    case ImGuiKey_RightBracket: return ']';
+    case ImGuiKey_GraveAccent:  return '`';
+    default:                    return 0;
+    }
+}
+
+// A key pressed or repeated, as the shell should have it.
+static void termpress(Gui *g, TermTab *tt, ImGuiKey k, b32 repeat)
+{
+    ariel_Key key = {};
+    key.mods   = termmods(g);
+    key.action = repeat ? ARIEL_REPEAT : ARIEL_PRESS;
+    key.key    = termnamed(k);
+    if (!key.key) {
+        // Text keys go as their text, but for Ctrl chords, which have none
+        u32 cp = termtextkey(k);
+        if (!cp || !(key.mods & ARIEL_CTRL) || k==ImGuiKey_GraveAccent) {
+            return;
+        }
+        key.cp = cp;
+    }
+    ariel_Str s = ariel_key(tt->t, &key);
+    terminput(g, tt, {s.data, s.len});
+}
+
+static void termpaste(Gui *g, TermTab *tt, Arena a)
+{
+    char const *clip = ImGui::GetClipboardText();
+    Str         in   = {(u8 *)clip, clip ? (iz)__builtin_strlen(clip) : 0};
+    while (in.len) {
+        Str part = takehead(in, in.len<TERMTAB_INPUT ? in.len : (iz)TERMTAB_INPUT);
+        i32 flags = (part.len==in.len ? ARIEL_PASTE_END : 0) |
+                    (in.data==(u8 *)clip ? ARIEL_PASTE_BEGIN : 0);
+        Arena t   = a;
+        iz    cap = part.len + 16;
+        u8   *out = allocbytes(&t, cap);
+        iz    n   = ariel_paste(tt->t, out, cap, {part.data, part.len}, flags);
+        terminput(g, tt, {out, n});
+        in = cuthead(in, part.len);
+    }
+}
+
+// The keys of a frame, in order: text as typed, named keys and Ctrl
+// chords through ariel's encoder. ImGui keeps no key repeats in its
+// trail, so those come from its repeat timing.
+static void termkeys(Gui *g, TermTab *tt, Arena a)
+{
+    ImGuiIO      &io   = ImGui::GetIO();
+    ImGuiContext &c    = *GImGui;
+    b32           cmd  = g->mac && io.KeyCtrl;  // Cmd: the app's
+    b32           ctrl = termctrl(g);
+    if (cmd) {
+        if (ImGui::IsKeyPressed(ImGuiKey_V, false)) {
+            termpaste(g, tt, a);
+        }
+        return;
+    } else if (!g->mac && io.KeyCtrl && io.KeyShift) {
+        if (ImGui::IsKeyPressed(ImGuiKey_V, false)) {
+            termpaste(g, tt, a);
+        }
+        return;
+    }
+
+    b32 pressed[ImGuiKey_NamedKey_COUNT] = {};
+    for (i32 i = 0; i < c.InputEventsTrail.Size; i++) {
+        ImGuiInputEvent *e = &c.InputEventsTrail[i];
+        if (e->Type==ImGuiInputEventType_Key && e->Key.Down &&
+                ImGui::IsNamedKey(e->Key.Key) && !(e->Key.Key & ImGuiMod_Mask_)) {
+            pressed[e->Key.Key - ImGuiKey_NamedKey_BEGIN] = 1;
+            termpress(g, tt, e->Key.Key, 0);
+        } else if (e->Type==ImGuiInputEventType_Text && !ctrl) {
+            u32 cp = e->Text.Char;
+            if (cp>=0x20 && cp!=0x7f) {
+                u8        buf[4];
+                iz        n = utf8encode(buf, (i32)cp);
+                ariel_Str s = ariel_text(tt->t, {buf, n});
+                terminput(g, tt, {s.data, s.len});
+            }
+        }
+    }
+    for (i32 k = ImGuiKey_NamedKey_BEGIN; k < ImGuiKey_NamedKey_END; k++) {
+        ImGuiKey key = (ImGuiKey)k;
+        if (!pressed[k - ImGuiKey_NamedKey_BEGIN] && (termnamed(key) || termtextkey(key)) &&
+                ImGui::GetKeyData(key)->DownDuration>0 &&
+                ImGui::IsKeyPressed(key, ImGuiInputFlags_Repeat, ImGuiKeyOwner_Any)) {
+            termpress(g, tt, key, 1);
+        }
+    }
+}
+
+// Ctrl+`, at the top of the frame, before any shortcut: shows the pane
+// and focuses the terminal, or from the terminal, hides the pane. While
+// the terminal has the keyboard, so that the app keeps its shortcuts,
+// it lets go of it with Cmd held on macOS, or with Ctrl+Shift elsewhere.
+static void termhotkeys(Gui *g)
+{
+    ImGuiIO      &io = ImGui::GetIO();
+    ImGuiContext &c  = *GImGui;
+    if (c.ActiveId && c.ActiveId==g->termid) {
+        b32 app = g->mac ? io.KeyCtrl : io.KeyCtrl&&io.KeyShift;
+        if (!app) {
+            ImGui::SetActiveIdUsingAllKeyboardKeys();
+        } else {
+            c.ActiveIdUsingAllKeyboardKeys = false;
+            c.ActiveIdUsingNavDirMask      = 0;
+        }
+    }
+    if (!termctrl(g) || io.KeyShift || !ImGui::IsKeyPressed(ImGuiKey_GraveAccent, false)) {
+        return;
+    }
+    if (g->panes[PANE_TERMINAL] && g->termfocused) {
+        setpane(g, PANE_TERMINAL, 0);
+        g->promptfocus = 1;
+        if (c.ActiveId == g->termid) {
+            ImGui::ClearActiveID();
+        }
+    } else {
+        setpane(g, PANE_TERMINAL, 1);
+        g->termfocus = 1;
+    }
+    scheddirty(&g->sched);
+}
+
+
+// The pane
+
+// The pane's banner over an ended or failed terminal, with its buttons.
+static void termbanner(Gui *g, GuiSession *s, TermTab *tt, Arena a, i32 cols, i32 rows)
+{
+    Buf b(&a, 256);
+    if (tt->state == TT_FAILED) {
+        print(&b, "The terminal could not start: ");
+        print(&b, termerr(tt));
+    } else if (tt->errlen) {
+        print(&b, "The terminal ended: ");
+        print(&b, termerr(tt));
+    } else if (tt->signal) {
+        print(&b, "The shell was killed by signal ");
+        print(&b, (i64)tt->signal);
+    } else {
+        print(&b, "The shell exited with code ");
+        print(&b, (i64)tt->code);
+    }
+    ImGui::PushStyleColor(ImGuiCol_Text, g->pal->amber);
+    ImGui::TextWrapped("%s", cstr0(&a, finish(&b)));
+    ImGui::PopStyleColor();
+    b32 restart = ImGui::Button("Restart");
+    itemtip("Start a new shell (Enter)");
+    ImGui::SameLine();
+    b32 close = ImGui::Button("Close");
+    restart |= ImGui::IsWindowFocused() && ImGui::IsKeyPressed(ImGuiKey_Enter, false);
+    if (restart) {
+        termstart(g, s, cols, rows);
+        g->termfocus = 1;
+    } else if (close) {
+        termfree(g, tt);
+    }
+}
+
+// The Terminal pane's contents: the current session's terminal, its
+// grid filling the pane, which takes the keyboard once clicked.
+static void drawterm(Gui *g)
+{
+    Arena        a  = g->frame;
+    GuiSession  *s  = g->sess ? sessroot(g, g->sess) : 0;
+    TermTab     *tt = s ? s->term : 0;
+    ImGuiWindow *win = ImGui::GetCurrentWindow();
+    ImGuiID      id  = win->GetID("##grid");
+    g->termid      = id;
+    g->termfocused = 0;
+
+    TermMetrics m     = termmetrics(g);
+    ImVec2      avail = ImGui::GetContentRegionAvail();
+    i32         cols  = (i32)(avail.x / m.cw);
+    i32         rows  = (i32)(avail.y / m.ch);
+    cols = cols<2 ? 2 : cols;
+    rows = rows<1 ? 1 : rows;
+
+    Str why = termwhy(g, s);
+    if (!tt || tt->state==TT_NONE) {
+        if (why.len) {
+            ImGui::TextDisabled("%s", cstr0(&a, why));
+            return;
+        }
+        if (g->termfocus || ImGui::Button("Start a shell")) {
+            termstart(g, s, cols, rows);
+            tt = s->term;
+        } else {
+            ImGui::TextDisabled("Ctrl+` starts one, and comes back to it");
+            return;
+        }
+    }
+    if (tt->state==TT_ENDED || tt->state==TT_FAILED) {
+        termbanner(g, s, tt, a, cols, rows);
+        if (!tt->t || tt->state==TT_FAILED) {
+            return;
+        }
+        avail = ImGui::GetContentRegionAvail();
+    }
+
+    if (tt->pal != g->pal) {
+        termcolors(g, tt);  // the theme changed
+    }
+
+    // The grid, an item that takes the keyboard once clicked
+    ImVec2 pos = ImGui::GetCursorScreenPos();
+    pos = v2(termsnap(pos.x, m.density), termsnap(pos.y, m.density));
+    ImVec2 size = v2(avail.x>1 ? avail.x : 1, avail.y>1 ? avail.y : 1);
+    ImRect bb(pos, v2(pos.x + size.x, pos.y + size.y));
+    ImGui::ItemSize(size);
+    if (!ImGui::ItemAdd(bb, id)) {
+        return;
+    }
+    ImGuiContext &c       = *GImGui;
+    b32           hovered = ImGui::ItemHoverable(bb, id, 0);
+    if (hovered) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_TextInput);
+    }
+    if (g->termfocus || (hovered && ImGui::IsMouseClicked(0))) {
+        g->termfocus = 0;
+        ImGui::SetActiveID(id, win);
+        ImGui::SetFocusID(id, win);
+        ImGui::FocusWindow(win);
+        ImGui::SetActiveIdUsingAllKeyboardKeys();
+    } else if (c.ActiveId==id && ImGui::IsMouseClicked(0) && !hovered) {
+        ImGui::ClearActiveID();
+    }
+    b32 active = c.ActiveId==id && tt->state==TT_LIVE;
+    g->termfocused = c.ActiveId == id;
+
+    // A new size, once it settles
+    if (tt->state==TT_LIVE || tt->state==TT_OPENING) {
+        b32 differ = cols!=tt->cols || rows!=tt->rows;
+        if (!differ) {
+            tt->wantcols = 0;
+        } else if (cols!=tt->wantcols || rows!=tt->wantrows) {
+            tt->wantcols = cols;
+            tt->wantrows = rows;
+            tt->wantat   = g->sched.now;
+        }
+        if (tt->wantcols) {
+            i64 at = tt->wantat + TERMTAB_RESIZE;
+            if (g->sched.now >= at) {
+                b32 fits = cols<=tt->capcols && rows<=tt->caprows;
+                if (fits || termblock(g, tt, cols, rows)) {
+                    if (ariel_resize(tt->t, cols, rows, (i32)(m.cw*m.density),
+                                     (i32)(m.ch*m.density))) {
+                        tt->cols = cols;
+                        tt->rows = rows;
+                        if (tt->tid) {
+                            termsize(g, tt, cols, rows, m.cw*m.density, m.ch*m.density);
+                        }
+                    }
+                }
+                tt->wantcols = 0;
+            } else {
+                schedat(&g->sched, at, DUE_APP);
+            }
+        }
+    }
+
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    u32         bg = termimcolor(ariel_color(tt->t, ARIEL_C_BG));
+    dl->AddRectFilled(bb.Min, bb.Max, bg);
+    termcells(g, tt, &m, pos, active, a);
+
+    if (active) {
+        termkeys(g, tt, a);
+        c.ActiveIdAllowOverlap = !ImGui::GetIO().MouseDown[0];
+        ariel_Cursor cur = ariel_cursor(tt->t);
+        ImGuiPlatformImeData *ime = &c.PlatformImeData;
+        ime->WantVisible     = true;
+        ime->WantTextInput   = true;
+        ime->InputPos        = v2(pos.x + (f32)cur.x*m.cw, pos.y + (f32)cur.y*m.ch);
+        ime->InputLineHeight = m.ch;
+        ime->ViewportId      = win->Viewport->ID;
+    }
+}
+
+
+// For the checklist (--drive)
+
+// The shown session's terminal's screen as text, a line a row, else
+// empty.
+static Str termscreen(Gui *g, Arena *a)
+{
+    GuiSession *s  = g->sess ? sessroot(g, g->sess) : 0;
+    TermTab    *tt = s ? s->term : 0;
+    if (!tt || !tt->t) {
+        return {};
+    }
+    iz  len = ariel_dump(tt->t, 0, 0, 0);
+    u8 *buf = allocbytes(a, len);
+    ariel_dump(tt->t, 0, buf, len);
+    return {buf, len};
+}
+
+// Whether the terminal fills its pane, as last drawn, at the size the
+// engine was told, with no new size waiting.
+static b32 termsizecheck(Gui *g)
+{
+    GuiSession  *s  = g->sess ? sessroot(g, g->sess) : 0;
+    TermTab     *tt = s ? s->term : 0;
+    ImGuiWindow *w  = ImGui::FindWindowByName("Terminal");
+    if (!tt || !tt->t || !w || tt->state!=TT_LIVE) {
+        guilog(g, "drive: no live terminal shown");
+        return 0;
+    }
+    TermMetrics m    = termmetrics(g);
+    ariel_Modes mo   = ariel_modes(tt->t);
+    f32         cw   = w->ContentRegionRect.GetWidth();
+    f32         ch   = w->ContentRegionRect.GetHeight();
+    i32         cols = (i32)(cw / m.cw);
+    i32         rows = (i32)(ch / m.ch);
+    Arena       a    = g->frame;
+    Buf         b(&a, 128);
+    print(&b, "drive: the terminal is ");
+    print(&b, (i64)mo.cols);
+    print(&b, "x");
+    print(&b, (i64)mo.rows);
+    print(&b, ", its pane fits ");
+    print(&b, (i64)cols);
+    print(&b, "x");
+    print(&b, (i64)rows);
+    guilog(g, finish(&b));
+    return !tt->wantcols && mo.cols==tt->cols && mo.rows==tt->rows &&
+           cols-mo.cols<=1 && cols>=mo.cols && rows-mo.rows<=1 && rows>=mo.rows;
+}

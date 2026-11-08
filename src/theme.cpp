@@ -73,6 +73,11 @@ struct Palette {
     u32 amber;      // waiting, asking, stalled
     u32 active;     // running, streaming
     u32 stale;      // the metrics overlay's alarm
+    // The terminal's (term.cpp): its 16 colors, text, background, cursor
+    u32 ansi[16];
+    u32 termfg;
+    u32 termbg;
+    u32 termcursor;
 };
 
 static constexpr u32 rgb(i32 r, i32 g, i32 b)
@@ -130,6 +135,15 @@ static Palette themedark = {
     .amber     = rgb(235, 180,  80),
     .active    = rgb(110, 170, 240),
     .stale     = rgb(255, 102,  77),
+    .ansi = {
+        rgb( 40,  42,  46), rgb(205,  49,  49), rgb( 13, 188, 121), rgb(229, 229,  16),
+        rgb( 36, 114, 200), rgb(188,  63, 188), rgb( 17, 168, 205), rgb(204, 204, 204),
+        rgb(102, 102, 102), rgb(241,  76,  76), rgb( 35, 209, 139), rgb(245, 245,  67),
+        rgb( 59, 142, 234), rgb(214, 112, 214), rgb( 41, 184, 219), rgb(229, 229, 229),
+    },
+    .termfg     = rgb(222, 222, 222),
+    .termbg     = rgb( 15,  15,  16),
+    .termcursor = rgb(230, 230, 230),
 };
 
 static Palette themelight = {
@@ -182,6 +196,15 @@ static Palette themelight = {
     .amber     = rgb(125,  78,   0),
     .active    = rgb(  0,  80, 176),
     .stale     = rgb(180,  40,  20),
+    .ansi = {
+        rgb(  0,   0,   0), rgb(205,  49,  49), rgb(  0, 138,   0), rgb(128, 118,   0),
+        rgb(  4,  81, 165), rgb(188,   5, 188), rgb(  5, 132, 168), rgb( 85,  85,  85),
+        rgb(102, 102, 102), rgb(205,  49,  49), rgb( 20, 160,  20), rgb(150, 140,   0),
+        rgb(  4,  81, 165), rgb(188,   5, 188), rgb(  5, 152, 188), rgb(165, 165, 165),
+    },
+    .termfg     = rgb( 32,  33,  36),
+    .termbg     = rgb(255, 255, 255),
+    .termcursor = rgb( 32,  33,  36),
 };
 
 // The setting's value from its name, or -1 if it names none.

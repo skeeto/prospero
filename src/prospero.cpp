@@ -609,6 +609,10 @@ enum {
     GKEY_2,
     GKEY_COMMA,
     GKEY_S,
+    GKEY_GRAVE,  // ` (the Terminal pane's Ctrl+`)
+    GKEY_BACKSPACE,
+    GKEY_LEFT,
+    GKEY_D,
 };
 struct GuiEvent {
     i32 kind;

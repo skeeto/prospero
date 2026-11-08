@@ -13305,6 +13305,10 @@ static void applylayout(Gui *g, ImGuiID id, ImVec2 pos, ImVec2 size)
     for (i32 i = 0; i < PANE_COUNT; i++) {
         shown |= g->panes[i] ? 1u<<i : 0;
     }
+    // A terminal shown gets its home under the prompt; hidden, it floats
+    // until shown (dockwindows), so that its room stays the prompt's
+    g->termhome = !g->panes[PANE_TERMINAL] || !dockaddterm(l);
+    g->termhome = g->termhome && !(dockplaced(l)>>PANE_TERMINAL & 1);
     i32     at     = 0;
     ImGuiID center = id;
     applypart(l, &at, id, shown, &center, g->scale);
@@ -14001,6 +14005,7 @@ static b32 beginpane(Gui *g, i32 pane)
 
 static void dockwindows(Gui *g)
 {
+    termhotkeys(g);
     menukeys(g);
     drawmenubar(g);
     ImGuiViewportP *vp   = (ImGuiViewportP *)ImGui::GetMainViewport();
@@ -14224,6 +14229,31 @@ static void dockwindows(Gui *g)
     if (show[PANE_LOG]) {
         if (beginpane(g, PANE_LOG)) {
             drawlog(g);
+        }
+        ImGui::End();
+    }
+    g->termfocused = 0;
+    if (show[PANE_TERMINAL]) {
+        // Its first showing, or after a layout left it no home: under the
+        // prompt, as the layout with it applied the next frame
+        b32 known = saveddock("Terminal") || ImGui::FindWindowByName("Terminal") ||
+                    ImGui::FindWindowSettingsByID(ImHashStr("Terminal"));
+        if ((g->termhome || !known) && !g->layoutpending && !g->layoutnow) {
+            g->termhome = 0;
+            b32        ok = 0;
+            DockLayout l  = capturelayout(g, &ok);
+            if (ok && dockaddterm(&l)) {
+                l.name = g->layout.name;
+                l.keep = ~(u32)0;
+                picklayout(g, &l);
+                g->panefocus = PANE_TERMINAL + 1;
+            }
+        }
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, v2(4*g->scale, 4*g->scale));
+        b32 vis = beginpane(g, PANE_TERMINAL);
+        ImGui::PopStyleVar();
+        if (vis) {
+            drawterm(g);
         }
         ImGui::End();
     }

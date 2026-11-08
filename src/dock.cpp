@@ -60,6 +60,7 @@ enum : i32 {
     PANE_CHANGES,
     PANE_JOBS,
     PANE_LOG,
+    PANE_TERMINAL,
     PANE_HOSTS,
     PANE_SETTINGS,
     PANE_HELP,
@@ -70,15 +71,16 @@ static_assert(PANE_COUNT <= 32);  // as bits of a u32
 
 static char const *panenames[] = {
     "Sessions", "Transcript", "Prompt", "Todo", "Plan", "Changes", "Jobs", "Log",
-    "Hosts", "Settings", "Help", "Metrics",
+    "Terminal", "Hosts", "Settings", "Help", "Metrics",
 };
 static_assert(countof(panenames) == PANE_COUNT);
 
-// The panes hidden until asked for: the metrics, and the changes, which
-// a click on the session bar's branch shows (ui.cpp drawbranch).
+// The panes hidden until asked for: the metrics; the changes, which a
+// click on the session bar's branch shows (ui.cpp drawbranch); and the
+// terminal, which Ctrl+` shows.
 static b32 panehidden(i32 pane)
 {
-    return pane==PANE_METRICS || pane==PANE_CHANGES;
+    return pane==PANE_METRICS || pane==PANE_CHANGES || pane==PANE_TERMINAL;
 }
 
 #ifndef PROSPERO_DEVTOOLS
@@ -480,10 +482,12 @@ static Str docknamewhy(Str name)
 
 // A preset, as if read from the layout file. Help, Settings and Hosts
 // stay shown or hidden in Standard and Compact, whose side columns have
-// little room for them.
+// little room for them. No preset places the terminal, nor shows or
+// hides it: dockaddterm gives it a home under the prompt.
 static DockLayout dockpreset(i32 preset)
 {
-    u32        extras = 1u<<PANE_HELP | 1u<<PANE_SETTINGS | 1u<<PANE_HOSTS;
+    u32        term   = 1u << PANE_TERMINAL;
+    u32        extras = 1u<<PANE_HELP | 1u<<PANE_SETTINGS | 1u<<PANE_HOSTS | term;
     DockLayout l      = {};
     l.name = presetnames[preset];
     switch (preset) {
@@ -523,7 +527,64 @@ static DockLayout dockpreset(i32 preset)
                                "Help,Settings,Hosts");
         dockline(&l, "Tabs", "Prompt");
         dockline(&l, "TabBar", "Hidden");
+        l.keep = term;
         break;
     }
     return l;
+}
+
+// Give the terminal a home, if it has none, under the prompt and the
+// transcript over it: the split of those two, else the leaf holding the
+// prompt, else the center, goes over a new leaf for the terminal, which
+// takes TERM_SHARE of their height. Hidden, the terminal gives it all
+// back, as ImGui closes a split's empty side. Returns whether it changed
+// the layout.
+static f32 const TERM_SHARE = 0.4f;
+
+static b32 dockaddterm(DockLayout *l)
+{
+    if (dockplaced(l)>>PANE_TERMINAL & 1 || l->nparts+2 > DOCK_PARTS) {
+        return 0;
+    }
+    i32 at = -1;
+    for (i32 i = 0; i < l->nparts; i++) {
+        DockPart *p = l->parts + i;
+        for (i32 t = 0; t < p->ntabs; t++) {
+            at = p->tabs[t]==PANE_PROMPT ? i : at;
+        }
+    }
+    for (i32 i = 0; at<0 && i<l->nparts; i++) {
+        at = l->parts[i].central ? i : at;
+    }
+    if (at < 0) {
+        return 0;
+    }
+    for (i32 i = 0; i < at; i++) {
+        if (l->parts[i].kind==DOCK_Y && dockskip(l, i+1)==at) {
+            at = i;  // the split with the prompt its lower side
+            break;
+        }
+    }
+
+    // [at, end) becomes [at+1, end+1) under a split, the leaf after it
+    i32 end = dockskip(l, at);
+    for (i32 i = l->nparts-1; i >= end; i--) {
+        l->parts[i+2] = l->parts[i];
+    }
+    for (i32 i = end-1; i >= at; i--) {
+        l->parts[i+1] = l->parts[i];
+    }
+    l->nparts += 2;
+    DockPart *split = l->parts + at;
+    *split = {};
+    split->kind  = DOCK_Y;
+    split->share = 1 - TERM_SHARE;
+    split->front = -1;
+    DockPart *leaf = l->parts + end + 1;
+    *leaf = {};
+    leaf->kind  = DOCK_LEAF;
+    leaf->front = -1;
+    docktab(leaf, PANE_TERMINAL);
+    l->floats &= ~(1u << PANE_TERMINAL);
+    return 1;
 }

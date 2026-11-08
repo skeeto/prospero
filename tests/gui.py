@@ -1703,7 +1703,8 @@ def main():
                     choices=["drive", "idle", "streamtest", "e2e", "signals",
                              "settings", "enginestop", "bench", "background", "remote",
                              "compose", "sessions", "plan", "launch", "firstrun",
-                             "mcp", "hosttask", "changes", "thin", "containers"])
+                             "mcp", "hosttask", "changes", "thin", "containers",
+                             "terminal"])
     ap.add_argument("--ssh", help="with --mode remote: the remote host, over real ssh "
                                   "(default: this machine, through a fake ssh)")
     ap.add_argument("--remote-prospero", help="with --ssh: the harness built there")
@@ -1861,6 +1862,10 @@ def main():
     elif args.mode == "changes":
         gitrepo(work)
         before = config(curl, model)
+    elif args.mode == "terminal":
+        # A plain sh, with a known prompt, whatever the user's shell
+        before = config(curl, model) + "\n[terminal]\nshell = /bin/sh\n"
+        os.environ["PS1"] = "tty$ "
     elif args.mode == "drive" and not args.fake:
         before = config(curl, model, extra=m4config(curl, nonce))
         if not args.host:
@@ -2038,7 +2043,8 @@ def main():
         else:
             print(f"copilot: signed in by the device flow, polled {len(cp) - 1} times")
     if args.mode in ("drive", "e2e", "settings", "enginestop", "sessions", "plan",
-                     "firstrun", "mcp", "hosttask", "changes", "thin", "containers"):
+                     "firstrun", "mcp", "hosttask", "changes", "thin", "containers",
+                     "terminal"):
         summary = [l for l in lines if "drive:" in l and " checks, " in l]
         if not summary:
             problems.append("no checklist summary")
@@ -2081,6 +2087,19 @@ def main():
                          "settings-narrowest"):
                 if not os.path.exists(os.path.join(args.shots, name + ".png")):
                     problems.append(f"no {name}.png")
+    if args.mode == "terminal":
+        # The shell's HUP trap, as quitting hung it up
+        deadline = time.monotonic() + 5
+        while not os.path.exists(os.path.join(work, "hup.txt")) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        if not os.path.exists(os.path.join(work, "hup.txt")):
+            problems.append("quitting did not hang up the terminal's shell")
+        else:
+            print("terminal: quitting hung up the shell")
+    if args.mode == "terminal" and args.shots:
+        for name in ("terminal", "terminal-small", "terminal-vim", "terminal-ended"):
+            if not os.path.exists(os.path.join(args.shots, name + ".png")):
+                problems.append(f"no {name}.png")
     if args.mode == "changes" and args.shots:
         for name in ("changes-branch", "changes"):
             if not os.path.exists(os.path.join(args.shots, name + ".png")):

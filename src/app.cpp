@@ -576,6 +576,8 @@ struct QForm {
 };
 
 // A session the GUI knows: listed by the engine, or opened here.
+struct TermTab;
+
 struct GuiSession {
     GuiSession  *next;
     GuiHost     *host;      // where it runs
@@ -649,6 +651,7 @@ struct GuiSession {
     GuiSession  *toastsel;  // what a click on it selects, under it
     QForm       *qform;     // the answers to the agent's questions, null
                             // until it first asks
+    TermTab     *term;      // a root's terminal (term.cpp), null until one
 };
 
 // A command awaiting its reply.
@@ -1662,6 +1665,11 @@ struct Gui {
     b32                opendellayout;
     i32                dellayout;  // the layout to delete, +1
     b32                openmodal;
+    // The Terminal pane (term.cpp)
+    b32                termhome;     // it has no home in the dock space yet
+    b32                termfocus;    // focus the terminal when next drawn
+    b32                termfocused;  // it has the keyboard, as last drawn
+    ImGuiID            termid;       // its grid's item
 
     // Files and log
     Str                statedir;
@@ -5683,6 +5691,13 @@ static void setpane(Gui *, i32, b32);
 static void guiofferask(Gui *);
 static void onoffer(Gui *, Arena, Json *, b32);
 static void ontermenv(Gui *, Arena, Json *, b32);
+static void termopened(Gui *, GuiSession *, i64, Json *, b32, Str);
+static void termapply(Gui *, GuiHost *, Arena, EvRec *);
+static void termcloseall(Gui *);
+static void drawterm(Gui *);
+static void termhotkeys(Gui *);
+static Str  termscreen(Gui *, Arena *);
+static b32  termsizecheck(Gui *);
 
 static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
 {
@@ -5730,6 +5745,10 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
         guilist(g, h);
         guiskills(g, s);
     } return;
+
+    case CMD_TERMOPEN:
+        termopened(g, q.s, id, j, ok, err);
+        return;
 
     case CMD_SKILLS:
         if (q.s && q.s->skillsid==id) {
@@ -7178,6 +7197,11 @@ static b32 guiapply(Gui *g, GuiHost *h, Arena a, EvRec *r, Str line)
         return 1;
     case EV_RELIST:
         h->relist = 1;  // as a subagent's container's sessions, kept
+        return 1;
+    case EV_TERM:
+    case EV_TERMEND:
+    case EV_TERMBUSY:
+        termapply(g, h, a, r);
         return 1;
     case EV_OVERFLOW:
         if (!r->sid.len && h->kind==GH_ENGINE) {
@@ -10605,8 +10629,10 @@ static b32 gobackground(Gui *g)
             hc.toastsince = os_time(g->os);
         }
         // Commands to the engine go through the host from now on: the
-        // calls it makes for thin hosts end here
+        // calls it makes for thin hosts end here. The terminals hang up,
+        // having no window to show them.
         guirelaylostall(g, newarena(g->cmdr), "this computer's window closed");
+        termcloseall(g);
         Arena hp = newarena(os_reserve(g->os, (iz)1<<30));
         g->host  = hp.beg ? newhost(g->os, &hp, g->frame, &hc, &why) : 0;
         why      = g->host ? Str{} : why.len ? why : Str("out of memory");
@@ -10823,6 +10849,7 @@ static void zoomby(Gui *, i32);
 static void setpane(Gui *, i32, b32);
 
 #include "ui.cpp"
+#include "term.cpp"
 
 
 // The fake agent
@@ -13154,6 +13181,11 @@ enum : i32 {
     CHK_MENTIONSTATUS,// its one line, as drawn ("no files match")
     CHK_MENTIONSEL,   // its pick's path is text, from the path not the row
     CHK_MENTIONTAG,   // its pick was drawn marked attached (dx 1) or not (0)
+    CHK_TERMFOCUS,    // the terminal has the keyboard
+    CHK_TERMSCREEN,   // the terminal's screen has text
+    CHK_TERMSIZE,     // the terminal fills its pane, the engine told its size
+    CHK_TERMNONE,     // the session shown has no terminal
+    CHK_TERMQUIET,    // no frames while idle, the terminal shown
     CHK_COUNT,
 };
 
@@ -13435,6 +13467,9 @@ static Str chknames[] = {
     "the '@' picker's one line, as drawn",
     "the '@' picker's pick is the path it should be",
     "the '@' picker's pick says it is attached, or does not",
+    "the terminal has the keyboard", "the terminal shows the text",
+    "the terminal fills its pane", "the terminal is closed",
+    "no frames while idle, the terminal shown",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -13518,6 +13553,7 @@ enum : i32 {
     W_VIA,        // the session shown streams, relayed
     W_CTR,        // the container runtime, or the first container, is as
                   // text says (ctrwait)
+    W_TERM,       // the shown session's terminal shows text
 };
 
 static Str waitnames[] = {
@@ -13543,8 +13579,9 @@ static Str waitnames[] = {
     "the subagent on far", "the subagent on far shown", "a toast",
     "the changes", "the folder's probe", "the worktree's branch",
     "the thin remote", "a relayed stream", "the container",
+    "the terminal's text",
 };
-static_assert(countof(waitnames) == W_CTR+1);
+static_assert(countof(waitnames) == W_TERM+1);
 
 enum : i32 {
     KEY_CTRL  = 1,
@@ -17322,6 +17359,124 @@ static DriveOp planops[] = {
 // both, no frames while idle with it shown, a file made elsewhere listed
 // once the window has the focus back and not before, another click
 // hiding the pane.
+// Physical Ctrl and a key, pressed and let go
+#define CTRLKEY(key, ms) \
+    {OP_KEYDOWN, 0, GKEY_CTRL, KEY_CTRL, 50, ""}, \
+    {OP_KEYDOWN, 0, key, KEY_CTRL, 50, ""}, \
+    {OP_KEYUP, 0, key, KEY_CTRL, 50, ""}, \
+    {OP_KEYUP, 0, GKEY_CTRL, 0, ms, ""}
+#define TERMKEY(key, ms) \
+    {OP_KEYDOWN, 0, key, 0, 50, ""}, {OP_KEYUP, 0, key, 0, ms, ""}
+
+// The Terminal pane (--terminal), on [terminal] shell = /bin/sh with
+// PS1 "tty$ ": Ctrl+` shows it, starting a shell, typing and editing
+// reach it, Ctrl+C interrupts, a new window size reaches the shell, it
+// draws nothing while idle, Ctrl+` hides it and brings it back as it
+// was, vim edits and writes a file through a resize, less pages, exit
+// closes it, a failing exit leaves a banner to restart, and quitting
+// hangs the shell up.
+static DriveOp termops[] = {
+    {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
+    {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
+    {OP_MARK, 0, 0, 0, 1000, ""},
+    FIRSTRUN(0),
+    {OP_NEWSESSION, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_PANECLOSED, 0, 0, 0, "Terminal"},
+    CTRLKEY(GKEY_GRAVE, 500),
+    {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Terminal"},
+    {OP_WAIT, W_TERM, 0, 0, 10000, "tty$ "},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMSIZE, 0, 0, 0, ""},
+    // Typed, in pieces, with a mistake taken back
+    {OP_TEXT, 0, 0, 0, 100, "echo ab$((6*7))"},
+    {OP_TEXT, 0, 0, 0, 100, "X"},
+    TERMKEY(GKEY_BACKSPACE, 100),
+    {OP_TEXT, 0, 0, 0, 100, "cd"},
+    TERMKEY(GKEY_LEFT, 100),
+    {OP_TEXT, 0, 0, 0, 100, "-"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\nab42c-d"},
+    // Ctrl+C ends what runs; Ctrl+D at the prompt would end the shell
+    {OP_TEXT, 0, 0, 0, 100, "sleep 30"},
+    TERMKEY(GKEY_ENTER, 500),
+    CTRLKEY(GKEY_C, 300),
+    {OP_TEXT, 0, 0, 0, 100, "echo after"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\nafter"},
+    {OP_SHOT, 0, 0, 0, 300, "terminal"},
+    // A new size, which the shell hears of
+    {OP_RESIZE, 0, 1100, 700, 1000, ""},
+    {OP_CHECK, CHK_TERMSIZE, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "terminal-small"},
+    {OP_TEXT, 0, 0, 0, 100, "echo cols=$(tput cols)"},
+    TERMKEY(GKEY_ENTER, 300),
+    {OP_CHECK, CHK_TERMSIZE, 0, 0, 0, ""},
+    {OP_RESIZE, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_TERMSIZE, 0, 0, 0, ""},
+    // Quiet once its output stops
+    {OP_MOVE, T_EMPTY, 0, 0, 1000, ""},  // its tooltip's timers run out
+    {OP_MARK, 0, 0, 0, 3000, ""},
+    {OP_CHECK, CHK_TERMQUIET, 0, 0, 0, ""},
+    // Hidden from the terminal, then back as it was, with the keyboard
+    CTRLKEY(GKEY_GRAVE, 500),
+    {OP_CHECK, CHK_PANECLOSED, 0, 0, 0, "Terminal"},
+    CTRLKEY(GKEY_GRAVE, 500),
+    {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Terminal"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMSCREEN, 0, 0, 0, "\nafter"},
+    // vim: an edit, resized mid-edit, written and quit
+    {OP_TEXT, 0, 0, 0, 100, "vim -u NONE -N notes.txt"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\"notes.txt\""},
+    {OP_TEXT, 0, 0, 0, 100, "ihello vim"},
+    TERMKEY(GKEY_ESCAPE, 300),
+    {OP_RESIZE, 0, 1100, 700, 1000, ""},
+    {OP_CHECK, CHK_TERMSIZE, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMSCREEN, 0, 0, 0, "hello vim"},
+    {OP_SHOT, 0, 0, 0, 300, "terminal-vim"},
+    {OP_RESIZE, 0, 0, 0, 1000, ""},
+    {OP_TEXT, 0, 0, 0, 100, ":w"},
+    TERMKEY(GKEY_ENTER, 300),
+    {OP_TEXT, 0, 0, 0, 100, ":q"},
+    TERMKEY(GKEY_ENTER, 300),
+    {OP_WAIT, W_FILE, 0, 0, 5000, "notes.txt"},
+    {OP_TEXT, 0, 0, 0, 100, "cat notes.txt"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\nhello vim\n"},
+    // less: paged, to the end, and quit back to the shell's screen
+    {OP_TEXT, 0, 0, 0, 100, "seq 1 500 | less"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\n10\n"},
+    {OP_TEXT, 0, 0, 0, 300, "G"},
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\n500\n"},
+    {OP_TEXT, 0, 0, 0, 300, "q"},
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\nhello vim\n"},
+    // exit closes it; a failing exit leaves its screen under a banner,
+    // and Enter starts another shell
+    {OP_TEXT, 0, 0, 0, 100, "exit"},
+    TERMKEY(GKEY_ENTER, 1000),
+    {OP_CHECK, CHK_TERMNONE, 0, 0, 0, ""},
+    CTRLKEY(GKEY_GRAVE, 500),
+    {OP_WAIT, W_TERM, 0, 0, 10000, "tty$ "},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 100, "exit 3"},
+    TERMKEY(GKEY_ENTER, 1000),
+    {OP_SHOT, 0, 0, 0, 300, "terminal-ended"},
+    {OP_CHECK, CHK_TERMSCREEN, 0, 0, 0, "exit 3"},
+    TERMKEY(GKEY_ENTER, 500),
+    {OP_WAIT, W_TERM, 0, 0, 10000, "tty$ "},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 100, "echo fresh"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\nfresh"},
+    // Quitting hangs up the shell, whose trap leaves a file (gui.py)
+    {OP_TEXT, 0, 0, 0, 100, "trap 'echo hup >hup.txt; exit' HUP"},
+    TERMKEY(GKEY_ENTER, 300),
+    {OP_SUMMARY, 0, 0, 0, 0, ""},
+    {OP_QUIT, 0, 0, 0, 0, ""},
+};
+
 static DriveOp changesops[] = {
     {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
     {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
@@ -18859,7 +19014,7 @@ static b32 focuscheck(Gui *g)
     DockPlace places[PANE_COUNT];
     i32 len = 0;
     for (i32 i = 0; i < PANE_COUNT; i++) {
-        if (i != PANE_METRICS) {
+        if (i!=PANE_METRICS && i!=PANE_TERMINAL) {
             places[len++] = {i, i==PANE_PROMPT ? bottom : top};
         }
     }
@@ -19298,6 +19453,10 @@ static b32 drivewaitdone(Gui *g)
     }
     case W_CTR:
         return ctrwait(g, g->ops[g->drivepc-1].text);
+    case W_TERM: {
+        Arena a = g->frame;
+        return find(termscreen(g, &a), g->ops[g->drivepc-1].text) >= 0;
+    }
     case W_VIA:
         return g->sess && v->state==LIVE_STREAMING && v->relaylen>0 && v->deltas>0;
     case W_PLAN: {
@@ -21044,6 +21203,25 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_GITQUIET:
         return g->changesshown && drivequiet(g, "idle with the changes shown", 2);
+    case CHK_TERMFOCUS:
+        return g->termfocused && GImGui->ActiveId==g->termid;
+    case CHK_TERMSCREEN: {
+        Arena a      = g->frame;
+        Str   screen = termscreen(g, &a);
+        b32   ok     = find(screen, g->ops[g->drivepc-1].text) >= 0;
+        if (!ok) {
+            guilog(g, concat(&a, "drive: the terminal shows:\n", screen));
+        }
+        return ok;
+    }
+    case CHK_TERMSIZE:
+        return termsizecheck(g);
+    case CHK_TERMNONE: {
+        GuiSession *s = g->sess ? sessroot(g, g->sess) : 0;
+        return s && (!s->term || s->term->state==TT_NONE);
+    }
+    case CHK_TERMQUIET:
+        return g->panes[PANE_TERMINAL] && drivequiet(g, "idle with the terminal shown", 2);
     case CHK_PLANTEXT:
         return tabselected("Plan") && g->planshown>0 && g->plan.doc &&
                find(g->plan.doc->v->msgs[0].text, g->ops[g->drivepc-1].text)>=0;
@@ -22577,6 +22755,7 @@ static Str guiusage =
 "                 Plan window, the toggle and /plan\n"
 "  --changes      the branch on the session bar and the Changes pane, in a\n"
 "                 --cwd that is a git repository\n"
+"  --terminal     the Terminal pane: Ctrl+`, typing, a resize, exit\n"
 "  --mcp          an MCP server's page in Settings: its state, Sign in\n"
 "                 (a stand-in browser), a call from a session, Sign out\n"
 "  --hosttask     subagents on another host: opened and answered here, a\n"
@@ -22776,6 +22955,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     b32 subprocess = 0, fake = 0, e2e = 0, settings = 0, enginestop = 0;
     b32 background = 0, attach = 0, remote = 0, compose = 0, sidebar = 0, plan = 0;
     b32 launch = 0, first = 0, mcp = 0, hosttask = 0, changes = 0, thin = 0;
+    b32 terminal = 0;
     b32 containers = 0;
     i64 history = 0;
     Str opendir = {};  // prospero DIR, as given
@@ -22821,6 +23001,8 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
             plan = probe = 1;
         } else if (a == "--changes") {
             changes = probe = 1;
+        } else if (a == "--terminal") {
+            terminal = probe = 1;
         } else if (a == "--mcp") {
             mcp = probe = 1;
         } else if (a == "--hosttask") {
@@ -22903,9 +23085,12 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->enginekind = fake ? ENGINE_FAKE : subprocess ? ENGINE_SUBPROCESS : ENGINE_INPROC;
     if (drive || idle || streamtest || e2e || settings || enginestop ||
             background || attach || remote || compose || sidebar || plan || launch ||
-            first || mcp || hosttask || changes || thin || containers) {
+            first || mcp || hosttask || changes || thin || containers || terminal) {
         g->drive = 1;
-        if (containers) {
+        if (terminal) {
+            g->ops  = termops;
+            g->nops = countof(termops);
+        } else if (containers) {
             g->ops  = ctrops;
             g->nops = countof(ctrops);
         } else if (thin) {
