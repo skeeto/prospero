@@ -1650,6 +1650,55 @@ static WebHits webexa(Arena *perm, Str body, i32 max)
     return r;
 }
 
+// The request for Keenable's search, keyless or keyed.
+static Str webkeenablebody(Arena *perm, Str query, i32 max)
+{
+    Buf     b(perm, query.len + 64);
+    JsonOut w = {&b};
+    putobject(&w);
+    putstrkey(&w, "query", query);
+    putintkey(&w, "max_results", max);
+    putend(&w);
+    return finish(&b);
+}
+
+// Hits from Keenable's JSON reply. A hit's excerpt is its snippet, or
+// its description without one.
+static WebHits webkeenable(Arena *perm, Str body, i32 max)
+{
+    WebHits r       = {};
+    JsonDoc d       = jsonparse(perm, body);
+    Json   *results = jsonget(d.root, "results");
+    if (results->type != JSON_ARRAY) {
+        r.err = "Keenable sent no JSON results";
+        return r;
+    }
+    for (Json *e = results->child; e; e = e->next) {
+        Str excerpt = jsonstr(jsonget(e, "snippet"));
+        if (!trim(excerpt).len) {
+            excerpt = jsonstr(jsonget(e, "description"));
+        }
+        webaddhit(perm, &r, max,
+            jsonstr(jsonget(e, "url")),
+            jsonstr(jsonget(e, "title")),
+            jsonstr(jsonget(e, "published_at")),
+            excerpt);
+    }
+    return r;
+}
+
+// Why Keenable refused a request, from its error body: its message, or
+// its error without one. Null if the body says neither.
+static Str webkeenableerr(Arena *perm, Str body)
+{
+    JsonDoc d   = jsonparse(perm, body);
+    Str     why = jsonstr(jsonget(d.root, "message"));
+    if (!trim(why).len) {
+        why = jsonstr(jsonget(d.root, "error"));
+    }
+    return webline(perm, why, WEB_ERRMAX, 0);
+}
+
 // A non-streaming Messages request that has a model search the web, with
 // the content blocks of its paused reply, if any, to continue it.
 static Str webanthropicbody(Arena *perm, Str model, Str query, Str date, Str blocks)

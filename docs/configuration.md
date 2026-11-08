@@ -344,7 +344,8 @@ absolute. Neither is offered until `[web]` turns it on:
 
 `search` is `searxng` (your own instance, with `json` in its
 `search.formats`), `exa` (Exa's keyless MCP endpoint, or with `key`),
-or `anthropic` (a side request to an Anthropic model with Anthropic's
+`keenable` (Keenable's keyless search API, or with `key`), or
+`anthropic` (a side request to an Anthropic model with Anthropic's
 web search tool: `model = ENDPOINT/MODEL`, by default
 `claude-haiku-5-5` on the first endpoint of kind `anthropic`).
 `fetch = no` leaves out `web_fetch`, `results` caps a search's

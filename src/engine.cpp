@@ -7760,9 +7760,11 @@ static Str deskdenial(Arena *a, i32 by, Str note, i64 wait)
 // whole call has a deadline. What comes back is framed as web content
 // between lines marked by a nonce that the pages cannot know.
 
-enum : i32 { WEBS_NONE, WEBS_SEARXNG, WEBS_EXA, WEBS_ANTHROPIC, WEBS_RELAY };
+enum : i32 {
+    WEBS_NONE, WEBS_SEARXNG, WEBS_EXA, WEBS_KEENABLE, WEBS_ANTHROPIC, WEBS_RELAY
+};
 static Str const webservices[] = {
-    "none", "SearXNG", "Exa", "Anthropic", "a connected computer"
+    "none", "SearXNG", "Exa", "Keenable", "Anthropic", "a connected computer"
 };
 
 enum : i64 {
@@ -7782,6 +7784,7 @@ static i32 websearchservice(Engine *e)
     b32       unset = !x || !trim(x->value).len;
     return v=="searxng"   ? WEBS_SEARXNG   :
            v=="exa"       ? WEBS_EXA       :
+           v=="keenable"  ? WEBS_KEENABLE  :
            v=="anthropic" ? WEBS_ANTHROPIC :
            unset && e->cfg->thin && relaysearches(e) ? WEBS_RELAY : WEBS_NONE;
 }
@@ -8135,6 +8138,24 @@ static Str websend(Engine *e, WebRun *w, Arena scratch)
         print(&h, "Content-Type: application/json\r\n"
                   "Accept: application/json, text/event-stream\r\n"
                   "User-Agent: prospero/" PROSPERO_VERSION "\r\n");
+    } else if (w->service == WEBS_KEENABLE) {
+        // Keyless at /public, which asks for the app's name; keyed with
+        // the key in a header, so never in the URL
+        Str key = cfgsecret(e->cfg, &scratch, "web", "", "key");
+        r.method = "POST";
+        r.url    = webtesturl(e, &scratch, key.len
+                       ? Str("https://api.keenable.ai/v1/search")
+                       : Str("https://api.keenable.ai/v1/search/public"));
+        r.body   = webkeenablebody(&scratch, w->query, (i32)webint(e, "results", 8, 1, 20));
+        print(&h, "Content-Type: application/json\r\n"
+                  "Accept: application/json\r\n"
+                  "X-Keenable-Title: prospero\r\n"
+                  "User-Agent: prospero/" PROSPERO_VERSION "\r\n");
+        if (key.len) {
+            print(&h, "X-API-Key: ");
+            print(&h, key);
+            print(&h, "\r\n");
+        }
     } else if (w->service == WEBS_RELAY) {
         Buf     q(&scratch, 64 + 2*w->query.len);
         JsonOut j = {&q};
@@ -8581,7 +8602,9 @@ static void websearched(Engine *e, WebRun *w, Arena scratch)
         print(&b, " answered HTTP ");
         print(&b, (i64)st);
         Str body = {w->body.data, w->body.len};
-        Str why  = w->service==WEBS_ANTHROPIC ? webanthropic(&scratch, body, 1).err : Str{};
+        Str why  = w->service==WEBS_ANTHROPIC ? webanthropic(&scratch, body, 1).err :
+                   w->service==WEBS_KEENABLE  ? webkeenableerr(&scratch, body)     :
+                   Str{};
         if (why.len) {
             print(&b, ": ");
             print(&b, why);
@@ -8607,9 +8630,10 @@ static void websearched(Engine *e, WebRun *w, Arena scratch)
     }
     WebHits h = {};
     switch (w->service) {
-    case WEBS_SEARXNG: h = websearxng(&scratch, body, max);   break;
-    case WEBS_EXA:     h = webexa(&scratch, body, max);       break;
-    default:           h = webanthropic(&scratch, body, max); break;
+    case WEBS_SEARXNG:  h = websearxng(&scratch, body, max);   break;
+    case WEBS_EXA:      h = webexa(&scratch, body, max);       break;
+    case WEBS_KEENABLE: h = webkeenable(&scratch, body, max);  break;
+    default:            h = webanthropic(&scratch, body, max); break;
     }
     if (!h.err.len && w->service==WEBS_ANTHROPIC) {
         webmerge(&w->arena, &w->acc, webhitsclone(&w->arena, h), max);

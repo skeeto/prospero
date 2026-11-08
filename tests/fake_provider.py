@@ -5246,6 +5246,18 @@ def sc_web_exa(model, n, req):
         "Done."])
 
 
+def sc_web_keenable(model, n, req):
+    yield from web_steps(model, n, req, [
+        web_search("widgets"),
+        web_search("busy"),
+        web_search("refused"),
+        web_fetch("https://forum.example.org/{nonce}/next"),
+        "Done."])
+
+
+sc_web_keenable_key = sc_web_keenable
+
+
 def sc_web_anthropic(model, n, req):
     yield from web_steps(model, n, req, [
         web_search("widgets"),
@@ -6045,7 +6057,8 @@ class Handler(BaseHTTPRequestHandler):
 
     # The web tools: pages at /web/HOST/NONCE/NAME, where
     # PROSPERO_TEST_WEB sends https://HOST/..., Exa's endpoint at
-    # /web/mcp.exa.ai/mcp, and SearXNG at /searxng/search
+    # /web/mcp.exa.ai/mcp, Keenable's at /web/api.keenable.ai/v1/search
+    # and .../search/public, and SearXNG at /searxng/search
 
     def send_bytes(self, status, ctype, data, headers=None):
         self.send_response(status)
@@ -6069,6 +6082,9 @@ class Handler(BaseHTTPRequestHandler):
             self.searxng(q.get("q", [""])[0], q)
         elif url.path == "/web/mcp.exa.ai/mcp":
             self.exa(raw)
+        elif url.path in ("/web/api.keenable.ai/v1/search",
+                          "/web/api.keenable.ai/v1/search/public"):
+            self.keenable(url.path, raw)
         else:
             self.webpage(url.path)
 
@@ -6112,6 +6128,46 @@ class Handler(BaseHTTPRequestHandler):
             self.send_bytes(200, "text/event-stream", data)
         else:
             self.send_json(200, reply)
+
+    def keenable(self, path, raw):
+        # Keyless needs X-Keenable-Title, keyed an X-API-Key; a "busy"
+        # query is refused the first time, a "refused" one always
+        try:
+            body = json.loads(raw)
+            query = body["query"]
+        except (ValueError, KeyError, TypeError):
+            self.send_json(400, {"error": "Bad request", "message": "query is required"})
+            return
+        if path.endswith("/public") and not self.headers.get("X-Keenable-Title"):
+            self.send_json(400, {"error": "Missing app identifier",
+                                 "message": "X-Keenable-Title header is required "
+                                            "for token-less requests"})
+            return
+        if not path.endswith("/public") and not self.headers.get("X-API-Key"):
+            self.send_json(401, {"error": "Authentication failed",
+                                 "message": "Missing API key"})
+            return
+        words = query.split()
+        nonce = words[-1] if words else ""
+        with STATE.lock:
+            tries = sum(1 for w in STATE.web if w["body"] == raw.decode("utf-8", "replace"))
+        if "refused" in words:
+            self.send_json(403, {"error": "Forbidden", "message": "Query blocked\nby policy"})
+            return
+        if "busy" in words and tries == 1:
+            self.send_json(429, {"error": "Too many requests",
+                                 "message": "Rate limit exceeded"})
+            return
+        n = int(body.get("max_results", 10))
+        results = [
+            {"title": "Widget docs", "url": f"https://docs.example.com/{nonce}/page",
+             "description": "", "snippet": "Widgets turn at **42 rpm**.\n\nMore.",
+             "published_at": "2026-10-20T00:00:00Z", "acquired_at": "2026-11-01T00:00:00Z"},
+            {"title": "Widget forum", "url": f"https://forum.example.org/{nonce}/next",
+             "description": "Someone asked about widgets.", "snippet": "",
+             "published_at": None, "acquired_at": "2026-11-01T00:00:00Z"},
+        ]
+        self.send_json(200, {"query": query, "mode": "pro", "results": results[:n]})
 
     WEB_HTML = (
         "<!doctype html><html><head><title>Widget &amp; docs</title>"

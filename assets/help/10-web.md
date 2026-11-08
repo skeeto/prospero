@@ -16,6 +16,8 @@ it on.
   uses.
 - `exa`: Exa's search service, which needs no account; `key` adds an
   Exa key for more searches.
+- `keenable`: Keenable's search service, which also needs no account;
+  `key` adds a Keenable key for more searches.
 - `anthropic`: a request to an Anthropic model with Anthropic's own
   web search tool. `model`, as `ENDPOINT/MODEL`, names an endpoint of
   kind `anthropic` and a model there; by default, the first such

@@ -557,16 +557,17 @@ static CfgKey cfgschema[] = {
     {"desktop", "ask_timeout", CFG_SECONDS, "60", {}, {}, "desktop",
      "Seconds to wait for an answer to a desktop action, then deny"},
 
-    {"web", "search", CFG_ENUM, "none", {}, "none searxng exa anthropic", "web",
+    {"web", "search", CFG_ENUM, "none", {}, "none searxng exa keenable anthropic", "web",
      "The service web_search uses: none (no web_search), searxng (an "
-     "instance at url), exa (Exa's MCP endpoint, which needs no key) or "
+     "instance at url), exa (Exa's MCP endpoint, which needs no key), "
+     "keenable (Keenable's search API, which needs no key) or "
      "anthropic (a model of an anthropic endpoint searches, as model says)"},
     {"web", "url", CFG_URL, "", {}, {}, "web",
      "For searxng: the instance's URL, with json among the formats in its "
      "settings.yml (search: formats)"},
     {"web", "key", CFG_SECRET, "", {}, {}, "web",
-     "For exa: an API key, as env:NAME or file:PATH, for more searches "
-     "than Exa allows without one"},
+     "For exa or keenable: an API key, as env:NAME or file:PATH, for "
+     "more searches than the service allows without one"},
     {"web", "model", CFG_STRING, "", {}, {}, "web",
      "For anthropic: the model that searches, ENDPOINT/MODEL at an "
      "endpoint of kind anthropic, by default claude-haiku-5-5 at the "

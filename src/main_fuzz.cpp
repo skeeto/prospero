@@ -733,6 +733,7 @@ static void fuzzweb(Arena a, Str src)
         WebHits hits[] = {
             websearxng(&t, src, 5),
             webexa(&t, src, 5),
+            webkeenable(&t, src, 5),
             webanthropic(&t, src, 5),
         };
         WebHits acc = {};

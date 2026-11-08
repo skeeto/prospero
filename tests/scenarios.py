@@ -12592,6 +12592,57 @@ def web_exa(t):
             "the key in no record")
 
 
+def web_keenable_check(t, r):
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    ends = r.all("tool.end")
+    t.check([e["status"] for e in ends] == ["ok", "ok", "error", "ok"],
+            f"statuses {[(e['status'], e['text'][:80]) for e in ends]}")
+    t.check(f"https://forum.example.org/{t.nonce}/next" in ends[0]["text"] and
+            "42 rpm" in ends[0]["text"] and "asked about widgets" in ends[0]["text"] and
+            "from Keenable" in ends[0]["text"], f"results {ends[0]['text']}")
+    t.check("Widget docs" in ends[1]["text"], f"retried {ends[1]['text']}")
+    t.check("HTTP 403: Query blocked by policy" in ends[2]["text"],
+            f"refused {ends[2]['text']}")
+    reqs = webreqs(t, "/search") + webreqs(t, "/search/public")
+    busy = [w for w in reqs if "busy" in w["body"]]
+    t.check(len(busy) == 2, f"the 429 retried once: {len(busy)}")
+    t.check(all(w["method"] == "POST" and
+                w["headers"].get("X-Keenable-Title") == "prospero" and
+                json.loads(w["body"])["max_results"] == 8 for w in reqs),
+            f"the requests {[(w['path'], w['headers'], w['body']) for w in reqs]}")
+    return reqs
+
+
+@scenario(bound=15)
+def web_keenable(t):
+    """Keenable without a key: its public endpoint, named by the title
+    header, a 429 retried once, and a refusal's message reported."""
+    webconf(t, search="keenable", url=None, ask="false")
+    r = t.run(env=webenv(t))
+    reqs = web_keenable_check(t, r)
+    t.check(len(reqs) == 4 and all(w["path"].endswith("/search/public") and
+                                   "X-API-Key" not in w["headers"] for w in reqs),
+            f"keyless {[(w['path'], w['headers']) for w in reqs]}")
+
+
+@scenario(bound=15)
+def web_keenable_key(t):
+    """Keenable with [web] key: the keyed endpoint, the key in a header,
+    never in the URL, and in no record the harness writes."""
+    key = "keen-key-71c0aa"
+    webconf(t, search="keenable", url=None, key="env:KEENABLE_TEST_KEY", ask="false")
+    r = t.run(env=webenv(t, KEENABLE_TEST_KEY=key))
+    reqs = web_keenable_check(t, r)
+    t.check(len(reqs) == 4 and all(w["path"].endswith("/v1/search") and
+                                   w["headers"].get("X-API-Key") == key and
+                                   key not in w["path"] + w["query"] for w in reqs),
+            f"keyed {[(w['path'], w['headers']) for w in reqs]}")
+    sid, _ = r.sessions()
+    events = t.host.read(t.host.join(t.state, "sessions", sid, "events.jsonl")) or ""
+    t.check(key not in json.dumps(r.events) and key not in r.stderr and key not in events,
+            "the key in no record")
+
+
 AN_WEB = "[endpoint an]\nurl = {url}\nkind = anthropic\nkey = env:PROSPERO_TEST_KEY\n"
 
 
