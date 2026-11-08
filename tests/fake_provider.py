@@ -3909,9 +3909,14 @@ def an_check_reasoning(req, i, k, b):
     return None
 
 
+def an_pdf_pages(data):
+    """A PDF's pages as the fake counts them: its /Type /Page objects."""
+    return len(re.findall(rb"/Type\s*/Page(?![A-Za-z])", data))
+
+
 def an_check_result(where, content):
     """Why a tool_result's content is not what the API takes: a string,
-    or a list of text and image blocks."""
+    or a list of text, image and document (a base64 PDF) blocks."""
     if content is None or isinstance(content, str):
         return None
     if not isinstance(content, list):
@@ -3927,6 +3932,19 @@ def an_check_result(where, content):
                     src.get("media_type") not in ("image/png", "image/jpeg",
                                                   "image/gif", "image/webp")):
                 return f"{at}.source: an image needs base64 data and a media type"
+        elif c.get("type") == "document":
+            src = c.get("source", {})
+            try:
+                data = base64.b64decode(src.get("data", ""), validate=True)
+            except ValueError:
+                data = b""
+            if (src.get("type") != "base64" or src.get("media_type") != "application/pdf" or
+                    not data.startswith(b"%PDF-")):
+                return f"{at}.source: a document needs a base64 PDF"
+            if b"/Encrypt" in data:
+                return f"{at}: The PDF specified is password protected."
+            if b"garbage" in data:  # damaged, as the real API finds one
+                return f"{at}.pdf.source.base64.data: The PDF specified was not valid."
         else:
             return f"{at}: unexpected block type {c.get('type')} in a tool result"
     return None
@@ -3962,6 +3980,14 @@ def an_check(req, prefill=False):
     msgs = req.get("messages")
     if not isinstance(msgs, list) or not msgs:
         return "messages: at least one message is required"
+    pages = sum(an_pdf_pages(base64.b64decode(c["source"]["data"]))
+                for m in msgs if isinstance(m.get("content"), list)
+                for b in m["content"] if b.get("type") == "tool_result"
+                and isinstance(b.get("content"), list)
+                for c in b["content"] if c.get("type") == "document"
+                and isinstance(c.get("source", {}).get("data"), str))
+    if pages > 100:
+        return "A maximum of 100 PDF pages may be provided."
     for i, m in enumerate(msgs):
         role = m.get("role")
         if role != ("user" if i % 2 == 0 else "assistant"):
@@ -4375,6 +4401,41 @@ def sc_an_desktop(model, n, req):
         yield from an_call(model, req, n, "desktop", {"action": "click", "x": 2, "y": 3})
     else:
         yield from an_answer(model, req, "Clicked it.")
+
+
+def sc_an_read_pdf(model, n, req):
+    # Each PDF in turn, then an answer; a resumed run's "again" at once
+    files = ["three.pdf", "two.pdf", "locked.pdf", "long.pdf"]
+    k = len([m for m in req.get("messages", []) if m.get("role") == "assistant"])
+    if last_user_text(req) == "again" or k >= len(files):
+        yield from an_answer(model, req, "Read them.")
+    else:
+        yield from an_call(model, req, n, "read", {"path": files[k]})
+
+
+def sc_an_read_pdf_room(model, n, req):
+    # Two PDFs of 30 pages: a request has room for one
+    files = ["thirty.pdf", "thirty2.pdf"]
+    k = len([m for m in req.get("messages", []) if m.get("role") == "assistant"])
+    if k < len(files):
+        yield from an_call(model, req, n, "read", {"path": files[k]})
+    else:
+        yield from an_answer(model, req, "Read both.")
+
+
+def sc_an_read_pdf_bad(model, n, req):
+    k = len([m for m in req.get("messages", []) if m.get("role") == "assistant"])
+    if k == 0:
+        yield from an_call(model, req, n, "read", {"path": "broken.pdf"})
+    else:
+        yield from an_answer(model, req, "It was damaged.")
+
+
+def sc_read_pdf_unsent(model, n, req):
+    if step(req) == 0:
+        yield from tool(model, n, "read", {"path": "three.pdf"})
+    else:
+        yield from answer(model, "Read it.")
 
 
 def sc_an_desktop_cache(model, n, req):

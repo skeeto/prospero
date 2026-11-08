@@ -730,6 +730,7 @@ struct Session {
     i32          callimgw;   // to dir, and its size, and a screenshot's
     i32          callimgh;   // geometry (deskshotstr), for tool.end
     Str          callshot;
+    i32          callpages;  // callimage is a PDF read, of so many pages
     DeskRun      desk;       // the desktop helper
     WebRun      *web;        // the web call running, if one is
     Proc        *proc;
@@ -2921,6 +2922,8 @@ static b32 unbind(Session *s)
     return any;
 }
 
+static b32 refusepdf(Session *, Str);
+
 // Fail the current attempt. Transient failures back off and retry while
 // nothing visible has streamed, and otherwise commit what streamed and
 // ask the agent to continue. Once quick retries are spent, fallbacks and
@@ -2970,6 +2973,15 @@ static void fail(Session *s, Arena scratch, i32 cls, i32 status, Str msg, i64 re
     b32      visible = p && committed(p);
     s->part = 0;
 
+    if (cls==CLASS_DETERMINISTIC && reqep(s)->wire==EP_ANTHROPIC &&
+            contains(msg, "PDF") && refusepdf(s, msg)) {
+        // A PDF read that the API takes for one but refuses (damaged),
+        // which every request after would carry: the newest left out,
+        // which is the one this request added, and the step goes again
+        retryevent(s, scratch, RETRY_QUICK, cls, status, 0, msg);
+        request(s, scratch);
+        return;
+    }
     if (cls==CLASS_DETERMINISTIC && reqep(s)->wire==EP_ANTHROPIC &&
             contains(msg, "signature") && contains(msg, "thinking") &&
             unbind(s)) {
@@ -3613,7 +3625,10 @@ static void toolend(Session *s, Arena scratch, Str status, Str text,
         putintkey(&w.json, "hop", s->msghop);
     }
     puturls(&w.json, s->callurls);  // a task's report's (webvouch)
-    if (s->callimage.len) {
+    if (s->callimage.len && s->callpages) {
+        putstrkey(&w.json, "pdf", s->callimage);  // not an image to draw
+        putintkey(&w.json, "pages", s->callpages);
+    } else if (s->callimage.len) {
         putstrkey(&w.json, "image", s->callimage);
         putintkey(&w.json, "width", s->callimgw);
         putintkey(&w.json, "height", s->callimgh);
@@ -3634,10 +3649,12 @@ static void toolend(Session *s, Arena scratch, Str status, Str text,
     m.imgw   = s->callimgw;
     m.imgh   = s->callimgh;
     m.imgread = s->callimage.len && !s->callshot.len;
+    m.pages   = s->callpages;
     addmsg(s, m);
     webnotetool(s, scratch, c->name, status, text, s->callurls);
     s->callimage = {};
     s->callshot  = {};
+    s->callpages = 0;
     s->msgto     = {};
     s->msgtitle  = {};
     s->msghow    = {};
@@ -5046,6 +5063,7 @@ static void runpatch(Session *s, Arena scratch, Args *args, Str allowed)
 }
 
 static b32 readimage(Session *, Arena, Str);
+static b32 readpdf(Session *, Arena, Str);
 
 // A path tool on a path the guard allowed, or the user did. Returns 1
 // if the call finished, 0 if it goes on (a search).
@@ -5077,7 +5095,7 @@ static b32 runfile(Session *s, Arena scratch, i32 tool, Str path, Args *args)
     }
     if (tool==TOOL_WRITE || tool==TOOL_EDIT) {
         pre = snapbefore(s, scratch, path);
-    } else if (tool==TOOL_READ && readimage(s, scratch, path)) {
+    } else if (tool==TOOL_READ && (readimage(s, scratch, path) || readpdf(s, scratch, path))) {
         return 1;
     }
     switch (tool) {
@@ -6730,6 +6748,37 @@ static DeskLimits desklimits(Session *s)
     return r;
 }
 
+// Whether read sends a PDF, and a request carries one, as a document:
+// to a model on an endpoint of kind anthropic, unless [model] pdf is off.
+static b32 pdfon(Session *s)
+{
+    return s->ep.kind==EP_ANTHROPIC && !s->mc.nopdf;
+}
+
+// After a request the API refused over a PDF: the newest PDF read that
+// requests still send is not sent again, why kept to say in its place
+// (deskimages). 0 if there is none.
+static b32 refusepdf(Session *s, Str why)
+{
+    for (iz i = s->history.len-1; i >= 0; i--) {
+        Msg *m = &s->history[i];
+        if (m->pages && !m->pdfbad.len) {
+            m->pdfbad = clone(&s->perm, why);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// The most pages of PDFs a request carries: Anthropic's limit, and no
+// more than half the model's window holds, as estimated (PDF_TOKENS).
+static i64 pdfpagesmax(Session *s)
+{
+    i64 ctx = s->mc.ctx ? s->mc.ctx : s->ctxhint;
+    i64 fit = ctx>0 ? ctx/2/PDF_TOKENS : PDF_PAGES;
+    return fit<1 ? 1 : fit>PDF_PAGES ? PDF_PAGES : fit;
+}
+
 // Screenshots kept in requests, and how many more before the oldest
 // are dropped (deskdropped).
 static i64 deskkeep(Engine *e)
@@ -6778,16 +6827,27 @@ static DeskDrop deskdrop(Session *s)
     return r;
 }
 
-// Tokens of the screenshots the next request carries.
+// Tokens of the screenshots, images and PDFs read that the next request
+// carries, the PDFs as pdfskeep would keep them by their pages.
 static i64 deskimagetokens(Session *s)
 {
-    i64 drop = deskdrop(s).drop;
-    i64 n    = 0;
-    i64 r    = 0;
+    i64 drop  = deskdrop(s).drop;
+    i64 max   = pdfon(s) ? pdfpagesmax(s) : 0;
+    i64 n     = 0;
+    i64 pages = 0;
+    i64 r     = 0;
     for (iz i = 0; i < s->history.len; i++) {
+        n += s->history[i].image.len > 0;
+    }
+    for (iz i = s->history.len-1; i >= 0; i--) {
         Msg *m = &s->history[i];
-        if (m->image.len && n++>=drop) {
+        if (!m->image.len || --n<drop) {
+            continue;
+        } else if (!m->pages) {
             r += imagetokens(m->imgw, m->imgh);
+        } else if (!m->pdfbad.len && pages+m->pages<=max) {
+            pages += m->pages;
+            r     += (i64)m->pages * PDF_TOKENS;
         }
     }
     return r;
@@ -6861,11 +6921,41 @@ static Str sessrefstext(Arena *a, Slice<MsgSess> refs)
     return finish(&b);
 }
 
+// Which of the PDFs read a request shown carries (its [desktop] images
+// count them with screenshots): the newest first while they fit in a
+// request (pdfpagesmax, PDF_BYTES), each kept if keep[i] for history[i].
+static b32 *pdfskeep(Session *s, Arena *a, i64 drop)
+{
+    b32 *keep  = alloc<b32>(a, s->history.len);
+    i64  max   = pdfpagesmax(s);
+    i64  n     = 0;
+    i64  pages = 0;
+    i64  bytes = 0;
+    for (iz i = 0; i < s->history.len; i++) {
+        n += s->history[i].image.len > 0;
+    }
+    for (iz i = s->history.len-1; i >= 0; i--) {
+        Msg *m = &s->history[i];
+        if (!m->image.len || --n<drop || !m->pages || m->pdfbad.len) {
+            continue;
+        }
+        i64 size = os_stat(s->e->os, *a, join(a, s->dir, m->image)).size;
+        if (pages+m->pages<=max && bytes+size<=PDF_BYTES) {
+            keep[i] = 1;
+            pages += m->pages;
+            bytes += size;
+        }
+    }
+    return keep;
+}
+
 // The history for a request: the screenshots shown read in as base64,
 // with a short text in place of each left out, and the floors marked;
-// the images attached, each read in, or a note if its file is lost; and
-// the text files attached, as text before their message's own.
-// The history itself if it has none of them.
+// the PDFs read likewise, each with no room for it, or for a model that
+// takes none, left out too (pdfskeep, pdfon); the images attached, each
+// read in, or a note if its file is lost; and the text files attached,
+// as text before their message's own. The history itself if it has
+// none of them.
 static Slice<Msg> deskimages(Session *s, Arena *a)
 {
     Engine *e   = s->e;
@@ -6877,8 +6967,10 @@ static Slice<Msg> deskimages(Session *s, Arena *a)
     if (!any) {
         return s->history;
     }
-    DeskDrop   d = deskdrop(s);
-    Slice<Msg> h = {};
+    DeskDrop   d    = deskdrop(s);
+    b32       *keep = pdfskeep(s, a, d.drop);
+    b32        pdf  = pdfon(s);
+    Slice<Msg> h    = {};
     h.data = alloc<Msg>(a, s->history.len);
     h.len  = h.cap = s->history.len;
     i64 n  = 0;
@@ -6886,11 +6978,24 @@ static Slice<Msg> deskimages(Session *s, Arena *a)
         Msg m = s->history[i];
         if (m.image.len) {
             m.floor = n==d.read ? FLOOR_READ : n==d.write ? FLOOR_WRITE : FLOOR_NONE;
-            Str what = m.imgread ? Str("image") : Str("screenshot");
+            Str what = m.pages   ? Str("PDF")   :
+                       m.imgread ? Str("image") : Str("screenshot");
             if (n++ < d.drop) {
                 Str why  = m.imgread ? Str("; read the file again to see it]") : Str("]");
                 m.imgalt = concat(a, concat(a, concat(a, "[", what), " omitted: "),
                                   concat(a, m.callid, why));
+            } else if (m.pages && m.pdfbad.len) {
+                m.imgalt = concat(a, concat(a, concat(a, "[PDF omitted: ", m.callid),
+                                            ", which the API refused: "),
+                                  concat(a, m.pdfbad, " The shell may extract its text "
+                                                      "instead.]"));
+            } else if (m.pages && !pdf) {
+                m.imgalt = concat(a, concat(a, "[PDF omitted: ", m.callid),
+                                  ", since this model is not sent PDFs]");
+            } else if (m.pages && !keep[i]) {
+                m.imgalt = concat(a, concat(a, "[PDF omitted: ", m.callid),
+                                  ", for room in the request for newer ones; read "
+                                  "the file again to see it]");
             } else {
                 Read rd = os_read(e->os, a, join(a, s->dir, m.image), DESK_REPLYMAX);
                 if (rd.err == READ_OK) {
@@ -14909,6 +15014,7 @@ static void buildprefix(Session *s, Arena scratch)
     s->te.shellenum = shellsenum(&s->perm, scratch, s->te.shells);
     s->te.coords    = s->mc.coords;
     s->te.vision    = !s->mc.novision;
+    s->te.pdf       = pdfon(s);
     s->te.year      = (i32)civil(os_time(e->os)).year;  // web_search names it
     if (tooloffered(&s->te, TOOL_TASK)) {
         taskroles(e, &s->perm, scratch, &s->te);
@@ -17887,7 +17993,12 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             m.imgw   = (i32)jsonint(jsonget(j, "width"), 0);
             m.imgh   = (i32)jsonint(jsonget(j, "height"), 0);
             m.imgread = m.image.len && !jsonstr(jsonget(j, "shot")).len;
-            if (m.image.len) {
+            if (!m.image.len) {
+                m.image   = clone(&s->perm, jsonstr(jsonget(j, "pdf")));
+                m.pages   = m.image.len ? (i32)jsonint(jsonget(j, "pages"), 1) : 0;
+                m.pages   = m.image.len && m.pages<1 ? 1 : m.pages;
+                m.imgread = m.image.len > 0;
+            } else {
                 // Points refer to the latest screenshot, as they did
                 DeskShot sh = deskshotparse(&s->perm, jsonstr(jsonget(j, "shot")));
                 s->desk.shot = sh.ok ? sh : s->desk.shot;
@@ -20510,6 +20621,82 @@ static b32 readimage(Session *s, Arena scratch, Str path)
     s->callimage = rel;
     s->callimgw  = p.w;
     s->callimgh  = p.h;
+    toolend(s, scratch, "ok", finish(&b), 0, 0, {}, 0);
+    return 1;
+}
+
+// read on a PDF: for a model that takes them (pdfon), the file itself,
+// kept among the session's output files and sent as a document in the
+// tool result, where Anthropic gives the model its text and an image of
+// each page; leaving requests as a read image does (deskimages), and
+// only while one has room for it (pdfskeep). For one that takes none,
+// or a PDF it cannot be sent, what it is. Returns 0 if the file is not
+// a PDF, for read to go on.
+static b32 readpdf(Session *s, Arena scratch, Str path)
+{
+    Engine *e    = s->e;
+    Read    head = os_readat(e->os, &scratch, path, 0, PDF_HEAD);
+    if (head.err!=READ_OK || !pdfsniff(head.data)) {
+        return 0;
+    }
+    Str  show = showpath(s->guard.cwd, path);
+    Str  tool = "The shell may extract its text instead (pdftotext, or Python's pypdf).";
+    Read rd   = os_read(e->os, &scratch, path, PDF_BYTES);
+    Buf  b(&scratch, 512);
+    print(&b, show);
+    if (rd.err == READ_TOOBIG) {
+        print(&b, ": a PDF over 16 MiB, too large to show you. ");
+        print(&b, tool);
+        toolend(s, scratch, "error", finish(&b), 0, 0, {}, 0);
+        return 1;
+    } else if (rd.err != READ_OK) {
+        return 0;  // read says why
+    }
+    PdfInfo info = pdfinfo(scratch, rd.data);
+    print(&b, ": a PDF, ");
+    if (info.pages) {
+        print(&b, (i64)info.pages);
+        print(&b, info.pages==1 ? Str(" page, ") : Str(" pages, "));
+    }
+    print(&b, (i64)((rd.data.len + 1023) / 1024));
+    print(&b, " KiB");
+    if (!pdfon(s)) {
+        print(&b, ". This model is not sent PDFs, so it is not shown. ");
+        print(&b, tool);
+        toolend(s, scratch, "ok", finish(&b), 0, 0, {}, 0);
+        return 1;
+    } else if (info.encrypted) {
+        print(&b, ", encrypted, which cannot be shown to you. ");
+        print(&b, tool);
+        toolend(s, scratch, "error", finish(&b), 0, 0, {}, 0);
+        return 1;
+    } else if (!info.pages) {
+        print(&b, ", whose pages cannot be counted, so it is not shown to you: "
+                  "it may be damaged. ");
+        print(&b, tool);
+        toolend(s, scratch, "error", finish(&b), 0, 0, {}, 0);
+        return 1;
+    } else if (info.pages > pdfpagesmax(s)) {
+        print(&b, ", more than the ");
+        print(&b, pdfpagesmax(s));
+        print(&b, " pages that can be shown to you. ");
+        print(&b, tool);
+        print(&b, " Or split it into parts to read each (qpdf --pages, or pypdf).");
+        toolend(s, scratch, "error", finish(&b), 0, 0, {}, 0);
+        return 1;
+    }
+
+    Str rel = {};
+    Str out = spillfile(s, scratch, s->calls[s->callidx].id, &rel, ".pdf");
+    if (!os_write(e->os, scratch, out, rd.data)) {
+        print(&b, ". It could not be saved to show you: ");
+        print(&b, os_lasterr(e->os, &scratch));
+        toolend(s, scratch, "error", finish(&b), 0, 0, {}, 0);
+        return 1;
+    }
+    print(&b, ", shown to you as a document: its text and an image of each page.");
+    s->callimage = rel;
+    s->callpages = info.pages;
     toolend(s, scratch, "ok", finish(&b), 0, 0, {}, 0);
     return 1;
 }

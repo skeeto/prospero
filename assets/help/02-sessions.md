@@ -92,6 +92,10 @@ session keeps a copy in its own folder, so the agent can read the rest
 without asking. A binary file (one with a NUL byte) is refused. The
 transcript shows a folded "Attached:" line under the message.
 
+On an Anthropic endpoint the agent's `read` shows it a PDF whole, its
+text and an image of each page; other models are told only what the
+file is, and can extract its text with the shell.
+
 `@` in the prompt mentions a file or folder instead: a picked file's text is
 attached too, and the path stays in the message, so the agent can read the
 file or list the folder itself (see [Keyboard and mouse](help:keys)). A

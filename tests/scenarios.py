@@ -13527,6 +13527,152 @@ def read_image_blind(t):
     t.check("image" not in desc, f"read's description: {desc}")
 
 
+def mkpdf(pages, encrypt=False):
+    """A PDF of so many pages, each with a line of text, as bytes: its
+    trailer naming an /Encrypt dictionary if encrypt."""
+    objs = ["<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [%s] /Count %d >>" %
+            (" ".join(f"{3 + 2*i} 0 R" for i in range(pages)), pages)]
+    font = 3 + 2*pages
+    for i in range(pages):
+        s = f"BT /F1 24 Tf 72 700 Td (Page {i + 1}) Tj ET"
+        objs.append(f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources "
+                    f"<< /Font << /F1 {font} 0 R >> >> /Contents {4 + 2*i} 0 R >>")
+        objs.append(f"<< /Length {len(s)} >>\nstream\n{s}\nendstream")
+    objs.append("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+    if encrypt:
+        objs.append("<< /Filter /Standard /V 1 /R 2 /O <00> /U <00> /P -4 >>")
+    out, offs = "%PDF-1.4\n", []
+    for i, o in enumerate(objs):
+        offs.append(len(out))
+        out += f"{i + 1} 0 obj\n{o}\nendobj\n"
+    xref = len(out)
+    out += f"xref\n0 {len(objs) + 1}\n0000000000 65535 f \n"
+    out += "".join(f"{o:010d} 00000 n \n" for o in offs)
+    enc = f" /Encrypt {len(objs)} 0 R" if encrypt else ""
+    out += (f"trailer\n<< /Size {len(objs) + 1} /Root 1 0 R{enc} >>\n"
+            f"startxref\n{xref}\n%%EOF\n")
+    return out.encode()
+
+
+def an_result(body, i):
+    """The content of the i-th tool result in a Messages API request."""
+    rs = [b for m in body["messages"] if m["role"] == "user" and isinstance(m["content"], list)
+          for b in m["content"] if b.get("type") == "tool_result"]
+    return rs[i]["content"]
+
+
+@scenario(conf={**AN, "_extra": "[desktop]\nimages = 1\nimages_slack = 0\n"}, bound=20)
+def an_read_pdf(t):
+    """read sends a PDF to a model on kind anthropic as a document block in
+    its tool result, kept among the session's files, and left out of
+    later requests as a read image is ([desktop] images); one encrypted,
+    or over the pages half the window holds (50 of the fake's 200000
+    tokens), is refused, pointing to the shell. A resumed session's
+    request carries the PDF still shown."""
+    three = mkpdf(3)
+    t.host.write(t.host.join(t.work, "three.pdf"), three)
+    t.host.write(t.host.join(t.work, "two.pdf"), mkpdf(2))
+    t.host.write(t.host.join(t.work, "locked.pdf"), mkpdf(1, encrypt=True))
+    t.host.write(t.host.join(t.work, "long.pdf"), mkpdf(51))
+    r = t.run(env=ANENV)
+    anok(t, r)
+    ends = r.all("tool.end")
+    texts = [e["text"] for e in ends]
+    t.check(texts[0] == "three.pdf: a PDF, 3 pages, 2 KiB, shown to you as a document: its "
+                       "text and an image of each page." and
+            ends[0].get("pages") == 3 and ends[0]["pdf"].endswith(".pdf") and
+            "image" not in ends[0], f"the first {ends[0]}")
+    t.check(texts[1].startswith("two.pdf: a PDF, 2 pages") and ends[1].get("pages") == 2,
+            f"the second {ends[1]}")
+    t.check(ends[2]["status"] == "error" and "encrypted" in texts[2] and
+            "pdftotext" in texts[2] and "pdf" not in ends[2], f"locked {ends[2]}")
+    t.check(ends[3]["status"] == "error" and "51 pages" in texts[3] and
+            "more than the 50 pages" in texts[3] and "pdf" not in ends[3], f"long {ends[3]}")
+    sid = r.sessions()[0]
+    kept = t.host.read(t.host.join(t.state, "sessions", sid, ends[0]["pdf"]))
+    t.check(kept == three.decode(), "kept as read")
+
+    reqs = [q["body"] for q in t.requests()]
+    desc = [x["description"] for x in reqs[0]["tools"] if x["name"] == "read"][0]
+    t.check("a PDF as a document" in desc, f"read says so: {desc}")
+    first = an_result(reqs[1], 0)
+    t.check([c["type"] for c in first] == ["text", "document"] and
+            first[1]["source"]["media_type"] == "application/pdf" and
+            base64.b64decode(first[1]["source"]["data"]) == three, f"sent {first[:1]}")
+    last = reqs[-1]
+    calls = [b["id"] for m in last["messages"] if m["role"] == "assistant"
+             for b in m["content"] if b["type"] == "tool_use"]
+    old = an_result(last, 0)
+    t.check([c["type"] for c in old] == ["text", "text"] and
+            old[1]["text"] == f"[PDF omitted: {calls[0]}; read the file again to see it]",
+            f"the first leaves {old}")
+    t.check([c["type"] for c in an_result(last, 1)] == ["text", "document"], "the second stays")
+
+    r2 = t.run("again", resume=sid, env=ANENV)
+    anok(t, r2)
+    again = t.requests()[-1]["body"]
+    t.check([c["type"] for c in an_result(again, 1)] == ["text", "document"] and
+            [c["type"] for c in an_result(again, 0)] == ["text", "text"], "resumed as it was")
+
+
+@scenario(conf={**AN, "_extra": "[desktop]\nimages = 3\n"}, bound=15)
+def an_read_pdf_room(t):
+    """A request has room for 50 pages of PDFs, half the fake's window: of
+    two of 30 pages, the older leaves the request once the newer is
+    read, with a text saying why in its place."""
+    t.host.write(t.host.join(t.work, "thirty.pdf"), mkpdf(30))
+    t.host.write(t.host.join(t.work, "thirty2.pdf"), mkpdf(30))
+    r = t.run(env=ANENV)
+    anok(t, r)
+    last = t.requests()[-1]["body"]
+    old = an_result(last, 0)
+    t.check([c["type"] for c in old] == ["text", "text"] and
+            old[1]["text"].startswith("[PDF omitted: ") and
+            "for room in the request" in old[1]["text"], f"the older leaves {old}")
+    t.check([c["type"] for c in an_result(last, 1)] == ["text", "document"], "the newer stays")
+    t.check(not r.all("retry"), "the API took every request")
+
+
+@scenario(conf=AN, bound=15)
+def an_read_pdf_bad(t):
+    """A PDF the API refuses though it counts its pages (damaged) is not
+    sent again, the step retried at once with a text saying why in its
+    place, so the session goes on rather than failing every request."""
+    pdf = mkpdf(2).replace(b"%%EOF", b"garbage")
+    t.host.write(t.host.join(t.work, "broken.pdf"), pdf)
+    r = t.run(env=ANENV)
+    anok(t, r)
+    t.check(r.all("tool.end")[0].get("pages") == 2, "sent as a PDF")
+    retries = r.all("retry")
+    t.check(len(retries) == 1 and "not valid" in retries[0].get("err", json.dumps(retries[0])),
+            f"one retry {retries}")
+    reqs = [q["body"] for q in t.requests()]
+    t.check(len(reqs) == 3, f"the refused request and its retry: {len(reqs)}")
+    res = an_result(reqs[-1], 0)
+    t.check([c["type"] for c in res] == ["text", "text"] and
+            res[1]["text"].startswith("[PDF omitted: ") and
+            "which the API refused: " in res[1]["text"] and
+            "The PDF specified was not valid." in res[1]["text"], f"in its place {res}")
+    t.check(r.text().endswith("It was damaged."), f"answered {r.text()!r}")
+
+
+@scenario(bound=15)
+def read_pdf_unsent(t):
+    """A model not on kind anthropic is told what a PDF is, and that the
+    shell can extract its text, and read's description offers none."""
+    t.host.write(t.host.join(t.work, "three.pdf"), mkpdf(3))
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    end = r.all("tool.end")[0]
+    t.check(end["status"] == "ok" and "pdf" not in end and
+            end["text"].startswith("three.pdf: a PDF, 3 pages, 2 KiB. This model is not "
+                                   "sent PDFs") and "pdftotext" in end["text"], f"told {end}")
+    desc = [x["function"]["description"] for x in t.requests()[0]["body"]["tools"]
+            if x["function"]["name"] == "read"][0]
+    t.check("PDF" not in desc, f"read's description: {desc}")
+
+
 def desk_alts(req):
     """The texts in place of screenshots left out, in order."""
     return [p["text"] for m in req["messages"]

@@ -366,6 +366,9 @@ static CfgKey cfgschema[] = {
     {"model", "vision", CFG_BOOL, "true", {}, {}, "model",
      "Whether the model takes images: the desktop tool's screenshots and "
      "image files read"},
+    {"model", "pdf", CFG_BOOL, "true", {}, {}, "model",
+     "Whether read sends a PDF to the model as a document, its text and "
+     "its pages' images (only on an endpoint of kind anthropic)"},
     {"model", "coordinates", CFG_ENUM, "pixels", {}, "pixels norm1000", "model",
      "How the model gives points in a screenshot: pixels of the image it "
      "was sent, or norm1000, thousandths of its width and height (Qwen-VL, "

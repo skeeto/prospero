@@ -638,6 +638,7 @@ static Str istr(Arena *a, i64 v)
 #include "test/desktop_test.cpp"
 #include "test/image_test.cpp"  // after deskhelp.cpp: dkpng
 #include "test/zip_test.cpp"
+#include "test/pdf_test.cpp"
 #include "test/delta_test.cpp"
 #include "test/relay_test.cpp"  // after config's test platform
 #include "dbus.cpp"
@@ -722,6 +723,7 @@ int main()
     test_desktop(&t);
     test_image(&t);
     test_zip(&t);
+    test_pdf(&t);
     test_delta(&t);
     test_relay(&t);
     test_dbus(&t);

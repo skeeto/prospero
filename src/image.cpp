@@ -35,6 +35,10 @@ extern "C" {
     // Inflate raw DEFLATE into exactly dstlen bytes of dst, which has room
     // for dstlen+1. Wuffs' error, or null.
     char const *wuffsinflate(void *state, u8 *dst, iz dstlen, u8 *src, iz srclen);
+    // Inflate raw DEFLATE into dst, room for cap bytes, as far as the
+    // stream goes, storing the bytes written in *len. Wuffs' error, or
+    // null.
+    char const *wuffsinflateto(void *state, u8 *dst, iz cap, iz *len, u8 *src, iz srclen);
 }
 
 enum : i32 {

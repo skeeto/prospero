@@ -173,6 +173,7 @@ struct ToolEnv {
     i32 edit;        // EDIT_*: the edit tool's format (edit.cpp)
     i32 coords;      // COORDS_*: how the desktop tool takes points
     b32 vision;      // the model takes images, which read then shows
+    b32 pdf;         // and PDFs, which read sends as documents
     i32 year;        // when the prefix was built, for web_search
 };
 
@@ -971,6 +972,18 @@ static Str tooljson(Arena *a, ToolEnv *te)
             "2000 lines at a time (continue with offset). A directory lists "
             "its entries, and an image (PNG, JPEG, GIF, WebP, BMP) is shown "
             "as an image.";
+    }
+    if (te->pdf) {
+        defs[TOOL_READ].desc = te->vision ?
+            Str("Read a text file, each line shown with its number and a tab, "
+                "2000 lines at a time (continue with offset). A directory lists "
+                "its entries, an image (PNG, JPEG, GIF, WebP, BMP) is shown as "
+                "an image, and a PDF as a document, its text and its pages' "
+                "images.") :
+            Str("Read a text file, each line shown with its number and a tab, "
+                "2000 lines at a time (continue with offset). A directory lists "
+                "its entries, and a PDF is shown as a document, its text and "
+                "its pages' images.");
     }
 
     putarray(&w);

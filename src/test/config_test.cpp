@@ -1044,6 +1044,7 @@ static void testcfgjson(Test *t)
         "model/m/thinking_display=summarized*\n"
         "model/m/effort=*\n"
         "model/m/vision=true*\n"
+        "model/m/pdf=true*\n"
         "model/m/coordinates=pixels*\n"
         "model/m/image_edge=*\n"
         "model/m/image_pixels=*\n"

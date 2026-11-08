@@ -1,6 +1,6 @@
 // wuffs: image decoding through Google's Wuffs, a translation unit of
 // its own, in C, so that Wuffs and its system headers stay out of the
-// core, which reaches it through these three functions (image.cpp)
+// core, which reaches it through these few functions (image.cpp)
 //
 // Wuffs (github.com/google/wuffs, Apache-2.0 OR MIT) is fetched as its
 // single-file release, wuffs-v0.4.c, which CMake puts on the include
@@ -237,6 +237,38 @@ char const *wuffsinflate(void *state, uint8_t *dst, ptrdiff_t dstlen,
         return errof(st);
     } else if (out.meta.wi != (size_t)dstlen) {
         return "#wuffs: inflates to less than expected";
+    }
+    return 0;
+}
+
+// Inflate raw DEFLATE from src into dst, which has room for cap bytes,
+// as far as the stream goes, which may leave input unread (a zlib
+// trailer). Stores how many bytes it wrote in *len. Returns Wuffs'
+// error, or one of its own if it needs more than cap, null if none.
+char const *wuffsinflateto(void *state, uint8_t *dst, ptrdiff_t cap, ptrdiff_t *len,
+                           uint8_t *src, ptrdiff_t srclen)
+{
+    *len = 0;
+    wuffs_base__status st = wuffs_deflate__decoder__initialize(
+        state, (size_t)wuffsinflatestate(), WUFFS_VERSION,
+        WUFFS_INITIALIZE__ALREADY_ZEROED
+    );
+    if (!wuffs_base__status__is_ok(&st)) {
+        return errof(st);
+    }
+    wuffs_base__io_buffer in  = wuffs_base__ptr_u8__reader(src, (size_t)srclen, 1);
+    wuffs_base__io_buffer out = wuffs_base__ptr_u8__writer(dst, (size_t)cap);
+    uint8_t work[WUFFS_DEFLATE__DECODER_WORKBUF_LEN_MAX_INCL_WORST_CASE + 1];
+    st = wuffs_deflate__decoder__transform_io(
+        state, &out, &in, wuffs_base__make_slice_u8(work, sizeof(work))
+    );
+    *len = (ptrdiff_t)out.meta.wi;
+    if (st.repr == wuffs_base__suspension__short_write) {
+        return "#wuffs: inflates to more than expected";
+    } else if (st.repr == wuffs_base__suspension__short_read) {
+        return "#wuffs: cut short";
+    } else if (!wuffs_base__status__is_ok(&st)) {
+        return errof(st);
     }
     return 0;
 }

@@ -210,6 +210,18 @@ read leave the conversation along with screenshots (`[desktop]
 images`), each replaced by a line that says to read the file again. A
 model with `vision = false` is told only the image's kind and size.
 
+On an endpoint of kind `anthropic`, `read` sends a PDF to the model
+whole, as a document: Anthropic gives the model its text and an image
+of each page, so it sees figures, tables and scans too. A page costs
+somewhere near 2000 tokens, so a PDF may have at most as many pages as
+half the model's window holds (50 in 200K tokens, 100 at most, the
+API's limit), and 16 MiB. PDFs leave the conversation as images read
+do, and an older one also leaves when a newer one needs its room. An
+encrypted PDF, or one too long, is refused, and the agent is pointed
+to the shell (`pdftotext`, Python's pypdf) to extract its text or split
+it. A model on another kind, or with `[model] pdf = false`, is told
+only what the file is.
+
 The New session dialog's working directory may be picked with Browse,
 in the platform's folder dialog, for a directory on this computer. A
 leading `~` there (`~`, `~/src`, and `~\src` on Windows) is the home

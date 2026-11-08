@@ -212,8 +212,8 @@ static void anblock(JsonOut *w, Arena scratch, AnPart *p, b32 cache)
     }
     putobject(w);
     if (!p->block && m->role==ROLE_TOOL && (m->imgb64.len || m->imgalt.len)) {
-        // A screenshot goes in the result, after its text, or what
-        // stands in its place
+        // A screenshot, image or PDF goes in the result, after its
+        // text, or what stands in its place
         putstrkey(w, "type", "tool_result");
         putstrkey(w, "tool_use_id", m->callid);
         putkey(w, "content");
@@ -225,7 +225,17 @@ static void anblock(JsonOut *w, Arena scratch, AnPart *p, b32 cache)
             putend(w);
         }
         putobject(w);
-        if (m->imgb64.len) {
+        if (m->imgb64.len && m->pages) {
+            putstrkey(w, "type", "document");
+            putkey(w, "source");
+            putobject(w);
+            putstrkey(w, "type", "base64");
+            putstrkey(w, "media_type", "application/pdf");
+            putkey(w, "data");
+            Str data = concat(&scratch, "\"", m->imgb64);
+            putraw(w, concat(&scratch, data, "\""));  // base64 needs no escapes
+            putend(w);
+        } else if (m->imgb64.len) {
             putstrkey(w, "type", "image");
             putkey(w, "source");
             putobject(w);

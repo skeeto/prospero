@@ -677,6 +677,7 @@ static u32     os_guilimits(Os *);
 #include "png.cpp"
 #include "image.cpp"
 #include "zip.cpp"    // after png.cpp and image.cpp: zcrc32, wuffsinflate
+#include "pdf.cpp"    // after image.cpp: wuffsinflateto
 #include "delta.cpp"
 #include "desktop.cpp"
 #include "tools.cpp"

@@ -426,6 +426,10 @@ struct Msg {
     i32          imgw;    // read (PNG), relative to the session's
     i32          imgh;    // directory, and its size
     b32          imgread;  // an image read, not a screenshot
+    i32          pages;   // an image read that is a PDF, of this many
+                          // pages: Anthropic's document, else imgalt
+    Str          pdfbad;  // why the API refused that PDF, which is
+                          // then not sent (this run only)
     Str          imgb64;  // in a request's history: the screenshot as
                           // base64, or null where it is left out,
     Str          imgalt;  // with this text in its place
@@ -629,6 +633,7 @@ struct ModelConf {
     b32          novision;   // the model takes no images
     i64          imgedge;    // [model] image_edge, 0 if unset
     i64          imgpixels;  // [model] image_pixels, 0 if unset
+    b32          nopdf;      // [model] pdf off: read sends no PDFs
     b32          conf;       // from a [model NAME] section of its name
 };
 
