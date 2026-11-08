@@ -1394,6 +1394,18 @@ def sc_compact_long_compact(model, n, req):
     yield from finish(model, prompt=ptok(req))
 
 
+def sc_compact_shorter(model, n, req):
+    yield from sc_compaction(model, n, req)
+
+
+def sc_compact_shorter_compact(model, n, req):
+    # Too long, as sc_compact_long's, until told so: then one that fits
+    if "Your last summary" in json.dumps(req):
+        yield from compact_default(model, n, req)
+    else:
+        yield from sc_compact_long_compact(model, n, req)
+
+
 def sc_compact_prune(model, n, req):
     # Big outputs in a big window: pruning old ones is enough
     if n < 10:

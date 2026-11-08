@@ -313,8 +313,10 @@ static Str const compactsections =
 
 // The summarizer's prompt: the previous summary to update (if any),
 // then the conversation (transcript). A focus, from a user asking for
-// the compaction, is what to keep in more detail.
-static Str summaryprompt(Arena *a, Str prev, Str convo, i64 words, Str focus)
+// the compaction, is what to keep in more detail. over is the size in
+// tokens of the summary before, which was too long, 0 if none.
+static Str summaryprompt(Arena *a, Str prev, Str convo, i64 words, Str focus,
+                         i64 over)
 {
     Buf u(a, convo.len + prev.len + focus.len + 4096);
     print(&u, "Summarize the conversation below for the agent that will "
@@ -348,6 +350,15 @@ static Str summaryprompt(Arena *a, Str prev, Str convo, i64 words, Str focus)
     print(&u, "</conversation>\n");
     // Restated last: after a long conversation, what came first is what
     // a model most easily loses, and it may copy the conversation out
+    if (over) {
+        print(&u, "\nYour last summary of it was about ");
+        print(&u, over);
+        print(&u, " tokens, over the ");
+        print(&u, (i64)COMPACT_SUMMAX);
+        print(&u, " a summary may have, so it was not used. Write a shorter "
+                  "one: keep the sections, and leave out what the agent does "
+                  "not need, such as copies of messages.\n");
+    }
     print(&u, "\nWrite the summary of the conversation above now, in the "
               "sections given before it, under ");
     print(&u, words);
@@ -389,9 +400,9 @@ static b32 hasgoal(Str summary)
 
 // The summarizer's request: no tools offered, text only.
 static Str encodesummary(Arena *a, Arena scratch, ModelConf *mc, Str prev,
-                         Str convo, i64 words, Str focus)
+                         Str convo, i64 words, Str focus, i64 over)
 {
-    Str     u = summaryprompt(&scratch, prev, convo, words, focus);
+    Str     u = summaryprompt(&scratch, prev, convo, words, focus, over);
     Buf     b(a, u.len + 1024);
     JsonOut w = {&b};
     putobject(&w);
@@ -439,11 +450,11 @@ static Str encodesummary(Arena *a, Arena scratch, ModelConf *mc, Str prev,
 
 // The same request for Anthropic's Messages API (anthropic.cpp).
 static Str ansummary(Arena *a, Arena scratch, ModelConf *mc, Str prev,
-                     Str convo, i64 words, Str focus)
+                     Str convo, i64 words, Str focus, i64 over)
 {
     Msg m = {};
     m.role = ROLE_USER;
-    m.text = summaryprompt(&scratch, prev, convo, words, focus);
+    m.text = summaryprompt(&scratch, prev, convo, words, focus, over);
     ChatReq r = {};
     r.mc      = mc;
     r.system  = compactsystem;
@@ -454,11 +465,11 @@ static Str ansummary(Arena *a, Arena scratch, ModelConf *mc, Str prev,
 // The same request for the Responses API (responses.cpp), for ChatGPT's
 // backend if codex.
 static Str rssummary(Arena *a, Arena scratch, ModelConf *mc, Str prev,
-                     Str convo, i64 words, Str focus, b32 codex)
+                     Str convo, i64 words, Str focus, i64 over, b32 codex)
 {
     Msg m = {};
     m.role = ROLE_USER;
-    m.text = summaryprompt(&scratch, prev, convo, words, focus);
+    m.text = summaryprompt(&scratch, prev, convo, words, focus, over);
     ChatReq r = {};
     r.mc      = mc;
     r.system  = compactsystem;

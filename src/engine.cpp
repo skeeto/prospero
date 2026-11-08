@@ -592,6 +592,7 @@ struct Compact {
     i32       shrink;    // the summarizer rejected its input so often
     iz        inbytes;   // of the conversation in the last request
     iz        rejected;  // of the first one rejected, 0 if none
+    i64       toolong;   // tokens of a summary over COMPACT_SUMMAX, 0 if none
     i64       began;     // ticks
 };
 
@@ -13616,15 +13617,21 @@ static void sendcompact(Session *s, Arena scratch)
     Str convo = transcript(&s->attempt, scratch, s->history, cp->start,
                            cp->cut, limit);
     i64 words = sumbudget(cp->goal) * 3/4;
+    if (cp->toolong) {
+        // Asked again, after a summary too long: fewer words, by as much
+        // as it was over and a quarter more
+        words = words * COMPACT_SUMMAX / cp->toolong * 3/4;
+    }
+    i64 over  = cp->toolong;
     i32 wire  = cp->ep.wire;
     Str body  = wire==EP_ANTHROPIC ?
                     ansummary(&s->attempt, scratch, &cp->mc, prev, convo, words,
-                              cp->focus) :
+                              cp->focus, over) :
                 epresponses(wire) ?
                     rssummary(&s->attempt, scratch, &cp->mc, prev, convo, words,
-                              cp->focus, cp->ep.kind==EP_CHATGPT) :
+                              cp->focus, over, cp->ep.kind==EP_CHATGPT) :
                     encodesummary(&s->attempt, scratch, &cp->mc, prev, convo, words,
-                                  cp->focus);
+                                  cp->focus, over);
     Str url   = callurl(&scratch, &cp->ep);
     cp->inbytes = convo.len;
     if (!startreq(s, scratch, &cp->ep, "POST", url, body, "text/event-stream", 0)) {
@@ -13645,7 +13652,8 @@ static void sendcompact(Session *s, Arena scratch)
 // user asked for is its turn's whole work, which ends. A summary declined
 // (refusal), cut off (length), over COMPACT_SUMMAX or without its Goal
 // (hasgoal) is never used, since the history it stands for would be gone
-// for good, and asking again would most likely end alike.
+// for good. One over COMPACT_SUMMAX is asked for once more, shorter, and
+// told how long it was; the others would most likely end alike.
 static void compacted(Session *s, Arena scratch, Partial *p)
 {
     Engine *e    = s->e;
@@ -13681,6 +13689,16 @@ static void compacted(Session *s, Arena scratch, Partial *p)
         return;
     }
     i64 size = tokensof(s->rate, text.len);
+    if (size>COMPACT_SUMMAX && !cp.toolong) {
+        Buf b(&scratch, 128);
+        print(&b, "the summary was too long, about ");
+        print(&b, size);
+        print(&b, " tokens: asking for a shorter one");
+        s->cp.toolong = size;
+        retryevent(s, scratch, RETRY_QUICK, CLASS_DETERMINISTIC, 0, 0, finish(&b));
+        request(s, scratch);
+        return;
+    }
     if (size>COMPACT_SUMMAX || !hasgoal(text)) {
         // Not cut to fit, which would drop its last sections, nor taken
         // without them: the history it stands for would be gone for good
@@ -13693,7 +13711,9 @@ static void compacted(Session *s, Arena scratch, Partial *p)
             print(&b, size);
             print(&b, " tokens, over the ");
             print(&b, (i64)COMPACT_SUMMAX);
-            print(&b, " a summary may have");
+            print(&b, " a summary may have, even when asked again after one "
+                      "of about ");
+            print(&b, cp.toolong);
         } else {
             print(&b, ", wrote no summary in the sections it was asked for "
                       "(it has no Goal)");

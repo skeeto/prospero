@@ -131,7 +131,7 @@ static void test_compact(Test *t)
         ModelConf mc = {};
         mc.name     = "m";
         mc.llamacpp = 1;
-        Str     body = encodesummary(a, tmp, &mc, "old", "[user]\nhi\n\n", 300, {});
+        Str     body = encodesummary(a, tmp, &mc, "old", "[user]\nhi\n\n", 300, {}, 0);
         JsonDoc d    = jsonparse(a, body);
         expect(t, "summary request parses", istr(a, d.ok), "1");
         expect(t, "summary no tools",
@@ -157,7 +157,7 @@ static void test_compact(Test *t)
         expect(t, "summary no focus", istr(a, find(user, "<focus>")), "-1");
 
         // A focus from the user: a paragraph before the conversation
-        Str focused = summaryprompt(a, {}, "[user]\nhi\n\n", 300, "the parser's API");
+        Str focused = summaryprompt(a, {}, "[user]\nhi\n\n", 300, "the parser's API", 0);
         iz  at      = find(focused, "<focus>\nthe parser's API\n</focus>\n");
         expect(t, "summary focus", istr(a, at>0 && at<find(focused, "<conversation>")), "1");
         expect(t, "summary focus asks", istr(a, find(focused, "more detail about") > 0), "1");
@@ -167,9 +167,21 @@ static void test_compact(Test *t)
                     "the conversation above now, in the sections given before "
                     "it, under 300 words, keeping more detail about the user's "
                     "focus:\n\n<focus>\nthe parser's API\n</focus>\n")), "1");
-        Str an = ansummary(a, tmp, &mc, {}, "[user]\nhi\n\n", 300, "the parser's API");
+        Str an = ansummary(a, tmp, &mc, {}, "[user]\nhi\n\n", 300, "the parser's API", 0);
         expect(t, "summary focus anthropic", istr(a, find(an, "\\u003cfocus>") > 0 ||
                find(an, "<focus>") > 0), "1");
+
+        // Asked again after a summary too long: its size, before the task
+        Str again = summaryprompt(a, {}, "[user]\nhi\n\n", 200, {}, 16843);
+        expect(t, "summary again",
+               istr(a, endswith(again, "</conversation>\n\nYour last summary of "
+                    "it was about 16843 tokens, over the 16384 a summary may "
+                    "have, so it was not used. Write a shorter one: keep the "
+                    "sections, and leave out what the agent does not need, "
+                    "such as copies of messages.\n\nWrite the summary of the "
+                    "conversation above now, in the sections given before it, "
+                    "under 200 words.\n")), "1");
+        expect(t, "summary not again", istr(a, find(focused, "Your last summary")), "-1");
     }
 
     // A summary has its Goal section, or the summarizer wrote something

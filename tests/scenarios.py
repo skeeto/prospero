@@ -4337,9 +4337,9 @@ def compact_guard(t):
     t.check(not any(checkpointed(chat(x)) for x in reqs), "no request after it")
 
 
-def compact_unused(t, why, said):
+def compact_unused(t, why, said, retries=0):
     """A summary the turn ends on, never used: the history intact, and
-    the note saying why."""
+    the note saying why, after retries asking again."""
     bigfiles(t, 8, 160)
     r = t.run()
     t.check(r.rc == 1, f"exit {r.rc}: {r.stderr}")
@@ -4349,8 +4349,9 @@ def compact_unused(t, why, said):
     notes = [n["text"] for n in r.all("note") if n.get("level") == "error"]
     t.check(any(said in n and "not compacted" in n for n in notes),
             f"explained: {[n['text'] for n in r.all('note')]}")
-    t.check(not r.all("compact") and not r.all("retry") and len(t.compactions()) == 1,
-            f"no summary, no retry: {r.all('compact')} {r.all('retry')}")
+    t.check(not r.all("compact") and len(r.all("retry")) == retries and
+            len(t.compactions()) == 1 + retries,
+            f"no summary, {retries} retries: {r.all('compact')} {r.all('retry')}")
     t.check(not any(checkpointed(chat(x)) for x in t.requests()), "no checkpoint")
     return r
 
@@ -4365,10 +4366,37 @@ def compact_echo(t):
 
 @scenario(conf=SMALL, bound=20, alone=True)
 def compact_long(t):
-    """A summary over its 16384 tokens ends the turn rather than be cut to
-    fit, which lost its sections, written last after copies of messages
-    as an instruction file asked (issue #17)."""
-    compact_unused(t, "summary was too long", "over the 16384")
+    """A summary over its 16384 tokens, twice, ends the turn rather than be
+    cut to fit, which lost its sections, written last after copies of
+    messages as an instruction file asked (issue #17)."""
+    compact_unused(t, "summary was too long", "over the 16384", retries=1)
+    again = json.dumps(t.compactions()[1])
+    t.check("Your last summary" in again and "over the 16384" in again,
+            "asked again, told why")
+    t.check("Your last summary" not in json.dumps(t.compactions()[0]),
+            "not told at first")
+
+
+@scenario(conf=SMALL, bound=20, alone=True)
+def compact_shorter(t):
+    """A summary over its 16384 tokens is asked for again, told how long
+    it was and with fewer words, and the shorter one compacts (issue
+    #17): the turn carries on."""
+    bigfiles(t, 8, 160)
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    sums = r.all("compact")
+    t.check(sums and all(c["kind"] == "summary" for c in sums), f"compacted: {sums}")
+    rs = r.all("retry")
+    t.check(len(rs) == len(sums) and
+            all(x.get("compact") == 1 and "too long" in x.get("msg", "") for x in rs),
+            f"a retry for each: {rs}")
+    cs = t.compactions()
+    t.check(len(cs) == 2*len(sums), f"each asked twice: {len(cs)}")
+    words = [int(re.findall(r"under (\d+) words", json.dumps(c))[-1]) for c in cs]
+    t.check(all(words[i+1] < words[i] for i in range(0, len(words), 2)),
+            f"fewer words: {words}")
+    t.check(r.text().endswith("All files read."), f"text {r.text()!r}")
 
 
 @scenario(conf={"_listing": {"meta": {"n_ctx": 200000, "n_ctx_train": 262144}}},
