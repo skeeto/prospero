@@ -220,7 +220,8 @@ Right-click a session in the sidebar, or open the Session menu, for:
   **Delete...**.
 - **Copy session ID**.
 - **Open working folder**: the folder the session works in, in Finder
-  or Explorer, as the folder button beside the prompt box opens it. **Open session records**: its folder in the state
+  or Explorer, as the folder button beside the prompt box opens it (in
+  a container, only a folder here mounted at `/work`). **Open session records**: its folder in the state
   directory, with its log, plan and command output.
 - **Open in terminal**: a terminal window in the folder the session
   works in, as the terminal button beside the prompt box and the Info
@@ -231,7 +232,9 @@ Right-click a session in the sidebar, or open the Session menu, for:
   apply, as to the agent's commands, and a WSL shell opens in its
   `distro` (but not on macOS, where Terminal keeps its own
   environment). On a remote it is a shell there, over
-  ssh (`ssh -t`, so it may ask for a password) or WSL. The terminal is
+  ssh (`ssh -t`, so it may ask for a password) or WSL, and in a
+  container a shell inside it by its runtime (`docker exec -it`), as
+  the agent's user there. The terminal is
   `[ui] terminal`, else Terminal on macOS, Windows Terminal (or a
   console) on Windows, and elsewhere `$TERMINAL` or the first of the
   usual ones found.

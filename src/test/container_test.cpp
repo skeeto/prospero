@@ -70,6 +70,41 @@ static void test_container(Test *t)
     expect(t, "ctrexec argv", joinwords(&a, linkargv(&a, {}, l, "x")),
            "/d/bin/docker|exec|-i|prospero-p-0011aabb|/bin/sh|-c|cd; x");
 
+    // Its folder here, only where it is mounted at /work
+    expect(t, "ctrhostpath copy", ctrhostpath(&a, &c, "/work", 0), "");
+    c.workspace = CTR_MOUNT;
+    Ctr none = {};
+    none.workspace = CTR_MOUNT;
+    expect(t, "ctrhostpath no folder", ctrhostpath(&a, &none, "/work", 0), "");
+    c.folder = "/h/src";
+    expect(t, "ctrhostpath work", ctrhostpath(&a, &c, "/work", 0), "/h/src");
+    expect(t, "ctrhostpath work/", ctrhostpath(&a, &c, "/work/", 0), "/h/src");
+    expect(t, "ctrhostpath sub", ctrhostpath(&a, &c, "/work/a/b/", 0), "/h/src/a/b");
+    expect(t, "ctrhostpath worker", ctrhostpath(&a, &c, "/worker", 0), "");
+    expect(t, "ctrhostpath outside", ctrhostpath(&a, &c, "/tmp", 0), "");
+    c.folder = "C:\\h\\src\\";
+    expect(t, "ctrhostpath windows", ctrhostpath(&a, &c, "/work/a/b", 1), "C:\\h\\src\\a\\b");
+    c.workspace = CTR_COPY;
+    c.folder    = "/h/src";
+
+    // A terminal there: as root, or as this user with HOME its own; the
+    // session's shell, else /bin/sh's, a login shell
+    expect(t, "ctrterm", joinwords(&a, ctrterm(&a, &c, "/work/x", {})),
+           "/d/bin/docker|exec|-it|-w|/work/x|prospero-p-0011aabb|/bin/sh|-l");
+    {
+        Ctr u = c;
+        u.user = "1000:1001";
+        Slice<Str> sh = {};
+        sh = push(&a, sh, Str("/bin/bash"));
+        sh = push(&a, sh, Str("-l"));
+        expect(t, "ctrterm user", joinwords(&a, ctrterm(&a, &u, "/work", sh)),
+               "/d/bin/docker|exec|-it|-u|1000:1001|-e|HOME=/prospero/home|-w|/work|"
+               "prospero-p-0011aabb|/bin/bash|-l");
+        u.user = "0";
+        expect(t, "ctrterm root", joinwords(&a, ctrterm(&a, &u, "/", {})),
+               "/d/bin/docker|exec|-it|-u|0|-w|/|prospero-p-0011aabb|/bin/sh|-l");
+    }
+
     // container.ini, kept and read back
     c.created = 1793546320000;
     c.trashed = 1793546330000;

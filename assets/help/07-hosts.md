@@ -100,6 +100,11 @@ Delete container..., also in the Hosts pane's Containers, removes it
 and its sessions for good, as emptying the Trash or the Trash's purge
 after `trash_days` does. A mounted folder is never removed.
 
+A session's Open working folder opens the mounted folder here, where
+its folder is in it; with a copy or an empty workspace its files are
+only in the container. Open in terminal opens a shell inside the
+container, in the session's folder, while it runs.
+
 Whatever user the image names, the engine and the agent run as root in
 the container, which is you, not root, on this computer with Docker
 Desktop, Podman, or rootless Docker. A rootful Docker on Linux would

@@ -398,6 +398,64 @@ static Str ctrexec(Arena *a, Ctr *c)
     return finish(&b);
 }
 
+// Where dir, a path in it, is here: in the folder mounted at /work, else
+// null (its files are only in the container). windows: the tail's
+// slashes turned, for the shell to open it.
+static Str ctrhostpath(Arena *a, Ctr *c, Str dir, b32 windows)
+{
+    Str work = "/work";
+    if (c->workspace!=CTR_MOUNT || !c->folder.len || !startswith(dir, work) ||
+            (dir.len>work.len && dir[work.len]!='/')) {
+        return {};
+    }
+    Str tail = cuthead(dir, work.len);
+    while (tail.len && tail[tail.len-1]=='/') {
+        tail = takehead(tail, tail.len-1);
+    }
+    if (!tail.len) {
+        return c->folder;
+    }
+    Buf b(a, c->folder.len + tail.len);
+    print(&b, c->folder);
+    if (c->folder[c->folder.len-1]=='/' || c->folder[c->folder.len-1]=='\\') {
+        tail = cuthead(tail, 1);
+    }
+    for (iz i = 0; i < tail.len; i++) {
+        putbyte(&b, windows && tail[i]=='/' ? '\\' : tail[i]);
+    }
+    return finish(&b);
+}
+
+// The command that opens a shell in dir in it, in a terminal here, as
+// whom its exec makes Prospero there (ctrexec): shell, a login shell,
+// else /bin/sh's.
+static Slice<Str> ctrterm(Arena *a, Ctr *c, Str dir, Slice<Str> shell)
+{
+    Slice<Str> r = {};
+    r = push(a, r, c->program);
+    r = push(a, r, Str("exec"));
+    r = push(a, r, Str("-it"));
+    if (c->user.len) {
+        r = push(a, r, Str("-u"));
+        r = push(a, r, c->user);
+    }
+    if (c->user.len && c->user!="0") {
+        r = push(a, r, Str("-e"));
+        r = push(a, r, concat(a, "HOME=", ctrhome));
+    }
+    r = push(a, r, Str("-w"));
+    r = push(a, r, dir);
+    r = push(a, r, ctrcname(a, c->name));
+    if (!shell.len) {
+        r = push(a, r, Str("/bin/sh"));
+        r = push(a, r, Str("-l"));
+    }
+    for (iz i = 0; i < shell.len; i++) {
+        r = push(a, r, shell[i]);
+    }
+    return r;
+}
+
 // The command that makes it, as described at the top. cpus, memory and
 // args are [container]'s.
 static Slice<Str> ctrcreateargv(Arena *a, Ctr *c, Str owner, Str state, Str cpus,

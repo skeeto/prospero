@@ -451,6 +451,7 @@ struct GuiHost {
     b32      ctr;       // a container made for sessions (GuiCtr): its Trash stops it
     Str      taskexec;  // a container made for a subagent (ctrtask): its exec
     Str      taskimage; // and its image
+    Ctr     *taskctr;   // and its container.ini
     i64      pid;       // GH_LOCAL: the host's process
     i64      started;   // GH_LOCAL: epoch ms
     Str      endpoint;  // GH_LOCAL
@@ -7609,7 +7610,22 @@ static GuiHost *ctrtask(Gui *g, Arena scratch, Str hostname)
     h = h ? h : addhost(g, GH_REMOTE, hostname);
     h->taskexec  = ctrexec(&g->perm, &c);
     h->taskimage = clone(&g->perm, c.image);
+    h->taskctr   = alloc<Ctr>(&g->perm);
+    *h->taskctr  = ctrparse(&g->perm, name, rd.data);
     return h;
+}
+
+// The container a host is in, made for sessions or for a subagent, as
+// its container.ini says, else null; *running whether it runs, as last
+// known (a subagent's while its host is connected).
+static Ctr *hostctr(Gui *g, GuiHost *h, b32 *running)
+{
+    if (GuiCtr *c = ctrofhost(g, h)) {
+        *running = c->state == "running";
+        return &c->c;
+    }
+    *running = h && h->taskctr && h->up;
+    return h ? h->taskctr : 0;
 }
 
 // A [container] setting of the user's own file, else null.
@@ -7769,7 +7785,24 @@ static TermPlan termplan(Gui *g, Arena *a, GuiSession *s, Str distro = {})
         return r;
     }
     Slice<Str> cmd = {};
-    if (h->kind == GH_REMOTE) {
+    b32        run = 0;
+    Ctr       *c   = h->kind==GH_REMOTE ? hostctr(g, h, &run) : 0;
+    if (c) {
+        // Inside it, by its runtime, as its engine runs there
+        if (!run) {
+            r.why = "Its container is not running";
+            return r;
+        }
+        Slice<Str> sh = {};
+        if (v && v->shellpath.len) {
+            sh = termshell(a, v->shellkind, v->shellpath, 0);
+            if (!sh.len && v->shellkind=="sh") {
+                sh = push(a, sh, v->shellpath);  // bash or /bin/sh, a login shell
+                sh = push(a, sh, Str("-l"));
+            }
+        }
+        cmd = ctrterm(a, c, dir, sh);
+    } else if (h->kind == GH_REMOTE) {
         Reach l = remotelink(g, h->name);
         if (l.ssh.len) {
             cmd = termssh(a, Str("ssh"), l.ssh, dir, hostwin(h));
@@ -16621,7 +16654,8 @@ static b32 ctrwait(Gui *g, Str what)
 }
 
 // CHK_CTR: "made", the container copies --rcwd to /work, with no
-// network, its registry saying so; "trashed", it and its session are in
+// network, its registry saying so; "nofolder", so its session's folder
+// is only in it, not here to open; "trashed", it and its session are in
 // the Trash, the host left; "started", it is up again, its session
 // still in the Trash; "restored", neither is; "gone", nothing of it is
 // listed. Of the shown session's subagent in a container of its own:
@@ -16663,6 +16697,14 @@ static b32 ctrcheck(Gui *g, Str what)
         b32 ok = c->made && !k.network && k.workspace==CTR_COPY && k.image==c->c.image &&
                  g->driverwd.len && pathendswith(k.folder, g->driverwd);
         return ok;
+    } else if (what == "nofolder") {
+        Arena a   = g->frame;
+        Str   why = {};
+        if (!g->sess || g->sess->host!=c->h) {
+            return 0;
+        }
+        sesswork(g, &a, g->sess, &why);
+        return why == "Its files are only in its container";
     } else if (what == "trashed") {
         return c->c.trashed && trashed==1 && !live && !c->h->r;
     } else if (what == "started") {
@@ -16709,6 +16751,8 @@ static DriveOp ctrops[] = {
     {OP_UP, 0, 0, 0, 300, ""},  // selects it all, to be typed over
     {OP_TEXTRCWD, 0, 0, 0, 300, ""},
     {OP_SHOT, 0, 0, 0, 300, "containers-1-new"},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},  // closes the field's completion
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
     {OP_MOVE, T_NEWCREATE, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
@@ -16719,6 +16763,13 @@ static DriveOp ctrops[] = {
     {OP_WAIT, W_IDLE, 0, 0, 60000, ""},
     {OP_MARK, 0, 0, 0, 1000, ""},
     {OP_SHOT, 0, 0, 0, 300, "containers-2-turn"},
+    // Its files copied in, so no folder here to open, but a terminal in
+    // its folder inside it, by its runtime
+    {OP_CHECK, CHK_CTR, 0, 0, 0, "nofolder"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "prompt terminal"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_TERMRAN, 1, 0, 0, " exec -it "},
     {OP_MOVE, T_SESSTITLE, 0, 0, 100, ""},  // untitled, the only one
     {OP_RDOWN, 0, 0, 0, 60, ""},
     {OP_RUP, 0, 0, 0, 500, ""},

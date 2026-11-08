@@ -2564,10 +2564,18 @@ static f32 rightof()
 }
 
 // The folder a session works in, which Open working folder shows: else
-// null, and why in *why.
-static Str sesswork(GuiSession *s, Str *why)
+// null, and why in *why. A container's is here where a folder here is
+// mounted at /work.
+static Str sesswork(Gui *g, Arena *a, GuiSession *s, Str *why)
 {
-    Str cwd = s->view && s->view->cwd.len ? s->view->cwd : s->cwd;
+    Str  cwd = s->view && s->view->cwd.len ? s->view->cwd : s->cwd;
+    b32  run = 0;
+    Ctr *c   = s->host->kind==GH_REMOTE ? hostctr(g, s->host, &run) : 0;
+    if (c && cwd.len) {
+        cwd  = ctrhostpath(a, c, cwd, HOST_WINDOWS);
+        *why = cwd.len ? Str{} : Str("Its files are only in its container");
+        return cwd;
+    }
     *why = s->host->kind==GH_REMOTE ? Str("Its files are on another computer") :
            !cwd.len                 ? Str("Its folder is not known yet") : Str{};
     return why->len ? Str{} : cwd;
@@ -6523,7 +6531,7 @@ static void drawprompt(Gui *g)
     if (g->sess) {
         // Its folder and its terminal, as the Session menu opens them
         Str wwhy = {};
-        Str cwd  = sesswork(s, &wwhy);
+        Str cwd  = sesswork(g, &a, s, &wwhy);
         ImGui::BeginDisabled(wwhy.len > 0);
         if (ImGui::Button(ICON_FOLDER "##folder", v2(bw, 0))) {
             workopen(g, a, cwd);
@@ -7400,7 +7408,7 @@ static void sessitems(Gui *g, Arena a, GuiSession *s)
     // Its two folders: where it works, and where its records are
     Str there = h->kind==GH_REMOTE ? Str("Its files are on another computer") : Str{};
     Str work  = {};
-    Str cwd   = sesswork(s, &work);
+    Str cwd   = sesswork(g, &a, s, &work);
     if (menutip(g, &a, "Open working folder", work,
                 concat(&a, "Open the folder it works in, ", cwd))) {
         workopen(g, a, cwd);
