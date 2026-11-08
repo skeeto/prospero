@@ -143,4 +143,17 @@ llama.cpp router on this machine, and a model at Anthropic:
     $ prospero eval -m anthropic/claude-haiku-5-5 -f all -t t00-operator,t09-delete \
           -o claude.jsonl tests/bench/editbench
 
+`tests/pdfcorpus.py` builds a corpus of PDFs for testing PDF reading,
+from this machine's programs (TeX Live, Chrome, Quartz, Ghostscript,
+qpdf, tesseract), each skipped if missing: real producers' output,
+structural variants (object streams, LZW and other filters, an
+incremental update), damaged and hostile files, oddities of text
+(Type 3 fonts, ToUnicode, forms, invisible text) and images in every
+encoding. Its manifest says what each file is and what a reader should
+make of it; Poppler's reading of each is recorded beside. Its eval
+suite asks one question a task, answered through `read` alone:
+
+    $ uv run tests/pdfcorpus.py build-pdfcorpus
+    $ prospero eval -m MODEL -o pdf.jsonl build-pdfcorpus/eval
+
 [uv]: https://docs.astral.sh/uv/
