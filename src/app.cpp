@@ -22696,6 +22696,9 @@ static b32 startinproc(Gui *g, Arena scratch)
         guilog(g, finish(&b));
     }
     g->engine = newengine(os, &g->perm, cfg, g->statedir, g->inbox, g->skillsdirs);
+    if (g->engine) {
+        g->engine->gui = 1;  // a desktop session's login ran its profile
+    }
     if (!g->engine || !enginestart(g->engine)) {
         g->engineerr = "cannot start the engine";
         return 0;

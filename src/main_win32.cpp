@@ -2073,7 +2073,7 @@ static Proc *os_ptyspawn(Os *, Spawn *, PtySize, iz, Arena)
     SetLastError(50);  // ERROR_NOT_SUPPORTED
     return 0;
 }
-static Str  os_ptypeek(Os *, Proc *) { return {}; }
+static Str  os_ptypeek(Os *, Proc *, iz) { return {}; }
 static void os_ptytake(Os *, Proc *, iz) {}
 static b32  os_ptyresize(Os *, Proc *, PtySize) { return 0; }
 static b32  os_ptybusy(Os *, Proc *) { return 0; }

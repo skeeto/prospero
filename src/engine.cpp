@@ -919,6 +919,8 @@ struct WtJob {
 
 // Engine functions take scratch by value, so that whatever a caller has
 // allocated in its own scratch stays intact below them.
+struct Terms;  // ptyhost.cpp
+
 struct Engine {
     Os         *os;
     Arena       perm;
@@ -965,6 +967,8 @@ struct Engine {
     u64         farserial;
     EHttp      *freehttp; // handles to reuse (ehttp)
     Relay      *relay;    // offers, relayed calls, and those served (relay.cpp)
+    Terms      *terms;    // terminals' shells (ptyhost.cpp)
+    b32         gui;      // the GUI's own engine, in its process
     Slice<Str>  distros;  // the WSL distros installed, as last listed
     Str         ctrname;  // the container runtime, docker or podman, for
     Str         ctrpath;  // subagents (hostlink.cpp): its program, and
@@ -2007,6 +2011,14 @@ static b32  relaylisting(Engine *, Buf *, Endpoint *);
 static b32  relaytoken(Str);
 static void relaytick(Engine *, Arena);
 static i64  relaynext(Engine *, i64 now);
+static void termopen(Engine *, Arena, i64 id, Json *);
+static void termcmd(Engine *, Arena, i32 cmd, Json *);
+static b32  termrecord(Engine *, Arena, Record);
+static void termtick(Engine *, Arena);
+static i64  termnext(Engine *, i64 now);
+static i32  termcount(Engine *, i64 peer);
+static void termhangupall(Engine *, i64 peer, Str sid);
+static Terms *newterms(Arena *);
 
 // Start a request to an endpoint, its records to req->mbox with its id,
 // for a session (s) or not; with no endpoint, a plain request, or at
@@ -19844,6 +19856,9 @@ static void cmddelete(Engine *e, Arena scratch, i64 id, Json *j)
     Slice<Str> mines   = {};  // their scratch directories
     err = deletetree(e, &scratch, &sc, tree, &deleted, &mines);
     removelater(e, ownscratch(e, &scratch, &sc, deleted, mines));
+    for (iz i = 0; i < deleted.len; i++) {
+        termhangupall(e, -1, deleted[i]);
+    }
     replydeleted(e, scratch, id, sid, err, deleted);
 }
 
@@ -19925,6 +19940,7 @@ static void cmdtrash(Engine *e, Arena scratch, i64 id, Json *j)
             e->parked.len--;
         }
         trashed = push(&scratch, trashed, msid);
+        termhangupall(e, -1, msid);
     }
     e->wtdue = push(&e->perm, e->wtdue, clone(&e->perm, sid));
 
@@ -21645,6 +21661,7 @@ static void command(Engine *e, Arena scratch, Str line)
         case CMD_EPAUTH:
         case CMD_SHELL:
         case CMD_GIT:
+        case CMD_TERMOPEN:
             reply(e, scratch, id, 0, "the engine is stopping", sid);
             return;
         }
@@ -21660,6 +21677,7 @@ static void command(Engine *e, Arena scratch, Str line)
         if (e->home.len) {
             putstrkey(&w.json, "home", e->home);  // where ~ is
         }
+        putintkey(&w.json, "pty", PTY_ABLE);  // whether term.open can work
         emit(e, evend(&w));
         reply(e, scratch, id, 1, {}, {});
     } return;
@@ -21689,6 +21707,7 @@ static void command(Engine *e, Arena scratch, Str line)
             stopjobs(t, scratch, 1);
         }
         farstop(e, scratch, 1);
+        termhangupall(e, -1, {});
         wtquit(e);  // a job under way is asked to stop, and waited for
         reply(e, scratch, id, 1, {}, {});
     } return;
@@ -21717,6 +21736,7 @@ static void command(Engine *e, Arena scratch, Str line)
         putintkey(&w.json, "parked", e->parked.len);
         putintkey(&w.json, "turns", turns);
         putintkey(&w.json, "jobs", jobs);
+        putintkey(&w.json, "terms", termcount(e, -1));
         emit(e, evend(&w));
     } return;
     case CMD_STOP:
@@ -21754,6 +21774,9 @@ static void command(Engine *e, Arena scratch, Str line)
         relaymore(e, j);
         return;
     case CMD_RELAYPEER:
+        if (jsonstr(jsonget(j, "state")) == "gone") {
+            termhangupall(e, jsonint(jsonget(j, "peer"), 0), {});
+        }
         relaypeernews(e, scratch, j);
         return;
     case CMD_RELAYCALL:
@@ -21818,6 +21841,15 @@ static void command(Engine *e, Arena scratch, Str line)
         return;
     case CMD_EPLOGOUT:
         cmdeplogout(e, scratch, id, j);
+        return;
+    case CMD_TERMOPEN:
+        termopen(e, scratch, id, j);
+        return;
+    case CMD_TERMINPUT:
+    case CMD_TERMRESIZE:
+    case CMD_TERMACK:
+    case CMD_TERMCLOSE:
+        termcmd(e, scratch, cmd, j);  // no reply
         return;
     case CMD_NONE:
         reply(e, scratch, id, 0, "unknown command", {});
@@ -22048,7 +22080,7 @@ static void onrecord(Engine *e, Arena scratch, Record r)
         return;
     } else if (onconfig(e, scratch, r) || onprobe(e, scratch, r) ||
                onctl(e, scratch, r) || onlister(e, scratch, r) ||
-               relayrecord(e, scratch, r)) {
+               relayrecord(e, scratch, r) || termrecord(e, scratch, r)) {
         return;
     }
 
@@ -22272,6 +22304,7 @@ static void enginethread(void *arg)
         next = e->wtdue.len || e->wtgone.len ? now : next;
         next = !e->quitting && e->trashat<next ? e->trashat : next;
         next = relaynext(e, now)<next ? relaynext(e, now) : next;
+        next = termnext(e, now)<next ? termnext(e, now) : next;
         for (Lister *l = e->listers; l; l = l->next) {
             next = !l->replied && l->by<next ? l->by : next;
         }
@@ -22316,6 +22349,7 @@ static void enginethread(void *arg)
         }
         listertimeout(e, newarena(e->scratch), now);
         relaytick(e, newarena(e->scratch));
+        termtick(e, newarena(e->scratch));
         if (mcpnext(e) <= now) {
             mcptick(e, newarena(e->scratch), now);
         }
@@ -22399,6 +22433,7 @@ static Engine *newengine(Os *os, Arena *perm, Config *cfg, Str statedir,
     }
     e->perm     = newarena(r);
     e->relay    = newrelay(os, &e->perm);
+    e->terms    = newterms(&e->perm);
     Str exe     = os_exepath(os, &e->perm);
     e->exedir   = parentdir(exe);
     e->env      = os_environ(os, &e->perm);

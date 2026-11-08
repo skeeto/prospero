@@ -2153,11 +2153,13 @@ static void os_procfree(Os *os, Proc *p)
     procrelease(p);
 }
 
-static Str os_ptypeek(Os *, Proc *p)
+static Str os_ptypeek(Os *, Proc *p, iz off)
 {
     os_lock(&p->lock);
     iz avail = (iz)(p->wpos - p->rpos);
-    iz at    = (iz)(p->rpos % p->ringcap);
+    assert(off>=0 && off<=avail);
+    avail -= off;
+    iz at    = (iz)((p->rpos + off) % p->ringcap);
     iz len   = avail<p->ringcap-at ? avail : p->ringcap-at;
     p->told  = p->told && avail;
     os_unlock(&p->lock);
@@ -4053,6 +4055,229 @@ static void loginenviron(Os *os, Arena scratch)
 #endif
 
 
+// prospero --tty-probe: a stand-in shell for testing terminals, which
+// reads a command a line from its terminal and answers on it, without
+// echo or output processing, so that what it writes arrives as written:
+//
+//   size           "size COLSxROWS XPXxYPX"
+//   echo TEXT      "TEXT"
+//   flood N        N bytes of floodbyte, then "flood end"
+//   env NAME       "env NAME=VALUE", or "env NAME unset"
+//   cwd            "cwd DIR"
+//   hup FILE       on SIGHUP, write "hup" to FILE and exit 129
+//   sleep MS       "slept" once MS passed
+//   busy MS        a job in the foreground for MS, then "busy done"
+//   nohup SECONDS  a child that ignores SIGHUP and lives that long,
+//                  "nohup PID"
+//   exit N         exit with status N
+//
+// It starts with "probe ready", and a resize prints "winch COLSxROWS".
+
+static volatile sig_atomic_t probewinch;
+static char probehup[1024];
+
+static void probeonwinch(int) { probewinch = 1; }
+
+static void probeonhup(int)
+{
+    i32 fd = open(probehup, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+    if (fd >= 0) {
+        if (write(fd, "hup\n", 4)) {}
+        close(fd);
+    }
+    _exit(129);
+}
+
+struct ProbeOut {
+    u8 buf[4096];
+    iz len;
+};
+
+static void probeput(ProbeOut *o, Str s)
+{
+    for (iz i = 0; i<s.len && o->len<countof(o->buf); i++) {
+        o->buf[o->len++] = s[i];
+    }
+}
+
+static void probeint(ProbeOut *o, i64 v)
+{
+    u8  tmp[24];
+    iz  n   = 0;
+    u64 u   = v<0 ? -(u64)v : (u64)v;
+    do tmp[n++] = (u8)('0' + u%10); while (u /= 10);
+    if (v < 0) tmp[n++] = '-';
+    for (; n > 0; n--) probeput(o, {tmp+n-1, 1});
+}
+
+static void probeflush(ProbeOut *o)
+{
+    probeput(o, "\n");
+    writeall(1, {o->buf, o->len});
+    o->len = 0;
+}
+
+static void probesize(ProbeOut *o, Str what, b32 px)
+{
+    struct winsize ws = {};
+    ioctl(0, TIOCGWINSZ, &ws);
+    probeput(o, what);
+    probeint(o, ws.ws_col);
+    probeput(o, "x");
+    probeint(o, ws.ws_row);
+    if (px) {
+        probeput(o, " ");
+        probeint(o, ws.ws_xpixel);
+        probeput(o, "x");
+        probeint(o, ws.ws_ypixel);
+    }
+    probeflush(o);
+}
+
+static void probenap(i64 ms)
+{
+    struct timespec ts = {(time_t)(ms/1000), (long)(ms%1000*1000000)};
+    while (nanosleep(&ts, &ts)<0 && errno==EINTR) {}
+}
+
+// Byte i of a flood: lines of 64 bytes, letters shifting by line.
+static u8 floodbyte(i64 i)
+{
+    return i%64==63 ? '\n' : (u8)('a' + (i/64 + i%64)%26);
+}
+
+static void ttyprobe(char **argv)
+{
+    (void)argv;
+    struct termios tio = {};
+    if (!tcgetattr(0, &tio)) {
+        tio.c_oflag &= ~(tcflag_t)OPOST;
+        tio.c_lflag &= ~(tcflag_t)(ECHO|ECHONL);
+        tcsetattr(0, TCSANOW, &tio);
+    }
+    struct sigaction sa = {};
+    sa.sa_handler = probeonwinch;  // no SA_RESTART: read returns
+    sigaction(SIGWINCH, &sa, 0);
+
+    ProbeOut o = {};
+    probeput(&o, "probe ready");
+    probeflush(&o);
+    u8 line[4096];
+    iz len = 0;
+    for (;;) {
+        if (probewinch) {
+            probewinch = 0;
+            probesize(&o, "winch ", 0);
+        }
+        iz nl = 0;
+        for (; nl<len && line[nl]!='\n' && line[nl]!='\r'; nl++) {}
+        if (nl == len) {
+            len = len==countof(line) ? 0 : len;
+            iz r = read(0, line+len, (size_t)(countof(line)-len));
+            if (r<0 && errno==EINTR) {
+                continue;
+            } else if (r <= 0) {
+                _exit(0);
+            }
+            len += r;
+            continue;
+        }
+        Str cmd = {line, nl};
+        Cut c   = cut(cmd, ' ');
+        Str arg = c.tail;
+        Int n   = parseint(arg);
+        if (c.head == "size") {
+            probesize(&o, "size ", 1);
+        } else if (c.head == "echo") {
+            probeput(&o, arg);
+            probeflush(&o);
+        } else if (c.head=="flood" && n.ok && n.val>=0) {
+            u8 buf[4096];
+            for (i64 i = 0; i < n.val;) {
+                iz k = 0;
+                for (; k<countof(buf) && i<n.val; k++, i++) {
+                    buf[k] = floodbyte(i);
+                }
+                writeall(1, {buf, k});
+            }
+            probeput(&o, "flood end");
+            probeflush(&o);
+        } else if (c.head == "env") {
+            char name[256] = {};
+            for (iz i = 0; i<arg.len && i<countof(name)-1; i++) {
+                name[i] = (char)arg[i];
+            }
+            char *v = getenv(name);
+            probeput(&o, "env ");
+            probeput(&o, arg);
+            if (v) {
+                probeput(&o, "=");
+                probeput(&o, {(u8 *)v, (iz)strlen(v)});
+            } else {
+                probeput(&o, " unset");
+            }
+            probeflush(&o);
+        } else if (c.head == "cwd") {
+            char dir[1024];
+            probeput(&o, "cwd ");
+            if (getcwd(dir, sizeof(dir))) {
+                probeput(&o, {(u8 *)dir, (iz)strlen(dir)});
+            }
+            probeflush(&o);
+        } else if (c.head=="hup" && arg.len && arg.len<countof(probehup)) {
+            __builtin_memcpy(probehup, arg.data, (size_t)arg.len);
+            probehup[arg.len] = 0;
+            signal(SIGHUP, probeonhup);
+            probeput(&o, "hup set");
+            probeflush(&o);
+        } else if (c.head=="sleep" && n.ok) {
+            probenap(n.val);
+            probeput(&o, "slept");
+            probeflush(&o);
+        } else if (c.head=="busy" && n.ok) {
+            signal(SIGTTOU, SIG_IGN);
+            pid_t pid = fork();
+            if (!pid) {
+                setpgid(0, 0);
+                tcsetpgrp(0, getpid());
+                probenap(n.val);
+                _exit(0);
+            } else if (pid > 0) {
+                setpgid(pid, pid);
+                tcsetpgrp(0, pid);
+                while (waitpid(pid, 0, 0)<0 && errno==EINTR) {}
+                tcsetpgrp(0, getpgrp());
+            }
+            probeput(&o, "busy done");
+            probeflush(&o);
+        } else if (c.head=="nohup" && n.ok) {
+            pid_t pid = fork();
+            if (!pid) {
+                signal(SIGHUP, SIG_IGN);
+                i32 null = open("/dev/null", O_RDWR);
+                dup2(null, 0);
+                dup2(null, 1);
+                dup2(null, 2);
+                probenap(n.val*1000);
+                _exit(0);
+            }
+            probeput(&o, "nohup ");
+            probeint(&o, pid);
+            probeflush(&o);
+        } else if (c.head=="exit" && n.ok) {
+            _exit((int)n.val);
+        } else if (cmd.len) {
+            probeput(&o, "? ");
+            probeput(&o, cmd);
+            probeflush(&o);
+        }
+        iz rest = len - nl - 1;
+        __builtin_memmove(line, line+nl+1, (size_t)rest);
+        len = rest;
+    }
+}
+
+
 #if PROSPERO_DESKTOP
 // The desktop helper, "prospero desktop" (main_desktop_x11.cpp)
 extern "C" int prospero_desktop(int argc, char **argv);
@@ -4062,6 +4287,8 @@ int main(int argc, char **argv)
 {
     if (argc>1 && reapmode(argv[1])) {
         reap(argc, argv);
+    } else if (argc>1 && !__builtin_strcmp(argv[1], "--tty-probe")) {
+        ttyprobe(argv);
     }
     #if PROSPERO_DESKTOP
     if (argc>1 && !__builtin_strcmp(argv[1], "desktop")) {

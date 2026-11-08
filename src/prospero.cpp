@@ -325,15 +325,25 @@ struct PtySize {
 };
 // Null on failure, explained by os_lasterr.
 static Proc   *os_ptyspawn(Os *, Spawn *, PtySize, iz ring, Arena scratch);
-// The oldest output in the ring, perhaps not all of it, valid until
-// os_ptytake; empty when there is none, re-arming PROC_READY.
-static Str     os_ptypeek(Os *, Proc *);
+// Output in the ring from off bytes past the oldest, perhaps not all of
+// it, valid until os_ptytake; empty when there is none, re-arming
+// PROC_READY. So output may be sent ahead and kept until acknowledged.
+static Str     os_ptypeek(Os *, Proc *, iz off);
 static void    os_ptytake(Os *, Proc *, iz len);  // drop len peeked bytes
 // The kernel tells the foreground programs (SIGWINCH). 0 on failure.
 static b32     os_ptyresize(Os *, Proc *, PtySize);
 // Whether a program other than the child runs in the foreground, as when
 // a shell runs a command.
 static b32     os_ptybusy(Os *, Proc *);
+#if defined(_WIN32)
+enum { PTY_ABLE = 0, PTY_MAC = 0, PTY_LINUX = 0 };  // os_ptyspawn fails
+#elif defined(__APPLE__)
+enum { PTY_ABLE = 1, PTY_MAC = 1, PTY_LINUX = 0 };
+#elif defined(__linux__)
+enum { PTY_ABLE = 1, PTY_MAC = 0, PTY_LINUX = 1 };
+#else
+enum { PTY_ABLE = 1, PTY_MAC = 0, PTY_LINUX = 0 };
+#endif
 
 // A program started apart from this one, to outlive it, as a terminal
 // window is: neither waited for nor killed with it, its output nowhere,
@@ -728,6 +738,7 @@ static u32     os_guilimits(Os *);
 #include "help.cpp"   // after config.cpp and mcp.cpp: cfgkinds, hexval
 #include "engine.cpp"
 #include "relay.cpp"
+#include "ptyhost.cpp"  // after relay.cpp
 #include "git.cpp"
 #include "worktree.cpp"
 #include "cli.cpp"

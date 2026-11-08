@@ -3635,7 +3635,9 @@ def hello_caps(t):
                                                    "relay.call", "offer", "ask.touch",
                                                    "shell.env", "call.stop", "cut", "uncut",
                                                    "approve", "endpoint.auth",
-                                                   "endpoint.logout"]
+                                                   "endpoint.logout", "term.open",
+                                                   "term.input", "term.resize",
+                                                   "term.ack", "term.close"]
         t.check(cmds == want, f"cmds: {cmds}")
         caps = hello.get("caps", [])
         t.check(isinstance(caps, list) and all(isinstance(c, str) for c in caps) and
@@ -3646,9 +3648,10 @@ def hello_caps(t):
                  "message", "bypass", "nofolder", "dir", "config.create", "side", "background", "models",
                  "mcp", "mcp.auth", "task.remote", "task.host", "memory", "shell",
                  "git", "answer.trust", "trash", "cut", "endpoint.auth",
-                 "endpoint.copilot"} <= set(caps)
+                 "endpoint.copilot", "term"} <= set(caps)
                 and "host" not in caps,
                 f"caps: {caps}")
+        t.check(hello.get("pty") == (0 if t.host.windows else 1), f"pty: {hello.get('pty')}")
 
         sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
         local = isinstance(t.host, LocalHost)
@@ -15500,6 +15503,394 @@ def worktree_quit(t):
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")
+
+
+# Terminals: term.open and its commands (ptyhost.cpp), each with
+# "prospero --tty-probe" for its shell, a stand-in that answers commands
+
+
+TERM_WINDOW = 256 << 10
+
+
+def ttyprobe(t):
+    """[terminal] shell set to this harness's own --tty-probe."""
+    exe = getattr(t.host, "exe", None) or t.host.prospero
+    with open(t.config, "a") as f:
+        # Quoted as a word of its own, and so the whole value too
+        f.write(f'[terminal]\nshell = "\\"{exe}\\" --tty-probe"\n')
+
+
+class Tty:
+    """A terminal of term.open: its output gathered in order, and acked
+    every ackevery bytes and when no more has come (after slow seconds
+    each time), or not at all while hold. Records may be lost on purpose (dropafter, the first at
+    or past that offset), and a gap asks for output again (resend)."""
+
+    def __init__(self, t, h, sid, cols=80, rows=24, **kw):
+        self.t = t
+        self.h = h
+        r = h.call("term.open", sid=sid, cols=cols, rows=rows, **kw)
+        t.check(r.get("ok"), f"term.open: {r}")
+        self.reply = r
+        self.tid = r["tid"]
+        self.data = bytearray()
+        self.acked = 0
+        self.asked = -1      # where a resend was last asked from
+        self.cur = 0         # where line() looks next
+        self.at = 0          # the next of h.events to look at
+        self.end = None
+        self.busy = []
+        self.window = 0      # the most output sent past what was acked
+        self.records = 0
+        self.dups = 0        # records of output already had
+        self.resends = 0
+        self.ackevery = 0
+        self.slow = 0.0
+        self.hold = False
+        self.dropafter = None
+        self.dropped = 0
+
+    def type(self, text):
+        data = text.encode() if isinstance(text, str) else text
+        self.h.send("term.input", tid=self.tid, data=base64.b64encode(data).decode())
+
+    def ack(self, resend=False):
+        fields = {"resend": True} if resend else {}
+        self.h.send("term.ack", tid=self.tid, off=len(self.data), **fields)
+        self.acked = len(self.data)
+
+    def step(self, ev):
+        if ev.get("tid") != self.tid or "peer" in ev:
+            return
+        name = ev.get("ev")
+        if name == "term.end":
+            self.end = ev
+        elif name == "term.busy":
+            self.busy.append(ev["busy"])
+        elif name == "term":
+            self.records += 1
+            off = ev["off"]
+            data = base64.b64decode(ev["data"])
+            self.window = max(self.window, off + len(data) - self.acked)
+            if self.dropafter is not None and off >= self.dropafter:
+                self.dropafter = None
+                self.dropped += 1
+                return
+            if off > len(self.data):
+                if self.asked != len(self.data):  # once for each gap
+                    self.asked = len(self.data)
+                    self.resends += 1
+                    self.ack(resend=True)
+                return
+            if off < len(self.data):
+                self.dups += 1
+                have = bytes(self.data[off:off + len(data)])
+                if data[:len(have)] != have:
+                    raise Failure(f"output at {off} differs when sent again")
+                data = data[len(have):]
+            self.data += data
+            if not self.hold and len(self.data) - self.acked >= max(1, self.ackevery):
+                self.later()
+
+    def later(self):
+        """Ack what came, after a while if slow."""
+        if self.slow:
+            time.sleep(self.slow)
+        self.ack()
+
+    def pump(self, until, timeout=20, what="output"):
+        deadline = time.monotonic() + timeout
+        while not until(self):
+            with self.h.cond:
+                evs = self.h.events[self.at:]
+                self.at = len(self.h.events)
+                if not evs:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        tail = bytes(self.data[-300:])
+                        raise Failure(f"timed out waiting for {what}; "
+                                      f"{len(self.data)} bytes, the last {tail!r}")
+                    self.h.cond.wait(min(left, 0.25))
+                    continue
+            for ev in evs:
+                self.step(ev)
+            if not self.hold and len(self.data) > self.acked:
+                self.later()  # all there is for now
+
+    def line(self, prefix, timeout=20):
+        """The next whole line of output that starts with prefix."""
+        found = []
+
+        def has(tt):
+            while True:
+                nl = tt.data.find(b"\n", tt.cur)
+                if nl < 0:
+                    return False
+                line = bytes(tt.data[tt.cur:nl]).decode(errors="replace")
+                tt.cur = nl + 1
+                if line.startswith(prefix):
+                    found.append(line)
+                    return True
+        self.pump(has, timeout, repr(prefix))
+        return found[0]
+
+    def ended(self, timeout=20):
+        self.pump(lambda tt: tt.end is not None, timeout, "term.end")
+        return self.end
+
+
+def floodbytes(n):
+    """What --tty-probe's flood N writes (floodbyte)."""
+    out = bytearray(n)
+    for i in range(n):
+        out[i] = 10 if i % 64 == 63 else 97 + (i // 64 + i % 64) % 26
+    return bytes(out)
+
+
+def termsession(t, h):
+    return h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+
+
+@scenario(bound=30, posix=True)
+def term_basic(t):
+    """A terminal's shell gets its size, its folder, the terminal's
+    environment without another terminal's, a resize, and term.busy while
+    a job has the terminal; its exit ends it with its status, after all
+    of its output."""
+    ttyprobe(t)
+    h = t.headless(env={"COLUMNS": "99", "LINES": "9", "TERM_SESSION_ID": "x",
+                        "ITERM_PROFILE": "y", "TERM": "dumb"})
+    try:
+        sid = termsession(t, h)
+        tt = Tty(t, h, sid, cols=100, rows=30, xpx=800, ypx=600)
+        argv = tt.reply.get("argv")
+        t.check(argv and argv[-1] == "--tty-probe", f"argv {argv}")
+        t.check(os.path.realpath(tt.reply.get("cwd")) == os.path.realpath(t.work),
+                f"cwd {tt.reply.get('cwd')}")
+        tt.line("probe ready")
+        tt.type("size\n")
+        got = tt.line("size ")
+        t.check(got == "size 100x30 800x600", got)
+        tt.type("cwd\n")
+        got = tt.line("cwd ")
+        t.check(os.path.realpath(got[4:]) == os.path.realpath(t.work), got)
+        for name, want in [("TERM", None), ("COLORTERM", "truecolor"),
+                           ("TERM_PROGRAM", "Prospero"), ("COLUMNS", "unset"),
+                           ("LINES", "unset"), ("TERM_SESSION_ID", "unset"),
+                           ("ITERM_PROFILE", "unset")]:
+            tt.type(f"env {name}\n")
+            got = tt.line(f"env {name}")
+            if name == "TERM":
+                t.check(got in ("env TERM=xterm-256color", "env TERM=xterm"), got)
+            elif want == "unset":
+                t.check(got == f"env {name} unset", got)
+            else:
+                t.check(got == f"env {name}={want}", got)
+        h.send("term.resize", tid=tt.tid, cols=120, rows=40)
+        got = tt.line("winch ")
+        t.check(got == "winch 120x40", got)
+
+        tt.type("busy 2500\n")
+        tt.pump(lambda x: 1 in x.busy, 10, "term.busy 1")
+        tt.line("busy done", 10)
+        tt.pump(lambda x: x.busy[-1:] == [0], 10, "term.busy 0")
+
+        tt.type("echo bye\nexit 3\n")
+        end = tt.ended()
+        t.check(end.get("code") == 3 and end.get("signal") == 0, f"term.end {end}")
+        t.check(end.get("off") == len(tt.data), f"end at {end.get('off')}, "
+                f"had {len(tt.data)}")
+        t.check(tt.data.endswith(b"bye\n"), f"the last output {bytes(tt.data[-20:])!r}")
+        deadline = time.monotonic() + 5
+        while h.call("status").get("terms") and time.monotonic() < deadline:
+            time.sleep(0.1)
+        t.check(h.call("status").get("terms") == 0, "the terminal went")
+    finally:
+        h.close()
+
+
+@scenario(bound=90, posix=True, alone=True)
+def term_flood(t):
+    """10 MiB through a terminal to a slow acker arrive byte for byte,
+    with no more than the window unacked at any time."""
+    ttyprobe(t)
+    h = t.headless()
+    try:
+        sid = termsession(t, h)
+        tt = Tty(t, h, sid)
+        tt.line("probe ready")
+        n = 10 << 20
+        tt.ackevery = 1 << 20  # past the window: acks only once it stops
+        tt.slow = 0.02
+        start = len(tt.data)
+        tt.type(f"flood {n}\n")
+        tt.pump(lambda x: len(x.data) >= start + n + len(b"flood end\n"), 80,
+                "the flood")
+        got = bytes(tt.data[start:start + n])
+        if got != floodbytes(n):
+            bad = next(i for i in range(n) if got[i] != floodbytes(i + 1)[i])
+            raise Failure(f"the flood differs at byte {bad}")
+        t.check(bytes(tt.data[start + n:]) == b"flood end\n",
+                f"after the flood {bytes(tt.data[start + n:start + n + 40])!r}")
+        t.check(tt.window <= TERM_WINDOW, f"{tt.window} bytes unacked at once")
+        t.check(tt.dups == 0 and tt.resends == 0,
+                f"{tt.dups} records again, {tt.resends} resends")
+        t.check(tt.window > TERM_WINDOW * 3 // 4, f"the window never filled: {tt.window}")
+        t.note(f"{tt.records} records, window {tt.window}")
+        tt.type("exit 0\n")
+        t.check(tt.ended().get("code") == 0, "exit 0")
+    finally:
+        h.close()
+
+
+@scenario(bound=40, posix=True)
+def term_resend(t):
+    """Output lost on the way is sent again from where a resend asks, and
+    output never acked is sent again after a stall."""
+    ttyprobe(t)
+    h = t.headless()
+    try:
+        sid = termsession(t, h)
+        tt = Tty(t, h, sid)
+        tt.line("probe ready")
+        n = 1 << 20
+        start = len(tt.data)
+        tt.dropafter = start + 100000
+        tt.type(f"flood {n}\n")
+        tt.line("flood end", 20)
+        t.check(tt.dropped == 1 and tt.resends == 1,
+                f"dropped {tt.dropped}, resends {tt.resends}")
+        t.check(bytes(tt.data[start:start + n]) == floodbytes(n), "the flood is whole")
+
+        # A stall: nothing acked for longer than TERM_STALL (3 s)
+        tt.hold = True
+        start = len(tt.data)
+        tt.type(f"flood {n}\n")
+        tt.pump(lambda x: len(x.data) - x.acked >= TERM_WINDOW, 10, "a full window")
+        before = tt.dups
+        time.sleep(4)
+        tt.pump(lambda x: x.dups > before, 5, "output sent again")
+        tt.hold = False
+        tt.ack()
+        tt.line("flood end", 20)
+        t.check(bytes(tt.data[start:start + n]) == floodbytes(n), "the flood is whole")
+        t.check(tt.window <= TERM_WINDOW, f"{tt.window} bytes unacked at once")
+        t.check(tt.end is None, f"no end: {tt.end}")
+    finally:
+        h.close()
+
+
+@scenario(bound=30, posix=True)
+def term_close(t):
+    """term.close hangs up: the shell gets SIGHUP, and what ignores it
+    lives on; with kill, the shell's whole tree goes."""
+    ttyprobe(t)
+    h = t.headless()
+    try:
+        sid = termsession(t, h)
+        hup = t.host.join(t.base, "hup1")
+        tt = Tty(t, h, sid)
+        tt.line("probe ready")
+        tt.type(f"hup {hup}\nnohup 30\n")
+        tt.line("hup set")
+        pid = int(tt.line("nohup ")[6:])
+        h.send("term.close", tid=tt.tid)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not os.path.exists(hup):
+            time.sleep(0.05)
+        t.check(os.path.exists(hup) and open(hup).read() == "hup\n", "the shell got SIGHUP")
+        t.check(t.host.alive(pid), "what ignored the hang-up lives on")
+        t.host.killpid(pid)
+        count = tt.records
+        tt.type("echo more\n")  # dropped: the terminal is gone
+        time.sleep(0.5)
+        tt.pump(lambda x: True, 1)
+        t.check(tt.records == count and tt.end is None,
+                f"nothing more after close: {tt.records - count} records, end {tt.end}")
+
+        tt = Tty(t, h, sid)
+        tt.line("probe ready")
+        tt.type("nohup 30\n")
+        pid = int(tt.line("nohup ")[6:])
+        h.send("term.close", tid=tt.tid, kill=True)
+        t.check(t.gone([pid]), "kill takes what ignored the hang-up too")
+        deadline = time.monotonic() + 5
+        while h.call("status").get("terms") and time.monotonic() < deadline:
+            time.sleep(0.1)
+        t.check(h.call("status").get("terms") == 0, "both terminals went")
+
+        # Slots come free: more terminals than TERM_MAX (32), one by one
+        for i in range(40):
+            tt = Tty(t, h, sid)
+            tt.line("probe ready")
+            h.send("term.close", tid=tt.tid, kill=bool(i % 2))
+    finally:
+        h.close()
+
+
+@scenario(bound=30, posix=True)
+def term_quit(t):
+    """A quit hangs up every terminal, and a deleted session's."""
+    ttyprobe(t)
+    h = t.headless()
+    try:
+        sid = termsession(t, h)
+        other = termsession(t, h)
+        hup = t.host.join(t.base, "hup-delete")
+        tt = Tty(t, h, other)
+        tt.line("probe ready")
+        tt.type(f"hup {hup}\n")
+        tt.line("hup set")
+        keep = Tty(t, h, sid)
+        keep.line("probe ready")
+        h.call("close", sid=other)
+        r = h.call("delete", sid=other)
+        t.check(r.get("ok"), f"delete: {r}")
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not os.path.exists(hup):
+            time.sleep(0.05)
+        t.check(os.path.exists(hup), "deleting its session hung the terminal up")
+        keep.type("echo still\n")
+        keep.line("still")
+
+        hup = t.host.join(t.base, "hup-quit")
+        keep.type(f"hup {hup}\n")
+        keep.line("hup set")
+        r = h.call("term.open", sid=sid, cols=80, rows=24)
+        t.check(r.get("ok"), f"a second terminal: {r}")
+        h.call("quit")
+        h.exit()
+        t.check(os.path.exists(hup), "the quit hung the terminal up")
+    finally:
+        h.close()
+
+
+@scenario(bound=15, posix=True)
+def term_errors(t):
+    """term.open refuses a bad or unknown session; the other commands
+    drop what names no terminal; an ack past what was sent is ignored."""
+    ttyprobe(t)
+    h = t.headless()
+    try:
+        r = h.call("term.open", sid="../x", cols=80, rows=24)
+        t.check(not r.get("ok") and "invalid" in r.get("err", ""), f"bad sid: {r}")
+        r = h.call("term.open", sid="20200101-000000-0000", cols=80, rows=24)
+        t.check(not r.get("ok") and "no such session" in r.get("err", ""),
+                f"unknown sid: {r}")
+        h.send("term.input", tid=99, data="aGkK")
+        h.send("term.ack", tid=99, off=5)
+        h.send("term.close", tid=99)
+        sid = termsession(t, h)
+        tt = Tty(t, h, sid)
+        tt.line("probe ready")
+        h.send("term.ack", tid=tt.tid, off=1 << 30)  # past what was sent
+        h.send("term.input", tid=tt.tid, data="not base64!")
+        h.send("term.input", tid=tt.tid, peer=7, data="ZWNobyB4Cg==")  # not its frontend's
+        tt.type("echo ok\n")
+        t.check(tt.line("") == "ok", "the terminal works on")
+        t.check(h.call("status").get("terms") == 1, "one terminal")
+    finally:
+        h.close()
 
 
 # The soak: sessions under 10% random faults for a while

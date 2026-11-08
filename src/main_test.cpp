@@ -486,7 +486,7 @@ static void  os_kill(Os *, Proc *, b32) {}
 static void  os_letgo(Os *, Proc *) {}
 static void  os_procfree(Os *, Proc *) {}
 static Proc *os_ptyspawn(Os *, Spawn *, PtySize, iz, Arena) { return 0; }
-static Str   os_ptypeek(Os *, Proc *) { return {}; }
+static Str   os_ptypeek(Os *, Proc *, iz) { return {}; }
 static void  os_ptytake(Os *, Proc *, iz) {}
 static b32   os_ptyresize(Os *, Proc *, PtySize) { return 0; }
 static b32   os_ptybusy(Os *, Proc *) { return 0; }
@@ -646,6 +646,7 @@ static Str istr(Arena *a, i64 v)
 #include "test/pdf_test.cpp"
 #include "test/delta_test.cpp"
 #include "test/relay_test.cpp"  // after config's test platform
+#include "test/term_test.cpp"
 #include "dbus.cpp"
 #include "test/dbus_test.cpp"
 #include "test/door_test.cpp"
@@ -731,6 +732,7 @@ int main()
     test_pdf(&t);
     test_delta(&t);
     test_relay(&t);
+    test_term(&t);
     test_dbus(&t);
     test_door(&t);
     #if PROSPERO_GUI

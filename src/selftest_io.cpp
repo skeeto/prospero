@@ -830,7 +830,7 @@ static b32 ptywatch(Os *os, Mailbox *mb, Proc *pr, u64 id, PtyWatch *w, i32 ms, 
         }
         iz budget = w->take ? w->take : (iz)1<<40;
         for (;;) {
-            Str s = os_ptypeek(os, pr);
+            Str s = os_ptypeek(os, pr, 0);
             if (!s.len) {
                 more = 0;
                 break;

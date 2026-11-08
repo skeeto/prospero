@@ -3264,6 +3264,34 @@ static Slice<Str> envdel(Arena *a, Slice<Str> env, Str name, b32 windows)
     return r;
 }
 
+// The command that opens a session's shell by hand (Open in terminal,
+// and a terminal tab), as its records give its kind (shellkinds) and
+// program: a POSIX sh as a login shell, so its profile sets it up; wsl
+// in its section's distro, if any. None for a POSIX system's bash or
+// /bin/sh, the defaults, where the terminal's own shell, the user's, is
+// better.
+static Slice<Str> termshell(Arena *a, Str kind, Str path, b32 win, Str distro = {})
+{
+    Slice<Str> r = {};
+    b32 dflt = !win && kind=="sh" && (path=="/bin/sh" || basename(path)=="bash");
+    if (!path.len || dflt) {
+        return r;
+    }
+    r = push(a, r, path);
+    if (kind == "sh") {
+        r = push(a, r, Str("-l"));
+    } else if (kind == "busybox") {
+        r = push(a, r, Str("sh"));
+        r = push(a, r, Str("-l"));
+    } else if (kind=="pwsh" || kind=="powershell") {
+        r = push(a, r, Str("-NoLogo"));
+    } else if (kind=="wsl" && distro.len) {
+        r = push(a, r, Str("-d"));
+        r = push(a, r, distro);
+    }
+    return r;
+}
+
 // A PATH of the directories pre, then path, then post, each joined by
 // the platform's separator, empty ones left out. On Windows the extra
 // directories take backslashes, which cmd.exe's own search wants.

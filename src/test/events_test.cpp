@@ -668,7 +668,8 @@ static void test_events(Test *t)
                "\"mcp\",\"mcp.auth\",\"mcp.code\",\"mcp.logout\",\"mcp.restart\",\"shell\",\"shells\","
                "\"git\",\"trash\",\"trash.empty\",\"relay.offer\",\"relay.data\","
                "\"relay.more\",\"relay.peer\",\"relay.call\",\"offer\",\"ask.touch\",\"shell.env\",\"call.stop\","
-               "\"cut\",\"uncut\",\"approve\",\"endpoint.auth\",\"endpoint.logout\"],"
+               "\"cut\",\"uncut\",\"approve\",\"endpoint.auth\",\"endpoint.logout\","
+               "\"term.open\",\"term.input\",\"term.resize\",\"term.ack\",\"term.close\"],"
                "\"caps\":[\"close.forget\",\"config.refresh\",\"file.base64\",\"desktop\","
                "\"subagents\",\"rename\",\"title.by\",\"archive\",\"group\",\"draft\","
                "\"compact\",\"model\",\"gauge\",\"answer.always\",\"scratch\","
@@ -676,7 +677,8 @@ static void test_events(Test *t)
                "\"answer.always.desktop\",\"skills\",\"plan\",\"queue\",\"message\",\"images\",\"home\",\"bypass\",\"nofolder\",\"dir\",\"config.create\",\"side\",\"background\",\"mcp\",\"models\",\"mcp.auth\",\"task.remote\",\"task.host\",\"memory\",\"shell\","
                "\"git\",\"answer.trust\",\"web\",\"question\",\"files\",\"worktree\",\"worktree.side\","
                "\"trash\",\"relay\",\"question.deadline\",\"ask.deadline\",\"shell.env\",\"call.stop\","
-               "\"cut\",\"approve\",\"files.path\",\"sessions.mention\",\"fork.cwd\",\"endpoint.auth\",\"endpoint.copilot\"]}");
+               "\"cut\",\"approve\",\"files.path\",\"sessions.mention\",\"fork.cwd\",\"endpoint.auth\",\"endpoint.copilot\","
+               "\"term\"]}");
         b.len = 0;
         w = {&b};
         putobject(&w);

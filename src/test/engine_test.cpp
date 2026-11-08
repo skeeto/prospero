@@ -947,6 +947,8 @@ static void test_engine(Test *t)
             "{\"cmd\":\"group\",\"id\":15,\"sid\":\"x\",\"name\":\"g\"}",
             "{\"cmd\":\"draft\",\"id\":16,\"sid\":\"x\",\"text\":\"t\"}",
             "{\"cmd\":\"draft\",\"id\":17,\"sid\":\"../x\",\"text\":\"t\"}",
+            "{\"cmd\":\"term.open\",\"id\":18,\"sid\":\"x\"}",
+            "{\"cmd\":\"term.ack\",\"tid\":1,\"off\":0}",
         };
         for (iz i = 0; i < countof(cmds); i++) {
             command(e, *a, cmds[i]);
@@ -994,6 +996,7 @@ static void test_engine(Test *t)
                "15-no such session\n"
                "16-no such session\n"
                "17-invalid session id\n"
+               "18-the engine is stopping\n"
                "8-command too long\n");
         Buf want(a, 1024);
         print(&want, "{\"ts\":0,\"ev\":\"hello\",\"proto\":0,\"version\":\""
@@ -1003,6 +1006,8 @@ static void test_engine(Test *t)
         w.objects = 1;
         w.comma   = 0;
         putcaps(&w, 0);
+        print(&want, ",\"pty\":");
+        print(&want, (i64)PTY_ABLE);
         print(&want, "}\n");
         expect(t, "hello", hello, finish(&want));
     }

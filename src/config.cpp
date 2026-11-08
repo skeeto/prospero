@@ -246,6 +246,7 @@ static CfgKind cfgkinds[] = {
     {"worktree", 0, "Worktree sessions: each in a git worktree and branch of its own"},
     {"sessions", 0, "Sessions deleted: how long the Trash keeps them"},
     {"ui",       0, "How the GUI looks, and when it tells you of a session"},
+    {"terminal", 0, "The Terminal pane: the shell its tabs run"},
     {"desktop",  0, "The desktop tool: seeing the screen, and the mouse and keyboard"},
     {"web",      0, "Web search and reading web pages: the web_search and web_fetch tools"},
     {"host",     0, "The engine as a background host (prospero serve)"},
@@ -638,6 +639,11 @@ static CfgKey cfgschema[] = {
      "ask waits for you (a permission, a plan to approve, the agent's "
      "questions), done when a session stops by itself "
      "(finished, failed or out of budget); none for neither"},
+
+    {"terminal", "shell", CFG_STRING, "", {}, {}, "terminal",
+     "The program a terminal tab runs, with its arguments, a \"quoted\" "
+     "one holding blanks. Empty: the session's shell, unless it is the "
+     "system's sh, else $SHELL, a POSIX shell as a login shell"},
 
     {"host", "idle_exit", CFG_SECONDS, "600", {}, {}, "host",
      "Seconds a host waits with no client connected and nothing running, "
@@ -1063,7 +1069,8 @@ static b32 cfgruns(CfgKey *k, Str v)
                (k->key=="shell" && !cfghasword("auto sh powershell cmd", v) &&
                 (HOST_WINDOWS || v!="bash"));
     }
-    return k->kind=="ui" && (k->key=="editor" || k->key=="terminal");
+    return (k->kind=="ui" && (k->key=="editor" || k->key=="terminal")) ||
+           (k->kind=="terminal" && k->key=="shell");
 }
 
 // Whether only the user's own file may give a key a value: what runs on

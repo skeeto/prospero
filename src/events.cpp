@@ -73,6 +73,9 @@ enum : i32 {
     EV_RELAYDATA, // the response to a relay.call, part by part
     EV_OFFER,     // what this engine's models are, for a thin engine
     EV_RELIST,    // the sessions changed by no command: list them again
+    EV_TERM,      // a terminal's output (ptyhost.cpp)
+    EV_TERMEND,   // a terminal's shell exited, its output all sent
+    EV_TERMBUSY,  // a job of the shell's has the terminal, or no longer
     EV_COUNT,
 };
 
@@ -136,6 +139,9 @@ static EvInfo evinfo[] = {
     {"relay.data", 0, 0},
     {"offer",      0, 0},
     {"relist",     0, 0},
+    {"term",       0, 0},
+    {"term.end",   0, 0},
+    {"term.busy",  0, 0},
 };
 static_assert(countof(evinfo) == EV_COUNT);
 
@@ -198,6 +204,11 @@ enum : i32 {
     CMD_APPROVE,     // credentials for urls of web includes: listed, approved
     CMD_EPAUTH,      // sign in to ChatGPT for an endpoint: the browser's URL, late
     CMD_EPLOGOUT,    // an endpoint's ChatGPT tokens forgotten
+    CMD_TERMOPEN,    // a terminal: a shell on a pseudo-terminal (ptyhost.cpp)
+    CMD_TERMINPUT,   // bytes typed into it
+    CMD_TERMRESIZE,  // its new size
+    CMD_TERMACK,     // its output taken, up to an offset
+    CMD_TERMCLOSE,   // hung up, or killed
     CMD_COUNT,
 };
 
@@ -211,7 +222,8 @@ static Str cmdnames[] = {
     "mcp.logout", "mcp.restart", "shell", "shells", "git", "trash",
     "trash.empty", "relay.offer", "relay.data", "relay.more", "relay.peer",
     "relay.call", "offer", "ask.touch", "shell.env", "call.stop", "cut",
-    "uncut", "approve", "endpoint.auth", "endpoint.logout",
+    "uncut", "approve", "endpoint.auth", "endpoint.logout", "term.open",
+    "term.input", "term.resize", "term.ack", "term.close",
 };
 static_assert(countof(cmdnames) == CMD_COUNT);
 
@@ -340,6 +352,10 @@ static Str capnames[] = {
                        // redirect replies with a GitHub code (url, code),
                        // and mcp.code {endpoint:1} with none waits for it
                        // to be entered; models' login
+    "term",            // term.open, term.input, term.resize, term.ack and
+                       // term.close: a shell on a pseudo-terminal, its
+                       // output in term records, acked, then term.end;
+                       // term.busy; hello's pty, whether the system can
 };
 
 static Str evname(i32 ev)
