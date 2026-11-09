@@ -1086,11 +1086,16 @@ static void termhotkeys(Gui *g)
             c.ActiveIdUsingNavDirMask      = 0;
         }
     }
-    if (!termctrl(g) || io.KeyShift || !ImGui::IsKeyPressed(ImGuiKey_GraveAccent, false)) {
+    if (!termctrl(g) || !ImGui::IsKeyPressed(ImGuiKey_GraveAccent, false)) {
         return;
     }
     os_guiimereset(g->os);  // on German, ^ is a dead key
-    if (g->panes[PANE_TERMINAL] && g->termfocused) {
+    if (io.KeyShift) {
+        // A new tab, made by drawterm once the pane's size holds
+        g->termaddto = g->sess ? termroot(g, g->sess) : 0;
+        setpane(g, PANE_TERMINAL, 1);
+        g->termfocus = 1;
+    } else if (g->panes[PANE_TERMINAL] && g->termfocused) {
         setpane(g, PANE_TERMINAL, 0);
         g->promptfocus = 1;
         if (c.ActiveId == g->termid) {
@@ -1099,6 +1104,32 @@ static void termhotkeys(Gui *g)
     } else {
         setpane(g, PANE_TERMINAL, 1);
         g->termfocus = 1;
+    }
+    scheddirty(&g->sched);
+}
+
+
+// Why session s can have no new tab now, else empty.
+static Str termaddwhy(Gui *g, GuiSession *s)
+{
+    Str why = termwhy(g, s);
+    return why.len ? why : termfull(g, termroot(g, s));
+}
+
+// A new tab for session s's root, shown in the pane: the shown root's
+// waits for drawterm to size it, another's starts at the last size and
+// follows the pane once shown.
+static void termadd(Gui *g, GuiSession *s)
+{
+    GuiSession *r = termroot(g, s);
+    setpane(g, PANE_TERMINAL, 1);
+    g->termfocus = 1;
+    if (g->sess && termroot(g, g->sess)==r) {
+        g->termaddto = r;
+    } else {
+        i32 cols = g->termlastcols ? g->termlastcols : 80;
+        i32 rows = g->termlastrows ? g->termlastrows : 24;
+        termnew(g, r, cols, rows);
     }
     scheddirty(&g->sched);
 }
@@ -1287,20 +1318,26 @@ static void drawterm(Gui *g)
         }
         scheddirty(&g->sched);
     }
+    // The pane takes its place in the dock over frames, through a
+    // layout (drawpanes), and a shell started smaller loses what
+    // scrolled away, as ConPTY keeps no history: a shell started by key
+    // waits until the size holds for a frame.
+    b32 held = !win->Appearing && !g->layoutpending && !g->layoutnow &&
+               cols==g->termlastcols && rows==g->termlastrows;
+    g->termlastcols = cols;
+    g->termlastrows = rows;
     if (plus) {
+        termnew(g, s, cols, rows);
+    }
+    if (g->termaddto != s) {
+        g->termaddto = 0;  // the shown root changed
+    } else if (held) {
+        g->termaddto = 0;
         termnew(g, s, cols, rows);
     }
 
     TermTab *tt = termsetfront(&s->terms);
     if (!tt || tt->state==TT_NONE) {
-        // The pane takes its place in the dock over frames, through a
-        // layout (drawpanes), and
-        // a shell started smaller loses what scrolled away, as ConPTY
-        // keeps no history: it starts once the size holds for a frame.
-        b32 held = !win->Appearing && !g->layoutpending && !g->layoutnow &&
-                   cols==g->termlastcols && rows==g->termlastrows;
-        g->termlastcols = cols;
-        g->termlastrows = rows;
         if (g->termfocus && !held) {
             return;
         } else if (g->termfocus || ImGui::Button("Start a shell")) {

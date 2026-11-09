@@ -1712,6 +1712,7 @@ struct Gui {
     ImRect             termgrid;     // the front tab's grid, as last drawn
     u32                termserial;   // the last tab's serial
     b32                termfocus;    // focus the terminal when next drawn
+    GuiSession        *termaddto;    // root wanting a new tab once sized
     i32                termlastcols; // the pane's size in cells last frame,
     i32                termlastrows; //   before its shell starts
     b32                termfocused;  // it has the keyboard, as last drawn
@@ -5768,6 +5769,8 @@ static void termcloseall(Gui *);
 static void drawterm(Gui *);
 static void termhotkeys(Gui *);
 static void termsweep(Gui *);
+static Str  termaddwhy(Gui *, GuiSession *);
+static void termadd(Gui *, GuiSession *);
 static void termgrab(Gui *);
 static Str  termscreen(Gui *, Arena *);
 static b32  termsizecheck(Gui *);
@@ -17388,6 +17391,14 @@ static DriveOp planops[] = {
     {OP_KEYDOWN, 0, key, KEY_CTRL, 50, ""}, \
     {OP_KEYUP, 0, key, KEY_CTRL, 50, ""}, \
     {OP_KEYUP, 0, GKEY_CTRL, 0, ms, ""}
+// Physical Ctrl+Shift and a key
+#define CTRLSHIFTKEY(key, ms) \
+    {OP_KEYDOWN, 0, GKEY_CTRL, KEY_CTRL, 50, ""}, \
+    {OP_KEYDOWN, 0, GKEY_SHIFT, KEY_CTRL|KEY_SHIFT, 50, ""}, \
+    {OP_KEYDOWN, 0, key, KEY_CTRL|KEY_SHIFT, 50, ""}, \
+    {OP_KEYUP, 0, key, KEY_CTRL|KEY_SHIFT, 50, ""}, \
+    {OP_KEYUP, 0, GKEY_SHIFT, KEY_CTRL, 50, ""}, \
+    {OP_KEYUP, 0, GKEY_CTRL, 0, ms, ""}
 #define TERMKEY(key, ms) \
     {OP_KEYDOWN, 0, key, 0, 50, ""}, {OP_KEYUP, 0, key, 0, ms, ""}
 
@@ -17526,6 +17537,35 @@ static DriveOp termops[] = {
     {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*onetwo"},
     {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
     {OP_CHECK, CHK_TERMCOUNT, 1, 0, 0, ""},
+    // Ctrl+Shift+` adds a tab, named by its shell until titled, and so
+    // does the session's menu
+    CTRLSHIFTKEY(GKEY_GRAVE, 500),
+    {OP_WAIT, W_TERM, 0, 0, 10000, "tty$"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 100, "echo keyed"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\nkeyed"},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "onetwo|*bash"},
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, ""},
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_POPUP, 0, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "New terminal tab"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_WAIT, W_TERM, 0, 0, 10000, "tty$"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 100, "echo menued"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\nmenued"},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "onetwo|bash|*bash"},
+    {OP_TEXT, 0, 0, 0, 100, "exit"},
+    TERMKEY(GKEY_ENTER, 1000),
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "onetwo|*bash"},
+    {OP_CHECK, CHK_TERMSCREEN, 0, 0, 0, "\nkeyed"},
+    {OP_TEXT, 0, 0, 0, 100, "exit"},
+    TERMKEY(GKEY_ENTER, 1000),
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*onetwo"},
     // exit closes it; a failing exit leaves its screen under a banner,
     // and Enter starts another shell
     {OP_TEXT, 0, 0, 0, 100, "exit"},

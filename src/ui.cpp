@@ -7445,6 +7445,11 @@ static void sessitems(Gui *g, Arena a, GuiSession *s)
                                    : Str("Its shell in its folder, in a terminal"))) {
         termopen(g, a, s);
     }
+    if (menutip(g, &a, "New terminal tab", termaddwhy(g, s),
+                "A shell in its folder, in a tab of the Terminal pane",
+                "Ctrl+Shift+`")) {
+        termadd(g, s);
+    }
     Str close = !s->view ? Str("It is not open here") :
                 s->view->busy && !s->readonly ? Str("Close it once its turn ends") : Str{};
     if (menutip(g, &a, "Close", close,
@@ -14241,6 +14246,7 @@ static void drawmenubar(Gui *g)
             ImGui::MenuItem("Move to Trash");
             ImGui::Separator();
             ImGui::MenuItem("Open in terminal");
+            ImGui::MenuItem("New terminal tab", "Ctrl+Shift+`");
             ImGui::MenuItem("Close");
             ImGui::EndDisabled();
         }
