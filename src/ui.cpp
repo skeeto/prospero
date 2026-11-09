@@ -7990,6 +7990,21 @@ static Str trashleft(Gui *g, Arena *a, GuiSession *root, i64 nowms)
     return finish(&b);
 }
 
+// Show a session, as a click on its row does: the Transcript with it,
+// the box ready, its caret after the draft. One in the Trash cannot
+// open, nor one deleted.
+static b32 sessgo(Gui *g, GuiSession *s)
+{
+    if (s->gone || sessroot(g, s)->trashed) {
+        return 0;
+    }
+    guiselect(g, s);
+    setpane(g, PANE_TRANSCRIPT, 1);
+    g->promptfocus = 1;
+    g->promptend   = 1;
+    return 1;
+}
+
 static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other, i64 nowms)
 {
     f32         sc    = g->scale;
@@ -8004,10 +8019,7 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other, 
     f32    w = ImGui::GetContentRegionAvail().x;
     ImGui::SetNextItemAllowOverlap();
     if (ImGui::Selectable("##s", s==g->sess, 0, v2(0, 2*lineh + 4*sc)) && !r->trashed) {
-        guiselect(g, s);  // one in the Trash cannot open
-        setpane(g, PANE_TRANSCRIPT, 1);  // shown with it, the box ready,
-        g->promptfocus = 1;              // as New session does, its caret
-        g->promptend   = 1;              // after the draft
+        sessgo(g, s);
     }
     ImVec2 r0 = ImGui::GetItemRectMin();
     ImVec2 r1 = ImGui::GetItemRectMax();
@@ -13175,10 +13187,295 @@ static void newfree(Gui *g)
     }
 }
 
+// The Ctrl/Cmd+K palette (palette.cpp): a modal over the window, its
+// query field on top and the sessions it offers below, which it opens.
+
+enum : i32 {
+    PAL_ROWS = 9,  // rows shown before the list scrolls
+};
+
+// Open it as dialogs are next drawn, remembering whether the prompt had
+// the keyboard, to give it back if nothing is picked.
+static void palopen(Gui *g)
+{
+    PalWin *p = &g->palw;
+    p->open   = 1;
+    p->prompt = g->sess && g->promptactive;
+}
+
+// Build the items again from the sessions as they are now, and order
+// them for the query. The pick stays on its item if keep, else goes to
+// the top.
+static void palbuild(Gui *g, b32 keep)
+{
+    PalWin *p = &g->palw;
+    if (!p->base) {
+        p->mem  = newarena(os_reserve(g->os, (iz)1<<24));
+        p->base = p->mem.beg;
+    }
+    Arena scratch = g->frame;
+    Str   pick    = {};
+    if (keep && p->sel>=0 && p->sel<p->order.len) {
+        pick = clone(&scratch, p->items[p->order[p->sel]].id);
+    }
+    p->mem.beg = p->base;
+    Arena *a   = &p->mem;
+    p->items = {};
+    p->sess  = {};
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        GuiSession *root = sessroot(g, s);
+        if (s->gone || !(s->view || s->listed) || root->trashed) {
+            continue;
+        }
+        View   *v  = s->view;
+        PalItem it = {};
+        Buf     id(a, 64);
+        print(&id, (i64)s->host->uid);
+        putbyte(&id, ':');
+        print(&id, s->sid);
+        it.kind   = PAL_SESSION;
+        it.id     = finish(&id);
+        it.title  = clone(a, sesstitle(s));
+        it.group  = clone(a, root->group);
+        it.folder = clone(a, v && v->cwd.len ? v->cwd : s->cwd);
+        it.host   = s->host->kind==GH_ENGINE ? Str{} : clone(a, s->host->name);
+        it.sid    = clone(a, s->sid);
+        it.at     = s->lastact;
+        it.seen   = s->viewseq;
+        it.minor  = sessparent(s).len>0 || root->archived;
+        it.shown  = s == g->sess;
+        p->items  = push(a, p->items, it);
+        p->sess   = push(a, p->sess, s);
+    }
+    Str q    = {(u8 *)p->q, (iz)__builtin_strlen(p->q)};
+    p->order = palorder(a, p->items, q);
+    p->sel   = palkeep(p->items, p->order, pick);
+}
+
+struct PalCb {
+    Gui *g;
+    b32  edited;
+};
+
+static i32 palcb(ImGuiInputTextCallbackData *d)
+{
+    PalCb  *c = (PalCb *)d->UserData;
+    PalWin *p = &c->g->palw;
+    i32     n = (i32)p->order.len;
+    if (d->EventFlag==ImGuiInputTextFlags_CallbackHistory && n) {
+        b32 up = d->EventKey == ImGuiKey_UpArrow;
+        p->sel    = (p->sel + (up ? n-1 : 1)) % n;
+        p->follow = 1;
+    } else if (d->EventFlag == ImGuiInputTextFlags_CallbackEdit) {
+        c->edited = 1;
+    }
+    return 0;
+}
+
+// One session's row: its state's dot and title, and below, dim, what it
+// is, its state, folder, host, group and when it was last active.
+static b32 palrow(Gui *g, Arena a, i32 i, b32 sel, i64 nowms)
+{
+    PalWin     *p     = &g->palw;
+    GuiSession *s     = p->sess[p->order[i]];
+    PalItem    *it    = &p->items[p->order[i]];
+    f32         sc    = g->scale;
+    f32         lineh = ImGui::GetTextLineHeight();
+    f32         small = smallsize(&g->fonts);
+    ImDrawList *dl    = ImGui::GetWindowDrawList();
+    View       *v     = s->view;
+    i32         state = v ? v->state : s->state;
+
+    ImGui::PushID(i);
+    ImVec2 at = ImGui::GetCursorScreenPos();
+    f32    w  = ImGui::GetContentRegionAvail().x;
+    b32    hit = ImGui::Selectable("##r", sel, 0, v2(0, 2*lineh + 4*sc));
+    ImGui::PopID();
+    if (sel && p->follow) {
+        ImGui::ScrollToItem(ImGuiScrollFlags_KeepVisibleEdgeY);
+        p->follow = 0;
+    }
+
+    f32 x     = at.x + 6*sc;
+    b32 down  = s->host->kind!=GH_ENGINE && !s->host->up;
+    b32 asks  = v && v->asks;
+    u32 color = asks || s->readonly ? g->pal->amber : livecolor(g->pal, state);
+    drawdot(dl, v2(x + 4*sc, at.y + 2*sc + lineh/2), 3.5f*sc, color);
+    x += 13*sc;
+    Pen t = {dl, &g->fonts, x, at.y + 2*sc, at.x + w, g->fonts.size};
+    pen(&t, it->title, 0, g->pal->text);
+
+    Pen b = {dl, &g->fonts, x, at.y + 2*sc + lineh, at.x + w, small};
+    if (sessparent(s).len) {
+        pen(&b, "subagent  ", STYLE_BOLD, g->pal->dim);
+    } else if (sessside(s).len) {
+        pen(&b, "side  ", STYLE_BOLD, g->pal->dim);
+    }
+    if (sessroot(g, s)->archived) {
+        pen(&b, "archived  ", STYLE_BOLD, g->pal->dim);
+    }
+    if (down) {
+        b32 back = s->host->r && !s->host->closing;
+        pen(&b, back ? Str("reconnecting") : Str("disconnected"), STYLE_BOLD,
+            back ? g->pal->amber : g->pal->dim);
+    } else if (s->readonly) {
+        pen(&b, "read-only", STYLE_BOLD, g->pal->amber);
+    } else if (asks) {
+        pen(&b, "needs an answer", STYLE_BOLD, g->pal->amber);
+    } else {
+        pen(&b, livelabel(v, state), STYLE_BOLD, livecolor(g->pal, state));
+    }
+    Buf d(&a, 256);
+    print(&d, "  ");
+    print(&d, sesswhere(&a, s));
+    if (s->host->kind != GH_ENGINE) {
+        print(&d, "  on ");
+        print(&d, hostlabel(g, &a, s->host));
+    }
+    if (it->group.len) {
+        print(&d, "  in ");
+        print(&d, it->group);
+    }
+    if (s->lastact) {
+        print(&d, "  ");
+        printage(g, &d, nowms - s->lastact);
+        print(&d, " ago");
+    }
+    pen(&b, finish(&d), 0, g->pal->dim);
+    return hit;
+}
+
+static void drawpalette(Gui *g)
+{
+    PalWin *p  = &g->palw;
+    f32     sc = g->scale;
+    if (p->open) {
+        p->open   = 0;
+        p->close  = 0;
+        p->q[0]   = 0;
+        p->sel    = 0;
+        p->follow = 1;
+        palbuild(g, 0);
+        ImGui::OpenPopup("##palette");
+    }
+    ImGuiViewport *vp = ImGui::GetMainViewport();
+    f32 w = vp->WorkSize.x / 2;
+    w = w<420*sc ? 420*sc : w>760*sc ? 760*sc : w;
+    w = w>vp->WorkSize.x-32*sc ? vp->WorkSize.x-32*sc : w;
+    ImGui::SetNextWindowPos(v2(vp->WorkPos.x + vp->WorkSize.x/2, vp->WorkPos.y + 48*sc),
+                            ImGuiCond_Always, v2(0.5f, 0));
+    ImGui::SetNextWindowSize(v2(w, 0));
+    ImGuiWindowFlags f = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove |
+                         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_AlwaysAutoResize |
+                         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNavInputs;
+    p->shown = ImGui::BeginPopupModal("##palette", 0, f);
+    p->rows  = 0;
+    if (!p->shown) {
+        return;
+    }
+    Arena a     = g->frame;
+    i64   nowms = os_time(g->os);
+    b32   appearing = ImGui::IsWindowAppearing();
+
+    // Its keys, taken ahead of the field, which would otherwise let go
+    // of the keyboard on Enter, and ahead of escapecancel, which would
+    // cancel the shown session's turn on Esc as the palette closes. A
+    // pick's Enter is held until released: the prompt has the keyboard
+    // next, and a held Enter repeating there would send its draft.
+    ImGuiID keys  = ImGui::GetID("##palkeys");
+    b32     enter = ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
+                    ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false);
+    b32     esc   = ImGui::IsKeyPressed(ImGuiKey_Escape, false);
+    b32     pick  = enter && p->sel>=0 && p->sel<p->order.len;
+    ImGuiInputFlags hold = pick ? ImGuiInputFlags_LockUntilRelease : ImGuiInputFlags_LockThisFrame;
+    if (ImGui::IsKeyDown(ImGuiKey_Enter)) {
+        ImGui::SetKeyOwner(ImGuiKey_Enter, keys, hold);
+    }
+    if (ImGui::IsKeyDown(ImGuiKey_KeypadEnter)) {
+        ImGui::SetKeyOwner(ImGuiKey_KeypadEnter, keys, hold);
+    }
+    if (esc) {
+        ImGui::SetKeyOwner(ImGuiKey_Escape, keys, ImGuiInputFlags_LockThisFrame);
+    }
+    i32 n    = (i32)p->order.len;
+    i32 page = PAL_ROWS - 1;
+    if (n && ImGui::IsKeyPressed(ImGuiKey_PageDown)) {
+        p->sel    = p->sel+page < n ? p->sel+page : n-1;
+        p->follow = 1;
+    }
+    if (n && ImGui::IsKeyPressed(ImGuiKey_PageUp)) {
+        p->sel    = p->sel-page > 0 ? p->sel-page : 0;
+        p->follow = 1;
+    }
+
+    // The field has the keyboard throughout
+    if (appearing || !ImGui::IsAnyItemActive()) {
+        ImGui::SetKeyboardFocusHere();
+    }
+    ImGui::SetNextItemWidth(-1);
+    PalCb cb = {g, 0};
+    ImGui::InputTextWithHint("##palq", "Go to a session", p->q, sizeof(p->q),
+                             ImGuiInputTextFlags_CallbackHistory |
+                             ImGuiInputTextFlags_CallbackEdit, palcb, &cb);
+    itemnamed(g, "palette query");
+    if (cb.edited) {
+        palbuild(g, 0);
+        p->follow = 1;
+        n = (i32)p->order.len;
+    }
+
+    // The list, PAL_ROWS rows high at most, scrolled to follow the pick
+    i32 hitrow = -1;
+    if (n) {
+        f32 rowh = 2*ImGui::GetTextLineHeight() + 4*sc + ImGui::GetStyle().ItemSpacing.y;
+        f32 h    = (f32)(n<PAL_ROWS ? n : PAL_ROWS) * rowh;
+        ImGui::BeginChild("##palrows", v2(0, h), 0, ImGuiWindowFlags_NoNavInputs);
+        for (i32 i = 0; i < n; i++) {
+            if (palrow(g, a, i, i==p->sel, nowms)) {
+                hitrow = i;
+            }
+        }
+        ImGui::EndChild();
+        Str first = p->items[p->order[0]].title;
+        iz  len   = first.len<(iz)sizeof(p->first)-1 ? first.len : (iz)sizeof(p->first)-1;
+        __builtin_memcpy(p->first, first.data, (uz)len);
+        p->first[len] = 0;
+        p->rows       = n;
+    } else {
+        ImGui::TextDisabled(p->items.len ? "No session matches." : "No sessions.");
+    }
+    ImGui::TextDisabled("Enter to open, Esc to close");
+
+    // A click outside closes it, as Esc and Ctrl/Cmd+K do
+    b32 outside = !appearing && ImGui::IsMouseClicked(0) &&
+                  !ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows |
+                                          ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
+    GuiSession *go = 0;
+    if (hitrow >= 0) {
+        go = p->sess[p->order[hitrow]];
+    } else if (pick) {
+        go = p->sess[p->order[p->sel]];
+    }
+    if (go) {
+        ImGui::CloseCurrentPopup();
+        if (!sessgo(g, go)) {
+            guilog(g, "the palette's pick could not open: in the Trash, or deleted");
+        }
+    } else if (esc || outside || p->close) {
+        ImGui::CloseCurrentPopup();
+        if (p->prompt) {
+            g->promptfocus = 1;
+            g->promptend   = 1;
+        }
+    }
+    p->close = 0;
+    ImGui::EndPopup();
+}
+
 // The menus' shortcuts, wherever the focus is (a global route, which a
 // focused field's own use of a key goes ahead of): a new session, zoom
 // by key or by Ctrl+wheel (Cmd on macOS), find and the session's
-// folding toggles, Settings, up to a parent, and quitting on Linux, where
+// folding toggles, Settings, the palette, up to a parent, and quitting on Linux, where
 // no system shortcut does (macOS has Cmd+Q, Windows Alt+F4). While the
 // terminal holds the keyboard, which culls global routes, the ones it
 // leaves the app (termkept) route over it; the rest are its.
@@ -13216,6 +13513,14 @@ static void menukeys(Gui *g)
     }
     if (ImGui::Shortcut(ctrl|ImGuiKey_Comma, glob)) {
         opensettings(g);
+    }
+    // The palette: again to close it, and never over another dialog
+    if (ImGui::Shortcut(ctrl|ImGuiKey_K, glob)) {
+        if (g->palw.shown) {
+            g->palw.close = 1;
+        } else if (!ImGui::GetTopMostPopupModal()) {
+            palopen(g);
+        }
     }
     // Up from a subagent or side chat, as a file explorer goes up a
     // folder: Alt+Up, and on macOS Finder's Cmd+Up too
@@ -13757,6 +14062,12 @@ static void drawmenubar(Gui *g)
     b32 menu = ImGui::BeginMenu("Session");
     itemrect(g, RECT_SESSMENU);
     if (menu) {
+        if (ImGui::MenuItem("Go to...", cmdkey(g, &a, "K"))) {
+            palopen(g);
+        }
+        itemnamed(g, "menu Go to");
+        itemtip("Find a session by its title, folder or group, and show it");
+        ImGui::Separator();
         b32 add = ImGui::MenuItem("New session...", cmdkey(g, &a, "N"), false, cannew(g));
         itemrect(g, RECT_NEWBTN);
         itemtip("Start a session in a working directory");
@@ -13848,6 +14159,12 @@ static void drawmenubar(Gui *g)
     menu = ImGui::BeginMenu("View");
     itemrect(g, RECT_MENU);
     if (menu) {
+        Arena k = a;  // let go before drawlayoutmenu takes the frame's arena
+        if (ImGui::MenuItem("Go to...", cmdkey(g, &k, "K"))) {
+            palopen(g);
+        }
+        itemtip("Find a session by its title, folder or group, and show it");
+        ImGui::Separator();
         // Layouts first, the quickest to reach, then the panes
         drawlayoutmenu(g);
         ImGui::Separator();
@@ -13967,6 +14284,7 @@ static void drawmenubar(Gui *g)
 static void drawdialogs(Gui *g)
 {
     f32 sc = g->scale;
+    drawpalette(g);
     if (g->openmodal) {
         ImGui::OpenPopup("Modal");
         g->openmodal = 0;

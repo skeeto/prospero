@@ -74,6 +74,7 @@
 #include "filewalk.cpp"
 #include "sidebar.cpp"
 #include "dock.cpp"
+#include "palette.cpp"
 
 enum : i64 {
     STREAM_PERIOD = 1000000/30,  // µs between frames showing new deltas
@@ -612,6 +613,7 @@ struct GuiSession {
                             // its host's clock, never before it was made
     i64          sortat;    // the time the sidebar orders it by, which
                             // holds still while the pointer is there
+    i64          viewseq;   // when last shown here, by g->viewseq; 0 if not
     i64          jobs;      // running background jobs, from the list
     i64          openid;    // the open in flight, 0 if none
     i32          depth;     // under its parent in the sidebar, this frame
@@ -746,6 +748,27 @@ struct PathComp {
     i32      rows;     // its picks, 0 if it was not drawn
     char     first[64];
     i64      accepts;
+};
+
+// The Ctrl/Cmd+K palette (palette.cpp, drawpalette): its items, each
+// one's session, and their order for the query, built in mem as it
+// opens and as the query changes, never in between.
+struct PalWin {
+    Arena               mem;
+    byte               *base;
+    Slice<PalItem>      items;
+    Slice<GuiSession *> sess;    // each item's
+    Slice<i32>          order;
+    i32                 sel;     // the pick, a place in order
+    char                q[FIELD_MAX];
+    b32                 open;    // to be opened as dialogs are next drawn
+    b32                 close;   // to be closed likewise (Ctrl/Cmd+K again)
+    b32                 shown;   // open, as of this frame
+    b32                 prompt;  // the prompt had the keyboard as it opened
+    b32                 follow;  // the list to scroll to the pick
+    // For the checklist: the list as drawn last
+    i32                 rows;
+    char                first[64];
 };
 
 // A Markdown document, read-only, shown as the transcript shows a
@@ -1448,6 +1471,8 @@ struct Gui {
     b32                openwt;
     Str                newrole;    // in this role, if any
     PathComp           pc;         // newcwd's completion
+    PalWin             palw;       // the Ctrl/Cmd+K palette
+    i64                viewseq;    // sessions shown so far (GuiSession.viewseq)
     i64                newid;      // the new command in flight
     char              *denynote;   // "Deny with note"
     Str                denyreq;
@@ -1991,6 +2016,9 @@ static void setcur(Gui *g, GuiSession *s)
 {
     if (g->sess && g->sess!=s) {
         draftsend(g, g->sess);  // left: its draft is kept now
+    }
+    if (s && s!=g->sess) {
+        s->viewseq = ++g->viewseq;  // the palette's empty query goes by it
     }
     g->sess = s;
     g->view = s && s->view ? s->view : g->nosession.view;
@@ -13223,6 +13251,8 @@ enum : i32 {
                       // (0 by 0: its pane's), and passes
     CHK_TERMGRID,     // the terminal is dx by dy, drawn in over 64K
                       // vertices (32-bit indices)
+    CHK_PALETTE,      // the palette is open, listing dx rows (0: any), the
+                      // first titled text if any
     CHK_COUNT,
 };
 
@@ -13508,6 +13538,7 @@ static Str chknames[] = {
     "the terminal fills its pane", "the terminal is closed",
     "no frames while idle, the terminal shown",
     "the terminal's grid is set", "the terminal is that size, in 32-bit indices",
+    "the palette lists what it should",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -13641,6 +13672,13 @@ struct DriveOp {
 #define DRAGSESS(title) \
     {OP_MOVE, T_SESSTITLE, 0, 0, 100, title}, {OP_DOWN, 0, 0, 0, 100, ""}, \
     {OP_MOVE, T_SESSTITLE, 4, 3, 100, title}, {OP_MOVE, T_SESSTITLE, 14, 8, 300, title}
+
+// A key with Cmd held on macOS, else Ctrl
+#define CMDKEY(key, ms) \
+    {OP_KEYDOWN, 0, GKEY_CMD, KEY_CMD, 50, ""}, \
+    {OP_KEYDOWN, 0, key, KEY_CMD, 50, ""}, \
+    {OP_KEYUP, 0, key, KEY_CMD, 50, ""}, \
+    {OP_KEYUP, 0, GKEY_CMD, 0, ms, ""}
 
 // A layout picked from View, Layout, by its name
 #define LAYOUT(name) \
@@ -14096,6 +14134,50 @@ static DriveOp m3ops[] = {
     LAYOUT("Focus"),
     {OP_CHECK, CHK_FOCUSED, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "18-layoutfocus"},
+    // The palette, here in Focus, where the Sessions pane is hidden: a
+    // query narrows the sessions, the better match first, and Enter
+    // opens it, the prompt having the keyboard. Esc closes it, the
+    // prompt given the keyboard back; Ctrl/Cmd+K then Enter goes back
+    // to the session before.
+    CMDKEY(GKEY_K, 500),
+    {OP_CHECK, CHK_PALETTE, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 500, "hold"},
+    {OP_CHECK, CHK_PALETTE, 1, 0, 0, "Hold me: say hello."},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 500, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TITLE, 0, 0, 0, "Hold me: say hello."},
+    CMDKEY(GKEY_K, 500),
+    {OP_TEXT, 0, 0, 0, 500, "say hel"},
+    {OP_CHECK, CHK_PALETTE, 2, 0, 0, "Say hello."},
+    {OP_SHOT, 0, 0, 0, 300, "18-palette"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 500, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TITLE, 0, 0, 0, "Say hello."},
+    {OP_TEXT, 0, 0, 0, 300, "xy"},
+    {OP_CHECK, CHK_NEWTYPED, 0, 0, 0, "xy"},
+    CMDKEY(GKEY_K, 500),
+    {OP_CHECK, CHK_PALETTE, 0, 0, 0, "Hold me: say hello."},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 500, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TITLE, 0, 0, 0, "Say hello."},
+    {OP_TEXT, 0, 0, 0, 300, "z"},
+    {OP_CHECK, CHK_NEWTYPED, 0, 0, 0, "xyz"},
+    {OP_KEYDOWN, 0, GKEY_BACKSPACE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_BACKSPACE, 0, 50, ""},
+    {OP_KEYDOWN, 0, GKEY_BACKSPACE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_BACKSPACE, 0, 50, ""},
+    {OP_KEYDOWN, 0, GKEY_BACKSPACE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_BACKSPACE, 0, 300, ""},
+    {OP_CHECK, CHK_NEWTYPED, 0, 0, 0, ""},
+    CMDKEY(GKEY_K, 500),
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 500, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TITLE, 0, 0, 0, "Hold me: say hello."},
+    {OP_MAIN, 0, 0, 0, 500, ""},
     LAYOUT("Drive"),
     {OP_CHECK, CHK_LAYOUTBACK, 0, 0, 0, "Drive"},
     // Layouts by number too, as the View menu numbers them: the second,
@@ -21297,6 +21379,23 @@ static b32 drivecheck(Gui *g, i32 chk)
         return s && in && s->git.state==GITW_REPO && startswith(s->git.branch, want) &&
                s->wtbranch==s->git.branch && s->wtname.len &&
                endswith(s->git.branch, s->wtname);
+    }
+    case CHK_PALETTE: {
+        DriveOp *op    = &g->ops[g->drivepc-1];
+        Str      first = {(u8 *)g->palw.first, (iz)__builtin_strlen(g->palw.first)};
+        b32      ok    = g->palw.shown && g->palw.rows>0 &&
+                         (op->dx==0 || g->palw.rows==(i32)op->dx) &&
+                         (!op->text.len || first==op->text);
+        if (!ok) {
+            Arena a = g->frame;
+            Buf   b(&a, 128);
+            print(&b, "drive: the palette: ");
+            print(&b, (i64)g->palw.rows);
+            print(&b, " rows, the first ");
+            print(&b, first);
+            guilog(g, finish(&b));
+        }
+        return ok;
     }
     case CHK_PATHPICK: {
         DriveOp *op    = &g->ops[g->drivepc-1];

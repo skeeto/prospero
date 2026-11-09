@@ -94,7 +94,12 @@ their own, after those still at work, asking, or in view. Sessions
 come by recent activity, the latest message sent or turn begun or
 ended first, a session's subagents counting as its own; the sort
 button at its top switches to date created, and the window keeps the
-choice. Rows hold still while the pointer is over the sidebar. A session's
+choice. Rows hold still while the pointer is over the sidebar.
+Ctrl+K (Cmd+K on macOS), or Go to... in the Session and View menus,
+opens a palette over the window, in any layout: type words from a
+session's title, group, folder or host, and Enter shows it. With
+nothing typed it lists the sessions viewed before, latest first, so
+Ctrl+K then Enter goes back to the previous one. A session's
 context menu, and the Session menu, rename it, move it to a group,
 fork it, compact it now, switch its model, export it (Markdown or the
 raw log), archive it, or move it to the Trash (with its subagents),

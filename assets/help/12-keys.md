@@ -7,6 +7,11 @@ except Ctrl+G in the prompt box, which is Ctrl there too.
 
 - **Ctrl+N**: New session. Once it's made, the prompt box has the
   keyboard.
+- **Ctrl+K**: Go to, the palette: find a session by words from its
+  title, group, folder or host and show it. With nothing typed it
+  lists the sessions viewed before, so Ctrl+K then Enter goes back to
+  the previous one. Up, Down, Page Up and Page Down move the pick, and
+  Esc or Ctrl+K again closes it.
 - **Ctrl+Shift+N**: New session, no folder, with the default model:
   no dialog, straight to its prompt box.
 - **Ctrl+F**: find in the transcript. In Help or Settings, while it has

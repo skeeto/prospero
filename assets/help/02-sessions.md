@@ -61,6 +61,21 @@ ends its turn meanwhile moves once the pointer leaves, never from under
 a click. A session from before Prospero kept this time starts at when
 it was made, until its next turn.
 
+## Going to a session
+
+Session → Go to... (Ctrl+K, Cmd+K on macOS) opens a palette over the
+window, in any layout, Focus too, where the sidebar is hidden. Type
+words from a session's title, group, folder or host, or a piece of its
+id: every word must match, and title matches rank first. Up and Down
+move the pick, Enter shows it with its prompt box ready, and Esc, a
+click outside, or Ctrl+K again closes the palette.
+
+With nothing typed, it lists the sessions viewed in this window, the
+latest first, then the rest by recent activity, leaving out the one
+shown: Ctrl+K then Enter goes back to the previous session. Subagents
+and archived sessions are listed only when typed words match them, and
+sessions in the Trash never are.
+
 ## Talking to the agent
 
 Enter sends the prompt. The transcript shows your messages as
