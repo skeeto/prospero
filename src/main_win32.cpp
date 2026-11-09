@@ -85,6 +85,7 @@ enum : i32 {
     CREATE_UNICODE_ENVIRONMENT        = 0x00000400,
     CREATE_ALWAYS                     = 2,
     ERROR_BROKEN_PIPE                 = 109,
+    ERROR_MORE_DATA                   = 234,
     ERROR_NOT_ENOUGH_MEMORY           = 8,
     ERROR_NOT_SUPPORTED               = 50,
     FORMAT_MESSAGE_FROM_HMODULE       = 0x00000800,
@@ -95,6 +96,7 @@ enum : i32 {
     JOB_KILL_ON_JOB_CLOSE             = 0x2000,
     JOB_DIE_ON_UNHANDLED_EXCEPTION    = 0x400,
     JobObjectExtendedLimitInformation = 9,
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000,
     SEM_FAILCRITICALERRORS            = 0x0001,
     SEM_NOGPFAULTERRORBOX             = 0x0002,
     SEM_NOOPENFILEERRORBOX            = 0x8000,
@@ -305,6 +307,7 @@ W32(byte *, VirtualAlloc(uz, iz, i32, i32));
 W32(b32,    VirtualFree(uz, iz, i32));
 W32(i32,    WaitForSingleObject(uz, i32));
 W32(uz,     OpenProcess(i32, b32, i32));
+W32(b32,    GetProcessTimes(uz, Filetime *, Filetime *, Filetime *, Filetime *));
 W32(b32,    WriteConsoleW(uz, c16 *, i32, i32 *, uz));
 W32(b32,    WriteFile(uz, u8 *, i32, i32 *, Overlapped *));
 W32(void,   DeleteCriticalSection(CriticalSection *));
@@ -1503,6 +1506,7 @@ struct Proc {
     b32        exited;    // under lock
     b32        full;      // under lock: the reader waits for room
     b32        told;      // under lock: PROC_READY sent, not re-armed
+    i64        born;      // the root's creation, in 100 ns units
     u32        lastread;  // under lock: GetTickCount at the last output
     u8        *ring;
     iz         ringcap;
@@ -2305,6 +2309,12 @@ using InitAttrs   = b32  (__stdcall *)(void *, i32, i32, uz *);
 using UpdateAttr  = b32  (__stdcall *)(void *, i32, uz, void *, uz, void *, uz *);
 using DeleteAttrs = void (__stdcall *)(void *);
 
+struct JobPids {  // JOBOBJECT_BASIC_PROCESS_ID_LIST
+    u32 assigned;
+    u32 listed;
+    uz  pids[64];
+};
+
 struct JobAccounting {  // JOBOBJECT_BASIC_ACCOUNTING_INFORMATION
     i64 user;
     i64 kernel;
@@ -2322,6 +2332,16 @@ enum : uz {
 
 // The child on a new pseudoconsole, inheriting no handles: the console's
 // are its standard ones. In a job that doesn't kill on close.
+// When a process started, in 100 ns units, else 0.
+static i64 procborn(uz h)
+{
+    Filetime t[4] = {};
+    if (!GetProcessTimes(h, t+0, t+1, t+2, t+3)) {
+        return 0;
+    }
+    return (i64)((u64)t[0].hi<<32 | t[0].lo);
+}
+
 static Proc *os_ptyspawn(Os *os, Spawn *sp, PtySize z, iz ring, Arena scratch)
 {
     if (!os->pcreate) {
@@ -2458,6 +2478,7 @@ static Proc *os_ptyspawn(Os *os, Spawn *sp, PtySize z, iz ring, Arena scratch)
     p->job     = job;
     p->pid     = pi.pid;
     p->process = pi.process;
+    p->born    = procborn(pi.process);
     p->pipe    = pr;
     p->mbox    = sp->mbox;
     p->id      = sp->id;
@@ -2537,11 +2558,33 @@ static b32 os_ptyresize(Os *os, Proc *p, PtySize z)
 }
 
 // Busy while the shell's job holds more than the shell.
+// A program runs in the console: its job holds a process started later
+// than the shell. The shell may be more than one process: a launcher
+// such as w64devkit's sh.exe, or Git's bash.exe, starts the real shell
+// as its child and waits. That comes within moments of the root, and
+// nothing typed at the shell's prompt comes so soon.
 static b32 os_ptybusy(Os *, Proc *p)
 {
-    JobAccounting acct = {};
-    return QueryInformationJobObject(p->job, 1, &acct, sizeof(acct), 0) &&
-           acct.active > 1;
+    enum { SHELLTIME = 200*10000 };  // 200 ms
+    JobPids ids = {};
+    if (!QueryInformationJobObject(p->job, 3, &ids, sizeof(ids), 0) &&
+            GetLastError()!=ERROR_MORE_DATA) {
+        return 0;
+    }
+    if (ids.assigned > ids.listed) {
+        return 1;  // more than a shell's few
+    }
+    for (u32 i = 0; i < ids.listed; i++) {
+        if ((i32)ids.pids[i] == p->pid) continue;
+        uz h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, (i32)ids.pids[i]);
+        if (!h) continue;  // gone meanwhile
+        i64 born = procborn(h);
+        CloseHandle(h);
+        if (!p->born || born-p->born>SHELLTIME) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 

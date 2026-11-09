@@ -1040,6 +1040,10 @@ static void testconpty(ProcTest *p, Arena scratch)
     PtySize big = {100, 30, 1000, 480};
     check(t, ready && os_ptyresize(os, pr, big), "os_ptyresize");
     check(t, ptysees(p, pr, &w, scratch, "winch 100x30\n", 5000), "the program sees the new size");
+    check(t, !os_ptybusy(os, pr), "not busy at the probe's first read");
+    // Windows takes what starts within 200 ms as part of the shell (a
+    // launcher's), which nothing typed at a prompt is
+    ptywatch(os, p->mb, pr, p->id, &w, 300, "\x01");
     os_procwrite(os, pr, "busy 1500\r");
     b32 busy = 0;
     for (i64 end = os_ticks(os)+1200000; !busy && os_ticks(os)<end;) {
