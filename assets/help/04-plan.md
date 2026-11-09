@@ -69,7 +69,8 @@ notify`). In Plan mode they wait for you with no countdown, as you
 mean to review a plan soon. Otherwise they are skipped after `[guard]
 question_timeout` (300 seconds, or no limit at 0), with the agent
 going with its recommendations, and the countdown starts over whenever
-you pick an option or type in the card. While they wait, the model, the shell and
+you pick an option or type in the card. **Keep waiting**, at the card's
+top right, drops the countdown for those questions. While they wait, the model, the shell and
 the mode may change, and Bypass mode leaves them for you. Only the
 sessions you start yourself get questions: never subagents, roles, or
 runs from the command line, where the agent decides for itself and

@@ -1638,6 +1638,7 @@ enum : i32 {
     ACT_OUTPUT,   // show a call's whole output (its spill file)
     ACT_BACKGROUND, // move a running command or subagent to the background
     ACT_STOP,     // stop a running command alone, the agent going on
+    ACT_HOLD,     // keep a waiting ask waiting, its deadline dropped
 };
 
 // An icon button's width: the same for every icon, which all share
@@ -1784,6 +1785,11 @@ static MsgAction msgaction(Gui *g, GuiSession *s, View *v, ViewMsg *m)
         r.kind  = ACT_REWIND;
         r.label = ICON_HISTORY "###rewind";
         r.icon  = 1;
+    } else if (m->role==VIEW_ASK && s && t->answer==VASK_PENDING && t->deadline &&
+               !v->readonly && hostcap(s->host, "ask.hold") && hostlive(g, s)) {
+        // Beside its countdown: no deadline for this one
+        r.kind  = ACT_HOLD;
+        r.label = "Keep waiting###hold";
     }
     f32 pad = 2*ImGui::GetStyle().FramePadding.x;
     if (r.kind) {
@@ -1860,6 +1866,16 @@ static void drawaction(Gui *g, GuiSession *s, ViewMsg *m, MsgAction *act)
         } else if (go) {
             guiselect(g, act->child);
         }
+        break;
+    case ACT_HOLD:
+        itemrect(g, RECT_HOLD);
+        itemtip(t->kind=="question"
+                ? "Keep waiting: no countdown for these questions, which wait "
+                  "until you answer them or skip them (while this window has "
+                  "the session open)"
+                : "Keep waiting: no countdown for this ask, which waits until "
+                  "you answer it (while this window has the session open)");
+        if (go) guihold(g, s, t->req);
         break;
     case ACT_UNDO:
         itemrect(g, RECT_UNDO);

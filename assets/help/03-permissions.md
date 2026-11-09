@@ -17,9 +17,11 @@ and, if it cannot finish, to ask you for it when it ends its turn.
 
 An ask shows as a card in the transcript, "Allow TOOL PATH?", with a
 countdown: it is denied unless you answer within `[guard] ask_timeout`
-seconds (60 by default). Set to 0, asks wait until you answer, while a
-window has the session open; with none, they are denied at once. Its
-buttons:
+seconds (60 by default). **Keep waiting**, at the card's top right,
+drops the countdown for that one ask, which then waits until you answer
+it. Set to 0, every ask waits until you answer. Either way that holds
+while a window has the session open; with none, asks are denied at
+once. Its buttons:
 
 - **Allow** lets this one call go ahead.
 - **Always allow DIR (read)**, or **(write)**, set apart from Allow,

@@ -573,6 +573,7 @@ struct Ask {
     b32       approve;  // credentials for urls of web includes (approving)
     i64       deadline; // epoch ms, as the frontends have it, or 0
     i64       delay;    // ticks: the deadline's, which a touch starts over
+    b32       held;     // the user chose to wait for it: no deadline (ask.hold)
 };
 
 // An "always allow" from the user: a path (a directory, or a file) the
@@ -4518,7 +4519,8 @@ static i64 askdue(Session *s, b32 wait, i64 delay)
 // on the answer (a question's form, a denial's note), else as it was.
 // The agent's questions have none in plan mode, where the user means to
 // review a plan soon, else question_timeout; other asks keep the delay
-// they were armed with, and one that waits with none keeps none. A
+// they were armed with, and one that waits with none keeps none, as
+// does one the user chose to keep waiting (ask.hold). A
 // changed deadline goes to the frontends as an ask.deadline record,
 // unless it moved by under a tenth of the delay (5 s at most), so a
 // stream of touches logs little: the deadline they show is then at most
@@ -4532,7 +4534,9 @@ static void askclock(Session *s, Arena scratch, b32 restart)
     Engine *e     = s->e;
     i64     delay = k->delay;
     b32     armed = s->timers[T_ASK] != 0;
-    if (k->tool == TOOL_ASKUSER) {
+    if (k->held) {
+        delay = 0;
+    } else if (k->tool == TOOL_ASKUSER) {
         delay = planning(s) ? 0 : questiondelay(e);
     } else if (!armed || !delay) {
         return;
@@ -22926,6 +22930,19 @@ static void command(Engine *e, Arena scratch, Str line)
         } else {
             reply(e, scratch, id, 1, {}, sid);
             askclock(s, scratch, 1);
+        }
+    } return;
+    case CMD_ASKHOLD: {
+        // The user will answer in their own time: no deadline from now on,
+        // which the frontends hear of as ask.deadline 0. Unattended, it is
+        // denied at once all the same (unattend).
+        Str req = jsonstr(jsonget(j, "req"));
+        if (s->state!=S_ASK || req!=s->ask.req) {
+            reply(e, scratch, id, 0, "no such request waits", sid);
+        } else {
+            reply(e, scratch, id, 1, {}, sid);
+            s->ask.held = 1;
+            askclock(s, scratch, 0);
         }
     } return;
     case CMD_PROMPT:

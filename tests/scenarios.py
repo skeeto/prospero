@@ -3411,6 +3411,36 @@ def ask_wait(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+@scenario(conf={"_guard": {"ask_timeout": 2}}, bound=15)
+def ask_hold(t):
+    """ask.hold: the user keeps a permission ask waiting, its deadline
+    dropped and logged as ask.deadline 0, a later touch arming none; it
+    waits past the deadline it had, until answered."""
+    h = t.headless()
+    try:
+        h.call("hello", proto=0, client="scenarios")
+        t.check("ask.hold" in h.all("hello")[0].get("caps", []), "the cap")
+        sid, ask = asked(t, h)
+        t.check(ask["deadline"] > 0, f"a deadline first: {ask}")
+        r = h.call("ask.hold", sid=sid, req="nope")
+        t.check(r.get("ok") == 0, f"an unknown request: {r}")
+        r = h.call("ask.hold", sid=sid, req=ask["req"])
+        t.check(r.get("ok") == 1, f"held: {r}")
+        h.call("ask.touch", sid=sid, req=ask["req"])
+        time.sleep(3)  # past the deadline it had
+        t.check(not h.all("answer", sid), f"still waiting: {h.all('answer', sid)}")
+        dls = [e for e in logged(t, sid) if e["ev"] == "ask.deadline"]
+        t.check([d["deadline"] for d in dls] == [0] and dls[0]["req"] == ask["req"],
+                f"logged as none, once: {dls}")
+        h.call("answer", sid=sid, req=ask["req"], decision="deny")
+        end = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        t.check(h.all("answer", sid)[0]["by"] == "user", f"answered: {h.all('answer', sid)}")
+        t.check(end["why"] == "done", f"the turn goes on: {end}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 @scenario(bound=10)
 def ask_steer(t):
     """A steer while an ask waits does not answer it: it waits, queued,
@@ -3671,7 +3701,7 @@ def hello_caps(t):
                                                    "relay.offer", "relay.data",
                                                    "relay.more", "relay.peer",
                                                    "relay.call", "offer", "ask.touch",
-                                                   "shell.env", "call.stop", "cut", "uncut",
+                                                   "ask.hold", "shell.env", "call.stop", "cut", "uncut",
                                                    "approve", "endpoint.auth",
                                                    "endpoint.logout", "term.open",
                                                    "term.input", "term.resize",
@@ -3686,7 +3716,7 @@ def hello_caps(t):
                  "message", "bypass", "nofolder", "dir", "config.create", "side", "background", "models",
                  "mcp", "mcp.auth", "task.remote", "task.host", "memory", "shell",
                  "git", "answer.trust", "trash", "cut", "endpoint.auth",
-                 "endpoint.copilot", "term"} <= set(caps)
+                 "endpoint.copilot", "term", "ask.hold"} <= set(caps)
                 and "host" not in caps,
                 f"caps: {caps}")
         want = 0 if isinstance(t.host, XpHost) else 1  # ConPTY, from 10 1809
@@ -11037,6 +11067,29 @@ def question_wait(t):
                 "no deadline logged")
         h.call("answer", sid=sid, req=ask["req"], decision="deny")
         end = ended(h, sid, 1)
+        t.check(h.all("answer", sid)[-1]["by"] == "user", f"answered: {h.all('answer', sid)}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf={"_guard": {"question_timeout": 2}}, bound=15)
+def question_hold(t):
+    """ask.hold on the agent's questions: no deadline from then on, even
+    as the user works on them; they wait until answered."""
+    h = t.headless()
+    try:
+        sid, ask = questioned(t, h)
+        t.check(ask["deadline"] > 0, f"a deadline first: {ask}")
+        r = h.call("ask.hold", sid=sid, req=ask["req"])
+        t.check(r.get("ok") == 1, f"held: {r}")
+        h.call("ask.touch", sid=sid, req=ask["req"])
+        time.sleep(3)
+        t.check(not h.all("answer", sid), f"still waiting: {h.all('answer', sid)}")
+        dls = [e["deadline"] for e in logged(t, sid) if e["ev"] == "ask.deadline"]
+        t.check(dls == [0], f"logged as none, once: {dls}")
+        h.call("answer", sid=sid, req=ask["req"], decision="deny")
+        ended(h, sid, 1)
         t.check(h.all("answer", sid)[-1]["by"] == "user", f"answered: {h.all('answer', sid)}")
     finally:
         rc = h.close()

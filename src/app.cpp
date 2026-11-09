@@ -223,6 +223,7 @@ enum : i32 {
     RECT_PARENTLINK, // a subagent's link to its parent
     RECT_MSGLINK,    // the latest message's link to its other session
     RECT_UNDO,       // the latest Undo on a tool row
+    RECT_HOLD,       // the latest ask's Keep waiting
     RECT_REWINDTURN, // the latest Rewind to here
     RECT_REWINDOK,   // the rewind confirmation's buttons
     RECT_REWINDCANCEL,
@@ -4438,6 +4439,18 @@ static void guitouch(Gui *g, GuiSession *s, Str req, i64 *touched, Str cap)
     Arena a = newarena(g->cmdr);
     Buf   b(&a, 128 + req.len);
     EvOut w = cmdopen(g, &b, CMD_ASKTOUCH, s);
+    putkey(&w.json, "req");
+    putstr(&w.json, req);
+    cmdsend(g, &w, a);
+}
+
+// The user chose to keep a waiting ask waiting, with no deadline
+// (ask.hold): the engine drops it, and says so with ask.deadline 0.
+static void guihold(Gui *g, GuiSession *s, Str req)
+{
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 128 + req.len);
+    EvOut w = cmdopen(g, &b, CMD_ASKHOLD, s);
     putkey(&w.json, "req");
     putstr(&w.json, req);
     cmdsend(g, &w, a);
@@ -12890,6 +12903,7 @@ enum : i32 {
     T_PARENTLINK,  // a subagent's link back to its parent
     T_MSGLINK,     // the latest message's link to its other session
     T_UNDO,        // the latest Undo on a tool row
+    T_HOLD,        // the latest ask's Keep waiting
     T_REWINDTURN,  // the latest Rewind to here
     T_REWINDOK,    // the rewind confirmation's Rewind
     T_FORCE,       // the latest rewind card's Rewind anyway
@@ -12983,6 +12997,7 @@ enum : i32 {
     CHK_LIVETAIL,
     CHK_ASKCARD,
     CHK_ASKALLOWED,
+    CHK_ASKHELD,    // kept waiting: no deadline, past the one it had
     CHK_QCARD,      // the agent's questions: the form as reserved
     CHK_QWAITING,   // and as picked and typed, still waiting, touched
     CHK_QANSWERED,  // the agent read the answers
@@ -13325,6 +13340,7 @@ static Str chknames[] = {
     "tool rows for read, edit and shell, each ok, with exit code and output file",
     "the edit shows a highlighted diff", "shell output showed while it ran",
     "an ask card with its buttons", "allowed by the user, and the agent went on",
+    "kept waiting: no deadline, and still waiting past the one it had",
     "the questions' form, at its reserved height, recommended options picked",
     "the questions picked and typed, still waiting",
     "the agent read the answers", "skipped with a note, which the agent read",
@@ -14621,6 +14637,14 @@ static DriveOp m3ops[] = {
     {OP_MARK, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_ASKCARD, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "2-ask"},
+    // Kept waiting, past its 10 s deadline (tests/gui.py), then allowed
+    {OP_MOVE, T_HOLD, 0, 0, 200, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_ASKHELD, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "2-askheld"},
+    {OP_MOVE, T_EMPTY, 0, 0, 11000, ""},
+    {OP_CHECK, CHK_ASKHELD, 0, 0, 0, ""},
     {OP_TOASTMARK, 0, 0, 0, 0, ""},
     {OP_MOVE, T_ALLOW, 0, 0, 200, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -19013,6 +19037,7 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_PARENTLINK:  return rectcenter(g->rects[RECT_PARENTLINK]);
     case T_MSGLINK:     return rectcenter(g->rects[RECT_MSGLINK]);
     case T_UNDO:        return rectcenter(g->rects[RECT_UNDO]);
+    case T_HOLD:        return rectcenter(g->rects[RECT_HOLD]);
     case T_REWINDTURN:  return rectcenter(g->rects[RECT_REWINDTURN]);
     case T_REWINDOK:    return rectcenter(g->rects[RECT_REWINDOK]);
     case T_FORCE:       return rectcenter(g->rects[RECT_FORCE]);
@@ -21011,6 +21036,10 @@ static b32 drivecheck(Gui *g, i32 chk)
         ViewMsg *a = lastmsg(g, VIEW_ASSISTANT);
         return k && k->tool->answer==VASK_ALLOWED && k->tool->by=="user" &&
                a && find(a->text, "allowed")>=0;
+    }
+    case CHK_ASKHELD: {
+        ViewMsg *k = lastmsg(g, VIEW_ASK);
+        return k && k->tool->answer==VASK_PENDING && !k->tool->deadline;
     }
     case CHK_ASKTIMEOUT: {
         ViewMsg *k = lastmsg(g, VIEW_ASK);

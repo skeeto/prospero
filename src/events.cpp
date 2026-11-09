@@ -197,6 +197,7 @@ enum : i32 {
     CMD_RELAYCALL,   // a thin engine's call, for this engine to make
     CMD_OFFER,       // this engine's models as relay.offer gives them
     CMD_ASKTOUCH,    // the user works on a waiting ask's answer
+    CMD_ASKHOLD,     // the user chose to keep a waiting ask waiting, no deadline
     CMD_SHELLENV,    // a session's shell's environment, to open it by hand
     CMD_CALLSTOP,    // the running command stopped, while the turn goes on
     CMD_CUT,         // the conversation rewound to before a turn
@@ -221,7 +222,7 @@ static Str cmdnames[] = {
     "unqueue", "dir", "background", "models", "mcp", "mcp.auth", "mcp.code",
     "mcp.logout", "mcp.restart", "shell", "shells", "git", "trash",
     "trash.empty", "relay.offer", "relay.data", "relay.more", "relay.peer",
-    "relay.call", "offer", "ask.touch", "shell.env", "call.stop", "cut",
+    "relay.call", "offer", "ask.touch", "ask.hold", "shell.env", "call.stop", "cut",
     "uncut", "approve", "endpoint.auth", "endpoint.logout", "term.open",
     "term.input", "term.resize", "term.ack", "term.close",
 };
@@ -319,6 +320,9 @@ static Str capnames[] = {
                        // records change (0 for none)
     "ask.deadline",    // ask.touch {sid, req} starts any waiting ask's
                        // deadline again, as the user writes a denial's note
+    "ask.hold",        // ask.hold {sid, req}: a waiting ask keeps waiting
+                       // until answered, its deadline dropped (ask.deadline
+                       // 0), touches arming none again
     "shell.env",       // shell.env {sid}: the environment, and distro, to
                        // open the session's shell in by hand
     "call.stop",       // call.stop {sid, call}: the running command killed,
