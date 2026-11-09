@@ -2123,6 +2123,32 @@ def main():
                 problems.append(f"{what} did not hang up the terminal's shell")
             else:
                 print(f"terminal: {what} hung up the shell")
+        # A tab's Kill ended the stray that ignored SIGHUP; its Close
+        # left one, ended here, by a pid checked as ours
+        def stray(pidfile):
+            try:
+                found = P.parse(open(os.path.join(work, pidfile)).read())
+            except OSError:
+                return None
+            return found[0] if found else None
+        pid = stray("kill.pid")
+        deadline = time.monotonic() + 5
+        while pid and alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        if not pid:
+            problems.append("no kill.pid")
+        elif alive(pid):
+            problems.append("a tab's Kill left its shell's child running")
+        else:
+            print("terminal: a tab's Kill ended its shell's child")
+        pid = stray("close.pid")
+        if not pid:
+            problems.append("no close.pid")
+        elif not alive(pid) or not ours(pid, host.root):
+            problems.append("a tab's Close ended a child ignoring SIGHUP")
+        else:
+            print("terminal: a child ignoring SIGHUP outlived a tab's Close")
+            P.signal_ours(pid, P.KILL, lambda q: ours(q, host.root), "stray")
     if args.mode == "terminal" and args.shots and os.name != "nt":  # SDL's alone
         for name in ("terminal", "terminal-small", "terminal-vim", "terminal-big",
                      "terminal-ended"):

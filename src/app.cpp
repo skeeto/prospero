@@ -13653,6 +13653,7 @@ enum : i32 {
     W_CTR,        // the container runtime, or the first container, is as
                   // text says (ctrwait)
     W_TERM,       // the shown session's terminal shows text
+    W_TERMBUSY,   // its front tab runs a program
 };
 
 static Str waitnames[] = {
@@ -13678,9 +13679,9 @@ static Str waitnames[] = {
     "the subagent on far", "the subagent on far shown", "a toast",
     "the changes", "the folder's probe", "the worktree's branch",
     "the thin remote", "a relayed stream", "the container",
-    "the terminal's text",
+    "the terminal's text", "the terminal's program",
 };
-static_assert(countof(waitnames) == W_TERM+1);
+static_assert(countof(waitnames) == W_TERMBUSY+1);
 
 enum : i32 {
     KEY_CTRL  = 1,
@@ -17399,6 +17400,11 @@ static DriveOp planops[] = {
     {OP_KEYUP, 0, key, KEY_CTRL|KEY_SHIFT, 50, ""}, \
     {OP_KEYUP, 0, GKEY_SHIFT, KEY_CTRL, 50, ""}, \
     {OP_KEYUP, 0, GKEY_CTRL, 0, ms, ""}
+// A program in the foreground that leaves a child ignoring SIGHUP, its
+// pid in a file, its command line naming the folder for gui.py's checks
+#define TERMSTRAY(file) \
+    "sh -c 'trap \"\" HUP; sh -c \"while :; do sleep 1; done\" stray \"$PWD\" & " \
+    "echo $! >" file "; wait'"
 #define TERMKEY(key, ms) \
     {OP_KEYDOWN, 0, key, 0, 50, ""}, {OP_KEYUP, 0, key, 0, ms, ""}
 
@@ -17563,6 +17569,58 @@ static DriveOp termops[] = {
     TERMKEY(GKEY_ENTER, 1000),
     {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "onetwo|*bash"},
     {OP_CHECK, CHK_TERMSCREEN, 0, 0, 0, "\nkeyed"},
+    {OP_TEXT, 0, 0, 0, 100, "exit"},
+    TERMKEY(GKEY_ENTER, 1000),
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*onetwo"},
+    // A tab's menu: Kill ends what its shell started, even ignoring
+    // SIGHUP (kill.pid, which gui.py finds gone); Close only hangs up,
+    // so that lives on (close.pid, which gui.py ends); Restart starts a
+    // new shell in the same tab
+    CTRLSHIFTKEY(GKEY_GRAVE, 500),
+    {OP_WAIT, W_TERM, 0, 0, 10000, "tty$"},
+    {OP_TEXT, 0, 0, 0, 100, TERMSTRAY("kill.pid")},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERMBUSY, 0, 0, 5000, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "term tab 2"},
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_POPUP, 0, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Kill"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*onetwo"},
+    CTRLSHIFTKEY(GKEY_GRAVE, 500),
+    {OP_WAIT, W_TERM, 0, 0, 10000, "tty$"},
+    {OP_TEXT, 0, 0, 0, 100, TERMSTRAY("close.pid")},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERMBUSY, 0, 0, 5000, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "term tab 2"},
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_POPUP, 0, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Close"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*onetwo"},
+    CTRLSHIFTKEY(GKEY_GRAVE, 500),
+    {OP_WAIT, W_TERM, 0, 0, 10000, "tty$"},
+    {OP_TEXT, 0, 0, 0, 100, "echo before"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\nbefore"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "term tab 2"},
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_POPUP, 0, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Restart"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_WAIT, W_TERM, 0, 0, 10000, "tty$"},
+    {OP_TEXT, 0, 0, 0, 100, "echo after"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\nafter"},
+    {OP_CHECK, CHK_TERMSCREEN, 0, 0, 0, "tty$ echo after"},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "onetwo|*bash"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
     {OP_TEXT, 0, 0, 0, 100, "exit"},
     TERMKEY(GKEY_ENTER, 1000),
     {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*onetwo"},
@@ -19609,6 +19667,10 @@ static b32 drivewaitdone(Gui *g)
     case W_TERM: {
         Arena a = g->frame;
         return find(termscreen(g, &a), g->ops[g->drivepc-1].text) >= 0;
+    }
+    case W_TERMBUSY: {
+        TermTab *tt = termfront(g);
+        return tt && tt->busy;
     }
     case W_VIA:
         return g->sess && v->state==LIVE_STREAMING && v->relaylen>0 && v->deltas>0;

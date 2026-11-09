@@ -1181,25 +1181,31 @@ static void termbanner(Gui *g, GuiSession *s, TermTab *tt, Arena a, i32 cols, i3
     }
 }
 
+// What the tab bar asks of its caller, which knows the size.
+struct TermBar {
+    i32 closed;   // the tab to close, else -1
+    b32 kill;     //   sweeping its tree
+    i32 restart;  // the tab to restart, else -1
+    b32 plus;     // a new tab
+};
+
 // The tab bar over the grid, drawn while the root can have terminals,
 // even with none, so the grid keeps its height as the first starts. It
 // selects its tab when front changed here (frontset), else front follows
-// the tab the user picked, and the set follows the bar's order. A tab
-// closed or "+" waits in *closed or *plus for the caller, which knows
-// the size.
-static void termtabs(Gui *g, GuiSession *s, i32 *closed, b32 *plus)
+// the tab the user picked, and the set follows the bar's order. Each
+// tab's context menu closes, restarts or kills it.
+static TermBar termtabs(Gui *g, GuiSession *s)
 {
+    TermBar  r   = {-1, 0, -1, 0};
     TermSet *set = &s->terms;
     if (g->termbarroot != s) {
         g->termbarroot = s;  // another root: its own front, selected
         set->frontset  = set->n > 0;
     }
-    *closed = -1;
-    *plus   = 0;
     ImGuiTabBarFlags bf = ImGuiTabBarFlags_Reorderable |
                           ImGuiTabBarFlags_FittingPolicyShrink;
     if (!ImGui::BeginTabBar("##termtabs", bf)) {
-        return;
+        return r;
     }
     Arena   a = g->frame;
     ImGuiID ids[TERMTABS] = {};
@@ -1228,18 +1234,35 @@ static void termtabs(Gui *g, GuiSession *s, i32 *closed, b32 *plus)
         print(&nb, "term tab ");
         print(&nb, (i64)i + 1);
         itemnamed(g, finish(&nb));
+        if (ImGui::BeginPopupContextItem()) {
+            Str live = tt->state==TT_LIVE ? Str{} : Str("Its shell has ended");
+            if (menutip(g, &a, "Close", {},
+                        "Hang up its shell; jobs it disowned live on")) {
+                r.closed = i;
+            }
+            if (menutip(g, &a, "Restart", termwhy(g, s),
+                        "Hang up its shell and start another in this tab")) {
+                r.restart = i;
+            }
+            if (menutip(g, &a, "Kill", live,
+                        "Close it, ending every process its shell started")) {
+                r.closed = i;
+                r.kill   = 1;
+            }
+            ImGui::EndPopup();
+        }
         if (shown) {
             ImGui::EndTabItem();
         }
-        if (!open && *closed<0) {
-            *closed = i;
+        if (!open && r.closed<0) {
+            r.closed = i;
         }
     }
     Str why = termfull(g, s);
     ImGui::BeginDisabled(why.len > 0);
     if (ImGui::TabItemButton("+", ImGuiTabItemFlags_Trailing |
                                   ImGuiTabItemFlags_NoTooltip)) {
-        *plus        = 1;
+        r.plus       = 1;
         g->termfocus = 1;
     }
     ImGui::EndDisabled();
@@ -1277,6 +1300,7 @@ static void termtabs(Gui *g, GuiSession *s, i32 *closed, b32 *plus)
     }
     termsetorder(set, order, norder);
     ImGui::EndTabBar();
+    return r;
 }
 
 // The Terminal pane's contents: the current session's tabs, the front
@@ -1296,9 +1320,7 @@ static void drawterm(Gui *g)
         ImGui::TextDisabled("%s", cstr0(&a, why));
         return;
     }
-    i32 closed = -1;
-    b32 plus   = 0;
-    termtabs(g, s, &closed, &plus);
+    TermBar bar = termtabs(g, s);
 
     TermMetrics m     = termmetrics(g);
     ImVec2      avail = ImGui::GetContentRegionAvail();
@@ -1310,8 +1332,12 @@ static void drawterm(Gui *g)
         cols = g->termforcecols;
         rows = g->termforcerows;
     }
-    if (closed >= 0) {
-        termdrop(g, s, closed, 0);
+    if (bar.restart >= 0) {
+        termrestart(g, s, s->terms.tabs[bar.restart], cols, rows);
+        termsetshow(&s->terms, bar.restart);
+        g->termfocus = 1;
+    } else if (bar.closed >= 0) {
+        termdrop(g, s, bar.closed, bar.kill);
         if (!s->terms.n && GImGui->ActiveId==id) {
             ImGui::ClearActiveID();
             g->promptfocus = 1;
@@ -1326,7 +1352,7 @@ static void drawterm(Gui *g)
                cols==g->termlastcols && rows==g->termlastrows;
     g->termlastcols = cols;
     g->termlastrows = rows;
-    if (plus) {
+    if (bar.plus) {
         termnew(g, s, cols, rows);
     }
     if (g->termaddto != s) {
