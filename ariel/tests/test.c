@@ -1392,7 +1392,7 @@ static void emojitest(char *path)
 // line gives the size. Fed whole and then a byte at a time.
 static void rectest(char *path)
 {
-    long  vtlen, txtlen;
+    long  vtlen = 0, txtlen = 0;  // set by slurp when it reads
     char *vt = slurp(path, &vtlen);
     char  golden[1024];
     snprintf(golden, sizeof(golden), "%.*s.txt", (int)strlen(path)-3, path);

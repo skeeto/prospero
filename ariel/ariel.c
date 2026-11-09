@@ -7404,7 +7404,7 @@ static b32 esrcnext(ariel_Term *t, Esrc *s, Ecell *o)
 static void epatch(Exp *e, Esrc s, i32 n, i32 y)
 {
     ariel_Term *t = e->t;
-    Ecell c;
+    Ecell c   = {0};  // read only once esrcnext fills it; GCC can't tell
     i32   run = 0, x0 = 0;
     u32   bg  = 0;
     for (i32 i = 0, x = 0; i <= n; i++) {

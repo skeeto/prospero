@@ -356,6 +356,7 @@ static Str capnames[] = {
                        // term.close: a shell on a pseudo-terminal, its
                        // output in term records, acked, then term.end;
                        // term.busy; hello's pty, whether the system can
+                       // run one at all
     "pdf",             // upload {kind:"file"} of a PDF: kept as
                        // files/N-NAME.pdf, its text extracted beside it as
                        // files/N-NAME.pdf.txt, which the reply names; a
