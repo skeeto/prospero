@@ -1643,6 +1643,7 @@ static Str pdfpredict(Pdf *p, Str d, PdfObj parms)
     }
 
     // TIFF: each sample adds the one colors samples before it in its row
+    iz nc  = (iz)colors;  // at most 32, and cols at most 2^24, as checked
     iz len = d.len;
     if (bpc == 16) {
         len &= ~(iz)1;  // a lone half sample would change with the next byte
@@ -1651,11 +1652,11 @@ static Str pdfpredict(Pdf *p, Str d, PdfObj parms)
         iz  n   = len-r<rb ? len-r : rb;
         u8 *row = s + r;
         if (bpc == 8) {
-            for (iz j = colors; j < n; j++) {
+            for (iz j = nc; j < n; j++) {
                 row[j] = (u8)(row[j] + row[j-colors]);
             }
         } else if (bpc == 16) {
-            for (iz j = 2*colors; j+1 < n; j += 2) {
+            for (iz j = 2*nc; j+1 < n; j += 2) {
                 i32 v = (row[j]<<8 | row[j+1]) + (row[j-2*colors]<<8 | row[j-2*colors+1]);
                 row[j]   = (u8)(v >> 8);
                 row[j+1] = (u8)v;
@@ -1663,11 +1664,11 @@ static Str pdfpredict(Pdf *p, Str d, PdfObj parms)
         } else {
             i32 b       = (i32)bpc;
             i32 mask    = (1<<b) - 1;
-            iz  samples = colors * cols;
+            iz  samples = nc * (iz)cols;
             samples = samples<n*8/b ? samples : n*8/b;
-            for (iz j = colors; j < samples; j++) {
+            for (iz j = nc; j < samples; j++) {
                 iz  at   = j * b;
-                iz  from = (j - colors) * b;
+                iz  from = (j - nc) * b;
                 i32 sh   = 8 - b - (i32)(at & 7);
                 i32 fs   = 8 - b - (i32)(from & 7);
                 i32 v    = (row[at>>3]>>sh) + (row[from>>3]>>fs);
@@ -2561,7 +2562,7 @@ static void pdfxrefstm(Pdf *p, PdfObj o, i32 rev)
         if (!pdfcharge(p, rows)) {
             break;
         }
-        for (i64 k = 0; k < rows; k++, at += rw) {
+        for (i64 k = 0; k < rows; k++, at += (iz)rw) {  // rw at most 24
             u8 *row  = s.data + at;
             i64 type = ws[0] ? pdffield(row, ws[0]) : 1;
             i64 f2   = pdffield(row+ws[0], ws[1]);
