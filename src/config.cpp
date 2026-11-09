@@ -246,7 +246,7 @@ static CfgKind cfgkinds[] = {
     {"worktree", 0, "Worktree sessions: each in a git worktree and branch of its own"},
     {"sessions", 0, "Sessions deleted: how long the Trash keeps them"},
     {"ui",       0, "How the GUI looks, and when it tells you of a session"},
-    {"terminal", 0, "The Terminal pane: the shell its tabs run"},
+    {"terminal", 0, "The Terminal pane: the shell its tabs run, their history and copying"},
     {"desktop",  0, "The desktop tool: seeing the screen, and the mouse and keyboard"},
     {"web",      0, "Web search and reading web pages: the web_search and web_fetch tools"},
     {"host",     0, "The engine as a background host (prospero serve)"},
@@ -648,6 +648,12 @@ static CfgKey cfgschema[] = {
      "system's sh, else $SHELL. A POSIX shell starts as a login shell, "
      "except on Linux for this computer's sessions, whose desktop login "
      "ran the profile already"},
+    {"terminal", "scrollback", CFG_INT, "10000", {}, {}, "terminal",
+     "Lines of history a new terminal tab keeps above its screen, 0 to "
+     "100000"},
+    {"terminal", "copy_on_select", CFG_BOOL, "false", {}, {}, "terminal",
+     "Whether selecting text in a terminal copies it at once, without "
+     "the copy key"},
 
     {"host", "idle_exit", CFG_SECONDS, "600", {}, {}, "host",
      "Seconds a host waits with no client connected and nothing running, "

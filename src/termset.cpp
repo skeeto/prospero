@@ -116,6 +116,25 @@ static void termsetorder(TermSet *s, TermTab **order, i32 n)
     }
 }
 
+// [terminal] scrollback as a tab's history lines, 0 to 100000, the
+// default for what isn't a number.
+static i32 termscrollparse(Str v)
+{
+    Int n = parseint(v);
+    if (!n.ok) {
+        return 10000;
+    }
+    return n.val<0 ? 0 : n.val>100000 ? 100000 : (i32)n.val;
+}
+
+// History for that many lines: ariel's ring in proportion to its
+// default (10000 lines in 4 MiB), at least 64 KiB; none for 0.
+static iz termscrollbytes(i32 lines)
+{
+    iz n = (iz)lines * 420;
+    return !lines ? 0 : n<((iz)1<<16) ? (iz)1<<16 : n;
+}
+
 // A title as a tab shows it, from the bytes a program set (OSC 0 or 2),
 // into dst (TERMTITLECAP bytes): what the eye can't see dropped (the
 // bidi and zero-width controls, C0 and C1), blank runs as one space,

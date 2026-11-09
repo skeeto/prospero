@@ -1714,6 +1714,8 @@ struct Gui {
     b32                termfocus;    // focus the terminal when next drawn
     GuiSession        *termaddto;    // root wanting a new tab once sized
     i32                closeterms;   // busy tabs the quit dialog counted
+    i32                termscroll;   // [terminal] scrollback, for new tabs
+    b32                termcopysel;  // [terminal] copy_on_select
     TermTab           *termshowing;  // the tab drawn in front last
     u32                termshowingserial;  // its serial then
     i32                termlastcols; // the pane's size in cells last frame,
@@ -4764,6 +4766,10 @@ static void loadcfg(Gui *g, Str line)
             setcfgstr(g, &g->editor, r);
         } else if (r.kind=="ui" && r.key=="terminal") {
             setcfgstr(g, &g->terminal, r);
+        } else if (r.kind=="terminal" && r.key=="scrollback") {
+            g->termscroll = termscrollparse(r.valid && r.value.len ? r.value : r.dflt);
+        } else if (r.kind=="terminal" && r.key=="copy_on_select") {
+            g->termcopysel = cfgbool(r.valid && r.value.len ? r.value : r.dflt) == 1;
         } else if (r.kind=="ui" && r.key=="mentions") {
             g->nomentions = cfgbool(r.valid && r.value.len ? r.value : r.dflt) == 0;
         } else if (r.kind=="ui" && r.key=="notify") {
@@ -13281,6 +13287,7 @@ enum : i32 {
     CHK_TERMKID,      // a subagent is shown, with its root's tabs
     CHK_TERMCLOSE,    // the quit dialog counted dx busy terminal tabs
     CHK_TERMHOME,     // the terminal docked under the prompt, as placed
+    CHK_TERMHIST,     // its front tab keeps dx rows of history
     CHK_TERMQUIET,    // no frames while idle, the terminal shown
     CHK_TERMFORCE,    // sets the grid to dx by dy, clipped to its pane
                       // (0 by 0: its pane's), and passes
@@ -13575,6 +13582,7 @@ static Str chknames[] = {
     "a subagent shows its root's terminal tabs",
     "the quit dialog counts the busy terminal tabs",
     "the terminal is in its home under the prompt",
+    "the terminal keeps as much history as configured",
     "no frames while idle, the terminal shown",
     "the terminal's grid is set", "the terminal is that size, in 32-bit indices",
     "the palette lists what it should",
@@ -17588,6 +17596,13 @@ static DriveOp termops[] = {
     {OP_CHECK, CHK_TERMHOME, 0, 0, 0, ""},
     {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "onetwo|*bash"},
     {OP_CHECK, CHK_TERMSIZE, 0, 0, 1500, ""},
+    // History as [terminal] scrollback says (gui.py's 100)
+    CTRLKEY(GKEY_GRAVE, 500),  // the menu took the keyboard
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 100, "seq 1 300"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\n300\n"},
+    {OP_CHECK, CHK_TERMHIST, 100, 0, 0, ""},
     {OP_MOVE, T_SESSTITLE, 0, 0, 100, ""},
     {OP_RDOWN, 0, 0, 0, 60, ""},
     {OP_RUP, 0, 0, 0, 500, ""},
@@ -17604,7 +17619,7 @@ static DriveOp termops[] = {
     {OP_TEXT, 0, 0, 0, 100, "exit"},
     TERMKEY(GKEY_ENTER, 1000),
     {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "onetwo|*bash"},
-    {OP_CHECK, CHK_TERMSCREEN, 0, 0, 0, "\nkeyed"},
+    {OP_CHECK, CHK_TERMSCREEN, 0, 0, 0, "\n300\n"},  // the keyed tab's
     {OP_TEXT, 0, 0, 0, 100, "exit"},
     TERMKEY(GKEY_ENTER, 1000),
     {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*onetwo"},
@@ -21537,6 +21552,20 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_TERMCLOSE:
         return (f32)g->closeterms == g->ops[g->drivepc-1].dx;
+    case CHK_TERMHIST: {
+        TermTab *tt = termfront(g);
+        if (!tt || !tt->t) {
+            return 0;
+        }
+        ariel_View v = ariel_view(tt->t);
+        Arena      a = g->frame;
+        Buf        b(&a, 64);
+        print(&b, "drive: the terminal's history is ");
+        print(&b, (i64)(v.total - tt->rows));
+        print(&b, " rows");
+        guilog(g, finish(&b));
+        return (f32)(v.total - tt->rows) == g->ops[g->drivepc-1].dx;
+    }
     case CHK_TERMHOME: {
         // The lower side of a vertical split, near its share, whose
         // upper side holds the prompt
@@ -23341,6 +23370,8 @@ static void readconfig(Gui *g, Arena scratch)
     g->terminal   = clone(&g->perm, cfgget(cfg, "ui", "", "terminal", 0));
     g->notify     = notifyparse(cfgget(cfg, "ui", "", "notify", 0));
     g->nomentions = cfgbool(cfgget(cfg, "ui", "", "mentions", 0)) == 0;
+    g->termscroll  = termscrollparse(cfgget(cfg, "terminal", "", "scrollback", 0));
+    g->termcopysel = cfgbool(cfgget(cfg, "terminal", "", "copy_on_select", 0)) == 1;
     g->pathpre    = clone(&g->perm, cfgget(cfg, "tools", "", "path_prepend", 0));
     g->pathpost   = clone(&g->perm, cfgget(cfg, "tools", "", "path_append", 0));
     g->configured = cfgconfigured(cfg);
@@ -23433,6 +23464,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->layout   = dockpreset(PRESET_STANDARD);
     g->zoom     = 1;
     g->fontbase = FONT_BASE;
+    g->termscroll = 10000;  // until the configuration says
     for (i32 i = 0; i < PANE_COUNT; i++) {
         g->panes[i] = !panehidden(i);
     }

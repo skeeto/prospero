@@ -1890,7 +1890,7 @@ def main():
         if os.name == "nt":
             # busybox's sh from w64devkit, with its vim, less, seq and tr
             shell = shword(shutil.which("sh").replace("\\", "/"))
-        before = config(curl, model) + f"\n[terminal]\nshell = {shell}\n"
+        before = config(curl, model) + f"\n[terminal]\nshell = {shell}\nscrollback = 100\n"
         os.environ["PS1"] = "tty$ "
         os.environ["HISTFILE"] = ""  # not the user's history
     elif args.mode == "drive" and not args.fake:

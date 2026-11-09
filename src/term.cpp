@@ -55,6 +55,7 @@ struct TermTab {
     b32         pasteins;  // Insert, held since it pasted with Shift
     i32         textkey;   // a Ctrl+Alt key that typed (AltGr), while held
     b32         busy;      // a program runs in the shell
+    i32         histlines; // its history, as [terminal] scrollback said
     Palette    *pal;       // the colors given ariel
     i32         code;      // the end's exit code, or -1
     i32         signal;
@@ -132,7 +133,8 @@ static void termcolors(Gui *g, TermTab *tt)
     ariel_setcolor(tt->t, ARIEL_C_CURSOR, termrgb(p->termcursor));
 }
 
-static ariel_Config termconfig(i32 cols, i32 rows, i32 capcols, i32 caprows)
+// ariel's configuration for a tab, history lines (0 for none) given.
+static ariel_Config termconfig(i32 cols, i32 rows, i32 capcols, i32 caprows, i32 hist)
 {
     static char name[] = "Prospero(" PROSPERO_VERSION ")";
     ariel_Config c = {};
@@ -140,6 +142,8 @@ static ariel_Config termconfig(i32 cols, i32 rows, i32 capcols, i32 caprows)
     c.rows      = rows;
     c.capcols   = capcols;
     c.caprows   = caprows;
+    c.histlines = hist ? hist : -1;  // ariel's 0 is its default
+    c.histbytes = termscrollbytes(hist);
     c.name.data = (u8 *)name;
     c.name.len  = countof(name) - 1;
     return c;
@@ -159,7 +163,7 @@ static b32 termblock(Gui *g, TermTab *tt, i32 cols, i32 rows)
 {
     i32          capcols = termcap(cols, 200);
     i32          caprows = termcap(rows, 80);
-    ariel_Config c       = termconfig(cols, rows, capcols, caprows);
+    ariel_Config c       = termconfig(cols, rows, capcols, caprows, tt->histlines);
     iz           size    = ariel_size(&c);
     if (!size) {
         return 0;
@@ -393,6 +397,9 @@ static void termsweep(Gui *g)
 static void termlaunch(Gui *g, GuiSession *s, TermTab *tt, i32 cols, i32 rows)
 {
     tt->host = s->host;
+    if (!tt->t) {
+        tt->histlines = g->termscroll;  // kept through moves and restarts
+    }
     cols = cols>0 ? cols : 80;
     rows = rows>0 ? rows : 24;
     if (!termblock(g, tt, cols, rows)) {

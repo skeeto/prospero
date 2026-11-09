@@ -1096,6 +1096,8 @@ static void testcfgjson(Test *t)
         "ui//mentions=true*\n"
         "ui//notify=allow done*\n"
         "terminal//shell=*\n"
+        "terminal//scrollback=10000*\n"
+        "terminal//copy_on_select=false*\n"
         "desktop//offer=all*\n"
         "desktop//ask=true*\n"
         "desktop//ask_timeout=60*\n"

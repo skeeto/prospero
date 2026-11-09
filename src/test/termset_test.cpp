@@ -88,6 +88,16 @@ static void test_termset(Test *t)
     termsetorder(&o, order2, 3);
     expect(t, "termset.orderpart", termsetstr(&a, &o, names), "c*bda");
 
+    // Scrollback
+    expect(t, "termscroll.plain", termscrollparse("500")==500 ? Str("ok") : "bad", "ok");
+    expect(t, "termscroll.zero", termscrollparse("0")==0 ? Str("ok") : "bad", "ok");
+    expect(t, "termscroll.neg", termscrollparse("-5")==0 ? Str("ok") : "bad", "ok");
+    expect(t, "termscroll.big", termscrollparse("999999999999")==100000 ? Str("ok") : "bad", "ok");
+    expect(t, "termscroll.junk", termscrollparse("lots")==10000 ? Str("ok") : "bad", "ok");
+    expect(t, "termscroll.bytes0", termscrollbytes(0)==0 ? Str("ok") : "bad", "ok");
+    expect(t, "termscroll.bytesmin", termscrollbytes(10)==65536 ? Str("ok") : "bad", "ok");
+    expect(t, "termscroll.bytes", termscrollbytes(10000)==4200000 ? Str("ok") : "bad", "ok");
+
     // Titles
     expect(t, "termtitle.plain", termtitlestr(&a, Str("vim main.c")), "vim main.c");
     expect(t, "termtitle.blank", termtitlestr(&a, Str("  a \t\n b  ")), "a b");
