@@ -1576,7 +1576,7 @@ typedef struct {
     iz  total;
 } Layout;
 
-static iz align16(iz n) { return (n + 15) & ~(iz)15; }
+static i64 align16(i64 n) { return (n + 15) & ~(i64)15; }
 
 static Layout layout(ariel_Config *cfg)
 {
@@ -1600,21 +1600,21 @@ static Layout layout(ariel_Config *cfg)
         return l;  // total 0: invalid
     }
 
-    iz cells = (iz)l.capcols * l.caprows;
+    i64 cells = (i64)l.capcols * l.caprows;
     l.npool  = (i32)imax(64, (i32)(cells/4));
-    iz off   = align16((iz)sizeof(ariel_Term));
+    i64 off   = align16((i64)sizeof(ariel_Term));
     for (i32 g = 0; g < 3; g++) {
-        l.grid[g][0] = (u32)off;  off = align16(off + cells*(iz)sizeof(Cell));
-        l.grid[g][1] = (u32)off;  off = align16(off + l.caprows*(iz)sizeof(Head));
-        l.grid[g][2] = (u32)off;  off = align16(off + l.caprows*(iz)sizeof(u16));
+        l.grid[g][0] = (u32)off;  off = align16(off + cells*(i64)sizeof(Cell));
+        l.grid[g][1] = (u32)off;  off = align16(off + l.caprows*(i64)sizeof(Head));
+        l.grid[g][2] = (u32)off;  off = align16(off + l.caprows*(i64)sizeof(u16));
     }
-    l.pool    = (u32)off;  off = align16(off + (iz)l.npool*(POOLN+1)*4);
-    l.histidx = (u32)off;  off = align16(off + (iz)l.histlines*(iz)sizeof(Hent));
+    l.pool    = (u32)off;  off = align16(off + (i64)l.npool*(POOLN+1)*4);
+    l.histidx = (u32)off;  off = align16(off + (i64)l.histlines*(i64)sizeof(Hent));
     l.hist    = (u32)off;  off = align16(off + l.histbytes);
-    if (off > (iz)0xffffffff) {
-        return l;
+    if (off>0xffffffff || off>PTRDIFF_MAX) {
+        return l;   // offsets are u32, and sizes iz
     }
-    l.total = off;
+    l.total = (iz)off;
     return l;
 }
 
