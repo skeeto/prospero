@@ -1109,11 +1109,13 @@ static void termselect(Gui *g, TermTab *tt, TermMetrics *m, ImVec2 pos, b32 loca
     ImGuiIO    &io = ImGui::GetIO();
     ariel_Modes mo = ariel_modes(tt->t);
     f32         h  = (f32)mo.rows * m->ch;
-    f32         dx = io.MousePos.x - pos.x;
+    f32         w  = (f32)mo.cols * m->cw;
+    f32         dx = io.MousePos.x - pos.x;  // -FLT_MAX off the window
     f32         dy = my - pos.y;
+    dx = dx>0 ? (dx<w ? dx : w) : 0;  // clamped before any cast
+    dy = dy>0 ? (dy<h ? dy : h-1) : 0;
     i32         bx = (i32)((dx + m->cw/2) / m->cw);  // a column boundary
-    i32         y  = (i32)((dy>0 ? (dy<h ? dy : h-1) : 0) / m->ch);
-    bx = bx<0 ? 0 : bx>mo.cols ? mo.cols : bx;
+    i32         y  = (i32)(dy / m->ch);
     i32 block = io.KeyAlt ? ARIEL_SEL_BLOCK : 0;
 
     if (local && ImGui::IsMousePosValid() && ImGui::IsMouseClicked(0)) {
