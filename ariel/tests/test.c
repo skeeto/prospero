@@ -984,7 +984,8 @@ static void runline(Script *sc, Tester *s, char *p)
     if (word(&p, "?screen_row")) {
         int r = (int)number(&p);
         if (!expect(&p, '=')) goto syntax;
-        int n = quoted(&p, buf, countof(buf));
+        skipws(&p);
+        int n = !*p || *p=='\n' ? 0 : quoted(&p, buf, countof(buf));
         if (n < 0) goto syntax;
         int m = rowtext(s, r, 0, 4096, got, countof(got));
         if (m != n || memcmp(got, buf, (size_t)n)) {
