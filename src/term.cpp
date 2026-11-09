@@ -83,6 +83,16 @@ static Str termerr(TermTab *tt)
     return {tt->err, tt->errlen};
 }
 
+// A tab's label: its program's title, else its shell's name.
+static Str termlabel(TermTab *tt)
+{
+    if (tt->titlelen) {
+        return {tt->title, tt->titlelen};
+    }
+    Str shell = basename(termshellname(tt));
+    return shell.len ? shell : Str("Terminal");
+}
+
 // Why a session can have no terminal now, else empty.
 static Str termwhy(Gui *g, GuiSession *s)
 {
@@ -486,6 +496,13 @@ static void termfeed(Gui *g, TermTab *tt, Str data)
             return;
         case ARIEL_EV_REPLY:
             terminput(g, tt, {f.ev.data.data, f.ev.data.len});
+            break;
+        case ARIEL_EV_TITLE:
+            if (!f.ev.arg) {
+                // The window's title names its tab
+                tt->titlelen = termtitle(tt->title, {f.ev.data.data, f.ev.data.len});
+                scheddirty(&g->sched);
+            }
             break;
         }
     }
@@ -1133,17 +1150,124 @@ static void termbanner(Gui *g, GuiSession *s, TermTab *tt, Arena a, i32 cols, i3
     }
 }
 
-// The Terminal pane's contents: the current session's terminal, its
-// grid filling the pane, which takes the keyboard once clicked.
+// The tab bar over the grid, drawn while the root can have terminals,
+// even with none, so the grid keeps its height as the first starts. It
+// selects its tab when front changed here (frontset), else front follows
+// the tab the user picked, and the set follows the bar's order. A tab
+// closed or "+" waits in *closed or *plus for the caller, which knows
+// the size.
+static void termtabs(Gui *g, GuiSession *s, i32 *closed, b32 *plus)
+{
+    TermSet *set = &s->terms;
+    if (g->termbarroot != s) {
+        g->termbarroot = s;  // another root: its own front, selected
+        set->frontset  = set->n > 0;
+    }
+    *closed = -1;
+    *plus   = 0;
+    ImGuiTabBarFlags bf = ImGuiTabBarFlags_Reorderable |
+                          ImGuiTabBarFlags_FittingPolicyShrink;
+    if (!ImGui::BeginTabBar("##termtabs", bf)) {
+        return;
+    }
+    Arena   a = g->frame;
+    ImGuiID ids[TERMTABS] = {};
+    for (i32 i = 0; i < set->n; i++) {
+        TermTab          *tt    = set->tabs[i];
+        bool              open  = true;
+        ImGuiTabItemFlags flags = 0;
+        if (set->frontset && i==set->front) {
+            flags |= ImGuiTabItemFlags_SetSelected;
+        }
+        if (tt->busy) {
+            flags |= ImGuiTabItemFlags_UnsavedDocument;
+        }
+        Buf b(&a, TERMTITLECAP + 32);
+        print(&b, termlabel(tt));
+        print(&b, "###tt");
+        print(&b, (i64)tt->serial);
+        b32 shown = ImGui::BeginTabItem(cstr0(&a, finish(&b)), &open, flags);
+        ids[i] = ImGui::GetItemID();
+        if (ImGui::IsItemDeactivated()) {
+            // On release, not press: focus takes the active ID, which
+            // would end a drag before it started
+            g->termfocus = 1;
+        }
+        Buf nb(&a, 32);
+        print(&nb, "term tab ");
+        print(&nb, (i64)i + 1);
+        itemnamed(g, finish(&nb));
+        if (shown) {
+            ImGui::EndTabItem();
+        }
+        if (!open && *closed<0) {
+            *closed = i;
+        }
+    }
+    Str why = termfull(g, s);
+    ImGui::BeginDisabled(why.len > 0);
+    if (ImGui::TabItemButton("+", ImGuiTabItemFlags_Trailing |
+                                  ImGuiTabItemFlags_NoTooltip)) {
+        *plus        = 1;
+        g->termfocus = 1;
+    }
+    ImGui::EndDisabled();
+    if (why.len) {
+        itemtip("%s", cstr0(&a, why));
+    } else {
+        itemtip("New terminal tab (Ctrl+Shift+`)");
+    }
+    itemnamed(g, "term tab +");
+
+    // The bar's order and selection back into the set
+    ImGuiTabBar *bar = ImGui::GetCurrentTabBar();
+    TermTab     *order[TERMTABS];
+    i32          norder = 0;
+    for (i32 k = 0; k < bar->Tabs.Size; k++) {
+        for (i32 i = 0; i < set->n; i++) {
+            if (ids[i] && bar->Tabs[k].ID==ids[i] && norder<TERMTABS) {
+                order[norder++] = set->tabs[i];
+            }
+        }
+    }
+    TermTab *selected = 0;
+    for (i32 i = 0; i < set->n; i++) {
+        if (ids[i] && ids[i]==bar->SelectedTabId) {
+            selected = set->tabs[i];
+        }
+    }
+    if (set->frontset) {
+        if (set->n && selected==set->tabs[set->front]) {
+            set->frontset = 0;
+        }
+    } else if (selected && selected!=set->tabs[set->front]) {
+        set->front = termsetfind(set, selected);
+        scheddirty(&g->sched);
+    }
+    termsetorder(set, order, norder);
+    ImGui::EndTabBar();
+}
+
+// The Terminal pane's contents: the current session's tabs, the front
+// one's grid filling the pane, which takes the keyboard once clicked.
 static void drawterm(Gui *g)
 {
-    Arena        a  = g->frame;
-    GuiSession  *s  = g->sess ? termroot(g, g->sess) : 0;
-    TermTab     *tt = s ? termsetfront(&s->terms) : 0;
+    Arena        a   = g->frame;
+    GuiSession  *s   = g->sess ? termroot(g, g->sess) : 0;
     ImGuiWindow *win = ImGui::GetCurrentWindow();
     ImGuiID      id  = win->GetID("##grid");
     g->termid      = id;
     g->termfocused = 0;
+    g->termgrid    = {};
+
+    Str why = termwhy(g, s);
+    if (why.len && (!s || !s->terms.n)) {
+        ImGui::TextDisabled("%s", cstr0(&a, why));
+        return;
+    }
+    i32 closed = -1;
+    b32 plus   = 0;
+    termtabs(g, s, &closed, &plus);
 
     TermMetrics m     = termmetrics(g);
     ImVec2      avail = ImGui::GetContentRegionAvail();
@@ -1155,13 +1279,20 @@ static void drawterm(Gui *g)
         cols = g->termforcecols;
         rows = g->termforcerows;
     }
-
-    Str why = termwhy(g, s);
-    if (!tt || tt->state==TT_NONE) {
-        if (why.len) {
-            ImGui::TextDisabled("%s", cstr0(&a, why));
-            return;
+    if (closed >= 0) {
+        termdrop(g, s, closed, 0);
+        if (!s->terms.n && GImGui->ActiveId==id) {
+            ImGui::ClearActiveID();
+            g->promptfocus = 1;
         }
+        scheddirty(&g->sched);
+    }
+    if (plus) {
+        termnew(g, s, cols, rows);
+    }
+
+    TermTab *tt = termsetfront(&s->terms);
+    if (!tt || tt->state==TT_NONE) {
         // The pane takes its place in the dock over frames, through a
         // layout (drawpanes), and
         // a shell started smaller loses what scrolled away, as ConPTY
@@ -1200,6 +1331,7 @@ static void drawterm(Gui *g)
     pos = v2(termsnap(pos.x, m.density), termsnap(pos.y, m.density));
     ImVec2 size = v2(avail.x>1 ? avail.x : 1, avail.y>1 ? avail.y : 1);
     ImRect bb(pos, v2(pos.x + size.x, pos.y + size.y));
+    g->termgrid = bb;
     ImGui::ItemSize(size);
     if (!ImGui::ItemAdd(bb, id)) {
         return;
@@ -1305,16 +1437,15 @@ static Str termscreen(Gui *g, Arena *a)
 // engine was told, with no new size waiting.
 static b32 termsizecheck(Gui *g)
 {
-    TermTab     *tt = termfront(g);
-    ImGuiWindow *w  = ImGui::FindWindowByName("Terminal");
-    if (!tt || !tt->t || !w || tt->state!=TT_LIVE) {
+    TermTab *tt = termfront(g);
+    if (!tt || !tt->t || tt->state!=TT_LIVE || g->termgrid.GetWidth()<=0) {
         guilog(g, "drive: no live terminal shown");
         return 0;
     }
     TermMetrics m    = termmetrics(g);
     ariel_Modes mo   = ariel_modes(tt->t);
-    f32         cw   = w->ContentRegionRect.GetWidth();
-    f32         ch   = w->ContentRegionRect.GetHeight();
+    f32         cw   = g->termgrid.GetWidth();
+    f32         ch   = g->termgrid.GetHeight();
     i32         cols = (i32)(cw / m.cw);
     i32         rows = (i32)(ch / m.ch);
     Arena       a    = g->frame;

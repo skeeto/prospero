@@ -1708,6 +1708,8 @@ struct Gui {
     // The Terminal pane (term.cpp)
     b32                termhome;     // it has no home in the dock space yet
     TermTab           *termspare;    // closed tabs, to reuse
+    GuiSession        *termbarroot;  // whose tabs the bar showed last
+    ImRect             termgrid;     // the front tab's grid, as last drawn
     u32                termserial;   // the last tab's serial
     b32                termfocus;    // focus the terminal when next drawn
     i32                termlastcols; // the pane's size in cells last frame,
@@ -13269,6 +13271,7 @@ enum : i32 {
     CHK_TERMSIZE,     // the terminal fills its pane, the engine told its size
     CHK_TERMNONE,     // the session shown has no terminal
     CHK_TERMCOUNT,    // dx terminals are open, in every session
+    CHK_TERMTABS,     // the shown root's tab labels, '|' between, '*' front
     CHK_TERMQUIET,    // no frames while idle, the terminal shown
     CHK_TERMFORCE,    // sets the grid to dx by dy, clipped to its pane
                       // (0 by 0: its pane's), and passes
@@ -13559,7 +13562,7 @@ static Str chknames[] = {
     "the '@' picker's pick says it is attached, or does not",
     "the terminal has the keyboard", "the terminal shows the text",
     "the terminal fills its pane", "the terminal is closed",
-    "that many terminals are open",
+    "that many terminals are open", "the terminal tabs are as said",
     "no frames while idle, the terminal shown",
     "the terminal's grid is set", "the terminal is that size, in 32-bit indices",
     "the palette lists what it should",
@@ -17484,6 +17487,45 @@ static DriveOp termops[] = {
     {OP_SHOT, 0, 0, 0, 300, "terminal-big"},
     {OP_CHECK, CHK_TERMFORCE, 0, 0, 1000, ""},
     {OP_CHECK, CHK_TERMSIZE, 0, 0, 0, ""},
+    // Tabs: a title names one; "+" adds one, shown, with the keyboard
+    // and a shell of its own; a drag reorders them; a click shows one;
+    // exit closes one, showing its neighbour
+    {OP_TEXT, 0, 0, 0, 100, "printf '\\033]0;one\\342\\200\\256two\\007'; echo titled"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\ntitled"},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*onetwo"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "term tab +"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_WAIT, W_TERM, 0, 0, 10000, "tty$"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 100, "printf '\\033]2;two\\007'; echo second"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\nsecond"},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 300, "onetwo|*two"},
+    {OP_SHOT, 0, 0, 0, 300, "terminal-tabs"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "term tab 2"},
+    {OP_DOWN, 0, 0, 0, 100, ""},
+    {OP_MOVE, T_NAMED, -6, 0, 100, "term tab 2"},
+    {OP_MOVE, T_NAMED, -20, 0, 100, "term tab 1"},
+    {OP_MOVE, T_NAMED, -30, 0, 300, "term tab 1"},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*two|onetwo"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "term tab 2"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "two|*onetwo"},
+    {OP_CHECK, CHK_TERMSCREEN, 0, 0, 0, "\ntitled"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "term tab 1"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_TERMSCREEN, 0, 0, 0, "\nsecond"},
+    {OP_TEXT, 0, 0, 0, 100, "exit"},
+    TERMKEY(GKEY_ENTER, 1000),
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*onetwo"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMCOUNT, 1, 0, 0, ""},
     // exit closes it; a failing exit leaves its screen under a banner,
     // and Enter starts another shell
     {OP_TEXT, 0, 0, 0, 100, "exit"},
@@ -21290,6 +21332,22 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_TERMNONE: {
         TermTab *tt = termfront(g);
         return g->sess && (!tt || tt->state==TT_NONE);
+    }
+    case CHK_TERMTABS: {
+        GuiSession *s = g->sess ? termroot(g, g->sess) : 0;
+        Arena       a = g->frame;
+        Buf         b(&a, 256);
+        for (i32 i = 0; s && i<s->terms.n; i++) {
+            print(&b, i ? Str("|") : Str(""));
+            print(&b, i==s->terms.front ? Str("*") : Str(""));
+            print(&b, termlabel(s->terms.tabs[i]));
+        }
+        Str got = finish(&b);
+        if (!(got == g->ops[g->drivepc-1].text)) {
+            guilog(g, concat(&a, "drive: the terminal tabs are ", got));
+            return 0;
+        }
+        return 1;
     }
     case CHK_TERMCOUNT: {
         i64 n = 0;
