@@ -489,6 +489,7 @@ static b32 os_lockheld(Os *os, Arena, Str path)
 // No processes or standard input: the engine is tested end to end by
 // tests/scenarios.py against the real platforms.
 static Slice<Str> os_environ(Os *, Arena *) { return {}; }
+static Slice<Str> os_launchenv(Os *, Arena *) { return {}; }
 static iz    os_stdin(Os *, u8 *, iz) { return 0; }
 static Proc *os_spawn(Os *, Spawn *, Arena) { return 0; }
 static Proc *os_spawnio(Os *, Spawn *, Arena) { return 0; }

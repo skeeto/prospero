@@ -108,6 +108,7 @@ struct Os {
     Resp   resp;      // macOS: responsibility, if there
     i32    respself;  // macOS: the pid responsible for this process, or 0
     FileId exeid;     // macOS: exe as it was at startup, zero if unknown
+    Slice<Str> launchenv;  // macOS: launchd's, if loginenviron replaced it
 };
 
 enum : iz {
@@ -997,6 +998,18 @@ static Slice<Str> os_environ(Os *, Arena *a)
         Str s = {(u8 *)*e, 0};
         while (s.data[s.len]) s.len++;
         r = push(a, r, clone(a, s));
+    }
+    return r;
+}
+
+static Slice<Str> os_launchenv(Os *os, Arena *a)
+{
+    if (!os->launchenv.len) {
+        return os_environ(os, a);
+    }
+    Slice<Str> r = {};
+    for (iz i = 0; i < os->launchenv.len; i++) {
+        r = push(a, r, clone(a, os->launchenv[i]));
     }
     return r;
 }
@@ -3957,9 +3970,11 @@ static void os_httpfree(Os *, Http *h)
 // PROSPERO_RESOLVING_ENVIRONMENT=1 so a profile can tell. Here, before
 // any thread starts, so setenv races nothing. Five seconds at most: a
 // profile that waits on a terminal is killed, and the window keeps
-// launchd's environment.
-static void loginenviron(Os *os, Arena scratch)
+// launchd's environment. That stays, in perm, for os_launchenv.
+static void loginenviron(Os *os, Arena *perm)
 {
+    Slice<Str> launch  = os_environ(os, perm);
+    Arena      scratch = *perm;
     if (!loginwanted(os_getenv(os, &scratch, "PATH"))) {
         return;
     }
@@ -4052,6 +4067,7 @@ static void loginenviron(Os *os, Arena scratch)
     }
 
     Slice<Str> env = loginenv(&scratch, {buf, len});
+    os->launchenv = env.len ? launch : Slice<Str>{};
     for (iz i = 0; i < env.len; i++) {
         Cut kv = cut(env[i], '=');
         setenv(cstr(&scratch, kv.head), cstr(&scratch, kv.tail), 1);
@@ -4348,7 +4364,7 @@ int main(int argc, char **argv)
     #if PROSPERO_GUI
     if (guiwanted(args, argc)) {
         #ifdef __APPLE__
-        loginenviron(&os, a);
+        loginenviron(&os, &a);
         #endif
         // For sigthread (gui_sdl.cpp) alone: every thread inherits this
         sigset_t quit;

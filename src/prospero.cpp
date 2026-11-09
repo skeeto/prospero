@@ -183,6 +183,10 @@ static void    os_logclose(Os *, iz log);
 static Read    os_readat(Os *, Arena *, Str path, i64 off, iz max);
 // (M2) The environment as "NAME=value" entries.
 static Slice<Str> os_environ(Os *, Arena *);
+// The environment this process started with, before a desktop-started
+// window took its login shell's (macOS), for a login shell of its own:
+// else os_environ's.
+static Slice<Str> os_launchenv(Os *, Arena *);
 // (M2) Read standard input: bytes read, 0 at its end, -1 on error.
 static iz      os_stdin(Os *, u8 *buf, iz len);
 

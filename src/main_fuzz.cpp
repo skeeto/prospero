@@ -237,6 +237,7 @@ static void os_logclose(Os *, iz) {}
 
 static Read os_readat(Os *, Arena *, Str, i64, iz) { return {{}, 0, READ_NOTFOUND}; }
 static Slice<Str> os_environ(Os *, Arena *) { return {}; }
+static Slice<Str> os_launchenv(Os *, Arena *) { return {}; }
 static iz    os_stdin(Os *, u8 *, iz) { return 0; }
 static Str   os_realpath(Os *, Arena *, Str) { return {}; }
 static Str   os_hostids(Os *, Arena *) { return {}; }

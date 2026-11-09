@@ -1249,6 +1249,11 @@ static Read os_readat(Os *, Arena *a, Str path, i64 off, iz max)
     return r;
 }
 
+static Slice<Str> os_launchenv(Os *os, Arena *a)
+{
+    return os_environ(os, a);
+}
+
 static Slice<Str> os_environ(Os *, Arena *a)
 {
     Slice<Str> r   = {};

@@ -435,11 +435,17 @@ static Str termstart(Engine *e, Arena scratch, i64 id, Json *j, Session *s, Str 
     Str cwd = jsonstr(jsonget(j, "cwd"));
     cwd = cwd.len && os_stat(e->os, scratch, cwd).type==STAT_DIR ? cwd : s->cwd;
 
-    Shell      sh   = s->te.shell;
-    Slice<Str> env  = envsetpath(&scratch, e->env, enginepath(e, &scratch, win), win);
+    // A login shell runs the profile itself, so it starts from what
+    // this process started with, as a terminal's would: not the login
+    // environment a desktop-started window took (macOS), whose EDITOR
+    // would start zsh in vi mode, its PATH entries doubled
+    Shell      sh    = s->te.shell;
+    b32        login = !(PTY_LINUX && e->gui);
+    Slice<Str> env   = login && !win ? os_launchenv(e->os, &scratch) : e->env;
+    Str        path  = cfgsearchpath(e->cfg, &scratch, envpath(env, win), e->home, win);
+    env = envsetpath(&scratch, env, path, win);
     env = shellover(s, &scratch, &sh, env, 1);
     Str        conf = trim(cfgget(e->cfg, "terminal", {}, "shell", 0));
-    b32        login = !(PTY_LINUX && e->gui);
     Slice<Str> argv = termargv(&scratch, conf, shellkinds[sh.kind], sh.path,
                                sh.distro, envget(env, "SHELL", win), win, login);
     if (!argv.len) {
