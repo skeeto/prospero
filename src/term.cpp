@@ -86,11 +86,21 @@ static Str termerr(TermTab *tt)
     return {tt->err, tt->errlen};
 }
 
-// A tab's label: its program's title, else its shell's name.
+// A tab's label: its program's title, else its shell's name. ConPTY
+// titles a console with its program's path, which names it as a shell's
+// would be (C:\...\sh.EXE is sh).
 static Str termlabel(TermTab *tt)
 {
     if (tt->titlelen) {
-        return {tt->title, tt->titlelen};
+        Str title = {tt->title, tt->titlelen};
+        Str name  = basename(title);
+        Str ext   = cuthead(name, name.len<4 ? name.len : name.len-4);
+        b32 exe   = ext.len==4 && ext[0]=='.' && (ext[1]|0x20)=='e' &&
+                    (ext[2]|0x20)=='x' && (ext[3]|0x20)=='e';
+        if (exe && name.len>4 && name.len<title.len) {
+            return takehead(name, name.len-4);
+        }
+        return title;
     }
     Str shell = basename(termshellname(tt));
     return shell.len ? shell : Str("Terminal");

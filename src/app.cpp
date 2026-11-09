@@ -16255,6 +16255,13 @@ static DriveOp stopops[] = {
 #define TERMSTRAY(file) \
     "sh -c 'trap \"\" HUP; sh -c \"while :; do sleep 1; done\" stray \"$PWD\" & " \
     "echo $! >" file "; wait'"
+// The shell a tab runs, as its label names it: the test's bash, or on
+// Windows the session's busybox sh
+#if defined(_WIN32)
+#  define TERMSH "sh"
+#else
+#  define TERMSH "bash"
+#endif
 #define TERMKEY(key, ms) \
     {OP_KEYDOWN, 0, key, 0, 50, ""}, {OP_KEYUP, 0, key, 0, ms, ""}
 
@@ -17602,25 +17609,25 @@ static DriveOp termops[] = {
     {OP_TEXT, 0, 0, 0, 100, "echo keyed"},
     TERMKEY(GKEY_ENTER, 100),
     {OP_WAIT, W_TERM, 0, 0, 5000, "\nkeyed"},
-    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "onetwo|*bash"},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "onetwo|*" TERMSH},
     // Each layout picked keeps the terminal, under the prompt, its tabs
     // as they were, its size following
     LAYOUT("Compact"),
     {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Terminal"},
     {OP_CHECK, CHK_TERMHOME, 0, 0, 0, ""},
-    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "onetwo|*bash"},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "onetwo|*" TERMSH},
     {OP_CHECK, CHK_TERMSIZE, 0, 0, 1500, ""},
     {OP_SHOT, 0, 0, 0, 300, "terminal-compact"},
     LAYOUT("Focus"),
     {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Terminal"},
     {OP_CHECK, CHK_TERMHOME, 0, 0, 0, ""},
-    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "onetwo|*bash"},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "onetwo|*" TERMSH},
     {OP_CHECK, CHK_TERMSIZE, 0, 0, 1500, ""},
     {OP_SHOT, 0, 0, 0, 300, "terminal-focus"},
     LAYOUT("Standard"),
     {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Terminal"},
     {OP_CHECK, CHK_TERMHOME, 0, 0, 0, ""},
-    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "onetwo|*bash"},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "onetwo|*" TERMSH},
     {OP_CHECK, CHK_TERMSIZE, 0, 0, 1500, ""},
     // History as [terminal] scrollback says (gui.py's 100)
     CTRLKEY(GKEY_GRAVE, 500),  // the menu took the keyboard
@@ -17707,11 +17714,11 @@ static DriveOp termops[] = {
     {OP_TEXT, 0, 0, 0, 100, "echo menued"},
     TERMKEY(GKEY_ENTER, 100),
     {OP_WAIT, W_TERM, 0, 0, 5000, "\nmenued"},
-    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "onetwo|bash|*bash"},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "onetwo|" TERMSH "|*" TERMSH},
     {OP_TEXT, 0, 0, 0, 100, "exit"},
     TERMKEY(GKEY_ENTER, 1000),
-    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "onetwo|*bash"},
-    {OP_CHECK, CHK_TERMSCREEN, 0, 0, 0, "\n300\n"},  // the keyed tab's
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "onetwo|*" TERMSH},
+    {OP_CHECK, CHK_TERMSCREEN, 0, 0, 0, "300\ntty$ echo pick"},  // the keyed tab's
     {OP_TEXT, 0, 0, 0, 100, "exit"},
     TERMKEY(GKEY_ENTER, 1000),
     {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*onetwo"},
@@ -17762,7 +17769,7 @@ static DriveOp termops[] = {
     TERMKEY(GKEY_ENTER, 100),
     {OP_WAIT, W_TERM, 0, 0, 5000, "\nafter"},
     {OP_CHECK, CHK_TERMSCREEN, 0, 0, 0, "tty$ echo after"},
-    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "onetwo|*bash"},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "onetwo|*" TERMSH},
     {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
     {OP_TEXT, 0, 0, 0, 100, "exit"},
     TERMKEY(GKEY_ENTER, 1000),
@@ -17834,7 +17841,7 @@ static DriveOp termops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_TERMKID, 0, 0, 0, ""},
-    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*bash"},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*" TERMSH},
     {OP_CHECK, CHK_TERMSCREEN, 0, 0, 0, "\nrootwo"},
     {OP_NEWSESSION, 0, 0, 0, 0, ""},
     {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
@@ -17844,13 +17851,13 @@ static DriveOp termops[] = {
     {OP_TEXT, 0, 0, 0, 100, "echo third"},
     TERMKEY(GKEY_ENTER, 100),
     {OP_WAIT, W_TERM, 0, 0, 5000, "\nthird"},
-    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*bash"},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*" TERMSH},
     {OP_CHECK, CHK_TERMCOUNT, 2, 0, 0, ""},
     {OP_CHECK, CHK_TERMREGIONS, 2, 0, 0, ""},
     {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Start subagents."},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 800, ""},
-    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*bash"},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*" TERMSH},
     {OP_CHECK, CHK_TERMSCREEN, 0, 0, 0, "\nrootwo"},
     CTRLKEY(GKEY_GRAVE, 500),
     {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
