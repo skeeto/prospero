@@ -63,8 +63,8 @@ without a terminal, and takes under five seconds. Add directories with
 full path if need be. See [Configuration](help:config).
 
 **An ask was denied before you answered.** Asks are denied when their
-time runs out (`[guard] ask_timeout`), and at once in a session nobody
-is watching. See [Permissions and asks](help:permissions).
+time runs out (`[guard] ask_timeout`, 60 s; 0 for no limit), and at
+once in a session nobody is watching. See [Permissions and asks](help:permissions).
 
 **Launching Prospero again only brings the old window forward.** One
 window runs per state directory, even while it runs in the

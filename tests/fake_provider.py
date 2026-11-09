@@ -1220,7 +1220,7 @@ def sc_ask(model, n, req):
 
 
 sc_ask_allow = sc_ask_deny = sc_ask_timeout = sc_ask_steer = sc_ask_close = sc_ask
-sc_ask_touch = sc_ask
+sc_ask_touch = sc_ask_wait = sc_ask
 sc_config_roots = sc_ask
 
 
@@ -2148,7 +2148,7 @@ sc_question_steer_first = sc_question
 sc_question_cancel = sc_question_close = sc_question_bypass = sc_question
 sc_question_switch = sc_question_switch_b = sc_question_offered = sc_question
 sc_question_reopen = sc_question_fork = sc_question_gui = sc_question
-sc_question_timeout = sc_question_touch = sc_question_plan = sc_question
+sc_question_timeout = sc_question_touch = sc_question_plan = sc_question_wait = sc_question
 
 
 # Agents for prospero eval (tests/scenarios.py, eval_*): scripted good

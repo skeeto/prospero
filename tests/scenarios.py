@@ -3286,7 +3286,7 @@ def ask_allow(t):
     h = t.headless()
     try:
         sid, ask = asked(t, h)
-        t.check(29000 <= ask["deadline"] - ask["ts"] <= 31000, f"a 30 s deadline: {ask}")
+        t.check(59000 <= ask["deadline"] - ask["ts"] <= 61000, f"a 60 s deadline: {ask}")
         r = h.call("answer", sid=sid, req=ask["req"], decision="allow", note="ok")
         t.check(r.get("ok") == 1, f"answer accepted: {r}")
         end = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
@@ -3382,6 +3382,30 @@ def ask_touch(t):
         ans = h.wait(lambda e: e.get("ev") == "answer" and e.get("sid") == sid, 10)
         t.check(ans["by"] == "timeout" and ans["ts"] - ask["ts"] >= 4500,
                 f"then timed out: {ans} after {ans['ts'] - ask['ts']} ms")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf={"_guard": {"ask_timeout": 0}}, bound=15)
+def ask_wait(t):
+    """ask_timeout = 0: a permission ask has no deadline, a touch arms
+    none, and it waits until answered. (Closed, with nobody left to
+    answer, it is denied at once as ever: ask_close.)"""
+    h = t.headless()
+    try:
+        sid, ask = asked(t, h)
+        t.check(ask["deadline"] == 0, f"no deadline: {ask}")
+        r = h.call("ask.touch", sid=sid, req=ask["req"])
+        t.check(r.get("ok") == 1, f"touched: {r}")
+        time.sleep(2)
+        t.check(not h.all("answer", sid), f"still waiting: {h.all('answer', sid)}")
+        dls = [e for e in logged(t, sid) if e["ev"] == "ask.deadline"]
+        t.check(not dls, f"nothing logged: {dls}")
+        h.call("answer", sid=sid, req=ask["req"], decision="deny")
+        end = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        t.check(h.all("answer", sid)[0]["by"] == "user", f"answered: {h.all('answer', sid)}")
+        t.check(end["why"] == "done", f"the turn goes on: {end}")
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")
@@ -10242,7 +10266,7 @@ def plan_enter(t):
         sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
         h.send("prompt", sid=sid, text="Plan first.")
         ask = h.wait(lambda e: e.get("ev") == "ask" and e.get("sid") == sid)
-        t.check(ask["kind"] == "plan.enter" and 29000 <= ask["deadline"] - ask["ts"] <= 31000,
+        t.check(ask["kind"] == "plan.enter" and 59000 <= ask["deadline"] - ask["ts"] <= 61000,
                 f"the ask: {ask}")
         h.call("answer", sid=sid, req=ask["req"], decision="allow")
         plan = planask(h, sid)
@@ -10993,6 +11017,27 @@ def question_timeout(t):
         te = h.all("tool.end", sid)[-1]
         t.check(te["status"] == "denied" and te["text"].startswith("Nobody answered in time") and
                 "recommended options" in te["text"], f"the result: {te}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf={"_guard": {"question_timeout": 0}}, bound=10)
+def question_wait(t):
+    """question_timeout = 0: outside plan mode too, the questions wait
+    with no deadline until answered."""
+    h = t.headless()
+    try:
+        sid, ask = questioned(t, h)
+        t.check(ask["deadline"] == 0, f"no deadline: {ask}")
+        h.call("ask.touch", sid=sid, req=ask["req"])
+        time.sleep(2)
+        t.check(not h.all("answer", sid), f"still waiting: {h.all('answer', sid)}")
+        t.check(not [e for e in logged(t, sid) if e["ev"] == "ask.deadline"],
+                "no deadline logged")
+        h.call("answer", sid=sid, req=ask["req"], decision="deny")
+        end = ended(h, sid, 1)
+        t.check(h.all("answer", sid)[-1]["by"] == "user", f"answered: {h.all('answer', sid)}")
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")

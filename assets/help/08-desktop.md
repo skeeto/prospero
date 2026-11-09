@@ -23,7 +23,7 @@ An included file cannot change `[desktop]`.
 
 Every action asks you first, screenshots included, and is denied if
 you do not answer within `[desktop] ask_timeout` seconds (60 by
-default). Instead of Allow, an ask may allow its action's class for
+default; 0 waits until you answer). Instead of Allow, an ask may allow its action's class for
 the rest of the session and its subagents, with "Allow CLASS for this
 session":
 

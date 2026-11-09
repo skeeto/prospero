@@ -69,7 +69,7 @@
 // frontend that can answer has it open, which the frontend declares with
 // attended:1 on new or open (and close ends). Unattended, an ask is
 // denied at once by policy. Attended, the session logs an ask with a
-// deadline ([guard] ask_timeout, 30 s by default) and waits in its own state,
+// deadline ([guard] ask_timeout, 60 s by default, 0 for none) and waits in its own state,
 // blocking nothing else: an answer resolves it, the deadline denies it.
 // A steer never answers one: it waits behind the ask, to be read at the
 // next step with the ask's outcome (the user may not have seen the ask
@@ -4489,16 +4489,29 @@ static void planheed(Session *s, Arena scratch)
 // How long the agent's questions wait, in ticks, outside plan mode.
 static i64 questiondelay(Engine *e)
 {
-    return cfgms(e->cfg, "guard", "", "question_timeout", 0)*MS;
+    return cfgwaitms(e->cfg, "guard", "question_timeout")*MS;
 }
 
 // Arm a waiting ask's deadline, from now, and keep its delay for the
-// user's touches to start over (askclock).
+// user's touches to start over (askclock). A delay of 0 waits with no
+// deadline ([guard] ask_timeout = 0).
 static void askarm(Session *s, i64 delay)
 {
-    arm(s, T_ASK, delay);
+    if (delay) {
+        arm(s, T_ASK, delay);
+    } else {
+        disarm(s, T_ASK);
+    }
     s->ask.delay    = delay;
-    s->ask.deadline = os_time(s->e->os) + delay/MS;
+    s->ask.deadline = delay ? os_time(s->e->os) + delay/MS : 0;
+}
+
+// An ask record's deadline, epoch ms: now if nobody attends it, as it is
+// denied at once, else after delay, or 0 for none.
+static i64 askdue(Session *s, b32 wait, i64 delay)
+{
+    i64 now = os_time(s->e->os);
+    return !wait ? now : delay ? now + delay/MS : 0;
 }
 
 // The clock of a waiting ask, from now with restart, as the user works
@@ -5601,7 +5614,7 @@ static b32 askcall(Session *s, Arena scratch, i32 tool, GuardPath *gp)
     // A steer waiting for the next step waits behind this ask, as behind
     // every ask: the user may not have seen it when writing the steer
     b32 wait  = attending(s);
-    i64 delay = cfgms(e->cfg, "guard", "", "ask_timeout", 0)*MS;
+    i64 delay = cfgwaitms(e->cfg, "guard", "ask_timeout")*MS;
     if (wait) {
         // The deadline runs from now: the record's fsync, which a slow
         // disk may draw out, must not extend it
@@ -5629,7 +5642,7 @@ static b32 askcall(Session *s, Arena scratch, i32 tool, GuardPath *gp)
             putstrkey(&w.json, "always", k->grant);
             putstrkey(&w.json, "access", read ? Str("read") : Str("write"));
         }
-        putintkey(&w.json, "deadline", os_time(e->os) + (wait ? delay/MS : 0));
+        putintkey(&w.json, "deadline", askdue(s, wait, delay));
         putstrkey(&w.json, "dflt", "deny");
         ssend(s, &w);
     }
@@ -8041,7 +8054,7 @@ static b32 deskcall(Session *s, Arena scratch, DeskArgs *d)
         k->gclass = cls;
     }
     b32 wait  = attending(s);
-    i64 delay = cfgms(e->cfg, "desktop", "", "ask_timeout", 0)*MS;
+    i64 delay = cfgwaitms(e->cfg, "desktop", "ask_timeout")*MS;
     if (wait) {
         askarm(s, delay);
     }
@@ -8058,7 +8071,7 @@ static b32 deskcall(Session *s, Arena scratch, DeskArgs *d)
             putstrkey(&w.json, "always", k->grant);
             putstrkey(&w.json, "scope", "desktop");
         }
-        putintkey(&w.json, "deadline", os_time(e->os) + (wait ? delay/MS : 0));
+        putintkey(&w.json, "deadline", askdue(s, wait, delay));
         putstrkey(&w.json, "dflt", "deny");
         ssend(s, &w);
     }
@@ -8706,7 +8719,7 @@ static b32 webcall(Session *s, Arena scratch, i32 tool, Args *args)
     k->grant  = tool==TOOL_WEBSEARCH ? Str("search") : clone(&s->perm, host);
     k->opened = os_ticks(e->os);
     b32 wait  = attending(s);
-    i64 delay = cfgms(e->cfg, "guard", "", "ask_timeout", 0)*MS;
+    i64 delay = cfgwaitms(e->cfg, "guard", "ask_timeout")*MS;
     if (wait) {
         askarm(s, delay);
     }
@@ -8732,7 +8745,7 @@ static b32 webcall(Session *s, Arena scratch, i32 tool, Args *args)
         }
         putstrkey(&w.json, "always", k->grant);
         putstrkey(&w.json, "scope", "web");
-        putintkey(&w.json, "deadline", os_time(e->os) + (wait ? delay/MS : 0));
+        putintkey(&w.json, "deadline", askdue(s, wait, delay));
         putstrkey(&w.json, "dflt", "deny");
         ssend(s, &w);
     }
@@ -9668,7 +9681,7 @@ static b32 plancall(Session *s, Arena scratch, i32 tool)
     k->opened  = os_ticks(e->os);
     k->plansum = hash(plan.text);  // to know a plan revised by hand
     b32 wait  = attending(s);
-    i64 delay = leave ? 0 : cfgms(e->cfg, "guard", "", "ask_timeout", 0)*MS;
+    i64 delay = leave ? 0 : cfgwaitms(e->cfg, "guard", "ask_timeout")*MS;
     if (wait && delay) {
         askarm(s, delay);
     }
@@ -10907,7 +10920,7 @@ static b32 mcpprojgate(Session *s, Arena scratch)
     k->grant   = "project";
     k->opened  = os_ticks(e->os);
     b32 wait  = attending(s);
-    i64 delay = cfgms(e->cfg, "guard", "", "ask_timeout", 0)*MS;
+    i64 delay = cfgwaitms(e->cfg, "guard", "ask_timeout")*MS;
     if (wait) {
         askarm(s, delay);
     }
@@ -10936,7 +10949,7 @@ static b32 mcpprojgate(Session *s, Arena scratch)
         putstrkey(&w.json, "detail", detail);
         putstrkey(&w.json, "always", "project");
         putstrkey(&w.json, "scope", "mcp.project");
-        putintkey(&w.json, "deadline", os_time(e->os) + (wait ? delay/MS : 0));
+        putintkey(&w.json, "deadline", askdue(s, wait, delay));
         putstrkey(&w.json, "dflt", "deny");
         ssend(s, &w);
     }
@@ -11057,7 +11070,7 @@ static b32 approvegate(Session *s, Arena scratch)
     k->approve = 1;
     k->opened  = os_ticks(e->os);
     b32 wait  = attending(s);
-    i64 delay = cfgms(e->cfg, "guard", "", "ask_timeout", 0)*MS;
+    i64 delay = cfgwaitms(e->cfg, "guard", "ask_timeout")*MS;
     if (wait) {
         askarm(s, delay);
     }
@@ -11098,7 +11111,7 @@ static b32 approvegate(Session *s, Arena scratch)
         putstrkey(&w.json, "path", path);
         putstrkey(&w.json, "detail", detail);
         putstrkey(&w.json, "scope", "approve");
-        putintkey(&w.json, "deadline", os_time(e->os) + (wait ? delay/MS : 0));
+        putintkey(&w.json, "deadline", askdue(s, wait, delay));
         putstrkey(&w.json, "dflt", "deny");
         ssend(s, &w);
     }
@@ -11739,7 +11752,7 @@ static b32 mcpcall(Session *s, Arena scratch, McpTool *t)
     k->mcpurl = all.host.len ? clone(&s->perm, all.host) : Str{};
     k->opened = os_ticks(e->os);
     b32 wait  = attending(s);
-    i64 delay = cfgms(e->cfg, "guard", "", "ask_timeout", 0)*MS;
+    i64 delay = cfgwaitms(e->cfg, "guard", "ask_timeout")*MS;
     if (wait) {
         askarm(s, delay);
     }
@@ -11758,7 +11771,7 @@ static b32 mcpcall(Session *s, Arena scratch, McpTool *t)
         if (k->trust.len) {
             putstrkey(&w.json, "trust", k->trust);
         }
-        putintkey(&w.json, "deadline", os_time(e->os) + (wait ? delay/MS : 0));
+        putintkey(&w.json, "deadline", askdue(s, wait, delay));
         putstrkey(&w.json, "dflt", "deny");
         ssend(s, &w);
     }
@@ -16420,7 +16433,7 @@ static b32 taskasks(Session *s, Arena scratch)
         q->grant  = args.network ? Str{} : clone(&s->perm, args.image);
         q->opened = os_ticks(e->os);
         b32 wait  = attending(s);
-        i64 delay = cfgms(e->cfg, "guard", "", "ask_timeout", 0)*MS;
+        i64 delay = cfgwaitms(e->cfg, "guard", "ask_timeout")*MS;
         if (wait) {
             askarm(s, delay);
         }
@@ -16449,7 +16462,7 @@ static b32 taskasks(Session *s, Arena scratch)
                 putstrkey(&w.json, "always", q->grant);
                 putstrkey(&w.json, "scope", "container");
             }
-            putintkey(&w.json, "deadline", os_time(e->os) + (wait ? delay/MS : 0));
+            putintkey(&w.json, "deadline", askdue(s, wait, delay));
             putstrkey(&w.json, "dflt", "deny");
             ssend(s, &w);
         }

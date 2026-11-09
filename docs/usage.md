@@ -329,8 +329,8 @@ with a few options, the recommended one marked and picked, and a field
 for an answer in your own words, then a note, Submit answers and Skip.
 A skip, or nobody there to answer, has the agent go with its
 recommendations. In Plan mode the questions wait with no countdown;
-otherwise they are skipped after `[guard] question_timeout` (300 s),
-a countdown that starts over whenever you work on the card. A
+otherwise they are skipped after `[guard] question_timeout` (300 s;
+0 for no limit), a countdown that starts over whenever you work on the card. A
 notification tells of them (`[ui] notify` `allow`). Only the sessions
 you start yourself, attended, get the tool: never subagents, roles, a
 `tools` list or command-line runs. Over the protocol, an ask of kind

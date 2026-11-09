@@ -68,6 +68,12 @@ static void testcfgschema(Test *t)
         {"endpoint", "idle_timeout", "0", CFG_BAD, 0},
         {"endpoint", "idle_timeout", "-1", CFG_BAD, 0},
         {"endpoint", "idle_timeout", "1e7", CFG_BAD, 0},
+        {"guard", "ask_timeout", "0", CFG_OK, 0},           // no deadline
+        {"guard", "question_timeout", "0", CFG_OK, 0},
+        {"desktop", "ask_timeout", "0", CFG_OK, 0},
+        {"guard", "ask_timeout", "-1", CFG_BAD, 0},
+        {"guard", "ask_timeout", "1e7", CFG_BAD, 0},
+        {"mcp", "timeout", "0", CFG_BAD, 0},                // only the asks'
         {"endpoint", "idle_timeout", " 30 ", CFG_OK, 0},
         {"endpoint", "idle_timeout", "30s", CFG_BAD, 0},
         {"endpoint", "slow_retry", "60 120, 0.5", CFG_OK, 0},
@@ -859,7 +865,7 @@ static void testcfgdelete(Test *t)
     tmp = v.scratch;
     r   = cfgdelete(c, &tmp, "guard", "");
     expect(t, "del.guard", istr(&a, r.ok), "1");
-    expect(t, "del.guard.value", cfgget(c, "guard", "", "ask_timeout", 0), "30");
+    expect(t, "del.guard.value", cfgget(c, "guard", "", "ask_timeout", 0), "60");
     expect(t, "del.text", cfgfile(v.os, "/d/h.ini"),
            "# My settings\ninclude = team.ini\n");
     expect(t, "del.team", cfgfile(v.os, "/d/team.ini"), team);
@@ -1061,7 +1067,7 @@ static void testcfgjson(Test *t)
         "model/m/seed=*\n"
         "model/m/max_tokens=*\n"
         "guard//roots=*\n"
-        "guard//ask_timeout=30*\n"
+        "guard//ask_timeout=60*\n"
         "guard//question_timeout=300*\n"
         "guard//temp=allow*\n"
         "tools//job_timeout=1800*\n"

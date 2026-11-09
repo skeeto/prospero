@@ -441,13 +441,15 @@ static CfgKey cfgschema[] = {
 
     {"guard", "roots", CFG_PATHS, "", {}, {}, "guard",
      "More directories the file tools may use, separated by ;"},
-    {"guard", "ask_timeout", CFG_SECONDS, "30", {}, {}, "guard",
+    {"guard", "ask_timeout", CFG_SECONDS, "60", {}, {}, "guard",
      "Seconds to wait for an answer when a tool asks to leave the roots, "
-     "then deny"},
+     "or asks for anything else, then deny; 0 waits until answered while "
+     "a window has the session open (with none, asks are denied at once)"},
     {"guard", "question_timeout", CFG_SECONDS, "300", {}, {}, "guard",
      "Seconds to wait for answers to the agent's questions (ask_user), "
      "counted again whenever the user works on them, then skip them; in "
-     "plan mode they wait with no limit"},
+     "plan mode they wait with no limit; 0 waits until answered while a "
+     "window has the session open (with none, they are skipped at once)"},
     {"guard", "temp", CFG_ENUM, "allow", {}, "allow ask", "guard",
      "The system's temporary directory: allow the file tools there without "
      "asking, or ask as for any directory outside the roots"},
@@ -558,7 +560,9 @@ static CfgKey cfgschema[] = {
      "Ask the user before every desktop action, denying it when nobody "
      "answers in time; false lets the agent act unattended"},
     {"desktop", "ask_timeout", CFG_SECONDS, "60", {}, {}, "desktop",
-     "Seconds to wait for an answer to a desktop action, then deny"},
+     "Seconds to wait for an answer to a desktop action, then deny; 0 "
+     "waits until answered while a window has the session open (with "
+     "none, actions are denied at once)"},
 
     {"web", "search", CFG_ENUM, "none", {}, "none searxng exa keenable anthropic", "web",
      "The service web_search uses: none (no web_search), searxng (an "
@@ -1063,6 +1067,14 @@ static b32 cfgenvname(Str s)
     return 1;
 }
 
+// The asks' timeouts, which may be 0: no deadline, waiting until the
+// user answers, while anyone attends the session to.
+static b32 cfgwaitkey(CfgKey *k)
+{
+    return (k->kind=="guard" && (k->key=="ask_timeout" || k->key=="question_timeout")) ||
+           (k->kind=="desktop" && k->key=="ask_timeout");
+}
+
 static b32 cfgtilde(Str p)
 {
     return p=="~" || startswith(p, "~/") || startswith(p, "~\\");
@@ -1170,6 +1182,9 @@ static i32 cfgjudge(CfgKey *k, Str v, b32 shared)
     } else if (k->kind=="sessions" && k->key=="trash_days") {
         Int n = parseint(v);
         return n.ok && n.val>=0 && n.val<=36500 ? CFG_OK : CFG_BAD;
+    } else if (cfgwaitkey(k)) {
+        Float f = parsefloat(v);
+        return f.ok && f.val>=0 && f.val<1e7 ? CFG_OK : CFG_BAD;
     }
     switch (k->type) {
     case CFG_STRING:
@@ -1284,6 +1299,8 @@ static Str cfgproblem(Arena *a, CfgKey *k, Str v, b32 shared)
         return "expected a name of letters, digits, '.', '_' and '-', at most 64";
     } else if (k->kind=="sessions" && k->key=="trash_days") {
         return "expected days, 0 or more (at most 36500): 0 turns the Trash off";
+    } else if (cfgwaitkey(k)) {
+        return "expected seconds, 0 or more: 0 waits until answered";
     }
     Buf b(a, 128);
     switch (k->type) {
@@ -1728,6 +1745,17 @@ static i64 cfgms(Config *c, Str kind, Str name, Str key, b32 local)
     Float f  = parsefloat(trim(cfgget(c, kind, name, key, local)));
     i64   ms = f.ok ? (i64)(f.val * 1000) : 0;
     return ms>0 ? ms : 1;
+}
+
+// An ask's timeout (cfgwaitkey) in milliseconds, 0 for none: wait until
+// answered.
+static i64 cfgwaitms(Config *c, Str kind, Str key)
+{
+    Float f = parsefloat(trim(cfgget(c, kind, {}, key, 0)));
+    if (f.ok && f.val==0) {
+        return 0;
+    }
+    return cfgms(c, kind, {}, key, 0);
 }
 
 // A secret setting, resolved: env:NAME reads the environment, and
