@@ -13688,6 +13688,7 @@ enum : i32 {
                   // text says (ctrwait)
     W_TERM,       // the shown session's terminal shows text
     W_TERMBUSY,   // its front tab runs a program, or not with "idle"
+    W_TERMCOUNT,  // dx terminals are open, in every session
 };
 
 static Str waitnames[] = {
@@ -13713,9 +13714,9 @@ static Str waitnames[] = {
     "the subagent on far", "the subagent on far shown", "a toast",
     "the changes", "the folder's probe", "the worktree's branch",
     "the thin remote", "a relayed stream", "the container",
-    "the terminal's text", "the terminal's program",
+    "the terminal's text", "the terminal's program", "the terminals' count",
 };
-static_assert(countof(waitnames) == W_TERMBUSY+1);
+static_assert(countof(waitnames) == W_TERMCOUNT+1);
 
 enum : i32 {
     KEY_CTRL  = 1,
@@ -17688,7 +17689,7 @@ static DriveOp termops[] = {
     {OP_KEYUP, 0, GKEY_SHIFT, 0, 300, ""},
     {OP_CHECK, CHK_TERMSEL, 0, 0, 0, "echo l1\necho l2"},
     TERMCOPY(300),
-    {OP_TEXT, 0, 0, 0, 100, "cat >pasted.txt"},  // only the tty's echo shows
+    {OP_TEXT, 0, 0, 0, 100, "head -n 2 >pasted.txt"},  // the tty echoes
     TERMKEY(GKEY_ENTER, 500),
     TERMPASTE(500),
     {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
@@ -17696,10 +17697,9 @@ static DriveOp termops[] = {
     {OP_MOVE, T_NAMED, 0, 0, 100, "term paste ok"},
     {OP_DOWN, 0, 0, 0, 60, ""}, {OP_UP, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
-    {OP_WAIT, W_TERM, 0, 0, 5000, "tty$ cat >pasted.txt\necho l1\necho l2"},
+    {OP_WAIT, W_TERM, 0, 0, 5000, "tty$ head -n 2 >pasted.txt\necho l1\necho l2"},
     {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
-    TERMKEY(GKEY_ENTER, 100),
-    CTRLKEY(GKEY_D, 500),
+    TERMKEY(GKEY_ENTER, 500),  // the second line, and head is done
     {OP_CLIPBACK, 0, 0, 0, 100, ""},
     {OP_CHECK, CHK_DCLICKTIME, 0.3f, 0, 0, ""},
     {OP_MOVE, T_SESSTITLE, 0, 0, 100, ""},
@@ -17821,7 +17821,7 @@ static DriveOp termops[] = {
     {OP_MOVE, T_NAMED, 0, 0, 100, "Move to Trash"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 500, ""},
-    {OP_CHECK, CHK_TERMCOUNT, 0, 0, 1000, ""},
+    {OP_WAIT, W_TERMCOUNT, 0, 0, 10000, ""},  // Windows' console closes slowly
     {OP_NEWSESSION, 0, 0, 0, 0, ""},
     {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
     {OP_CHECK, CHK_TERMNONE, 0, 0, 0, ""},
@@ -19730,6 +19730,18 @@ static Str lastmark(Gui *g, Arena *a)
     return {};
 }
 
+// Terminals open, in every session.
+static i64 drivetermcount(Gui *g)
+{
+    i64 n = 0;
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        for (i32 i = 0; i < s->terms.n; i++) {
+            n += s->terms.tabs[i]->state != TT_NONE;
+        }
+    }
+    return n;
+}
+
 static b32 drivewaitdone(Gui *g)
 {
     View *v = g->view;
@@ -19894,6 +19906,8 @@ static b32 drivewaitdone(Gui *g)
         b32      idle = g->ops[g->drivepc-1].text == Str("idle");
         return tt && tt->busy!=idle;
     }
+    case W_TERMCOUNT:
+        return (f32)drivetermcount(g) == g->ops[g->drivepc-1].dx;
     case W_VIA:
         return g->sess && v->state==LIVE_STREAMING && v->relaylen>0 && v->deltas>0;
     case W_PLAN: {
@@ -21657,8 +21671,14 @@ static b32 drivecheck(Gui *g, i32 chk)
         TermTab *tt = termfront(g);
         return g->sess && (!tt || tt->state==TT_NONE);
     }
-    case CHK_TERMCLOSE:
+    case CHK_TERMCLOSE: {
+        Arena a = g->frame;
+        Buf   b(&a, 64);
+        print(&b, "drive: the quit dialog counts busy terminal tabs: ");
+        print(&b, (i64)g->closeterms);
+        guilog(g, finish(&b));
         return (f32)g->closeterms == g->ops[g->drivepc-1].dx;
+    }
     case CHK_TERMREGIONS: {
         Arena a = g->frame;
         Buf   b(&a, 64);
@@ -21762,15 +21782,8 @@ static b32 drivecheck(Gui *g, i32 chk)
         }
         return 1;
     }
-    case CHK_TERMCOUNT: {
-        i64 n = 0;
-        for (GuiSession *s = g->sessions; s; s = s->next) {
-            for (i32 i = 0; i < s->terms.n; i++) {
-                n += s->terms.tabs[i]->state != TT_NONE;
-            }
-        }
-        return (f32)n == g->ops[g->drivepc-1].dx;
-    }
+    case CHK_TERMCOUNT:
+        return (f32)drivetermcount(g) == g->ops[g->drivepc-1].dx;
     case CHK_TERMQUIET:
         return g->panes[PANE_TERMINAL] && drivequiet(g, "idle with the terminal shown", 2);
     case CHK_TERMFORCE: {

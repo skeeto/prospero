@@ -933,6 +933,13 @@ static void termpaste(Gui *g, TermTab *tt, Arena a)
 {
     char const *clip = ImGui::GetClipboardText();
     Str         in   = {(u8 *)clip, clip ? (iz)__builtin_strlen(clip) : 0};
+    if (g->drive && !(in==g->driveclip) && g->driveclip.len &&
+            (os_guilimits(g->os) & GUI_NOSERIAL)) {
+        // As driveclipboard says
+        guilog(g, "drive: the window system refused the selection made by synthetic "
+                  "input (no real input's serial): pasting what the GUI set");
+        in = g->driveclip;
+    }
     if (!in.len) {
         return;
     } else if (!ariel_pastecheck(tt->t, {in.data, in.len})) {

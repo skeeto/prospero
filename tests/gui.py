@@ -2155,9 +2155,20 @@ def main():
             problems.append("a tab's Kill left its shell's child running")
         else:
             print("terminal: a tab's Kill ended its shell's child")
+        # On Windows closing the pseudoconsole ends its console programs,
+        # as closing a console window does: there is no SIGHUP to ignore
         pid = stray("close.pid")
         if not pid:
             problems.append("no close.pid")
+        elif os.name == "nt":
+            deadline = time.monotonic() + 5
+            while alive(pid) and time.monotonic() < deadline:
+                time.sleep(0.1)
+            if alive(pid) and ours(pid, host.root):
+                problems.append("a tab's Close left its console's program running")
+                P.signal_ours(pid, P.KILL, lambda q: ours(q, host.root), "stray")
+            else:
+                print("terminal: a tab's Close ended its console's program")
         elif not alive(pid) or not ours(pid, host.root):
             problems.append("a tab's Close ended a child ignoring SIGHUP")
         else:
