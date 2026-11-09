@@ -6437,7 +6437,8 @@ static void tooljobout(Session *s, Arena scratch, Args *args)
         print(&b, "]\n");
     }
     if (j->state != JOB_DONE) {
-        print(&b, "[you are told when the job ends: do not poll it]");
+        print(&b, "[you are told when the job ends: do not poll it, ");
+        print(&b, "end your turn if you have nothing else to do]");
     }
     Str text = finish(&b);
     toolend(s, scratch, "ok", text, 0, 0, {}, 0);
