@@ -74,6 +74,7 @@
 #include "filewalk.cpp"
 #include "sidebar.cpp"
 #include "dock.cpp"
+#include "termset.cpp"
 #include "palette.cpp"
 
 enum : i64 {

@@ -680,6 +680,7 @@ static Str istr(Arena *a, i64 v)
 #  include "pathpick.cpp"
 #  include "sidebar.cpp"
 #  include "dock.cpp"
+#  include "termset.cpp"
 #  include "palette.cpp"
 #  include "test/sched_test.cpp"
 #  include "test/highlight_test.cpp"
@@ -696,6 +697,7 @@ static Str istr(Arena *a, i64 v)
 #  include "test/pathpick_test.cpp"
 #  include "test/sidebar_test.cpp"
 #  include "test/dock_test.cpp"
+#  include "test/termset_test.cpp"
 #  include "test/palette_test.cpp"
 #endif
 
@@ -787,6 +789,7 @@ int main()
     test_pathpick(&t);
     test_sidebar(&t);
     test_dock(&t);
+    test_termset(&t);
     test_palette(&t);
     test_viewexport(&t);
     #endif
