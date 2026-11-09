@@ -174,16 +174,19 @@ static b32 termblock(Gui *g, TermTab *tt, i32 cols, i32 rows)
     if (!r) {
         return 0;
     }
+    g->termregions++;
     Arena a = newarena(r);
     allocbytes(&a, -(uz)a.beg & 15);
     void       *mem = allocbytes(&a, size);
     ariel_Term *t   = tt->t ? ariel_move(tt->t, mem, size, &c) : ariel_init(mem, size, &c);
     if (!t) {
         os_release(g->os, r);
+        g->termregions--;
         return 0;
     }
     if (tt->region) {
         os_release(g->os, tt->region);
+        g->termregions--;
     }
     tt->region  = r;
     tt->t       = t;
@@ -197,6 +200,7 @@ static void termfree(Gui *g, TermTab *tt)
 {
     if (tt->region) {
         os_release(g->os, tt->region);
+        g->termregions--;
     }
     GuiHost *h      = tt->host;
     u32      serial = tt->serial;

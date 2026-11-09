@@ -1715,6 +1715,7 @@ struct Gui {
     GuiSession        *termaddto;    // root wanting a new tab once sized
     i32                closeterms;   // busy tabs the quit dialog counted
     i32                termscroll;   // [terminal] scrollback, for new tabs
+    i32                termregions;  // tabs' blocks reserved, for the drive
     Region            *termpasteregion;  // a paste waiting to be confirmed
     Str                termpastetext;    //   in it
     TermTab           *termpastetab;     //   for this tab
@@ -13299,6 +13300,7 @@ enum : i32 {
     CHK_TERMVIEW,     // scrolled back into history (dx 1), or not (0)
     CHK_TERMSEL,      // the front tab's selection is the text
     CHK_DCLICKTIME,   // (sets) ImGui's double-click time to dx seconds
+    CHK_TERMREGIONS,  // dx terminal blocks are reserved, one a tab
     CHK_TERMQUIET,    // no frames while idle, the terminal shown
     CHK_TERMFORCE,    // sets the grid to dx by dy, clipped to its pane
                       // (0 by 0: its pane's), and passes
@@ -13597,6 +13599,7 @@ static Str chknames[] = {
     "the terminal's view is scrolled back, or at the bottom, as said",
     "the terminal's selection is as said",
     "the double-click time is set",
+    "closed tabs let their blocks go",
     "no frames while idle, the terminal shown",
     "the terminal's grid is set", "the terminal is that size, in 32-bit indices",
     "the palette lists what it should",
@@ -17764,6 +17767,7 @@ static DriveOp termops[] = {
     {OP_TEXT, 0, 0, 0, 100, "exit"},
     TERMKEY(GKEY_ENTER, 1000),
     {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*onetwo"},
+    {OP_CHECK, CHK_TERMREGIONS, 1, 0, 0, ""},
     // A tab behind another draws nothing while it prints (in one
     // program, so that its busy dot holds still)
     {OP_TEXT, 0, 0, 0, 100, "sh -c 'while :; do date; sleep 0.2; done'"},
@@ -17842,6 +17846,7 @@ static DriveOp termops[] = {
     {OP_WAIT, W_TERM, 0, 0, 5000, "\nthird"},
     {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*bash"},
     {OP_CHECK, CHK_TERMCOUNT, 2, 0, 0, ""},
+    {OP_CHECK, CHK_TERMREGIONS, 2, 0, 0, ""},
     {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Start subagents."},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 800, ""},
@@ -21647,6 +21652,14 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_TERMCLOSE:
         return (f32)g->closeterms == g->ops[g->drivepc-1].dx;
+    case CHK_TERMREGIONS: {
+        Arena a = g->frame;
+        Buf   b(&a, 64);
+        print(&b, "drive: terminal blocks reserved: ");
+        print(&b, (i64)g->termregions);
+        guilog(g, finish(&b));
+        return (f32)g->termregions == g->ops[g->drivepc-1].dx;
+    }
     case CHK_DCLICKTIME: {
         // The delayed single click must stay longer (0.5 s by default)
         ImGuiIO &io = ImGui::GetIO();

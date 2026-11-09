@@ -2165,7 +2165,8 @@ def main():
             P.signal_ours(pid, P.KILL, lambda q: ours(q, host.root), "stray")
     if args.mode == "terminal" and args.shots and os.name != "nt":  # SDL's alone
         for name in ("terminal", "terminal-small", "terminal-vim", "terminal-big",
-                     "terminal-ended"):
+                     "terminal-ended", "terminal-tabs", "terminal-quit",
+                     "terminal-selected", "terminal-paste"):
             if not os.path.exists(os.path.join(args.shots, name + ".png")):
                 problems.append(f"no {name}.png")
     if args.mode == "changes" and args.shots:
