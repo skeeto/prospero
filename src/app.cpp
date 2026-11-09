@@ -13280,6 +13280,7 @@ enum : i32 {
     CHK_TERMTABS,     // the shown root's tab labels, '|' between, '*' front
     CHK_TERMKID,      // a subagent is shown, with its root's tabs
     CHK_TERMCLOSE,    // the quit dialog counted dx busy terminal tabs
+    CHK_TERMHOME,     // the terminal docked under the prompt, as placed
     CHK_TERMQUIET,    // no frames while idle, the terminal shown
     CHK_TERMFORCE,    // sets the grid to dx by dy, clipped to its pane
                       // (0 by 0: its pane's), and passes
@@ -13573,6 +13574,7 @@ static Str chknames[] = {
     "that many terminals are open", "the terminal tabs are as said",
     "a subagent shows its root's terminal tabs",
     "the quit dialog counts the busy terminal tabs",
+    "the terminal is in its home under the prompt",
     "no frames while idle, the terminal shown",
     "the terminal's grid is set", "the terminal is that size, in 32-bit indices",
     "the palette lists what it should",
@@ -17567,6 +17569,25 @@ static DriveOp termops[] = {
     TERMKEY(GKEY_ENTER, 100),
     {OP_WAIT, W_TERM, 0, 0, 5000, "\nkeyed"},
     {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "onetwo|*bash"},
+    // Each layout picked keeps the terminal, under the prompt, its tabs
+    // as they were, its size following
+    LAYOUT("Compact"),
+    {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Terminal"},
+    {OP_CHECK, CHK_TERMHOME, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "onetwo|*bash"},
+    {OP_CHECK, CHK_TERMSIZE, 0, 0, 1500, ""},
+    {OP_SHOT, 0, 0, 0, 300, "terminal-compact"},
+    LAYOUT("Focus"),
+    {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Terminal"},
+    {OP_CHECK, CHK_TERMHOME, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "onetwo|*bash"},
+    {OP_CHECK, CHK_TERMSIZE, 0, 0, 1500, ""},
+    {OP_SHOT, 0, 0, 0, 300, "terminal-focus"},
+    LAYOUT("Standard"),
+    {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Terminal"},
+    {OP_CHECK, CHK_TERMHOME, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "onetwo|*bash"},
+    {OP_CHECK, CHK_TERMSIZE, 0, 0, 1500, ""},
     {OP_MOVE, T_SESSTITLE, 0, 0, 100, ""},
     {OP_RDOWN, 0, 0, 0, 60, ""},
     {OP_RUP, 0, 0, 0, 500, ""},
@@ -21516,6 +21537,28 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_TERMCLOSE:
         return (f32)g->closeterms == g->ops[g->drivepc-1].dx;
+    case CHK_TERMHOME: {
+        // The lower side of a vertical split, near its share, whose
+        // upper side holds the prompt
+        ImGuiWindow   *w = ImGui::FindWindowByName(panenames[PANE_TERMINAL]);
+        ImGuiWindow   *p = ImGui::FindWindowByName(panenames[PANE_PROMPT]);
+        ImGuiDockNode *n = w ? w->DockNode : 0;
+        ImGuiDockNode *s = n ? n->ParentNode : 0;
+        if (!s || !p || !p->DockNode || s->SplitAxis!=ImGuiAxis_Y || s->ChildNodes[1]!=n) {
+            return 0;
+        }
+        b32 under = 0;
+        for (ImGuiDockNode *q = p->DockNode; q; q = q->ParentNode) {
+            under |= q == s->ChildNodes[0];
+        }
+        f32 share = s->ChildNodes[0]->Size.y / s->Size.y;
+        Arena a = g->frame;
+        Buf   b(&a, 64);
+        print(&b, "drive: the terminal's split gives the prompt's side ");
+        printfloat(&b, share, 2);
+        guilog(g, finish(&b));
+        return under && share>0.5f && share<0.7f;
+    }
     case CHK_TERMKID: {
         GuiSession *r = g->sess ? termroot(g, g->sess) : 0;
         return r && r!=g->sess && g->sess->view && g->sess->view->parent==r->sid &&
