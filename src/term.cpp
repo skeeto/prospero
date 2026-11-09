@@ -242,6 +242,17 @@ static void terminput(Gui *g, TermTab *tt, Str data)
     }
 }
 
+// Bytes the user sent, typed, pasted or clicked: the view goes back to
+// the bottom first, where they land. Replies go through terminput.
+static void termsend(Gui *g, TermTab *tt, Str data)
+{
+    if (data.len && tt->t && ariel_view(tt->t).offset) {
+        ariel_scrollto(tt->t, ARIEL_TO_BOTTOM);
+        scheddirty(&g->sched);
+    }
+    terminput(g, tt, data);
+}
+
 static void termsize(Gui *g, TermTab *tt, i32 cols, i32 rows, f32 cw, f32 ch)
 {
     Arena a = newarena(g->cmdr);
@@ -859,7 +870,7 @@ static void termpress(Gui *g, TermTab *tt, ImGuiKey k, b32 repeat)
         }
     }
     ariel_Str s = ariel_key(tt->t, &key);
-    terminput(g, tt, {s.data, s.len});
+    termsend(g, tt, {s.data, s.len});
     if (HOST_WINDOWS && !key.key) {
         // Windows translated the chord's key too, and a dead key's stays
         // pending (Alt+^ on German): the next key would compose with it.
@@ -879,7 +890,7 @@ static void termpaste(Gui *g, TermTab *tt, Arena a)
         iz    cap = part.len + 16;
         u8   *out = allocbytes(&t, cap);
         iz    n   = ariel_paste(tt->t, out, cap, {part.data, part.len}, flags);
-        terminput(g, tt, {out, n});
+        termsend(g, tt, {out, n});
         in = cuthead(in, part.len);
     }
 }
@@ -997,20 +1008,20 @@ static void termmouse(Gui *g, TermTab *tt, TermMetrics *m, ImVec2 pos, ImGuiID i
                 e.button = buttons[b];
                 tt->mheld |= bit;
                 ariel_Str s = ariel_mouse(tt->t, &e);
-                terminput(g, tt, {s.data, s.len});
+                termsend(g, tt, {s.data, s.len});
             } else if ((tt->mheld & bit) && !io.MouseDown[b]) {
                 e.action = ARIEL_RELEASE;
                 e.button = buttons[b];
                 tt->mheld &= ~bit;
                 ariel_Str s = ariel_mouse(tt->t, &e);
-                terminput(g, tt, {s.data, s.len});
+                termsend(g, tt, {s.data, s.len});
             }
         }
         if ((hovered || tt->mheld) && (io.MouseDelta.x!=0 || io.MouseDelta.y!=0)) {
             e.action = ARIEL_MOTION;
             e.button = 0;  // ariel knows which are held
             ariel_Str s = ariel_mouse(tt->t, &e);
-            terminput(g, tt, {s.data, s.len});
+            termsend(g, tt, {s.data, s.len});
         }
     } else if (!mo.mouse) {
         tt->mheld = 0;
@@ -1029,7 +1040,7 @@ static void termmouse(Gui *g, TermTab *tt, TermMetrics *m, ImVec2 pos, ImGuiID i
             e.action = ARIEL_PRESS;
             e.button = notches>0 ? 4 : 5;
             ariel_Str s = ariel_mouse(tt->t, &e);
-            terminput(g, tt, {s.data, s.len});
+            termsend(g, tt, {s.data, s.len});
         } else if (mo.altscreen && mo.altscroll) {
             ariel_Key k = {};
             k.key = notches>0 ? ARIEL_K_UP : ARIEL_K_DOWN;
@@ -1037,6 +1048,9 @@ static void termmouse(Gui *g, TermTab *tt, TermMetrics *m, ImVec2 pos, ImGuiID i
                 ariel_Str s = ariel_key(tt->t, &k);
                 terminput(g, tt, {s.data, s.len});
             }
+        } else {
+            ariel_scroll(tt->t, notches>0 ? -3 : 3);  // history
+            scheddirty(&g->sched);
         }
     }
 }
@@ -1113,7 +1127,7 @@ static void termkeys(Gui *g, TermTab *tt, Arena a)
                 u8        buf[4];
                 iz        n = utf8encode(buf, (i32)cp);
                 ariel_Str s = ariel_text(tt->t, {buf, n});
-                terminput(g, tt, {s.data, s.len});
+                termsend(g, tt, {s.data, s.len});
             }
         }
     }
@@ -1473,8 +1487,16 @@ static void drawterm(Gui *g)
     if (!ImGui::ItemAdd(bb, id)) {
         return;
     }
+    // History's scrollbar, over the grid's right edge, taking no column:
+    // the grid hovers apart from it
+    ariel_View view  = ariel_view(tt->t);
+    b32        sb    = view.total > tt->rows;
+    f32        barw  = ImGui::GetStyle().ScrollbarSize * 0.6f;
+    ImRect     barbb = ImRect(v2(bb.Max.x - barw, bb.Min.y), bb.Max);
+    ImRect     hovbb = sb ? ImRect(bb.Min, v2(barbb.Min.x, bb.Max.y)) : bb;
+
     ImGuiContext &c       = *GImGui;
-    b32           hovered = ImGui::ItemHoverable(bb, id, 0);
+    b32           hovered = ImGui::ItemHoverable(hovbb, id, 0);
     if (hovered) {
         ImGui::SetMouseCursor(ImGuiMouseCursor_TextInput);
     }
@@ -1525,6 +1547,17 @@ static void drawterm(Gui *g)
     u32         bg = termimcolor(ariel_color(tt->t, ARIEL_C_BG));
     dl->AddRectFilled(bb.Min, bb.Max, bg);
     termcells(g, tt, &m, pos, active, a);
+    if (sb) {
+        ImS64 hist = view.total - tt->rows;
+        ImS64 at   = hist - view.offset;  // rows of history above the view
+        ImS64 was  = at;
+        ImGui::ScrollbarEx(barbb, win->GetID("##termbar"), ImGuiAxis_Y, &at,
+                           tt->rows, view.total, 0);
+        if (at != was) {
+            ariel_scroll(tt->t, (i32)(at - was));  // positive: newer
+            scheddirty(&g->sched);
+        }
+    }
     g->termverts = dl->VtxBuffer.Size;
     if (tt->state == TT_LIVE) {
         termmouse(g, tt, &m, pos, id, hovered);
@@ -1537,7 +1570,8 @@ static void drawterm(Gui *g)
         ImGuiPlatformImeData *ime = &c.PlatformImeData;
         ime->WantVisible     = true;
         ime->WantTextInput   = true;
-        ime->InputPos        = v2(pos.x + (f32)cur.x*m.cw, pos.y + (f32)cur.y*m.ch);
+        f32 cy = (f32)(cur.y<0 ? tt->rows-1 : cur.y);  // scrolled off
+        ime->InputPos        = v2(pos.x + (f32)cur.x*m.cw, pos.y + cy*m.ch);
         ime->InputLineHeight = m.ch;
         ime->ViewportId      = win->Viewport->ID;
     }

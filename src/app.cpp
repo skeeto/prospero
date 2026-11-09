@@ -12852,6 +12852,7 @@ enum : i32 {
     T_TRANSCRIPT,
     T_PROMPT,
     T_EMPTY,       // an empty part of the menu bar
+    T_TERMGRID,    // the middle of the terminal's grid
     T_SPLITTER,    // the dock splitter between the columns
     T_HELPTAB,
     T_TRANSCRIPTTAB,
@@ -13288,6 +13289,7 @@ enum : i32 {
     CHK_TERMCLOSE,    // the quit dialog counted dx busy terminal tabs
     CHK_TERMHOME,     // the terminal docked under the prompt, as placed
     CHK_TERMHIST,     // its front tab keeps dx rows of history
+    CHK_TERMVIEW,     // scrolled back into history (dx 1), or not (0)
     CHK_TERMQUIET,    // no frames while idle, the terminal shown
     CHK_TERMFORCE,    // sets the grid to dx by dy, clipped to its pane
                       // (0 by 0: its pane's), and passes
@@ -13583,6 +13585,7 @@ static Str chknames[] = {
     "the quit dialog counts the busy terminal tabs",
     "the terminal is in its home under the prompt",
     "the terminal keeps as much history as configured",
+    "the terminal's view is scrolled back, or at the bottom, as said",
     "no frames while idle, the terminal shown",
     "the terminal's grid is set", "the terminal is that size, in 32-bit indices",
     "the palette lists what it should",
@@ -17603,6 +17606,16 @@ static DriveOp termops[] = {
     TERMKEY(GKEY_ENTER, 100),
     {OP_WAIT, W_TERM, 0, 0, 5000, "\n300\n"},
     {OP_CHECK, CHK_TERMHIST, 100, 0, 0, ""},
+    // The wheel scrolls history (a notch may be lost to XWayland, so
+    // only back at all), and typing comes back to the bottom
+    {OP_MOVE, T_TERMGRID, 0, 0, 100, ""},
+    {OP_WHEEL, 0, 0, 1, 50, ""},
+    {OP_WHEEL, 0, 0, 1, 300, ""},
+    {OP_CHECK, CHK_TERMVIEW, 1, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "terminal-scrolled"},
+    {OP_TEXT, 0, 0, 0, 300, "x"},
+    {OP_CHECK, CHK_TERMVIEW, 0, 0, 0, ""},
+    TERMKEY(GKEY_BACKSPACE, 300),
     {OP_MOVE, T_SESSTITLE, 0, 0, 100, ""},
     {OP_RDOWN, 0, 0, 0, 60, ""},
     {OP_RUP, 0, 0, 0, 500, ""},
@@ -18895,6 +18908,10 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_TOPTEXT: {
         Rect r = g->rects[RECT_TRANSCRIPT];
         return v2((r.x0+r.x1)/2, r.y0 + 24*g->scale);
+    }
+    case T_TERMGRID: {
+        ImRect r = g->termgrid;
+        return r.Max.x>r.Min.x ? v2((r.Min.x+r.Max.x)/2, (r.Min.y+r.Max.y)/2) : v2(-1, -1);
     }
     case T_EMPTY: {
         Rect r = g->rects[RECT_TOOLBAR];
@@ -21552,6 +21569,20 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_TERMCLOSE:
         return (f32)g->closeterms == g->ops[g->drivepc-1].dx;
+    case CHK_TERMVIEW: {
+        TermTab *tt = termfront(g);
+        if (!tt || !tt->t) {
+            return 0;
+        }
+        ariel_View v = ariel_view(tt->t);
+        Arena      a = g->frame;
+        Buf        b(&a, 64);
+        print(&b, "drive: the terminal's view is ");
+        print(&b, (i64)v.offset);
+        print(&b, " rows back");
+        guilog(g, finish(&b));
+        return (v.offset > 0) == (g->ops[g->drivepc-1].dx != 0);
+    }
     case CHK_TERMHIST: {
         TermTab *tt = termfront(g);
         if (!tt || !tt->t) {
