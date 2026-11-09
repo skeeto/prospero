@@ -55,6 +55,7 @@ struct TermTab {
     b32         pasteins;  // Insert, held since it pasted with Shift
     i32         textkey;   // a Ctrl+Alt key that typed (AltGr), while held
     b32         busy;      // a program runs in the shell
+    b32         selecting; // the left button drags a local selection
     i32         histlines; // its history, as [terminal] scrollback said
     Palette    *pal;       // the colors given ariel
     i32         code;      // the end's exit code, or -1
@@ -674,6 +675,15 @@ static void termglyph(ImDrawList *dl, ImFontBaked *f, f32 x, f32 y, u32 cp, u32 
 }
 
 // The cells of the screen at o: backgrounds, glyphs, lines, cursor.
+// A cell's background as drawn, ImGui's color, 0 for the default's.
+static u32 termcellbg(Gui *g, ariel_Cell *c)
+{
+    if (c->attr & ARIEL_A_SELECTED) {
+        return g->pal->sel;
+    }
+    return c->attr&ARIEL_A_DEFBG ? 0 : termimcolor(c->bg);
+}
+
 static void termcells(Gui *g, TermTab *tt, TermMetrics *m, ImVec2 o, b32 focused, Arena a)
 {
     ImDrawList *dl    = ImGui::GetWindowDrawList();
@@ -690,12 +700,11 @@ static void termcells(Gui *g, TermTab *tt, TermMetrics *m, ImVec2 o, b32 focused
 
         // Backgrounds, in runs of one color, the default left as it is
         for (i32 x = 0; x < n;) {
+            u32 bg  = termcellbg(g, cells + x);
             i32 end = x + 1;
-            for (; end<n && cells[end].bg==cells[x].bg &&
-                   (cells[end].attr&ARIEL_A_DEFBG)==(cells[x].attr&ARIEL_A_DEFBG); end++) {}
-            if (!(cells[x].attr & ARIEL_A_DEFBG)) {
-                dl->AddRectFilled(v2(o.x + (f32)x*cw, cy), v2(o.x + (f32)end*cw, cy + ch),
-                                  termimcolor(cells[x].bg));
+            for (; end<n && termcellbg(g, cells+end)==bg; end++) {}
+            if (bg) {
+                dl->AddRectFilled(v2(o.x + (f32)x*cw, cy), v2(o.x + (f32)end*cw, cy + ch), bg);
             }
             x = end;
         }
@@ -712,7 +721,7 @@ static void termcells(Gui *g, TermTab *tt, TermMetrics *m, ImVec2 o, b32 focused
                 u32 bg = c->bg;
                 fg = ((fg>>1 & 0x7f7f7f) + (bg>>1 & 0x7f7f7f));
             }
-            u32 col = termimcolor(fg);
+            u32 col = c->attr&ARIEL_A_SELECTED ? g->pal->seltext : termimcolor(fg);
             if (c->cp && c->cp!=' ' && !(c->attr & ARIEL_A_HIDDEN)) {
                 ImFontBaked *f = c->attr&ARIEL_A_BOLD ? m->bold : m->regular;
                 termglyph(dl, f, cx, cy + top, c->cp, col);
@@ -959,8 +968,77 @@ static void termletgo(Gui *g, TermTab *tt)
     }
     tt->mheld    = 0;
     tt->wheel    = 0;
-    tt->pasteins = 0;
-    tt->textkey  = 0;
+    tt->pasteins  = 0;
+    tt->textkey   = 0;
+    tt->selecting = 0;
+}
+
+// Whether tab tt has text selected.
+static b32 termselected(TermTab *tt)
+{
+    return tt->t && ariel_copy(tt->t, 0, 0)>0;
+}
+
+// Copy tab tt's selection to the clipboard, if it has one.
+static b32 termcopy(Gui *g, TermTab *tt)
+{
+    iz n = tt->t ? ariel_copy(tt->t, 0, 0) : 0;
+    if (n <= 0) {
+        return 0;
+    }
+    Arena a   = g->frame;
+    u8   *buf = allocbytes(&a, n+1);
+    ariel_copy(tt->t, buf, n);
+    buf[n] = 0;
+    ImGui::SetClipboardText((char *)buf);
+    return 1;
+}
+
+// Local selection with the left button, when the app doesn't take the
+// mouse or Shift keeps it here (local): by character, word or line as
+// clicked once, twice or thrice, Shift extending (unless it is what
+// keeps the mouse local), Alt a block. A drag past the grid's top or
+// bottom scrolls history.
+static void termselect(Gui *g, TermTab *tt, TermMetrics *m, ImVec2 pos, b32 local, f32 my)
+{
+    ImGuiIO    &io = ImGui::GetIO();
+    ariel_Modes mo = ariel_modes(tt->t);
+    f32         h  = (f32)mo.rows * m->ch;
+    f32         dx = io.MousePos.x - pos.x;
+    f32         dy = my - pos.y;
+    i32         bx = (i32)((dx + m->cw/2) / m->cw);  // a column boundary
+    i32         y  = (i32)((dy>0 ? (dy<h ? dy : h-1) : 0) / m->ch);
+    bx = bx<0 ? 0 : bx>mo.cols ? mo.cols : bx;
+    i32 block = io.KeyAlt ? ARIEL_SEL_BLOCK : 0;
+
+    if (local && ImGui::IsMousePosValid() && ImGui::IsMouseClicked(0)) {
+        i32 clicks = ImGui::GetMouseClickedCount(0);
+        i32 op     = clicks>=3 ? ARIEL_SEL_LINE : clicks==2 ? ARIEL_SEL_WORD : ARIEL_SEL_CHAR;
+        if (clicks==1 && io.KeyShift && !mo.mouse && termselected(tt)) {
+            op = ARIEL_SEL_EXTEND;
+        }
+        ariel_select(tt->t, op|block, bx, y);
+        tt->selecting = 1;
+        scheddirty(&g->sched);
+    } else if (tt->selecting && io.MouseDown[0]) {
+        if (dy < 0) {
+            ariel_scroll(tt->t, -1);  // past the top: older
+        } else if (dy >= h) {
+            ariel_scroll(tt->t, 1);
+        }
+        if (dy<0 || dy>=h) {
+            schedat(&g->sched, g->sched.now + 16000, DUE_APP);
+        }
+        if (dy<0 || dy>=h || io.MouseDelta.x!=0 || io.MouseDelta.y!=0) {
+            ariel_select(tt->t, ARIEL_SEL_EXTEND|block, bx, y);
+            scheddirty(&g->sched);
+        }
+    } else if (tt->selecting) {
+        tt->selecting = 0;
+        if (g->termcopysel) {
+            termcopy(g, tt);
+        }
+    }
 }
 
 // when the app asks (mouse modes), unless Shift is held, which keeps it
@@ -1026,6 +1104,7 @@ static void termmouse(Gui *g, TermTab *tt, TermMetrics *m, ImVec2 pos, ImGuiID i
     } else if (!mo.mouse) {
         tt->mheld = 0;
     }
+    termselect(g, tt, m, pos, hovered && !rep, at.y);
 
     if (!hovered || io.KeyCtrl) {
         tt->wheel = 0;
@@ -1602,6 +1681,31 @@ static Str termscreen(Gui *g, Arena *a)
     }
     for (; n>0 && buf[n-1]==' '; n--) {}
     return {buf, n};
+}
+
+// Where the screen last shows text, its first cell's middle, else
+// (-1, -1): ASCII text, so that bytes are cells.
+static ImVec2 termtextat(Gui *g, Str text)
+{
+    Arena a   = g->frame;
+    Str   scr = termscreen(g, &a);
+    iz    at  = -1;
+    for (iz i = find(scr, text); i >= 0;) {
+        at = i;
+        iz next = find(cuthead(scr, i+1), text);
+        i = next<0 ? -1 : i+1+next;
+    }
+    if (at<0 || g->termgrid.GetWidth()<=0) {
+        return v2(-1, -1);
+    }
+    i32 row = 0, col = 0;
+    for (iz i = 0; i < at; i++) {
+        col = scr.data[i]=='\n' ? 0 : col+1;
+        row += scr.data[i] == '\n';
+    }
+    TermMetrics m = termmetrics(g);
+    return v2(g->termgrid.Min.x + ((f32)col + 0.5f)*m.cw,
+              g->termgrid.Min.y + ((f32)row + 0.5f)*m.ch);
 }
 
 // Whether the terminal fills its pane, as last drawn, at the size the

@@ -91,6 +91,17 @@ static void test_theme(Test *t)
             }
             expect(t, concat(&a, name, pairs[i].name), finish(&b), "AA");
         }
+        // A terminal's selection stands out from its background
+        {
+            f64 r = contrast(pal->sel, pal->termbg);
+            Buf b(&a, 16);
+            if (r < 1.5) {
+                printfloat(&b, r, 2);
+            } else {
+                print(&b, "apart");
+            }
+            expect(t, concat(&a, name, "sel against termbg"), finish(&b), "apart");
+        }
         for (i32 i = HL_PLAIN+1; i < HL_COUNT; i++) {
             f64 r = contrast(pal->hl[i], pal->codebg);
             Buf b(&a, 16);

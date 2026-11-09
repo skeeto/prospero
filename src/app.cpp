@@ -5783,6 +5783,7 @@ static i32  termbusy(Gui *);
 static void termadd(Gui *, GuiSession *);
 static void termgrab(Gui *);
 static Str  termscreen(Gui *, Arena *);
+static ImVec2 termtextat(Gui *, Str);
 static b32  termsizecheck(Gui *);
 
 static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
@@ -12853,6 +12854,7 @@ enum : i32 {
     T_PROMPT,
     T_EMPTY,       // an empty part of the menu bar
     T_TERMGRID,    // the middle of the terminal's grid
+    T_TERMTEXT,    // the terminal's text, where it last shows
     T_SPLITTER,    // the dock splitter between the columns
     T_HELPTAB,
     T_TRANSCRIPTTAB,
@@ -13290,6 +13292,8 @@ enum : i32 {
     CHK_TERMHOME,     // the terminal docked under the prompt, as placed
     CHK_TERMHIST,     // its front tab keeps dx rows of history
     CHK_TERMVIEW,     // scrolled back into history (dx 1), or not (0)
+    CHK_TERMSEL,      // the front tab's selection is the text
+    CHK_DCLICKTIME,   // (sets) ImGui's double-click time to dx seconds
     CHK_TERMQUIET,    // no frames while idle, the terminal shown
     CHK_TERMFORCE,    // sets the grid to dx by dy, clipped to its pane
                       // (0 by 0: its pane's), and passes
@@ -13586,6 +13590,8 @@ static Str chknames[] = {
     "the terminal is in its home under the prompt",
     "the terminal keeps as much history as configured",
     "the terminal's view is scrolled back, or at the bottom, as said",
+    "the terminal's selection is as said",
+    "the double-click time is set",
     "no frames while idle, the terminal shown",
     "the terminal's grid is set", "the terminal is that size, in 32-bit indices",
     "the palette lists what it should",
@@ -17616,6 +17622,26 @@ static DriveOp termops[] = {
     {OP_TEXT, 0, 0, 0, 300, "x"},
     {OP_CHECK, CHK_TERMVIEW, 0, 0, 0, ""},
     TERMKEY(GKEY_BACKSPACE, 300),
+    // A double-click selects a word, a triple-click its line; a click
+    // clears it. The drive's clicks come a few frames apart, too slow
+    // for ImGui's double-click time, so it is longer meanwhile.
+    {OP_TEXT, 0, 0, 0, 100, "echo pick selword here"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\npick selword here"},
+    {OP_CHECK, CHK_DCLICKTIME, 1, 0, 0, ""},
+    {OP_MOVE, T_TERMTEXT, 2, 0, 100, "selword here"},
+    {OP_DOWN, 0, 0, 0, 30, ""}, {OP_UP, 0, 0, 0, 30, ""},
+    {OP_DOWN, 0, 0, 0, 30, ""}, {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_TERMSEL, 0, 0, 0, "selword"},
+    {OP_SHOT, 0, 0, 0, 1200, "terminal-selected"},  // past a double-click
+    {OP_DOWN, 0, 0, 0, 30, ""}, {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_TERMSEL, 0, 0, 1200, ""},
+    {OP_MOVE, T_TERMTEXT, 0, 0, 100, "pick selword here"},
+    {OP_DOWN, 0, 0, 0, 30, ""}, {OP_UP, 0, 0, 0, 30, ""},
+    {OP_DOWN, 0, 0, 0, 30, ""}, {OP_UP, 0, 0, 0, 30, ""},
+    {OP_DOWN, 0, 0, 0, 30, ""}, {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_TERMSEL, 0, 0, 0, "pick selword here"},
+    {OP_CHECK, CHK_DCLICKTIME, 0.3f, 0, 0, ""},
     {OP_MOVE, T_SESSTITLE, 0, 0, 100, ""},
     {OP_RDOWN, 0, 0, 0, 60, ""},
     {OP_RUP, 0, 0, 0, 500, ""},
@@ -18909,6 +18935,8 @@ static ImVec2 targetpos(Gui *g, i32 t)
         Rect r = g->rects[RECT_TRANSCRIPT];
         return v2((r.x0+r.x1)/2, r.y0 + 24*g->scale);
     }
+    case T_TERMTEXT:
+        return termtextat(g, g->ops[g->drivepc-1].text);
     case T_TERMGRID: {
         ImRect r = g->termgrid;
         return r.Max.x>r.Min.x ? v2((r.Min.x+r.Max.x)/2, (r.Min.y+r.Max.y)/2) : v2(-1, -1);
@@ -21569,6 +21597,30 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_TERMCLOSE:
         return (f32)g->closeterms == g->ops[g->drivepc-1].dx;
+    case CHK_DCLICKTIME: {
+        // The delayed single click must stay longer (0.5 s by default)
+        ImGuiIO &io = ImGui::GetIO();
+        f32      t  = g->ops[g->drivepc-1].dx;
+        io.MouseDoubleClickTime  = t;
+        io.MouseSingleClickDelay = t<0.4f ? 0.5f : t + 0.2f;
+        return 1;
+    }
+    case CHK_TERMSEL: {
+        TermTab *tt = termfront(g);
+        if (!tt || !tt->t) {
+            return 0;
+        }
+        Arena a   = g->frame;
+        iz    n   = ariel_copy(tt->t, 0, 0);
+        u8   *buf = allocbytes(&a, n>0 ? n : 1);
+        n = n>0 ? ariel_copy(tt->t, buf, n) : 0;
+        Buf b(&a, 64 + n);
+        print(&b, "drive: the terminal's selection is \"");
+        print(&b, Str{buf, n});
+        print(&b, "\"");
+        guilog(g, finish(&b));
+        return Str{buf, n} == g->ops[g->drivepc-1].text;
+    }
     case CHK_TERMVIEW: {
         TermTab *tt = termfront(g);
         if (!tt || !tt->t) {
