@@ -4673,6 +4673,8 @@ static void setcfgstr(Gui *g, Str *dst, CfgRow r)
 static void wslremotes(Gui *);
 static void setnotify(Gui *, u32);
 
+static void palbuild(Gui *, b32);
+
 // The settings window's rows, from a config.get reply line, and the
 // theme they set.
 static void loadcfg(Gui *g, Str line)
@@ -4781,6 +4783,9 @@ static void loadcfg(Gui *g, Str line)
         g->cfgrows = push(a, g->cfgrows, r);
     }
     wslremotes(g);
+    if (g->palw.shown) {
+        palbuild(g, 1);  // its settings, as they are now, the pick kept
+    }
 }
 
 static void guiopen(Gui *, GuiSession *);
@@ -13252,7 +13257,7 @@ enum : i32 {
     CHK_TERMGRID,     // the terminal is dx by dy, drawn in over 64K
                       // vertices (32-bit indices)
     CHK_PALETTE,      // the palette is open, listing dx rows (0: any), the
-                      // first titled text if any
+                      // first titled text if any (dy 1: any row)
     CHK_COUNT,
 };
 
@@ -14142,14 +14147,14 @@ static DriveOp m3ops[] = {
     CMDKEY(GKEY_K, 500),
     {OP_CHECK, CHK_PALETTE, 0, 0, 0, ""},
     {OP_TEXT, 0, 0, 0, 500, "hold"},
-    {OP_CHECK, CHK_PALETTE, 1, 0, 0, "Hold me: say hello."},
+    {OP_CHECK, CHK_PALETTE, 0, 0, 0, "Hold me: say hello."},
     {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
     {OP_KEYUP, 0, GKEY_ENTER, 0, 500, ""},
     {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
     {OP_CHECK, CHK_TITLE, 0, 0, 0, "Hold me: say hello."},
     CMDKEY(GKEY_K, 500),
     {OP_TEXT, 0, 0, 0, 500, "say hel"},
-    {OP_CHECK, CHK_PALETTE, 2, 0, 0, "Say hello."},
+    {OP_CHECK, CHK_PALETTE, 0, 0, 0, "Say hello."},
     {OP_SHOT, 0, 0, 0, 300, "18-palette"},
     {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
     {OP_KEYUP, 0, GKEY_ENTER, 0, 500, ""},
@@ -14177,6 +14182,30 @@ static DriveOp m3ops[] = {
     {OP_KEYUP, 0, GKEY_ENTER, 0, 500, ""},
     {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
     {OP_CHECK, CHK_TITLE, 0, 0, 0, "Hold me: say hello."},
+    // And beyond sessions: a setting, shown on its page in Settings,
+    // hidden in Focus; a layout, applied; a Help section, its page
+    // scrolled to it
+    CMDKEY(GKEY_K, 500),
+    {OP_TEXT, 0, 0, 0, 500, "theme"},
+    {OP_CHECK, CHK_PALETTE, 0, 0, 0, "theme"},
+    {OP_SHOT, 0, 0, 0, 300, "18-palettefind"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 1000, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Settings"},
+    {OP_CHECK, CHK_CFGFOCUS, 0, 0, 0, "ui theme"},
+    CMDKEY(GKEY_K, 500),
+    {OP_TEXT, 0, 0, 0, 500, "focus lay"},
+    {OP_CHECK, CHK_PALETTE, 0, 0, 0, "Focus layout"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 800, ""},
+    {OP_CHECK, CHK_FOCUSED, 0, 0, 0, ""},
+    CMDKEY(GKEY_K, 500),
+    {OP_TEXT, 0, 0, 0, 500, "dropping files"},
+    {OP_CHECK, CHK_PALETTE, 0, 0, 0, "Dropping files"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 1000, ""},
+    {OP_CHECK, CHK_HELPSECTION, 0, 0, 0, "# Keyboard and mouse\n"},
     {OP_MAIN, 0, 0, 0, 500, ""},
     LAYOUT("Drive"),
     {OP_CHECK, CHK_LAYOUTBACK, 0, 0, 0, "Drive"},
@@ -21382,10 +21411,13 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_PALETTE: {
         DriveOp *op    = &g->ops[g->drivepc-1];
-        Str      first = {(u8 *)g->palw.first, (iz)__builtin_strlen(g->palw.first)};
-        b32      ok    = g->palw.shown && g->palw.rows>0 &&
-                         (op->dx==0 || g->palw.rows==(i32)op->dx) &&
-                         (!op->text.len || first==op->text);
+        PalWin  *p     = &g->palw;
+        Str      first = {(u8 *)p->first, (iz)__builtin_strlen(p->first)};
+        b32      any   = !op->text.len || (op->dy==0 && first==op->text);
+        for (iz i = 0; op->dy!=0 && !any && i<p->order.len; i++) {
+            any = p->items[p->order[i]].title == op->text;
+        }
+        b32      ok    = p->shown && p->rows>0 && (op->dx==0 || p->rows==(i32)op->dx) && any;
         if (!ok) {
             Arena a = g->frame;
             Buf   b(&a, 128);

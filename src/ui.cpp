@@ -13191,7 +13191,8 @@ static void newfree(Gui *g)
 // query field on top and the sessions it offers below, which it opens.
 
 enum : i32 {
-    PAL_ROWS = 9,  // rows shown before the list scrolls
+    PAL_ROWS  = 9,  // rows shown before the list scrolls
+    PAL_FOUND = 8,  // settings, and Help's sections, offered at most
 };
 
 // Open it as dialogs are next drawn, remembering whether the prompt had
@@ -13201,10 +13202,14 @@ static void palopen(Gui *g)
     PalWin *p = &g->palw;
     p->open   = 1;
     p->prompt = g->sess && g->promptactive;
+    if (!g->cfgrows.len) {
+        guiconfigget(g);  // its settings, which come later (palbuild again)
+    }
 }
 
-// Build the items again from the sessions as they are now, and order
-// them for the query. The pick stays on its item if keep, else goes to
+// Build the items again from the sessions, layouts and panes as they
+// are now, and the settings and Help's sections the query finds, and
+// order them for the query. The pick stays on its item if keep, else goes to
 // the top.
 static void palbuild(Gui *g, b32 keep)
 {
@@ -13247,7 +13252,70 @@ static void palbuild(Gui *g, b32 keep)
         p->items  = push(a, p->items, it);
         p->sess   = push(a, p->sess, s);
     }
-    Str q    = {(u8 *)p->q, (iz)__builtin_strlen(p->q)};
+
+    // The rest have no session; each has an id of its own kind
+    Str q = {(u8 *)p->q, (iz)__builtin_strlen(p->q)};
+    i32 nl = PRESET_COUNT + (i32)g->layouts.len;
+    for (i32 n = 0; n < nl; n++) {
+        Str     name = n<PRESET_COUNT ? presetnames[n] : g->layouts[n-PRESET_COUNT].name;
+        PalItem it   = {};
+        it.kind  = PAL_LAYOUT;
+        it.id    = concat(a, "l:", name);
+        it.title = concat(a, name, " layout");
+        it.note  = n<PRESET_COUNT ? Str("A layout, as View, Layout has it") : Str("A layout you saved");
+        it.ref   = n;
+        p->items = push(a, p->items, it);
+        p->sess  = push(a, p->sess, (GuiSession *)0);
+    }
+    for (i32 i = 0; i < PANE_COUNT; i++) {
+        if (!paneoffered(i)) {
+            continue;
+        }
+        PalItem it = {};
+        it.kind  = PAL_PANE;
+        it.id    = concat(a, "p:", panestr(i));
+        it.title = concat(a, panestr(i), " pane");
+        it.group = "show";
+        it.note  = g->panes[i] ? Str("Shown: brought to the front") : Str("Show it");
+        it.ref   = i;
+        p->items = push(a, p->items, it);
+        p->sess  = push(a, p->sess, (GuiSession *)0);
+    }
+    if (trim(q).len) {
+        Slice<i32> rows = cfgfindlist(g, a, q);
+        for (i32 i = 0; i<(i32)rows.len && i<PAL_FOUND; i++) {
+            CfgRow *r  = &g->cfgrows[rows[i]];
+            PalItem it = {};
+            it.kind  = PAL_SETTING;
+            it.id    = concat(a, concat(a, concat(a, "c:", r->kind), concat(a, ":", r->name)),
+                              concat(a, ":", r->key));
+            it.title = clone(a, r->key);
+            it.note  = cfgfindpage(a, r->kind, r->name);
+            it.rank  = i + 1;
+            it.ref   = rows[i];
+            p->items = push(a, p->items, it);
+            p->sess  = push(a, p->sess, (GuiSession *)0);
+        }
+        Slice<HelpHit> hits = helpsearch(a, q, PAL_FOUND);
+        for (i32 i = 0; i<(i32)hits.len && i<PAL_FOUND; i++) {
+            HelpHit *h     = &hits[i];
+            Str      title = helptitle(h->page);
+            PalItem  it    = {};
+            it.kind  = PAL_HELP;
+            it.id    = concat(a, concat(a, "h:", title), concat(a, ":", h->head));
+            it.title = h->head.len ? h->head : title;
+            it.note  = h->head.len ? title : Str{};
+            if (h->snippet.len) {
+                it.note = it.note.len ? concat(a, concat(a, it.note, " \xc2\xb7 "), h->snippet)
+                                   : h->snippet;  // as Help's own search shows it
+            }
+            it.rank  = i + 1;
+            it.ref   = h->page;
+            it.arg   = h->head;
+            p->items = push(a, p->items, it);
+            p->sess  = push(a, p->sess, (GuiSession *)0);
+        }
+    }
     p->order = palorder(a, p->items, q);
     p->sel   = palkeep(p->items, p->order, pick);
 }
@@ -13272,8 +13340,9 @@ static i32 palcb(ImGuiInputTextCallbackData *d)
     return 0;
 }
 
-// One session's row: its state's dot and title, and below, dim, what it
-// is, its state, folder, host, group and when it was last active.
+// One row: a session's state's dot and title, and below, dim, what it
+// is, its state, folder, host, group and when it was last active; for
+// the rest, the title over its note.
 static b32 palrow(Gui *g, Arena a, i32 i, b32 sel, i64 nowms)
 {
     PalWin     *p     = &g->palw;
@@ -13283,8 +13352,6 @@ static b32 palrow(Gui *g, Arena a, i32 i, b32 sel, i64 nowms)
     f32         lineh = ImGui::GetTextLineHeight();
     f32         small = smallsize(&g->fonts);
     ImDrawList *dl    = ImGui::GetWindowDrawList();
-    View       *v     = s->view;
-    i32         state = v ? v->state : s->state;
 
     ImGui::PushID(i);
     ImVec2 at = ImGui::GetCursorScreenPos();
@@ -13295,6 +13362,16 @@ static b32 palrow(Gui *g, Arena a, i32 i, b32 sel, i64 nowms)
         ImGui::ScrollToItem(ImGuiScrollFlags_KeepVisibleEdgeY);
         p->follow = 0;
     }
+    if (!s) {
+        f32 x = at.x + 6*sc + 13*sc;
+        Pen t = {dl, &g->fonts, x, at.y + 2*sc, at.x + w, g->fonts.size};
+        pen(&t, it->title, it->kind==PAL_SETTING ? STYLE_CODE : 0, g->pal->text);
+        Pen b = {dl, &g->fonts, x, at.y + 2*sc + lineh, at.x + w, small};
+        pen(&b, it->note, 0, g->pal->dim);
+        return hit;
+    }
+    View *v     = s->view;
+    i32   state = v ? v->state : s->state;
 
     f32 x     = at.x + 6*sc;
     b32 down  = s->host->kind!=GH_ENGINE && !s->host->up;
@@ -13343,6 +13420,39 @@ static b32 palrow(Gui *g, Arena a, i32 i, b32 sel, i64 nowms)
     }
     pen(&b, finish(&d), 0, g->pal->dim);
     return hit;
+}
+
+// Go to an item picked, as its own pane would.
+static void palgo(Gui *g, i32 i)
+{
+    PalWin  *p  = &g->palw;
+    PalItem *it = &p->items[i];
+    switch (it->kind) {
+    case PAL_SESSION:
+        if (!sessgo(g, p->sess[i])) {
+            guilog(g, "the palette's pick could not open: in the Trash, or deleted");
+        }
+        break;
+    case PAL_LAYOUT:
+        picklayoutnum(g, it->ref);
+        break;
+    case PAL_PANE:
+        setpane(g, it->ref, 1);
+        break;
+    case PAL_SETTING:
+        // Its row, unless the configuration came again since (palbuild
+        // then ran again too)
+        if (it->ref<g->cfgrows.len && g->cfgrows[it->ref].key==it->title) {
+            setpane(g, PANE_SETTINGS, 1);
+            cfggoto(g, &g->cfgrows[it->ref]);
+        }
+        break;
+    case PAL_HELP:
+        helppick(g, it->ref);
+        g->helpsect = it->arg.len ? clone(&g->perm, it->arg) : Str{};
+        setpane(g, PANE_HELP, 1);
+        break;
+    }
 }
 
 static void drawpalette(Gui *g)
@@ -13408,13 +13518,19 @@ static void drawpalette(Gui *g)
         p->follow = 1;
     }
 
-    // The field has the keyboard throughout
-    if (appearing || !ImGui::IsAnyItemActive()) {
+    // The field has the keyboard throughout: taken back from a field
+    // elsewhere that was given it as the palette opened (Settings' search,
+    // after a setting picked), but not from a row being clicked
+    ImGuiContext &c    = *GImGui;
+    b32           ours = c.ActiveIdWindow &&
+                         c.ActiveIdWindow->RootWindow == ImGui::GetCurrentWindow()->RootWindow;
+    if (appearing || !ours) {
         ImGui::SetKeyboardFocusHere();
     }
     ImGui::SetNextItemWidth(-1);
     PalCb cb = {g, 0};
-    ImGui::InputTextWithHint("##palq", "Go to a session", p->q, sizeof(p->q),
+    ImGui::InputTextWithHint("##palq", "Go to a session, setting, help topic or layout",
+                             p->q, sizeof(p->q),
                              ImGuiInputTextFlags_CallbackHistory |
                              ImGuiInputTextFlags_CallbackEdit, palcb, &cb);
     itemnamed(g, "palette query");
@@ -13424,13 +13540,29 @@ static void drawpalette(Gui *g)
         n = (i32)p->order.len;
     }
 
-    // The list, PAL_ROWS rows high at most, scrolled to follow the pick
+    // The list, PAL_ROWS rows high at most, scrolled to follow the pick,
+    // a query's results in sections under their headings
     i32 hitrow = -1;
     if (n) {
-        f32 rowh = 2*ImGui::GetTextLineHeight() + 4*sc + ImGui::GetStyle().ItemSpacing.y;
-        f32 h    = (f32)(n<PAL_ROWS ? n : PAL_ROWS) * rowh;
+        b32 heads = p->q[0] != 0;
+        f32 gap   = ImGui::GetStyle().ItemSpacing.y;
+        f32 rowh  = 2*ImGui::GetTextLineHeight() + 4*sc + gap;
+        f32 headh = ImGui::GetTextLineHeight() + gap;
+        f32 h     = 0;
+        i32 sect  = -1;
+        for (i32 i = 0; i<n && i<PAL_ROWS; i++) {
+            i32 k = palsect(p->items[p->order[i]].kind);
+            h    += rowh + (heads && k!=sect ? headh : 0);
+            sect  = k;
+        }
         ImGui::BeginChild("##palrows", v2(0, h), 0, ImGuiWindowFlags_NoNavInputs);
+        sect = -1;
         for (i32 i = 0; i < n; i++) {
+            i32 k = palsect(p->items[p->order[i]].kind);
+            if (heads && k!=sect) {
+                ImGui::TextDisabled("%s", palsectnames[k].cdata);
+            }
+            sect = k;
             if (palrow(g, a, i, i==p->sel, nowms)) {
                 hitrow = i;
             }
@@ -13442,7 +13574,7 @@ static void drawpalette(Gui *g)
         p->first[len] = 0;
         p->rows       = n;
     } else {
-        ImGui::TextDisabled(p->items.len ? "No session matches." : "No sessions.");
+        ImGui::TextDisabled(p->q[0] ? "Nothing matches." : "No other sessions.");
     }
     ImGui::TextDisabled("Enter to open, Esc to close");
 
@@ -13450,17 +13582,10 @@ static void drawpalette(Gui *g)
     b32 outside = !appearing && ImGui::IsMouseClicked(0) &&
                   !ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows |
                                           ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
-    GuiSession *go = 0;
-    if (hitrow >= 0) {
-        go = p->sess[p->order[hitrow]];
-    } else if (pick) {
-        go = p->sess[p->order[p->sel]];
-    }
-    if (go) {
+    i32 go = hitrow>=0 ? hitrow : pick ? p->sel : -1;
+    if (go >= 0) {
         ImGui::CloseCurrentPopup();
-        if (!sessgo(g, go)) {
-            guilog(g, "the palette's pick could not open: in the Trash, or deleted");
-        }
+        palgo(g, p->order[go]);
     } else if (esc || outside || p->close) {
         ImGui::CloseCurrentPopup();
         if (p->prompt) {
@@ -14066,7 +14191,7 @@ static void drawmenubar(Gui *g)
             palopen(g);
         }
         itemnamed(g, "menu Go to");
-        itemtip("Find a session by its title, folder or group, and show it");
+        itemtip("Find a session by its title, folder or group, or a layout, pane, setting or Help topic");
         ImGui::Separator();
         b32 add = ImGui::MenuItem("New session...", cmdkey(g, &a, "N"), false, cannew(g));
         itemrect(g, RECT_NEWBTN);
@@ -14163,7 +14288,7 @@ static void drawmenubar(Gui *g)
         if (ImGui::MenuItem("Go to...", cmdkey(g, &k, "K"))) {
             palopen(g);
         }
-        itemtip("Find a session by its title, folder or group, and show it");
+        itemtip("Find a session by its title, folder or group, or a layout, pane, setting or Help topic");
         ImGui::Separator();
         // Layouts first, the quickest to reach, then the panes
         drawlayoutmenu(g);

@@ -1,6 +1,12 @@
 // The Ctrl/Cmd+K palette's logic, apart from ImGui: the items it offers
 // and their order for a query.
 //
+// Items come in sections, in this order: sessions; layouts and panes;
+// settings; Help's sections. Each section keeps its own ranking, and
+// ranks are never compared across them. Settings and Help are searched
+// by their own panes' searches (cfgfindlist, helpsearch), which give
+// their items already ranked (rank); the rest are matched here.
+//
 // A query is split on spaces into words, ignoring case, and every word
 // must match one of an item's fields. A title or group matches as a
 // subsequence, scored as the '@' picker scores a name (mentionrange),
@@ -12,7 +18,8 @@
 // come after the rest, then the most recently active first, then the
 // newest sid.
 //
-// The empty query offers only the major items, and not the one shown:
+// The empty query offers only sessions, the major ones, and not the one
+// shown:
 // those viewed in this run first, most recently viewed first, so that
 // the palette then Enter goes back to the session before, then the rest
 // by recent activity.
@@ -25,7 +32,25 @@
 
 enum : i32 {
     PAL_SESSION,
+    PAL_LAYOUT,
+    PAL_PANE,
+    PAL_SETTING,
+    PAL_HELP,
 };
+
+// The sections, as palsect numbers them, with their headings.
+static Str palsectnames[] = {"Sessions", "Layouts and panes", "Settings", "Help"};
+
+static i32 palsect(i32 kind)
+{
+    switch (kind) {
+    case PAL_SESSION: return 0;
+    case PAL_LAYOUT:
+    case PAL_PANE:    return 1;
+    case PAL_SETTING: return 2;
+    }
+    return 3;
+}
 
 enum : i32 {
     PAL_TITLE_WEIGHT = 2,              // a title's match counts this many times
@@ -44,6 +69,12 @@ struct PalItem {
     i64  seen;      // when viewed in this run, larger is later; 0 if not
     b32  minor;     // a subagent or archived: offered only to a query
     b32  shown;     // the one in view: left out of the empty query
+    i32  rank;      // its place in another search's results, 1 first,
+                    // offered as given; 0 to be matched here
+    Str  note;      // the dim line under its title, if not a session's
+    i32  ref;       // what it goes to: a layout's number, a pane, a
+                    // setting's row, a Help page
+    Str  arg;       // and a Help section's heading, empty for the top
 };
 
 // The best score of a lower-cased word as a subsequence of s, from any
@@ -99,6 +130,7 @@ static i32 palscore(PalItem *it, Str lowq)
 }
 
 struct PalKey {
+    i32  sect;
     i32  score;
     i32  minor;
     i64  seen;
@@ -109,6 +141,7 @@ struct PalKey {
 
 static b32 palbefore(PalKey *a, PalKey *b)
 {
+    if (a->sect  != b->sect)  return a->sect  < b->sect;
     if (a->score != b->score) return a->score > b->score;
     if (a->minor != b->minor) return a->minor < b->minor;
     if (a->seen  != b->seen)  return a->seen  > b->seen;
@@ -128,14 +161,17 @@ static Slice<i32> palorder(Arena *a, Slice<PalItem> items, Str query)
     for (i32 i = 0; i < (i32)items.len; i++) {
         PalItem *it = &items.data[i];
         PalKey   k  = {};
-        k.i   = i;
-        k.at  = it->at;
-        k.sid = it->sid;
+        k.i    = i;
+        k.sect = palsect(it->kind);
+        k.at   = it->at;
+        k.sid  = it->sid;
         if (!lowq.len) {
-            if (it->minor || it->shown) {
+            if (it->kind!=PAL_SESSION || it->minor || it->shown) {
                 continue;
             }
             k.seen = it->seen;
+        } else if (it->rank) {
+            k.score = -it->rank;  // as that search ranked it
         } else {
             k.score = palscore(it, lowq);
             k.minor = it->minor;

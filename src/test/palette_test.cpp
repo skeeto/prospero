@@ -96,4 +96,41 @@ static void test_palette(Test *t)
     expect(t, "palette.keepgone", istr(&a, palkeep(items, order, "20260104-000000-dddd")), "0");
     order = palorder(&a, items, "test");
     expect(t, "palette.keepquery", istr(&a, palkeep(items, order, "20260103-000000-cccc")), "1");
+
+    // Sections: sessions, then layouts and panes, then settings, then
+    // Help, whatever their scores; settings and Help as their searches
+    // ranked them; none of them for the empty query
+    Slice<PalItem> mix = {};
+    PalItem h = {};
+    h.kind  = PAL_HELP;
+    h.title = "Themes";
+    h.rank  = 1;
+    mix = push(&a, mix, h);
+    PalItem c = {};
+    c.kind  = PAL_SETTING;
+    c.title = "theme_dark";
+    c.rank  = 2;
+    mix = push(&a, mix, c);
+    c.title = "theme";
+    c.rank  = 1;
+    mix = push(&a, mix, c);
+    PalItem p = {};
+    p.kind  = PAL_PANE;
+    p.title = "Settings pane";
+    p.group = "show";
+    mix = push(&a, mix, p);
+    PalItem l = {};
+    l.kind  = PAL_LAYOUT;
+    l.title = "Focus layout";
+    mix = push(&a, mix, l);
+    mix = push(&a, mix, palsess("20260101-000000-aaaa", "Theme work", 1));
+    expect(t, "palette.sections", paltitles(&a, mix, "the"),
+           "Theme work\ntheme\ntheme_dark\nThemes\n");
+    // (Settings and Help are searched for each query, so offered as given)
+    Str rest = "theme\ntheme_dark\nThemes\n";
+    expect(t, "palette.layout", paltitles(&a, mix, "focus"), concat(&a, "Focus layout\n", rest));
+    expect(t, "palette.paneshow", paltitles(&a, mix, "show set"),
+           concat(&a, "Settings pane\n", rest));
+    expect(t, "palette.emptykinds", paltitles(&a, mix, ""), "Theme work\n");
+    expect(t, "palette.sectnames", palsectnames[palsect(PAL_PANE)], "Layouts and panes");
 }

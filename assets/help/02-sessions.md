@@ -70,6 +70,12 @@ id: every word must match, and title matches rank first. Up and Down
 move the pick, Enter shows it with its prompt box ready, and Esc, a
 click outside, or Ctrl+K again closes the palette.
 
+What you type finds more than sessions, each kind under its own
+heading after the sessions: layouts and panes ("focus layout", "show
+jobs"), settings, as the Settings pane's search finds them, and Help's
+sections. Enter applies the layout, shows the pane, opens Settings at
+the setting, or Help at the section.
+
 With nothing typed, it lists the sessions viewed in this window, the
 latest first, then the rest by recent activity, leaving out the one
 shown: Ctrl+K then Enter goes back to the previous session. Subagents
