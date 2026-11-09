@@ -31,6 +31,7 @@ on this machine's LAN address instead.
 
 import argparse
 import base64
+import calendar
 import concurrent.futures
 import hashlib
 import json
@@ -7380,6 +7381,54 @@ def logged(t, sid):
 def ended(h, sid, turn):
     return h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid and
                   e.get("turn") == turn)
+
+
+def sidms(sid):
+    """When a session was made, as its id says: epoch ms, to the second."""
+    return calendar.timegm(time.strptime(sid[:15], "%Y%m%d-%H%M%S")) * 1000
+
+
+@scenario(bound=20)
+def sessions_lastact(t):
+    """The listing's lastact, a session's latest activity: its last
+    message, turn begun or turn ended, kept in its lastact sidecar as each
+    is logged, but not a rename or archiving. Never before the time in its
+    id, where a session with no turn starts, and a fork too, which copies
+    its original's records but not that sidecar."""
+    h = t.headless()
+    try:
+        old = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        new = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        en = listentry(h, new)
+        t.check(en and en.get("lastact") == sidms(new) and
+                sidecar(t, new, "lastact") is None, f"no turn yet, its making: {en}")
+
+        h.send("prompt", sid=old, text="slow")
+        turn = h.wait(lambda e: e.get("ev") == "turn" and e.get("sid") == old)
+        user = h.all("user", old)[-1]
+        en = listentry(h, old)
+        t.check(user["ts"] <= turn["ts"] and en.get("lastact") == turn["ts"],
+                f"its turn begun: {en.get('lastact')} {turn['ts']}")
+        end = ended(h, old, 1)
+        en = listentry(h, old)
+        t.check(en.get("lastact") == end["ts"] and sidecar(t, old, "lastact") == str(end["ts"]),
+                f"its turn ended: {en.get('lastact')} {end['ts']}")
+        t.check(en["lastact"] > listentry(h, new)["lastact"], "now after the newer one")
+
+        r = h.call("fork", sid=old)
+        t.check(r.get("ok") == 1, f"fork {r}")
+        en = listentry(h, r["sid"])
+        t.check(en and en.get("lastact") == sidms(r["sid"]) and
+                sidecar(t, r["sid"], "lastact") is None, f"a fork, its making: {en}")
+
+        t.check(h.call("rename", sid=old, title="Renamed").get("ok") == 1, "renamed")
+        t.check(h.call("archive", sid=old, on=1).get("ok") == 1, "archived")
+        en = listentry(h, old)
+        t.check(en.get("lastact") == end["ts"] and en.get("archived") == 1,
+                f"neither counts: {en}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
 
 
 @scenario(bound=15)

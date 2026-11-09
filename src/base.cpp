@@ -623,6 +623,17 @@ static Civil civil(i64 ms)
     return c;
 }
 
+// Days since 1970-01-01 of a proleptic Gregorian date.
+static i64 epochdays(i64 y, i64 m, i64 d)
+{
+    y -= m <= 2;
+    i64 era = (y >= 0 ? y : y-399) / 400;
+    i64 yoe = y - era*400;
+    i64 doy = (153*(m + (m > 2 ? -3 : 9)) + 2)/5 + d - 1;
+    i64 doe = yoe*365 + yoe/4 - yoe/100 + doy;
+    return era*146097 + doe - 719468;
+}
+
 // ISO 8601 in UTC, to the second: 2026-10-26T14:05:09Z.
 static void printiso(Buf *b, i64 ms)
 {

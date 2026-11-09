@@ -1398,6 +1398,8 @@ static Slice<Str> geturls(Arena *a, Json *list)
     return r;
 }
 
+static void lastactput(Session *, Arena, i64);
+
 // Log a user record and append its message: the images in perm. A
 // task's names the URLs in its prompt that the parent saw (webvouch).
 static void adduser(Session *s, Arena scratch, Str text, Str via,
@@ -1429,6 +1431,7 @@ static void adduser(Session *s, Arena scratch, Str text, Str via,
     }
     puturls(&w.json, urls);
     ssend(s, &w);
+    lastactput(s, scratch, w.ts);
     Msg m = {};
     m.role   = ROLE_USER;
     m.text   = clone(&s->perm, text);
@@ -14089,6 +14092,7 @@ static void beginturn(Session *s, Arena scratch, Str via)
             putintkey(&w.json, "hop", s->hop);
         }
         ssend(s, &w);
+        lastactput(s, a, w.ts);
     }
     s->steps      = 0;
     s->attempts   = 0;
@@ -14191,6 +14195,7 @@ static void endturn(Session *s, Arena scratch, Str why, Str err)
         }
         putgauge(s, &w.json, estimate(s));  // as it rests
         ssend(s, &w);
+        lastactput(s, a, w.ts);
     }
     setstate(s, S_IDLE);
 
@@ -16630,6 +16635,19 @@ static Str sidecarput(Engine *e, Arena scratch, Str sid, Str name, Str data)
     return ok ? Str{} : Str("cannot write the session's files");
 }
 
+// Keep the time of the session's latest activity (evactivity) in its
+// lastact sidecar, which the listing reads instead of the log: as the
+// three writers of those records send each one. Forks, imports and the
+// crash record of an open never come this way. Best effort: a session
+// whose sidecar fails lists at an earlier time.
+static void lastactput(Session *s, Arena scratch, i64 ts)
+{
+    Buf b(&scratch, 24);
+    print(&b, ts);
+    Str v = finish(&b);
+    sidecarwrite(s->e, scratch, s->sid, "lastact", v);
+}
+
 // When a session went to the Trash (epoch ms), as its trashed sidecar
 // says, else as that file's time says; 0 if it is not in the Trash.
 static i64 trashedat(Engine *e, Arena scratch, Str sid)
@@ -16690,6 +16708,7 @@ struct ListEntry {
     Str       group;   // empty if in none
     Str       scratch; // its scratch directory, if any
     i64       mtime;
+    i64       lastact; // its latest activity (epoch ms), never before it was made
     b32       locked;  // open in another process
     b32       parked;
     b32       archived;
@@ -16700,6 +16719,19 @@ struct ListEntry {
     b32       shown;
     Slice<iz> kids;    // its subagents, oldest first
 };
+
+// A session's latest activity, from its lastact sidecar (lastactput),
+// but never before the time in its id, else made, its session record's:
+// a fork or import starts at its own making, not the original's last
+// turn, and one with no turn yet, or made before the sidecar was kept,
+// at its making.
+static i64 lastactof(Engine *e, Arena scratch, Str sid, i64 made)
+{
+    i64 floor = sidms(sid);
+    floor = floor ? floor : made;
+    Int v = parseint(sidecarget(e, &scratch, sid, "lastact", 32));
+    return v.ok && v.val>floor ? v.val : floor;
+}
 
 static b32 listbefore(ListEntry *a, ListEntry *b)
 {
@@ -16750,6 +16782,7 @@ static SessScan scansessions(Engine *e, Arena *a)
         en.wt       = wtfrom(a, jsonget(rec.root, "worktree"));
         en.wtgone   = en.wt.name.len && !wtexists(e, *a, &en.wt);
         en.mtime    = d->mtime;
+        en.lastact  = lastactof(e, *a, d->name, rec.ts);
         en.parked   = !s && parkedat(e, d->name)>=0;  // its lock is ours
         en.locked   = (!s || s->readonly) && !en.parked &&
                       os_lockheld(e->os, *a, lock);
@@ -19090,6 +19123,7 @@ static void listput(Engine *e, JsonOut *w, Slice<ListEntry> list, iz i, i32 dept
     putstrkey(w, "model", en->model);
     putstrkey(w, "state", state);
     putintkey(w, "mtime", en->mtime);
+    putintkey(w, "lastact", en->lastact);
     putintkey(w, "locked", en->locked);
     putintkey(w, "jobs", live ? jobsrunning(live) : 0);
     if (en->parent.len) {

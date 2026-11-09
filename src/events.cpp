@@ -380,6 +380,16 @@ static b32 evdurable(i32 ev)
     return evinfo[ev].durable;
 }
 
+// Whether a record is the session's activity, which orders the sidebar
+// by default: a message sent, a turn begun, a turn ended. Not the
+// turn.end of a crash, which opening the session writes later
+// ("interrupted"), nor anything else: opening, renaming, moving or
+// archiving a session never counts, nor do the steps of a turn.
+static b32 evactivity(i32 ev, Str why)
+{
+    return ev==EV_USER || ev==EV_TURN || (ev==EV_TURNEND && why!="interrupted");
+}
+
 static Str cmdname(i32 cmd)
 {
     assert(cmd>=0 && cmd<CMD_COUNT);
@@ -408,6 +418,32 @@ static b32 validsid(Str sid)
     return ok;
 }
 
+// When a session was made, as its id says (YYYYMMDD-HHMMSS-..., in UTC),
+// in epoch milliseconds to the second, or 0 if the id holds no time.
+static i64 sidms(Str sid)
+{
+    static i32 const at[]  = {0, 4, 6, 9, 11, 13};
+    static i32 const len[] = {4, 2, 2, 2, 2, 2};
+    if (sid.len<15 || sid[8]!='-') {
+        return 0;
+    }
+    i64 f[6] = {};
+    for (i32 i = 0; i < 6; i++) {
+        for (i32 k = 0; k < len[i]; k++) {
+            u8 c = sid[at[i] + k];
+            if (!digit(c)) {
+                return 0;
+            }
+            f[i] = f[i]*10 + (c - '0');
+        }
+    }
+    if (f[1]<1 || f[1]>12 || f[2]<1 || f[2]>31 || f[3]>23 || f[4]>59 || f[5]>60) {
+        return 0;
+    }
+    i64 days = epochdays(f[0], f[1], f[2]);
+    return ((days*24 + f[3])*60 + f[4])*60000 + f[5]*1000;
+}
+
 
 // Records
 
@@ -416,6 +452,7 @@ struct EvOut {
     JsonOut json;
     iz      start;  // offset of the record in the buffer
     i32     ev;     // EV_NONE for commands
+    i64     ts;     // as the record has it
 };
 
 // Begin an event record. The seq is written only for durable events, and
@@ -427,6 +464,7 @@ static EvOut evbegin(Buf *b, Str sid, i64 seq, i64 ts, i32 ev)
     r.json.b = b;
     r.start  = b->len;
     r.ev     = ev;
+    r.ts     = ts;
     putobject(&r.json);
     if (sid.data) {
         putkey(&r.json, "sid");

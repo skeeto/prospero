@@ -716,6 +716,50 @@ static void test_events(Test *t)
         }
     }
 
+    // A session's making, as its id says, to the second; 0 for an id
+    // that holds no such time
+    {
+        struct { Str sid; i64 ms; } sids[] = {
+            {"20261020-153012-7f3a", 1792510212000},
+            {"20260101-000000-aaaa", 1767225600000},
+            {"20000229-235959", 951868799000},
+            {"", 0},
+            {"a", 0},
+            {"20261020-15301", 0},
+            {"20261020_153012-7f3a", 0},
+            {"2026x020-153012-7f3a", 0},
+            {"20261320-153012-7f3a", 0},
+            {"20261000-153012-7f3a", 0},
+            {"20261020-243012-7f3a", 0},
+            {"20261020-156012-7f3a", 0},
+        };
+        for (iz i = 0; i < countof(sids); i++) {
+            expect(t, concat(a, "sidms ", sids[i].sid),
+                   istr(a, sidms(sids[i].sid)), istr(a, sids[i].ms));
+        }
+    }
+
+    // What counts as a session's activity: not a crash's turn.end, which
+    // an open writes later, nor any record but these three
+    {
+        struct { i32 ev; Str why; b32 want; } recs[] = {
+            {EV_USER,      {},            1},
+            {EV_TURN,      {},            1},
+            {EV_TURNEND,   "done",        1},
+            {EV_TURNEND,   "cancel",      1},
+            {EV_TURNEND,   "interrupted", 0},
+            {EV_SESSION,   {},            0},
+            {EV_TITLE,     {},            0},
+            {EV_ASSISTANT, {},            0},
+            {EV_TOOLEND,   {},            0},
+            {EV_NOTE,      {},            0},
+        };
+        for (iz i = 0; i < countof(recs); i++) {
+            Str name = concat(a, concat(a, "evactivity ", evinfo[recs[i].ev].name), recs[i].why);
+            expect(t, name, istr(a, evactivity(recs[i].ev, recs[i].why)), istr(a, recs[i].want));
+        }
+    }
+
     // Encoding: fixed header order, seq only when durable, one line each
     {
         Buf   b(a, 64);

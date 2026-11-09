@@ -97,6 +97,9 @@ static void testlist(Test *t)
     makesessions(v.os, &a, {made, countof(made)});
     os_write(v.os, a, "/s/sessions/20260101-000000-aaaa/title", "Root \"one\"");
     os_write(v.os, a, "/s/sessions/20260101-000003-dddd/title", "A grandchild");
+    os_write(v.os, a, "/s/sessions/20260101-000005-ffff/lastact", "1767229200000");
+    os_write(v.os, a, "/s/sessions/20260101-000007-hhhh/lastact", "junk");
+    os_write(v.os, a, "/s/sessions/20260101-000008-iiii/lastact", "5");
     os_mkdirs(v.os, a, "/s/sessions/not-a-session");
     os_write(v.os, a, "/s/sessions/stray", "a file");
     Parked k = {};
@@ -140,6 +143,20 @@ static void testlist(Test *t)
         }
         expect(t, "subtree", finish(&trees),
                "aaaa,bbbb,eeee,dddd bbbb,dddd gggg,hhhh iiii ");
+
+        // The latest activity, past the sids' first second: the lastact
+        // sidecar's, but never before the making in the sid, which is
+        // also what a session without one, or with junk, gets
+        Buf acts(&tmp, 256);
+        for (iz i = 0; i < sc.list.len; i++) {
+            print(&acts, cuthead(sc.list[i].sid, 16));
+            putbyte(&acts, '=');
+            print(&acts, sc.list[i].lastact - 1767225600000);
+            putbyte(&acts, ' ');
+        }
+        expect(t, "lastact", finish(&acts),
+               "aaaa=0 bbbb=1000 cccc=2000 dddd=3000 eeee=4000 ffff=3600000 "
+               "gggg=6000 hhhh=7000 iiii=8000 ");
     }
 
     cmdlist(e, v.scratch, 1, 0);
@@ -179,7 +196,7 @@ static void testlist(Test *t)
     Buf     want(&a, 1024);
     print(&want, "{\"sid\":\"20260101-000000-aaaa\",\"title\":\"Root \\\"one\\\"\","
                  "\"cwd\":\"/w\",\"model\":\"m\",\"state\":\"closed\",\"mtime\":0,"
-                 "\"locked\":0,\"jobs\":0}");
+                 "\"lastact\":1767225600000,\"locked\":0,\"jobs\":0}");
     Buf entry(&a, 1024);
     JsonOut w = {&entry};
     putjson(&w, jsonat(list, 3));
@@ -189,15 +206,15 @@ static void testlist(Test *t)
     putjson(&w, jsonat(list, 5));
     expect(t, "list subagent entry", finish(&entry),
            "{\"sid\":\"20260101-000003-dddd\",\"title\":\"A grandchild\",\"cwd\":\"/w\","
-           "\"model\":\"m\",\"state\":\"closed\",\"mtime\":0,\"locked\":0,\"jobs\":0,"
-           "\"parent\":\"20260101-000001-bbbb\",\"depth\":2}");
+           "\"model\":\"m\",\"state\":\"closed\",\"mtime\":0,\"lastact\":1767225603000,"
+           "\"locked\":0,\"jobs\":0,\"parent\":\"20260101-000001-bbbb\",\"depth\":2}");
     entry.len = 0;
     w = {&entry};
     putjson(&w, jsonat(list, 2));
     expect(t, "list parked entry", finish(&entry),
            "{\"sid\":\"20260101-000002-cccc\",\"title\":\"\",\"cwd\":\"/w\","
-           "\"model\":\"m\",\"state\":\"idle\",\"mtime\":0,\"locked\":0,\"jobs\":0,"
-           "\"parked\":1}");
+           "\"model\":\"m\",\"state\":\"idle\",\"mtime\":0,\"lastact\":1767225602000,"
+           "\"locked\":0,\"jobs\":0,\"parked\":1}");
     expect(t, "list record", istr(&a, startswith(line, "{\"ts\":0,\"ev\":\"sessions\","
            "\"list\":[{\"sid\":\"20260101-000008-iiii\"")), "1");
 }
@@ -744,8 +761,8 @@ static void testremotetask(Test *t)
     putjson(&w, x);
     expect(t, "list remote child entry", finish(&entry),
            "{\"sid\":\"20260101-000001-bbbb\",\"title\":\"\",\"cwd\":\"/w\","
-           "\"model\":\"m\",\"state\":\"closed\",\"mtime\":0,\"locked\":0,\"jobs\":0,"
-           "\"parent\":\"20260101-000000-aaaa\",\"remote\":1}");
+           "\"model\":\"m\",\"state\":\"closed\",\"mtime\":0,\"lastact\":1767225601000,"
+           "\"locked\":0,\"jobs\":0,\"parent\":\"20260101-000000-aaaa\",\"remote\":1}");
 }
 
 // The prompt's ETA (prefilleta), against a server whose cost per token

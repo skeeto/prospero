@@ -1449,17 +1449,6 @@ static Str headervalue(Str headers, Str name)
     return {};
 }
 
-// Days since 1970-01-01 of a proleptic Gregorian date.
-static i64 epochdays(i64 y, i64 m, i64 d)
-{
-    y -= m <= 2;
-    i64 era = (y >= 0 ? y : y-399) / 400;
-    i64 yoe = y - era*400;
-    i64 doy = (153*(m + (m > 2 ? -3 : 9)) + 2)/5 + d - 1;
-    i64 doe = yoe*365 + yoe/4 - yoe/100 + doy;
-    return era*146097 + doe - 719468;
-}
-
 // "Sun, 06 Nov 1994 08:49:37 GMT" as epoch milliseconds, or -1.
 static i64 httpdate(Str s)
 {

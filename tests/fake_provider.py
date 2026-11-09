@@ -4508,6 +4508,14 @@ def sc_session_ops(model, n, req):
     yield from finish(model)
 
 
+def sc_sessions_lastact(model, n, req):
+    yield S.head()
+    if last_user_text(req) == "slow":
+        yield S.sleep(1)  # busy a while, for a listing meanwhile
+    yield from text(model, f"Answer {n}.")
+    yield from finish(model)
+
+
 def sc_draft(model, n, req):
     yield from answer(model, "Sent.")
 
