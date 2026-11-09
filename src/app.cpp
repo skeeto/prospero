@@ -17470,8 +17470,8 @@ static DriveOp planops[] = {
 // The Terminal pane (--terminal), on [terminal] shell = /bin/sh with
 // PS1 "tty$ ": Ctrl+` shows it, starting a shell, typing and editing
 // reach it, Ctrl+C interrupts, a new window size reaches the shell, it
-// draws nothing while idle, Ctrl+` hides it and brings it back as it
-// was, vim edits and writes a file through a resize, less pages, exit
+// draws nothing while idle, Ctrl+` goes to the prompt and back with
+// the pane docked, and floating hides it and brings it back as it was, vim edits and writes a file through a resize, less pages, exit
 // closes it, a failing exit leaves a banner to restart, and quitting
 // hangs the shell up.
 static DriveOp termops[] = {
@@ -17518,11 +17518,28 @@ static DriveOp termops[] = {
     {OP_MOVE, T_EMPTY, 0, 0, 4500, ""},
     {OP_MARK, 0, 0, 0, 3000, ""},
     {OP_CHECK, CHK_TERMQUIET, 0, 0, 0, ""},
-    // Hidden from the terminal, then back as it was, with the keyboard
+    // Docked beside the prompt, from the terminal to the prompt and back,
+    // the pane staying where it is
+    CTRLKEY(GKEY_GRAVE, 500),
+    {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Terminal"},
+    {OP_CHECK, CHK_TERMHOME, 0, 0, 0, ""},
+    {OP_CHECK, CHK_NEWTYPED, 0, 0, 0, ""},
+    CTRLKEY(GKEY_GRAVE, 500),
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    // Floating, hidden from the terminal, then back as it was, with the
+    // keyboard; then home again by the layout, its own node having closed
+    // as it floated
+    {OP_FLOAT, 0, 700, 400, 700, "Terminal"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
     CTRLKEY(GKEY_GRAVE, 500),
     {OP_CHECK, CHK_PANECLOSED, 0, 0, 0, "Terminal"},
     CTRLKEY(GKEY_GRAVE, 500),
     {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Terminal"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    LAYOUT("Standard"),
+    {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Terminal"},
+    {OP_CHECK, CHK_TERMHOME, 0, 0, 0, ""},
+    CTRLKEY(GKEY_GRAVE, 500),  // the menu took the keyboard
     {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
     {OP_CHECK, CHK_TERMSCREEN, 0, 0, 0, "\nafter"},
     // vim: an edit, resized mid-edit, written and quit

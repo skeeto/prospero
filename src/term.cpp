@@ -9,7 +9,8 @@
 // and the engine sends again from there. Keys and pastes go out encoded
 // by ariel as term.input. Ctrl+` (physical Ctrl on macOS too) shows the
 // pane and focuses the terminal, starting one if there is none, and
-// hides it again from the terminal.
+// from the terminal goes back to the prompt, hiding the pane only where
+// it covers the prompt or floats.
 //
 // For now only the local engine runs terminals: the routing of remote
 // hosts' term records comes later.
@@ -1345,7 +1346,8 @@ static void termkeys(Gui *g, TermTab *tt, Arena a)
 }
 
 // Ctrl+`, at the top of the frame, before any shortcut: shows the pane
-// and focuses the terminal, or from the terminal, hides the pane. While
+// and focuses the terminal, or from the terminal, focuses the prompt,
+// hiding the pane unless it is docked beside the prompt. While
 // the terminal has the keyboard on macOS, it lets go of it with Cmd held,
 // so the app keeps every Cmd chord. Elsewhere it keeps the keyboard but
 // for the app's few chords (termkept): on the frame one is pressed it
@@ -1374,7 +1376,15 @@ static void termhotkeys(Gui *g)
         setpane(g, PANE_TERMINAL, 1);
         g->termfocus = 1;
     } else if (g->panes[PANE_TERMINAL] && g->termfocused) {
-        setpane(g, PANE_TERMINAL, 0);
+        // To the prompt. Docked beside it, the pane stays, since hiding
+        // it would reflow the layout; covering it, as a tab of its node,
+        // or floating, it goes
+        ImGuiWindow *w     = ImGui::FindWindowByName(panenames[PANE_TERMINAL]);
+        b32          docked = w && w->DockIsActive;
+        b32          beside = g->panedrawn[PANE_PROMPT] >= g->total.frames-1;
+        if (!docked || !beside) {
+            setpane(g, PANE_TERMINAL, 0);
+        }
         g->promptfocus = 1;
         if (c.ActiveId == g->termid) {
             ImGui::ClearActiveID();
