@@ -56,6 +56,7 @@ struct TermTab {
     i32         textkey;   // a Ctrl+Alt key that typed (AltGr), while held
     b32         busy;      // a program runs in the shell
     b32         selecting; // the left button drags a local selection
+    b32         copyc;     // C, held since Ctrl+C copied (Windows)
     i32         histlines; // its history, as [terminal] scrollback said
     Palette    *pal;       // the colors given ariel
     i32         code;      // the end's exit code, or -1
@@ -887,14 +888,21 @@ static void termpress(Gui *g, TermTab *tt, ImGuiKey k, b32 repeat)
     }
 }
 
-static void termpaste(Gui *g, TermTab *tt, Arena a)
+// Text for the shell as a paste, in pieces cut between code points, so
+// that no piece ends partway into one ariel's filter would then pass.
+static void termpastenow(Gui *g, TermTab *tt, Str text, Arena a)
 {
-    char const *clip = ImGui::GetClipboardText();
-    Str         in   = {(u8 *)clip, clip ? (iz)__builtin_strlen(clip) : 0};
-    while (in.len) {
-        Str part = takehead(in, in.len<TERMTAB_INPUT ? in.len : (iz)TERMTAB_INPUT);
+    for (Str in = text; in.len;) {
+        iz cut = in.len<TERMTAB_INPUT ? in.len : (iz)TERMTAB_INPUT;
+        for (iz back = cut; cut<in.len && back>cut-4 && back>0; back--) {
+            if ((in.data[back] & 0xc0) != 0x80) {
+                cut = back;  // a code point starts here
+                break;
+            }
+        }
+        Str part  = takehead(in, cut);
         i32 flags = (part.len==in.len ? ARIEL_PASTE_END : 0) |
-                    (in.data==(u8 *)clip ? ARIEL_PASTE_BEGIN : 0);
+                    (in.data==text.data ? ARIEL_PASTE_BEGIN : 0);
         Arena t   = a;
         iz    cap = part.len + 16;
         u8   *out = allocbytes(&t, cap);
@@ -902,6 +910,81 @@ static void termpaste(Gui *g, TermTab *tt, Arena a)
         termsend(g, tt, {out, n});
         in = cuthead(in, part.len);
     }
+}
+
+// The clipboard into tab tt, unless the shell isn't bracketing pastes
+// and it has more than one line, each of which might then run: that
+// waits in a block of its own for the user to say (termpasteask).
+static void termpaste(Gui *g, TermTab *tt, Arena a)
+{
+    char const *clip = ImGui::GetClipboardText();
+    Str         in   = {(u8 *)clip, clip ? (iz)__builtin_strlen(clip) : 0};
+    if (!in.len) {
+        return;
+    } else if (!ariel_pastecheck(tt->t, {in.data, in.len})) {
+        termpastenow(g, tt, in, a);
+        return;
+    }
+    if (g->termpasteregion) {
+        os_release(g->os, g->termpasteregion);
+    }
+    g->termpasteregion = os_reserve(g->os, in.len);
+    if (!g->termpasteregion) {
+        return;
+    }
+    Arena r = newarena(g->termpasteregion);
+    u8   *p = allocbytes(&r, in.len);
+    __builtin_memcpy(p, in.data, (uz)in.len);
+    g->termpastetext   = {p, in.len};
+    g->termpastetab    = tt;
+    g->termpasteserial = tt->serial;
+    g->termpasteopen   = 1;
+}
+
+// The question a paste waits on, while it does.
+static void termpasteask(Gui *g, Arena a)
+{
+    char const *title = "Paste into the terminal?";
+    if (g->termpasteopen) {
+        g->termpasteopen = 0;
+        ImGui::ClearActiveID();
+        ImGui::OpenPopup(title);
+    }
+    if (!ImGui::BeginPopupModal(title, 0, ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+    Str text  = g->termpastetext;
+    i64 lines = 1;
+    for (iz i = 0; i < text.len; i++) {
+        lines += text.data[i]=='\n' && i+1<text.len;
+    }
+    Buf b(&a, 160);
+    print(&b, "The text has ");
+    print(&b, lines);
+    print(&b, " lines, and the program in the terminal doesn't take pastes "
+              "as such: each line may run as a command.");
+    ImGui::PushTextWrapPos(ImGui::GetFontSize() * 28);
+    ImGui::TextUnformatted(cstr0(&a, finish(&b)));
+    ImGui::PopTextWrapPos();
+    b32 ok     = ImGui::Button("Paste");
+    itemnamed(g, "term paste ok");
+    ImGui::SameLine();
+    b32 cancel = ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape, false);
+    itemnamed(g, "term paste cancel");
+    if (ok || cancel) {
+        TermTab *tt = g->termpastetab;
+        if (ok && tt && tt->serial==g->termpasteserial && termowner(g, tt) &&
+                tt->state==TT_LIVE) {
+            termpastenow(g, tt, text, a);  // the tab may have gone meanwhile
+        }
+        os_release(g->os, g->termpasteregion);
+        g->termpasteregion = 0;
+        g->termpastetext   = {};
+        g->termpastetab    = 0;
+        g->termfocus       = 1;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
 }
 
 // Whether a chord on Windows and Linux is the app's, not the terminal's:
@@ -971,6 +1054,7 @@ static void termletgo(Gui *g, TermTab *tt)
     tt->pasteins  = 0;
     tt->textkey   = 0;
     tt->selecting = 0;
+    tt->copyc     = 0;
 }
 
 // Whether tab tt has text selected.
@@ -1167,9 +1251,18 @@ static void termkeys(Gui *g, TermTab *tt, Arena a)
     if (cmd) {
         if (ImGui::IsKeyPressed(ImGuiKey_V, false)) {
             termpaste(g, tt, a);
+        } else if (ImGui::IsKeyPressed(ImGuiKey_C, false)) {
+            termcopy(g, tt);
         }
         return;
     }
+    // Copy: Ctrl+Shift+C, and on Windows Ctrl+C while there is a
+    // selection, which it clears, else Ctrl+C is ^C. The C it took
+    // stays the copy's until let go, sending no repeats.
+    if (termkept(g, ImGuiKey_C) && ImGui::IsKeyPressed(ImGuiKey_C, false)) {
+        termcopy(g, tt);
+    }
+    tt->copyc = tt->copyc && ImGui::IsKeyDown(ImGuiKey_C);
     // Paste: Ctrl+Shift+V, and Shift+Insert as in GNOME Terminal and
     // Konsole (the clipboard, not the primary selection). It doesn't
     // repeat, and the Insert it took stays the paste's until let go.
@@ -1193,7 +1286,13 @@ static void termkeys(Gui *g, TermTab *tt, Arena a)
         if (e->Type==ImGuiInputEventType_Key && e->Key.Down &&
                 ImGui::IsNamedKey(e->Key.Key) && !(e->Key.Key & ImGuiMod_Mask_)) {
             pressed[e->Key.Key - ImGuiKey_NamedKey_BEGIN] = 1;
-            if (alttext && termtextkey(e->Key.Key) &&
+            if (HOST_WINDOWS && e->Key.Key==ImGuiKey_C && io.KeyCtrl && !io.KeyShift &&
+                    !io.KeyAlt && termselected(tt)) {
+                termcopy(g, tt);
+                ariel_select(tt->t, ARIEL_SEL_CLEAR, 0, 0);
+                tt->copyc = 1;
+                scheddirty(&g->sched);
+            } else if (alttext && termtextkey(e->Key.Key) &&
                     (termtyped(c, i) || (os_guialtgr(g->os) &&
                                          os_guikeycp(g->os, e->Key.Key, io.KeyShift)))) {
                 tt->textkey = e->Key.Key;
@@ -1214,7 +1313,7 @@ static void termkeys(Gui *g, TermTab *tt, Arena a)
         ImGuiKey key = (ImGuiKey)k;
         if (!pressed[k - ImGuiKey_NamedKey_BEGIN] && (termnamed(key) || termtextkey(key)) &&
                 !termkept(g, key) && !(tt->pasteins && key==ImGuiKey_Insert) &&
-                key!=tt->textkey &&
+                key!=tt->textkey && !(tt->copyc && key==ImGuiKey_C) &&
                 ImGui::GetKeyData(key)->DownDuration>0 &&
                 ImGui::IsKeyPressed(key, ImGuiInputFlags_Repeat, ImGuiKeyOwner_Any)) {
             termpress(g, tt, key, 1);
@@ -1477,6 +1576,7 @@ static void drawterm(Gui *g)
         return;
     }
     TermBar bar = termtabs(g, s);
+    termpasteask(g, a);
 
     TermMetrics m     = termmetrics(g);
     ImVec2      avail = ImGui::GetContentRegionAvail();

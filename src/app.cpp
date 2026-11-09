@@ -1715,6 +1715,11 @@ struct Gui {
     GuiSession        *termaddto;    // root wanting a new tab once sized
     i32                closeterms;   // busy tabs the quit dialog counted
     i32                termscroll;   // [terminal] scrollback, for new tabs
+    Region            *termpasteregion;  // a paste waiting to be confirmed
+    Str                termpastetext;    //   in it
+    TermTab           *termpastetab;     //   for this tab
+    u32                termpasteserial;  //   while its serial is this
+    b32                termpasteopen;    //   its question to open
     b32                termcopysel;  // [terminal] copy_on_select
     TermTab           *termshowing;  // the tab drawn in front last
     u32                termshowingserial;  // its serial then
@@ -16233,6 +16238,15 @@ static DriveOp stopops[] = {
     {OP_KEYUP, 0, key, KEY_CTRL|KEY_SHIFT, 50, ""}, \
     {OP_KEYUP, 0, GKEY_SHIFT, KEY_CTRL, 50, ""}, \
     {OP_KEYUP, 0, GKEY_CTRL, 0, ms, ""}
+// The terminal's copy and paste chords: Cmd on macOS, Ctrl on Windows
+// (Ctrl+C copying while there is a selection), else Ctrl+Shift
+#if defined(__APPLE__) || defined(_WIN32)
+#  define TERMCOPY(ms)  CMDKEY(GKEY_C, ms)
+#  define TERMPASTE(ms) CMDKEY(GKEY_V, ms)
+#else
+#  define TERMCOPY(ms)  CTRLSHIFTKEY(GKEY_C, ms)
+#  define TERMPASTE(ms) CTRLSHIFTKEY(GKEY_V, ms)
+#endif
 // A program in the foreground that leaves a child ignoring SIGHUP, its
 // pid in a file, its command line naming the folder for gui.py's checks
 #define TERMSTRAY(file) \
@@ -17641,6 +17655,42 @@ static DriveOp termops[] = {
     {OP_DOWN, 0, 0, 0, 30, ""}, {OP_UP, 0, 0, 0, 30, ""},
     {OP_DOWN, 0, 0, 0, 30, ""}, {OP_UP, 0, 0, 0, 300, ""},
     {OP_CHECK, CHK_TERMSEL, 0, 0, 0, "pick selword here"},
+    // Copied, then pasted (the clipboard put back afterwards)
+    {OP_CLIPPNG, 0, 8, 8, 100, ""},
+    TERMCOPY(300),
+    {OP_CHECK, CHK_CLIPBOARD, 0, 0, 0, "pick selword here"},
+    {OP_TEXT, 0, 0, 0, 100, "echo pasted:"},
+    TERMPASTE(300),
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\npasted:pick selword here"},
+    // Lines selected, by a triple-click and a Shift+click, and pasted
+    // where they aren't taken as a paste (cat's), ask first
+    {OP_TEXT, 0, 0, 0, 100, "printf 'echo l1\\necho l2\\n'"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\necho l1\necho l2\n"},
+    {OP_MOVE, T_TERMTEXT, 2, 0, 1200, "echo l1"},  // past a double-click
+    {OP_DOWN, 0, 0, 0, 30, ""}, {OP_UP, 0, 0, 0, 30, ""},
+    {OP_DOWN, 0, 0, 0, 30, ""}, {OP_UP, 0, 0, 0, 30, ""},
+    {OP_DOWN, 0, 0, 0, 30, ""}, {OP_UP, 0, 0, 0, 300, ""},
+    {OP_MOVE, T_TERMTEXT, 2, 0, 1200, "echo l2"},
+    {OP_KEYDOWN, 0, GKEY_SHIFT, KEY_SHIFT, 50, ""},
+    {OP_DOWN, 0, 0, 0, 30, ""}, {OP_UP, 0, 0, 0, 30, ""},
+    {OP_KEYUP, 0, GKEY_SHIFT, 0, 300, ""},
+    {OP_CHECK, CHK_TERMSEL, 0, 0, 0, "echo l1\necho l2"},
+    TERMCOPY(300),
+    {OP_TEXT, 0, 0, 0, 100, "cat >pasted.txt"},  // only the tty's echo shows
+    TERMKEY(GKEY_ENTER, 500),
+    TERMPASTE(500),
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "terminal-paste"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "term paste ok"},
+    {OP_DOWN, 0, 0, 0, 60, ""}, {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    {OP_WAIT, W_TERM, 0, 0, 5000, "tty$ cat >pasted.txt\necho l1\necho l2"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    TERMKEY(GKEY_ENTER, 100),
+    CTRLKEY(GKEY_D, 500),
+    {OP_CLIPBACK, 0, 0, 0, 100, ""},
     {OP_CHECK, CHK_DCLICKTIME, 0.3f, 0, 0, ""},
     {OP_MOVE, T_SESSTITLE, 0, 0, 100, ""},
     {OP_RDOWN, 0, 0, 0, 60, ""},
