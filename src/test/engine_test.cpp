@@ -1405,6 +1405,29 @@ static void test_engine(Test *t)
     testtargets(t);
     Arena *a = &t->perm;
 
+    // A command that only sleeps, a wait for a job (#32)
+    {
+        struct { Str cmd; b32 want; } cases[] = {
+            {"sleep 30", 1},
+            {"  sleep 1.5;", 1},
+            {"sleep 2m", 1},
+            {"sleep 1 1", 1},
+            {"Start-Sleep -Seconds 20", 1},
+            {"start-sleep 5", 1},
+            {"sleep", 0},
+            {"sleep 5; tail log", 0},
+            {"sleep 5 && curl localhost:8080", 0},
+            {"sleep $N", 0},
+            {"sleeper 5", 0},
+            {"Start-Sleep -Verbose 5", 0},
+            {"echo sleep 5", 0},
+        };
+        for (iz i = 0; i < countof(cases); i++) {
+            expect(t, concat(a, "onlysleeps ", cases[i].cmd),
+                   istr(a, onlysleeps(cases[i].cmd)), istr(a, cases[i].want));
+        }
+    }
+
     Str long60 = "Refactor the parser so that it handles nested quotes and "
                  "escapes correctly everywhere";
     struct { Str in; Str want; } titles[] = {

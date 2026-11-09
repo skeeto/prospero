@@ -728,6 +728,41 @@ def sc_job_tools(model, n, req):
         yield from answer(model, "Killed the job.")
 
 
+def sc_job_announce(model, n, req):
+    # Says it will wait for its job, and stops: not nudged on, since the
+    # job's end brings it back (#32)
+    if n == 0:
+        cmd = "sleep 1; echo built"
+        yield from tool(model, n, "shell", {"command": cmd, "background": True})
+    elif n == 1:
+        yield from answer(model, "Let me wait for the build to finish.")
+    else:
+        yield from answer(model, "Saw: " + last_user(req)[:60])
+
+
+def sc_job_poll(model, n, req):
+    # Polls a job that writes nothing new, and sleeps for it (#32)
+    if n == 0:
+        cmd = "echo $$ > jobpid; echo one; sleep 30"
+        yield from tool(model, n, "shell", {"command": cmd, "background": True})
+    elif n == 1:
+        yield S.sleep(0.5)  # for its output to arrive
+        yield from tool(model, n, "job_output", {"job": 1})
+    elif n == 2:
+        yield from tool(model, n, "job_output", {"job": 1})
+    elif n == 3:
+        yield from tool(model, n, "shell", {"command": "sleep 0.1"})
+    elif n == 4:
+        yield from tool(model, n, "shell", {"command": "sleep 0.1; echo hi"})
+    elif n == 5:
+        yield from tool(model, n, "job_kill", {"job": 1})
+    else:
+        yield from answer(model, "Stopped it.")
+
+
+sc_job_poll_noresume = sc_job_poll
+
+
 def sc_job_busy(model, n, req):
     # A job that ends while the turn still runs: told at the next step
     if n == 0:

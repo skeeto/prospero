@@ -1204,6 +1204,61 @@ def job_tools(t):
 
 
 @scenario(bound=10)
+def job_announce(t):
+    """An agent that says it will wait for its job and stops is not nudged
+    on: the job's end starts its next turn (#32)."""
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    start = r.all("tool.end")[0]["text"]
+    t.check("a new one starts for it" in start and "end your turn" in start,
+            f"it is told it may end its turn: {start!r}")
+    t.check(not r.all("nudge"), f"no nudge: {r.all('nudge')}")
+    t.seq(r, ["job.start", "tool.end", "assistant", "turn.end", "job.end", "turn",
+              "notice", "attempt", "assistant", "turn.end"])
+    t.check("Saw: Background job 1 ended" in r.text(), f"text {r.text()!r}")
+
+
+@scenario(bound=10)
+def job_poll(t):
+    """Reading a running job again with nothing new, or sleeping while a
+    job runs, is answered plainly: end the turn instead (#32)."""
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    ends = r.all("tool.end")
+    t.check([e["status"] for e in ends] == ["ok"] * 6, f"statuses {[e['status'] for e in ends]}")
+    first, second = ends[1]["text"], ends[2]["text"]
+    t.check("in a new turn if yours has ended: do not poll it" in first and
+            "Stop polling" not in first, f"first read: {first!r}")
+    t.check("job 1 is still running, with no new output since you last read "
+            "it. Stop polling it: if there is nothing else to do, end your turn "
+            "now" in second, f"second read: {second!r}")
+    t.check("instead of sleeping" in ends[3]["text"], f"sleep: {ends[3]['text']!r}")
+    t.check("instead of sleeping" not in ends[4]["text"] and "hi" in ends[4]["text"],
+            f"sleep, then work: {ends[4]['text']!r}")
+    t.check(t.gone(t.pids("jobpid")), "the job's process is gone")
+
+
+@scenario(conf={"_tools": {"auto_resume": 0}}, bound=10)
+def job_poll_noresume(t):
+    """With no turns of its own, polling is still answered, but the agent
+    is not told a new turn starts, and sleeping goes unremarked (#32)."""
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    ends = r.all("tool.end")
+    t.check("a new one starts" not in ends[0]["text"] and
+            "at your next request" in ends[0]["text"], f"start: {ends[0]['text']!r}")
+    t.check(ends[1]["text"].endswith("[you are told when the job ends: do not poll it]"),
+            f"first read: {ends[1]['text']!r}")
+    t.check("Stop polling it: you are told when it ends, at your next request"
+            in ends[2]["text"], f"second read: {ends[2]['text']!r}")
+    t.check("instead of sleeping" not in ends[3]["text"], f"sleep: {ends[3]['text']!r}")
+    reqs = t.requests()
+    shell = [x for x in reqs[0]["body"]["tools"] if x["function"]["name"] == "shell"]
+    t.check(shell and "a new turn starts" not in shell[0]["function"]["description"],
+            "the shell tool does not promise a turn")
+
+
+@scenario(bound=10)
 def job_busy(t):
     """A job that ends while its turn still runs is told at the next step
     of that turn."""
@@ -1424,8 +1479,9 @@ def bg_shell(t):
         t.check(end["status"] == "background" and end.get("job") == 1 and
                 "started" in end["text"] and end["ms"] < 3000, f"the call ended: {end}")
         t.check(re.search(r"\[the user moved it to the background after [12](\.[0-9])? s, so "
-                          r"it continues as job 1\. You will be told when it ends: do not "
-                          r"poll it or wait for it\.", end["text"]), f"its text: {end['text']!r}")
+                          r"it continues as job 1\. You will be told when it ends, and if "
+                          r"your turn has ended by then, a new one starts for it: do not "
+                          r"poll it, sleep, or wait for it", end["text"]), f"its text: {end['text']!r}")
         js = h.all("job.start", sid)
         t.check(js and js[0]["call"] == start["call"], f"job.start {js}")
         h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)

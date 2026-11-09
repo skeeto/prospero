@@ -32,6 +32,12 @@ told.
   the session starts a turn by itself to report it, at most this many
   times an hour (5 by default; 0 for never).
 
+While it may resume, the agent is told so, and that it may end its turn
+to wait for a job rather than check on it. One that reads a running
+job's output again with nothing new, or runs only `sleep` while a job
+runs, is told plainly to stop and end its turn. A turn that ends saying
+it will wait for a job it started isn't pushed to go on.
+
 Closing a session stops its jobs, and so does quitting.
 
 ## Subagents

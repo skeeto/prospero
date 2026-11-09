@@ -1177,16 +1177,29 @@ static void test_tools(Test *t)
         e.timeout = 120;
         ToolOut o = shellresult(os, a, "/s/none.log", &e);
         expect(t, "moved to a job", o.text, "[still running after 2 minutes, so it "
-               "continues in the background as job 3. You will be told when it ends: "
-               "do not poll it or wait for it. Use job_output to read more of its "
-               "output, and job_kill to stop it]");
+               "continues in the background as job 3. You will be told when it "
+               "ends, at your next request after that: do not poll it or wait for "
+               "it, but go on with other work, or end your turn if there is nothing "
+               "else to do. Use job_output to read more of its output, and job_kill "
+               "to stop it]");
+        e.resume = 1;
+        o = shellresult(os, a, "/s/none.log", &e);
+        expect(t, "moved to a job, resumed", o.text, "[still running after 2 minutes, "
+               "so it continues in the background as job 3. You will be told when it "
+               "ends, and if your turn has ended by then, a new one starts for it: do "
+               "not poll it, sleep, or wait for it, but go on with other work, or end "
+               "your turn if there is nothing else to do. Use job_output to read more "
+               "of its output, and job_kill to stop it]");
+        e.resume = 0;
         e.moved = 1;
         e.ms    = 7300;
         o = shellresult(os, a, "/s/none.log", &e);
         expect(t, "moved by the user", o.text, "[the user moved it to the background "
                "after 7.3 s, so it continues as job 3. You will be told when it "
-               "ends: do not poll it or wait for it. Use job_output to read more of "
-               "its output, and job_kill to stop it]");
+               "ends, at your next request after that: do not poll it or wait for "
+               "it, but go on with other work, or end your turn if there is nothing "
+               "else to do. Use job_output to read more of its output, and job_kill "
+               "to stop it]");
         e = {};
         e.timedout = 1;
         e.nojob    = 1;

@@ -338,6 +338,9 @@ struct Job {
     b32   quiet;     // the agent stopped it: no notice
     b32   cut;       // processes it left held its output
     i64   ran;       // ticks it ran, once done
+    i64   turn;      // the session's turn it began in
+    i64   seen;      // its output's size at the agent's last job_output,
+                     // or -1: polling, if no larger at the next
 };
 
 // The original of a file the harness changed, kept as snap/<n> in the
@@ -5951,6 +5954,8 @@ static Job *newjob(Session *s, Arena scratch, Str call, Str command, Proc *proc,
     j->start    = start;
     j->deadline = start + timeout*SEC;
     j->hidden   = hidden;
+    j->turn     = s->turn;
+    j->seen     = -1;
     j->next     = s->jobs;
     s->jobs     = j;
     if (!hidden) {
@@ -6005,6 +6010,21 @@ static i32 msgwake(Session *s)
         }
     }
     return s->readonly || s->e->quitting ? 0 : hop;
+}
+
+// A job begun in this turn still runs, and its end may start the next:
+// the agent may end its turn to wait for it, and is not nudged on.
+static b32 jobwaiting(Session *s)
+{
+    if (!canresume(s)) {
+        return 0;
+    }
+    for (Job *j = s->jobs; j; j = j->next) {
+        if (!j->hidden && j->state!=JOB_DONE && j->turn==s->turn) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 // Start a turn to give the agent its notices, a session left idle.
@@ -6286,11 +6306,10 @@ static void startjob(Session *s, Arena scratch, Args *args)
     print(&b, j->n);
     print(&b, ". It may run for ");
     printduration(&b, timeout);
-    print(&b, ". You will be told when it ends, with the end of its "
-              "output: do not poll it or wait for it, but go on with other "
-              "work, or end your turn if there is nothing else to do. Use "
-              "job_output to read its output so far, and job_kill to stop "
-              "it.");
+    print(&b, ". ");
+    printjobwait(&b, canresume(s));
+    print(&b, " Its notice has the end of its output. Use job_output to "
+              "read its output so far, and job_kill to stop it.");
     Str text = finish(&b);
     toolend(s, scratch, "ok", text, 0, 0, rel, 0, j->n);
 }
@@ -6341,6 +6360,7 @@ static void movetojob(Session *s, Arena scratch, b32 user)
     end.job     = j->n;
     end.timeout = s->sh.timeout;
     end.moved   = user;
+    end.resume  = canresume(s);
     end.ms      = shellran(s);
     ToolOut o  = shellresult(e->os, &scratch, s->sh.spill, &end);
     Stat    st = os_stat(e->os, scratch, s->sh.spill);
@@ -6398,7 +6418,11 @@ static void tooljobs(Session *s, Arena scratch)
         print(&b, j->command.len>200 ? utf8head(j->command, 200) : j->command);
         putbyte(&b, '\n');
     }
-    print(&b, "You are told when each job ends: there is no need to check.");
+    print(&b, canresume(s) ? Str("You are told when each job ends, in a new "
+                                 "turn if yours has ended: there is no need "
+                                 "to check.")
+                           : Str("You are told when each job ends: there is "
+                                 "no need to check."));
     Str text = finish(&b);
     toolend(s, scratch, "ok", text, 0, 0, {}, 0);
 }
@@ -6454,7 +6478,27 @@ static void tooljobout(Session *s, Arena scratch, Args *args)
         print(&b, "]\n");
     }
     if (j->state != JOB_DONE) {
-        print(&b, "[you are told when the job ends: do not poll it]");
+        // Read again with nothing new: it is being polled, so be plain
+        b32 resume = canresume(s);
+        if (j->seen>=0 && st.size<=j->seen) {
+            print(&b, "[job ");
+            print(&b, j->n);
+            print(&b, resume ? Str(" is still running, with no new output "
+                                   "since you last read it. Stop polling it: "
+                                   "if there is nothing else to do, end your "
+                                   "turn now, and a new turn starts when the "
+                                   "job ends]")
+                             : Str(" is still running, with no new output "
+                                   "since you last read it. Stop polling it: "
+                                   "you are told when it ends, at your next "
+                                   "request after that]"));
+        } else {
+            print(&b, resume ? Str("[you are told when the job ends, in a new "
+                                   "turn if yours has ended: do not poll it]")
+                             : Str("[you are told when the job ends: do not "
+                                   "poll it]"));
+        }
+        j->seen = st.size;
     }
     Str text = finish(&b);
     toolend(s, scratch, "ok", text, 0, 0, {}, 0);
@@ -6566,6 +6610,44 @@ static b32 startsearch(Session *s, Arena scratch, i32 tool, Str path, Args *args
     return 0;
 }
 
+// A command that only sleeps, as "sleep 30" or "Start-Sleep -s 30":
+// with a job running, likely a wait for it.
+static b32 onlysleeps(Str cmd)
+{
+    cmd = trim(cmd);
+    while (cmd.len && cmd[cmd.len-1]==';') {
+        cmd = trimright(takehead(cmd, cmd.len-1));
+    }
+    i32 words = 0;
+    b32 num   = 0;
+    while (cmd.len) {
+        iz i = 0;
+        for (; i<cmd.len && cmd[i]!=' ' && cmd[i]!='\t'; i++) {}
+        Str w = takehead(cmd, i);
+        cmd   = trimleft(cuthead(cmd, i));
+        if (!words++) {
+            if (w!="sleep" && !equalfold(w, "Start-Sleep")) {
+                return 0;
+            }
+            continue;
+        } else if (w.len>1 && w[0]=='-') {
+            if (!equalfold(w, "-s") && !equalfold(w, "-Seconds") &&
+                !equalfold(w, "-m") && !equalfold(w, "-Milliseconds")) {
+                return 0;
+            }
+            continue;
+        }
+        iz d = 0;
+        for (; d<w.len && ((w[d]>='0' && w[d]<='9') || w[d]=='.'); d++) {}
+        Str unit = cuthead(w, d);
+        if (!d || (unit.len && unit!="s" && unit!="m" && unit!="h" && unit!="d")) {
+            return 0;
+        }
+        num = 1;
+    }
+    return num;
+}
+
 // A command or search ends: cancelled with the turn, or stopped alone
 // by the user, or done.
 static void finishshell(Session *s, Arena scratch, b32 cancelled, b32 stopped = 0)
@@ -6624,6 +6706,14 @@ static void finishshell(Session *s, Arena scratch, b32 cancelled, b32 stopped = 
     end.nojob     = s->sh.nojob;
     end.ms        = shellran(s);
     ToolOut o = shellresult(e->os, &scratch, s->sh.spill, &end);
+    if (!cancelled && !stopped && jobsrunning(s) && canresume(s) &&
+        onlysleeps(s->sh.command)) {
+        // Sleeping to wait for a job: say plainly that it need not
+        o.text = concat(&scratch, o.text,
+                        Str("\n[a background job is running: to wait for "
+                            "its end, end your turn instead of sleeping, "
+                            "and a new turn starts when it ends]"));
+    }
     Str status = cancelled    ? Str("cancelled") :
                  stopped      ? Str("stopped")   :
                  end.timedout ? Str("timeout")   :
@@ -14428,9 +14518,11 @@ static void finalize(Session *s, Arena scratch)
                 return;
             }
             prepare(s, scratch);
-        } else if (announces(finish(&p->text))) {
+        } else if (announces(finish(&p->text)) && !jobwaiting(s)) {
             // It said it would go on, but stopped: remind it, a few
-            // times, and past that let the turn end as it chose
+            // times, and past that let the turn end as it chose. Not
+            // while a job of this turn runs, whose end brings it back:
+            // "I'll wait for the build" is then just what it should do.
             Str text = "Your response says you will continue, but it ended "
                        "without a tool call, so nothing was done. If there is "
                        "more to do, do it now with a tool call; if the task "
@@ -15538,6 +15630,7 @@ static void jobconf(Session *s)
     max = max<1 ? 1 : max;
     s->te.jobmax     = max;
     s->te.jobtimeout = dft<1 ? 1 : dft>max ? max : dft;
+    s->te.resume     = parseint(trim(cfgget(cfg, "tools", "", "auto_resume", 0))).val > 0;
 }
 
 // Discover the session's instruction files, unless its log told which

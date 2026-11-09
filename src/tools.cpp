@@ -165,6 +165,7 @@ struct ToolEnv {
     Str exe;         // this executable, for the built-in search
     i64 jobtimeout;  // seconds a job may run, unless asked otherwise
     i64 jobmax;      // seconds a job may be asked to run
+    b32 resume;      // a job's end starts a turn: [tools] auto_resume
     u32 deny;        // tools not offered (a role's), as bits 1<<TOOL_*
     Str roles;       // the roles task may give, a line for each
     Str roleenum;    // their names, as a JSON schema's enum member
@@ -468,8 +469,13 @@ static Str shelldesc(Arena *a, ToolEnv *te)
     printduration(&b, job);
     print(&b, ", or with background after its timeout (at most ");
     printduration(&b, max);
-    print(&b, "). You are told when a job ends: do not poll, check on, or "
-              "sleep for it. Processes a command leaves running are killed "
+    print(&b, te->resume
+              ? Str("). You are told when a job ends, and a new turn starts "
+                    "for it if yours has ended: do not poll, check on, or "
+                    "sleep for it.")
+              : Str("). You are told when a job ends: do not poll, check on, "
+                    "or sleep for it."));
+    print(&b, " Processes a command leaves running are killed "
               "when it ends, unless it is a job. The user cannot undo what "
               "commands change.");
     if (te->shells.len) {
@@ -3466,6 +3472,22 @@ static ShellCmd shellcmd(Arena *a, Shell *sh, b32 windows, Str command)
     return r;
 }
 
+// What the agent is told of waiting for a job, resume if its end starts
+// a turn by itself ([tools] auto_resume, unless spent).
+static void printjobwait(Buf *b, b32 resume)
+{
+    if (resume) {
+        print(b, "You will be told when it ends, and if your turn has ended "
+                 "by then, a new one starts for it: do not poll it, sleep, or "
+                 "wait for it, but go on with other work, or end your turn if "
+                 "there is nothing else to do.");
+    } else {
+        print(b, "You will be told when it ends, at your next request after "
+                 "that: do not poll it or wait for it, but go on with other "
+                 "work, or end your turn if there is nothing else to do.");
+    }
+}
+
 struct ShellEnd {
     i32  code;      // exit status
     i32  signal;    // terminating signal (POSIX), or 0
@@ -3477,6 +3499,7 @@ struct ShellEnd {
     i64  timeout;   // seconds
     i64  job;       // moved to the background as this job, or 0
     b32  moved;     // and moved there by the user, not at its timeout
+    b32  resume;    // and its end starts a turn (printjobwait)
     i64  ms;        // how long it ran, to its exit if it exited
     b32  nojob;     // timed out, but too many jobs ran to move it
     b32  stopped;   // the user stopped it, and the turn went on
@@ -3533,9 +3556,10 @@ static ToolOut shellresult(Os *os, Arena *a, Str spill, ShellEnd *e)
             print(&b, ", so it continues in the background as job ");
         }
         print(&b, e->job);
-        print(&b, ". You will be told when it ends: do not poll it or wait "
-                  "for it. Use job_output to read more of its output, and "
-                  "job_kill to stop it]");
+        print(&b, ". ");
+        printjobwait(&b, e->resume);
+        print(&b, " Use job_output to read more of its output, and job_kill "
+                  "to stop it]");
         r.ok = 1;
     } else if (e->timedout) {
         print(&b, "[timed out after ");
