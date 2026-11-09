@@ -3731,6 +3731,9 @@ def sc_qualified_model(model, n, req):
     yield from answer(model, "Done.")
 
 
+sc_effort_chat = sc_qualified_model
+
+
 def sc_template_variant(model, n, req):
     # Long enough that a model and its variant overlap, if let
     yield S.head()

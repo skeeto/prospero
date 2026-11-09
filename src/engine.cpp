@@ -15000,6 +15000,17 @@ static void modelconf(Engine *e, Arena *perm, Str which, Str bare, ModelConf *mc
     mc->hidethink = td == "omitted";
     mc->effort    = ef.len ? clone(perm, ef) : Str{};
 
+    // For OpenAI chat: effort where effort_as says, as effort_map says
+    {
+        CfgEffort ce = cfgeffort(perm, mc->effort,
+                                 trim(cfgget(cfg, "model", model, "effort_as", 0)),
+                                 trim(cfgget(cfg, "model", model, "effort_map", 0)),
+                                 mc->kwargs);
+        mc->effkey  = ce.key;
+        mc->effjson = ce.json;
+        mc->chatkw  = ce.kwargs;
+    }
+
     // For the desktop tool's screenshots
     Str co = trim(cfgget(cfg, "model", model, "coordinates", 0));
     Int ie = parseint(trim(cfgget(cfg, "model", model, "image_edge", 0)));

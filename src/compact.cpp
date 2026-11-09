@@ -440,9 +440,13 @@ static Str encodesummary(Arena *a, Arena scratch, ModelConf *mc, Str prev,
         putkey(&w, mc->extras[i].key);
         putraw(&w, mc->extras[i].json);
     }
-    if (mc->kwargs.len) {
+    if (mc->effkey.len) {
+        putkey(&w, mc->effkey);
+        putraw(&w, mc->effjson);
+    }
+    if (mc->chatkw.len) {
         putkey(&w, "chat_template_kwargs");
-        putraw(&w, mc->kwargs);
+        putraw(&w, mc->chatkw);
     }
     putend(&w);
     return finish(&b);

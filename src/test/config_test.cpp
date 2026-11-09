@@ -74,6 +74,17 @@ static void testcfgschema(Test *t)
         {"guard", "ask_timeout", "-1", CFG_BAD, 0},
         {"guard", "ask_timeout", "1e7", CFG_BAD, 0},
         {"mcp", "timeout", "0", CFG_BAD, 0},                // only the asks'
+        {"model", "effort_as", "reasoning_effort", CFG_OK, 0},
+        {"model", "effort_as", "reasoning.effort", CFG_OK, 0},
+        {"model", "effort_as", "template.reasoning_effort", CFG_OK, 0},
+        {"model", "effort_as", "none", CFG_OK, 0},
+        {"model", "effort_as", "template.", CFG_BAD, 0},
+        {"model", "effort_as", "effort", CFG_BAD, 0},
+        {"model", "effort_map", "high:xhigh none:off", CFG_OK, 0},
+        {"model", "effort_map", "low:25  high:100", CFG_OK, 0},
+        {"model", "effort_map", "huge:max", CFG_BAD, 0},
+        {"model", "effort_map", "high", CFG_BAD, 0},
+        {"model", "effort_map", "high:", CFG_BAD, 0},
         {"endpoint", "idle_timeout", " 30 ", CFG_OK, 0},
         {"endpoint", "idle_timeout", "30s", CFG_BAD, 0},
         {"endpoint", "slow_retry", "60 120, 0.5", CFG_OK, 0},
@@ -1049,6 +1060,8 @@ static void testcfgjson(Test *t)
         "model/m/thinking=adaptive*\n"
         "model/m/thinking_display=summarized*\n"
         "model/m/effort=*\n"
+        "model/m/effort_as=reasoning_effort*\n"
+        "model/m/effort_map=*\n"
         "model/m/vision=true*\n"
         "model/m/pdf=true*\n"
         "model/m/coordinates=pixels*\n"
@@ -2421,8 +2434,51 @@ static void testcfgcreds(Test *t)
     cfgfree(c);
 }
 
+// Where [model] effort goes on OpenAI chat (cfgeffort): a field and its
+// value, or into chat_template_kwargs, each "key=json|kwargs"
+static void testcfgeffort(Test *t)
+{
+    Arena a = t->perm;
+    static struct { Str name, effort, as, map, kwargs, want; } cases[] = {
+        {"unset",        "",     "",                 "",          "", "=|"},
+        {"default",      "high", "",                 "",          "", "reasoning_effort=\"high\"|"},
+        {"top",          "max",  "reasoning_effort", "",          "", "reasoning_effort=\"max\"|"},
+        {"openrouter",   "low",  "reasoning.effort", "",          "",
+         "reasoning={\"effort\":\"low\"}|"},
+        {"none",         "high", "none",             "",          "", "=|"},
+        {"tmpl alone",   "high", "template.reasoning_effort", "", "",
+         "=|{\"reasoning_effort\":\"high\"}"},
+        {"tmpl added",   "low",  "template.effort",  "",          "{\"thinking\":true}",
+         "=|{\"thinking\":true,\"effort\":\"low\"}"},
+        {"tmpl wins",    "low",  "template.reasoning_effort", "",
+         "{\"reasoning_effort\":25}", "=|{\"reasoning_effort\":25}"},
+        {"top yields",   "low",  "",                 "",          "{\"reasoning_effort\":\"max\"}",
+         "=|{\"reasoning_effort\":\"max\"}"},
+        {"top beside",   "low",  "",                 "",          "{\"thinking\":true}",
+         "reasoning_effort=\"low\"|{\"thinking\":true}"},
+        {"mapped",       "high", "",                 "low:low high:xhigh", "",
+         "reasoning_effort=\"xhigh\"|"},
+        {"unmapped",     "medium", "",               "high:xhigh", "",
+         "reasoning_effort=\"medium\"|"},
+        {"numbers",      "high", "template.reasoning_effort", "low:25 high:100",
+         "{\"thinking\":true}", "=|{\"thinking\":true,\"reasoning_effort\":100}"},
+        {"booleans",     "none", "template.enable_thinking", "none:false low:true", "",
+         "=|{\"enable_thinking\":false}"},
+        {"bad as",       "high", "effort",           "",          "", "=|"},
+    };
+    for (iz i = 0; i < countof(cases); i++) {
+        Arena     b = a;
+        CfgEffort e = cfgeffort(&b, cases[i].effort, cases[i].as, cases[i].map,
+                                cases[i].kwargs);
+        Str got = concat(&b, concat(&b, e.key, "="), concat(&b, e.json, "|"));
+        got = concat(&b, got, e.kwargs);
+        expect(t, concat(&b, "effort ", cases[i].name), got, cases[i].want);
+    }
+}
+
 static void test_config(Test *t)
 {
+    testcfgeffort(t);
     testcfgwsl(t);
     testcfgsha256(t);
     testcfgurls(t);

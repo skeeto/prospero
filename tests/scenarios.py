@@ -4615,6 +4615,52 @@ def template_variant(t):
     t.check(peak == 1, f"one model at a time: {peak}")
 
 
+@scenario(conf={"_extra": (
+    "[model {model}]\n"
+    "effort = high\n"
+    "template.thinking = true\n"
+    "[model tmpl-{nonce}]\n"
+    "like = {model}\n"
+    "effort_as = template.reasoning_effort\n"
+    "effort_map = low:25 high:100\n"
+    "[model router-{nonce}]\n"
+    "like = {model}\n"
+    "effort = low\n"
+    "effort_as = reasoning.effort\n"
+    "[model said-{nonce}]\n"
+    "like = {model}\n"
+    "template.reasoning_effort = max\n")}, bound=20)
+def effort_chat(t):
+    """[model] effort on an OpenAI-compatible chat endpoint (#30): by
+    default the request's own reasoning_effort; with effort_as a template
+    argument, mapped by effort_map, or OpenRouter's reasoning.effort; and a
+    template.reasoning_effort set by hand wins."""
+    models = [t.model, f"tmpl-{t.nonce}", f"router-{t.nonce}", f"said-{t.nonce}"]
+    h = t.headless()
+    try:
+        for m in models:
+            sid = h.call("new", cwd=t.work, model=m, endpoint="fake")["sid"]
+            h.send("prompt", sid=sid, text="go")
+            end = h.wait(lambda e: e.get("sid") == sid and e.get("ev") == "turn.end")
+            t.check(end["why"] == "done", f"{m}: {end}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+    reqs = [x["body"] for x in t.requests()]
+    t.check(len(reqs) == 4, f"four requests: {len(reqs)}")
+    base, tmpl, router, said = reqs
+    t.check(base.get("reasoning_effort") == "high" and
+            base.get("chat_template_kwargs") == {"thinking": True}, f"by default: {base}")
+    t.check("reasoning_effort" not in tmpl and
+            tmpl.get("chat_template_kwargs") == {"thinking": True, "reasoning_effort": 100},
+            f"a template argument, mapped: {tmpl}")
+    t.check(router.get("reasoning") == {"effort": "low"} and "reasoning_effort" not in router,
+            f"OpenRouter's: {router}")
+    t.check("reasoning_effort" not in said and
+            said.get("chat_template_kwargs") == {"thinking": True, "reasoning_effort": "max"},
+            f"set by hand, it wins: {said}")
+
+
 MINUTE = {"PROSPERO_TEST_MINUTE_MS": "60"}  # a minute in 60 ms
 
 

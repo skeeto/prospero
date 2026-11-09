@@ -625,6 +625,10 @@ struct ModelConf {
     Slice<Extra> extras;     // sampling parameters, only if configured
     Str          kwargs;     // chat_template_kwargs, a JSON object, empty:
                              // not sent (OpenAI-compatible only)
+    Str          effkey;     // effort on OpenAI chat (effort_as): a field,
+    Str          effjson;    // and its value, or null (cfgeffort)
+    Str          chatkw;     // kwargs for OpenAI chat, effort in them where
+                             // effort_as is template.NAME
     b32          llamacpp;   // llama.cpp extras (return_progress,
                              // reasoning_control)
     i64          ctx;        // context limit in tokens, 0 if unknown
@@ -949,9 +953,13 @@ static Str encodechat(Arena *a, Arena tmp, ChatReq *r)
         putkey(&w, r->mc->extras[i].key);
         putraw(&w, r->mc->extras[i].json);
     }
-    if (r->mc->kwargs.len) {
+    if (r->mc->effkey.len) {
+        putkey(&w, r->mc->effkey);
+        putraw(&w, r->mc->effjson);
+    }
+    if (r->mc->chatkw.len) {
         putkey(&w, "chat_template_kwargs");
-        putraw(&w, r->mc->kwargs);
+        putraw(&w, r->mc->chatkw);
     }
     putend(&w);
     return finish(&b);

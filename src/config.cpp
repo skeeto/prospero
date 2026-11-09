@@ -362,8 +362,19 @@ static CfgKey cfgschema[] = {
      "Anthropic: summarized reasoning to show, or omitted"},
     {"model", "effort", CFG_ENUM, "", {}, "none minimal low medium high xhigh max",
      "model", "How much the model thinks and writes, by default its own "
-     "default: Anthropic's output_config.effort (low to max), or the "
-     "Responses API's reasoning.effort (none to xhigh)"},
+     "default: Anthropic's output_config.effort (low to max), the "
+     "Responses API's reasoning.effort (none to xhigh), or on an "
+     "OpenAI-compatible chat endpoint, where effort_as says"},
+    {"model", "effort_as", CFG_STRING, "reasoning_effort", {}, {}, "model",
+     "Where effort goes on an OpenAI-compatible chat endpoint: "
+     "reasoning_effort (the request's own field, which llama.cpp and vLLM "
+     "pass to the chat template), reasoning.effort (OpenRouter), "
+     "template.NAME (chat_template_kwargs), or none; a template.NAME set "
+     "for the same argument wins over effort"},
+    {"model", "effort_map", CFG_STRING, "", {}, {}, "model",
+     "Effort words rewritten for templates with words of their own, "
+     "EFFORT:VALUE separated by blanks, such as high:xhigh none:off or "
+     "low:25 high:100: numbers sent as numbers, true and false as booleans"},
     {"model", "vision", CFG_BOOL, "true", {}, {}, "model",
      "Whether the model takes images: the desktop tool's screenshots and "
      "image files read"},
@@ -1067,6 +1078,31 @@ static b32 cfgenvname(Str s)
     return 1;
 }
 
+// effort_as: reasoning_effort, reasoning.effort, none or template.NAME.
+static b32 cfgeffortas(Str v)
+{
+    return v=="reasoning_effort" || v=="reasoning.effort" || v=="none" ||
+           cfgtemplatename(v).len;
+}
+
+// effort_map: EFFORT:VALUE words, each EFFORT one of effort's choices.
+static b32 cfgeffortmap(Str v)
+{
+    for (Cut c = {{}, v, 1}; c.ok;) {
+        c = cut(c.tail, ' ');
+        Str w = trim(c.head);
+        if (!w.len) {
+            continue;
+        }
+        Cut kv = cut(w, ':');
+        if (!kv.ok || !kv.tail.len ||
+                !cfghasword("none minimal low medium high xhigh max", kv.head)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 // The asks' timeouts, which may be 0: no deadline, waiting until the
 // user answers, while anyone attends the session to.
 static b32 cfgwaitkey(CfgKey *k)
@@ -1185,6 +1221,10 @@ static i32 cfgjudge(CfgKey *k, Str v, b32 shared)
     } else if (cfgwaitkey(k)) {
         Float f = parsefloat(v);
         return f.ok && f.val>=0 && f.val<1e7 ? CFG_OK : CFG_BAD;
+    } else if (k->kind=="model" && k->key=="effort_as") {
+        return cfgeffortas(v) ? CFG_OK : CFG_BAD;
+    } else if (k->kind=="model" && k->key=="effort_map") {
+        return cfgeffortmap(v) ? CFG_OK : CFG_BAD;
     }
     switch (k->type) {
     case CFG_STRING:
@@ -1301,6 +1341,11 @@ static Str cfgproblem(Arena *a, CfgKey *k, Str v, b32 shared)
         return "expected days, 0 or more (at most 36500): 0 turns the Trash off";
     } else if (cfgwaitkey(k)) {
         return "expected seconds, 0 or more: 0 waits until answered";
+    } else if (k->kind=="model" && k->key=="effort_as") {
+        return "expected reasoning_effort, reasoning.effort, template.NAME or none";
+    } else if (k->kind=="model" && k->key=="effort_map") {
+        return "expected EFFORT:VALUE words, such as high:xhigh none:off, "
+               "each EFFORT one of none, minimal, low, medium, high, xhigh, max";
     }
     Buf b(a, 128);
     switch (k->type) {
@@ -1655,6 +1700,76 @@ static Str cfgtemplate(Config *c, Arena *perm, Str name)
     }
     putend(&w);
     return finish(&b);
+}
+
+// Where [model] effort goes on an OpenAI-compatible chat request: key
+// and json, a top-level field and its value, or kwargs with it added, as
+// effort_as says, its word first rewritten by effort_map. A template
+// argument set for the same thing (reasoning_effort, or effort_as's
+// NAME) wins, so nothing is added: kwargs already says it.
+struct CfgEffort {
+    Str key;     // reasoning_effort, reasoning, or null for none
+    Str json;    // its value
+    Str kwargs;  // chat_template_kwargs, as given or with effort added
+};
+
+static CfgEffort cfgeffort(Arena *perm, Str effort, Str as, Str map, Str kwargs)
+{
+    CfgEffort r = {};
+    r.kwargs = kwargs;
+    as = as.len ? as : Str("reasoning_effort");
+    if (!effort.len || as=="none" || !cfgeffortas(as)) {
+        return r;
+    }
+    Str v = effort;
+    for (Cut c = {{}, map, 1}; c.ok;) {
+        c = cut(c.tail, ' ');
+        Cut kv = cut(trim(c.head), ':');
+        if (kv.ok && kv.head==effort && kv.tail.len) {
+            v = kv.tail;
+            break;
+        }
+    }
+    Str  name = cfgtemplatename(as);
+    Str  set  = name.len ? name : Str("reasoning_effort");
+    {
+        Arena tmp = *perm;  // the parse, gone before perm is used again
+        Json *kw  = kwargs.len ? jsonparse(&tmp, kwargs).root : 0;
+        if (kw && jsonget(kw, set)->type!=JSON_MISSING) {
+            return r;  // template.NAME says it
+        }
+    }
+
+    // The value alone, then put in its place
+    Buf     vb(perm, 16 + v.len);
+    JsonOut vw = {&vb};
+    putcfgtemplate(&vw, v, 0);
+    Str     val = finish(&vb);
+    Buf     b(perm, 64 + kwargs.len + name.len + val.len);
+    if (name.len) {
+        if (kwargs.len > 2) {
+            print(&b, takehead(kwargs, kwargs.len-1));  // up to its "}"
+            putbyte(&b, ',');
+        } else {
+            putbyte(&b, '{');
+        }
+        putbyte(&b, '"');
+        print(&b, name);  // an identifier: no escapes
+        print(&b, "\":");
+        print(&b, val);
+        putbyte(&b, '}');
+        r.kwargs = finish(&b);
+    } else if (as == "reasoning.effort") {
+        r.key = "reasoning";
+        print(&b, "{\"effort\":");
+        print(&b, val);
+        putbyte(&b, '}');
+        r.json = finish(&b);
+    } else {
+        r.key  = "reasoning_effort";
+        r.json = val;
+    }
+    return r;
 }
 
 // Whether the configuration names a model, by default or with a

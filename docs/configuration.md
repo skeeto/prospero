@@ -198,6 +198,31 @@ discovery, context limits and the places on a router are OTHER's:
 A variant is chosen as any model is, for a session, a role, a
 fallback or a compactor.
 
+`effort` works on an OpenAI-compatible server too. By default it goes
+in the request's own `reasoning_effort` field, which llama.cpp and vLLM
+pass on to the chat template, so `effort = high` is often all a model
+needs. `effort_as` sends it elsewhere instead: `reasoning.effort`, as
+OpenRouter takes it; `template.NAME`, an argument of the chat template;
+or `none`. A template with words of its own takes them through
+`effort_map`, as `EFFORT:VALUE` pairs, numbers sent as numbers. The
+variants above, with effort:
+
+    [model large]
+    template.thinking = true
+    effort_as = template.reasoning_effort
+    effort_map = low:25 high:100
+
+    [model large-quick]
+    like = large
+    effort = low
+
+    [model large-deep]
+    like = large
+    effort = high
+
+A `template.NAME` set by hand for the same argument (`reasoning_effort`,
+or effort_as's NAME) wins over `effort`.
+
 A `[model NAME]` section applies wherever an endpoint lists NAME. Where
 two endpoints list the same model, `[model ENDPOINT/MODEL]` sets it on
 one of them only, each of its settings winning over `[model MODEL]`'s:
