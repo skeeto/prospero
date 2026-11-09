@@ -1424,7 +1424,7 @@ typedef struct {
 
 // A history record: one logical line
 typedef struct {
-    u32 off, len;   // bytes in the ring
+    u32 off, len;   // bytes in the ring, the map after them not counted
     u32 width;      // cells, wide ones counted twice
     u16 flags;      // HR_*
     u16 rcols;      // rows was counted at this width
@@ -1885,11 +1885,16 @@ static void erase(ariel_Term *t, i32 y, i32 x0, i32 x1)
 // H_WIDE before a wide cell and H_EXTRA before each extra code point of
 // its cluster. Records are contiguous in the ring and lie in index order
 // cyclically, so the oldest is always the next in the way.
+//
+// A record with a wide cell is sealed with a map when the next record
+// starts: a bit per column, set where a wide cell starts, so its rows
+// count at any width without decoding it. The newest record has none.
 
 enum {
     HR_WIDE   = 1<<0,   // has a wide cell
     HR_PROMPT = 1<<1,   // began on an OSC 133 A row
     HR_JOIN   = 1<<2,   // the line continues in the next record
+    HR_MAP    = 1<<3,   // its wide cell map follows it
     RUN_FG    = 1<<0,
     RUN_BG    = 1<<1,
     RUN_UL    = 1<<2,
@@ -1900,6 +1905,12 @@ enum {
     H_EXTRA   = 3,
     RUNMAX    = 0xffff,
 };
+
+// A record's bytes in the ring, its map included
+static u32 hsize(Hent *e)
+{
+    return e->len + (e->flags&HR_MAP ? (e->width+7)/8 : 0);
+}
 
 static b32 histon(ariel_Term *t)
 {
@@ -2096,6 +2107,17 @@ static Wrap hwrap(ariel_Term *t, Hent *e, i32 cols)
         return w;
     }
     u8 *rec = hbytes(t, e->off);
+    if (e->flags & HR_MAP) {
+        // A row ends a column early when a wide cell starts in its last
+        u8 *map = rec + e->len;
+        i32 s   = 0;
+        for (; (i32)e->width-s > cols; w.rows++) {
+            i32 x = s + cols - 1;
+            s = map[x>>3]>>(x&7) & 1 ? x : x+1;
+        }
+        w.col = (i32)e->width - s;
+        return w;
+    }
     for (i32 pos = 0; pos < (i32)e->len;) {
         Hpos h = hrunat(rec, pos);
         if (!(h.mask & RUN_WIDE)) {
@@ -2386,6 +2408,27 @@ static i32 hfits(ariel_Term *t, Cell *r, i32 n, u32 max)
     return k;
 }
 
+// Seal the newest record, as a new one starts after it
+static void hseal(ariel_Term *t)
+{
+    Hent *e = hent(t, t->hcount-1);
+    if (!(e->flags&HR_WIDE) || e->flags&HR_MAP) return;
+    u32 n = (e->width + 7)/8;
+    if (e->len+n > (u32)t->histbytes) return;   // decoded instead
+    hroom(t, n, 0);     // may move the record
+    e = hent(t, t->hcount-1);
+    u8   *rec = hbytes(t, e->off);
+    u8   *map = rec + e->len;
+    Hpos  h   = {0};
+    Hcell c;
+    xset(map, 0, n);
+    for (u32 x = 0; hnext(rec, (i32)e->len, &h, &c); x += (u32)c.width) {
+        if (c.width == 2) map[x>>3] |= (u8)(1u << (x&7));
+    }
+    e->flags |= HR_MAP;
+    t->hw     = e->off + hsize(e);
+}
+
 // The first record of the newest line, the start of its HR_JOIN chain
 static i32 hlinefirst(ariel_Term *t)
 {
@@ -2426,6 +2469,9 @@ static void hpiece(ariel_Term *t, Cell *r, i32 n, b32 cont, u16 flags,
     if (!fresh) {
         hrowsof(t, t->hcount-1);    // for hwcol
     } else {
+        if (t->hcount) {
+            hseal(t);
+        }
         if (cont) {
             hent(t, t->hcount-1)->flags |= HR_JOIN;
         }
@@ -4932,7 +4978,7 @@ static void hmove(ariel_Term *n, ariel_Term *t)
     u32 used = 0;
     if (histon(n)) {
         for (; keep<t->hcount && keep<n->histlines; keep++) {
-            u32 len = hent(t, t->hcount-1-keep)->len;
+            u32 len = hsize(hent(t, t->hcount-1-keep));
             if (used+len > (u32)n->histbytes) break;
             used += len;
         }
@@ -4947,11 +4993,11 @@ static void hmove(ariel_Term *n, ariel_Term *t)
         Hent *d = (Hent *)at(n, n->histidx) + n->hcount++;
         *d = *e;
         d->off = n->hw;
-        xcpy(hbytes(n, n->hw), hbytes(t, e->off), e->len);
+        xcpy(hbytes(n, n->hw), hbytes(t, e->off), hsize(e));
         if (i == t->hcount-1) {
             n->hrun = d->off + (t->hrun - e->off);
         }
-        n->hw += e->len;
+        n->hw += hsize(e);
     }
     n->hserial  = t->hserial + (u64)drop;
     n->hrows    = t->hrows - rows;
@@ -6147,6 +6193,7 @@ static void htruncate(ariel_Term *t, i32 idx, i32 coloff)
         if (t->hcount) {
             // The newest now, it may reopen (HR_JOIN): find its last run
             e = hent(t, t->hcount-1);
+            e->flags &= (u16)~HR_MAP;   // its map is free space now
             u8 *rec = hbytes(t, e->off);
             u32 run = 0;
             for (u32 pos = 0; pos < e->len; pos = (u32)hrunat(rec, (i32)pos).runend) {
@@ -6181,7 +6228,7 @@ static void htruncate(ariel_Term *t, i32 idx, i32 coloff)
     put16(rec+run+2, (u32)n);
     e->len   = (u32)h.pos;
     e->width = (u32)coloff;
-    e->flags &= (u16)~HR_JOIN;  // the screen continues it now, if anything
+    e->flags &= (u16)~(HR_JOIN|HR_MAP);  // the screen continues it now
     e->rcols = 0;
     e->gen   = t->gen + 1;
     t->hw    = e->off + e->len;

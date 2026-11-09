@@ -144,17 +144,21 @@ static void checkhistory(ariel_Term *t)
     for (i32 i = 0; i < t->hcount; i++) {
         Hent *e = hent(t, i);
         affirm(e->len >= 1);
-        affirm(e->off+e->len <= (u32)t->histbytes);
+        affirm(e->off+hsize(e) <= (u32)t->histbytes);
         if (i) {
             // Cyclic order: offsets rise, wrapping around once at most
             if (e->off < prev) wraps++;
             affirm(wraps <= 1);
         }
-        prev = e->off + e->len;
+        prev = e->off + hsize(e);
         // Runs are well formed and add up to the width
         u8 *rec   = hbytes(t, e->off);
+        u8 *map   = e->flags&HR_MAP ? rec+e->len : 0;
         u32 width = 0;
         b32 wide  = 0;
+        affirm(!map || e->flags&HR_WIDE);
+        Wrap slow[4] = {{1, 0}, {1, 0}, {1, 0}, {1, 0}};
+        i32  wcols[4] = {2, 3, t->hcols, t->hcols+7};
         for (i32 pos = 0; pos < (i32)e->len;) {
             affirm(pos+5 <= (i32)e->len);
             Hpos h = hrunat(rec, pos);
@@ -163,6 +167,12 @@ static void checkhistory(ariel_Term *t)
             Hcell c;
             Hpos  q = h;
             while (q.pos < h.runend && hnext(rec, h.runend, &q, &c)) {
+                if (map) {
+                    // The map marks exactly the columns wide cells start
+                    b32 bit = map[width>>3]>>(width&7) & 1;
+                    affirm(bit == (c.width==2));
+                }
+                for (i32 k = 0; k < 4; k++) wrapcell(slow+k, c.width, wcols[k]);
                 width += (u32)c.width;
                 wide  |= c.width == 2;
                 // RUN_WIDE may outlive a wide cell cut off, not the reverse
@@ -174,6 +184,16 @@ static void checkhistory(ariel_Term *t)
         }
         affirm(width == e->width);
         affirm(!wide || e->flags&HR_WIDE);
+        if (map) {
+            // Bits past the width stay clear
+            for (u32 x = width; x < (width+7)/8*8; x++) {
+                affirm(!(map[x>>3]>>(x&7) & 1));
+            }
+        }
+        for (i32 k = 0; k < 4; k++) {
+            Wrap f = hwrap(t, e, wcols[k]);
+            affirm(f.rows==slow[k].rows && f.col==slow[k].col);
+        }
         Wrap w = hwrap(t, e, t->hcols);
         affirm(hrowsof(t, i) == w.rows);
         rows += w.rows;
@@ -181,6 +201,7 @@ static void checkhistory(ariel_Term *t)
     if (t->hcount) {
         Hent *e = hent(t, t->hcount-1);
         affirm(t->hw == e->off+e->len);
+        affirm(!(e->flags & HR_MAP));   // only sealed records have maps
         affirm(!(e->flags & HR_JOIN));  // the newest continues in none
         // The records are apart: the oldest lies past the newest's end,
         // or wholly before it when the ring hasn't wrapped

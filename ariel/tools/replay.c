@@ -428,9 +428,8 @@ static int benchsuite(double secs)
     }
 
     // Resize steps on a full 200x60 screen with full history, back and
-    // forth across 160x40 to 200x60 inside a 256x96 capacity
-    // Lines that fit take a row; longer ones with wide cells are walked
-    // whenever the width changes, so that case has no target
+    // forth across 160x40 to 200x60 inside a 256x96 capacity, first
+    // with lines that fit, then with long CJK lines that wrap
     Gen cjk  = gencjk(8<<20, 150);
     Gen cjkl = gencjk(8<<20, 400);
     Gen *fill[] = {&sgr, &cjk, &cjkl};
@@ -458,11 +457,7 @@ static int benchsuite(double secs)
             elapsed = now() - start;
         } while (elapsed < secs);
         double step = elapsed/(double)n*1e3;
-        if (f < 2) {
-            ok &= verdict(name[f][0], step, "ms", 1, 1);
-        } else {
-            printf("%-14s %10.2f ms     (no target)\n", name[f][0], step);
-        }
+        ok &= verdict(name[f][0], step, "ms", 1, 1);
         printf("%-14s %10.2f ms     (preemption shows here)\n", name[f][1], worst*1e3);
     }
     free(cjk.data);

@@ -183,6 +183,29 @@ RESIZE 1,10
   ?history 1 = "ab"
   ?history 2 = "0123456789"
 
+!Wide cells rewrap in a sealed record as on the screen
+INIT 5,10
+RESIZE 1,10
+PUSH "a中中中中中\r\nx\r\ny"
+  ?history 1 = "x"
+  ?history 2 = "中"
+  ?history 3 = "a中中中中"
+RESIZE 1,7
+  ?history 2 = "中中"
+  ?history 3 = "a中中中"
+RESIZE 1,6
+  ?history 2 = "中中中"
+  ?history 3 = "a中中"
+RESIZE 1,3
+  ?history 2 = "中"
+  ?history 5 = "中"
+  ?history 6 = "a中"
+  ?history 7 = "<none>"
+RESIZE 1,2
+  ?history 6 = "中"
+  ?history 7 = "a"
+  ?history 8 = "<none>"
+
 !A scrolled-back view stays on its text through a reflow
 RESET
 RESIZE 5,10
