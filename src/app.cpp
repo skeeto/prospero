@@ -109,6 +109,12 @@ enum : i32 {
     ENGINE_FAKE,
 };
 
+// The sidebar's order (the sort button), kept with the layout
+enum : i32 {
+    SIDESORT_ACTIVITY,  // roots by their latest activity, the default
+    SIDESORT_CREATED,   // newest made first
+};
+
 // Input kinds, recorded for staleness reports
 enum : i32 {
     INPUT_MOVE,
@@ -602,6 +608,10 @@ struct GuiSession {
     Str          wtbranch;  // and branch
     b32          wtgone;    // and it is not there now, removed
     i64          mtime;
+    i64          lastact;   // its latest activity (evactivity), epoch ms on
+                            // its host's clock, never before it was made
+    i64          sortat;    // the time the sidebar orders it by, which
+                            // holds still while the pointer is there
     i64          jobs;      // running background jobs, from the list
     i64          openid;    // the open in flight, 0 if none
     i32          depth;     // under its parent in the sidebar, this frame
@@ -1284,6 +1294,9 @@ struct Gui {
     Map<b32>          *folds;      // the user's fold choices (sidebar.cpp)
     Slice<Str>         groups;     // the groups' order, empty ones included
     b32                sidedirty;  // folds or groups changed: kept with the layout
+    i32                sidesort;   // SIDESORT_*: the sidebar's order, kept with the layout
+    i64                sideframe;  // the frame the sidebar last drew, to tell
+                                   // when it shows again
     GuiSession        *menusess;   // the session the context menu is for
     b32                dragcancel; // a session's drag ended by Escape: none
                                    // again until the button is up
@@ -1935,6 +1948,7 @@ static GuiSession *addsess(Gui *g, GuiHost *h, Str sid)
     GuiSession *s = alloc<GuiSession>(&g->perm);
     s->host  = h;
     s->sid   = clone(&g->perm, sid);
+    s->lastact = sidms(sid);  // made now, as far as it is known
     s->stick = 1;
     s->state = LIVE_CLOSED;
     s->mutebeg = -1;  // no '@' dismissed: offset 0 is a real one
@@ -4826,6 +4840,8 @@ static void onsessions(Gui *g, GuiHost *h, Json *j)
         s->parent = s->parent==parent ? s->parent : clone(&g->perm, parent);
         s->remote = jsonint(jsonget(e, "remote"), 0) == 1;
         s->mtime  = jsonint(jsonget(e, "mtime"), 0);
+        i64 act   = jsonint(jsonget(e, "lastact"), 0);  // an older engine's: none
+        s->lastact = act>s->lastact ? act : s->lastact;
         s->jobs   = jsonint(jsonget(e, "jobs"), 0);
         s->locked = jsonint(jsonget(e, "locked"), 0) != 0;
         s->state  = livestate(state);
@@ -7266,6 +7282,10 @@ static b32 guiapply(Gui *g, GuiHost *h, Arena a, EvRec *r, Str line)
         g->tailseen += i>=0 && v->msgs[i].tool->status==VTOOL_RUNNING;
     }
     b32 changed = viewrecord(v, a, r);
+    b32 rose    = evactivity(r->ev, jsonstr(jsonget(r->root, "why"))) && r->ts>s->lastact;
+    if (rose) {
+        s->lastact = r->ts;  // a replay's older records leave it be
+    }
     if (r->ev==EV_ASK && changed) {
         s->stick = 1;  // an ask needs seeing: scroll to it
     }
@@ -7286,13 +7306,13 @@ static b32 guiapply(Gui *g, GuiHost *h, Arena a, EvRec *r, Str line)
     if (s != g->sess) {
         // Only the sidebar shows it, and the rows of its parent's tasks
         return state!=v->state || asks!=v->asks || busy!=v->busy ||
-               jobs!=v->jobsrun || qpos!=v->queuepos ||
+               jobs!=v->jobsrun || qpos!=v->queuepos || rose ||
                r->ev==EV_TITLE || r->ev==EV_SESSION || r->ev==EV_TOOLEND;
     }
     if (g->histreq && r->ev==EV_NOTE && find(line, "history loaded")>=0) {
         g->histdone = 1;
     }
-    return changed;
+    return changed || rose;
 }
 
 // Apply one record from a host. Returns 1 if what shows changed. It is
@@ -11724,6 +11744,7 @@ static void saveini(Gui *g, b32 last)
 //   Maximized=0
 //   Fullscreen=0
 //   [Prospero][Sidebar]
+//   Sort=created
 //   Group=Work
 //   Folded=g:Work
 //   Opened=a
@@ -11740,7 +11761,8 @@ static void saveini(Gui *g, b32 last)
 // A pane missing (a layout older than it) keeps its default, and the
 // window's place is fitted to the displays as they are (place.cpp). The
 // sidebar keeps its groups' order, empty ones included, and each fold
-// the user chose by its key (sidebar.cpp), folded or opened. Help keeps
+// the user chose by its key (sidebar.cpp), folded or opened, and its
+// order, written only when not the default, recent activity. Help keeps
 // its topic by name (help.cpp), an unknown one the first. Each layout
 // the user saved has a section, in the order saved (dock.cpp); one
 // that cannot be read, or named as one before it, is dropped (iniapply).
@@ -11783,7 +11805,9 @@ static void iniline(ImGuiContext *, ImGuiSettingsHandler *h, void *entry, char c
         }
         return;
     } else if (entry == (void *)3) {
-        if (kv.head=="Group" && kv.tail.len) {
+        if (kv.head == "Sort") {
+            g->sidesort = kv.tail=="created" ? SIDESORT_CREATED : SIDESORT_ACTIVITY;
+        } else if (kv.head=="Group" && kv.tail.len) {
             addgroup(g, kv.tail);
             g->sidedirty = 0;  // as the file has it
         } else if ((kv.head=="Folded" || kv.head=="Opened") && kv.tail.len) {
@@ -11847,8 +11871,11 @@ static void iniwrite(ImGuiContext *, ImGuiSettingsHandler *h, ImGuiTextBuffer *o
         out->appendf("Maximized=%d\n", w->max ? 1 : 0);
         out->appendf("Fullscreen=%d\n\n", w->full ? 1 : 0);
     }
-    if (g->groups.len || g->folds) {
+    if (g->groups.len || g->folds || g->sidesort) {
         out->append("[Prospero][Sidebar]\n");
+        if (g->sidesort == SIDESORT_CREATED) {
+            out->append("Sort=created\n");
+        }
         for (iz i = 0; i < g->groups.len; i++) {
             Str n = g->groups[i];
             out->append("Group=");
@@ -15958,180 +15985,32 @@ static DriveOp sessionsops[] = {
     {OP_CHECK, CHK_SIDE, 0, 0, 0, "S Whole fork\n"},
     // Into another folder, from the sidebar: the dialog's folder typed
     // over, Enter forks; the fork works there, titled as a fork
-    {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Whole fork"},
-    {OP_RDOWN, 0, 0, 0, 60, ""},
-    {OP_RUP, 0, 0, 0, 500, ""},
-    {OP_MOVE, T_NAMED, 0, 0, 100, "Fork into another folder\xe2\x80\xa6"},
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Start more subagents."},
     {OP_DOWN, 0, 0, 0, 60, ""},
-    {OP_UP, 0, 0, 0, 500, ""},
-    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
-    {OP_TEXTCWD, 0, 0, 0, 500, "/moved"},
-    {OP_SHOT, 0, 0, 0, 300, "sessions-forkfolder"},
-    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
-    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
-    {OP_WAIT, W_NOTE, 0, 0, 10000, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
     {OP_WAIT, W_OPENED, 0, 0, 10000, ""},
-    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
-    {OP_CHECK, CHK_NOTE, 0, 0, 0, "into"},
-    {OP_CHECK, CHK_SESSDIR, 0, 0, 0, "/moved"},
-    {OP_CHECK, CHK_TITLE, 0, 0, 0, "Whole fork (fork)"},
-    // A fork before a prompt, from the transcript's menu: the turns
-    // before it, none here, the prompt left in the new session's box
-    {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Greeting"},
-    {OP_DOWN, 0, 0, 0, 60, ""},
-    {OP_UP, 0, 0, 0, 800, ""},
-    {OP_WAIT, W_OPENED, 0, 0, 5000, ""},
-    {OP_MOVE, T_USERMSG, 0, 0, 100, ""},
-    {OP_RDOWN, 0, 0, 0, 60, ""},
-    {OP_RUP, 0, 0, 0, 500, ""},
-    {OP_SHOT, 0, 0, 0, 300, "sessions-forkhere"},
-    {OP_MOVE, T_NAMED, 0, 0, 100, "Fork before this prompt"},
-    {OP_DOWN, 0, 0, 0, 60, ""},
-    {OP_UP, 0, 0, 0, 100, ""},
-    {OP_WAIT, W_NOTE, 0, 0, 10000, ""},
-    {OP_WAIT, W_OPENED, 0, 0, 10000, ""},
-    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
-    {OP_CHECK, CHK_FORKED, 0, 0, 0, "Say hello."},
-    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "Say hello."},
-    {OP_CHECK, CHK_TITLE, 0, 0, 0, "Greeting (fork)"},
-    {OP_SHOT, 0, 0, 0, 300, "sessions-forked"},
-    // The forked session with its subagents: Delete Permanently, the
-    // confirmation counting all three, cancelled; into the Trash from its
-    // menu, there under the Trash heading once opened; Empty Trash
-    // counting them, cancelled; restored from its menu there; then
-    // dragged into the Trash again, the toast dismissed, and the Trash
-    // emptied
-    {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Start subagents."},
-    {OP_RDOWN, 0, 0, 0, 60, ""},
-    {OP_RUP, 0, 0, 0, 500, ""},
-    {OP_MOVE, T_NAMED, 0, 0, 100, "Delete Permanently"},
-    {OP_DOWN, 0, 0, 0, 60, ""},
-    {OP_UP, 0, 0, 0, 800, ""},
-    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
-    {OP_CHECK, CHK_DELCOUNT, 3, 0, 0, ""},
-    {OP_SHOT, 0, 0, 0, 300, "sessions-delete"},
-    {OP_MOVE, T_NAMED, 0, 0, 100, "delete cancel"},
-    {OP_DOWN, 0, 0, 0, 60, ""},
-    {OP_UP, 0, 0, 0, 800, ""},
-    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
-    {OP_CHECK, CHK_SIDE, 0, 0, 0, "S Start subagents.\n"},
-    {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Start subagents."},
-    {OP_RDOWN, 0, 0, 0, 60, ""},
-    {OP_RUP, 0, 0, 0, 500, ""},
-    {OP_MOVE, T_NAMED, 0, 0, 100, "Move to Trash"},
-    {OP_DOWN, 0, 0, 0, 60, ""},
-    {OP_UP, 0, 0, 0, 1500, ""},
-    {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "S Start subagents.\n"},
-    {OP_CHECK, CHK_SIDE, 0, 0, 0, "\nT+\n"},
-    {OP_CHECK, CHK_TRASHTOAST, 1, 0, 0, ""},
-    {OP_MOVE, T_NAMED, 0, 0, 100, "head t"},
-    {OP_DOWN, 0, 0, 0, 60, ""},
-    {OP_UP, 0, 0, 0, 1500, ""},
-    {OP_CHECK, CHK_SIDE, 0, 0, 0, "\nT\n H this\n  S Start subagents.\n"},
-    {OP_SHOT, 0, 0, 0, 300, "sessions-trashopen"},
-    {OP_MOVE, T_NAMED, 0, 0, 100, "head t"},
-    {OP_RDOWN, 0, 0, 0, 60, ""},
-    {OP_RUP, 0, 0, 0, 500, ""},
-    {OP_MOVE, T_NAMED, 0, 0, 100, "Empty Trash"},
-    {OP_DOWN, 0, 0, 0, 60, ""},
-    {OP_UP, 0, 0, 0, 800, ""},
-    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
-    {OP_CHECK, CHK_DELCOUNT, 3, 0, 0, ""},
-    {OP_MOVE, T_NAMED, 0, 0, 100, "delete cancel"},
-    {OP_DOWN, 0, 0, 0, 60, ""},
-    {OP_UP, 0, 0, 0, 800, ""},
-    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
-    {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Start subagents."},
-    {OP_RDOWN, 0, 0, 0, 60, ""},
-    {OP_RUP, 0, 0, 0, 500, ""},
-    {OP_MOVE, T_NAMED, 0, 0, 100, "Restore"},
-    {OP_DOWN, 0, 0, 0, 60, ""},
-    {OP_UP, 0, 0, 0, 1500, ""},
-    {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "\nT"},
-    {OP_CHECK, CHK_SIDE, 0, 0, 0, "S Start subagents.\n"},
-    DRAGSESS("Start subagents."),
-    {OP_MOVE, T_NAMED, 0, 0, 300, "sessions trash"},
-    {OP_UP, 0, 0, 0, 1500, ""},
-    {OP_CHECK, CHK_TRASHTOAST, 1, 0, 0, ""},
-    {OP_MOVE, T_NAMED, 0, 0, 100, "trash dismiss"},
-    {OP_DOWN, 0, 0, 0, 60, ""},
-    {OP_UP, 0, 0, 0, 500, ""},
-    {OP_CHECK, CHK_TRASHTOAST, 0, 0, 0, ""},
-    {OP_CHECK, CHK_SIDE, 0, 0, 0, "\nT\n H this\n  S Start subagents.\n"},
-    {OP_MOVE, T_NAMED, 0, 0, 100, "head t"},
-    {OP_RDOWN, 0, 0, 0, 60, ""},
-    {OP_RUP, 0, 0, 0, 500, ""},
-    {OP_MOVE, T_NAMED, 0, 0, 100, "Empty Trash"},
-    {OP_DOWN, 0, 0, 0, 60, ""},
-    {OP_UP, 0, 0, 0, 800, ""},
-    {OP_CHECK, CHK_DELCOUNT, 3, 0, 0, ""},
-    {OP_MOVE, T_NAMED, 0, 0, 100, "delete ok"},
-    {OP_DOWN, 0, 0, 0, 60, ""},
-    {OP_UP, 0, 0, 0, 2000, ""},
-    {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "S Start subagents.\n"},
-    {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "\nT"},
-    {OP_CHECK, CHK_SIDE, 0, 0, 0, "S Whole fork\n"},
-    {OP_CHECK, CHK_SIDE, 0, 0, 0, "S Greeting\n"},
-    // Imported from the raw log exported above, from the Session menu
-    // (the open dialog's answer that export): the dialog filled from the
-    // log, its model the one switched to, then the imported session
-    // shown with its transcript, and going on
-    {OP_MOVE, T_SESSMENU, 0, 0, 100, ""},
-    {OP_DOWN, 0, 0, 0, 60, ""},
-    {OP_UP, 0, 0, 0, 500, ""},
-    {OP_MOVE, T_NAMED, 0, 0, 100, "Import session..."},
-    {OP_DOWN, 0, 0, 0, 60, ""},
-    {OP_UP, 0, 0, 0, 800, ""},
-    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
-    {OP_SHOT, 0, 0, 0, 300, "sessions-import"},
-    {OP_MOVE, T_NEWCREATE, 0, 0, 100, ""},
-    {OP_DOWN, 0, 0, 0, 60, ""},
-    {OP_UP, 0, 0, 0, 100, ""},
-    {OP_WAIT, W_IMPORTED, 0, 0, 10000, ""},
-    {OP_WAIT, W_OPENED, 0, 0, 10000, ""},
-    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
-    {OP_CHECK, CHK_NOTE, 0, 0, 0, "imported from"},
-    {OP_CHECK, CHK_TITLE, 0, 0, 0, "Greeting (imported)"},
-    {OP_CHECK, CHK_LASTUSER, 0, 0, 0, "Say hello."},
-    {OP_CHECK, CHK_MODEL, 0, 0, 0, "fake:gui_b:"},
-    {OP_SHOT, 0, 0, 0, 300, "sessions-imported"},
-    {OP_CHECK, CHK_NOTOAST, 0, 0, 0, ""},
-    {OP_FOCUS, 0, 1, 0, 0, ""},
-    {OP_PROMPT, 0, 0, 0, 100, "Say hello again."},
+    {OP_PROMPT, 0, 0, 0, 100, "Say hello once more."},
     {OP_WAIT, W_SAID, 0, 0, 10000, "Hello"},
-    {OP_CHECK, CHK_LASTUSER, 0, 0, 0, "Say hello again."},
-    {OP_CHECK, CHK_SIDE, 0, 0, 0, "S Greeting (imported)\n"},
-    // A subagent's desktop ask (the fake helper, which tests/gui.py
-    // configures here only), allowed for its class through Always,
-    // apart from Allow: its next input is not asked about
-    {OP_IFROLE, 0, 17, 0, 0, "desk"},
-    {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Greeting"},
+    {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "H this\n S Start more subagents.\n"},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "H this\n S Start more subagents.\n"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "sessions sort"},
     {OP_DOWN, 0, 0, 0, 60, ""},
-    {OP_UP, 0, 0, 0, 300, ""},
-    {OP_WAIT, W_OPENED, 0, 0, 10000, ""},
-    {OP_PROMPT, 0, 0, 0, 0, "Start a desktop subagent."},
-    {OP_WAIT, W_KIDASK, 0, 0, 10000, ""},
-    {OP_MOVE, T_TASKLINK, 0, 0, 100, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-sort"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "sort created"},
     {OP_DOWN, 0, 0, 0, 60, ""},
-    {OP_UP, 0, 0, 0, 400, ""},
-    {OP_WAIT, W_ASK, 0, 0, 2000, ""},
-    {OP_CHECK, CHK_DESKALWAYSBTN, 0, 0, 0, ""},
-    {OP_SHOT, 0, 0, 0, 300, "sessions-deskalways"},
-    {OP_MOVE, T_ALWAYS, 0, 0, 150, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, " S Whole fork\n S Start more subagents.\n"},
+    {OP_CHECK, CHK_SIDEINI, 0, 0, 0, "Sort=created\n"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "sessions sort"},
     {OP_DOWN, 0, 0, 0, 60, ""},
-    {OP_UP, 0, 0, 0, 300, ""},
-    {OP_WAIT, W_ALLIDLE, 0, 0, 10000, ""},
-    {OP_CHECK, CHK_KIDALWAYS, 0, 0, 0, ""},
-    {OP_SHOT, 0, 0, 0, 300, "sessions-deskallowed"},
-    // The subagent whose parent is gone goes to the Trash, as a root
-    {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Orphaned subagent"},
-    {OP_RDOWN, 0, 0, 0, 60, ""},
-    {OP_RUP, 0, 0, 0, 500, ""},
-    {OP_MOVE, T_NAMED, 0, 0, 100, "Move to Trash"},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "sort activity"},
     {OP_DOWN, 0, 0, 0, 60, ""},
-    {OP_UP, 0, 0, 0, 1500, ""},
-    {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "\n S Orphaned subagent\n"},
-    {OP_CHECK, CHK_SIDE, 0, 0, 0, "\nT\n H this\n  S Orphaned subagent\n"},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "H this\n S Start more subagents.\n"},
+    {OP_CHECK, CHK_NOINI, 0, 0, 0, "Sort="},
     // Idle: no frames
     {OP_MOVE, T_EMPTY, 0, 0, 6000, ""},  // hover delays and the layout's save
     {OP_MARK, 0, 0, 0, 3000, ""},

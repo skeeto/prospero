@@ -45,6 +45,22 @@ A folder dropped on the window opens the dialog with that folder
 filled in. `prospero DIR` in a terminal starts a session in DIR at
 once.
 
+## The sidebar's order
+
+The sidebar lists sessions by recent activity: the one with the latest
+message sent, turn begun or turn ended comes first, a session's
+subagents counting as its own. Opening, renaming, moving or archiving a
+session doesn't count, so reading an old session leaves it where it
+is. Groups keep their own order, and subagents stay oldest first under
+their parents. The sort button at the top of the sidebar switches to
+Date created, newest first, and back, and the window remembers the
+choice. A session's tooltip says when it was last active.
+
+While the pointer is over the sidebar, rows hold still: a session that
+ends its turn meanwhile moves once the pointer leaves, never from under
+a click. A session from before Prospero kept this time starts at when
+it was made, until its next turn.
+
 ## Talking to the agent
 
 Enter sends the prompt. The transcript shows your messages as
@@ -189,7 +205,7 @@ Right-click a session in the sidebar, or open the Session menu, for:
   (shown while you drag), onto another session to join it there, below
   the list to take it out of its group, or onto the Move to Trash strip
   at the foot of the sidebar. Escape cancels a drag. A session never moves
-  to another host, and the sidebar stays newest first.
+  to another host, and dropping it never changes the sidebar's order.
 - **Fork**: a new session with a copy of this conversation, titled
   "(fork)", which starts in Build mode. A No folder session's fork gets
   a copy of its folder.

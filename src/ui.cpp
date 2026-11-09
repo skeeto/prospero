@@ -6682,8 +6682,9 @@ static void sessplace(SessTree *t, GuiSession *s, i32 depth)
 static Slice<GuiSession *> hostsessions(Gui *g, Arena *a, GuiHost *h);
 
 // The sessions made or opened here and listed, host by host, each
-// host's newest first, but each subagent's under its parent's, oldest
-// first, with its depth there.
+// host's newest made first, but each subagent's under its parent's,
+// oldest first, with its depth there: the sidebar's order by date
+// created.
 static Slice<GuiSession *> sesslist(Gui *g, Arena *a)
 {
     Slice<GuiSession *> r = {};
@@ -6696,7 +6697,22 @@ static Slice<GuiSession *> sesslist(Gui *g, Arena *a)
     return r;
 }
 
-// The sessions of one host, in the sidebar's order.
+static b32 actafter(GuiSession **a, GuiSession **b)
+{
+    return (*a)->lastact > (*b)->lastact;
+}
+
+// The sessions of one host, the most recently active first, newest made
+// first on a tie: where recent folders come from, whatever the sidebar's
+// order.
+static Slice<GuiSession *> sessrecent(Gui *g, Arena *a, GuiHost *h)
+{
+    Slice<GuiSession *> r = hostsessions(g, a, h);
+    sort(r.data, r.len, actafter, *a);
+    return r;
+}
+
+// The sessions of one host, in the sidebar's order by date created.
 static Slice<GuiSession *> hostsessions(Gui *g, Arena *a, GuiHost *h)
 {
     Slice<GuiSession *> all = {};
@@ -7649,7 +7665,7 @@ static void foldrow(Gui *g, SideRow *r)
 // puts it in that section, or below the rows, out of its group; or onto
 // the strip at the foot of the pane, into the Trash. Never to another
 // host: a heading or a session there is no target. No order and no
-// parent changes: the sections stay newest first. One in the Trash
+// parent changes: the sections keep the sidebar's order. One in the Trash
 // dragged out is restored, into where it is dropped; the Trash heading
 // is no target, so close under Archived.
 static Str dragwhy(Gui *g, GuiSession *s)
@@ -8013,6 +8029,11 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other, 
         }
         putbyte(&tip, '\n');
         print(&tip, s->sid);
+        if (s->lastact) {
+            print(&tip, "\nActive ");
+            printage(g, &tip, nowms - s->lastact);
+            print(&tip, " ago");
+        }
         if (r->trashed) {
             print(&tip, "\nIn the Trash: restore it to open it");
         }
@@ -8274,6 +8295,41 @@ static void drawsessions(Gui *g)
         itemtip(HOST_WINDOWS ? "Refresh: list the sessions and the WSL distros again"
                                            : "Refresh: list the sessions again");
     }
+    ImGui::SameLine();  // after refresh, or new session without it
+    if (iconbutton(ICON_SORT "##sort")) {
+        ImGui::OpenPopup("##sortmenu");
+    }
+    itemnamed(g, "sessions sort");
+    itemtip(g->sidesort==SIDESORT_CREATED ? "Sort: date created" : "Sort: recent activity");
+    b32 resync = 0;  // the order changed: every row to its place now
+    if (ImGui::BeginPopup("##sortmenu")) {
+        i32 was = g->sidesort;
+        if (ImGui::MenuItem("Recent activity", 0, g->sidesort==SIDESORT_ACTIVITY)) {
+            g->sidesort = SIDESORT_ACTIVITY;
+        }
+        itemnamed(g, "sort activity");
+        if (ImGui::MenuItem("Date created", 0, g->sidesort==SIDESORT_CREATED)) {
+            g->sidesort = SIDESORT_CREATED;
+        }
+        itemnamed(g, "sort created");
+        if (g->sidesort != was) {
+            resync       = 1;
+            g->sidedirty = 1;
+            scheddirty(&g->sched);
+        }
+        ImGui::EndPopup();
+    }
+
+    // Rows hold still while the pointer is over the pane, a session is
+    // dragged or a menu is open, so that a turn ending elsewhere never
+    // moves a row from under a click; but not as the pane shows again,
+    // which would keep an order from before
+    i32 frame = ImGui::GetFrameCount();
+    resync |= g->sideframe != frame-1;
+    g->sideframe = frame;
+    b32 hold = drag || ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows |
+                                              ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) ||
+               ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
 
     // The hosts to list: every one reached, and every configured remote
     // unless only while connected
@@ -8320,11 +8376,13 @@ static void drawsessions(Gui *g)
         }
     }
     in.heads   = in.hosts.len > 1;
+    in.byat    = g->sidesort == SIDESORT_ACTIVITY;
     in.groups  = g->groups;
     in.folds   = g->folds;
     in.archive = drag != 0;
 
-    // Its sessions, each host's newest first
+    // Its sessions, each host's newest made first, which sidetree orders
+    // by sortat with byat
     Slice<GuiSession *> sess = {};
     for (iz i = 0; i < refs.len; i++) {
         Slice<GuiSession *> l = {};
@@ -8359,6 +8417,10 @@ static void drawsessions(Gui *g)
             e.active   = v ? v->busy && !s->readonly
                            : s->state!=LIVE_IDLE && s->state!=LIVE_CLOSED;
             e.shown    = s == g->sess;
+            if (!hold || resync || !s->sortat) {
+                s->sortat = s->lastact;  // a new one takes its place at once
+            }
+            e.at    = s->sortat;
             in.sess = push(&a, in.sess, e);
             sess    = push(&a, sess, s);
         }
@@ -9215,7 +9277,8 @@ static void fieldput(char *field, Str s)
 
 // The new session dialog filled for an import to a host: the log's
 // directory where it is known to be there (on this machine, or as
-// another session's there), else the newest of that host's sessions',
+// another session's there), else the most recently active of that
+// host's sessions',
 // else this machine's first, or nothing for a remote with none, never
 // a directory of another machine. Its model where that host has one by
 // its name (its configuration's, which a host other than the main one
@@ -9230,7 +9293,7 @@ static void importfill(Gui *g, GuiHost *h)
         b32 there = h->kind!=GH_REMOTE && x->cwd.len &&
                     os_stat(g->os, a, x->cwd).type==STAT_DIR;
         Str newest = {};
-        Slice<GuiSession *> list = hostsessions(g, &a, h);
+        Slice<GuiSession *> list = sessrecent(g, &a, h);
         for (iz i = 0; i < list.len; i++) {
             GuiSession *s = list[i];
             Str         d = s->view && s->view->cwd.len ? s->view->cwd : s->cwd;
@@ -9938,7 +10001,7 @@ static void newcwdfor(Gui *g, Arena a, GuiHost *h)
         return;
     }
     Str dir = h==g->main ? g->firstcwd : Str("~");
-    Slice<GuiSession *> list = sesslist(g, &a);
+    Slice<GuiSession *> list = sessrecent(g, &a, h);
     for (iz i = 0; i < list.len; i++) {
         GuiSession *s   = list[i];
         Str         cwd = s->view && s->view->cwd.len ? s->view->cwd : s->cwd;
@@ -10193,8 +10256,9 @@ static void drawnew(Gui *g)
                                host->name)
                       : Str("Choose the directory in a dialog"));
 
-        // Recent directories there, newest first, not folders of sessions' own
-        Slice<GuiSession *> list   = sesslist(g, &a);
+        // Recent directories there, the most recently active first, not
+        // folders of sessions' own
+        Slice<GuiSession *> list   = sessrecent(g, &a, host);
         Slice<Str>          recent = {};
         for (iz i = 0; i<list.len && recent.len<8; i++) {
             Str cwd = list[i]->view && list[i]->view->cwd.len ? list[i]->view->cwd : list[i]->cwd;

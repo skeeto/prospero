@@ -19165,9 +19165,10 @@ static void listput(Engine *e, JsonOut *w, Slice<ListEntry> list, iz i, i32 dept
     }
 }
 
-// list {trash}: the sessions in the state directory, newest first, but
-// a subagent's under its parent, oldest first: in the order a sidebar
-// shows them. Those in the Trash, with their subagents, only with trash,
+// list {trash}: the sessions in the state directory, newest made first,
+// but a subagent's under its parent, oldest first, each with its latest
+// activity (lastact), which a sidebar may order them by instead. Those
+// in the Trash, with their subagents, only with trash,
 // as a frontend that knows the Trash asks (an older one would show them
 // as any other); trash_days says how long the Trash keeps them here.
 static void cmdlist(Engine *e, Arena scratch, i64 id, Json *j)

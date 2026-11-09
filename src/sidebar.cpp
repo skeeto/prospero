@@ -10,8 +10,11 @@
 // Host headings show only when more than one host could be shown
 // (heads), under each group and the Archived and Trash headings too,
 // where that host has sessions; at the top level every host listed always shows, empty or
-// not. Within a host, roots are newest first and subagents oldest first
-// under their parents, as the engine lists them. A subagent on another
+// not. Within a host, roots come as given, newest made first, or with
+// byat by the latest time (at) in each one's subtree, most recent first,
+// ties as given; subagents come oldest first under their parents. A
+// root's time counts only its own host's sessions, whose clock it is:
+// times are never compared across hosts. A subagent on another
 // host than its parent's (phost) goes under that parent, in its
 // section and host heading, marked away.
 //
@@ -74,6 +77,7 @@ struct SideSess {
     b32  active;    // runs a turn
     b32  asks;      // waits for the user
     b32  shown;     // the session in view
+    i64  at;        // its time to sort by (byat), on its host's clock
 };
 
 struct SideHost {
@@ -85,6 +89,7 @@ struct SideHost {
 
 struct SideIn {
     Slice<SideSess> sess;    // each host's newest first
+    b32             byat;    // roots by their subtrees' latest at
     Slice<SideHost> hosts;   // in order
     Slice<Str>      groups;  // in order, empty ones included
     Map<b32>       *folds;   // the user's choices: 1 folded, 0 open
@@ -122,6 +127,8 @@ struct SideTree {
     b32                      *asks;     // something in its subtree asks
     b32                      *keep;     // something in its subtree runs, asks
                                         // or is in view: not finished
+    i64                      *at;       // the latest at in its subtree, on
+                                        // its root's host
 };
 
 static Str sidekey(Arena *a, Str prefix, Str tail)
@@ -145,6 +152,8 @@ static void sideplace(SideTree *t, i32 i, i32 root, i32 depth)
     t->active[i] = s->active || s->asks;
     t->asks[i]   = s->asks;
     t->keep[i]   = s->active || s->asks || s->shown;
+    t->at[i]     = s->at;
+    i32 host     = t->in->sess[root].host;
     Slice<i32> k = t->kids[i];
     for (iz n = 0; n < k.len; n++) {
         i32 c = k[n];
@@ -157,7 +166,22 @@ static void sideplace(SideTree *t, i32 i, i32 root, i32 depth)
         t->active[i] |= t->active[c];
         t->asks[i]   |= t->asks[c];
         t->keep[i]   |= t->keep[c];
+        if (t->in->sess[c].host==host && t->at[c]>t->at[i]) {
+            t->at[i] = t->at[c];
+        }
     }
+}
+
+// A root and its subtree's time, to sort roots by (sort hands its
+// comparator no context).
+struct SideAt {
+    i64 at;
+    i32 root;
+};
+
+static b32 sideatafter(SideAt *a, SideAt *b)
+{
+    return a->at > b->at;
 }
 
 // A session's row, then its subagents', unless folded.
@@ -353,6 +377,7 @@ static Slice<SideRow> sidetree(Arena *a, SideIn *in)
     t.active = alloc<b32>(a, n ? n : 1);
     t.asks   = alloc<b32>(a, n ? n : 1);
     t.keep   = alloc<b32>(a, n ? n : 1);
+    t.at     = alloc<i64>(a, n ? n : 1);
     for (iz i = 0; i < n; i++) {
         t.kids    = push(a, t.kids, Slice<i32>{});
         t.root[i]  = -1;
@@ -423,6 +448,19 @@ static Slice<SideRow> sidetree(Arena *a, SideIn *in)
         }
         if (!dup) {
             groups = push(a, groups, s->group);
+        }
+    }
+
+    // Then, with byat, the roots by their subtrees' latest time: after
+    // the groups, which keep the order they were named in
+    if (in->byat && roots.len > 1) {
+        SideAt *by = alloc<SideAt>(a, roots.len);
+        for (iz r = 0; r < roots.len; r++) {
+            by[r] = {t.at[roots[r]], roots[r]};
+        }
+        sort(by, roots.len, sideatafter, *a);
+        for (iz r = 0; r < roots.len; r++) {
+            roots[r] = by[r].root;
         }
     }
     for (iz i = 0; i < groups.len; i++) {

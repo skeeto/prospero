@@ -90,7 +90,11 @@ session dialog with it.
 The sidebar is a tree: groups, then hosts, then sessions with their
 subagents, and archived sessions folded away at the end. Three or more
 finished subagents under one parent fold into a "finished" row of
-their own, after those still at work, asking, or in view. A session's
+their own, after those still at work, asking, or in view. Sessions
+come by recent activity, the latest message sent or turn begun or
+ended first, a session's subagents counting as its own; the sort
+button at its top switches to date created, and the window keeps the
+choice. Rows hold still while the pointer is over the sidebar. A session's
 context menu, and the Session menu, rename it, move it to a group,
 fork it, compact it now, switch its model, export it (Markdown or the
 raw log), archive it, or move it to the Trash (with its subagents),
