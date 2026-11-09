@@ -423,6 +423,46 @@ static void test_tools(Test *t)
                "[H]\n     1\tone\n[Showing lines 1-1 of 2. To read more, call read with "
                "offset=2.]\n");
         expect(t, "readbody empty", readbody(a, "", "[H]\n", 1, 10), "[H]\n(empty file)");
+
+        // readwin: the window's last line and the file's total, for a
+        // caller that maps lines to pages; no head at all for a PDF
+        {
+            Str     five = "a\nb\nc\nd\ne\n";
+            ReadWin w    = readwin(a, five, {}, 2, 2);
+            expect(t, "readwin text", w.text,
+                   "     2\tb\n     3\tc\n[Showing lines 2-3 of 5. To read more, call read "
+                   "with offset=4.]\n");
+            expect(t, "readwin last total", istr(a, w.last*10 + w.total), "35");
+            w = readwin(a, five, {}, 4, 100);
+            expect(t, "readwin to the end", w.text, "     4\td\n     5\te\n");
+            expect(t, "readwin end last", istr(a, w.last*10 + w.total), "55");
+            w = readwin(a, "x\r\ny", "[T]\n", 1, 10);
+            expect(t, "readwin no newline", w.text, "[T]\n     1\tx\n     2\ty\n");
+            expect(t, "readwin no newline last", istr(a, w.last*10 + w.total), "22");
+            w = readwin(a, five, {}, 9, 10);
+            expect(t, "readwin past the end", w.text,
+                   "The file has only 5 lines, so offset 9 is past its end.");
+            expect(t, "readwin past last", istr(a, w.last*10 + w.total), "85");
+            w = readwin(a, "\xef\xbb\xbf", {}, 1, 10);
+            expect(t, "readwin empty", w.text, "(empty file)");
+            expect(t, "readwin empty last", istr(a, w.last*10 + w.total), "0");
+
+            // Cut at READ_BYTES: last is the last line that fit
+            Buf big(a, READ_BYTES + 4096);
+            for (i32 i = 0; i < 2000; i++) {
+                for (i32 k = 0; k < 99; k++) putbyte(&big, 'y');
+                putbyte(&big, '\n');
+            }
+            w = readwin(a, finish(&big), {}, 1, 2000);
+            iz shown = 0;
+            for (iz i = 0; i < w.text.len; i++) shown += w.text[i] == '\n';
+            Buf want(a, 128);
+            print(&want, "[Showing lines 1-");
+            print(&want, (i64)w.last);
+            print(&want, " of 2000 (output limit reached).");
+            expect(t, "readwin cut", istr(a, w.last>0 && w.last<2000 && shown==w.last+1 &&
+                   w.total==2000 && find(w.text, finish(&want))>0), "1");
+        }
         Buf longline(a, 5000);
         for (i32 i = 0; i < 2500; i++) putbyte(&longline, 'x');
         os_write(os, *a, "/w/long.txt", finish(&longline));

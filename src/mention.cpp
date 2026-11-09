@@ -794,14 +794,19 @@ static Str mentionattach(Arena *a, Gui *g, GuiSession *s, Str rel)
     }
     Str shortwhy = why.len ? Str("ten files already attached") : Str{};
     if (!shortwhy.len && s->host && s->host->kind==GH_REMOTE) {
-        if (hostcap(s->host, "files.path")) {
+        if (hostcap(s->host, "files.path") && !hostcap(s->host, "pdf") &&
+                (endswith(name, ".pdf") || endswith(name, ".PDF"))) {
+            // Not read here, so known only by its name
+            shortwhy = "a PDF the engine is too old to read";
+        } else if (hostcap(s->host, "files.path")) {
             // Read there when the message goes: a chip that names it
             if (!mentionchip(g, s, name, abs, rel, {})) {
                 return "no room for another attachment";
             }
             return {};
+        } else {
+            shortwhy = "the host's engine is too old to attach it";
         }
-        shortwhy = "the host's engine is too old to attach it";
     }
     if (!shortwhy.len) {
         why = attachfile(g, s, abs);
@@ -816,10 +821,13 @@ static Str mentionattach(Arena *a, Gui *g, GuiSession *s, Str rel)
             Arena ra = newarena(rr);
             read = os_read(g->os, &ra, abs, (iz)ATTACH_FILE + 1);
         }
-        if (read.err==READ_OK && readbinary(read.data)) {
-            shortwhy = "binary";
-        } else if (read.err==READ_TOOBIG || (read.err==READ_OK && read.data.len>ATTACH_FILE)) {
+        b32 pdf = read.err==READ_OK && pdfsniff(read.data) && pdflikely(read.data);
+        if (read.err==READ_TOOBIG || (read.err==READ_OK && read.data.len>ATTACH_FILE)) {
             shortwhy = "over 16 MiB";
+        } else if (pdf && !hostcap(s->host, "pdf")) {
+            shortwhy = "a PDF the engine is too old to read";
+        } else if (!pdf && read.err==READ_OK && readbinary(read.data)) {
+            shortwhy = "binary";
         }
         if (rr) {
             os_release(g->os, rr);

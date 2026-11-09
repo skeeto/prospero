@@ -60,6 +60,41 @@ static void test_responses(Test *t)
 {
     Arena *a = &t->perm;
 
+    // An attached PDF's images, labelled, each after a caption naming it;
+    // one with no label, or not sent, has none
+    {
+        ModelConf mc = {};
+        mc.name = "m";
+        MsgImage g[3] = {};
+        g[0].mime  = "image/png";
+        g[0].b64   = "QUJD";
+        g[0].label = "image 3 (page 2) of x.pdf";
+        g[1].mime  = "image/jpeg";
+        g[1].b64   = "REVG";
+        g[2].mime  = "image/png";
+        g[2].label = "image 4 (page 2) of x.pdf";
+        g[2].alt   = "[image lost: img/3.png, its file could not be read]";
+        Msg h[1] = {};
+        h[0].role   = ROLE_USER;
+        h[0].text   = "look";
+        h[0].images = {g, 3, 3};
+        ChatReq r = {};
+        r.mc      = &mc;
+        r.tools   = "[]";
+        r.history = {h, 1, 1};
+        Arena tmp = *a;
+        tmp.beg  += (tmp.end - tmp.beg)/2;
+        Str  one  = rsencode(a, tmp, &r, 0);
+        Str  rest = cuthead(one, find(one, "\"input\""));
+        expect(t, "user image captions", takehead(rest, find(rest, ",\"tools\"")),
+               "\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":"
+               "\"input_text\",\"text\":\"look\"},{\"type\":\"input_text\",\"text\":\"Image 3 "
+               "(page 2) of x.pdf:\"},{\"type\":\"input_image\",\"image_url\":"
+               "\"data:image/png;base64,QUJD\"},{\"type\":\"input_image\",\"image_url\":"
+               "\"data:image/jpeg;base64,REVG\"},{\"type\":\"input_text\",\"text\":\"[image lost: "
+               "img/3.png, its file could not be read]\"}]}]");
+    }
+
     // Kinds, their paths and URLs
     {
         expect(t, "rs.kinds", concat(a, concat(a, epkindname(epkindof("responses")), ","),
@@ -169,6 +204,13 @@ static void test_responses(Test *t)
                "{\"type\":\"message\",\"role\":\"user\",\"content\":["
                "{\"type\":\"input_text\",\"text\":\"The screenshot of tool call call_2:\"},"
                "{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,UE5H\"}]}");
+        h[3].imgmime = "image/jpeg";
+        expect(t, "rs.screenshot jpeg",
+               jsonat(jsonget(jsonparse(a, rsencode(a, tmp, &r, 0)).root, "input"), 6)->raw,
+               "{\"type\":\"message\",\"role\":\"user\",\"content\":["
+               "{\"type\":\"input_text\",\"text\":\"The screenshot of tool call call_2:\"},"
+               "{\"type\":\"input_image\",\"image_url\":\"data:image/jpeg;base64,UE5H\"}]}");
+        h[3].imgmime = {};
 
         // The response came: reasoning without encrypted content stays
         // out, and every item before is the same

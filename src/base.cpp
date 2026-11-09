@@ -104,10 +104,12 @@ static void arenagrow(Arena *a, iz pad, iz count, iz size)
 }
 
 // Whether need more bytes can be allocated, counting uncommitted space.
+// Strictly less than the room: arenagrow and alloc<u8> refuse a request
+// that would end exactly at the limit.
 static b32 fits(Arena *a, iz need)
 {
     byte *limit = a->region ? a->region->base+a->region->cap : a->end;
-    return need>=0 && need<=limit-a->beg;
+    return need>=0 && need<limit-a->beg;
 }
 
 template<typename T>

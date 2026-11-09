@@ -741,6 +741,9 @@ static u32     os_guilimits(Os *);
 #include "image.cpp"
 #include "zip.cpp"    // after png.cpp and image.cpp: zcrc32, wuffsinflate
 #include "pdf.cpp"    // after image.cpp: wuffsinflateto
+#include "pdfenc.cpp" // after json.cpp: utf8strict
+#include "pdfimage.cpp"  // after png.cpp and image.cpp: pngfit, imgdecode
+#include "pdftext.cpp"   // after pdfimage.cpp
 #include "delta.cpp"
 #include "desktop.cpp"
 #include "tools.cpp"
@@ -806,6 +809,210 @@ static Str usage =
 #endif
 ;
 
+// prospero --pdf FILE: the built-in reader's text of a PDF, as read
+// extracts it, for checking it against a corpus (tests/pdfcheck.py) and
+// for triage of inputs too large for the fuzzer. Lines offset to
+// offset+limit-1, or all of them; stats on standard error. With
+// --images DIR, the images that window shows (pdfpick, then pdfimage)
+// are written there as p<page>-<N>.png or .jpg, N the image's number in
+// the text, within --edge and --pixels (the desktop's limits for kinds
+// other than anthropic by default), and the window is cut as read cuts
+// it, before the image past the most one shows; with --all, every
+// window's in turn. Exit 1 when the file is refused, with why, 2 for
+// usage.
+static i32 pdfmain(Os *os, Arena perm, Str *args, i32 nargs)
+{
+    Str usage  = "usage: prospero --pdf FILE [--offset N] [--limit N] [--all] "
+                 "[--images DIR [--edge N] [--pixels N]]\n";
+    Str path   = {};
+    Str dir    = {};
+    i64 offset = 1;
+    i64 limit  = 2000;
+    i64 edge   = DESK_EDGE_OAI;
+    i64 pixels = DESK_PIXELS_OAI;
+    b32 all    = 0;
+    for (i32 i = 2; i < nargs; i++) {
+        Str a = args[i];
+        if ((a=="--offset" || a=="--limit" || a=="--edge" || a=="--pixels") && i+1<nargs) {
+            Int n = parseint(args[++i]);
+            if (!n.ok || n.val<1) {
+                os_print(os, 2, usage);
+                return 2;
+            }
+            *(a=="--offset" ? &offset : a=="--limit" ? &limit :
+              a=="--edge" ? &edge : &pixels) = n.val;
+        } else if (a == "--all") {
+            all = 1;
+        } else if (a=="--images" && i+1<nargs) {
+            dir = args[++i];
+        } else if (!path.data && !startswith(a, "--")) {
+            path = a;
+        } else {
+            os_print(os, 2, usage);
+            return 2;
+        }
+    }
+    if (!path.data) {
+        os_print(os, 2, usage);
+        return 2;
+    }
+
+    Arena errs = carve(&perm, 16<<20);  // apart: images come and go in perm
+    Buf   err(&errs, 1024);
+    Arena region = newarena(os_reserve(os, PDF_REGION));
+    if (!region.beg) {
+        os_print(os, 2, "prospero --pdf: out of memory\n");
+        return 1;
+    }
+    Read rd = os_read(os, &region, path, PDF_READMAX);
+    if (rd.err != READ_OK) {
+        print(&err, "prospero --pdf: ");
+        print(&err, path);
+        print(&err, rd.err==READ_TOOBIG ? Str(": larger than the reader takes\n")
+                  : rd.err==READ_NOTFOUND ? Str(": not found\n")
+                  : Str(": cannot be read\n"));
+        os_print(os, 2, finish(&err));
+        return 1;
+    }
+
+    i64    t0 = os_ticks(os);
+    PdfOut r  = pdfread(&perm, region, rd.data, 0);
+    i64    us = os_ticks(os) - t0;
+    if (r.status!=PDFR_OK && r.status!=PDFR_PARTIAL) {
+        print(&err, "prospero --pdf: ");
+        print(&err, path);
+        print(&err, ": ");
+        print(&err, r.why);
+        putbyte(&err, '\n');
+        os_print(os, 2, finish(&err));
+        return 1;
+    }
+
+    // The window, by lines, and its images
+    Str text  = r.text;
+    iz  lines = 0;
+    for (iz i = 0; i < text.len; i++) {
+        lines += text[i] == '\n';
+    }
+    iz  first  = (iz)(offset<lines+1 ? offset : lines+1);
+    iz  last   = all || limit>lines-first+1 ? lines : first+(iz)limit-1;
+    i64 nimg   = 0;
+    i64 bytes  = 0;
+    i64 fails  = 0;
+    i64 imgus  = 0;
+    iz  cutat  = 0;
+    if (dir.data && !os_mkdirs(os, region, dir)) {
+        print(&err, "prospero --pdf: cannot make ");
+        print(&err, dir);
+        putbyte(&err, '\n');
+        os_print(os, 2, finish(&err));
+        return 1;
+    }
+    for (iz wf = first; dir.data && wf<=last;) {
+        PdfPick k = pdfpick(region, r.places, wf, last, edge, pixels, ATTACH_BYTES);
+        for (i32 i = 0; i < k.n; i++) {
+            PdfPlace *pl = r.places.data + k.at[i];
+            Arena     t  = perm;
+            i64       t1 = os_ticks(os);
+            PdfShown  s  = pdfimage(&t, region, rd.data, pl, k.edge, k.pixels, k.maxb64);
+            imgus += os_ticks(os) - t1;
+            Buf name(&t, 64);
+            putbyte(&name, 'p');
+            print(&name, (i64)pl->page);
+            putbyte(&name, '-');
+            print(&name, (i64)pl->id);
+            print(&name, s.mime=="image/jpeg" ? Str(".jpg") : Str(".png"));
+            Str file = finish(&name);
+            print(&err, "image ");
+            print(&err, (i64)pl->id);
+            print(&err, " page ");
+            print(&err, (i64)pl->page);
+            print(&err, " line ");
+            print(&err, pl->line);
+            print(&err, ": ");
+            Str path = join(&t, dir, file);
+            if (!s.data.data) {
+                fails++;
+                print(&err, s.err);
+            } else if (!os_write(os, t, path, s.data)) {
+                fails++;
+                print(&err, "cannot write ");
+                print(&err, file);
+            } else {
+                nimg++;
+                bytes += s.data.len;
+                print(&err, file);
+                putbyte(&err, ' ');
+                print(&err, (i64)s.w);
+                putbyte(&err, 'x');
+                print(&err, (i64)s.h);
+                putbyte(&err, ' ');
+                print(&err, s.data.len);
+                print(&err, " bytes");
+            }
+            putbyte(&err, '\n');
+        }
+        if (!all) {
+            cutat = k.cut ? k.last : 0;
+            last  = k.last;
+            break;
+        } else if (!k.cut) {
+            break;
+        }
+        wf = k.last + 1;
+    }
+
+    iz beg  = 0;
+    iz line = 1;
+    for (; beg<text.len && line<first; beg++) {
+        line += text[beg] == '\n';
+    }
+    iz end = beg;
+    for (; end<text.len && line<=last; end++) {
+        line += text[end] == '\n';
+    }
+    os_print(os, 1, {text.data+beg, end-beg});
+
+    print(&err, "status=");
+    print(&err, r.status==PDFR_OK ? Str("ok") : Str("partial"));
+    print(&err, " pages=");
+    print(&err, (i64)r.pages);
+    print(&err, " read=");
+    print(&err, r.pageline.len);
+    print(&err, " places=");
+    print(&err, r.places.len);
+    print(&err, " recovered=");
+    print(&err, (i64)r.recovered);
+    print(&err, " damaged=");
+    print(&err, (i64)pdfdamaged(region, rd.data));
+    print(&err, " bytes=");
+    print(&err, text.len);
+    print(&err, " ms=");
+    print(&err, us/1000);
+    if (dir.data) {
+        print(&err, " images=");
+        print(&err, nimg);
+        print(&err, " failed=");
+        print(&err, fails);
+        print(&err, " imagebytes=");
+        print(&err, bytes);
+        print(&err, " imagems=");
+        print(&err, imgus/1000);
+        if (cutat) {
+            print(&err, " cut=");
+            print(&err, cutat);
+        }
+    }
+    if (r.why.data) {
+        print(&err, " why=\"");
+        print(&err, r.why);
+        putbyte(&err, '"');
+    }
+    putbyte(&err, '\n');
+    os_print(os, 2, finish(&err));
+    return 0;
+}
+
 static i32 app_main(Os *os, Arena mem, Str *args, i32 nargs)
 {
     Arena perm    = mem;
@@ -822,6 +1029,8 @@ static i32 app_main(Os *os, Arena mem, Str *args, i32 nargs)
         return climain(os, perm, scratch, args, nargs, 1);
     } else if (nargs>1 && args[1]=="--search") {
         return searchmain(os, perm, scratch, args, nargs);  // grep and glob
+    } else if (nargs>1 && args[1]=="--pdf") {
+        return pdfmain(os, scratch, args, nargs);  // the reader's text
     } else if (nargs>1 && args[1]=="serve") {
         return servemain(os, perm, scratch, args, nargs);
     } else if (nargs>1 && args[1]=="attach") {

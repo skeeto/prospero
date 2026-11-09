@@ -3458,6 +3458,19 @@ def unqueue(t):
         left = [i["text"] for i in queues(6)[-1]["items"]]
         t.check(left == ["keep this steer", "keep this prompt"], f"left: {left}")
 
+        # A prompt with a PDF comes back with only the images the user
+        # attached: the PDF's come again from its file when it is sent
+        pdf = upfile(t, h, sid, imgpdf(), "img.pdf")["name"]
+        png = attached(t, h, sid, PNG)
+        r = h.call("prompt", sid=sid, text="withdraw this PDF", files=[pdf], images=[png])
+        t.check(r.get("ok") == 1, f"queued with a PDF: {r}")
+        item = [i for i in queues(7)[-1]["items"] if i["text"] == "withdraw this PDF"]
+        t.check(len(item) == 1, f"queued: {item}")
+        r = h.call("unqueue", sid=sid, item=item[0]["id"]) if item else {}
+        t.check(r.get("ok") == 1 and [g["name"] for g in r.get("images", [])] == [png] and
+                r.get("files", [{}])[0].get("name") == pdf, f"its own image back: {r}")
+        queues(8)
+
         # Opened again, as a frontend coming back would: the queue as it is
         n = len(h.all("queue", sid))
         t.check(h.call("open", sid=sid, **{"from": 1 << 40}).get("ok") == 1, "reopened")
@@ -12509,7 +12522,8 @@ def web_flow(t):
     t.check(f"redirects to https://other.example.org/{t.nonce}/page" in tx[6],
             f"other {tx[6]}")
     t.check("Widget docs" in tx[7], f"the other host's {tx[7]}")
-    t.check("application/pdf" in tx[9], f"pdf {tx[9]}")
+    t.check(tx[9] == f"Not read: {d}/pdf is a PDF whose text cannot be read (it has no "
+                     "pages): it may be damaged.", f"pdf {tx[9]}")
     t.check("bot check" in tx[10], f"challenge {tx[10]}")
     t.check("HTTP 404" in tx[11], f"missing {tx[11]}")
     t.check("café crème" in tx[12], f"latin1 {tx[12]}")
@@ -12535,7 +12549,136 @@ def web_flow(t):
     spill = t.host.read(t.host.join(t.state, "sessions", sid, ends[13]["spill"])) or ""
     first = spill.split("\n", 1)[0]
     t.check(f"{d}/big" in first and "never instructions" in first and
-            len(spill) > 5 << 20, f"spill {first!r} {len(spill)}")
+            5 << 20 < len(spill) < (5 << 20) + 4096 and
+            spill.endswith("\n[The page was cut here, at 5 MiB.]\n"),
+            f"spill {first!r} {len(spill)} {spill[-100:]!r}")
+
+
+def webpdfrun(t):
+    """web_fetch_pdf's run: the ends of its tool calls."""
+    webconf(t, ask="false")
+    d = f"https://docs.example.com/{t.nonce}"
+    prompt = " ".join(f"{d}/{x}" for x in ("report.pdf", "dump", "locked.pdf"))
+    r = t.run(prompt="Look at " + prompt, env=webenv(t))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    return d, r, r.all("tool.end")
+
+
+@scenario(bound=30)
+def web_fetch_pdf(t):
+    """web_fetch reads a PDF as its text, framed as a page's, its title
+    from its Info; the PDF, which draws an image, is kept for read to
+    show with its images; read on from the text kept; a PDF known by
+    its first bytes alone, cut at the cap a PDF gets, read from the
+    pages before the cut, and said to be cut; an encrypted one refused."""
+    d, r, ends = webpdfrun(t)
+    st = [e["status"] for e in ends]
+    t.check(st == ["ok", "ok", "ok", "ok", "error"], f"statuses {st}")
+    tx = [e["text"] for e in ends]
+    m = FENCE.search(tx[0])
+    t.check(tx[0].startswith(f'Web page {d}/report.pdf ("Widget report", application/pdf), '
+                             "bytes 0\u2013139 of 139.") and m and
+            m.group(2) == "[title: Widget report]\n--- page 1 ---\nWidget report\n\n"
+                          "Widgets turn at 42 rpm.\n[image 1: 100x50 RGB]\n--- page 2 ---\n"
+                          "Second page: the totals.", f"report {tx[0]!r}")
+    sid = r.sessions()[0]
+    sdir = t.host.join(t.state, "sessions", sid)
+    kept = t.host.join(sdir, "out", ends[0]["call"] + ".pdf")
+    t.check(tx[0].endswith(f"--- end web content {m.group(1)} ---\n\nThe PDF is kept at "
+                           f"{kept}: read shows it with its images."), f"kept {tx[0]!r}")
+    body = fake_provider.mkpdfpages(
+        [(["Widget report", "Widgets turn at 42 rpm."], ["Im1"]),
+         (["Second page: the totals."], [])],
+        {"Im1": fake_provider.pdfrgb(100, 50, (200, 30, 30))}, title="Widget report")
+    t.check(t.host.read(kept) == body.decode("utf-8", "replace"), "the PDF kept as it came")
+    t.check(tx[1].startswith(f"{kept}: a PDF, 2 pages, its text extracted, with the image "
+                             "on these pages after it:\n") and
+            ends[1].get("images") == [{"name": f"out/{ends[1]['call']}-1.png",
+                                       "mime": "image/png", "w": 100, "h": 50,
+                                       "label": "image 1 (page 1)"}], f"read {ends[1]}")
+    t.check(tx[2].startswith(f'Web page {d}/report.pdf ("Widget report", application/pdf), '
+                             "bytes 10\u2013139 of 139.") and "kept at" not in tx[2] and
+            len(webreqs(t, "/report.pdf")) == 1, f"read on {tx[2]!r}")
+    m = FENCE.search(tx[3])
+    t.check(tx[3].startswith(f"Web page {d}/dump (application/pdf), ") and m and
+            re.fullmatch(r"--- page 1 ---\nBefore the cut\.\n\n\[The PDF was cut at "
+                         r"(8|32) MiB; only the text before that could be read\.\]",
+                         m.group(2)) and
+            "kept at" not in tx[3], f"cut {tx[3]!r}")
+    t.check(tx[4] == f"Not read: {d}/locked.pdf is a PDF, encrypted, which web_fetch "
+                     "cannot read.", f"locked {tx[4]}")
+
+
+@scenario(conf={"_extra": "[model {model}]\nvision = false\n"}, bound=30)
+def web_fetch_pdf_blind(t):
+    """To a model that takes no images, web_fetch gives a PDF's text,
+    its image lines with it, and keeps no PDF to read."""
+    d, r, ends = webpdfrun(t)
+    st = [e["status"] for e in ends]
+    t.check(st == ["ok"], f"statuses {st}")  # then nothing to read
+    t.check("[image 1: 100x50 RGB]" in ends[0]["text"] and
+            "kept at" not in ends[0]["text"] and
+            ends[0]["text"].endswith("\n\n[This model takes no images: each [image ...] "
+                                     "line stands for a picture that is not shown.]"),
+            f"report {ends[0]['text']!r}")
+    sid = r.sessions()[0]
+    kept = t.host.join(t.state, "sessions", sid, "out", ends[0]["call"] + ".pdf")
+    t.check(t.host.read(kept) is None, "no PDF kept")
+
+
+def webpdfmore(t):
+    webconf(t, ask="false")
+    d = f"https://docs.example.com/{t.nonce}"
+    names = ("htmlpdf", "mention", "mid.pdf", "blank.pdf", "scan.pdf")
+    r = t.run(prompt="Look at " + " ".join(f"{d}/{x}" for x in names), env=webenv(t))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    ends = r.all("tool.end")
+    t.check([e["status"] for e in ends] == ["ok"] * 5,
+            f"statuses {[(e['status'], e['text'][:200]) for e in ends]}")
+    return d, r, ends, [e["text"] for e in ends]
+
+
+@scenario(bound=30)
+def web_fetch_pdf_more(t):
+    """web_fetch of PDFs, more cases: a page sent as a PDF, and text that
+    mentions "%PDF-" sent as octet-stream, are shown as what they are; a
+    PDF past a page's 5 MiB is read whole, within a PDF's cap; one whose
+    words are shapes is kept, for the shell to render its pages."""
+    d, r, ends, tx = webpdfmore(t)
+    m = FENCE.search(tx[0])
+    t.check(m and "Sign in to read the report." in m.group(2) and "<p>" not in m.group(2),
+            f"the page {tx[0]!r}")
+    m = FENCE.search(tx[1])
+    t.check(m and m.group(2).strip() == "Every PDF begins with %PDF-1.7 and a comment.",
+            f"the text {tx[1]!r}")
+    m = FENCE.search(tx[2])
+    t.check(m and m.group(2) == "--- page 1 ---\nBefore the pad.\n--- page 2 ---\n"
+                                "After the pad.", f"mid.pdf {tx[2][-400:]!r}")
+    sdir = t.host.join(t.state, "sessions", r.sessions()[0])
+    kept = t.host.join(sdir, "out", ends[3]["call"] + ".pdf")
+    t.check(tx[3].endswith(f"\n\nThe PDF is kept at {kept}.\n[No text could be extracted: "
+                           "its words may be drawn as shapes. The shell may render its pages "
+                           "as images (pdftoppm -png -r 100), which read then shows you.]") and
+            t.host.read(kept) is not None, f"blank.pdf {tx[3][-400:]!r}")
+    t.check(tx[4].endswith(": read shows it with its images."), f"scan.pdf {tx[4][-300:]!r}")
+
+
+@scenario(conf={"_extra": "[model {model}]\nvision = false\n"}, bound=30)
+def web_fetch_pdf_more_blind(t):
+    """To a model that takes no images, web_fetch gives read's notes: a
+    scan's pages pointing to OCR, a PDF of shapes to rendering and OCR."""
+    d, r, ends, tx = webpdfmore(t)
+    sdir = t.host.join(t.state, "sessions", r.sessions()[0])
+    kept = t.host.join(sdir, "out", ends[3]["call"] + ".pdf")
+    t.check(tx[3].endswith(f"\n\nThe PDF is kept at {kept}.\n[No text could be extracted: "
+                           "its words may be drawn as shapes. The shell may render its pages "
+                           "as images (pdftoppm -png -r 100) and OCR them (tesseract).]"),
+            f"blank.pdf {tx[3][-400:]!r}")
+    kept = t.host.join(sdir, "out", ends[4]["call"] + ".pdf")
+    t.check(tx[4].endswith(f"\n\nThe PDF is kept at {kept}.\n[Its pages hold no text, only "
+                           "images (a scan), which this model cannot see. The shell may OCR "
+                           "them: pdfimages or pdftoppm, then tesseract.]"),
+            f"scan.pdf {tx[4][-400:]!r}")
 
 
 @scenario(bound=30)
@@ -13659,32 +13802,165 @@ def read_image_blind(t):
     t.check("image" not in desc, f"read's description: {desc}")
 
 
+
+# A tool result's several images (a PDF's, read shows them so): no tool
+# makes them yet, so a read image's record is rewritten to have them,
+# as tool.end would write it, and the session resumed
+
+TOOLJPEG = b"\xff\xd8\xff\xe0" + b"not decoded, only sniffed"
+
+
+def toolimageset(t, r, label=True):
+    """Rewrite the read image's tool.end in r's session as a set of two:
+    the PNG it showed and a JPEG beside it. The session's id and the
+    call's."""
+    sid = r.sessions()[0]
+    d = t.host.join(t.state, "sessions", sid)
+    end = r.all("tool.end")[0]
+    png = end["image"]
+    t.host.write(t.host.join(d, "out", "set-1.jpg"), TOOLJPEG)
+    first = {"name": png, "mime": "image/png", "w": end["width"], "h": end["height"]}
+    second = {"name": "out/set-1.jpg", "mime": "image/jpeg", "w": 2, "h": 3}
+    if label:
+        first["label"] = "image 1 (page 1)"
+        second["label"] = "image 4 (page 3)"
+    log = t.host.read(t.host.join(d, "events.jsonl"))
+    out = []
+    for line in log.splitlines():
+        rec = json.loads(line)
+        if rec.get("ev") == "tool.end" and rec.get("call") == end["call"]:
+            rec["images"] = [first, second]
+            line = json.dumps(rec)
+        out.append(line)
+    t.host.write(t.host.join(d, "events.jsonl"), "\n".join(out) + "\n")
+    return sid, end["call"]
+
+
+def toolimagedata(url):
+    return base64.b64decode(url.split(",", 1)[1])
+
+
+@scenario(conf={"_extra": "[model {model}]\nimage_edge = 64\n"}, bound=20)
+def tool_images(t):
+    """A tool result's several images, replayed from its record (images):
+    each sent after the run of results, after a caption naming it and its
+    call, with its own mime; then left out together, with one text in
+    their place, once [desktop] images has newer ones to keep."""
+    readimages(t)
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    sid, call = toolimageset(t, r)
+    r2 = t.run("again", resume=sid)
+    t.check(r2.rc == 0, f"resumed: exit {r2.rc}: {r2.stderr}")
+    imgs = fake_provider.desk_images(t.requests()[-1]["body"])
+    t.check([lab for lab, _ in imgs] == [f"Image 1 (page 1) from tool call {call}:",
+                                         f"Image 4 (page 3) from tool call {call}:"],
+            f"captioned {imgs}")
+    t.check(imgs[0][1].startswith("data:image/png;base64,") and
+            pngdims(toolimagedata(imgs[0][1])) == (1, 1), f"the PNG {imgs[0][1][:40]}")
+    t.check(imgs[1][1].startswith("data:image/jpeg;base64,") and
+            toolimagedata(imgs[1][1]) == TOOLJPEG, f"the JPEG {imgs[1][1][:40]}")
+
+    # Newer images: with [desktop] images = 1, the set leaves whole
+    t.host.write(t.config, t.host.read(t.config) + "[desktop]\nimages = 1\nimages_slack = 0\n")
+    r3 = t.run("more", resume=sid)
+    t.check(r3.rc == 0, f"more: exit {r3.rc}: {r3.stderr}")
+    last = t.requests()[-1]["body"]
+    imgs = fake_provider.desk_images(last)
+    alts = [p["text"] for m in last["messages"]
+            if m["role"] == "user" and isinstance(m["content"], list)
+            for p in m["content"] if p["type"] == "text" and p["text"].startswith("[PDF images")]
+    t.check(len(imgs) == 1 and "Image" not in imgs[0][0], f"only the newer shown {imgs}")
+    t.check(alts == [f"[PDF images omitted: {call}; read the file again to see them]"],
+            f"the set stands in: {alts}")
+
+
+@scenario(conf={**AN, "_extra": "[model {model}]\nimage_edge = 64\n"}, bound=20)
+def an_tool_images(t):
+    """On kind anthropic, a tool result's several images go inside its
+    tool_result, each after a caption, as the API takes them."""
+    readimages(t)
+    r = t.run(env=ANENV)
+    anok(t, r)
+    sid, call = toolimageset(t, r, label=False)
+    r2 = t.run("again", resume=sid, env=ANENV)
+    anok(t, r2)
+    res = an_result(t.requests()[-1]["body"], 0)
+    t.check([c["type"] for c in res] == ["text", "text", "image", "text", "image"],
+            f"in the result {[c['type'] for c in res]}")
+    t.check([res[1]["text"], res[3]["text"]] == [f"Image 1 from tool call {call}:",
+                                                 f"Image 2 from tool call {call}:"],
+            f"numbered by place {res[1]} {res[3]}")
+    t.check(res[2]["source"]["media_type"] == "image/png" and
+            res[4]["source"]["media_type"] == "image/jpeg" and
+            base64.b64decode(res[4]["source"]["data"]) == TOOLJPEG, "their mimes")
+    t.check(not r2.all("retry"), "the API took them")
+
+
+@scenario(conf={**RS, "_extra": "[model {model}]\nimage_edge = 64\n"}, bound=20)
+def rs_tool_images(t):
+    """On the Responses API, a tool result's several images go in a user
+    message after the run of outputs, each after a caption."""
+    readimages(t)
+    r = t.run()
+    rsok(t, r)
+    sid, call = toolimageset(t, r)
+    r2 = t.run("again", resume=sid)
+    rsok(t, r2)
+    msgs = [x for x in rsinput(t.requests()[-1])
+            if x.get("type") == "message" and x.get("role") == "user" and
+            any(c["type"] == "input_image" for c in x["content"])]
+    t.check(len(msgs) == 1, f"one message of images {msgs}")
+    parts = msgs[0]["content"]
+    t.check([c["type"] for c in parts] == ["input_text", "input_image"] * 2, f"parts {parts}")
+    t.check(parts[2]["text"] == f"Image 4 (page 3) from tool call {call}:" and
+            parts[3]["image_url"].startswith("data:image/jpeg;base64,"), f"the JPEG {parts[2:]}")
+    t.check(not r2.all("retry"), "the API took them")
+
 def mkpdf(pages, encrypt=False):
     """A PDF of so many pages, each with a line of text, as bytes: its
     trailer naming an /Encrypt dictionary if encrypt."""
-    objs = ["<< /Type /Catalog /Pages 2 0 R >>",
-            "<< /Type /Pages /Kids [%s] /Count %d >>" %
-            (" ".join(f"{3 + 2*i} 0 R" for i in range(pages)), pages)]
-    font = 3 + 2*pages
-    for i in range(pages):
-        s = f"BT /F1 24 Tf 72 700 Td (Page {i + 1}) Tj ET"
-        objs.append(f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources "
-                    f"<< /Font << /F1 {font} 0 R >> >> /Contents {4 + 2*i} 0 R >>")
-        objs.append(f"<< /Length {len(s)} >>\nstream\n{s}\nendstream")
-    objs.append("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
-    if encrypt:
-        objs.append("<< /Filter /Standard /V 1 /R 2 /O <00> /U <00> /P -4 >>")
-    out, offs = "%PDF-1.4\n", []
-    for i, o in enumerate(objs):
-        offs.append(len(out))
-        out += f"{i + 1} 0 obj\n{o}\nendobj\n"
-    xref = len(out)
-    out += f"xref\n0 {len(objs) + 1}\n0000000000 65535 f \n"
-    out += "".join(f"{o:010d} 00000 n \n" for o in offs)
-    enc = f" /Encrypt {len(objs)} 0 R" if encrypt else ""
-    out += (f"trailer\n<< /Size {len(objs) + 1} /Root 1 0 R{enc} >>\n"
-            f"startxref\n{xref}\n%%EOF\n")
-    return out.encode()
+    return fake_provider.mkpdf(pages, encrypt).encode()
+
+
+mkpdfpages = fake_provider.mkpdfpages
+pdfrgb = fake_provider.pdfrgb
+
+
+PDFJPEG = flatjpeg(40, 30)
+
+
+def imgpdf():
+    """img.pdf's bytes (pdfimages)."""
+    im1 = pdfrgb(100, 50, (200, 30, 30))
+    im2 = (f"/Width 40 /Height 30 /ColorSpace /DeviceGray /BitsPerComponent 8 "
+           f"/Filter /DCTDecode", PDFJPEG)
+    return mkpdfpages(
+        [(["A red chart:"], ["Im1"]),
+         (["The chart again, and a photo:"], ["Im1", "Im2"]),
+         (["No pictures here."], [])], {"Im1": im1, "Im2": im2})
+
+
+def pdfimages(t):
+    """The work directory's PDFs with images: img.pdf, a 100x50 deflated
+    image on pages 1 and 2 and a 40x30 JPEG on page 2; many.pdf, ten
+    images, one a page; scan.pdf, two pages each only an image; and
+    blank.pdf, two pages with nothing on them."""
+    t.host.write(t.host.join(t.work, "img.pdf"), imgpdf())
+    many = {f"I{i}": pdfrgb(30, 30, (i*20, 100, 50)) for i in range(10)}
+    t.host.write(t.host.join(t.work, "many.pdf"), mkpdfpages(
+        [([f"Picture {i}:"], [f"I{i}"]) for i in range(10)], many))
+    t.host.write(t.host.join(t.work, "scan.pdf"), mkpdfpages(
+        [([], ["S"]), ([], ["S"])], {"S": pdfrgb(60, 80, (240, 240, 240))}))
+    t.host.write(t.host.join(t.work, "blank.pdf"), mkpdfpages([([], []), ([], [])]))
+
+
+IMGPDF = ("img.pdf: a PDF, 3 pages, its text extracted, with the 2 images on these "
+          "pages after it:\n"
+          "     1\t--- page 1 ---\n     2\tA red chart:\n     3\t[image 1: 100x50 RGB]\n"
+          "     4\t--- page 2 ---\n     5\tThe chart again, and a photo:\n"
+          "     6\t[image 1: 100x50 RGB]\n     7\t[image 2: 40x30 JPEG]\n"
+          "     8\t--- page 3 ---\n     9\tNo pictures here.\n")
 
 
 def an_result(body, i):
@@ -13719,8 +13995,11 @@ def an_read_pdf(t):
             f"the second {ends[1]}")
     t.check(ends[2]["status"] == "error" and "encrypted" in texts[2] and
             "pdftotext" in texts[2] and "pdf" not in ends[2], f"locked {ends[2]}")
-    t.check(ends[3]["status"] == "error" and "51 pages" in texts[3] and
-            "more than the 50 pages" in texts[3] and "pdf" not in ends[3], f"long {ends[3]}")
+    t.check(ends[3]["status"] == "ok" and
+            texts[3].startswith("long.pdf: a PDF, 51 pages, its text extracted, as more "
+                                "than the 50 pages that can be sent as a document:\n"
+                                "     1\t--- page 1 ---\n") and
+            "pdf" not in ends[3], f"long {ends[3]}")
     sid = r.sessions()[0]
     kept = t.host.read(t.host.join(t.state, "sessions", sid, ends[0]["pdf"]))
     t.check(kept == three.decode(), "kept as read")
@@ -13789,20 +14068,645 @@ def an_read_pdf_bad(t):
     t.check(r.text().endswith("It was damaged."), f"answered {r.text()!r}")
 
 
+@scenario(conf=AN, bound=15)
+def an_read_pdf_damaged(t):
+    """On kind anthropic, a PDF that loads only by repair, which the API
+    may refuse as invalid, has its text extracted instead, the head
+    saying why: one with junk before its header, one whose page tree
+    counts pages it lacks, and one cut short before its xref."""
+    good = mkpdf(2)
+    t.host.write(t.host.join(t.work, "junk.pdf"), b"junk\n" + good)
+    t.host.write(t.host.join(t.work, "count.pdf"), good.replace(b"/Count 2", b"/Count 9"))
+    t.host.write(t.host.join(t.work, "cut.pdf"), good[:good.index(b"xref")])
+    r = t.run(env=ANENV)
+    anok(t, r)
+    ends = r.all("tool.end")
+    for e, name in zip(ends, ["junk.pdf", "count.pdf", "cut.pdf"]):
+        t.check(e["status"] == "ok" and "pdf" not in e and
+                e["text"].startswith(f"{name}: a PDF, ") and
+                ", its text extracted, as it is damaged, and may be refused as a "
+                "document" in e["text"].split("\n")[0] and
+                "\t--- page 2 ---\n" in e["text"] and "Page 2" in e["text"],
+                f"{name} {e}")
+    t.check(len(ends) == 3 and not r.all("retry"), "the API took every request")
+
+
+@scenario(conf=AN, bound=30)
+def an_read_pdf_edge(t):
+    """On kind anthropic, a PDF of exactly the 50 pages a request has room
+    for goes as a document; one whose pages cannot be counted, or over
+    the 16 MiB a document may be, has its text extracted, the head saying
+    why."""
+    t.host.write(t.host.join(t.work, "fifty.pdf"), mkpdf(50))
+    nocount = mkpdf(2)
+    for s in (b"/Type /Pages ", b"/Type /Page ", b" /Count 2"):
+        nocount = nocount.replace(s, b" " * len(s))
+    t.host.write(t.host.join(t.work, "nocount.pdf"), nocount)
+    t.host.write(t.host.join(t.work, "huge.pdf"),
+                 mkpdfpages([(["Before the pad."], []), (["After it."], [])], pad=17 << 20))
+    r = t.run(json.dumps([["read", {"path": p}] for p in
+                          ("fifty.pdf", "nocount.pdf", "huge.pdf")]), env=ANENV)
+    anok(t, r)
+    ends = r.all("tool.end")
+    t.check(ends[0].get("pages") == 50 and "shown to you as a document" in ends[0]["text"],
+            f"fifty {ends[0]}")
+    t.check(ends[1]["text"] == "nocount.pdf: a PDF, 2 pages, its text extracted, as its "
+                               "pages cannot be counted to send it as a document:\n"
+                               "     1\t--- page 1 ---\n     2\tPage 1\n"
+                               "     3\t--- page 2 ---\n     4\tPage 2\n" and
+            "pdf" not in ends[1], f"nocount {ends[1]}")
+    t.check(ends[2]["text"].startswith("huge.pdf: a PDF, 2 pages, its text extracted, as "
+                                       "it is over the 16 MiB that can be sent as a "
+                                       "document:\n     1\t--- page 1 ---\n") and
+            "pdf" not in ends[2], f"huge {ends[2]['text'][:300]!r}")
+
+
+@scenario(conf={**AN, "_extra": "[model {model}]\nimage_edge = 1000\n"}, bound=60)
+def an_read_pdf_reqbytes(t):
+    """A request carries at most 20 MiB of PDFs and PDF images together,
+    within the API's 32 MB of base64: a 14 MiB document read after seven
+    images of 1 MB each leaves room for the document alone, the images
+    left out with a text in their place."""
+    big = padjpeg(flatjpeg(700, 700), 1_000_000)
+    imgs = {f"J{i}": ("/Width 700 /Height 700 /ColorSpace /DeviceGray /BitsPerComponent 8 "
+                      "/Filter /DCTDecode", big) for i in range(7)}
+    pages = [([f"Photo {i}:"], [f"J{i}"] if i < 7 else []) for i in range(51)]
+    t.host.write(t.host.join(t.work, "pics.pdf"), mkpdfpages(pages, imgs))
+    t.host.write(t.host.join(t.work, "doc.pdf"),
+                 mkpdfpages([(["Before the pad."], []), (["After it."], [])], pad=14 << 20))
+    r = t.run(json.dumps([["read", {"path": "pics.pdf"}], ["read", {"path": "doc.pdf"}]]),
+              env=ANENV)
+    ends = r.all("tool.end")
+    t.check(len(ends) == 2 and len(ends[0].get("images", [])) == 7 and
+            ends[1].get("pages") == 2, f"seven images, then a document {ends}")
+    bodies = [q["body"] for q in t.requests()]
+    t.check(r.rc == 0 and len(bodies) >= 3, f"exit {r.rc}, requests {len(bodies)}")
+    first = an_result(bodies[1], 0)
+    t.check([c["type"] for c in first].count("image") == 7, "the images sent at first")
+    last = bodies[2]
+    pics = an_result(last, 0)
+    t.check("image" not in [c["type"] for c in pics] and
+            any(c["type"] == "text" and c["text"].startswith("[PDF images omitted: ")
+                for c in pics), f"the images left out {[c['type'] for c in pics]}")
+    t.check([c["type"] for c in an_result(last, 1)] == ["text", "document"],
+            "the document stays")
+
+
+def readdesc(req):
+    """read's description in a Chat Completions request."""
+    return [x["function"]["description"] for x in req["tools"]
+            if x["function"]["name"] == "read"][0]
+
+
 @scenario(bound=15)
-def read_pdf_unsent(t):
-    """A model not on kind anthropic is told what a PDF is, and that the
-    shell can extract its text, and read's description offers none."""
+def read_pdf_text(t):
+    """A model not on kind anthropic is shown a PDF's text, extracted, a
+    line starting each page, numbered as read numbers a text file's, and
+    read's description says so."""
     t.host.write(t.host.join(t.work, "three.pdf"), mkpdf(3))
     r = t.run()
     t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
     end = r.all("tool.end")[0]
-    t.check(end["status"] == "ok" and "pdf" not in end and
-            end["text"].startswith("three.pdf: a PDF, 3 pages, 2 KiB. This model is not "
-                                   "sent PDFs") and "pdftotext" in end["text"], f"told {end}")
-    desc = [x["function"]["description"] for x in t.requests()[0]["body"]["tools"]
-            if x["function"]["name"] == "read"][0]
-    t.check("PDF" not in desc, f"read's description: {desc}")
+    t.check(end["status"] == "ok" and "pdf" not in end and "images" not in end and
+            end["text"] == "three.pdf: a PDF, 3 pages, its text extracted:\n"
+                           "     1\t--- page 1 ---\n     2\tPage 1\n"
+                           "     3\t--- page 2 ---\n     4\tPage 2\n"
+                           "     5\t--- page 3 ---\n     6\tPage 3\n", f"shown {end}")
+    desc = readdesc(t.requests()[0]["body"])
+    t.check("a PDF as its text, a '--- page N ---' line starting each page, with the "
+            "images on its pages shown" in desc, f"read's description: {desc}")
+    t.check(not fake_provider.desk_images(t.requests()[-1]["body"]), "no images")
+
+
+@scenario(bound=15)
+def read_pdf_paging(t):
+    """A PDF's text is read on as a text file's lines are (offset, limit):
+    a window short of the whole keeps the whole text in the session's
+    out/CALL.txt, said in the result, which reading on reuses while the
+    file is unchanged; once it changes, it is read again."""
+    t.host.write(t.host.join(t.work, "thirty.pdf"), mkpdf(30))
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    ends = r.all("tool.end")
+    texts = [e["text"] for e in ends]
+    sid = r.sessions()[0]
+    sdir = t.host.join(t.state, "sessions", sid)
+    kept = t.host.join(sdir, "out", ends[0]["call"] + ".txt")
+    t.check(texts[0] == "thirty.pdf: a PDF, 30 pages, its text extracted:\n"
+                       "     1\t--- page 1 ---\n     2\tPage 1\n     3\t--- page 2 ---\n"
+                       "     4\tPage 2\n     5\t--- page 3 ---\n"
+                       "[Showing lines 1-5 of 60. To read more, call read with offset=6.]\n"
+                       f"[The whole text is kept at {kept}.]\n", f"the first {texts[0]!r}")
+    whole = "".join(f"--- page {i} ---\nPage {i}\n" for i in range(1, 31))
+    t.check(t.host.read(kept) == whole, "the whole text kept")
+    t.check(texts[1].startswith("thirty.pdf: a PDF, 30 pages, its text extracted:\n"
+                                "     6\tPage 3\n     7\t--- page 4 ---\n") and
+            texts[1].endswith("[Showing lines 6-10 of 60. To read more, call read with "
+                              f"offset=11.]\n[The whole text is kept at {kept}.]\n"),
+            f"read on, from the text kept {texts[1]!r}")
+    t.check(t.host.read(t.host.join(sdir, "out", ends[1]["call"] + ".txt")) is None,
+            "kept once")
+    t.check(ends[2]["status"] == "ok", f"rewritten {ends[2]}")
+    t.check(texts[3] == "thirty.pdf: a PDF, 31 pages, its text extracted:\n"
+                       "    61\t--- page 31 ---\n    62\tPage 31\n", f"read anew {texts[3]!r}")
+
+
+READPDFIMG = "[model {model}]\nimage_edge = 64\n"
+
+
+@scenario(conf={"_extra": READPDFIMG}, bound=20)
+def read_pdf_images(t):
+    """To a model that takes images, read shows the images a PDF's window
+    of text draws, each once, at most 8, the window cut before the 9th:
+    kept as out/CALL-N.png (or .jpg, a JPEG passed through), named in the
+    record (images) with their labels, sent after the results, each after
+    a caption naming it, its page and its call; left out together as
+    newer images come ([desktop] images); a resumed session's request
+    carries them as they were."""
+    pdfimages(t)
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    ends = r.all("tool.end")
+    c0, c1 = ends[0]["call"], ends[1]["call"]
+    t.check(ends[0]["text"] == IMGPDF, f"img.pdf {ends[0]['text']!r}")
+    t.check(ends[0].get("images") == [
+        {"name": f"out/{c0}-1.png", "mime": "image/png", "w": 64, "h": 32,
+         "label": "image 1 (page 1)"},
+        {"name": f"out/{c0}-2.jpg", "mime": "image/jpeg", "w": 40, "h": 30,
+         "label": "image 2 (page 2)"}] and ends[0].get("image") == f"out/{c0}-1.png",
+            f"its images {ends[0]}")
+    sid = r.sessions()[0]
+    sdir = t.host.join(t.state, "sessions", sid)
+    t.check(t.host.read(t.host.join(sdir, "out", f"{c0}-2.jpg")) ==
+            PDFJPEG.decode("utf-8", "replace"), "the JPEG kept as it was")
+
+    reqs = [q["body"] for q in t.requests()]
+    imgs = fake_provider.desk_images(reqs[1])
+    t.check([lab for lab, _ in imgs] == [f"Image 1 (page 1) from tool call {c0}:",
+                                         f"Image 2 (page 2) from tool call {c0}:"],
+            f"captioned {[lab for lab, _ in imgs]}")
+    t.check(pngdims(toolimagedata(imgs[0][1])) == (64, 32) and
+            imgs[0][1].startswith("data:image/png;base64,"), "the PNG, scaled")
+    t.check(imgs[1][1].startswith("data:image/jpeg;base64,") and
+            toolimagedata(imgs[1][1]) == PDFJPEG, "the JPEG as it was")
+
+    # Ten images: eight shown, the window cut before the ninth's line
+    many = ends[1]
+    t.check(many["text"].startswith("many.pdf: a PDF, 10 pages, its text extracted, with "
+                                    "the 8 images on these pages after it:\n") and
+            "    26\t[Showing lines 1-26 of 30" not in many["text"] and
+            "[Showing lines 1-26 of 30. To read more, call read with offset=27.]\n"
+            in many["text"] and "[The whole text is kept at " in many["text"],
+            f"many.pdf {many['text']!r}")
+    t.check([g["label"] for g in many["images"]] ==
+            [f"image {i} (page {i})" for i in range(1, 9)], f"eight {many['images']}")
+    last = reqs[-1]
+    imgs = fake_provider.desk_images(last)
+    t.check([lab for lab, _ in imgs] ==
+            [f"Image 1 (page 1) from tool call {c0}:", f"Image 2 (page 2) from tool call {c0}:"]
+            + [f"Image {i} (page {i}) from tool call {c1}:" for i in range(1, 9)],
+            f"both sets {[lab for lab, _ in imgs]}")
+    alts = [p["text"] for m in last["messages"]
+            if m["role"] == "user" and isinstance(m["content"], list)
+            for p in m["content"] if p["type"] == "text" and p["text"].startswith("[PDF images")]
+    t.check(alts == [], f"both sets fit {alts}")
+
+    # Resumed with room for one set: the older leaves
+    t.host.write(t.config, t.host.read(t.config) + "[desktop]\nimages = 1\nimages_slack = 0\n")
+    r2 = t.run("again", resume=sid)
+    t.check(r2.rc == 0, f"resumed: exit {r2.rc}: {r2.stderr}")
+    again = t.requests()[-1]["body"]
+    imgs = fake_provider.desk_images(again)
+    t.check([lab for lab, _ in imgs] == [f"Image {i} (page {i}) from tool call {c1}:"
+                                         for i in range(1, 9)], f"replayed {imgs}")
+    alts = [p["text"] for m in again["messages"]
+            if m["role"] == "user" and isinstance(m["content"], list)
+            for p in m["content"] if p["type"] == "text" and p["text"].startswith("[PDF images")]
+    t.check(alts == [f"[PDF images omitted: {c0}; read the file again to see them]"],
+            f"the older set stands in {alts}")
+
+
+@scenario(conf={**RS, "_extra": READPDFIMG}, bound=20)
+def read_pdf_images_rs(t):
+    """On the Responses API, a PDF's images go in a user message after the
+    run of outputs, each after its caption; a scan's pages come as its
+    images."""
+    pdfimages(t)
+    r = t.run()
+    rsok(t, r)
+    ends = r.all("tool.end")
+    c0 = ends[0]["call"]
+    t.check(ends[0]["text"] == IMGPDF, f"img.pdf {ends[0]['text']!r}")
+    t.check(ends[1]["text"].startswith(
+        "scan.pdf: a PDF, 2 pages, with no text, only images of its pages (a scan), with "
+        "the image on these pages after it:\n") and len(ends[1]["images"]) == 1,
+            f"scan.pdf {ends[1]}")
+    msgs = [x for x in rsinput(t.requests()[1])
+            if x.get("type") == "message" and x.get("role") == "user" and
+            any(c["type"] == "input_image" for c in x["content"])]
+    t.check(len(msgs) == 1, f"one message of images {msgs}")
+    parts = msgs[0]["content"]
+    t.check([c["type"] for c in parts] == ["input_text", "input_image"] * 2, f"parts {parts}")
+    t.check(parts[0]["text"] == f"Image 1 (page 1) from tool call {c0}:" and
+            parts[1]["image_url"].startswith("data:image/png;base64,") and
+            parts[2]["text"] == f"Image 2 (page 2) from tool call {c0}:" and
+            parts[3]["image_url"].startswith("data:image/jpeg;base64,"), f"captioned {parts}")
+    t.check(not r.all("retry"), "the API took them")
+
+
+@scenario(conf={"_extra": "[model {model}]\nvision = false\n"}, bound=15)
+def read_pdf_blind(t):
+    """A model that takes no images is shown a PDF's text with its image
+    lines, and told they stand for pictures not shown; a scan is said to
+    be one, pointing to OCR in the shell, and a PDF whose words are
+    shapes to rendering its pages. No images are kept or sent."""
+    pdfimages(t)
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    ends = r.all("tool.end")
+    t.check(ends[0]["text"] == IMGPDF.replace(", with the 2 images on these pages after it",
+                                              "") +
+            "[This model takes no images: each [image ...] line stands for a picture "
+            "that is not shown.]\n" and "images" not in ends[0], f"img.pdf {ends[0]}")
+    t.check(ends[1]["text"].startswith("scan.pdf: a PDF, 2 pages, with no text, only images "
+                                       "of its pages (a scan):\n") and
+            "tesseract" in ends[1]["text"] and "images" not in ends[1], f"scan {ends[1]}")
+    t.check(ends[2]["text"] == "blank.pdf: a PDF, 2 pages, with no text to extract:\n"
+                               "     1\t--- page 1 ---\n     2\t[no text on this page]\n"
+                               "     3\t--- page 2 ---\n     4\t[no text on this page]\n"
+                               "[No text could be extracted: its words may be drawn as "
+                               "shapes. The shell may render its pages as images (pdftoppm "
+                               "-png -r 100) and OCR them (tesseract).]\n",
+            f"blank {ends[2]['text']!r}")
+    reqs = [q["body"] for q in t.requests()]
+    t.check(not any(fake_provider.desk_images(q) for q in reqs), "no image sent")
+    desc = readdesc(reqs[0])
+    t.check("a PDF shows as its text" in desc and "image" not in desc,
+            f"read's description: {desc}")
+
+
+@scenario(bound=15)
+def read_pdf_locked(t):
+    """An encrypted PDF is refused on any kind, pointing to the shell."""
+    t.host.write(t.host.join(t.work, "locked.pdf"), mkpdf(1, encrypt=True))
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    end = r.all("tool.end")[0]
+    t.check(end["status"] == "error" and
+            end["text"].startswith("locked.pdf: a PDF, encrypted, which cannot be read here.")
+            and "pdftotext" in end["text"], f"refused {end}")
+
+
+@scenario(conf={**AN, "_extra": "[model {model}]\npdf = false\nimage_edge = 64\n"}, bound=15)
+def an_read_pdf_text(t):
+    """On kind anthropic with [model] pdf = false, read extracts a PDF's
+    text, as for other kinds, its images inside the tool_result after
+    their captions, and read's description offers no documents."""
+    pdfimages(t)
+    r = t.run(env=ANENV)
+    anok(t, r)
+    end = r.all("tool.end")[0]
+    t.check(end["text"] == IMGPDF and "pdf" not in end and len(end["images"]) == 2,
+            f"extracted {end}")
+    reqs = [q["body"] for q in t.requests()]
+    desc = [x["description"] for x in reqs[0]["tools"] if x["name"] == "read"][0]
+    t.check("a PDF as its text" in desc and "document" not in desc, f"read says so: {desc}")
+    res = an_result(reqs[1], 0)
+    t.check([c["type"] for c in res] == ["text", "text", "image", "text", "image"],
+            f"in the result {[c['type'] for c in res]}")
+    t.check([res[1]["text"], res[3]["text"]] ==
+            [f"Image 1 (page 1) from tool call {end['call']}:",
+             f"Image 2 (page 2) from tool call {end['call']}:"], f"captions {res[1]} {res[3]}")
+    t.check(res[4]["source"]["media_type"] == "image/jpeg" and
+            base64.b64decode(res[4]["source"]["data"]) == PDFJPEG, "the JPEG")
+    t.check(not r.all("retry"), "the API took them")
+
+
+IMGPDFTEXT = ("--- page 1 ---\nA red chart:\n[image 1: 100x50 RGB]\n"
+              "--- page 2 ---\nThe chart again, and a photo:\n"
+              "[image 1: 100x50 RGB]\n[image 2: 40x30 JPEG]\n"
+              "--- page 3 ---\nNo pictures here.\n")
+
+
+@scenario(conf={"_extra": READPDFIMG + "[model {model2}]\nvision = false\n"}, bound=20)
+def attach_pdf(t):
+    """A PDF attached is kept as files/N-NAME.pdf, its text extracted
+    beside it as files/N-NAME.pdf.txt, which the reply names, with the
+    text's bytes and lines; a request has that text as an attached file's,
+    under a head that says it is a PDF's and where the PDF is. A model
+    that takes images gets the images that text's window shows as the
+    message's own (img/N), each with a label and a caption naming it, at
+    most 10 images to a message with those attached. A name without .pdf
+    gets it; an encrypted PDF is refused, as is one with no text."""
+    h = t.headless()
+    try:
+        h.call("hello", proto=0, client="scenarios")
+        caps = h.all("hello")[0].get("caps", [])
+        t.check("pdf" in caps, f"caps: {caps}")
+        img = imgpdf()
+
+        # Its text, to a model without vision
+        blind = h.call("new", cwd=t.work, model=t.model2, endpoint="fake")["sid"]
+        r = upfile(t, h, blind, img, "img.pdf")
+        t.check(r.get("ok") == 1 and r.get("name") == "files/1-img.pdf.txt" and
+                r.get("bytes") == len(IMGPDFTEXT) and r.get("lines") == 9, f"uploaded: {r}")
+        fdir = t.host.join(t.state, "sessions", blind, "files")
+        t.check(t.host.read(t.host.join(fdir, "1-img.pdf")) == img.decode("utf-8", "replace"),
+                "the PDF kept")
+        t.check(t.host.read(t.host.join(fdir, "1-img.pdf.txt")) == IMGPDFTEXT, "its text kept")
+        h.call("prompt", sid=blind, text="what is this?", files=[r["name"]])
+        ended(h, blind, 1)
+        user = h.all("user", blind)[0]
+        t.check(user["files"] == [{"name": "files/1-img.pdf.txt", "bytes": len(IMGPDFTEXT),
+                                   "lines": 9}] and "images" not in user, f"the user {user}")
+        said = fake_provider.user_text_all(t.requests(t.model2)[-1]["body"])
+        pdf = t.host.join(fdir, "1-img.pdf")
+        t.check(f"[Attached PDF img.pdf, its text extracted, kept at {pdf}.txt, where read "
+                f"continues it; the PDF itself is at {pdf}:]\n     1\t--- page 1 ---\n"
+                "     2\tA red chart:\n     3\t[image 1: 100x50 RGB]\n" in said and
+                said.endswith("what is this?"), f"the request: {said[:500]}")
+        t.check(lastsaid(h, blind) == "1 PDFs, 0 images.", f"said {lastsaid(h, blind)}")
+
+        def refused(r, err):
+            t.check(r.get("ok") == 0 and r.get("err", "").startswith(err), f"{err}: {r}")
+
+        refused(upfile(t, h, blind, mkpdf(1, encrypt=True), "locked.pdf"),
+                "locked.pdf is a PDF, encrypted, so it is not attached")
+        refused(upfile(t, h, blind, b"%PDF-1.4\n%%EOF\n", "empty.pdf"),
+                "empty.pdf is a PDF whose text cannot be read (")
+        r = upfile(t, h, blind, mkpdf(2), "scan")
+        t.check(r.get("name") == "files/2-scan.pdf.txt" and r.get("lines") == 4,
+                f"named as a PDF: {r}")
+
+        # Its images too, to a model that takes them
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        r = upfile(t, h, sid, img, "img.pdf")
+        t.check(r.get("name") == "files/1-img.pdf.txt", f"uploaded: {r}")
+        h.call("prompt", sid=sid, text="and this?", files=[r["name"]])
+        ended(h, sid, 1)
+        user = h.all("user", sid)[0]
+        t.check(user.get("images") == [
+            {"name": "img/1.png", "mime": "image/png", "w": 64, "h": 32,
+             "label": "image 1 (page 1) of img.pdf"},
+            {"name": "img/2.jpg", "mime": "image/jpeg", "w": 40, "h": 30,
+             "label": "image 2 (page 2) of img.pdf"}], f"the user {user}")
+        idir = t.host.join(t.state, "sessions", sid, "img")
+        t.check(t.host.read(t.host.join(idir, "2.jpg")) == PDFJPEG.decode("utf-8", "replace"),
+                "the JPEG as it was")
+        body = t.requests(t.model)[-1]["body"]
+        imgs = fake_provider.desk_images(body)
+        t.check([lab for lab, _ in imgs] == ["Image 1 (page 1) of img.pdf:",
+                                             "Image 2 (page 2) of img.pdf:"],
+                f"captioned {[lab for lab, _ in imgs]}")
+        t.check(pngdims(toolimagedata(imgs[0][1])) == (64, 32) and
+                toolimagedata(imgs[1][1]) == PDFJPEG, "the images sent")
+        said = fake_provider.user_text_all(body)
+        t.check(", which read shows with its images:]\n" in said, f"the head {said[:400]}")
+        t.check(lastsaid(h, sid) == "1 PDFs, 2 images.", f"said {lastsaid(h, sid)}")
+
+        # Ten images to a message: nine attached leave room for one
+        names = [attached(t, h, sid, PNG) for _ in range(9)]
+        h.call("prompt", sid=sid, text="all", files=[r["name"]], images=names)
+        ended(h, sid, 2)
+        got = h.all("user", sid)[1]["images"]
+        t.check(len(got) == 10 and got[9]["label"] == "image 1 (page 1) of img.pdf" and
+                got[9]["name"] == "img/12.png", f"one more {got[9:]}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+JUNKTEXT = ("# Notes on PDFs\n\nEvery PDF begins with %PDF-1.7 and a comment line.\n" +
+            "More text.\n" * 20)
+
+
+def pdfmore(t):
+    """read_pdf_more's files, beside pdfimages's: late.pdf, its only image
+    on page 2; trunc.pdf, img.pdf cut short; badimg.pdf, an image whose
+    data is junk; jbig.pdf, a scan in JBIG2; thirty.pdf and three.pdf;
+    and notes.md, a text file that mentions "%PDF-" in its first KiB."""
+    pdfimages(t)
+    w = lambda name, data: t.host.write(t.host.join(t.work, name), data)
+    w("late.pdf", mkpdfpages([(["No image here."], []), (["A picture:"], ["L"])],
+                             {"L": pdfrgb(40, 30, (10, 200, 10))}))
+    img = imgpdf()
+    w("trunc.pdf", img[:len(img)*7//10])
+    w("badimg.pdf", mkpdfpages([(["Broken:"], ["B"])], {"B": (
+        "/Width 40 /Height 30 /ColorSpace /DeviceRGB /BitsPerComponent 8 "
+        "/Filter /FlateDecode", b"\x78\x9c" + b"\xff" * 40)}))
+    w("jbig.pdf", mkpdfpages([([], ["J"]), ([], ["J"])], {"J": (
+        "/Width 60 /Height 80 /ColorSpace /DeviceGray /BitsPerComponent 1 "
+        "/Filter /JBIG2Decode", bytes(50))}))
+    w("thirty.pdf", mkpdf(30))
+    w("three.pdf", mkpdf(3))
+    w("notes.md", JUNKTEXT)
+
+
+READ_PDF_MORE = [
+    ["read", {"path": "many.pdf"}],
+    ["read", {"path": "many.pdf", "offset": 27}],
+    ["read", {"path": "img.pdf", "limit": 3}],
+    ["read", {"path": "img.pdf", "offset": 4, "limit": 4}],
+    ["read", {"path": "late.pdf"}],
+    ["read", {"path": "trunc.pdf"}],
+    ["read", {"path": "badimg.pdf"}],
+    ["read", {"path": "jbig.pdf"}],
+    ["read", {"path": "blank.pdf"}],
+    ["read", {"path": "thirty.pdf", "limit": 5}],
+    ["write", {"path": "thirty.pdf",
+               "content": fake_provider.mkpdf(30).replace("(Page 1)", "(Page X)")}],
+    ["read", {"path": "thirty.pdf", "limit": 5}],
+    ["read", {"path": "three.pdf", "offset": 100}],
+    ["read", {"path": "notes.md"}],
+]
+
+
+@scenario(conf={"_extra": READPDFIMG}, bound=30)
+def read_pdf_more(t):
+    """read of PDFs, more cases: reading on into images, from the text
+    kept, decodes those the window shows; a window shows the images of
+    its lines alone, labelled with their pages; a damaged PDF recovered;
+    an image that cannot be decoded named; a scan in JBIG2, and a PDF of
+    shapes, pointing to rendering its pages; a file changed though its
+    size is not, read again; an offset past the end keeping nothing; and
+    a text file that mentions "%PDF-" shown as text."""
+    pdfmore(t)
+    r = t.run(json.dumps(READ_PDF_MORE))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    ends = r.all("tool.end")
+    t.check(len(ends) == len(READ_PDF_MORE) and all(e["status"] == "ok" for e in ends),
+            f"statuses {[e['status'] for e in ends]}")
+    tx = [e["text"] for e in ends]
+    sid = r.sessions()[0]
+    sdir = t.host.join(t.state, "sessions", sid)
+    call = [e["call"] for e in ends]
+    labels = lambda e: [g["label"] for g in e.get("images", [])]
+
+    # Reading on into images, from the text kept
+    kept = t.host.join(sdir, "out", call[0] + ".txt")
+    t.check(tx[1] == "many.pdf: a PDF, 10 pages, its text extracted, with the 2 images on "
+                     "these pages after it:\n    27\t[image 9: 30x30 RGB]\n"
+                     "    28\t--- page 10 ---\n    29\tPicture 9:\n"
+                     "    30\t[image 10: 30x30 RGB]\n", f"read on {tx[1]!r}")
+    t.check([(g["name"], g["label"]) for g in ends[1]["images"]] ==
+            [(f"out/{call[1]}-1.png", "image 9 (page 9)"),
+             (f"out/{call[1]}-2.png", "image 10 (page 10)")], f"its images {ends[1]}")
+    t.check(t.host.read(t.host.join(sdir, "out", call[1] + ".txt")) is None and
+            t.host.read(kept) is not None, "the text kept once")
+
+    # The window's images alone
+    t.check(labels(ends[2]) == ["image 1 (page 1)"] and
+            "[Showing lines 1-3 of 9. To read more, call read with offset=4.]" in tx[2],
+            f"limit=3 {ends[2]}")
+    t.check(labels(ends[3]) == ["image 1 (page 2)", "image 2 (page 2)"] and
+            tx[3].startswith("img.pdf: a PDF, 3 pages, its text extracted, with the 2 "
+                             "images on these pages after it:\n     4\t--- page 2 ---\n"),
+            f"offset=4 {ends[3]}")
+    imgs = fake_provider.desk_images(t.requests()[4]["body"])
+    t.check([lab for lab, _ in imgs][-2:] == [f"Image 1 (page 2) from tool call {call[3]}:",
+                                              f"Image 2 (page 2) from tool call {call[3]}:"],
+            f"captioned {[lab for lab, _ in imgs]}")
+    t.check(labels(ends[4]) == ["image 1 (page 2)"] and
+            tx[4].endswith("     4\tA picture:\n     5\t[image 1: 40x30 RGB]\n"),
+            f"late.pdf {ends[4]}")
+
+    # Damaged, and an image that cannot be decoded
+    t.check(tx[5].startswith("trunc.pdf: a PDF, 3 pages, damaged but recovered, its text "
+                             "extracted, with the image on these pages after it:\n") and
+            labels(ends[5]) == ["image 1 (page 1)"], f"trunc.pdf {ends[5]}")
+    t.check(tx[6] == "badimg.pdf: a PDF, 1 page, its text extracted:\n"
+                     "     1\t--- page 1 ---\n     2\tBroken:\n     3\t[image 1: 40x30 RGB]\n"
+                     "[image 1 (page 1) is not shown: its data cannot be decoded.]\n" and
+            "images" not in ends[6], f"badimg.pdf {ends[6]}")
+
+    # Nothing to show: rendering the pages
+    t.check(tx[7].startswith("jbig.pdf: a PDF, 2 pages, with no text, only images of its "
+                             "pages (a scan):\n     1\t--- page 1 ---\n"
+                             "     2\t[image 1: 60x80, not shown (JBIG2)]\n") and
+            tx[7].endswith("[The images marked not shown are in a format that cannot be "
+                           "shown here. The shell may render their pages as images "
+                           "(pdftoppm -png -r 100), which read then shows you.]\n") and
+            "images" not in ends[7], f"jbig.pdf {ends[7]}")
+    t.check(tx[8].endswith("[No text could be extracted: its words may be drawn as shapes. "
+                           "The shell may render its pages as images (pdftoppm -png -r "
+                           "100), which read then shows you.]\n"), f"blank.pdf {tx[8]!r}")
+
+    # Changed, its size the same
+    t.check("     2\tPage 1\n" in tx[9] and "     2\tPage X\n" in tx[11],
+            f"read again {tx[11]!r}")
+
+    # Past the end: nothing kept
+    t.check(tx[12] == "three.pdf: a PDF, 3 pages, its text extracted:\n"
+                      "The file has only 6 lines, so offset 100 is past its end.",
+            f"past the end {tx[12]!r}")
+    t.check(t.host.read(t.host.join(sdir, "out", call[12] + ".txt")) is None, "none kept")
+
+    # Text, though "%PDF-" is in its first KiB
+    t.check(tx[13].startswith("     1\t# Notes on PDFs\n") and
+            "Every PDF begins with %PDF-1.7" in tx[13], f"notes.md {tx[13]!r}")
+
+
+def padjpeg(jpeg, size):
+    """jpeg made size bytes long by comment segments after its SOI."""
+    out, need = [jpeg[:2]], size - len(jpeg)
+    while need > 0:
+        n = min(need, 65537) - 4
+        n = max(n, 0)
+        out.append(b"\xff\xfe" + (n + 2).to_bytes(2, "big") + b"c" * n)
+        need -= n + 4
+    return b"".join(out) + jpeg[2:]
+
+
+@scenario(conf={"_extra": "[model {model}]\nimage_edge = 1000\n"}, bound=30)
+def read_pdf_bigimgs(t):
+    """A window's images, however large, fit a request: eight JPEGs of
+    1.05 MB each would pass through whole, 8.4 MB, past the 8 MiB of a
+    request's PDF images, so read shrinks them to fit, and the request
+    after it carries all eight."""
+    big = padjpeg(flatjpeg(700, 700), 1_050_000)
+    imgs = {f"J{i}": ("/Width 700 /Height 700 /ColorSpace /DeviceGray /BitsPerComponent 8 "
+                      "/Filter /DCTDecode", big) for i in range(8)}
+    t.host.write(t.host.join(t.work, "big.pdf"),
+                 mkpdfpages([([f"Photo {i}:"], [f"J{i}"]) for i in range(8)], imgs))
+    r = t.run(json.dumps([["read", {"path": "big.pdf"}]]))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    end = r.all("tool.end")[0]
+    t.check(len(end.get("images", [])) == 8, f"eight shown {end}")
+    sdir = t.host.join(t.state, "sessions", r.sessions()[0])
+    total = sum(len(t.host.read(t.host.join(sdir, g["name"])) or "") for g in end["images"])
+    t.check(0 < total <= 8 << 20, f"their files: {total} bytes")
+    body = t.requests()[1]["body"]
+    t.check(len(fake_provider.desk_images(body)) == 8 and
+            "[PDF images omitted" not in json.dumps(body), "all eight sent")
+
+
+@scenario(conf={"_extra": READPDFIMG}, bound=40)
+def attach_pdf_more(t):
+    """Attachments, more cases: a text file that mentions "%PDF-" is
+    attached as text; a PDF named .PDF keeps its PDF handling, named
+    .pdf; a text file named as a PDF's text is renamed, never taken for
+    one; images are labelled with their pages; several PDFs share a
+    message's room for images; and a request carries at most 40 of
+    attached PDFs' images, the newest, older ones left out with a text
+    in their place."""
+    h = t.headless()
+    try:
+        h.call("hello", proto=0, client="scenarios")
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        r = upfile(t, h, sid, JUNKTEXT.encode(), "notes.md")
+        t.check(r.get("ok") == 1 and r.get("name") == "files/1-notes.md", f"text: {r}")
+        r = upfile(t, h, sid, imgpdf(), "SHOUT.PDF")
+        t.check(r.get("name") == "files/2-SHOUT.pdf.txt", f"SHOUT.PDF: {r}")
+        shout = r["name"]
+        r = upfile(t, h, sid, b"Plain text.\n", "notes.pdf.txt")
+        t.check(r.get("name") == "files/3-notes_pdf.txt", f"renamed: {r}")
+        plain = r["name"]
+        late = mkpdfpages([(["No image here."], []), (["A picture:"], ["L"])],
+                          {"L": pdfrgb(40, 30, (10, 200, 10))})
+        r = upfile(t, h, sid, late, "late.pdf")
+        h.call("prompt", sid=sid, text="these", files=[shout, plain, r["name"]])
+        ended(h, sid, 1)
+        user = h.all("user", sid)[0]
+        t.check([g["label"] for g in user.get("images", [])] ==
+                ["image 1 (page 1) of SHOUT.pdf", "image 2 (page 2) of SHOUT.pdf",
+                 "image 1 (page 2) of late.pdf"], f"labels {user.get('images')}")
+        said = fake_provider.user_text_all(t.requests(t.model)[-1]["body"])
+        t.check("[Attached PDF SHOUT.pdf, its text extracted" in said and
+                "[Attached file notes_pdf.txt" in said and
+                "[Attached PDF notes" not in said, f"heads {said[:600]}")
+
+        # Two PDFs share the message's room: 7 images leave 3
+        a = upfile(t, h, sid, imgpdf(), "a.pdf")["name"]
+        b = upfile(t, h, sid, imgpdf(), "b.pdf")["name"]
+        names = [attached(t, h, sid, PNG) for _ in range(7)]
+        h.call("prompt", sid=sid, text="both", files=[a, b], images=names)
+        ended(h, sid, 2)
+        got = [g.get("label", "") for g in h.all("user", sid)[1]["images"]]
+        t.check(got == [""] * 7 + ["image 1 (page 1) of a.pdf", "image 2 (page 2) of a.pdf",
+                                   "image 1 (page 1) of b.pdf"], f"shared {got}")
+
+        # At most 40 in a request: the sixth set of 8 crowds out the first
+        many = {f"I{i}": pdfrgb(30, 30, (i*20, 100, 50)) for i in range(10)}
+        manypdf = mkpdfpages([([f"Picture {i}:"], [f"I{i}"]) for i in range(10)], many)
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        for k in range(6):
+            f = upfile(t, h, sid, manypdf, f"m{k}.pdf")["name"]
+            h.call("prompt", sid=sid, text=f"set {k}", files=[f])
+            ended(h, sid, k + 1)
+        reqs = [q["body"] for q in t.requests(t.model)][-6:]
+        counts = [len(fake_provider.user_images(q)) for q in reqs]
+        t.check(counts == [8, 16, 24, 32, 40, 40], f"images sent {counts}")
+        alts = [p["text"] for m in reqs[-1]["messages"]
+                if m["role"] == "user" and isinstance(m["content"], list)
+                for p in m["content"]
+                if p["type"] == "text" and p["text"].startswith("[image omitted")]
+        t.check(alts == [f"[image omitted: image {i} (page {i}) of m0.pdf, for room in the "
+                         "request for newer images; read the PDF again to see it]"
+                         for i in range(1, 9)], f"in their place {alts}")
+        t.check(lastsaid(h, sid) == "6 PDFs, 40 images.", f"said {lastsaid(h, sid)}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
 
 
 def desk_alts(req):

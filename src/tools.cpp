@@ -114,6 +114,7 @@ enum : i64 {
     MEM_TEXTMAX    = 32 << 10,        // its text
     WEB_QUERYMAX   = 1 << 10,         // longest search query
     WEB_PAGEMAX    = 5 << 20,         // bytes of a page read, then cut
+    WEB_PDFMAX     = sizeof(iz)==4 ? 8<<20 : 32<<20,  // of a PDF read
     WEB_SHOW       = 50 << 10,        // bytes of a page's text shown at once
     WEB_REDIRECTS  = 5,               // to the same host, followed
     WEB_SEARCHES   = 200,             // a session tree's, by default
@@ -863,7 +864,8 @@ static Str tooljson(Arena *a, ToolEnv *te)
         {
             "web_fetch",
             "Read a web page as text: HTML as Markdown with absolute links, "
-            "and plain text, Markdown or JSON as they are. Only https, and "
+            "plain text, Markdown or JSON as they are, and a PDF as its "
+            "text, a '--- page N ---' line starting each page. Only https, and "
             "only a URL that appeared earlier in the conversation (from the "
             "user, a search result, a page read, a file or a command's "
             "output), never one you composed; no local or private "
@@ -966,13 +968,18 @@ static Str tooljson(Arena *a, ToolEnv *te)
     if (te->edit>=0 && te->edit<EDIT_COUNT) {
         defs[TOOL_EDIT] = editdefs[te->edit];
     }
-    if (te->vision) {
-        defs[TOOL_READ].desc =
-            "Read a text file, each line shown with its number and a tab, "
+    // A PDF shows as its text, extracted here (readpdf), unless the
+    // endpoint takes it as a document (te->pdf)
+    defs[TOOL_READ].desc = te->vision ?
+        Str("Read a text file, each line shown with its number and a tab, "
             "2000 lines at a time (continue with offset). A directory lists "
-            "its entries, and an image (PNG, JPEG, GIF, WebP, BMP) is shown "
-            "as an image.";
-    }
+            "its entries, an image (PNG, JPEG, GIF, WebP, BMP) is shown as "
+            "an image, and a PDF as its text, a '--- page N ---' line "
+            "starting each page, with the images on its pages shown.") :
+        Str("Read a text file, each line shown with its number and a tab, "
+            "2000 lines at a time (continue with offset). A directory lists "
+            "its entries, and a PDF shows as its text, a '--- page N ---' "
+            "line starting each page.");
     if (te->pdf) {
         defs[TOOL_READ].desc = te->vision ?
             Str("Read a text file, each line shown with its number and a tab, "
@@ -2529,19 +2536,43 @@ static b32 readbinary(Str data)
     return 0;
 }
 
-// A text file's lines from first, at most limit of them and READ_BYTES
-// in all, each numbered, after head, then a note of where to go on if
-// more are left: read's output, and an attached file's.
-static Str readbody(Arena *a, Str data, Str head, iz first, iz limit)
+// Whether data that pdfsniff takes for a PDF is one for all the reader
+// can tell, though the reader found no pages in it: binary by read's
+// measure, or beginning as a PDF does. A text file that only mentions
+// "%PDF-" in its first KiB is neither, and is read as text.
+static b32 pdflikely(Str data)
 {
+    return readbinary(data) || startswith(data, "%PDF-");
+}
+
+// A window of a text file's lines, as read shows it: its text, the
+// last line it shows, and how many lines the file has. One that shows
+// none (an empty file, or first past the end) has last = first-1, which
+// may be past total, so a caller tests last<first, never last<total.
+struct ReadWin {
+    Str text;
+    iz  last;
+    iz  total;
+};
+
+// A text file's lines from first, at most limit of them and READ_BYTES
+// in all, each numbered, after head (empty for none: a PDF's text has
+// no hashline tag), then a note of where to go on if more are left:
+// read's output, and an attached file's.
+static ReadWin readwin(Arena *a, Str data, Str head, iz first, iz limit)
+{
+    ReadWin r = {};
+    r.last = first - 1;
     if (startswith(data, "\xef\xbb\xbf")) {
         data = cuthead(data, 3);
     }
     if (!data.len) {
-        return concat(a, head, "(empty file)");
+        r.text = concat(a, head, "(empty file)");
+        return r;
     }
 
     iz total = countlines(data);
+    r.total  = total;
     if (first > total) {
         Buf b(a, 160);
         print(&b, "The file has only ");
@@ -2549,7 +2580,8 @@ static Str readbody(Arena *a, Str data, Str head, iz first, iz limit)
         print(&b, " lines, so offset ");
         print(&b, (i64)first);
         print(&b, " is past its end.");
-        return finish(&b);
+        r.text = finish(&b);
+        return r;
     }
 
     Buf b(a, 4096);
@@ -2599,7 +2631,14 @@ static Str readbody(Arena *a, Str data, Str head, iz first, iz limit)
         print(&b, (i64)last+1);
         print(&b, ".]\n");
     }
-    return finish(&b);
+    r.text = finish(&b);
+    r.last = last;
+    return r;
+}
+
+static Str readbody(Arena *a, Str data, Str head, iz first, iz limit)
+{
+    return readwin(a, data, head, first, limit).text;
 }
 
 // Read a file, under its [PATH#TAG] header if tagged (hashline edits).

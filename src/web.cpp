@@ -26,7 +26,7 @@ enum : i32 {
     WEB_DEPTH   = 256,      // open HTML elements tracked
 };
 
-enum : i32 { WEBK_HTML = 1, WEBK_TEXT, WEBK_BINARY };
+enum : i32 { WEBK_HTML = 1, WEBK_TEXT, WEBK_BINARY, WEBK_PDF };
 
 enum : i32 {
     WEBR_FOLLOW = 1,  // same host, "www." aside: follow it
@@ -558,16 +558,32 @@ static WebRedirect webredirect(Arena *perm, Str from, Str location)
 
 // Content types and charsets
 
+// Whether a body starts as a PDF: "%PDF-" in its first KiB (pdfsniff,
+// which comes later in the build).
+static b32 webpdfsniff(Str body)
+{
+    return find(takehead(body, body.len<1024 ? body.len : 1024), "%PDF-") >= 0;
+}
+
 // What a response holds, from its Content-Type, or from its first bytes
-// when it has none.
+// when it has none. A PDF is one by its type, or by its first bytes when
+// its type is missing (and it does not start as HTML) or
+// application/octet-stream, before a NUL says it is binary.
 static i32 webkind(Str ctype, Str body)
 {
     Str type = trim(cut(ctype, ';').head);
+    if (equalfold(type, "application/pdf") || equalfold(type, "application/x-pdf")) {
+        return WEBK_PDF;
+    } else if (equalfold(type, "application/octet-stream") && webpdfsniff(body)) {
+        return WEBK_PDF;
+    }
     if (!type.len) {
         Str s = startswith(body, "\xef\xbb\xbf") ? cuthead(body, 3) : body;
         s = trimleft(s);
         if (webprefix(s, "<!doctype html") || webprefix(s, "<html")) {
             return WEBK_HTML;
+        } else if (webpdfsniff(body)) {
+            return WEBK_PDF;
         }
         for (iz i = 0; i<body.len && i<1024; i++) {
             if (!body[i]) {
@@ -1968,6 +1984,30 @@ static Str websearchtext(Arena *perm, Str query, Str service, Str date,
     }
     webfence(&b, "end", nonce);
     print(&b, "\n\nCite the pages you use as Markdown links.");
+    return finish(&b);
+}
+
+// A PDF's text read by web_fetch, with a note after it when its body was
+// cut at max bytes, or else the reader stopped short (why non-null).
+static Str webpdfnote(Arena *perm, Str text, b32 cut, iz max, Str why)
+{
+    if (!cut && !why.data) {
+        return text;
+    }
+    Buf b(perm, text.len + why.len + 128);
+    print(&b, text);
+    if (text.len) {
+        print(&b, endswith(text, "\n") ? Str("\n") : Str("\n\n"));
+    }
+    if (cut) {
+        print(&b, "[The PDF was cut at ");
+        print(&b, (i64)(max >> 20));
+        print(&b, " MiB; only the text before that could be read.]\n");
+    } else {
+        print(&b, "[Only part of the PDF could be read: ");
+        print(&b, why);
+        print(&b, ".]\n");
+    }
     return finish(&b);
 }
 

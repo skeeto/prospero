@@ -6069,7 +6069,9 @@ static void drawattached(Gui *g, GuiSession *s)
                                : Str(": its host attaches it to the next message"));
             } else {
                 print(&b, ", ");
-                if (m->file) {
+                if (m->file && m->pdf) {
+                    print(&b, "PDF");  // its size, of the PDF or its text
+                } else if (m->file) {
                     print(&b, m->lines);
                     print(&b, m->lines==1 ? Str(" line of text") : Str(" lines of text"));
                 } else {

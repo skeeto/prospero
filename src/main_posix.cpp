@@ -2824,7 +2824,7 @@ static i32 reapfork(char **argv)
     i32   resp   = r.spi.pidfor ? r.spi.pidfor(r.self) : 0;
     r.uniq  = reapinfo(&r, r.self, 0).uniq;
     r.resp  = reaprespid(r.spi.pidfor!=0, r.self, resp, r.uniq);
-    r.idcap = origin ? REAP_IDS : 0;
+    r.idcap = origin ? (iz)REAP_IDS : 0;
     r.nids  = reapaddid(r.ids, r.nids, r.idcap, r.uniq);
     r.kq    = origin ? kqueue() : -1;
     #endif

@@ -4,8 +4,11 @@
 // -DFUZZ_FRAMES the framing of remote links (frame.cpp), or with
 // -DFUZZ_IMAGE an image's intake: its kind, its decode through Wuffs
 // (image.cpp, wuffs.c), shrinking and PNG encoding, or with -DFUZZ_WEB
-// the web tools' text work (web.cpp). Every target links Wuffs, from the
-// release file CMake fetched:
+// the web tools' text work (web.cpp), or with -DFUZZ_PDF the PDF reader
+// (pdf.cpp), or with -DFUZZ_PDFENC its text encodings (pdfenc.cpp), or
+// with -DFUZZ_PDFIMG its image decoding (pdfimage.cpp): CCITT fax,
+// samples to RGBA, and showing one as a PNG or a JPEG. Every target
+// links Wuffs, from the release file CMake fetched:
 //   $ afl-clang-fast -O2 -g3 -fsanitize=address,undefined \
 //         -fsanitize-trap=undefined -I build/_deps/wuffs-src \
 //         -c -o wuffs.o src/wuffs.c
@@ -16,7 +19,17 @@
 //   $ afl-fuzz -i i -o o ./fuzzjson
 //
 // Likewise with -DFUZZ_EVENTS, -DFUZZ_PROVIDER, -DFUZZ_FRAMES,
-// -DFUZZ_IMAGE or -DFUZZ_WEB for the other targets.
+// -DFUZZ_IMAGE, -DFUZZ_WEB, -DFUZZ_PDF, -DFUZZ_PDFENC or -DFUZZ_PDFIMG
+// for the other targets. FUZZ_PDFIMG takes its parameters from the first
+// 16 bytes; seeds are test/pdfimage_test.cpp's fax fixtures after 16
+// bytes that pick their kind (byte 0: K+1, then the align and BlackIs1
+// bits; bytes 1 and 2: the columns, little endian; byte 3: twice the
+// rows, odd to count). The PDF target has a dictionary, used with
+// AFL++'s own:
+//   $ afl-fuzz -i i -o o -x tests/pdffuzz.dict \
+//         -x /opt/homebrew/share/afl/dictionaries/pdf.dict ./fuzzpdf
+// With -DPROSPERO_ARENACHECK=1 the arena is checked for aliasing, and
+// under ASan memory an arena gave back is poisoned.
 //
 // JSON: an input either fails at an offset inside it, or parses to a root
 // spanning the input less surrounding whitespace, and writes canonical
@@ -51,6 +64,59 @@
 // is not refused. The search services' replies parse without fault into
 // canonical hit URLs and clean, cut texts, merged as well, and a window
 // of a page's text is valid UTF-8.
+//
+// PDF: the old scan (pdfinfo) never faults. Every token consumes input,
+// and tokens tile it, with only whitespace and comments between them.
+// The objects parsed from the input print canonically, the same whether
+// the input is taken as stable or copied from, and the print parses
+// back and prints to identical bytes. In a scratch too small, a parse
+// stops for want of memory, never trapping, or prints the same. Every
+// decoder (Flate, LZW in both EarlyChange modes, ASCIIHex, ASCII85,
+// RunLength, TIFF and PNG predictors), with parameters and a cap the
+// input picks, stays within its cap and its budget, and all but Flate
+// decode a prefix of their input to a prefix of their whole output.
+// A document loads, as not a PDF with nothing found, or with pages
+// that are dicts, no more than PDF_PAGEMAX, and every object in its
+// xref and its scan resolves and every stream decodes, within budgets
+// that never go negative. A second read, at another offset, finds the
+// same; in a scratch too small, it finds the same or runs out of memory,
+// never trapping. Its text (pdfread) is valid UTF-8 with no controls
+// but newline and tab, at most PDF_TEXTMAX, its page markers 1..n at
+// the lines pageline names, every placement on a page read and a line
+// of it (pdfoutbad); a refusal leaves perm unchanged; two reads at
+// different offsets are byte-identical, and in a scratch too small the
+// read is the same or cut short for memory. Up to four of its images,
+// shown (pdfimage) within limits the input picks, fail with a reason
+// leaving their arena as it was, or give a PNG or a JPEG within those
+// limits that decodes to the size it states, the same at another
+// offset. A window of lines the input picks gets a pick (pdfpick) of at
+// most PDF_IMAGES distinct images inside it, in line order, none small
+// or undecodable, their shares within PDF_SHOWPIXELS and PDF_SHOWBYTES;
+// the window is cut only past PDF_IMAGES, and every image left in it is
+// one picked. Inputs over 64 KiB are
+// skipped, so the budgets that grow with the input are only fuzzed at
+// their minimums.
+//
+// PDF encodings: a text string decodes to clean text (below) costing
+// exactly its untrimmed length, all of it spaces outside the result, or
+// to nothing in an arena too small for it; the emitter writes only clean
+// text from any value; glyph names give at most PDF_UNIMAX scalars; the
+// Cork fallback gives 0 or the code's table entry; UTF-16 decoding
+// always advances; and standard widths and tables come from the tables.
+// Clean text is valid UTF-8 without NUL, controls, DEL, C1, NBSP, soft
+// hyphen, ligature forms or noncharacters.
+//
+// PDF images: CCITT fax data, with the parameters the input picks,
+// decodes to exactly its rows of bits, or fails with a reason leaving
+// the arena as it was, and any prefix of the data decodes the same rows
+// as far as both decoded cleanly. Samples of any space, depth, Decode,
+// colour key and soft mask the input picks, the fax rows among them,
+// convert at a size the input picks to opaque pixels of that size and
+// nothing more, or fail leaving the arena as it was; shown as a PNG they
+// decode back to the size reported, and a JPEG shown passes through or
+// converts the same way, in scratch of a size the input picks (byte 15's
+// top bit: tight), failing for want of it without touching the result
+// arena.
 //
 // Without AFL++ it runs one input from standard input.
 //
@@ -763,6 +829,97 @@ static void fuzzweb(Arena a, Str src)
     }
 }
 
+#if FUZZ_PDFENC
+static b32 fuzzpdfclean(Str s)
+{
+    for (iz i = 0; i < s.len;) {
+        i32 c = utf8strict(s, &i);
+        if (c<0x20 || (c>=0x7f && c<=0xa0) || c==0xad ||
+            (c>=0xd800 && c<=0xdfff) || (c>=0xfb00 && c<=0xfb06) ||
+            (c&0xfffe)==0xfffe) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void fuzzpdfenc(Arena a, Str src)
+{
+    {
+        Arena t    = a;
+        u8   *beg  = (u8 *)t.beg;
+        Str   r    = pdftextstr(&t, src);
+        u8   *end  = (u8 *)t.beg;
+        iz    cost = end - beg;
+        assert(fuzzpdfclean(r));
+        assert(cost <= 3*src.len);
+        if (r.len) {
+            assert(r.data>=beg && r.data+r.len<=end);
+            assert(r[0]!=' ' && r[r.len-1]!=' ');
+        }
+        for (u8 *p = beg; p < end; p++) {
+            assert((p>=r.data && p<r.data+r.len) || *p==' ');
+        }
+
+        // Too small an arena: nothing, and never a trap
+        Arena small = carve(&t, cost/2);
+        Str   z     = pdftextstr(&small, src);
+        assert(!cost || !z.len);
+    }
+
+    {
+        u32 cp[PDF_UNIMAX];
+        i32 n = pdfglyphname(src, cp);
+        assert(n>=0 && n<=PDF_UNIMAX);
+        for (i32 i = 0; i < n; i++) {
+            assert(cp[i]<=0x10ffff && (cp[i]<0xd800 || cp[i]>0xdfff));
+        }
+        i32 code = src.len ? src[0] : 0;
+        u32 k    = pdfcork(src, code);
+        assert(!k || k==PDF_CORK[code]);
+    }
+
+    for (b32 le = 0; le < 2; le++) {
+        for (iz i = 0; i < src.len;) {
+            iz  was = i;
+            i32 c   = pdfutf16(src, &i, le);
+            assert(i>was && i<=src.len);
+            assert(c>=0 && c<=0x10ffff && (c<0xd800 || c>0xdfff));
+        }
+    }
+
+    {
+        Arena t = a;
+        Buf   b(&t, 64);
+        for (iz i = 0; i+8 <= src.len; i += 8) {
+            i64 v;
+            memcpy(&v, src.data+i, 8);
+            pdfputcp(&b, v);
+            pdfputcp(&b, (i32)v);
+            pdfputcp(&b, (u16)v);
+            pdfputcp(&b, (u8)v);
+        }
+        assert(fuzzpdfclean(finish(&b)));
+    }
+
+    u16 const *ws[] = {PDF_HELVW, PDF_HELVBW, PDF_TIMESW,
+                       PDF_TIMESBW, PDF_TIMESIW, PDF_TIMESBIW};
+    for (i32 c = -1; c <= 256; c++) {
+        i32 w  = pdfstdwidth(src, c);
+        b32 ok = !w || w==600;
+        for (iz i = 0; !ok && c>=32 && c<=126 && i<countof(ws); i++) {
+            ok = w == ws[i][c-32];
+        }
+        assert(ok);
+    }
+    u16 const *e = pdfbuiltin(src);
+    assert(!e || e==PDF_SYMBOL || e==PDF_ZAPF);
+    e = pdfencoding(src);
+    assert(!e || e==PDF_STDENC || e==PDF_WINANSI ||
+           e==PDF_MACROMAN || e==PDF_PDFDOC);
+}
+#endif
+
 #if FUZZ_IMAGE
 static void fuzzimage(Arena a, Str src)
 {
@@ -787,6 +944,553 @@ static void fuzzimage(Arena a, Str src)
 }
 #endif
 
+#if FUZZ_PDF
+// The objects parsed from src, in a reader over scratch, printed
+// canonically, space-separated, with null data if the parse stopped.
+static Str fuzzpdfprint(Arena *perm, Arena scratch, Str src, b32 stable)
+{
+    Pdf    p = pdfstart(scratch, src, {});
+    PdfLex x = {&p, &p.keep, src, 0, stable, 0};
+    Buf    b(perm, 256);
+    for (i32 n = 0; !p.why.data && pdfpeek(&x)>=0; n++) {
+        if (n) putbyte(&b, ' ');
+        pdfprintobj(&b, pdfparse(&x));
+    }
+    return p.why.data ? Str{} : finish(&b);
+}
+
+// One filter over in, in a reader over a copy of scratch whose budgets
+// are in's, so that every run gets the same caps: its output in perm.
+static PdfData fuzzpdffilter(Arena *perm, Arena scratch, i32 id, Str parms,
+                             Str in, iz cap)
+{
+    Pdf     p = pdfstart(scratch, in, {});
+    PdfLex  x = {&p, &p.keep, parms, 0, 1, 0};
+    PdfObj  d = pdfparse(&x);
+    i64     b = p.decoded;
+    PdfData r = pdffilter(&p, &p.page, id, d, in, cap);
+    assert(r.data.len<=cap && p.decoded>=0);
+    assert(id==PDFF_CRYPT || r.data.len<=b-p.decoded);  // charged
+    if (id!=PDFF_FLATE && id!=PDFF_LZW) {               // no predictor
+        assert(!r.cut || r.data.len==cap || p.why.data);
+    }
+    r.data = p.why.data ? Str{} : clone(perm, r.data);
+    return r;
+}
+
+// The decoders over the input past its first six bytes, which pick a
+// cap, a point to cut the input, and the predictor's parameters.
+static void fuzzpdfdecode(Arena *perm, Arena scratch, Str src)
+{
+    if (src.len < 6) {
+        return;
+    }
+    u8 *h      = src.data;
+    Str in     = cuthead(src, 6);
+    iz  cap    = 1 + (h[1]<<8 | h[2]) * (h[0]&1 ? 64 : 1);
+    iz  cut    = in.len * h[3] / 255;
+    i32 preds[] = {1, 2, 10, 11, 12, 13, 14, 15};
+    i32 bpcs[]  = {1, 2, 4, 8, 16, 8, 3, 8};
+    Buf parms(perm, 128);
+    print(&parms, "<</Predictor ");
+    print(&parms, (i64)preds[h[0]>>1 & 7]);
+    print(&parms, " /Colors ");
+    print(&parms, (i64)(h[4]&3) + 1);
+    print(&parms, " /BitsPerComponent ");
+    print(&parms, (i64)bpcs[h[4]>>2 & 7]);
+    print(&parms, " /Columns ");
+    print(&parms, (i64)h[5] + (h[4]&0x80 ? 0 : 1));
+    print(&parms, " /EarlyChange ");
+    print(&parms, (i64)(h[0]>>4 & 1));
+    print(&parms, ">>");
+    Str pd = finish(&parms);
+
+    // Each within its cap, and a prefix decoding to a prefix. Outputs,
+    // up to two caps' worth, are given back each round.
+    i32 ids[] = {PDFF_FLATE, PDFF_LZW, PDFF_AHX, PDFF_A85, PDFF_RL, PDFF_CRYPT};
+    for (i32 i = 0; i < countof(ids); i++) {
+        Arena   t    = *perm;
+        PdfData full = fuzzpdffilter(&t, scratch, ids[i], pd, in, cap);
+        if (ids[i]==PDFF_FLATE || !full.data.data) {
+            continue;
+        }
+        PdfData part = fuzzpdffilter(&t, scratch, ids[i], pd, takehead(in, cut), cap);
+        assert(startswith(full.data, part.data));
+    }
+
+    // A chain the bytes pick, with the parameters for each
+    {
+        static Str const names[] = {
+            "/FlateDecode", "/LZW", "/AHx", "/A85", "/RL", "/DCT", "/Crypt", "/Foo",
+        };
+        Buf d(perm, 256);
+        print(&d, "<</Filter[");
+        for (i32 i = 0; i < (h[3]&3)+1; i++) {
+            print(&d, names[h[5-i]&7]);
+        }
+        print(&d, "]/DecodeParms ");
+        print(&d, pd);
+        print(&d, ">>");
+        Str     text = finish(&d);
+        Pdf     p    = pdfstart(scratch, in, {});
+        PdfLex  x    = {&p, &p.keep, text, 0, 1, 0};
+        PdfData r    = pdfdecode(&p, &p.page, pdfparse(&x), in, cap);
+        assert(r.data.len<=PDF_STREAMMAX && p.decoded>=0);
+        assert(r.image || r.data.len<=cap);
+    }
+}
+
+static u64 fuzzhash(u64 h, Str s)
+{
+    for (iz i = 0; i < s.len; i++) {
+        h = (h ^ s.data[i]) * 1111111111111111111u;
+    }
+    return h;
+}
+
+// An object, digested without allocating: its kind and contents, a
+// stream's dict and raw data.
+static u64 fuzzpdfhash(u64 h, PdfObj o)
+{
+    h = (h ^ (u64)o.kind) * 1111111111111111111u;
+    switch (o.kind) {
+    case PDFO_BOOL:
+    case PDFO_INT:
+    case PDFO_REAL:
+    case PDFO_REF:
+        h = (h ^ (u64)o.i) * 1111111111111111111u;
+        break;
+    case PDFO_STR:
+    case PDFO_NAME:
+        h = fuzzhash(h, o.s);
+        break;
+    case PDFO_ARRAY:
+        for (i32 i = 0; i < o.len; i++) h = fuzzpdfhash(h, o.items[i]);
+        break;
+    case PDFO_DICT:
+        for (i32 i = 0; i < 2*o.len; i++) h = fuzzpdfhash(h, o.items[i]);
+        break;
+    case PDFO_STREAM:
+        h = fuzzhash(fuzzpdfhash(h, o.st->dict), o.st->raw);
+        break;
+    }
+    return h;
+}
+
+// Every object in a trie of slots resolved, each stream decoded too.
+static u64 fuzzpdfslots(Pdf *p, PdfSlot *s, u64 h)
+{
+    if (!s) {
+        return h;
+    }
+    for (i32 i = 0; i < 4; i++) {
+        h = fuzzpdfslots(p, s->child[i], h);
+    }
+    PdfObj o = pdfresolve(p, s);
+    h = fuzzpdfhash(h ^ (u64)s->num, o);
+    if (o.kind == PDFO_STREAM) {
+        Arena   save = p->page;  // given back after
+        PdfData d    = pdfstream(p, &p->page, o, 0);
+        assert(p->decoded>=0 && (d.image || d.data.len<=PDF_STREAMMAX));
+        h = fuzzhash(h ^ (u64)(d.image<<1 | d.cut), d.data);
+        p->page = save;
+    }
+    return h;
+}
+
+// The document read whole, from a reader over scratch: loaded, its
+// pages walked, every object the xref and the scan know resolved and
+// every stream decoded, within budgets. What it gave, digested.
+struct FuzzPdfDoc {
+    u64 digest;
+    i32 status;
+    iz  pages;
+    i32 damage;
+    b32 recovered;
+    Str why;
+};
+
+static FuzzPdfDoc fuzzpdfdoc(Arena scratch, Str src)
+{
+    FuzzPdfDoc r = {};
+    Pdf        p = pdfstart(scratch, src, {});
+    r.status = pdfload(&p);
+    if (r.status == PDFR_NOTPDF) {
+        assert(!p.xref && !p.index && !p.why.data);
+        return r;
+    }
+    PdfPages g = pdfpages(&p);
+    assert(g.pages.len <= PDF_PAGEMAX);
+    u64 h = 0;
+    for (iz i = 0; i < g.pages.len; i++) {
+        PdfPage pg = g.pages.data[i];
+        assert(pg.page.kind == PDFO_DICT);
+        assert(pg.rotate>=0 && pg.rotate<360 && pg.rotate%90==0);
+        h = fuzzpdfhash(h, pg.page);
+    }
+    h = fuzzpdfslots(&p, p.xref, h);
+    h = p.index ? fuzzpdfslots(&p, p.index->objs, h) : h;
+    assert(p.work>=0 && p.decoded>=0 && p.scanned>=0 && p.hops==0);
+    r.digest    = h;
+    r.pages     = g.pages.len;
+    r.damage    = p.damage;
+    r.recovered = p.recovered;
+    r.why       = p.why;
+    return r;
+}
+
+static b32 fuzzpdfsame(FuzzPdfDoc a, FuzzPdfDoc b)
+{
+    return a.digest==b.digest && a.status==b.status && a.pages==b.pages &&
+           a.damage==b.damage && a.recovered==b.recovered && a.why==b.why;
+}
+
+// Whether two reads gave the same results, byte for byte.
+static b32 fuzzpdfsameout(PdfOut *a, PdfOut *b)
+{
+    if (a->status!=b->status || !(a->why==b->why) || a->pages!=b->pages ||
+        !(a->text==b->text) || a->recovered!=b->recovered ||
+        a->pageline.len!=b->pageline.len || a->places.len!=b->places.len) {
+        return 0;
+    }
+    for (iz i = 0; i < a->pageline.len; i++) {
+        if (a->pageline.data[i] != b->pageline.data[i]) return 0;
+    }
+    for (iz i = 0; i < a->places.len; i++) {
+        PdfPlace x = a->places.data[i];
+        PdfPlace y = b->places.data[i];
+        if (!(x.label==y.label)) return 0;
+        x.label = y.label = {};
+        if (__builtin_memcmp(&x, &y, sizeof(x))) return 0;
+    }
+    return 1;
+}
+
+static void fuzzpdfimages(Arena, Str, PdfOut *);
+
+static void fuzzpdf(Arena a, Str src)
+{
+    pdfinfo(a, src);
+
+    // Tokens tile the input
+    {
+        Pdf    p    = pdfstart(a, src, {});
+        PdfLex x    = {&p, &p.keep, src, 0, 1, 0};
+        iz     prev = 0;
+        for (;;) {
+            PdfTok k = pdflex(&x);
+            assert(k.beg>=prev && k.end>=k.beg && k.end<=src.len);
+            PdfLex gap = {&p, &p.op, {src.data+prev, k.beg-prev}, 0, 1, 0};
+            assert(pdfpeek(&gap) < 0);
+            if (!k.kind) {
+                assert(k.end==src.len && !p.why.data);
+                break;
+            }
+            assert(k.end > k.beg);
+            prev = k.end;
+        }
+    }
+
+    // Parse, print, parse again and print the same
+    Arena perm  = carve(&a, 16<<20);
+    Str   once  = fuzzpdfprint(&perm, a, src, 1);
+    assert(once.data);
+    Str   copy  = fuzzpdfprint(&perm, a, src, 0);
+    assert(copy == once);
+    Str   twice = fuzzpdfprint(&perm, a, once, 1);
+    assert(twice == once);
+
+    // In a small scratch, the same or out of memory
+    Arena tiny  = carve(&a, 256 + (src.len ? src[0]*64 : 0));
+    Str   small = fuzzpdfprint(&perm, tiny, src, 1);
+    assert(!small.data || small==once);
+
+    fuzzpdfdecode(&perm, a, src);
+
+    // The document, read the same at another offset, and in a scratch
+    // too small the same or out of memory
+    FuzzPdfDoc d1 = fuzzpdfdoc(a, src);
+    Arena      at = a;
+    allocbytes(&at, 24 + (src.len ? src[0] : 0));
+    FuzzPdfDoc d2 = fuzzpdfdoc(at, src);
+    assert(fuzzpdfsame(d1, d2));
+    Arena      lean = a;
+    lean.end = lean.beg + (1<<14) + (src.len>1 ? src[1]<<12 : 0);
+    FuzzPdfDoc d3 = fuzzpdfdoc(lean, src);
+    assert(fuzzpdfsame(d1, d3) || d3.why=="out of memory");
+
+    // The text, read twice at different offsets in scratches of one size,
+    // the same and valid, perm as it was after a refusal; and in a
+    // scratch too small, the same or cut short for memory
+    Arena   rest = a;
+    Arena   p1 = carve(&rest, 8<<20);
+    byte   *b1 = p1.beg;
+    Arena   s1 = rest;
+    s1.end = s1.beg + (24<<20);
+    PdfOut  r1 = pdfread(&p1, s1, src, 0);
+    assert(!pdfoutbad(&r1, &s1).data);
+    assert(r1.status<=PDFR_PARTIAL || p1.beg==b1);
+    Arena   s2 = rest;  // past r1's output
+    allocbytes(&s2, 40 + (src.len ? src[0] : 0));
+    Arena   p2 = carve(&s2, 8<<20);
+    s2.end = s2.beg + (24<<20);
+    PdfOut  r2 = pdfread(&p2, s2, src, 0);
+    assert(fuzzpdfsameout(&r1, &r2));
+    Arena   s3 = rest;
+    Arena   p3 = carve(&s3, 8<<20);
+    s3.end = s3.beg + (1<<15) + (src.len>2 ? src[2]<<14 : 0);
+    PdfOut  r3 = pdfread(&p3, s3, src, 0);
+    Arena   c3 = s3;  // past r3's output, for the check's scratch
+    c3.end = rest.end;
+    assert(!pdfoutbad(&r3, &c3).data);
+    assert(fuzzpdfsameout(&r1, &r3) || r3.why=="out of memory" ||
+           find(r3.text, "out of memory]")>=0 ||
+           (r3.status==PDFR_NOPAGES && r1.status!=PDFR_NOPAGES));
+
+    fuzzpdfimages(rest, src, &r1);
+}
+
+// Up to 4 of a read's placements shown (pdfimage), within limits the
+// input picks, the first twice at different offsets; then a window of
+// lines the input picks, and its pick (pdfpick).
+static void fuzzpdfimages(Arena rest, Str src, PdfOut *r)
+{
+    u64 h      = fuzzhash(0x9e3779b97f4a7c15u, src);
+    i64 edge   = 8 + (i64)(h % 700);
+    i64 pixels = 64 + (i64)(h>>10 & 0x3ffff);
+    iz  maxb64 = 256 + (iz)(h>>30 & 0xfffff);
+    iz  n      = r->places.len;
+    Str first  = {};
+    for (iz i = 0; i<4 && i<n; i++) {
+        PdfPlace *pl   = r->places.data + (i*n/4 + (iz)(h>>50)%(n/4 + 1)) % n;
+        Arena     t    = rest;  // 19 MiB of 40, twice with the offset below
+        Arena     perm = carve(&t, 2<<20);
+        byte     *beg  = perm.beg;
+        t.end = t.beg + (17<<20);
+        PdfShown  s    = pdfimage(&perm, t, src, pl, edge, pixels, maxb64);
+        assert(!s.data.data == !!s.err.len);
+        if (!s.data.data) {
+            assert(perm.beg == beg);
+            continue;
+        }
+        assert(s.mime=="image/png" || s.mime=="image/jpeg");
+        assert(s.w>=1 && s.h>=1 && s.w<=edge && s.h<=edge && (i64)s.w*s.h<=pixels);
+        assert(base64len(s.data.len) <= maxb64);
+        Image p = imgdecode(&t, s.data, pixels);
+        assert(p.rgba && p.width==s.w && p.height==s.h);
+        if (i == 0) {
+            first = s.data;
+            Arena u = rest;  // past the first: another offset, room for
+            allocbytes(&u, (19<<20) + 8 + (src.len ? src[src.len-1] : 0));
+            Arena    perm2 = carve(&u, (2<<20) + 64);  // ...its alignments
+            u.end = u.beg + (17<<20) + 64;
+            PdfShown s2    = pdfimage(&perm2, u, src, pl, edge, pixels, maxb64);
+            assert(s2.data == first && s2.mime == s.mime);
+        }
+    }
+
+    // A window and its pick
+    iz lines = 0;
+    for (iz i = 0; i < r->text.len; i++) {
+        lines += r->text[i] == '\n';
+    }
+    iz wfirst = 1 + (iz)(h>>8 & 0xffff) % (lines + 1);
+    iz wlast  = wfirst + (iz)(h>>24 & 0xffff) % (lines + 1);
+    // Limits wider than PDF_SHOWPIXELS and PDF_SHOWBYTES, to be shared
+    pixels  = 64 + (i64)(h>>10 & 0x7fffff);
+    maxb64  = 256 + (iz)(h>>33 & 0xffffff);
+    PdfPick k = pdfpick(rest, r->places, wfirst, wlast, edge, pixels, maxb64);
+    assert(k.n>=0 && k.n<=PDF_IMAGES);
+    assert(k.last<=wlast && (!k.n || k.last>=wfirst) && (k.cut ? k.n==PDF_IMAGES : k.last==wlast));
+    assert(k.edge==edge && k.pixels<=pixels && k.maxb64<=maxb64);
+    assert(k.pixels*(k.n ? k.n : 1) <= PDF_SHOWPIXELS);
+    assert(k.maxb64*(k.n ? k.n : 1) <= PDF_SHOWBYTES);
+    for (i32 i = 0; i < k.n; i++) {
+        assert(k.at[i]>=0 && k.at[i]<n);
+        PdfPlace *pl = r->places.data + k.at[i];
+        assert(pl->line>=wfirst && pl->line<=k.last);
+        assert(pl->w>=PDF_PICKMIN && pl->h>=PDF_PICKMIN);
+        assert(pl->image!=PDFI_JPX && pl->image!=PDFI_JBIG2);
+        assert(!i || r->places.data[k.at[i-1]].line<=pl->line);
+        for (i32 j = 0; j < i; j++) {
+            PdfPlace *q = r->places.data + k.at[j];
+            assert(q->id!=pl->id || (pl->mask && __builtin_memcmp(q->fill, pl->fill, 3)));
+        }
+    }
+    // Every image the window shows is a pick, or one of a pick's, but
+    // those past the most on the last pick's line
+    iz full = k.n==PDF_IMAGES ? r->places.data[k.at[k.n-1]].line : -1;
+    for (iz i = 0; i<n; i++) {
+        PdfPlace *pl = r->places.data + i;
+        if (pl->line==full || pl->line<wfirst || pl->line>k.last ||
+            pl->w<PDF_PICKMIN || pl->h<PDF_PICKMIN ||
+            pl->image==PDFI_JPX || pl->image==PDFI_JBIG2) {
+            continue;
+        }
+        b32 found = 0;
+        for (i32 j = 0; j<k.n && !found; j++) {
+            PdfPlace *q = r->places.data + k.at[j];
+            found = q->id==pl->id && (!pl->mask || !__builtin_memcmp(q->fill, pl->fill, 3));
+        }
+        assert(found);
+    }
+}
+#endif
+
+#if FUZZ_PDFIMG
+// Pixels converted, checked opaque and of the size asked for, else the
+// arena as it was.
+static void fuzzpixels(Arena *a, PdfSamples *s, i32 tw, i32 th, i64 *work)
+{
+    byte *beg = a->beg;
+    Image p   = pdfpixels(a, s, tw, th, work);
+    assert(!p.err.data == !!p.rgba);
+    if (!p.rgba) {
+        assert(a->beg == beg);
+        return;
+    }
+    assert(p.width==tw && p.height==th && a->beg-beg==(iz)tw*th*4);
+    for (iz i = 0; i < (iz)tw*th; i++) {
+        assert(p.rgba[4*i+3] == 255);
+    }
+}
+
+static void fuzzshown(Arena a, byte *beg, PdfShown r)
+{
+    assert(!r.data.data == !!r.err.data);
+    assert(r.data.data || a.beg==beg);
+    if (r.data.data) {
+        ImageKind k = imagekind(a, r.data);
+        assert(k.mime == r.mime && k.w==r.w && k.h==r.h);
+    }
+}
+
+static void fuzzpdfimg(Arena a, Str src)
+{
+    if (src.len < 16) {
+        return;
+    }
+    u8 *p    = src.data;
+    Str body = cuthead(src, 16);
+
+    // CCITT
+    CcittParams cp = {};
+    cp.k        = (p[0]&3) - 1;
+    cp.align    = p[0]>>2 & 1;
+    cp.blackis1 = p[0]>>3 & 1;
+    cp.columns  = (p[1] | p[2]<<8) & 0x3fff;
+    cp.rows     = p[3]&1 ? 0 : p[3]>>1;
+    {
+        Arena t    = a;
+        byte *beg  = t.beg;
+        i64   work = (i64)1<<24;
+        Ccitt c    = pdfccitt(&t, body, cp, 1<<22, &work);
+        if (!c.bits.data) {
+            assert(c.err.data && t.beg==beg);
+        } else {
+            iz stride = ((iz)c.cols + 7)/8;
+            assert(c.rows>=1 && c.good>=0 && c.good<=c.rows);
+            assert(c.bits.len==c.rows*stride && t.beg-beg==c.bits.len);
+            assert(!cp.rows || c.rows==cp.rows);
+
+            iz   n    = body.len * p[4] / 256;
+            u8  *cpy  = allocbytes(&t, n);  // so that nothing reads past it
+            copybytes(cpy, body.data, n);
+            i64  w2   = (i64)1<<24;
+            Arena u   = t;
+            Ccitt d   = pdfccitt(&u, {cpy, n}, cp, 1<<22, &w2);
+            if (d.bits.data) {
+                iz good = d.good<c.good ? d.good : c.good;
+                assert(d.cols == c.cols);
+                assert(!__builtin_memcmp(d.bits.data, c.bits.data, (uz)(good*stride)));
+            }
+
+            PdfSamples s = {};
+            s.data = c.bits;
+            s.w    = c.cols;
+            s.h    = c.rows;
+            s.bpc  = 1;
+            if (p[5] & 1) {
+                s.ndecode   = 2;
+                s.decode[0] = 1;
+            }
+            i32 tw = 1 + (i32)((p[6] | p[7]<<8) % s.w);
+            i32 th = 1 + (i32)((p[8] | p[9]<<8) % s.h);
+            fuzzpixels(&t, &s, tw, th, &work);
+        }
+    }
+
+    // Samples of every kind
+    static i32 const depths[] = {1, 2, 4, 8, 16};
+    static f32 const odd[]    = {0, 1, -1, 0.5f, 1e30f, -1e30f, 1.0f/0.0f, 0.0f/0.0f};
+    PdfSamples s = {};
+    PdfSamples m = {};
+    s.data    = body;
+    s.w       = 1 + (p[9] | (p[10]&7)<<8);
+    s.h       = 1 + p[11];
+    s.bpc     = depths[p[12]%5];
+    s.cs      = p[12]/5 % 7;  // one past the last
+    s.ncomp   = 1 + p[13]%5;
+    s.base    = (p[13]>>3) % 5;
+    s.hival   = p[14] - 8;
+    s.palette = body;
+    s.mask    = p[15]>>2 & 1;
+    s.fill[0] = p[14];
+    switch (p[15] & 3) {
+    case 1:
+        s.ndecode = 2*PDFIMG_COMPS;
+        for (i32 i = 0; i < s.ndecode; i++) {
+            s.decode[i] = (f32)(~i & 1);
+        }
+        break;
+    case 2:
+    case 3:
+        s.ndecode = 2*PDFIMG_COMPS;
+        for (i32 i = 0; i < s.ndecode; i++) {
+            s.decode[i] = odd[(p[i%16] >> (i%3)) & 7];
+        }
+        break;
+    }
+    if (p[15]>>3 & 1) {
+        s.nkey = 2*PDFIMG_COMPS;
+        for (i32 i = 0; i < s.nkey; i++) {
+            s.key[i] = p[i%16] * (i&1 ? 300 : 1);
+        }
+    }
+    if (p[15]>>4 & 1) {
+        m.data  = cuthead(body, body.len/2);
+        m.w     = 1 + p[1]%40;
+        m.h     = 1 + p[2]%40;
+        m.bpc   = depths[p[3]%5];
+        m.cs    = p[15]>>5 & 1 ? PDFCS_TINT : PDFCS_GRAY;
+        m.ncomp = 1;
+        s.smask = &m;
+    }
+    i32 tw = 1 + p[3] % s.w;
+    i32 th = 1 + p[4] % s.h;
+    i64 work = (i64)1<<24;
+    fuzzpixels(&a, &s, tw, th, &work);
+
+    // Tight scratch reaches every out-of-memory branch, pngfit's too
+    iz    cap = p[15]>>7 ? (32<<10) + ((p[7] | p[8]<<8) & 0x3ff)*1024 + p[1] : 32<<20;
+    Arena t   = a;
+    Arena mem = carve(&t, cap);
+    byte *beg = t.beg;
+    work = (i64)1<<24;
+    PdfShown r = pdfshowsamples(&t, mem, &s, 1 + p[5]%600, 1 + p[6]*256, 1<<20, &work);
+    fuzzshown(t, beg, r);
+
+    pdfjpeg(body);
+    if (imagesniff(body) == IMAGE_JPEG) {
+        t   = a;
+        mem = carve(&t, cap);
+        beg = t.beg;
+        r   = pdfshowjpeg(&t, mem, &s, 1 + p[5]%600, 1 + p[6]*256, 1<<20);
+        fuzzshown(t, beg, r);
+    }
+}
+#endif
+
 __AFL_FUZZ_INIT();
 
 int main()
@@ -795,6 +1499,9 @@ int main()
     iz    cap = (iz)1<<26;
     byte *mem = (byte *)malloc((uz)cap);
     u8   *buf = __AFL_FUZZ_TESTCASE_BUF;
+    #if PROSPERO_ARENACHECK
+    arenablank(mem, mem+cap);  // poisoned until allocated, and checked
+    #endif
     while (__AFL_LOOP(10000)) {
         #pragma GCC diagnostic push
         #pragma GCC diagnostic ignored "-Wconversion"  // inside AFL's macro
@@ -817,6 +1524,12 @@ int main()
         fuzzimage(a, {src, len});
         #elif FUZZ_WEB
         fuzzweb(a, {src, len});
+        #elif FUZZ_PDF
+        fuzzpdf(a, {src, len});
+        #elif FUZZ_PDFENC
+        fuzzpdfenc(a, {src, len});
+        #elif FUZZ_PDFIMG
+        fuzzpdfimg(a, {src, len});
         #else
         fuzzjson(a, {src, len});
         #endif

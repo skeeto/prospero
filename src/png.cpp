@@ -363,3 +363,94 @@ static Str pngencodez(Arena *a, u8 *px, i32 w, i32 h, b32 bgrx)
     n += 12;
     return {png, n};
 }
+
+
+// Fitting an image to a request: its size, and its PNG's base64
+
+static iz base64len(iz n)
+{
+    return (n + 2)/3 * 4;
+}
+
+// Whether need bytes, as an i64, fit in the arena.
+static b32 fitsi64(Arena *a, i64 need)
+{
+    return need>=0 && need<=(i64)((uz)-1 >> 1) && fits(a, (iz)need);
+}
+
+// Bytes pngencodez takes at most for w by h pixels, the scratch of its
+// zdeflate (two tables of 1<<15 i32) included.
+static i64 pngcost(i32 w, i32 h)
+{
+    i64 stride = (i64)w * 4;
+    i64 rawlen = (stride + 1) * h;
+    return 2*rawlen + rawlen/8 + 4*stride + ((i64)8<<15) + 1024;
+}
+
+// The scale that brings w by h within edge pixels on each side and
+// pixels in all, at most 1.
+static f64 fitscale(i32 w, i32 h, i64 edge, i64 pixels)
+{
+    i32 most = w>h ? w : h;
+    edge   = edge<1 ? 1 : edge;
+    pixels = pixels<1 ? 1 : pixels;
+    f64 s  = most>edge ? (f64)edge/most : 1;
+    while ((f64)w*s*h*s > (f64)pixels) {
+        s *= 0.97;
+    }
+    return s;
+}
+
+// An image converted for a request: its PNG and its size.
+struct Converted {
+    Str png;  // null on failure
+    Str err;
+    i32 w;
+    i32 h;
+};
+
+// Encode w by h RGBA pixels as a PNG within edge pixels on each side and
+// pixels in all, then smaller until its base64 is within maxb64 bytes.
+// The PNG goes in a, and the shrunk pixels and the encoder's temporaries
+// in mem, which must be another arena. Sides past 1<<16 are refused, so
+// that pngcost cannot overflow.
+static Converted pngfit(Arena *a, Arena mem, u8 *rgba, i32 w, i32 h,
+                        i64 edge, i64 pixels, iz maxb64)
+{
+    Converted r   = {};
+    b32       oom = 0;
+    if (!rgba || w<1 || h<1 || w>1<<16 || h>1<<16) {
+        r.err = "the image has no pixels, or too many";
+        return r;
+    }
+    f64 s = fitscale(w, h, edge, pixels);
+    for (i32 tries = 0; tries<8 && !r.png.data; tries++, s *= 0.75) {
+        Arena t  = mem;
+        i32   tw = (i32)(w*s);
+        i32   th = (i32)(h*s);
+        tw = tw<1 ? 1 : tw;
+        th = th<1 ? 1 : th;
+        b32 same = tw==w && th==h;
+        i64 cost = pngcost(tw, th) + (same ? 0 : (i64)tw*th*4 + (i64)tw*32 + 64);
+        if (!fitsi64(&t, cost)) {
+            oom = 1;  // a smaller size would fit, but not what was asked
+            break;
+        }
+        u8 *px  = same ? rgba : shrink(&t, rgba, w, h, tw, th);
+        Str out = pngencodez(&t, px, tw, th, 0);
+        if (base64len(out.len) > maxb64) {
+            continue;
+        } else if (!fits(a, out.len)) {
+            oom = 1;
+            break;
+        }
+        r.png = clone(a, out);
+        r.w   = tw;
+        r.h   = th;
+    }
+    if (!r.png.data) {
+        r.err = oom ? Str("out of memory to convert the image")
+                    : Str("the image is too large, and does not shrink to fit");
+    }
+    return r;
+}

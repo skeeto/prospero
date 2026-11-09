@@ -518,6 +518,25 @@ struct WebSpill {
     Str ctype;
 };
 
+// A PDF read whose text was kept (readpdf), by its absolute path, while
+// its size and time are the same: a paged read takes the text from its
+// file and the images' places from here, and parses the PDF again only
+// to decode the images it shows.
+struct PdfMemo {
+    i64             size;
+    i64             mtime;
+    Str             txt;       // the text's file, absolute...
+    i64             txtlen;    // ...and its length
+    i32             pages;
+    i32             read;      // pages whose text was read
+    i32             status;    // PDFR_OK or PDFR_PARTIAL
+    b32             recovered;
+    i32             imgonly;   // pages with no text, only images
+    i32             blank;     // pages with neither
+    Slice<iz>       pageline;
+    Slice<PdfPlace> places;
+};
+
 // The user's answer about a task call's container, before it starts.
 struct TaskAsk {
     Str call;   // its id
@@ -570,12 +589,6 @@ struct Grant {
     Str host;   // a host; for an MCP grant, its server's url by its
                 // SHA-256 (mcpurlkey), as it holds only while that stays
     Str image;  // a container image subagents may run in (the task tool's)
-};
-
-// An image converted for a request (topng).
-struct Converted {
-    Str png;  // null on failure
-    Str err;
 };
 
 // A summary compaction under way (REQ_COMPACT).
@@ -732,6 +745,8 @@ struct Session {
     i32          callimgh;   // geometry (deskshotstr), for tool.end
     Str          callshot;
     i32          callpages;  // callimage is a PDF read, of so many pages
+    Slice<MsgImage> callimages;  // in perm: its several images, if any
+                                 // (a PDF's), each a file under out/
     DeskRun      desk;       // the desktop helper
     WebRun      *web;        // the web call running, if one is
     Proc        *proc;
@@ -879,6 +894,8 @@ struct Session {
     // The web (see "Web")
     Map<b32>    *webseen;    // URLs the agent was shown: web_fetch's
     Map<WebSpill> *webspill; // pages read, by URL, to read on
+    Map<PdfMemo> *pdfmemo;   // PDFs read, by absolute path (readpdf)
+    iz           pdfmemobytes;  // perm pdfmemo took, within PDF_MEMOBYTES
     i32          websearches;  // a tree's root's: the tree's searches
     Slice<Str>   callurls;   // a task call's report's URLs its subagent saw
 };
@@ -1271,7 +1288,8 @@ static i64 estimate(Session *s)  // walks the history for images
            deskimagetokens(s) + attachtokens(s);
 }
 
-// Put images as the user record has them: [{name, mime, w, h}].
+// Put images as the user record has them: [{name, mime, w, h}], and a
+// tool result's with its label, if it has one.
 static void putimages(JsonOut *w, Slice<MsgImage> images)
 {
     putkey(w, "images");
@@ -1282,6 +1300,9 @@ static void putimages(JsonOut *w, Slice<MsgImage> images)
         putstrkey(w, "mime", images[i].mime);
         putintkey(w, "w", images[i].w);
         putintkey(w, "h", images[i].h);
+        if (images[i].label.len) {
+            putstrkey(w, "label", images[i].label);
+        }
         putend(w);
     }
     putend(w);
@@ -1348,21 +1369,80 @@ static Slice<MsgSess> getsessrefs(Arena *perm, Json *list)
     return r;
 }
 
-// The images of a user record, in perm, those well formed.
+// The images of a user record, or of a tool result, in perm, those
+// well formed.
 static Slice<MsgImage> getimages(Arena *perm, Json *list)
 {
     Slice<MsgImage> r = {};
     for (Json *x = list->child; x; x = x->next) {
         MsgImage g = {};
-        g.name = clone(perm, jsonstr(jsonget(x, "name")));
-        g.mime = clone(perm, jsonstr(jsonget(x, "mime")));
-        g.w    = (i32)jsonint(jsonget(x, "w"), 0);
-        g.h    = (i32)jsonint(jsonget(x, "h"), 0);
+        g.name  = clone(perm, jsonstr(jsonget(x, "name")));
+        g.mime  = clone(perm, jsonstr(jsonget(x, "mime")));
+        g.w     = (i32)jsonint(jsonget(x, "w"), 0);
+        g.h     = (i32)jsonint(jsonget(x, "h"), 0);
+        g.label = clone(perm, jsonstr(jsonget(x, "label")));
         if (g.name.len && g.mime.len) {
             r = push(perm, r, g);
         }
     }
     return r;
+}
+
+// A tool result's image keys in its record (tool.end), from its message:
+// a PDF sent as a document (pdf, pages); several images (images), with
+// the first PNG among them under the keys of one too (image, width,
+// height), which older engines replay and older views draw, and which
+// is sent as a PNG, so never a JPEG; or one image (image, width,
+// height), and a screenshot's geometry (shot). Never both a PDF and
+// images.
+static void putcallimages(JsonOut *w, Msg *m, Str shot)
+{
+    if (m->image.len && m->pages) {
+        putstrkey(w, "pdf", m->image);  // not an image to draw
+        putintkey(w, "pages", m->pages);
+    } else if (m->images.len) {
+        putimages(w, m->images);
+        for (iz k = 0; k < m->images.len; k++) {
+            MsgImage *g = &m->images[k];
+            if (g->mime == "image/png") {
+                putstrkey(w, "image", g->name);
+                putintkey(w, "width", g->w);
+                putintkey(w, "height", g->h);
+                break;
+            }
+        }
+    } else if (m->image.len) {
+        putstrkey(w, "image", m->image);
+        putintkey(w, "width", m->imgw);
+        putintkey(w, "height", m->imgh);
+        if (shot.len) {
+            putstrkey(w, "shot", shot);  // a screenshot's
+        }
+    }
+}
+
+// A tool result's image fields from its record (putcallimages), in perm:
+// its images, when it has several, and the image key, naming a PNG of
+// them, left aside; that alone if none of the images is well formed.
+static void getcallimages(Arena *perm, Json *j, Msg *m)
+{
+    Json *list = jsonget(j, "images");
+    if (list->type==JSON_ARRAY && list->child) {
+        m->images = getimages(perm, list);
+        if (m->images.len) {
+            return;
+        }
+    }
+    m->image   = clone(perm, jsonstr(jsonget(j, "image")));
+    m->imgw    = (i32)jsonint(jsonget(j, "width"), 0);
+    m->imgh    = (i32)jsonint(jsonget(j, "height"), 0);
+    m->imgread = m->image.len && !jsonstr(jsonget(j, "shot")).len;
+    if (!m->image.len) {
+        m->image   = clone(perm, jsonstr(jsonget(j, "pdf")));
+        m->pages   = m->image.len ? (i32)jsonint(jsonget(j, "pages"), 1) : 0;
+        m->pages   = m->image.len && m->pages<1 ? 1 : m->pages;
+        m->imgread = m->image.len > 0;
+    }
 }
 
 static void webanswered(Session *, Arena, b32 allow, i32 by, Str note, i64 wait);
@@ -2358,6 +2438,7 @@ static Slice<Msg> deskimages(Session *, Arena *);
 static void toolsessions(Session *, Arena);
 static void toolmessage(Session *, Arena, Args *);
 static b32  validimage(Str name);
+static b32  validout(Str name);
 static b32  validfile(Str name);
 
 // The ids of the session's calls so far, which a new call's must not
@@ -3641,19 +3722,6 @@ static void toolend(Session *s, Arena scratch, Str status, Str text,
         putintkey(&w.json, "hop", s->msghop);
     }
     puturls(&w.json, s->callurls);  // a task's report's (webvouch)
-    if (s->callimage.len && s->callpages) {
-        putstrkey(&w.json, "pdf", s->callimage);  // not an image to draw
-        putintkey(&w.json, "pages", s->callpages);
-    } else if (s->callimage.len) {
-        putstrkey(&w.json, "image", s->callimage);
-        putintkey(&w.json, "width", s->callimgw);
-        putintkey(&w.json, "height", s->callimgh);
-        if (s->callshot.len) {
-            putstrkey(&w.json, "shot", s->callshot);  // a screenshot's
-        }
-    }
-    putintkey(&w.json, "ms", (os_ticks(e->os) - s->callstart)/MS);
-    ssend(s, &w);
 
     Msg m = {};
     m.role   = ROLE_TOOL;
@@ -3661,16 +3729,27 @@ static void toolend(Session *s, Arena scratch, Str status, Str text,
     m.text   = clone(&s->perm, text);
     m.spill  = spill.len ? clone(&s->perm, spill) : Str{};
     m.error  = toolfailed(status);
-    m.image  = s->callimage;
-    m.imgw   = s->callimgw;
-    m.imgh   = s->callimgh;
-    m.imgread = s->callimage.len && !s->callshot.len;
-    m.pages   = s->callpages;
+    if (s->callimages.len && !(s->callimage.len && s->callpages)) {
+        m.images = s->callimages;  // several: no image of its own
+    } else {
+        m.image   = s->callimage;
+        m.imgw    = s->callimgw;
+        m.imgh    = s->callimgh;
+        m.imgread = s->callimage.len && !s->callshot.len;
+        m.pages   = s->callpages;
+    }
+    putcallimages(&w.json, &m, s->callshot);
+    putintkey(&w.json, "ms", (os_ticks(e->os) - s->callstart)/MS);
+    ssend(s, &w);
+
     addmsg(s, m);
     webnotetool(s, scratch, c->name, status, text, s->callurls);
-    s->callimage = {};
-    s->callshot  = {};
-    s->callpages = 0;
+    s->callimage  = {};
+    s->callimgw   = 0;
+    s->callimgh   = 0;
+    s->callimages = {};
+    s->callshot   = {};
+    s->callpages  = 0;
     s->msgto     = {};
     s->msgtitle  = {};
     s->msghow    = {};
@@ -5079,7 +5158,7 @@ static void runpatch(Session *s, Arena scratch, Args *args, Str allowed)
 }
 
 static b32 readimage(Session *, Arena, Str);
-static b32 readpdf(Session *, Arena, Str);
+static b32 readpdf(Session *, Arena, Str, Args *);
 
 // A path tool on a path the guard allowed, or the user did. Returns 1
 // if the call finished, 0 if it goes on (a search).
@@ -5111,7 +5190,7 @@ static b32 runfile(Session *s, Arena scratch, i32 tool, Str path, Args *args)
     }
     if (tool==TOOL_WRITE || tool==TOOL_EDIT) {
         pre = snapbefore(s, scratch, path);
-    } else if (tool==TOOL_READ && (readimage(s, scratch, path) || readpdf(s, scratch, path))) {
+    } else if (tool==TOOL_READ && (readimage(s, scratch, path) || readpdf(s, scratch, path, args))) {
         return 1;
     }
     switch (tool) {
@@ -6791,8 +6870,8 @@ static b32 refusepdf(Session *s, Str why)
 static i64 pdfpagesmax(Session *s)
 {
     i64 ctx = s->mc.ctx ? s->mc.ctx : s->ctxhint;
-    i64 fit = ctx>0 ? ctx/2/PDF_TOKENS : PDF_PAGES;
-    return fit<1 ? 1 : fit>PDF_PAGES ? PDF_PAGES : fit;
+    i64 fit = ctx>0 ? ctx/2/PDF_TOKENS : (i64)PDF_PAGES;
+    return fit<1 ? 1 : fit>PDF_PAGES ? (i64)PDF_PAGES : fit;
 }
 
 // Screenshots kept in requests, and how many more before the oldest
@@ -6809,12 +6888,56 @@ static i64 deskslack(Engine *e)
     return v.ok ? (v.val<0 ? 0 : v.val>20 ? 20 : v.val) : DESK_SLACK;
 }
 
+// Of the images of PDFs, tool results' and attached PDFs', a request
+// carries at most so many, and so many bytes of their files, the newest
+// first: Anthropic takes 100 images in a request to a 200k model, and
+// [desktop] images may keep 20 sets. With the PDFs sent as documents,
+// at most PDF_REQBYTES of files in all, within Anthropic's 32 MB of a
+// request as base64, with room for the rest of it.
+enum : i32 {
+    PDF_REQIMAGES   = 40,
+    PDF_REQIMGBYTES = 8 << 20,
+    PDF_REQBYTES    = 20 << 20,
+};
+// A window's images (pdfpick) always fit a request, alone
+static_assert((i64)PDF_SHOWBYTES/4*3 <= PDF_REQIMGBYTES);
+static_assert((i32)PDF_IMAGES <= (i32)PDF_REQIMAGES);
+static_assert((i32)PDF_BYTES<=(i32)PDF_REQBYTES && PDF_REQIMGBYTES<=PDF_REQBYTES);
+
+// Whether an image attached to a user message is one of an attached
+// PDF's (pdfattachimages), which come and go together as a set does.
+static b32 pdfattached(MsgImage *g)
+{
+    return g->label.len > 0;
+}
+
+static b32 pdfattachset(Msg *m)
+{
+    for (iz k = 0; m->role==ROLE_USER && k<m->images.len; k++) {
+        if (pdfattached(&m->images[k])) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Whether a message is one of the items [desktop] images counts: a
+// screenshot, an image or PDF read, or a tool result's several images,
+// which come and go together. deskdrop, deskimagetokens, deskkeepset
+// and deskimages count by it alike, or their indices fall apart.
+static b32 deskitem(Msg *m)
+{
+    return m->image.len || (m->role==ROLE_TOOL && m->images.len);
+}
+
 // Which screenshots a request leaves out, the oldest first, and where
 // its prefix stops matching the request before (FLOOR_*).
 struct DeskDrop {
     i64 drop;   // screenshots left out
     i64 read;   // FLOOR_READ, or -1
     i64 write;  // FLOOR_WRITE, or -1
+    i64 was;    // screenshots the request before left out
+    iz  last;   // the latest response, where the request before ended, or -1
 };
 
 static DeskDrop deskdrop(Session *s)
@@ -6829,7 +6952,7 @@ static DeskDrop deskdrop(Session *s)
     i64 total  = 0;
     i64 before = 0;
     for (iz i = 0; i < s->history.len; i++) {
-        b32 shot = s->history[i].image.len > 0;
+        b32 shot = deskitem(&s->history[i]);
         total  += shot;
         before += shot && i<last;
     }
@@ -6840,44 +6963,163 @@ static DeskDrop deskdrop(Session *s)
     i64 old = keep>0 && before>was ? was : -1;  // the oldest shown, or -1
     i64 now = keep>0 && total>r.drop ? r.drop : -1;
     r.write = now!=old ? now : -1;
+    r.was   = was;
+    r.last  = last;
+    return r;
+}
+
+// The size of a file of the session's directory, 0 if it is lost,
+// with an arena of its own on the stack, so that estimate, which has
+// none, weighs files as deskimages does (a path past 1 KiB, which no
+// session has, weighs nothing).
+static i64 deskfilesize(Session *s, Str name)
+{
+    byte  mem[1<<14];
+    Arena t = {mem, mem+countof(mem)};
+    if (s->dir.len+name.len > 1<<10) {
+        return 0;
+    }
+    Str path = join(&t, s->dir, name);  // before t is copied
+    i64 z    = os_stat(s->e->os, t, path).size;
+    return z>0 ? z : 0;
+}
+
+// Which of the PDFs read, and of tool results' sets of images, a
+// request shown carries (its [desktop] images count them with
+// screenshots), of history[0..len) with drop screenshots left out: the
+// newest first while they fit in a request, PDFs by pdfpagesmax and
+// PDF_BYTES, sets of images, each whole or not at all, by PDF_REQIMAGES
+// and PDF_REQIMGBYTES (the files of out/ alone, as no others are sent),
+// a user message's attached PDFs' images among them as one set (which
+// [desktop] images does not count), and both by PDF_REQBYTES together.
+// The first of a kind with no room ends that kind, older ones left out
+// too, so that one only ever leaves as newer ones arrive, and requests
+// keep their prefix (deskfloor); one with no room even alone is passed
+// over, as it never has any. Each kept sets keep[i], if keep is given;
+// returns the tokens of those kept that the model is sent: PDFs only if
+// pdfon, sets only if it takes images (deskimages).
+static i64 deskkept(Session *s, b32 *keep, i64 drop, iz len)
+{
+    i64 max    = pdfpagesmax(s);
+    b32 pdf    = pdfon(s);
+    b32 blind  = s->mc.novision;
+    i64 n      = 0;
+    i64 pages  = 0;
+    i64 bytes  = 0;
+    i64 imgs   = 0;
+    i64 ibytes = 0;
+    b32 nosets = 0;
+    b32 nopdfs = 0;
+    i64 r      = 0;
+    for (iz i = 0; i < len; i++) {
+        n += deskitem(&s->history[i]);
+    }
+    for (iz i = len-1; i >= 0; i--) {
+        Msg *m = &s->history[i];
+        if (pdfattachset(m)) {
+            i64 cnt  = 0;
+            i64 size = 0;
+            for (iz k = 0; k < m->images.len; k++) {
+                MsgImage *g = &m->images[k];
+                if (pdfattached(g)) {
+                    cnt++;
+                    size += validimage(g->name) ? deskfilesize(s, g->name) : 0;
+                }
+            }
+            if (nosets || cnt>PDF_REQIMAGES || size>PDF_REQIMGBYTES) {
+                continue;
+            } else if (imgs+cnt>PDF_REQIMAGES || ibytes+size>PDF_REQIMGBYTES ||
+                       bytes+ibytes+size>PDF_REQBYTES) {
+                nosets = 1;
+                continue;
+            }
+            imgs   += cnt;
+            ibytes += size;
+            for (iz k = 0; !blind && k<m->images.len; k++) {
+                MsgImage *g = &m->images[k];
+                r += pdfattached(g) ? imagetokens(g->w, g->h) : 0;
+            }
+            if (keep) {
+                keep[i] = 1;
+            }
+            continue;
+        }
+        if (!deskitem(m) || --n<drop) {
+            continue;
+        } else if (!m->image.len) {
+            if (nosets || m->images.len>PDF_REQIMAGES) {
+                continue;
+            }
+            i64 size = 0;
+            for (iz k = 0; k < m->images.len; k++) {
+                Str name = m->images[k].name;
+                size += validout(name) ? deskfilesize(s, name) : 0;
+            }
+            if (size > PDF_REQIMGBYTES) {
+                continue;
+            } else if (imgs+m->images.len>PDF_REQIMAGES || ibytes+size>PDF_REQIMGBYTES ||
+                       bytes+ibytes+size>PDF_REQBYTES) {
+                nosets = 1;
+                continue;
+            }
+            imgs   += m->images.len;
+            ibytes += size;
+            for (iz k = 0; !blind && k<m->images.len; k++) {
+                r += imagetokens(m->images[k].w, m->images[k].h);
+            }
+        } else if (!m->pages || m->pdfbad.len || nopdfs || m->pages>max) {
+            continue;
+        } else {
+            i64 size = deskfilesize(s, m->image);
+            if (size > PDF_BYTES) {
+                continue;
+            } else if (pages+m->pages>max || bytes+size>PDF_BYTES ||
+                       bytes+ibytes+size>PDF_REQBYTES) {
+                nopdfs = 1;
+                continue;
+            }
+            pages += m->pages;
+            bytes += size;
+            r     += pdf ? (i64)m->pages*PDF_TOKENS : 0;
+        }
+        if (keep) {
+            keep[i] = 1;
+        }
+    }
     return r;
 }
 
 // Tokens of the screenshots, images and PDFs read that the next request
-// carries, the PDFs as pdfskeep would keep them by their pages.
+// carries: the PDFs and tool results' sets of images as deskkept keeps
+// them, files and all, and for a model that takes no images, only the
+// PDFs (deskimages).
 static i64 deskimagetokens(Session *s)
 {
-    i64 drop  = deskdrop(s).drop;
-    i64 max   = pdfon(s) ? pdfpagesmax(s) : 0;
-    i64 n     = 0;
-    i64 pages = 0;
-    i64 r     = 0;
-    for (iz i = 0; i < s->history.len; i++) {
-        n += s->history[i].image.len > 0;
-    }
-    for (iz i = s->history.len-1; i >= 0; i--) {
+    i64 drop = deskdrop(s).drop;
+    i64 r    = deskkept(s, 0, drop, s->history.len);
+    for (iz i = 0, n = 0; !s->mc.novision && i<s->history.len; i++) {
         Msg *m = &s->history[i];
-        if (!m->image.len || --n<drop) {
-            continue;
-        } else if (!m->pages) {
+        if (deskitem(m) && n++>=drop && m->image.len && !m->pages) {
             r += imagetokens(m->imgw, m->imgh);
-        } else if (!m->pdfbad.len && pages+m->pages<=max) {
-            pages += m->pages;
-            r     += (i64)m->pages * PDF_TOKENS;
         }
     }
     return r;
 }
 
 // Tokens of the images attached to user messages, which requests always
-// carry, each as the model's limits would scale it down (desklimits).
+// carry, each as the model's limits would scale it down (desklimits),
+// but for a model that takes no images, which gets notes (deskimages),
+// and but for attached PDFs' images, which deskkept counts.
 static i64 attachtokens(Session *s)
 {
     DeskLimits l = desklimits(s);
     i64        r = 0;
-    for (iz i = 0; i < s->history.len; i++) {
+    for (iz i = 0; !s->mc.novision && i<s->history.len; i++) {
         Msg *m = &s->history[i];
-        for (iz k = 0; k < m->images.len; k++) {
+        for (iz k = 0; m->role==ROLE_USER && k<m->images.len; k++) {
+            if (pdfattached(&m->images[k])) {
+                continue;
+            }
             i64 w    = m->images[k].w;
             i64 h    = m->images[k].h;
             i64 edge = w>h ? w : h;
@@ -6892,9 +7134,42 @@ static i64 attachtokens(Session *s)
     return r;
 }
 
+// Whether an attached file is a PDF's text (attachfile), files/N-NAME.pdf
+// with its PDF beside it.
+static b32 filepdf(Str name)
+{
+    return endswith(name, ".pdf.txt");
+}
+
+// The head before an attached file's lines in a request (filestext),
+// in a: where it is kept, which the agent may read on from; for a PDF's
+// text, where the PDF is too, which read shows with its images.
+static Str filehead(Session *s, Arena *a, Str name)
+{
+    Str  path = join(a, s->dir, name);
+    Str  own  = cut(cuthead(name, 6), '-').tail;
+    Buf  b(a, 256 + 2*path.len);
+    if (filepdf(name)) {
+        print(&b, "[Attached PDF ");
+        print(&b, cuttail(own, 4));
+        print(&b, ", its text extracted, kept at ");
+        print(&b, path);
+        print(&b, ", where read continues it; the PDF itself is at ");
+        print(&b, cuttail(path, 4));
+        print(&b, s->mc.novision ? Str(":]\n") : Str(", which read shows with its images:]\n"));
+    } else {
+        print(&b, "[Attached file ");
+        print(&b, own);
+        print(&b, ", kept at ");
+        print(&b, path);
+        print(&b, ", where read continues it:]\n");
+    }
+    return finish(&b);
+}
+
 // The text a request has for the files attached to a user message, in
-// a, before its own: each as read shows it, where it is kept, which the
-// agent may read on from, or a note if its file is lost.
+// a, before its own: each as read shows it, after its head (filehead),
+// or a note if its file is lost.
 static Str filestext(Session *s, Arena *a, Slice<MsgFile> files)
 {
     Str r = {};
@@ -6904,12 +7179,13 @@ static Str filestext(Session *s, Arena *a, Slice<MsgFile> files)
         b32  ok   = validfile(files[i].name);
         Read rd   = ok ? os_read(s->e->os, a, path, ATTACH_FILE) : Read{};
         if (!ok || rd.err!=READ_OK) {
-            r = concat(a, r, concat(a, concat(a, "[Attached file ", name),
+            Str what = filepdf(name) ? Str("[Attached PDF ") : Str("[Attached file ");
+            name = filepdf(name) ? cuttail(name, 4) : name;
+            r = concat(a, r, concat(a, concat(a, what, name),
                                     " lost: its file could not be read]\n\n"));
             continue;
         }
-        Str head = concat(a, concat(a, concat(a, "[Attached file ", name), ", kept at "),
-                          concat(a, path, ", where read continues it:]\n"));
+        Str head = filehead(s, a, files[i].name);
         Str body = readbody(a, rd.data, head, 1, READ_LINES);
         r = concat(a, r, concat(a, body, endswith(body, "\n") ? Str("\n") : Str("\n\n")));
     }
@@ -6937,42 +7213,72 @@ static Str sessrefstext(Arena *a, Slice<MsgSess> refs)
     return finish(&b);
 }
 
-// Which of the PDFs read a request shown carries (its [desktop] images
-// count them with screenshots): the newest first while they fit in a
-// request (pdfpagesmax, PDF_BYTES), each kept if keep[i] for history[i].
-static b32 *pdfskeep(Session *s, Arena *a, i64 drop)
+// Which of the PDFs read and sets of images deskkept keeps, in a: each
+// kept if keep[i] for history[i].
+static b32 *deskkeepset(Session *s, Arena *a, i64 drop, iz len)
 {
-    b32 *keep  = alloc<b32>(a, s->history.len);
-    i64  max   = pdfpagesmax(s);
-    i64  n     = 0;
-    i64  pages = 0;
-    i64  bytes = 0;
-    for (iz i = 0; i < s->history.len; i++) {
-        n += s->history[i].image.len > 0;
-    }
-    for (iz i = s->history.len-1; i >= 0; i--) {
-        Msg *m = &s->history[i];
-        if (!m->image.len || --n<drop || !m->pages || m->pdfbad.len) {
-            continue;
-        }
-        Str path = join(a, s->dir, m->image);
-        i64 size = os_stat(s->e->os, *a, path).size;
-        if (pages+m->pages<=max && bytes+size<=PDF_BYTES) {
-            keep[i] = 1;
-            pages += m->pages;
-            bytes += size;
-        }
-    }
+    b32 *keep = alloc<b32>(a, s->history.len);
+    deskkept(s, keep, drop, len);
     return keep;
+}
+
+// Where a request's prefix stops matching the one before for a PDF or
+// set of images that deskkeepset kept then and leaves out now, which
+// newer ones crowd out: the index in history of the oldest such, which
+// takes FLOOR_READ, or -1. keep is this request's deskkeepset.
+static iz deskfloor(Session *s, Arena scratch, DeskDrop d, b32 *keep)
+{
+    if (d.last < 0) {
+        return -1;
+    }
+    b32 *was = deskkeepset(s, &scratch, d.was, d.last);
+    i64  n   = 0;
+    for (iz i = 0; i < d.last; i++) {
+        Msg *m = &s->history[i];
+        if (pdfattachset(m) && was[i]!=keep[i]) {
+            return i;
+        } else if (deskitem(m) && n++>=d.drop && was[i]!=keep[i]) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// A tool result's several images, kept, in a: each read in as base64,
+// or a note in its place if its file is lost.
+static Slice<MsgImage> toolimagesin(Session *s, Arena *a, Slice<MsgImage> images)
+{
+    Slice<MsgImage> r = {};
+    r.data = alloc<MsgImage>(a, images.len);
+    r.len  = r.cap = images.len;
+    for (iz k = 0; k < images.len; k++) {
+        MsgImage g  = images[k];
+        b32      ok = validout(g.name);
+        Read     rd = {};
+        if (ok) {
+            rd = os_read(s->e->os, a, join(a, s->dir, g.name), DESK_REPLYMAX);
+            ok = rd.err==READ_OK && imagetypes[imagesniff(rd.data)].mime==g.mime;
+        }
+        if (ok) {
+            g.b64 = base64(a, rd.data);
+        } else {
+            g.alt = concat(a, concat(a, "[image lost: ", g.name),
+                           ", its file could not be read]");
+        }
+        r.data[k] = g;
+    }
+    return r;
 }
 
 // The history for a request: the screenshots shown read in as base64,
 // with a short text in place of each left out, and the floors marked;
 // the PDFs read likewise, each with no room for it, or for a model that
-// takes none, left out too (pdfskeep, pdfon); the images attached, each
-// read in, or a note if its file is lost; and the text files attached,
-// as text before their message's own. The history itself if it has
-// none of them.
+// takes none, left out too (deskkeepset, pdfon); a tool result's
+// several images likewise, together, and each read in (toolimagesin);
+// the images attached, each read in, or a note if its file is lost; and
+// the text files attached, as text before their message's own. For a
+// model that takes no images (one switched to), a note in place of each
+// image. The history itself if it has none of them.
 static Slice<Msg> deskimages(Session *s, Arena *a)
 {
     Engine *e   = s->e;
@@ -6984,17 +7290,45 @@ static Slice<Msg> deskimages(Session *s, Arena *a)
     if (!any) {
         return s->history;
     }
-    DeskDrop   d    = deskdrop(s);
-    b32       *keep = pdfskeep(s, a, d.drop);
-    b32        pdf  = pdfon(s);
-    Slice<Msg> h    = {};
+    DeskDrop   d     = deskdrop(s);
+    b32       *keep  = deskkeepset(s, a, d.drop, s->history.len);
+    b32        pdf   = pdfon(s);
+    b32        blind = s->mc.novision;
+    Slice<Msg> h     = {};
     h.data = alloc<Msg>(a, s->history.len);
     h.len  = h.cap = s->history.len;
+
+    // One FLOOR_READ, the earlier of a screenshot dropped at this step
+    // and a PDF or set crowded out since the request before
+    iz read = deskfloor(s, *a, d, keep);
+    for (iz i = 0, n = 0; d.read>=0 && i<s->history.len; i++) {
+        if (deskitem(&s->history[i]) && n++==d.read) {
+            read = read<0 || i<read ? i : read;
+            break;
+        }
+    }
+
     i64 n  = 0;
     for (iz i = 0; i < s->history.len; i++) {
         Msg m = s->history[i];
-        if (m.image.len) {
-            m.floor = n==d.read ? FLOOR_READ : n==d.write ? FLOOR_WRITE : FLOOR_NONE;
+        if (deskitem(&m)) {
+            m.floor = i==read ? FLOOR_READ : n==d.write ? FLOOR_WRITE : FLOOR_NONE;
+        } else if (i == read) {
+            m.floor = FLOOR_READ;  // an attached PDF's images crowded out
+        }
+        if (!m.image.len && deskitem(&m)) {
+            if (n++<d.drop || !keep[i]) {
+                m.imgalt = concat(a, concat(a, "[PDF images omitted: ", m.callid),
+                                  "; read the file again to see them]");
+                m.images = {};
+            } else if (blind) {
+                m.imgalt = concat(a, concat(a, "[PDF images omitted: ", m.callid),
+                                  ", since this model takes no images]");
+                m.images = {};
+            } else {
+                m.images = toolimagesin(s, a, m.images);
+            }
+        } else if (m.image.len) {
             Str what = m.pages   ? Str("PDF")   :
                        m.imgread ? Str("image") : Str("screenshot");
             if (n++ < d.drop) {
@@ -7013,29 +7347,41 @@ static Slice<Msg> deskimages(Session *s, Arena *a)
                 m.imgalt = concat(a, concat(a, "[PDF omitted: ", m.callid),
                                   ", for room in the request for newer ones; read "
                                   "the file again to see it]");
+            } else if (!m.pages && blind) {
+                m.imgalt = concat(a, concat(a, concat(a, "[", what), " omitted: "),
+                                  concat(a, m.callid, ", since this model takes no images]"));
             } else {
                 Read rd = os_read(e->os, a, join(a, s->dir, m.image), DESK_REPLYMAX);
                 if (rd.err == READ_OK) {
-                    m.imgb64 = base64(a, rd.data);
+                    m.imgb64  = base64(a, rd.data);
+                    m.imgmime = m.pages ? Str{} : imagetypes[imagesniff(rd.data)].mime;
                 } else {
                     m.imgalt = concat(a, concat(a, concat(a, "[", what), " lost: "),
                                       concat(a, m.callid, ", its file could not be read]"));
                 }
             }
         }
-        if (m.images.len) {
+        if (m.role==ROLE_USER && m.images.len) {
             Slice<MsgImage> imgs = {};
             imgs.data = alloc<MsgImage>(a, m.images.len);
             imgs.len  = imgs.cap = m.images.len;
             for (iz k = 0; k < m.images.len; k++) {
-                MsgImage g  = m.images[k];
-                b32      ok = validimage(g.name);
-                Read     rd = {};
+                MsgImage g    = m.images[k];
+                b32      room = !pdfattached(&g) || keep[i];
+                b32      ok   = !blind && room && validimage(g.name);
+                Read     rd   = {};
                 if (ok) {
                     rd = os_read(e->os, a, join(a, s->dir, g.name), ATTACH_UPLOAD);
                     ok = rd.err==READ_OK && imagetypes[imagesniff(rd.data)].mime==g.mime;
                 }
-                if (ok) {
+                if (!blind && !room) {
+                    g.alt = concat(a, concat(a, "[image omitted: ", g.label),
+                                   ", for room in the request for newer images; read "
+                                   "the PDF again to see it]");
+                } else if (blind) {
+                    g.alt = concat(a, concat(a, "[image omitted: ", g.name),
+                                   ", since this model takes no images]");
+                } else if (ok) {
                     g.b64 = base64(a, rd.data);
                 } else {
                     g.alt = concat(a, concat(a, "[image lost: ", g.name),
@@ -8131,7 +8477,7 @@ static Str websend(Engine *e, WebRun *w, Arena scratch)
                   "*/*;q=0.1\r\n"
                   "Accept-Encoding: identity\r\n"
                   "User-Agent: prospero/" PROSPERO_VERSION "\r\n");
-        max = WEB_PAGEMAX;
+        max = WEB_PDFMAX;  // a page's body is cut sooner (webbodymax)
     } else if (w->service == WEBS_SEARXNG) {
         Str base = trim(cfgget(e->cfg, "web", "", "url", 0));
         r.method = "GET";
@@ -8444,12 +8790,14 @@ static Str webfailure(Arena *a, WebRun *w, i32 err, Str why)
     return finish(&b);
 }
 
+static void webshow(Session *, Arena, Str title, Str ctype, Str text, Str more);
+static b32  webpdfpage(Session *, Arena, Str body);
+
 // A fetched page's response, complete: a redirect, refusal, or its text.
 static void webpage(Session *s, Arena scratch)
 {
     Engine *e  = s->e;
     WebRun *w  = s->web;
-    Block  *c  = &s->calls[s->callidx];
     i32     st = w->status;
     Buf     b(&scratch, 1024 + w->url.len);
     if (st/100==3 && w->location.len) {
@@ -8508,13 +8856,21 @@ static void webpage(Session *s, Arena scratch)
 
     Str body = {w->body.data, w->body.len};
     i32 kind = webkind(w->ctype, body);
+    if (kind==WEBK_PDF && webpdfpage(s, scratch, body)) {
+        return;
+    } else if (kind == WEBK_PDF) {
+        // Not one after all, but text that mentions "%PDF-", or a page
+        // (a login or error page) sent as one
+        kind = webkind({}, body);
+        kind = kind==WEBK_PDF ? WEBK_TEXT : kind;
+    }
     if (kind == WEBK_BINARY) {
         Str type = trim(cut(w->ctype, ';').head);
         print(&b, "Not read: ");
         print(&b, w->url);
         print(&b, " is ");
         print(&b, type.len ? type : Str("binary data"));
-        print(&b, ", not text. web_fetch reads only web pages and text.");
+        print(&b, ", not text. web_fetch reads only web pages, text and PDFs.");
         webcallend(s, scratch, "error", finish(&b));
         return;
     }
@@ -8536,9 +8892,17 @@ static void webpage(Session *s, Arena scratch)
         print(&t, " MiB.]\n");
         text = finish(&t);
     }
+    webshow(s, scratch, title, w->ctype, text, {});
+}
 
-    // The whole text kept, to read on (webspillread), after a line
-    // saying where it came from
+// A fetched page's text, or a PDF's, title and Content-Type with it:
+// kept whole, to read on (webspillread), after a line saying where it
+// came from, and its window shown, after which more (if any) follows.
+static void webshow(Session *s, Arena scratch, Str title, Str ctype, Str text, Str more)
+{
+    Engine *e = s->e;
+    WebRun *w = s->web;
+    Block  *c = &s->calls[s->callidx];
     Str rel  = {};
     Str path = spillfile(s, scratch, c->id, &rel, ".txt");
     Buf f(&scratch, text.len + w->url.len + 256);
@@ -8553,7 +8917,7 @@ static void webpage(Session *s, Arena scratch)
         WebSpill sp = {};
         sp.path  = path;
         sp.title = clone(&s->perm, title);
-        sp.ctype = clone(&s->perm, w->ctype);
+        sp.ctype = clone(&s->perm, ctype);
         Str keys[] = {w->asked, w->url};
         for (iz i = 0; i < countof(keys); i++) {
             WebSpill *old = upsert(&s->webspill, keys[i], (Arena *)0);
@@ -8568,8 +8932,129 @@ static void webpage(Session *s, Arena scratch)
     }
     Str nonce = webnonce(&scratch, os_random(e->os));
     iz  off   = w->offset<0 ? 0 : w->offset<text.len ? (iz)w->offset : text.len;
-    Str shown = webfetchtext(&scratch, w->url, title, w->ctype, text, off, WEB_SHOW, nonce);
+    Str shown = webfetchtext(&scratch, w->url, title, ctype, text, off, WEB_SHOW, nonce);
+    if (more.len) {
+        shown = concat(&scratch, shown, Str("\n\n"));
+        shown = concat(&scratch, shown, more);
+    }
     webcallend(s, scratch, "ok", shown, rel, whole.len);
+}
+
+// A fetched PDF read: its text and title, clean, or err, why not, for
+// the agent; images, whether it draws any.
+struct WebPdf {
+    Str text;
+    Str title;
+    Str err;
+    b32 images;
+    b32 notpdf;  // no PDF after all, by its bytes (pdflikely)
+    i32 read;    // pages whose text was read
+    i32 imgonly; // of them, with no text but images (pdfnotext)
+    i32 blank;   // with neither
+};
+
+static void pdfnotext(Str, i32 *, i32 *);
+
+// The PDF body fetched from url read in mem, the reader's own region,
+// its results in perm; cut says its body was cut at WEB_PDFMAX.
+static WebPdf webpdf(Arena *perm, Arena mem, Str url, Str body, b32 cut)
+{
+    WebPdf r = {};
+    if (pdflocked(mem, body)) {
+        r.err = concat(perm, concat(perm, "Not read: ", url),
+                       Str(" is a PDF, encrypted, which web_fetch cannot read."));
+        return r;
+    }
+    PdfOut d = pdfread(perm, mem, body, 0);
+    if ((d.status==PDFR_NOTPDF || d.status==PDFR_NOPAGES) && !pdflikely(body)) {
+        r.notpdf = 1;
+        return r;
+    } else if ((d.status!=PDFR_OK && d.status!=PDFR_PARTIAL) || !d.text.len) {
+        b32 now = d.status==PDFR_PARTIAL;  // out of memory, say
+        Buf b(perm, 256 + url.len);
+        print(&b, "Not read: ");
+        print(&b, url);
+        print(&b, now ? Str(" is a PDF whose text cannot be read now (")
+                      : Str(" is a PDF whose text cannot be read ("));
+        print(&b, d.why.data ? d.why : Str("none was found"));
+        print(&b, now ? Str(").") : cut ? Str("): it was cut at ") : Str("): it may be damaged."));
+        if (!now && cut) {
+            print(&b, (i64)(WEB_PDFMAX >> 20));
+            print(&b, " MiB.");
+        }
+        r.err = finish(&b);
+        return r;
+    }
+    Str text = webclean(perm, d.text);
+    r.text   = webpdfnote(perm, text, cut, WEB_PDFMAX, d.why);
+    r.title  = webclean(perm, d.title);
+    r.images = d.places.len > 0;
+    r.read   = (i32)d.pageline.len;
+    pdfnotext(d.text, &r.imgonly, &r.blank);
+    return r;
+}
+
+// A fetched PDF's response: its text, shown as a page's, and when the
+// model takes images and it has some, the PDF kept for read to show
+// them; or why not. Returns 0 if it is no PDF after all (pdflikely),
+// for webpage to show it as the page or text it is.
+static b32 webpdfpage(Session *s, Arena scratch, Str body)
+{
+    Engine *e   = s->e;
+    WebRun *w   = s->web;
+    Block  *c   = &s->calls[s->callidx];
+    Region *reg = os_reserve(e->os, PDF_REGION);
+    if (!reg) {
+        Str text = concat(&scratch, concat(&scratch, "Not read: ", w->url),
+                          Str(" is a PDF, which cannot be read now: out of memory."));
+        webcallend(s, scratch, "error", text);
+        return 1;
+    }
+    WebPdf p = webpdf(&scratch, newarena(reg), w->url, body, w->cut);
+    os_release(e->os, reg);
+    if (p.notpdf) {
+        return 0;
+    } else if (p.err.len) {
+        webcallend(s, scratch, "error", p.err);
+        return 1;
+    }
+
+    // Kept for read to show its images, or for the shell when its pages
+    // hold no text, with read's notes (readpdf) after the window
+    b32 vision = !s->mc.novision;
+    b32 notext = p.read>0 && p.imgonly+p.blank==p.read;
+    Str kept   = {};
+    if ((p.images && vision) || notext) {
+        Str rel = {};
+        Str out = spillfile(s, scratch, c->id, &rel, ".pdf");
+        kept = os_write(e->os, scratch, out, body) ? out : Str{};
+    }
+    Buf m(&scratch, 512 + 2*kept.len);
+    if (kept.len) {
+        print(&m, "The PDF is kept at ");
+        print(&m, kept);
+        print(&m, p.images && vision ? Str(": read shows it with its images.")
+                                     : Str("."));
+    }
+    if (!vision && notext && p.imgonly) {
+        print(&m, m.len ? Str("\n") : Str(""));
+        print(&m, "[Its pages hold no text, only images (a scan), which this "
+                  "model cannot see. The shell may OCR them: pdfimages or "
+                  "pdftoppm, then tesseract.]");
+    } else if (!vision && (startswith(p.text, "[image ") || find(p.text, "\n[image ")>=0)) {
+        print(&m, m.len ? Str("\n") : Str(""));
+        print(&m, "[This model takes no images: each [image ...] line stands "
+                  "for a picture that is not shown.]");
+    }
+    if (notext && !p.imgonly) {
+        print(&m, m.len ? Str("\n") : Str(""));
+        print(&m, "[No text could be extracted: its words may be drawn as shapes. "
+                  "The shell may render its pages as images (pdftoppm -png -r 100)");
+        print(&m, vision ? Str(", which read then shows you.]")
+                         : Str(" and OCR them (tesseract).]"));
+    }
+    webshow(s, scratch, p.title, "application/pdf", p.text, finish(&m));
+    return 1;
 }
 
 // Hits copied into a, to keep past the scratch arena they were parsed in.
@@ -8709,6 +9194,19 @@ static void webdone(Engine *e, WebRun *w, Arena scratch, i32 err, Str why)
     }
 }
 
+// How much of a response's body is kept, next given more: a fetched
+// PDF's more than a page's, known by its type or its first bytes.
+static i64 webbodymax(WebRun *w, Str more)
+{
+    if (w->status/100 != 2) {
+        return WEB_ERRBODY;
+    } else if (w->tool != TOOL_WEBFETCH) {
+        return WEB_REPLYMAX;
+    }
+    Str head = w->body.len ? Str{w->body.data, w->body.len} : more;
+    return webkind(w->ctype, head)==WEBK_PDF ? (i64)WEB_PDFMAX : (i64)WEB_PAGEMAX;
+}
+
 static void webrecord(Engine *e, WebRun *w, Arena scratch, Record r)
 {
     switch (r.type) {
@@ -8720,8 +9218,7 @@ static void webrecord(Engine *e, WebRun *w, Arena scratch, Record r)
         w->challenge = equalfold(trim(headervalue(head, "cf-mitigated")), "challenge");
     } return;
     case HTTP_BODY: {
-        i64 max  = w->status/100!=2 ? (i64)WEB_ERRBODY :
-                   w->tool==TOOL_WEBFETCH ? (i64)WEB_PAGEMAX : (i64)WEB_REPLYMAX;
+        i64 max  = webbodymax(w, r.data);
         i64 room = max - w->body.len;
         if (w->cut) {
             return;
@@ -9292,7 +9789,6 @@ static Str mcpcwd(Session *s, Arena *a, Str name)
 static Str       findpath(Os *, Arena *, Arena, Str path, Str name, b32 win);
 static Session  *findsession(Engine *, Str sid);
 static Converted topng(Os *, Arena *, Str data, b32 big, i64 edge, i64 pixels);
-static iz        base64len(iz n);
 
 static McpServer *mcpfind(Engine *e, Str name, Str cwd)
 {
@@ -14493,6 +14989,7 @@ static void modelconf(Engine *e, Arena *perm, Str which, Str bare, ModelConf *mc
     Int ip = parseint(trim(cfgget(cfg, "model", model, "image_pixels", 0)));
     mc->coords    = co=="norm1000" ? COORDS_NORM1000 : COORDS_PIXELS;
     mc->novision  = !cfgbool(cfgget(cfg, "model", model, "vision", 0));
+    mc->nopdf     = !cfgbool(cfgget(cfg, "model", model, "pdf", 0));
     mc->imgedge   = ie.ok && ie.val>=16 && ie.val<=16384 ? ie.val : 0;
     mc->imgpixels = ip.ok && ip.val>=256 && ip.val<=(i64)1<<28 ? ip.val : 0;
 }
@@ -18079,16 +18576,8 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             m.spill  = clone(&s->perm, jsonstr(jsonget(j, "spill")));
             m.error  = toolfailed(jsonstr(jsonget(j, "status")));
             m.seq    = r.seq;
-            m.image  = clone(&s->perm, jsonstr(jsonget(j, "image")));
-            m.imgw   = (i32)jsonint(jsonget(j, "width"), 0);
-            m.imgh   = (i32)jsonint(jsonget(j, "height"), 0);
-            m.imgread = m.image.len && !jsonstr(jsonget(j, "shot")).len;
-            if (!m.image.len) {
-                m.image   = clone(&s->perm, jsonstr(jsonget(j, "pdf")));
-                m.pages   = m.image.len ? (i32)jsonint(jsonget(j, "pages"), 1) : 0;
-                m.pages   = m.image.len && m.pages<1 ? 1 : m.pages;
-                m.imgread = m.image.len > 0;
-            } else {
+            getcallimages(&s->perm, j, &m);
+            if (m.image.len && !m.pages) {
                 // Points refer to the latest screenshot, as they did
                 DeskShot sh = deskshotparse(&s->perm, jsonstr(jsonget(j, "shot")));
                 s->desk.shot = sh.ok ? sh : s->desk.shot;
@@ -18375,8 +18864,16 @@ static void cmdunqueue(Engine *e, Session *s, Arena scratch, i64 id, i64 item)
             putintkey(&w.json, "id", id);
             putintkey(&w.json, "ok", 1);
             putstrkey(&w.json, "text", q.text);
-            if (q.images.len) {
-                putimages(&w.json, q.images);  // to attach again
+            // To attach again: the user's own images, not a PDF's, which
+            // its file brings again (pdfattaching)
+            Slice<MsgImage> own = {};
+            for (iz n = 0; n < q.images.len; n++) {
+                if (!q.images[n].label.len) {
+                    own = push(&scratch, own, q.images[n]);
+                }
+            }
+            if (own.len) {
+                putimages(&w.json, own);
             }
             if (q.files.len) {
                 putfiles(&w.json, q.files);
@@ -20359,6 +20856,20 @@ static void sweepuploads(Engine *e, Arena scratch)
 // its first frame. One too large for the APIs, over ATTACH_EDGE pixels
 // on a side or ATTACH_BYTES as base64, is shrunk to fit, as a PNG.
 
+// A tool result's image's name, as tools make them: a file of out/,
+// out/NAME.png or out/NAME.jpg, NAME neither a path nor hidden.
+static b32 validout(Str name)
+{
+    b32 ok = name.len<=128 && startswith(name, "out/") &&
+             (endswith(name, ".png") || endswith(name, ".jpg"));
+    Str n  = ok ? cuttail(cuthead(name, 4), 4) : Str{};
+    ok = n.len>0 && n[0]!='.';
+    for (iz i = 0; ok && i < n.len; i++) {
+        ok = n[i]!='/' && n[i]!='\\' && n[i]!=':';
+    }
+    return ok;
+}
+
 // An attached image's name, as attaching makes them.
 static b32 validimage(Str name)
 {
@@ -20373,11 +20884,6 @@ static b32 validimage(Str name)
         ok = n[i]>='0' && n[i]<='9';
     }
     return ok;
-}
-
-static iz base64len(iz n)
-{
-    return (n + 2)/3 * 4;
 }
 
 // An image as a PNG that fits the APIs: decoded, within edge pixels on
@@ -20401,28 +20907,7 @@ static Converted topng(Os *os, Arena *a, Str data, b32 big, i64 edge, i64 pixels
         os_release(os, reg);
         return r;
     }
-    i32 w    = p.width;
-    i32 h    = p.height;
-    i32 most = w>h ? w : h;
-    f64 s    = most>edge ? (f64)edge/most : 1;
-    while ((f64)w*s*h*s > (f64)pixels) {
-        s *= 0.97;
-    }
-    for (i32 tries = 0; tries<8 && !r.png.data; tries++, s *= 0.75) {
-        Arena t  = mem;
-        i32   tw = (i32)(w*s);
-        i32   th = (i32)(h*s);
-        tw = tw<1 ? 1 : tw;
-        th = th<1 ? 1 : th;
-        u8 *px  = tw==w && th==h ? p.rgba : shrink(&t, p.rgba, w, h, tw, th);
-        Str out = pngencodez(&t, px, tw, th, 0);
-        if (base64len(out.len) <= ATTACH_BYTES) {
-            r.png = clone(a, out);
-        }
-    }
-    if (!r.png.data) {
-        r.err = "the image is too large, and does not shrink to fit";
-    }
+    r = pngfit(a, mem, p.rgba, p.width, p.height, edge, pixels, ATTACH_BYTES);
     os_release(os, reg);
     return r;
 }
@@ -20431,6 +20916,33 @@ struct Attached {
     MsgImage img;
     Str      err;
 };
+
+// Keep data, an image of extension ext (png or jpg), as the next image
+// of the session whose directory is sdir, numbered one past the highest
+// there: its name, img/N.ext, in a, or null if it could not be kept.
+static Str keepimage(Os *os, Arena *a, Str sdir, Str data, Str ext)
+{
+    Str dir = join(a, sdir, "img");
+    i64 n   = 0;
+    for (Dirent *d = os_list(os, a, dir); d; d = d->next) {
+        Str name = concat(a, "img/", d->name);
+        if (validimage(name)) {
+            Int v = parseint(takehead(d->name, d->name.len-4));
+            n = v.ok && v.val>n ? v.val : n;
+        }
+    }
+    Buf b(a, 32);
+    print(&b, "img/");
+    print(&b, n+1);
+    putbyte(&b, '.');
+    print(&b, ext);
+    Str name = finish(&b);
+    Str file = join(a, sdir, name);
+    if (!os_mkdirs(os, *a, dir) || !os_write(os, *a, file, data)) {
+        return {};
+    }
+    return name;
+}
 
 // Keep the image a complete upload staged at path, which goes, as session
 // sid's next, converted or shrunk if it must be, all in a. The image, or
@@ -20467,25 +20979,9 @@ static Attached attachstaged(Engine *e, Arena *a, Str sid, Str path)
         k    = imagekind(*a, data);
     }
 
-    // The next number: one past the highest there
     Str sdir = join(a, join(a, e->statedir, "sessions"), sid);
-    Str dir  = join(a, sdir, "img");
-    i64 n    = 0;
-    for (Dirent *d = os_list(os, a, dir); d; d = d->next) {
-        Str name = concat(a, "img/", d->name);
-        if (validimage(name)) {
-            Int v = parseint(takehead(d->name, d->name.len-4));
-            n = v.ok && v.val>n ? v.val : n;
-        }
-    }
-    Buf b(a, 32);
-    print(&b, "img/");
-    print(&b, n+1);
-    putbyte(&b, '.');
-    print(&b, k.ext);
-    Str name = finish(&b);
-    Str file = join(a, sdir, name);
-    if (!os_mkdirs(os, *a, dir) || !os_write(os, *a, file, data)) {
+    Str name = keepimage(os, a, sdir, data, k.ext);
+    if (!name.data) {
         r.err = "cannot keep the image in the session's directory";
         return r;
     }
@@ -20547,9 +21043,49 @@ struct AttachedFile {
     Str     err;
 };
 
+// A PDF's text, extracted (pdfread) for attaching it as safe, in a, or
+// null and *err why not: an encrypted PDF is refused, as one with no
+// text to read is. *notpdf if its bytes only begin as one's do, for the
+// caller to take it as any other file.
+static Str attachpdftext(Os *os, Arena *a, Str data, Str safe, Str *err, b32 *notpdf)
+{
+    Region *reg = os_reserve(os, PDF_REGION);
+    if (!reg) {
+        *err = concat(a, safe, " is a PDF, which cannot be read now: out of memory");
+        return {};
+    }
+    Arena mem = newarena(reg);
+    Str   r   = {};
+    if (pdflocked(mem, data)) {
+        *err = concat(a, safe, " is a PDF, encrypted, so it is not attached: the shell "
+                               "may extract its text with its password (pdftotext -upw)");
+    } else {
+        PdfOut o = pdfread(a, mem, data, 0);
+        b32    no = o.status==PDFR_NOTPDF || o.status==PDFR_NOPAGES;
+        if (no && !pdflikely(data)) {
+            *notpdf = 1;  // a text file that mentions "%PDF-"
+        } else if (o.status == PDFR_NOTPDF) {
+            *notpdf = 1;
+        } else if ((o.status!=PDFR_OK && o.status!=PDFR_PARTIAL) || !o.text.len) {
+            Buf b(a, 128 + safe.len + o.why.len);
+            print(&b, safe);
+            print(&b, " is a PDF whose text cannot be read (");
+            print(&b, o.why.len ? o.why : Str("none was found"));
+            print(&b, "), so it is not attached: it may be damaged");
+            *err = finish(&b);
+        } else {
+            r = o.text;
+        }
+    }
+    os_release(os, reg);
+    return r;
+}
+
 // Keep the text file a complete upload staged at path, named orig, as
 // session sid's next, all in a. The file, or why not: a binary one, by
-// read's measure, is not taken.
+// read's measure, is not taken. A PDF is kept as files/N-NAME.pdf, and
+// its text, extracted, beside it as files/N-NAME.pdf.txt, which the file
+// names, as requests show it (filestext).
 static AttachedFile attachfile(Engine *e, Arena *a, Str sid, Str path, Str orig)
 {
     Os          *os   = e->os;
@@ -20560,12 +21096,40 @@ static AttachedFile attachfile(Engine *e, Arena *a, Str sid, Str path, Str orig)
     if (rd.err != READ_OK) {
         r.err = "cannot read the staged upload";
         return r;
-    } else if (readbinary(rd.data)) {
+    }
+    Str text = rd.data;  // what the file names
+    b32 pdf  = pdfsniff(rd.data);
+    if (pdf) {
+        b32 notpdf = 0;
+        text = attachpdftext(os, a, rd.data, safe, &r.err, &notpdf);
+        if (r.err.len) {
+            return r;
+        }
+        pdf  = !notpdf;
+        text = pdf ? text : rd.data;
+    }
+    if (pdf) {
+        // Named as one, its extension in lower case whatever case it was
+        // in, as its text's name, NAME.pdf.txt, is how it is known for
+        // one (filepdf, and the GUI's chips)
+        Str tail = cuthead(safe, safe.len>4 ? safe.len-4 : 0);
+        b32 ext  = safe.len > 4;
+        for (iz i = 0; ext && i < 4; i++) {
+            u8 c = tail[i];
+            ext = (c>='A' && c<='Z' ? (u8)(c + 'a' - 'A') : c) == ".pdf"[i];
+        }
+        safe = ext ? concat(a, cuttail(safe, 4), ".pdf") : concat(a, safe, ".pdf");
+    } else if (endswith(safe, ".pdf.txt")) {
+        // Not one, but named as a PDF's text is: renamed, so that no
+        // request or chip takes it for a PDF's
+        safe = concat(a, cuttail(safe, 8), "_pdf.txt");
+    }
+    if (!pdf && readbinary(rd.data)) {
         Buf b(a, 128 + safe.len);
         print(&b, safe);
         print(&b, " is a binary file (");
         print(&b, (i64)rd.data.len);
-        print(&b, " bytes), so it is not attached: only text files and images are");
+        print(&b, " bytes), so it is not attached: only text files, PDFs and images are");
         r.err = finish(&b);
         return r;
     }
@@ -20591,10 +21155,18 @@ static AttachedFile attachfile(Engine *e, Arena *a, Str sid, Str path, Str orig)
         r.err = "cannot keep the file in the session's directory";
         return r;
     }
+    if (pdf) {
+        name = concat(a, name, ".txt");
+        Str txt = join(a, sdir, name);
+        if (!os_write(os, *a, txt, text)) {
+            os_remove(os, *a, to);
+            r.err = "cannot keep the file in the session's directory";
+            return r;
+        }
+    }
     r.file.name  = name;
-    r.file.bytes = rd.data.len;
-    r.file.lines = countlines(startswith(rd.data, "\xef\xbb\xbf") ? cuthead(rd.data, 3)
-                                                                      : rd.data);
+    r.file.bytes = text.len;
+    r.file.lines = countlines(startswith(text, "\xef\xbb\xbf") ? cuthead(text, 3) : text);
     return r;
 }
 
@@ -20640,6 +21212,74 @@ static Slice<MsgFile> attachingfiles(Session *s, Arena *perm, Arena scratch, Jso
         r[i].name = clone(perm, fs[i].name);
     }
     return r;
+}
+
+// The images of an attached PDF's text, f, that the window of it a
+// request shows (filestext) has, for a model that takes images: picked
+// as read picks them (pdfpick), each kept as the session's next img/N,
+// labelled "image 3 (page 2) of NAME.pdf", appended to imgs in perm, as
+// many as room allows. The PDF is parsed again to decode them, in a
+// region of its own; an image that cannot be is left out.
+static Slice<MsgImage> pdfattachimages(Session *s, Arena *perm, Arena scratch,
+                                       Slice<MsgImage> imgs, MsgFile f, iz room)
+{
+    Os  *os   = s->e->os;
+    Str  pdf  = cuttail(f.name, 4);
+    Str  own  = cut(cuthead(pdf, 6), '-').tail;
+    Str  tpath = join(&scratch, s->dir, f.name);
+    Read t    = os_read(os, &scratch, tpath, ATTACH_FILE);
+    Str  ppath = join(&scratch, s->dir, pdf);
+    Read d    = os_read(os, &scratch, ppath, ATTACH_FILE);
+    if (t.err!=READ_OK || d.err!=READ_OK || !validfile(pdf)) {
+        return imgs;
+    }
+    Str     head = filehead(s, &scratch, f.name);
+    ReadWin w    = readwin(&scratch, t.data, head, 1, READ_LINES);
+    if (find(w.text, "\t[image ") < 0) {
+        return imgs;  // the window shows none: no need to parse it again
+    }
+    Region *reg  = os_reserve(os, PDF_REGION);
+    if (!reg) {
+        return imgs;
+    }
+    Arena  mem = newarena(reg);
+    PdfOut o   = pdfread(&scratch, mem, d.data, 0);
+    if ((o.status!=PDFR_OK && o.status!=PDFR_PARTIAL) || !(o.text==t.data)) {
+        os_release(os, reg);  // not the text kept beside it
+        return imgs;
+    }
+    DeskLimits l = desklimits(s);
+    PdfPick    k = pdfpick(scratch, o.places, 1, w.last, l.edge, l.pixels, ATTACH_BYTES);
+    for (i32 i = 0; i<k.n && room>0; i++) {
+        PdfPlace *pl = o.places.data + k.at[i];
+        PdfShown  sh = pdfimage(&scratch, mem, d.data, pl, k.edge, k.pixels, k.maxb64);
+        b32       jpeg = sh.mime == "image/jpeg";
+        Str       name = {};
+        if (sh.data.data) {
+            name = keepimage(os, &scratch, s->dir, sh.data, jpeg ? Str("jpg") : Str("png"));
+        }
+        if (!name.data) {
+            continue;
+        }
+        Buf lab(&scratch, 64 + own.len);
+        print(&lab, "image ");
+        print(&lab, (i64)pl->id);
+        print(&lab, " (page ");
+        print(&lab, (i64)pl->page);
+        print(&lab, ") of ");
+        print(&lab, own);
+        Str label = finish(&lab);
+        MsgImage g = {};
+        g.name  = clone(perm, name);
+        g.mime  = jpeg ? Str("image/jpeg") : Str("image/png");
+        g.w     = sh.w;
+        g.h     = sh.h;
+        g.label = clone(perm, label);
+        imgs = push(perm, imgs, g);
+        room--;
+    }
+    os_release(os, reg);
+    return imgs;
 }
 
 // read on an image, a file that begins as one does: for a model that
@@ -20724,80 +21364,353 @@ static b32 readimage(Session *s, Arena scratch, Str path)
     return 1;
 }
 
-// read on a PDF: for a model that takes them (pdfon), the file itself,
-// kept among the session's output files and sent as a document in the
-// tool result, where Anthropic gives the model its text and an image of
-// each page; leaving requests as a read image does (deskimages), and
-// only while one has room for it (pdfskeep). For one that takes none,
-// or a PDF it cannot be sent, what it is. Returns 0 if the file is not
-// a PDF, for read to go on.
-static b32 readpdf(Session *s, Arena scratch, Str path)
+// read on a PDF. One encrypted is refused, whatever the model. For a
+// model that takes them (pdfon), the file itself when it may go as a
+// document (PDF_BYTES, pdfpagesmax) and loads without repair, as the API
+// may refuse one damaged (pdfdamaged): kept among the session's output
+// files and sent in the tool result, where Anthropic gives the model its
+// text and an image of each page; leaving requests as a read image does
+// (deskimages), and only while one has room for it (deskkeepset).
+// Otherwise its text, extracted here (pdfread) and shown as read shows
+// a text file's lines, a window of them, without a hashline tag; and to
+// a model that takes images, those the window shows (pdfpick, at most
+// PDF_IMAGES), each kept as out/CALL-N.png or .jpg and sent after the
+// result (callimages), the window cut before one past them. When the
+// window is short of the whole text, the text is kept as out/CALL.txt
+// and remembered (pdfmemo), so that reading on parses the PDF again
+// only to decode the images it shows. Returns 0 if the file is not a
+// PDF, for read to go on.
+
+// Pages of a PDF's text (pdfread) with no text but images, and with
+// neither, by the notes that say so.
+static void pdfnotext(Str text, i32 *imgonly, i32 *blank)
+{
+    for (Str rest = text; rest.len;) {
+        Cut c = cut(rest, '\n');
+        rest = c.tail;
+        *imgonly += c.head == "[no text on this page, only images]";
+        *blank   += c.head == "[no text on this page]";
+    }
+}
+
+// Of session perm, what pdfmemo may take in all: at most an eighth of
+// what perm has left with what it took, and at most so much.
+enum : iz {
+    PDF_MEMOBYTES = sizeof(iz)==4 ? (iz)4<<20 : (iz)64<<20,
+};
+
+// A PDF's text and places kept in perm with the file holding the text,
+// for reading on (pdfmemo); left out, before anything is allocated, if
+// they would take more than pdfmemo may (PDF_MEMOBYTES), as perm frees
+// nothing, an entry replaced included: read on then parses it again.
+static void pdfremember(Session *s, Str path, Stat st, PdfMemo m, Str txt, i64 txtlen)
+{
+    // Each allocation's size, with room for its alignment, and the entry
+    iz need = 256 + (iz)sizeof(Map<PdfMemo>) + path.len;
+    need += 16 + m.pageline.len*(iz)sizeof(iz);
+    need += 16 + m.places.len*(iz)sizeof(PdfPlace);
+    for (iz i = 0; i < m.places.len; i++) {
+        need += m.places.data[i].label.len;
+    }
+    iz cap = (pdfroom(&s->perm) + s->pdfmemobytes) / 8;
+    cap = cap<PDF_MEMOBYTES ? cap : PDF_MEMOBYTES;
+    if (need > cap-s->pdfmemobytes) {
+        return;
+    }
+    s->pdfmemobytes += need;
+
+    m.size     = st.size;
+    m.mtime    = st.mtime;
+    m.txt      = txt;  // in perm (spillfile)
+    m.txtlen   = txtlen;
+    m.pageline = pdfkeep(&s->perm, m.pageline);
+    m.places   = pdfkeep(&s->perm, m.places);
+    for (iz i = 0; i < m.places.len; i++) {
+        m.places.data[i].label = clone(&s->perm, m.places.data[i].label);
+    }
+    PdfMemo *slot = upsert(&s->pdfmemo, path, (Arena *)0);
+    if (!slot) {
+        Str key = clone(&s->perm, path);
+        slot = upsert(&s->pdfmemo, key, &s->perm);
+    }
+    *slot = m;
+}
+
+// readpdf in mem, the reader's own region.
+static b32 readpdfin(Session *s, Arena scratch, Arena mem, Str path, Args *args)
+{
+    Engine *e    = s->e;
+    Str     show = showpath(s->guard.cwd, path);
+    Str     id   = s->calls[s->callidx].id;
+    Str     tool = "The shell may extract its text instead (pdftotext, or Python's pypdf).";
+    Stat    st   = os_stat(e->os, scratch, path);
+
+    // Read before, unchanged: its text from the file that keeps it
+    PdfMemo *memo = upsert(&s->pdfmemo, path, (Arena *)0);
+    Str      text = {};
+    if (memo && memo->size==st.size && memo->mtime==st.mtime) {
+        Read t = os_read(e->os, &scratch, memo->txt, (iz)PDF_TEXTMAX);
+        text = t.err==READ_OK && t.data.len==memo->txtlen ? t.data : Str{};
+    }
+    b32 hit = text.data != 0;
+
+    Str data = {};
+    Str why  = {};  // why it is not sent as a document, if pdfon
+    Buf b(&scratch, 512);
+    print(&b, show);
+    if (pdfon(s) || !hit) {
+        Read rd = os_read(e->os, &mem, path, PDF_READMAX);
+        if (rd.err == READ_TOOBIG) {
+            print(&b, ": a PDF over ");
+            print(&b, (i64)(PDF_READMAX >> 20));
+            print(&b, " MiB, too large to read. ");
+            print(&b, tool);
+            toolend(s, scratch, "error", finish(&b), 0, 0, {}, 0);
+            return 1;
+        } else if (rd.err != READ_OK) {
+            return 0;  // read says why
+        }
+        data = rd.data;
+        if (pdflocked(mem, data)) {
+            print(&b, ": a PDF, encrypted, which cannot be read here. The shell may "
+                      "extract its text instead, with its password if it needs one "
+                      "(pdftotext -upw, qpdf --decrypt, or Python's pypdf).");
+            toolend(s, scratch, "error", finish(&b), 0, 0, {}, 0);
+            return 1;
+        }
+    }
+
+    if (pdfon(s)) {
+        i64     max  = pdfpagesmax(s);
+        PdfInfo info = data.len<=PDF_BYTES ? pdfinfo(mem, data) : PdfInfo{};
+        Buf     w(&scratch, 128);
+        if (data.len > PDF_BYTES) {
+            print(&w, ", as it is over the 16 MiB that can be sent as a document");
+        } else if (!info.pages) {
+            print(&w, ", as its pages cannot be counted to send it as a document");
+        } else if (info.pages > max) {
+            print(&w, ", as more than the ");
+            print(&w, max);
+            print(&w, max==1 ? Str(" page") : Str(" pages"));
+            print(&w, " that can be sent as a document");
+        } else if (pdfdamaged(mem, data)) {
+            print(&w, ", as it is damaged, and may be refused as a document");
+        } else {
+            Str rel = {};
+            Str out = spillfile(s, scratch, id, &rel, ".pdf");
+            print(&b, ": a PDF, ");
+            print(&b, (i64)info.pages);
+            print(&b, info.pages==1 ? Str(" page, ") : Str(" pages, "));
+            print(&b, (i64)((data.len + 1023) / 1024));
+            print(&b, " KiB");
+            if (!os_write(e->os, scratch, out, data)) {
+                print(&b, ". It could not be saved to show you: ");
+                print(&b, os_lasterr(e->os, &scratch));
+                toolend(s, scratch, "error", finish(&b), 0, 0, {}, 0);
+                return 1;
+            }
+            print(&b, ", shown to you as a document: its text and an image of each page.");
+            s->callimage = rel;
+            s->callpages = info.pages;
+            toolend(s, scratch, "ok", finish(&b), 0, 0, {}, 0);
+            return 1;
+        }
+        why = finish(&w);
+    }
+
+    // Its text, extracted
+    PdfMemo m = hit ? *memo : PdfMemo{};
+    if (!hit) {
+        PdfOut r = pdfread(&scratch, mem, data, 0);
+        b32    notpdf = r.status==PDFR_NOTPDF || r.status==PDFR_NOPAGES;
+        if (notpdf && !pdflikely(data)) {
+            return 0;  // a text file that mentions "%PDF-": read shows it
+        } else if (r.status!=PDFR_OK && r.status!=PDFR_PARTIAL) {
+            print(&b, ": a PDF whose text cannot be read (");
+            print(&b, r.why);
+            print(&b, "): it may be damaged. ");
+            print(&b, tool);
+            toolend(s, scratch, "error", finish(&b), 0, 0, {}, 0);
+            return 1;
+        } else if (!r.text.len) {
+            print(&b, ": a PDF whose text cannot be read now (");
+            print(&b, r.why.data ? r.why : Str("none was found"));
+            print(&b, "). ");
+            print(&b, tool);
+            toolend(s, scratch, "error", finish(&b), 0, 0, {}, 0);
+            return 1;
+        }
+        text        = r.text;
+        m.pages     = r.pages;
+        m.read      = (i32)r.pageline.len;
+        m.status    = r.status;
+        m.recovered = r.recovered;
+        m.pageline  = r.pageline;
+        m.places    = r.places;
+        pdfnotext(text, &m.imgonly, &m.blank);
+    }
+
+    // The window, and the images it shows, cut before one past them
+    b32     vision = !s->mc.novision;
+    iz      first  = args->offset>1 ? (iz)args->offset : 1;
+    iz      limit  = args->limit>0 && args->limit<READ_LINES ? (iz)args->limit : (iz)READ_LINES;
+    ReadWin w      = readwin(&scratch, text, {}, first, limit);
+    PdfPick k      = {};
+    if (vision && w.last>=first && m.places.len) {
+        DeskLimits l = desklimits(s);
+        k = pdfpick(scratch, m.places, first, w.last, l.edge, l.pixels, ATTACH_BYTES);
+        if (k.cut) {
+            w = readwin(&scratch, text, {}, first, k.last-first+1);
+        }
+    }
+    if (k.n && !data.data) {
+        Read rd = os_read(e->os, &mem, path, PDF_READMAX);
+        data = rd.err==READ_OK && rd.data.len==m.size ? rd.data : Str{};
+    }
+    Buf notes(&scratch, 256);
+    Slice<MsgImage> imgs = {};
+    if (k.n) {
+        imgs.data = alloc<MsgImage>(&s->perm, k.n);
+        imgs.cap  = k.n;
+    }
+    for (i32 i = 0; i < k.n; i++) {
+        PdfPlace *pl = m.places.data + k.at[i];
+        PdfShown  sh = {};
+        if (data.data) {
+            sh = pdfimage(&scratch, mem, data, pl, k.edge, k.pixels, k.maxb64);
+        } else {
+            sh.err = "the file could not be read again";
+        }
+        b32 jpeg = sh.mime == "image/jpeg";
+        Str rel  = {};
+        if (sh.data.data) {
+            Buf x(&scratch, 32);
+            putbyte(&x, '-');
+            print(&x, (i64)i + 1);
+            print(&x, jpeg ? Str(".jpg") : Str(".png"));
+            Str ext = finish(&x);
+            Str out = spillfile(s, scratch, id, &rel, ext);
+            if (!os_write(e->os, scratch, out, sh.data)) {
+                sh.data = {};
+                sh.err  = "it could not be saved to show you";
+            }
+        }
+        Buf lab(&scratch, 64);
+        print(&lab, "image ");
+        print(&lab, (i64)pl->id);
+        print(&lab, " (page ");
+        print(&lab, (i64)pl->page);
+        putbyte(&lab, ')');
+        Str label = finish(&lab);
+        if (!sh.data.data) {
+            print(&notes, "[");
+            print(&notes, label);
+            print(&notes, " is not shown: ");
+            print(&notes, sh.err);
+            print(&notes, ".]\n");
+            continue;
+        }
+        MsgImage g = {};
+        g.name  = rel;
+        g.mime  = jpeg ? Str("image/jpeg") : Str("image/png");
+        g.w     = sh.w;
+        g.h     = sh.h;
+        g.label = clone(&s->perm, label);
+        imgs.data[imgs.len++] = g;
+    }
+
+    // Notes after the window
+    b32 notext = m.read>0 && m.imgonly+m.blank==m.read;
+    if (!vision && notext && m.imgonly) {
+        print(&notes, "[Its pages hold no text, only images (a scan), which this "
+                      "model cannot see. The shell may OCR them: pdfimages or "
+                      "pdftoppm, then tesseract.]\n");
+    } else if (!vision && find(w.text, "\t[image ")>=0) {
+        print(&notes, "[This model takes no images: each [image ...] line stands "
+                      "for a picture that is not shown.]\n");
+    } else if (vision && find(w.text, ", not shown (")>=0) {
+        print(&notes, "[The images marked not shown are in a format that cannot be "
+                      "shown here. The shell may render their pages as images "
+                      "(pdftoppm -png -r 100), which read then shows you.]\n");
+    }
+    if (notext && !m.imgonly) {
+        print(&notes, "[No text could be extracted: its words may be drawn as "
+                      "shapes. The shell may render its pages as images (pdftoppm "
+                      "-png -r 100)");
+        print(&notes, vision ? Str(", which read then shows you.]\n")
+                             : Str(" and OCR them (tesseract).]\n"));
+    }
+    b32 whole = w.last >= w.total;  // past the end too (last = first-1)
+    Str kept  = {};
+    if (!whole && hit) {
+        kept = memo->txt;
+    } else if (!whole) {
+        Str rel = {};
+        Str out = spillfile(s, scratch, id, &rel, ".txt");
+        if (os_write(e->os, scratch, out, text)) {
+            kept = out;
+            pdfremember(s, path, st, m, out, text.len);
+        }
+    }
+    if (kept.len) {
+        print(&notes, "[The whole text is kept at ");
+        print(&notes, kept);
+        print(&notes, ".]\n");
+    }
+
+    // The head, then the window and its notes
+    print(&b, ": a PDF, ");
+    print(&b, (i64)m.pages);
+    print(&b, m.pages==1 ? Str(" page") : Str(" pages"));
+    if (m.recovered) {
+        print(&b, ", damaged but recovered");
+    }
+    if (m.status == PDFR_PARTIAL) {
+        print(&b, ", cut short, the text that could be read");
+    } else if (notext && m.imgonly) {
+        print(&b, ", with no text, only images of its pages (a scan)");
+    } else if (notext) {
+        print(&b, ", with no text to extract");
+    } else {
+        print(&b, ", its text extracted");
+    }
+    print(&b, why);
+    if (imgs.len == 1) {
+        print(&b, ", with the image on these pages after it");
+    } else if (imgs.len > 1) {
+        print(&b, ", with the ");
+        print(&b, imgs.len);
+        print(&b, " images on these pages after it");
+    }
+    print(&b, ":\n");
+    print(&b, w.text);
+    if (notes.len && !endswith(w.text, "\n")) {
+        putbyte(&b, '\n');
+    }
+    print(&b, finish(&notes));
+    s->callimages = imgs;
+    toolend(s, scratch, "ok", finish(&b), 0, 0, {}, 0);
+    return 1;
+}
+
+static b32 readpdf(Session *s, Arena scratch, Str path, Args *args)
 {
     Engine *e    = s->e;
     Read    head = os_readat(e->os, &scratch, path, 0, PDF_HEAD);
     if (head.err!=READ_OK || !pdfsniff(head.data)) {
         return 0;
     }
-    Str  show = showpath(s->guard.cwd, path);
-    Str  tool = "The shell may extract its text instead (pdftotext, or Python's pypdf).";
-    Read rd   = os_read(e->os, &scratch, path, PDF_BYTES);
-    Buf  b(&scratch, 512);
-    print(&b, show);
-    if (rd.err == READ_TOOBIG) {
-        print(&b, ": a PDF over 16 MiB, too large to show you. ");
-        print(&b, tool);
-        toolend(s, scratch, "error", finish(&b), 0, 0, {}, 0);
-        return 1;
-    } else if (rd.err != READ_OK) {
-        return 0;  // read says why
-    }
-    PdfInfo info = pdfinfo(scratch, rd.data);
-    print(&b, ": a PDF, ");
-    if (info.pages) {
-        print(&b, (i64)info.pages);
-        print(&b, info.pages==1 ? Str(" page, ") : Str(" pages, "));
-    }
-    print(&b, (i64)((rd.data.len + 1023) / 1024));
-    print(&b, " KiB");
-    if (!pdfon(s)) {
-        print(&b, ". This model is not sent PDFs, so it is not shown. ");
-        print(&b, tool);
-        toolend(s, scratch, "ok", finish(&b), 0, 0, {}, 0);
-        return 1;
-    } else if (info.encrypted) {
-        print(&b, ", encrypted, which cannot be shown to you. ");
-        print(&b, tool);
-        toolend(s, scratch, "error", finish(&b), 0, 0, {}, 0);
-        return 1;
-    } else if (!info.pages) {
-        print(&b, ", whose pages cannot be counted, so it is not shown to you: "
-                  "it may be damaged. ");
-        print(&b, tool);
-        toolend(s, scratch, "error", finish(&b), 0, 0, {}, 0);
-        return 1;
-    } else if (info.pages > pdfpagesmax(s)) {
-        print(&b, ", more than the ");
-        print(&b, pdfpagesmax(s));
-        print(&b, " pages that can be shown to you. ");
-        print(&b, tool);
-        print(&b, " Or split it into parts to read each (qpdf --pages, or pypdf).");
+    Region *reg = os_reserve(e->os, PDF_REGION);
+    if (!reg) {
+        Buf b(&scratch, 256);
+        print(&b, showpath(s->guard.cwd, path));
+        print(&b, ": a PDF, which cannot be read now: out of memory.");
         toolend(s, scratch, "error", finish(&b), 0, 0, {}, 0);
         return 1;
     }
-
-    Str rel = {};
-    Str out = spillfile(s, scratch, s->calls[s->callidx].id, &rel, ".pdf");
-    if (!os_write(e->os, scratch, out, rd.data)) {
-        print(&b, ". It could not be saved to show you: ");
-        print(&b, os_lasterr(e->os, &scratch));
-        toolend(s, scratch, "error", finish(&b), 0, 0, {}, 0);
-        return 1;
-    }
-    print(&b, ", shown to you as a document: its text and an image of each page.");
-    s->callimage = rel;
-    s->callpages = info.pages;
-    toolend(s, scratch, "ok", finish(&b), 0, 0, {}, 0);
-    return 1;
+    b32 r = readpdfin(s, scratch, newarena(reg), path, args);
+    os_release(e->os, reg);
+    return r;
 }
 
 struct Attaching {
@@ -20880,6 +21793,37 @@ static Attaching attaching(Session *s, Arena *perm, Arena scratch, Json *list)
         r.images[i].name = clone(perm, imgs[i].name);
     }
     return r;
+}
+
+// The images of the PDFs a prompt or a steer attaches (pdfattachimages),
+// after its own, in perm, within ATTACH_MAX in all: none for a model
+// that takes no images.
+static void pdfattaching(Session *s, Arena *perm, Arena scratch, Attaching *at)
+{
+    iz  room = ATTACH_MAX - at->images.len;
+    b32 any  = 0;
+    for (iz i = 0; i < at->files.len; i++) {
+        any |= filepdf(at->files[i].name);
+    }
+    if (s->mc.novision || room<=0 || !any) {
+        return;
+    }
+    Slice<MsgImage> imgs = {};  // room for all, so never moved
+    imgs.data = alloc<MsgImage>(perm, ATTACH_MAX);
+    imgs.cap  = ATTACH_MAX;
+    for (iz i = 0; i < at->images.len; i++) {
+        imgs.data[imgs.len++] = at->images[i];
+    }
+    iz own = imgs.len;
+    for (iz i = 0; i<at->files.len && imgs.len-own<room; i++) {
+        if (filepdf(at->files[i].name)) {
+            imgs = pdfattachimages(s, perm, scratch, imgs, at->files[i],
+                                   room - (imgs.len-own));
+        }
+    }
+    if (imgs.len > own) {
+        at->images = imgs;
+    }
 }
 
 // upload {kind:"file", sid, path}: a file in session sid's working
@@ -21982,6 +22926,7 @@ static void command(Engine *e, Arena scratch, Str line)
             reply(e, scratch, id, 0, at.err, sid);
             return;
         }
+        pdfattaching(s, &s->perm, scratch, &at);
         at.sessions = mentioned(s, &s->perm, scratch, jsonget(j, "sessions"));
         Json *skill = jsonget(j, "skill");
         if (skill->type!=JSON_MISSING && skill->type!=JSON_NULL) {

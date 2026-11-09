@@ -850,8 +850,550 @@ static void testprefill(Test *t)
            istr(&a, prefilleta(&r, &rl, 5, 400, 1000, 500)), "1449");
 }
 
+// A tool result's several images: its record keeps them, the first
+// under the keys of one image as well, and replays them, labels and
+// all; a PDF's record has no images; an older record replays as before.
+static void testcallimages(Test *t)
+{
+    Arena    a = t->perm;
+    MsgImage imgs[2] = {};
+    imgs[0].name  = "out/c1.png";
+    imgs[0].mime  = "image/png";
+    imgs[0].w     = 64;
+    imgs[0].h     = 32;
+    imgs[0].label = "image 1 (page 1)";
+    imgs[1].name  = "out/c1-1.jpg";
+    imgs[1].mime  = "image/jpeg";
+    imgs[1].w     = 10;
+    imgs[1].h     = 20;
+    Msg m = {};
+    m.role   = ROLE_TOOL;
+    m.images = {imgs, 2, 2};
+    {
+        Buf     b(&a, 512);
+        JsonOut w = {&b};
+        putobject(&w);
+        putcallimages(&w, &m, {});
+        putend(&w);
+        Str rec = finish(&b);
+        expect(t, "callimages record", rec,
+               "{\"images\":[{\"name\":\"out/c1.png\",\"mime\":\"image/png\",\"w\":64,"
+               "\"h\":32,\"label\":\"image 1 (page 1)\"},{\"name\":\"out/c1-1.jpg\","
+               "\"mime\":\"image/jpeg\",\"w\":10,\"h\":20}],\"image\":\"out/c1.png\","
+               "\"width\":64,\"height\":32}");
+
+        Msg     got = {};
+        JsonDoc d   = jsonparse(&a, rec);
+        getcallimages(&a, d.root, &got);
+        Buf g(&a, 256);
+        print(&g, got.image.len ? Str("image ") : Str(""));
+        for (iz i = 0; i < got.images.len; i++) {
+            MsgImage *x = &got.images[i];
+            print(&g, x->name);
+            putbyte(&g, ' ');
+            print(&g, x->mime);
+            putbyte(&g, ' ');
+            print(&g, (i64)x->w);
+            putbyte(&g, 'x');
+            print(&g, (i64)x->h);
+            print(&g, " [");
+            print(&g, x->label);
+            print(&g, "]|");
+        }
+        expect(t, "callimages replay", finish(&g),
+               "out/c1.png image/png 64x32 [image 1 (page 1)]|"
+               "out/c1-1.jpg image/jpeg 10x20 []|");
+    }
+
+    // A PDF sent as a document: never images as well
+    m.image = "out/c2.pdf";
+    m.pages = 3;
+    {
+        Buf     b(&a, 512);
+        JsonOut w = {&b};
+        putobject(&w);
+        putcallimages(&w, &m, {});
+        putend(&w);
+        expect(t, "callimages pdf", finish(&b), "{\"pdf\":\"out/c2.pdf\",\"pages\":3}");
+    }
+
+    // One screenshot, and an older record of one, replayed as one
+    Msg one = {};
+    one.role  = ROLE_TOOL;
+    one.image = "out/c3.png";
+    one.imgw  = 8;
+    one.imgh  = 6;
+    {
+        Buf     b(&a, 512);
+        JsonOut w = {&b};
+        putobject(&w);
+        putcallimages(&w, &one, "{\"x\":1}");
+        putend(&w);
+        Str rec = finish(&b);
+        expect(t, "callimages one", rec,
+               "{\"image\":\"out/c3.png\",\"width\":8,\"height\":6,\"shot\":\"{\\\"x\\\":1}\"}");
+        Msg     got = {};
+        JsonDoc d   = jsonparse(&a, rec);
+        getcallimages(&a, d.root, &got);
+        expect(t, "callimages one replay", concat(&a, got.image,
+               istr(&a, got.imgw*1000 + got.imgh*10 + got.imgread + 100000*got.images.len)),
+               "out/c3.png8060");
+        d = jsonparse(&a, "{\"pdf\":\"out/c4.pdf\",\"pages\":0,\"images\":[]}");
+        got = {};
+        getcallimages(&a, d.root, &got);
+        expect(t, "callimages pdf replay", concat(&a, got.image,
+               istr(&a, got.pages*10 + got.imgread)), "out/c4.pdf11");
+    }
+
+    // The keys of one image, sent as a PNG, name the first PNG, never a
+    // JPEG, or are left out
+    MsgImage first = imgs[0];
+    imgs[0] = imgs[1];
+    imgs[1] = first;
+    m.image = {};
+    m.pages = 0;
+    {
+        Buf     b(&a, 512);
+        JsonOut w = {&b};
+        putobject(&w);
+        putcallimages(&w, &m, {});
+        putend(&w);
+        Str rec = finish(&b);
+        expect(t, "callimages jpeg first", cut(rec, ']').tail,
+               ",\"image\":\"out/c1.png\",\"width\":64,\"height\":32}");
+    }
+    m.images.len = 1;
+    {
+        Buf     b(&a, 512);
+        JsonOut w = {&b};
+        putobject(&w);
+        putcallimages(&w, &m, {});
+        putend(&w);
+        expect(t, "callimages jpeg only", finish(&b),
+               "{\"images\":[{\"name\":\"out/c1-1.jpg\",\"mime\":\"image/jpeg\","
+               "\"w\":10,\"h\":20}]}");
+    }
+
+    // Images none well formed: the keys of one image instead
+    {
+        JsonDoc d = jsonparse(&a, "{\"images\":[{\"name\":\"out/x.png\"},7],"
+                                  "\"image\":\"out/y.png\",\"width\":3,\"height\":4}");
+        Msg got = {};
+        getcallimages(&a, d.root, &got);
+        expect(t, "callimages fallback", concat(&a, got.image,
+               istr(&a, got.imgw*1000 + got.imgh*10 + got.imgread + 100000*got.images.len)),
+               "out/y.png3041");
+    }
+}
+
+// toolend: a call's several images go into its record and its message,
+// the first PNG also under the keys of one, then are forgotten, so that
+// the next call's result has none of them.
+static void testtoolendimages(Test *t)
+{
+    Arena   a = t->perm;
+    Engine *e = alloc<Engine>(&a);
+    e->os  = newos(&a, 1<<16);
+    e->out = newmailbox(&a, 1<<16, 0, 0);
+    Session *s = alloc<Session>(&a);
+    s->e      = e;
+    s->sid    = "20260101-000000-aaaa";
+    s->log.os = e->os;
+    s->log.fd = -1;  // no log: records go to the frontend alone
+    s->perm   = carve(&a, 1<<16);
+    Block calls[2] = {};
+    calls[0].type = BLOCK_CALL;
+    calls[0].id   = "c1";
+    calls[0].name = "read";
+    calls[0].args = "{}";
+    calls[1]      = calls[0];
+    calls[1].id   = "c2";
+    s->calls = {calls, 2, 2};
+    MsgImage imgs[2] = {};
+    imgs[0].name = "out/c1-1.jpg";
+    imgs[0].mime = "image/jpeg";
+    imgs[0].w    = 5;
+    imgs[0].h    = 6;
+    imgs[1].name = "out/c1-2.png";
+    imgs[1].mime = "image/png";
+    imgs[1].w    = 7;
+    imgs[1].h    = 8;
+    s->callimages = {imgs, 2, 2};
+    toolend(s, a, "error", "t", 0, 0, {}, 0);
+    toolend(s, a, "error", "u", 0, 0, {}, 0);
+
+    Buf  got(&a, 512);
+    Mail m = mailtake(e->out);
+    for (Record r; (r = mailnext(&m)).ok;) {
+        EvRec rec = evparse(&a, r.data);
+        if (rec.ev != EV_TOOLEND) continue;
+        print(&got, jsonstr(jsonget(rec.root, "call")));
+        print(&got, " images=");
+        print(&got, jsonget(rec.root, "images")->raw);
+        print(&got, " image=");
+        print(&got, jsonstr(jsonget(rec.root, "image")));
+        putbyte(&got, '\n');
+    }
+    expect(t, "toolend images record", finish(&got),
+           "c1 images=[{\"name\":\"out/c1-1.jpg\",\"mime\":\"image/jpeg\",\"w\":5,\"h\":6},"
+           "{\"name\":\"out/c1-2.png\",\"mime\":\"image/png\",\"w\":7,\"h\":8}] "
+           "image=out/c1-2.png\n"
+           "c2 images= image=\n");
+    expect(t, "toolend images history", istr(&a, s->history.len*1000 +
+           s->history[0].images.len*100 + s->history[0].image.len*10 +
+           s->history[1].images.len), "2200");
+    expect(t, "toolend images reset", istr(&a, s->callimages.len), "0");
+}
+
+// The images of tool results in a request: a set counts as one under
+// [desktop] images, left out whole with a text naming its call; of
+// those shown, at most PDF_REQIMAGES images and PDF_REQIMGBYTES bytes
+// of files, the newest first; each file read in if it is one of out/
+// and what its mime says, else a text in its place.
+static void testdeskkeepset(Test *t)
+{
+    Arena  a = t->perm;
+    CfgEnv v = {};
+    v.os      = newos(&a, 24<<20);  // room for files of 5 MiB
+    v.scratch = carve(&a, 1<<22);
+    os_write(v.os, a, "/r/h.ini", "[desktop]\nimages = 3\nimages_slack = 0\n");
+    Engine *e = alloc<Engine>(&a);
+    e->os  = v.os;
+    e->cfg = newconfig(v.os, &a, v.scratch, "/r/h.ini", 0);
+    e->ini = e->cfg->ini;
+    Session *s = alloc<Session>(&a);
+    s->e   = e;
+    s->dir = "/s";
+    os_mkdirs(v.os, a, "/s/out");
+    Str png = "\x89PNG\r\n\x1a\nxx";
+    Str jpg = "\xff\xd8\xff\xe0yy";
+    os_write(v.os, a, "/s/out/p.png", png);
+    os_write(v.os, a, "/s/out/j.jpg", jpg);
+
+    // Sets of 30, 20 and 15 images, the newest last
+    i32 counts[] = {30, 20, 15};
+    for (i32 i = 0; i < 3; i++) {
+        Slice<MsgImage> set = {};
+        for (i32 k = 0; k < counts[i]; k++) {
+            MsgImage g = {};
+            g.name = k&1 ? Str("out/j.jpg") : Str("out/p.png");
+            g.mime = k&1 ? Str("image/jpeg") : Str("image/png");
+            g.w    = 750;
+            g.h    = 1;
+            set = push(&a, set, g);
+        }
+        Msg m = {};
+        m.role   = ROLE_TOOL;
+        m.callid = concat(&a, "c", istr(&a, i));
+        m.images = set;
+        s->history = push(&a, s->history, m);
+    }
+    {
+        Arena tmp  = v.scratch;
+        b32  *keep = deskkeepset(s, &tmp, 0, s->history.len);
+        expect(t, "keepset count", concat(&a, concat(&a, istr(&a, keep[0]),
+               istr(&a, keep[1])), istr(&a, keep[2])), "011");
+        expect(t, "keepset tokens", istr(&a, deskimagetokens(s)), "70");
+
+        tmp = v.scratch;
+        Slice<Msg> h = deskimages(s, &tmp);
+        expect(t, "keepset alt", h[0].imgalt,
+               "[PDF images omitted: c0; read the file again to see them]");
+        b32 ok = !h[0].images.len && h[1].images.len==20 && h[2].images.len==15;
+        for (iz k = 0; ok && k < 15; k++) {
+            ok = h[2].images[k].b64 == (k&1 ? Str("/9j/4Hl5") : Str("iVBORw0KGgp4eA=="));
+        }
+        expect(t, "keepset read in", istr(&a, ok && !h[1].imgalt.len), "1");
+    }
+
+    // By bytes: two files of 5 MiB are more than 8 MiB, so the newest
+    // set goes; the next, of 20, stays, and the oldest still has no room
+    {
+        Buf big(&a, 5<<20);
+        print(&big, png);
+        while (big.len < 5<<20) putbyte(&big, 'z');
+        os_write(v.os, a, "/s/out/big.png", finish(&big));
+        Msg *m = &s->history[2];
+        m->images.data[0].name = "out/big.png";
+        m->images.data[2].name = "out/big.png";
+        Arena tmp  = v.scratch;
+        b32  *keep = deskkeepset(s, &tmp, 0, s->history.len);
+        expect(t, "keepset bytes", concat(&a, concat(&a, istr(&a, keep[0]),
+               istr(&a, keep[1])), istr(&a, keep[2])), "010");
+        m->images.data[0].name = "out/p.png";
+        m->images.data[2].name = "out/p.png";
+    }
+
+    // [desktop] images: of four items, the oldest leaves, a screenshot
+    // counted alike
+    {
+        Msg shot = {};
+        shot.role   = ROLE_TOOL;
+        shot.callid = "c3";
+        shot.image  = "out/p.png";
+        shot.imgw   = 750;
+        shot.imgh   = 2;
+        s->history  = push(&a, s->history, shot);
+        expect(t, "keepset drop", istr(&a, deskdrop(s).drop), "1");
+        expect(t, "keepset drop tokens", istr(&a, deskimagetokens(s)), "73");
+        Arena      tmp = v.scratch;
+        Slice<Msg> h   = deskimages(s, &tmp);
+        expect(t, "keepset dropped", concat(&a, h[0].imgalt, istr(&a, h[0].images.len)),
+               "[PDF images omitted: c0; read the file again to see them]0");
+        expect(t, "keepset shot", istr(&a, h[3].imgb64.len>0 && h[1].images.len==20), "1");
+        s->history.len--;
+    }
+
+    // A name not of out/, or a file not what its mime says: lost
+    {
+        Msg *m = &s->history[2];
+        m->images.data[0].name = "img/1.png";
+        m->images.data[1].mime = "image/png";
+        Arena      tmp = v.scratch;
+        Slice<Msg> h   = deskimages(s, &tmp);
+        expect(t, "keepset lost name", h[2].images[0].alt,
+               "[image lost: img/1.png, its file could not be read]");
+        expect(t, "keepset lost mime", h[2].images[1].alt,
+               "[image lost: out/j.jpg, its file could not be read]");
+        expect(t, "keepset others", istr(&a, h[2].images[2].b64.len>0), "1");
+    }
+
+    // Attached images are the user's alone (attachtokens)
+    expect(t, "attachtokens tool", istr(&a, attachtokens(s)), "0");
+}
+
+// A session for tests of the images in requests, its files under /s,
+// with [desktop] images = keep and no slack.
+static Session *desksession(Arena *a, i32 keep)
+{
+    CfgEnv v = {};
+    v.os      = newos(a, 24<<20);
+    v.scratch = carve(a, 1<<22);
+    Str ini = concat(a, concat(a, "[desktop]\nimages = ", istr(a, keep)),
+                     "\nimages_slack = 0\n");
+    os_write(v.os, *a, "/r/h.ini", ini);
+    Engine *e = alloc<Engine>(a);
+    e->os  = v.os;
+    e->cfg = newconfig(v.os, a, v.scratch, "/r/h.ini", 0);
+    e->ini = e->cfg->ini;
+    Session *s = alloc<Session>(a);
+    s->e   = e;
+    s->dir = "/s";
+    os_mkdirs(v.os, *a, "/s/out");
+    os_mkdirs(v.os, *a, "/s/img");
+    os_write(v.os, *a, "/s/out/p.png", "\x89PNG\r\n\x1a\nxx");
+    os_write(v.os, *a, "/s/img/1.png", "\x89PNG\r\n\x1a\nxx");
+    return s;
+}
+
+// A tool result of n images, each of out/p.png at 750x1, appended.
+static Msg *deskset(Arena *a, Session *s, Str call, i32 n)
+{
+    Msg m = {};
+    m.role   = ROLE_TOOL;
+    m.callid = call;
+    for (i32 k = 0; k < n; k++) {
+        MsgImage g = {};
+        g.name = "out/p.png";
+        g.mime = "image/png";
+        g.w    = 750;
+        g.h    = 1;
+        m.images = push(a, m.images, g);
+    }
+    s->history = push(a, s->history, m);
+    return &s->history[s->history.len-1];
+}
+
+static Str keepflags(Arena *a, Session *s)
+{
+    Arena t    = *a;
+    b32  *keep = deskkeepset(s, &t, 0, s->history.len);
+    Buf   b(a, 64);
+    for (iz i = 0; i < s->history.len; i++) {
+        putbyte(&b, s->history[i].role==ROLE_TOOL ? (u8)('0'+keep[i]) : '-');
+    }
+    return finish(&b);
+}
+
+// deskkeepset's limits, inclusive; that a set only ever leaves as newer
+// ones arrive, where FLOOR_READ marks the prefix's change; names not of
+// out/ weigh nothing; a model with no vision gets notes, not images; a
+// user's attachments are never an item of [desktop] images.
+static void testdeskkeep2(Test *t)
+{
+    Arena a = t->perm;
+
+    // Exactly 40 images, and exactly 8 MiB
+    {
+        Session *s = desksession(&a, 3);
+        deskset(&a, s, "c0", 25);
+        deskset(&a, s, "c1", 15);
+        expect(t, "keep2 forty", keepflags(&a, s), "11");
+        expect(t, "keep2 forty tokens", istr(&a, deskimagetokens(s)), "80");
+        Buf big(&a, 4<<20);
+        print(&big, "\x89PNG\r\n\x1a\n");
+        while (big.len < 4<<20) putbyte(&big, 'z');
+        Str bigpng = finish(&big);
+        os_write(s->e->os, a, "/s/out/big.png", bigpng);
+        os_write(s->e->os, a, "/s/img/big.png", bigpng);
+        s->history[0].images.len = 1;
+        s->history[1].images.len = 1;
+        s->history[0].images.data[0].name = "out/big.png";
+        s->history[1].images.data[0].name = "out/big.png";
+        expect(t, "keep2 8 MiB", keepflags(&a, s), "11");
+
+        // A name not of out/ is never read, so it weighs nothing: here
+        // 4 MiB more would leave no room for the older set
+        deskset(&a, s, "c2", 1)->images.data[0].name = "img/big.png";
+        expect(t, "keep2 not out", keepflags(&a, s), "111");
+        Arena      tmp = a;
+        Slice<Msg> h   = deskimages(s, &tmp);
+        expect(t, "keep2 not out lost", h[2].images[0].alt,
+               "[image lost: img/big.png, its file could not be read]");
+        s->history[2].images.data[0].name = "img/1.png";  // a real PNG
+        tmp = a;
+        h   = deskimages(s, &tmp);
+        expect(t, "keep2 img lost", h[2].images[0].alt,
+               "[image lost: img/1.png, its file could not be read]");
+    }
+
+    // Sets of 10 and 35, then 10 more: the oldest, out for room, stays
+    // out, and where the 35 leaves the prefix changes (FLOOR_READ)
+    {
+        Session *s = desksession(&a, 3);
+        deskset(&a, s, "a", 10);
+        deskset(&a, s, "b", 35);
+        Msg reply = {};
+        reply.role = ROLE_ASSISTANT;
+        reply.text = "ok";
+        s->history = push(&a, s->history, reply);
+        expect(t, "keep2 before", keepflags(&a, s), "01-");
+        deskset(&a, s, "c", 10);
+        expect(t, "keep2 after", keepflags(&a, s), "00-1");
+        expect(t, "keep2 after tokens", istr(&a, deskimagetokens(s)), "20");
+        Arena      tmp = a;
+        Slice<Msg> h   = deskimages(s, &tmp);
+        Buf        b(&a, 64);
+        for (iz i = 0; i < h.len; i++) {
+            print(&b, (i64)h[i].floor);
+        }
+        expect(t, "keep2 floor", finish(&b), "0200");
+        expect(t, "keep2 omitted", concat(&a, h[0].imgalt, h[1].imgalt),
+               "[PDF images omitted: a; read the file again to see them]"
+               "[PDF images omitted: b; read the file again to see them]");
+    }
+
+    // Sets of 4 MiB each: the two newest fill 8 MiB, which ends sets,
+    // and the files are weighed by paths that survive os_stat's scratch
+    // (deskfilesize: the path allocated before its arena is copied)
+    {
+        Session *s = desksession(&a, 3);
+        Buf big(&a, 4<<20);
+        print(&big, "\x89PNG\r\n\x1a\n");
+        while (big.len < 4<<20) putbyte(&big, 'z');
+        os_write(s->e->os, a, "/s/out/big.png", finish(&big));
+        for (i32 i = 0; i < 3; i++) {
+            deskset(&a, s, "b", 1)->images.data[0].name = "out/big.png";
+        }
+        expect(t, "keep2 bytes over", keepflags(&a, s), "011");
+        expect(t, "keep2 bytes over tokens", istr(&a, deskimagetokens(s)), "4");
+
+        // A set too big even alone is passed over; older ones still go
+        deskset(&a, s, "huge", 3);
+        for (i32 k = 0; k < 3; k++) {
+            s->history[3].images.data[k].name = "out/big.png";
+        }
+        expect(t, "keep2 bytes alone", keepflags(&a, s), "0110");
+    }
+
+    // A single image read sent as what its bytes are, not always a PNG
+    {
+        Session *s = desksession(&a, 3);
+        os_write(s->e->os, a, "/s/out/j.jpg", "\xff\xd8\xff\xe0xx");
+        Msg m = {};
+        m.role    = ROLE_TOOL;
+        m.callid  = "j";
+        m.image   = "out/j.jpg";
+        m.imgw    = 750;
+        m.imgh    = 1;
+        m.imgread = 1;
+        s->history = push(&a, s->history, m);
+        m.callid   = "p";
+        m.image    = "out/p.png";
+        s->history = push(&a, s->history, m);
+        Arena      tmp = a;
+        Slice<Msg> h   = deskimages(s, &tmp);
+        expect(t, "keep2 single mime", concat(&a, concat(&a, h[0].imgmime, " "),
+               h[1].imgmime), "image/jpeg image/png");
+    }
+
+    // A PDF kept by its size in a request
+    {
+        Session *s = desksession(&a, 3);
+        os_write(s->e->os, a, "/s/out/d.pdf", "%PDF-1.4\n");
+        Msg m = {};
+        m.role   = ROLE_TOOL;
+        m.callid = "d";
+        m.image  = "out/d.pdf";
+        m.pages  = 2;
+        s->history = push(&a, s->history, m);
+        deskset(&a, s, "e", 2);
+        expect(t, "keep2 pdf", keepflags(&a, s), "11");
+    }
+
+    // No vision: a note in place of each image, and no tokens for them
+    {
+        Session *s = desksession(&a, 3);
+        Msg user = {};
+        user.role = ROLE_USER;
+        user.text = "look";
+        MsgImage att = {};
+        att.name = "img/1.png";
+        att.mime = "image/png";
+        att.w    = 750;
+        att.h    = 1;
+        user.images = push(&a, user.images, att);
+        s->history  = push(&a, s->history, user);
+        deskset(&a, s, "c0", 2);
+        Msg shot = {};
+        shot.role   = ROLE_TOOL;
+        shot.callid = "c1";
+        shot.image  = "out/p.png";
+        shot.imgw   = 750;
+        shot.imgh   = 1;
+        s->history  = push(&a, s->history, shot);
+        s->mc.novision = 1;
+        expect(t, "keep2 blind tokens", istr(&a, deskimagetokens(s)+attachtokens(s)), "0");
+        Arena      tmp = a;
+        Slice<Msg> h   = deskimages(s, &tmp);
+        expect(t, "keep2 blind attach", concat(&a, h[0].images[0].alt,
+               istr(&a, h[0].images[0].b64.len)),
+               "[image omitted: img/1.png, since this model takes no images]0");
+        expect(t, "keep2 blind set", concat(&a, h[1].imgalt, istr(&a, h[1].images.len)),
+               "[PDF images omitted: c0, since this model takes no images]0");
+        expect(t, "keep2 blind shot", concat(&a, h[2].imgalt, istr(&a, h[2].imgb64.len)),
+               "[screenshot omitted: c1, since this model takes no images]0");
+
+        // With vision, and [desktop] images = 1 leaving out the set: the
+        // attachments still go, counted once
+        s->mc.novision = 0;
+        Session *one = desksession(&a, 1);
+        one->history = s->history;
+        expect(t, "keep2 attach drop", istr(&a, deskdrop(one).drop), "1");
+        expect(t, "keep2 attach tokens", istr(&a, deskimagetokens(one)), "2");
+        tmp = a;
+        h   = deskimages(one, &tmp);
+        expect(t, "keep2 attach kept", concat(&a, h[0].images[0].b64,
+               istr(&a, h[2].imgb64.len>0)), "iVBORw0KGgp4eA==1");
+    }
+}
+
 static void test_engine(Test *t)
 {
+    testcallimages(t);
+    testdeskkeepset(t);
+    testdeskkeep2(t);
+    testtoolendimages(t);
     testprefill(t);
     testremotetask(t);
     testtilde(t);

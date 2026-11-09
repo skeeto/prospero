@@ -73,6 +73,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -2524,6 +2525,29 @@ def sc_read_image_blind(model, n, req):
         yield from answer(model, "Read it.")
 
 
+
+def sc_tool_images(model, n, req):
+    # An image read, then answers: its record becomes a set of images,
+    # and the resumed runs answer at once, "more" after reading another
+    # image
+    if last_user_text(req) == "more":
+        yield from tool(model, n, "read", {"path": "four.gif"})
+    elif step(req) == 0:
+        yield from tool(model, n, "read", {"path": "red.png"})
+    else:
+        yield from answer(model, "Saw them.")
+
+
+sc_rs_tool_images = sc_tool_images
+
+
+def sc_an_tool_images(model, n, req):
+    k = len([m for m in req.get("messages", []) if m.get("role") == "assistant"])
+    if k == 0:
+        yield from an_call(model, req, n, "read", {"path": "red.png"})
+    else:
+        yield from an_answer(model, req, "Saw them.")
+
 def sc_desktop_cache(model, n, req):
     # Twelve screenshots, one a step: the cache's view of each request
     if step(req) < 12:
@@ -3861,6 +3885,21 @@ def plain(obj):
     return obj
 
 
+def an_sized(obj):
+    """A value with base64 data past 16 KiB counted as 16 KiB, its digest
+    in place of the rest, as the API counts an image or document by what
+    it shows, not by its bytes: a large PDF fits the window."""
+    if isinstance(obj, dict):
+        d = obj.get("data")
+        if obj.get("type") == "base64" and isinstance(d, str) and len(d) > 16384:
+            digest = hashlib.sha256(d.encode()).hexdigest()
+            return {**obj, "data": digest + d[:16384 - len(digest)]}
+        return {k: an_sized(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [an_sized(v) for v in obj]
+    return obj
+
+
 def an_system(req):
     system = req.get("system", [])
     return [{"type": "text", "text": system}] if isinstance(system, str) else system
@@ -3886,7 +3925,7 @@ def an_usage(model, req):
     size = 0
     marks = []
     for b, where in units:
-        u = json.dumps(plain(b), sort_keys=True) + where
+        u = json.dumps(plain(an_sized(b)), sort_keys=True) + where
         h.update(u.encode())
         size += len(u)
         if isinstance(b, dict) and "cache_control" in b:
@@ -4443,11 +4482,208 @@ def sc_an_read_pdf_bad(model, n, req):
         yield from an_answer(model, req, "It was damaged.")
 
 
-def sc_read_pdf_unsent(model, n, req):
+def sc_an_read_pdf_damaged(model, n, req):
+    # Damaged PDFs, extracted rather than sent
+    files = ["junk.pdf", "count.pdf", "cut.pdf"]
+    k = len([m for m in req.get("messages", []) if m.get("role") == "assistant"])
+    if k < len(files):
+        yield from an_call(model, req, n, "read", {"path": files[k]})
+    else:
+        yield from an_answer(model, req, "Read them.")
+
+
+def mkpdf(pages, encrypt=False):
+    """A PDF of so many pages, each with a line of text, as text: its
+    trailer naming an /Encrypt dictionary if encrypt."""
+    objs = ["<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [%s] /Count %d >>" %
+            (" ".join(f"{3 + 2*i} 0 R" for i in range(pages)), pages)]
+    font = 3 + 2*pages
+    for i in range(pages):
+        s = f"BT /F1 24 Tf 72 700 Td (Page {i + 1}) Tj ET"
+        objs.append(f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources "
+                    f"<< /Font << /F1 {font} 0 R >> >> /Contents {4 + 2*i} 0 R >>")
+        objs.append(f"<< /Length {len(s)} >>\nstream\n{s}\nendstream")
+    objs.append("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+    if encrypt:
+        objs.append("<< /Filter /Standard /V 1 /R 2 /O <00> /U <00> /P -4 >>")
+    out, offs = "%PDF-1.4\n", []
+    for i, o in enumerate(objs):
+        offs.append(len(out))
+        out += f"{i + 1} 0 obj\n{o}\nendobj\n"
+    xref = len(out)
+    out += f"xref\n0 {len(objs) + 1}\n0000000000 65535 f \n"
+    out += "".join(f"{o:010d} 00000 n \n" for o in offs)
+    enc = f" /Encrypt {len(objs)} 0 R" if encrypt else ""
+    out += (f"trailer\n<< /Size {len(objs) + 1} /Root 1 0 R{enc} >>\n"
+            f"startxref\n{xref}\n%%EOF\n")
+    return out
+
+
+def mkpdfpages(pages, images=None, title=None, pad=0):
+    """A PDF as bytes: pages of (lines of text, names of the images drawn
+    below them, one under another), images by name as (dictionary
+    entries, stream data); an Info dictionary with title if given; and
+    pad bytes of an unused stream right after the first page's objects,
+    so that a body cut inside it keeps only that page whole."""
+    images = images or {}
+    names = list(images)
+    first = 3 + 2*len(pages)
+    font = first + len(names)
+    objs = [b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [%s] /Count %d >>" %
+            (" ".join(f"{3 + 2*i} 0 R" for i in range(len(pages))).encode(), len(pages))]
+    for i, (lines, drawn) in enumerate(pages):
+        ops, y = [], 740
+        for ln in lines:
+            ops.append(f"BT /F1 12 Tf 72 {y} Td ({ln}) Tj ET")
+            y -= 20
+        for nm in drawn:
+            y -= 110
+            ops.append(f"q 200 0 0 100 72 {y} cm /{nm} Do Q")
+            y -= 10
+        s = "\n".join(ops).encode()
+        xo = " ".join(f"/{nm} {first + names.index(nm)} 0 R" for nm in drawn)
+        objs.append(f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources "
+                    f"<< /Font << /F1 {font} 0 R >> /XObject << {xo} >> >> "
+                    f"/Contents {4 + 2*i} 0 R >>".encode())
+        objs.append(b"<< /Length %d >>\nstream\n%s\nendstream" % (len(s), s))
+    for nm in names:
+        d, data = images[nm]
+        objs.append(b"<< /Type /XObject /Subtype /Image %s /Length %d >>\nstream\n%s\n"
+                    b"endstream" % (d.encode(), len(data), data))
+    objs.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+    order = list(range(len(objs)))
+    if pad:
+        objs.append(b"<< /Length %d >>\nstream\n%s\nendstream" % (pad, b"\0" * pad))
+        order.insert(4 if len(pages) else 2, len(objs) - 1)
+    info = ""
+    if title is not None:
+        objs.append(b"<< /Title (%s) >>" % title.encode())
+        order.append(len(objs) - 1)
+        info = f" /Info {len(objs)} 0 R"
+    out, offs = b"%PDF-1.4\n", [0] * len(objs)
+    for i in order:
+        offs[i] = len(out)
+        out += b"%d 0 obj\n%s\nendobj\n" % (i + 1, objs[i])
+    xref = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objs) + 1)
+    out += b"".join(b"%010d 00000 n \n" % o for o in offs)
+    out += (b"trailer\n<< /Size %d /Root 1 0 R%s >>\nstartxref\n%d\n%%%%EOF\n" %
+            (len(objs) + 1, info.encode(), xref))
+    return out
+
+
+def pdfrgb(w, h, color):
+    """An image XObject's entries and data: w by h of one RGB color, deflated."""
+    return (f"/Width {w} /Height {h} /ColorSpace /DeviceRGB /BitsPerComponent 8 "
+            f"/Filter /FlateDecode", zlib.compress(bytes(color) * (w * h)))
+
+
+def sc_read_pdf_text(model, n, req):
     if step(req) == 0:
         yield from tool(model, n, "read", {"path": "three.pdf"})
     else:
         yield from answer(model, "Read it.")
+
+
+# Pages in windows of 5 lines, read on; then the file is changed (31
+# pages) and read on past where it ended
+READ_PDF_PAGING = [
+    ("read", {"path": "thirty.pdf", "limit": 5}),
+    ("read", {"path": "thirty.pdf", "offset": 6, "limit": 5}),
+    ("write", {"path": "thirty.pdf", "content": mkpdf(31)}),
+    ("read", {"path": "thirty.pdf", "offset": 61, "limit": 5}),
+]
+
+
+def sc_read_pdf_paging(model, n, req):
+    k = step(req)
+    if k < len(READ_PDF_PAGING):
+        yield from tool(model, n, *READ_PDF_PAGING[k])
+    else:
+        yield from answer(model, "Paged through it.")
+
+
+def sc_read_pdf_images(model, n, req):
+    # Two PDFs with images, then an answer; a resumed run answers at once
+    files = ["img.pdf", "many.pdf"]
+    k = step(req)
+    if last_user_text(req) == "again" or k >= len(files):
+        yield from answer(model, "Saw them.")
+    else:
+        yield from tool(model, n, "read", {"path": files[k]})
+
+
+def sc_read_pdf_images_rs(model, n, req):
+    files = ["img.pdf", "scan.pdf"]
+    k = step(req)
+    if k < len(files):
+        yield from tool(model, n, "read", {"path": files[k]})
+    else:
+        yield from answer(model, "Saw them.")
+
+
+def sc_read_pdf_blind(model, n, req):
+    files = ["img.pdf", "scan.pdf", "blank.pdf"]
+    k = step(req)
+    if k < len(files):
+        yield from tool(model, n, "read", {"path": files[k]})
+    else:
+        yield from answer(model, "Read them.")
+
+
+def sc_read_pdf_locked(model, n, req):
+    if step(req) == 0:
+        yield from tool(model, n, "read", {"path": "locked.pdf"})
+    else:
+        yield from answer(model, "It is locked.")
+
+
+def script_calls(req):
+    """The calls a scripted scenario makes, one a step: the prompt is a
+    JSON list of [name, args]."""
+    for m in req.get("messages", []):
+        if m.get("role") != "user":
+            continue
+        c = m.get("content")
+        if isinstance(c, list):
+            c = "".join(b.get("text", "") for b in c if b.get("type") == "text")
+        c = str(c or "").strip()
+        if c.startswith('[["'):
+            return json.loads(c)
+    return []
+
+
+def sc_calls(model, n, req):
+    # The prompt's calls in turn, then an answer
+    items = script_calls(req)
+    k = step(req)
+    if k < len(items):
+        yield from tool(model, n, *items[k])
+    else:
+        yield from answer(model, "Done.")
+
+
+def sc_an_calls(model, n, req):
+    items = script_calls(req)
+    k = len([m for m in req.get("messages", []) if m.get("role") == "assistant"])
+    if k < len(items):
+        yield from an_call(model, req, n, *items[k])
+    else:
+        yield from an_answer(model, req, "Done.")
+
+
+sc_read_pdf_more = sc_read_pdf_bigimgs = sc_calls
+sc_an_read_pdf_edge = sc_an_read_pdf_reqbytes = sc_an_calls
+
+
+def sc_an_read_pdf_text(model, n, req):
+    k = len([m for m in req.get("messages", []) if m.get("role") == "assistant"])
+    if k == 0:
+        yield from an_call(model, req, n, "read", {"path": "img.pdf"})
+    else:
+        yield from an_answer(model, req, "Read it.")
 
 
 def sc_an_desktop_cache(model, n, req):
@@ -5048,6 +5284,14 @@ def sc_mention_sessions(model, n, req):
 sc_attach_text_b = sc_attach_text  # its model without vision
 
 
+def sc_attach_pdf(model, n, req):
+    # How many PDFs are attached, and how many images the request has
+    k = user_text_all(req).count("[Attached PDF ")
+    yield from answer(model, f"{k} PDFs, {len(user_images(req))} images.")
+sc_attach_pdf_b = sc_attach_pdf  # its model without vision
+sc_attach_pdf_more = sc_attach_pdf
+
+
 def sc_attach_text_long(model, n, req):
     # The file cut, the agent reads on from where it is kept
     msgs = req.get("messages", [])
@@ -5221,6 +5465,36 @@ def sc_web_flow(model, n, req):
         web_search("forbidden"),
         web_search("nothing"),
         "Done reading."])
+
+
+def web_read_kept(nonce, results):
+    """read the PDF the last web_fetch kept, if it kept one."""
+    m = re.search(r"The PDF is kept at (\S+): read", results[-1] if results else "")
+    return ("read", {"path": m.group(1)}) if m else "Nothing kept."
+
+
+def sc_web_fetch_pdf(model, n, req):
+    d = "https://docs.example.com/{nonce}"
+    yield from web_steps(model, n, req, [
+        web_fetch(d + "/report.pdf"),
+        web_read_kept,
+        web_fetch(d + "/report.pdf", offset=10),
+        web_fetch(d + "/dump"),
+        web_fetch(d + "/locked.pdf"),
+        "Done reading."])
+
+
+sc_web_fetch_pdf_blind = sc_web_fetch_pdf
+
+
+def sc_web_fetch_pdf_more(model, n, req):
+    d = "https://docs.example.com/{nonce}"
+    yield from web_steps(model, n, req, [web_fetch(d + "/" + x) for x in
+                                         ("htmlpdf", "mention", "mid.pdf", "blank.pdf",
+                                          "scan.pdf")] + ["Done reading."])
+
+
+sc_web_fetch_pdf_more_blind = sc_web_fetch_pdf_more
 
 
 def sc_web_ask(model, n, req):
@@ -6219,6 +6493,36 @@ class Handler(BaseHTTPRequestHandler):
                             {"Location": f"https://{host}/{nonce}/loop"})
         elif name == "pdf":
             self.send_bytes(200, "application/pdf", b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+        elif name == "report.pdf":
+            self.send_bytes(200, "application/pdf", mkpdfpages(
+                [(["Widget report", "Widgets turn at 42 rpm."], ["Im1"]),
+                 (["Second page: the totals."], [])],
+                {"Im1": pdfrgb(100, 50, (200, 30, 30))}, title="Widget report"))
+        elif name == "dump":
+            # Known by its first bytes, and past any cap a PDF gets: read
+            # from its first page
+            self.send_bytes(200, "application/octet-stream", mkpdfpages(
+                [(["Before the cut."], []), (["After the cut."], [])],
+                title="Dump", pad=33 << 20))
+        elif name == "locked.pdf":
+            self.send_bytes(200, "application/pdf", mkpdf(1, encrypt=True).encode())
+        elif name == "htmlpdf":
+            # A login page sent as the PDF asked for
+            self.send_bytes(200, "application/pdf",
+                            b"<!doctype html><html><head><title>Sign in</title></head>"
+                            b"<body><p>Sign in to read the report.</p></body></html>")
+        elif name == "mention":
+            self.send_bytes(200, "application/octet-stream",
+                            b"Every PDF begins with %PDF-1.7 and a comment.\n")
+        elif name == "mid.pdf":
+            # Past a page's cap, within a PDF's
+            self.send_bytes(200, "application/pdf", mkpdfpages(
+                [(["Before the pad."], []), (["After the pad."], [])], pad=7 << 20))
+        elif name == "blank.pdf":
+            self.send_bytes(200, "application/pdf", mkpdfpages([([], []), ([], [])]))
+        elif name == "scan.pdf":
+            self.send_bytes(200, "application/pdf", mkpdfpages(
+                [([], ["S"]), ([], ["S"])], {"S": pdfrgb(60, 80, (240, 240, 240))}))
         elif name == "challenge":
             self.send_bytes(403, "text/html", b"<p>Just a moment...</p>",
                             {"cf-mitigated": "challenge"})

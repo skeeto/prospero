@@ -519,6 +519,16 @@ static void test_desktop(Test *t)
                "user:text* | assistant:tool_use,tool_use | user:tool_result,"
                "tool_result,text*");
 
+        // An image read that is a JPEG, sent as one
+        msgs[2].imgmime = "image/jpeg";
+        body = encodechat(a, tmp, &r);
+        expect(t, "openai image jpeg",
+               istr(a, find(body, "\"url\":\"data:image/jpeg;base64,QUJD\"") > 0), "1");
+        an = anencode(a, tmp, &r);
+        expect(t, "anthropic image jpeg",
+               istr(a, find(an, "\"media_type\":\"image/jpeg\",\"data\":\"QUJD\"") > 0), "1");
+        msgs[2].imgmime = {};
+
         // A screenshot left out: a text in its place, the shape kept
         msgs[2].imgb64 = {};
         msgs[2].imgalt = "[screenshot omitted: c1]";
@@ -591,6 +601,150 @@ static void test_desktop(Test *t)
                > 0), "1");
     }
 
+    // A tool result's several images (a PDF's): each after a caption
+    // naming it, from its label or its place, with its own mime; after
+    // the run of results (Chat Completions, Responses), or inside its
+    // tool_result (Anthropic); a lost one and a set left out as text
+    {
+        ModelConf mc = {};
+        mc.name = "m";
+        Block calls[3] = {};
+        for (i32 i = 0; i < 3; i++) {
+            calls[i].type = BLOCK_CALL;
+            calls[i].name = "read";
+            calls[i].args = "{\"path\":\"x.pdf\"}";
+        }
+        calls[0].id = "c1";
+        calls[1].id = "c2";
+        calls[2].id = "c3";
+        MsgImage imgs[3] = {};
+        imgs[0].name  = "out/c1.png";
+        imgs[0].mime  = "image/png";
+        imgs[0].label = "image 1 (page 1)";
+        imgs[0].b64   = "QUJD";
+        imgs[1].name  = "out/c1-1.jpg";
+        imgs[1].mime  = "image/jpeg";
+        imgs[1].label = "image 3 (page 2)";
+        imgs[1].b64   = "REVG";
+        imgs[2].name  = "out/c1-2.png";
+        imgs[2].mime  = "image/png";
+        imgs[2].b64   = "R0hJ";
+        Msg msgs[6] = {};
+        msgs[0].role   = ROLE_USER;
+        msgs[0].text   = "read it";
+        msgs[1].role   = ROLE_ASSISTANT;
+        msgs[1].blocks = {calls, 3, 3};
+        msgs[2].role   = ROLE_TOOL;
+        msgs[2].callid = "c1";
+        msgs[2].text   = "x.pdf";
+        msgs[2].images = {imgs, 1, 1};
+        msgs[3].role   = ROLE_TOOL;
+        msgs[3].callid = "c2";
+        msgs[3].text   = "shot";
+        msgs[3].image  = "out/c2.png";
+        msgs[3].imgb64 = "U0hU";
+        msgs[4].role   = ROLE_TOOL;
+        msgs[4].callid = "c3";
+        msgs[4].text   = "plain";
+        msgs[5].role   = ROLE_USER;
+        msgs[5].text   = "next";
+        ChatReq r = {};
+        r.mc      = &mc;
+        r.history = {msgs, 6, 6};
+        Arena tmp = *a;
+        tmp.beg  += (tmp.end - tmp.beg)/2;
+
+        // One image
+        Str body = encodechat(a, tmp, &r);
+        expect(t, "tool images one openai", istr(a, find(body,
+               "{\"role\":\"tool\",\"tool_call_id\":\"c3\",\"content\":\"plain\"},"
+               "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Image 1 "
+               "(page 1) from tool call c1:\"},{\"type\":\"image_url\",\"image_url\":"
+               "{\"url\":\"data:image/png;base64,QUJD\"}},{\"type\":\"text\",\"text\":"
+               "\"The screenshot of tool call c2:\"},{\"type\":\"image_url\",\"image_url\":"
+               "{\"url\":\"data:image/png;base64,U0hU\"}}]},{\"role\":\"user\",\"content\":"
+               "\"next\"}") > 0), "1");
+        expect(t, "tool images not in the tool message", istr(a, find(body,
+               "{\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":\"x.pdf\"}") > 0), "1");
+
+        // Several, of mixed mimes, one with no label
+        msgs[2].images = {imgs, 3, 3};
+        body = encodechat(a, tmp, &r);
+        expect(t, "tool images openai", istr(a, find(body,
+               "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Image 1 "
+               "(page 1) from tool call c1:\"},{\"type\":\"image_url\",\"image_url\":"
+               "{\"url\":\"data:image/png;base64,QUJD\"}},{\"type\":\"text\",\"text\":"
+               "\"Image 3 (page 2) from tool call c1:\"},{\"type\":\"image_url\","
+               "\"image_url\":{\"url\":\"data:image/jpeg;base64,REVG\"}},{\"type\":"
+               "\"text\",\"text\":\"Image 3 from tool call c1:\"},{\"type\":\"image_url\","
+               "\"image_url\":{\"url\":\"data:image/png;base64,R0hJ\"}},{\"type\":\"text\","
+               "\"text\":\"The screenshot of tool call c2:\"}") > 0), "1");
+
+        Str an = anencode(a, tmp, &r);
+        expect(t, "tool images anthropic", istr(a, find(an,
+               "{\"type\":\"tool_result\",\"tool_use_id\":\"c1\",\"content\":["
+               "{\"type\":\"text\",\"text\":\"x.pdf\"},"
+               "{\"type\":\"text\",\"text\":\"Image 1 (page 1) from tool call c1:\"},"
+               "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":"
+               "\"image/png\",\"data\":\"QUJD\"}},"
+               "{\"type\":\"text\",\"text\":\"Image 3 (page 2) from tool call c1:\"},"
+               "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":"
+               "\"image/jpeg\",\"data\":\"REVG\"}},"
+               "{\"type\":\"text\",\"text\":\"Image 3 from tool call c1:\"},"
+               "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":"
+               "\"image/png\",\"data\":\"R0hJ\"}}]}") > 0), "1");
+        expect(t, "tool images anthropic shape", anshape(a, an),
+               "user:text* | assistant:tool_use,tool_use,tool_use | user:tool_result,"
+               "tool_result,tool_result,text*");
+
+        mc.name = "gpt-test";
+        Str rs = rsencode(a, tmp, &r, 0);
+        expect(t, "tool images responses", istr(a, find(rs,
+               "{\"type\":\"function_call_output\",\"call_id\":\"c3\",\"output\":"
+               "\"plain\"},{\"type\":\"message\",\"role\":\"user\",\"content\":["
+               "{\"type\":\"input_text\",\"text\":\"Image 1 (page 1) from tool call c1:\"},"
+               "{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,QUJD\"},"
+               "{\"type\":\"input_text\",\"text\":\"Image 3 (page 2) from tool call c1:\"},"
+               "{\"type\":\"input_image\",\"image_url\":\"data:image/jpeg;base64,REVG\"},"
+               "{\"type\":\"input_text\",\"text\":\"Image 3 from tool call c1:\"},"
+               "{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,R0hJ\"},"
+               "{\"type\":\"input_text\",\"text\":\"The screenshot of tool call c2:\"},"
+               "{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,U0hU\"}]}")
+               > 0), "1");
+
+        // One lost: the text in its place, with no caption
+        imgs[1].b64 = {};
+        imgs[1].alt = "[image lost: out/c1-1.jpg, its file could not be read]";
+        body = encodechat(a, tmp, &r);
+        expect(t, "tool images lost openai", istr(a, find(body,
+               "base64,QUJD\"}},{\"type\":\"text\",\"text\":\"[image lost: out/c1-1.jpg, "
+               "its file could not be read]\"},{\"type\":\"text\",\"text\":\"Image 3 "
+               "from tool call c1:\"}") > 0), "1");
+        an = anencode(a, tmp, &r);
+        expect(t, "tool images lost anthropic", istr(a, find(an,
+               "\"data\":\"QUJD\"}},{\"type\":\"text\",\"text\":\"[image lost: "
+               "out/c1-1.jpg, its file could not be read]\"},{\"type\":\"text\","
+               "\"text\":\"Image 3 from tool call c1:\"}") > 0), "1");
+        rs = rsencode(a, tmp, &r, 0);
+        expect(t, "tool images lost responses", istr(a, find(rs,
+               "base64,QUJD\"},{\"type\":\"input_text\",\"text\":\"[image lost: "
+               "out/c1-1.jpg, its file could not be read]\"},") > 0), "1");
+
+        // The set left out (deskimages): its text alone
+        msgs[2].images = {};
+        msgs[2].imgalt = "[PDF images omitted: c1; read the file again to see them]";
+        body = encodechat(a, tmp, &r);
+        expect(t, "tool images omitted openai", istr(a, find(body,
+               "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"[PDF images "
+               "omitted: c1; read the file again to see them]\"},{\"type\":\"text\","
+               "\"text\":\"The screenshot of tool call c2:\"}") > 0), "1");
+        an = anencode(a, tmp, &r);
+        expect(t, "tool images omitted anthropic", istr(a, find(an,
+               "\"content\":[{\"type\":\"text\",\"text\":\"x.pdf\"},{\"type\":\"text\","
+               "\"text\":\"[PDF images omitted: c1; read the file again to see them]\"}]}")
+               > 0), "1");
+    }
+
     // The names attaching gives (image_test.cpp has what an image is)
     {
         expect(t, "image names", concat(a, concat(a, istr(a, validimage("img/1.png")),
@@ -598,6 +752,21 @@ static void test_desktop(Test *t)
                istr(a, validimage("img/0.png")), istr(a, validimage("img/../1.png"))),
                concat(a, istr(a, validimage("img/1.gif")), istr(a, validimage("out/1.png"))))),
                "110000");
+
+        // And a tool result's images' names: files of out/
+        Str outs[] = {"out/c1.png", "out/call_1-2.jpg", "out/.png", "out/.x.png",
+                      "out/a/b.png", "out/a\\b.png", "out/c1.gif", "img/1.png",
+                      "out/c:x.png", "out/", "outx/c1.png"};
+        Buf got(a, 32);
+        for (iz i = 0; i < countof(outs); i++) {
+            print(&got, (i64)validout(outs[i]));
+        }
+        Buf longname(a, 160);
+        print(&longname, "out/");
+        for (i32 i = 0; i < 121; i++) putbyte(&longname, 'x');
+        print(&longname, ".png");
+        print(&got, (i64)validout(finish(&longname)));
+        expect(t, "out names", finish(&got), "110000000000");
     }
 
     // Attached text files' names, and a file's own made safe for one

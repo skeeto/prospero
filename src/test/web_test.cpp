@@ -207,6 +207,28 @@ static void testwebredirect(Test *t)
     expect(t, "webredirect.addwww", istr(&a, r.kind), istr(&a, WEBR_FOLLOW));
 }
 
+static void testwebpdfnote(Test *t)
+{
+    Arena a = t->perm;
+    static struct { Str text; b32 cut; Str why; Str want; } cases[] = {
+        {"--- page 1 ---\nHello\n", 0, {}, "--- page 1 ---\nHello\n"},
+        {"--- page 1 ---\nHello\n", 1, {},
+         "--- page 1 ---\nHello\n\n"
+         "[The PDF was cut at 32 MiB; only the text before that could be read.]\n"},
+        {"--- page 1 ---\nHello", 1, "out of memory",
+         "--- page 1 ---\nHello\n\n"
+         "[The PDF was cut at 32 MiB; only the text before that could be read.]\n"},
+        {"--- page 1 ---\nHello\n", 0, "too much work",
+         "--- page 1 ---\nHello\n\n"
+         "[Only part of the PDF could be read: too much work.]\n"},
+        {"", 1, {}, "[The PDF was cut at 32 MiB; only the text before that could be read.]\n"},
+    };
+    for (iz i = 0; i < countof(cases); i++) {
+        Str got = webpdfnote(&a, cases[i].text, cases[i].cut, 32<<20, cases[i].why);
+        expect(t, concat(&a, "webpdfnote ", istr(&a, i)), got, cases[i].want);
+    }
+}
+
 static void testwebkind(Test *t)
 {
     Arena a = t->perm;
@@ -223,8 +245,16 @@ static void testwebkind(Test *t)
         {"application/atom+xml", "", WEBK_TEXT},
         {"application/javascript", "", WEBK_TEXT},
         {"application/x-ndjson", "", WEBK_TEXT},
-        {"application/pdf", "%PDF", WEBK_BINARY},
-        {"image/png", "", WEBK_BINARY},
+        {"application/pdf", "%PDF", WEBK_PDF},
+        {"Application/PDF; qs=1", "", WEBK_PDF},
+        {"application/x-pdf", "junk", WEBK_PDF},
+        {"application/octet-stream", "%PDF-1.7\n%\xe2\xe3", WEBK_PDF},
+        {"", "\r\n%PDF-1.4\n", WEBK_PDF},
+        {"", {(u8 *)"\0\0%PDF-1.4", 11}, WEBK_PDF},  // before the NUL check
+        {"", "<html>%PDF-1.4", WEBK_HTML},
+        {"", "%PDF", WEBK_TEXT},
+        {"text/plain", "%PDF-1.4", WEBK_TEXT},
+        {"image/png", "%PDF-1.4", WEBK_BINARY},
         {"application/octet-stream", "text", WEBK_BINARY},
         {"application/+json", "", WEBK_BINARY},
         {"", "\xef\xbb\xbf \n<!DOCTYPE HTML><p>", WEBK_HTML},
@@ -239,6 +269,19 @@ static void testwebkind(Test *t)
         name = concat(&a, name, istr(&a, i));
         expect(t, name, istr(&a, webkind(cases[i].ctype, cases[i].body)),
                istr(&a, cases[i].want));
+    }
+
+    // "%PDF-" past the first KiB is not looked for
+    {
+        Buf b(&a, 2048);
+        for (i32 i = 0; i < 1020; i++) {
+            putbyte(&b, ' ');
+        }
+        print(&b, "%PDF-1.4");
+        Str body = finish(&b);
+        expect(t, "webkind late", istr(&a, webkind("", body)), istr(&a, WEBK_TEXT));
+        body = cuthead(body, 1);
+        expect(t, "webkind early", istr(&a, webkind("", body)), istr(&a, WEBK_PDF));
     }
 
     static struct { Str ctype, body; b32 html; Str want; } utf8s[] = {
@@ -911,6 +954,7 @@ static void test_web(Test *t)
     testweburls(t);
     testwebredirect(t);
     testwebkind(t);
+    testwebpdfnote(t);
     testwebclean(t);
     testwebhtml(t);
     testwebsearxng(t);

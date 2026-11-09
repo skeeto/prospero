@@ -336,7 +336,7 @@ one. `prospero mcp logout NAME`, or Sign out, forgets them.
 `web_search` sends a query to a search service and returns titles,
 links, dates and excerpts; `web_fetch` reads one https page as text,
 with scripts, navigation and hidden elements dropped and links made
-absolute. Neither is offered until `[web]` turns it on:
+absolute, and a PDF as its text. Neither is offered until `[web]` turns it on:
 
     [web]
     search = searxng

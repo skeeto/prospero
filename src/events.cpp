@@ -356,6 +356,11 @@ static Str capnames[] = {
                        // term.close: a shell on a pseudo-terminal, its
                        // output in term records, acked, then term.end;
                        // term.busy; hello's pty, whether the system can
+    "pdf",             // upload {kind:"file"} of a PDF: kept as
+                       // files/N-NAME.pdf, its text extracted beside it as
+                       // files/N-NAME.pdf.txt, which the reply names; a
+                       // model with vision gets its images too, as the
+                       // message's own (img/N, with a label)
 };
 
 static Str evname(i32 ev)
@@ -1980,11 +1985,11 @@ static b32 importkeeps(i32 ev)
 }
 
 // Whether an import drops a field: of a tool result, one naming a file
-// or a session of the old state directory (spill, image, pdf, child, a
-// message's target), or describing one; of a message's notice, its
-// sender, whose title and text stay; of a user record, its images,
-// files and the sessions it mentioned. The
-// URLs one session vouched for to another (urls) go too, as grants do.
+// or a session of the old state directory (spill, image, images, pdf,
+// child, a message's target), or describing one; of a message's notice,
+// its sender, whose title and text stay; of a user record, its images,
+// files and the sessions it mentioned. The URLs one session vouched for
+// to another (urls) go too, as grants do.
 static b32 importdrops(i32 ev, Str key)
 {
     if (key == "urls") {
@@ -1995,9 +2000,10 @@ static b32 importdrops(i32 ev, Str key)
     } else if (ev == EV_USER) {
         return key=="images" || key=="files" || key=="sessions";
     }
-    return key=="spill" || key=="bytes" || key=="image" || key=="width" ||
-           key=="height" || key=="shot" || key=="pdf" || key=="pages" ||
-           key=="child" || key=="host" || key=="job" || key=="to";
+    return key=="spill" || key=="bytes" || key=="image" || key=="images" ||
+           key=="width" || key=="height" || key=="shot" || key=="pdf" ||
+           key=="pages" || key=="child" || key=="host" || key=="job" ||
+           key=="to";
 }
 
 // A tool result, notice or user record without the fields an import

@@ -69,12 +69,21 @@ refused. It never reads a local address: an IP address, `localhost`,
 a name without a dot, or names such as `.local` and `.internal`. A
 redirect to the same site is followed; one to another site is
 reported, and reading it is another call that asks for that site.
-PDFs, images and other files that are not text are refused.
+Images and other files that are not text are refused.
 
 A page is read as text, without its scripts, styles, navigation, and
 anything hidden. Its whole text is kept in the session's `out`
 folder, and the agent reads a long page in parts, without fetching it
 again or asking.
+
+A PDF is read as its text, by Prospero's own reader, a `--- page N ---`
+line starting each page, and up to 32 MiB of it (8 MiB on 32-bit
+systems): the pages before a cut are read, and the text says it was
+cut. An encrypted PDF is refused. When the model takes images and the
+PDF has some, the PDF is kept in `out` too, and `read` shows it with
+its images; one with no text (a scan, or words drawn as shapes) is kept
+too, with a note on rendering or OCR in the shell. A page sent as a
+PDF that is not one, such as a sign-in page, is read as the page it is.
 
 These rules hold against the agent, not against a determined one:
 the shell can reach the web too. The asks are what you control.

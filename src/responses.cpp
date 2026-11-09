@@ -97,7 +97,12 @@ static void rsuser(JsonOut *w, Arena scratch, Msg *m)
         rstext(w, "input_text", m->text);
     }
     for (iz i = 0; i < m->images.len; i++) {
-        MsgImage *g = &m->images[i];
+        MsgImage *g   = &m->images[i];
+        Arena     t   = scratch;
+        Str       cap = userimagecaption(&t, g);
+        if (cap.len) {
+            rstext(w, "input_text", cap);
+        }
         if (g->b64.len) {
             rsimage(w, scratch, g->mime, g->b64);
         } else {
@@ -114,7 +119,7 @@ static void rsimages(JsonOut *w, Arena tmp, Slice<Msg> h, iz beg, iz end)
 {
     b32 any = 0;
     for (iz i = beg; i < end; i++) {
-        any |= h[i].imgb64.len>0 || h[i].imgalt.len>0;
+        any |= toolimages(&h[i]);
     }
     if (!any) {
         return;
@@ -127,16 +132,25 @@ static void rsimages(JsonOut *w, Arena tmp, Slice<Msg> h, iz beg, iz end)
     for (iz i = beg; i < end; i++) {
         Msg  *m = &h[i];
         Arena t = tmp;
-        if (!m->imgb64.len) {
-            if (m->imgalt.len) {
-                rstext(w, "input_text", m->imgalt);
-            }
-            continue;
+        if (m->imgb64.len) {
+            Str what = m->imgread ? Str("The image read by tool call ")
+                                  : Str("The screenshot of tool call ");
+            rstext(w, "input_text", concat(&t, concat(&t, what, m->callid), ":"));
+            rsimage(w, t, m->imgmime.len ? m->imgmime : Str("image/png"), m->imgb64);
+        } else if (m->imgalt.len) {
+            rstext(w, "input_text", m->imgalt);
         }
-        Str what = m->imgread ? Str("The image read by tool call ")
-                              : Str("The screenshot of tool call ");
-        rstext(w, "input_text", concat(&t, concat(&t, what, m->callid), ":"));
-        rsimage(w, t, "image/png", m->imgb64);
+        for (iz k = 0; m->role==ROLE_TOOL && k<m->images.len; k++) {
+            // Each of several, after a caption naming it
+            MsgImage *g  = &m->images[k];
+            Arena     tk = t;
+            if (g->b64.len) {
+                rstext(w, "input_text", toolimagecaption(&tk, m, k));
+                rsimage(w, tk, g->mime, g->b64);
+            } else {
+                rstext(w, "input_text", imagealt(g));
+            }
+        }
     }
     putend(w);
     putend(w);

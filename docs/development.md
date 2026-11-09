@@ -156,4 +156,33 @@ suite asks one question a task, answered through `read` alone:
     $ uv run tests/pdfcorpus.py build-pdfcorpus
     $ prospero eval -m MODEL -o pdf.jsonl build-pdfcorpus/eval
 
+The built-in PDF reader, which `read`, `web_fetch` and attachments use
+for models not sent PDFs as documents, runs alone too: `prospero --pdf
+FILE` prints a PDF's text as `read` would show it, with `--offset N`
+and `--limit N` for a window, `--all` for the whole text, and `--images
+DIR` to write the images that window shows, as a vision model would get
+them, with stats on standard error. `tests/pdfcheck.py` (CTest
+`pdfcorpus`, skipped when the corpus's programs are missing) builds the
+corpus and checks the reader's text and images against its manifest,
+known gaps listed in its XFAIL table:
+
+    $ prospero --pdf report.pdf --offset 100 --limit 50 --images /tmp/imgs
+    $ uv run tests/pdfcheck.py --prospero build/prospero
+
+The reader, its text encodings and its image decoding are fuzzed with
+AFL++, as the targets `FUZZ_PDF`, `FUZZ_PDFENC` and `FUZZ_PDFIMG` of
+`src/main_fuzz.cpp`, whose head gives the build and the seeds; the PDF
+target has a dictionary, `tests/pdffuzz.dict`:
+
+    $ afl-clang-fast -O2 -g3 -fsanitize=address,undefined \
+          -fsanitize-trap=undefined -I build/_deps/wuffs-src \
+          -c -o wuffs.o src/wuffs.c
+    $ afl-clang-fast++ -std=c++20 -fno-exceptions -fno-rtti -g3 \
+          -fsanitize=address,undefined -fsanitize-trap=undefined \
+          -DFUZZ_PDF -o fuzzpdf src/main_fuzz.cpp wuffs.o
+    $ afl-fuzz -i i -o o -x tests/pdffuzz.dict ./fuzzpdf
+
+A crash too big for the fuzzer's 64 KiB inputs is triaged with
+`prospero --pdf`.
+
 [uv]: https://docs.astral.sh/uv/

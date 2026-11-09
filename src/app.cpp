@@ -1147,6 +1147,7 @@ struct AttImage {
     Str     label;  // where it came from: a file's name, else empty
     Str     name;   // as uploaded, img/N.png or img/N.jpg, or files/N-NAME
     b32     file;   // a text file, not an image
+    b32     pdf;    // that file a PDF, whose text the engine extracts
     i64     bytes;  // and its size
     i64     lines;
     Str     src;        // the absolute path it was read from, empty for a paste
@@ -4989,7 +4990,8 @@ static GuiTex *attthumb(Gui *g, Str data)
 
 // Attach an image, PNG, JPEG, GIF, WebP or BMP, which the engine
 // converts to a PNG if not a PNG or JPEG, or else a text file, which the
-// agent gets as read shows it, its bytes copied. A binary file, by read's
+// agent gets as read shows it, its bytes copied, or a PDF, whose text
+// the engine extracts, if it can ("pdf"). A binary file, by read's
 // measure, is refused. Returns why not, or empty if attached.
 static Str attachadd(Gui *g, GuiSession *s, Str data, Str label, Str src = {})
 {
@@ -4999,14 +5001,19 @@ static Str attachadd(Gui *g, GuiSession *s, Str data, Str label, Str src = {})
     }
     ImageKind k    = imagekind(g->frame, data);
     Str       name = label.len ? label : Str("the pasted file");
+    b32       pdf  = !k.mime.len && pdfsniff(data) && pdflikely(data);
     if (!k.mime.len && !hostcap(s->host, "files")) {
         return "not an image: only PNG, JPEG, GIF, WebP and BMP can be attached "
                "here, as this host's engine is too old to take text files";
-    } else if (!k.mime.len && readbinary(data)) {
-        return concat(&g->frame, name, " is a binary file: only text files and "
-                                       "images can be attached");
+    } else if (pdf && !hostcap(s->host, "pdf")) {
+        return concat(&g->frame, name, " is a PDF, which this host's engine is too "
+                                       "old to read: update the engine");
+    } else if (!pdf && !k.mime.len && readbinary(data)) {
+        return concat(&g->frame, name, " is a binary file: only text files, PDFs "
+                                       "and images can be attached");
     } else if (!k.mime.len && data.len>ATTACH_FILE) {
-        return "too large to attach: a text file is at most 16 MiB";
+        return pdf ? Str("too large to attach: a PDF is at most 16 MiB")
+                   : Str("too large to attach: a text file is at most 16 MiB");
     } else if (!k.mime.len) {
         Region *r = os_reserve(g->os, data.len + label.len + 4096);
         if (!r) {
@@ -5022,8 +5029,10 @@ static Str attachadd(Gui *g, GuiSession *s, Str data, Str label, Str src = {})
         m->data  = clone(&m->mem, data);
         m->label = clone(&m->mem, label.len ? label : Str("pasted.txt"));
         m->file  = 1;
+        m->pdf   = pdf;
         m->bytes = data.len;
-        m->lines = countlines(startswith(data, "\xef\xbb\xbf") ? cuthead(data, 3) : data);
+        m->lines = pdf ? 0 : countlines(startswith(data, "\xef\xbb\xbf") ? cuthead(data, 3)
+                                                                           : data);
         m->src   = clone(&m->mem, src);
         scheddirty(&g->sched);
         return {};
@@ -5106,6 +5115,8 @@ static void attachnamedfile(Gui *g, GuiSession *s, Json *k)
     m->name  = clone(&m->mem, name);
     m->label = cut(cuthead(m->name, 6), '-').tail;
     m->file  = 1;
+    m->pdf   = endswith(m->label, ".pdf.txt");  // its text, kept beside it
+    m->label = m->pdf ? cuttail(m->label, 4) : m->label;
     m->bytes = jsonint(jsonget(k, "bytes"), 0);
     m->lines = jsonint(jsonget(k, "lines"), 0);
 }
@@ -5312,6 +5323,7 @@ static void onattach(Gui *g, GuiSession *s, EvRec *r)
         } else {
             m->name  = clone(&m->mem, name);
             m->file  = !image;
+            m->pdf   = !image && endswith(name, ".pdf.txt");
             m->mime  = clone(&m->mem, jsonstr(jsonget(j, "mime")));
             m->w     = (i32)jsonint(jsonget(j, "w"), 0);
             m->h     = (i32)jsonint(jsonget(j, "h"), 0);
@@ -12781,7 +12793,8 @@ enum : i32 {
     OP_MAXIMIZE,  // maximize the window (macOS: zoom), as its button would;
                   // dx 1: fill the primary display unmaximized (macOS's
                   // Fill), else skip the next op where that is no maximum
-    OP_DROP,      // write a dx by dy PNG (or dy lines, .txt) to --cwd as text, drop it
+    OP_DROP,      // write a dx by dy PNG (or dy lines, .txt; dy pages, .pdf) to
+                  // --cwd as text, drop it
                   // (a flat gray JPEG if text ends in .jpg)
     OP_CLIPPNG,   // the clipboard's text kept, a dx by dy PNG put there
     OP_CLIPBACK,  // the clipboard's text put back
@@ -18114,6 +18127,20 @@ static DriveOp composeops[] = {
     {OP_CHECK, CHK_USERIMAGES, 0, 0, 0, "I see 3 lines, 0 lost."},
     {OP_CHECK, CHK_USERFILES, 0, 0, 0, "Attached: notes.txt"},
     {OP_SHOT, 0, 0, 0, 300, "compose-filesent"},
+    // E3: a PDF dropped is attached as a file too, its text extracted by
+    // the engine, a line for each page's marker and one for its text
+    {OP_NEWSESSION, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_DROP, 0, 0, 2, 800, "dropped.pdf"},
+    {OP_CHECK, CHK_ATTACHED, 1, 0, 0, ""},
+    CLICK(T_PROMPT, "", 200),
+    {OP_TEXT, 0, 0, 0, 200, "Describe the files."},
+    KEY(GKEY_ENTER, 0, 300),
+    {OP_WAIT, W_TURNS, 1, 0, 10000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 600, ""},
+    {OP_CHECK, CHK_ATTACHED, 0, 0, 0, ""},
+    {OP_CHECK, CHK_USERIMAGES, 0, 0, 0, "I see 4 lines, 0 lost."},
+    {OP_CHECK, CHK_USERFILES, 0, 0, 0, "Attached: dropped.pdf"},
     // Mentions: '@' at a word's start opens the picker of the session
     // folder's files and folders, which typing narrows, Up/Down pick in,
     // and Tab or a bare Enter insert without sending, a file's text
@@ -21877,6 +21904,75 @@ static void drivesummary(Gui *g)
     guilog(g, finish(&b));
 }
 
+// A PDF of so many pages (at most 30), each with a line of text, for the
+// checklist to drop: its objects, then the table of where each begins.
+static Str droppdf(Arena *a, i32 pages)
+{
+    assert(pages>=1 && pages<=30);
+    Buf  b(a, 1024);
+    iz   offs[64] = {};
+    i32  n    = 0;
+    i32  font = 3 + 2*pages;
+    print(&b, "%PDF-1.4\n");
+    offs[n++] = b.len;
+    print(&b, "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    offs[n++] = b.len;
+    print(&b, "2 0 obj\n<< /Type /Pages /Kids [");
+    for (i32 i = 0; i < pages; i++) {
+        print(&b, i ? Str(" ") : Str(""));
+        print(&b, (i64)(3 + 2*i));
+        print(&b, " 0 R");
+    }
+    print(&b, "] /Count ");
+    print(&b, (i64)pages);
+    print(&b, " >>\nendobj\n");
+    for (i32 i = 0; i < pages; i++) {
+        Buf c(a, 64);
+        print(&c, "BT /F1 12 Tf 72 700 Td (Dropped page ");
+        print(&c, (i64)i + 1);
+        print(&c, ") Tj ET");
+        Str ops = finish(&c);
+        offs[n++] = b.len;
+        print(&b, (i64)(3 + 2*i));
+        print(&b, " 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                  "/Resources << /Font << /F1 ");
+        print(&b, (i64)font);
+        print(&b, " 0 R >> >> /Contents ");
+        print(&b, (i64)(4 + 2*i));
+        print(&b, " 0 R >>\nendobj\n");
+        offs[n++] = b.len;
+        print(&b, (i64)(4 + 2*i));
+        print(&b, " 0 obj\n<< /Length ");
+        print(&b, (i64)ops.len);
+        print(&b, " >>\nstream\n");
+        print(&b, ops);
+        print(&b, "\nendstream\nendobj\n");
+    }
+    offs[n++] = b.len;
+    print(&b, (i64)font);
+    print(&b, " 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n");
+    iz xref = b.len;
+    print(&b, "xref\n0 ");
+    print(&b, (i64)n + 1);
+    print(&b, "\n0000000000 65535 f \n");
+    for (i32 i = 0; i < n; i++) {
+        Buf o(a, 16);
+        print(&o, (i64)offs[i]);
+        Str num = finish(&o);
+        for (iz k = num.len; k < 10; k++) {
+            putbyte(&b, '0');
+        }
+        print(&b, num);
+        print(&b, " 00000 n \n");
+    }
+    print(&b, "trailer\n<< /Size ");
+    print(&b, (i64)n + 1);
+    print(&b, " /Root 1 0 R >>\nstartxref\n");
+    print(&b, (i64)xref);
+    print(&b, "\n%%EOF\n");
+    return finish(&b);
+}
+
 // A baseline grayscale JPEG of w by h mid-gray pixels, for the checklist
 // to drop: under one-symbol Huffman tables, each block a zero bit for
 // its DC and another for its end.
@@ -22177,7 +22273,9 @@ static void drivestep(Gui *g)
         // A .txt is dy numbered lines of text instead
         Str png = endswith(op->text, ".jpg") ? flatjpeg(&a, w, h) :
                   pngencodez(&a, px, w, h, 0);
-        if (endswith(op->text, ".txt")) {
+        if (endswith(op->text, ".pdf")) {
+            png = droppdf(&a, (i32)op->dy);
+        } else if (endswith(op->text, ".txt")) {
             Buf t(&a, 64*(iz)op->dy);
             for (i32 i = 1; i <= (i32)op->dy; i++) {
                 print(&t, "Line ");

@@ -2320,9 +2320,10 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
             Buf body(&scratch, 512);
             for (Json *k = files->child; k; k = k->next) {
                 Str name = jsonstr(jsonget(k, "name"));
+                Str own  = cut(cuthead(name, name.len<6 ? name.len : 6), '-').tail;
                 i64 n    = jsonint(jsonget(k, "lines"), 0);
                 print(&names, names.len ? Str(", ") : Str(""));
-                print(&names, cut(cuthead(name, 6), '-').tail);
+                print(&names, endswith(own, ".pdf.txt") ? cuttail(own, 4) : own);  // a PDF's text
                 print(&body, "- `");
                 print(&body, name);
                 print(&body, "`: ");

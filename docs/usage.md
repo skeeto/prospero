@@ -173,6 +173,23 @@ request, so it needs no vision. A file with a NUL byte in its first
 8 KiB is binary, and is refused, as `read` refuses it. The transcript
 notes the files under their message, folded.
 
+A PDF attached so goes as its text, extracted by the engine as `read`
+extracts it (a `--- page N ---` line starting each page). The session
+keeps the PDF as `files/N-NAME.pdf` and its text beside it as
+`files/N-NAME.pdf.txt`, and the request names both, so the agent reads on
+from the text or reads the PDF itself. To a model that takes images,
+the pictures on the pages the request shows go too, as the message's own
+images (kept as `img/N`, each captioned with its number, page and PDF),
+at most eight from a PDF and ten to a message with those attached by
+hand. These count with the images `read` shows from PDFs, at most 40 of
+them and 8 MiB in a request: past that, the oldest PDF's images leave
+requests, a note in their place. A PDF named `.PDF` is kept as `.pdf`,
+and a text file named as a PDF's text (`NAME.pdf.txt`) as
+`NAME_pdf.txt`. An encrypted PDF, or one with no text to read, is
+refused, but a text file that only mentions `%PDF-` near its start is
+attached as text. With an engine too old to read PDFs, the window says
+so instead of attaching one.
+
 A file or folder may be mentioned in the prompt: type `@` at the start of
 a word (the text's start, or after a space or `(`), and a picker of the
 session's files and folders opens, ranked as you type, a subsequence of
@@ -188,7 +205,8 @@ mentions = false` turns the picker off, and `@` is then plain text.
 
 Picking a file also attaches its text to the next message, as the Attach
 button does, so the agent has the contents as well as the path. A file
-that cannot be attached (binary, over 16 MiB) still gets its token, with
+that cannot be attached (binary, over 16 MiB, a PDF an older engine
+cannot read) still gets its token, with
 a dimmed chip that says why, and the mention still works: the agent reads
 the file itself. With ten files already attached the box has no room for
 another chip: the token goes in, no chip is added, and a note says ten
@@ -227,11 +245,30 @@ of each page, so it sees figures, tables and scans too. A page costs
 somewhere near 2000 tokens, so a PDF may have at most as many pages as
 half the model's window holds (50 in 200K tokens, 100 at most, the
 API's limit), and 16 MiB. PDFs leave the conversation as images read
-do, and an older one also leaves when a newer one needs its room. An
-encrypted PDF, or one too long, is refused, and the agent is pointed
-to the shell (`pdftotext`, Python's pypdf) to extract its text or split
-it. A model on another kind, or with `[model] pdf = false`, is told
-only what the file is.
+do, and an older one also leaves when a newer one needs its room.
+
+Every other model, and one too long or too large to send as a
+document, or damaged, gets the PDF's text instead, extracted by
+Prospero's own reader. Damaged means it loads only by repair: junk
+before its header, its xref missing or wrong, or its page tree
+counting pages it lacks. Anthropic refuses many such PDFs as invalid,
+and the reader recovers them: a `--- page N ---` line starts each page, and each image drawn
+shows as a line such as `[image 2: 480x96 JPEG]` where it was drawn.
+The text is read as a text file's lines are, 2000 at a time, so the
+agent reads on with `offset`; when a read shows only part of it, the
+whole text is kept in the session's `out/` folder, where `grep` can
+search it. A model that takes images also gets the images in the lines
+it reads, up to 8 at a time, shrunk to the model's limits, and these
+leave the conversation together, as one read image does (at most 40
+of them and 8 MiB in a request, with attached PDFs' images, and 20 MiB
+with the PDFs sent as documents). A scan comes through as its page
+images; a model that takes none is pointed to OCR in the shell
+(`tesseract`), and a PDF whose words are drawn as shapes, or whose
+images are in JPEG 2000 or JBIG2, which are not shown, to rendering
+its pages (`pdftoppm`). An encrypted PDF is refused on every endpoint.
+`[model] pdf = false` makes a model on kind `anthropic` extract too.
+A GitHub Copilot endpoint (kind `copilot`) extracts even for Claude
+models on the Messages API.
 
 The New session dialog's working directory may be picked with Browse,
 in the platform's folder dialog, for a directory on this computer. A

@@ -386,14 +386,18 @@ struct Block {
     Str args;  // the raw argument string, as the model produced it
 };
 
-// An image the user attached to a message.
+// An image the user attached to a message, or one of the images of a
+// tool result (a PDF's, read shows several at once).
 struct MsgImage {
-    Str name;  // relative to the session's directory: img/N.png
-    Str mime;  // image/png or image/jpeg
+    Str name;   // relative to the session's directory: img/N.png, or
+                // a tool result's out/NAME.png or out/NAME.jpg
+    Str mime;   // image/png or image/jpeg
     i32 w;
     i32 h;
-    Str b64;   // in a request's history: the image as base64, or null
-    Str alt;   // with this text in its place (its file is lost)
+    Str label;  // a tool result's: what its caption names, such as
+                // "image 3 (page 2)", empty if none
+    Str b64;    // in a request's history: the image as base64, or null
+    Str alt;    // with this text in its place (its file is lost)
 };
 
 // A text file the user attached to a message, kept in the session's
@@ -433,8 +437,11 @@ struct Msg {
     Str          imgb64;  // in a request's history: the screenshot as
                           // base64, or null where it is left out,
     Str          imgalt;  // with this text in its place
+    Str          imgmime;  // and imgb64's type as its bytes say (image/png
+                           // if null)
     i32          floor;   // FLOOR_*: a cache breakpoint just before it
-    Slice<MsgImage> images;  // user messages: those attached
+    Slice<MsgImage> images;  // user messages: those attached; tool
+                             // messages: a result's several images
     Slice<MsgFile>  files;   // and the text files
     Slice<MsgSess>  sessions;  // and the sessions mentioned
 };
@@ -445,7 +452,8 @@ struct Msg {
 enum : i32 {
     FLOOR_NONE,
     FLOOR_WRITE,  // the oldest screenshot shown: the next step's change
-    FLOOR_READ,   // the oldest dropped at this step: its change
+    FLOOR_READ,   // the oldest dropped at this step, or PDF or set of
+                  // images crowded out since the last: its change
 };
 
 struct Usage {
@@ -670,6 +678,55 @@ static Str imagealt(MsgImage *g)
     return g->alt.len ? g->alt : Str("[image]");
 }
 
+// An image's label as a caption begins, capitalized.
+static void putlabel(Buf *b, Str label)
+{
+    u8 c = label[0];
+    putbyte(b, c>='a' && c<='z' ? (u8)(c - 'a' + 'A') : c);
+    print(b, cuthead(label, 1));
+}
+
+// The caption before an image the user attached that has a label, an
+// attached PDF's (pdfattachimages), in a: "Image 3 (page 2) of x.pdf:".
+// Null if it has none, or is not sent.
+static Str userimagecaption(Arena *a, MsgImage *g)
+{
+    if (!g->label.len || !g->b64.len) {
+        return {};
+    }
+    Buf b(a, 8 + g->label.len);
+    putlabel(&b, g->label);
+    putbyte(&b, ':');
+    return finish(&b);
+}
+
+// The caption before the image at index i of a tool result's several,
+// in a: "Image 3 (page 2) from tool call X:", from its label, else
+// numbered by its place.
+static Str toolimagecaption(Arena *a, Msg *m, iz i)
+{
+    MsgImage *g = &m->images[i];
+    Buf b(a, 64 + g->label.len + m->callid.len);
+    if (g->label.len) {
+        putlabel(&b, g->label);
+    } else {
+        print(&b, "Image ");
+        print(&b, (i64)i+1);
+    }
+    print(&b, " from tool call ");
+    print(&b, m->callid);
+    putbyte(&b, ':');
+    return finish(&b);
+}
+
+// Whether a tool result has images for a request to carry: its
+// screenshot or image, or the text in its place, or several.
+static b32 toolimages(Msg *m)
+{
+    return m->role==ROLE_TOOL &&
+           (m->imgb64.len || m->imgalt.len || m->images.len);
+}
+
 static void encodemsg(JsonOut *w, ModelConf *mc, Msg *m, Arena *a)
 {
     putobject(w);
@@ -691,7 +748,15 @@ static void encodemsg(JsonOut *w, ModelConf *mc, Msg *m, Arena *a)
             putend(w);
         }
         for (iz i = 0; i < m->images.len; i++) {
-            MsgImage *g = &m->images[i];
+            MsgImage *g   = &m->images[i];
+            Arena     t   = *a;
+            Str       cap = userimagecaption(&t, g);
+            if (cap.len) {
+                putobject(w);
+                putstrkey(w, "type", "text");
+                putstrkey(w, "text", cap);
+                putend(w);
+            }
             putobject(w);
             if (g->b64.len) {
                 putstrkey(w, "type", "image_url");
@@ -771,7 +836,7 @@ static void encodeimages(JsonOut *w, Arena tmp, Slice<Msg> h, iz beg, iz end)
 {
     b32 any = 0;
     for (iz i = beg; i < end; i++) {
-        any |= h[i].imgb64.len>0 || h[i].imgalt.len>0;
+        any |= toolimages(&h[i]);
     }
     if (!any) {
         return;
@@ -781,32 +846,48 @@ static void encodeimages(JsonOut *w, Arena tmp, Slice<Msg> h, iz beg, iz end)
     putkey(w, "content");
     putarray(w);
     for (iz i = beg; i < end; i++) {
-        Msg *m = &h[i];
-        if (!m->imgb64.len) {
-            if (m->imgalt.len) {
+        Msg  *m = &h[i];
+        Arena t = tmp;
+        if (m->imgb64.len) {
+            putobject(w);
+            putstrkey(w, "type", "text");
+            Str what = m->imgread ? Str("The image read by tool call ")
+                                  : Str("The screenshot of tool call ");
+            putstrkey(w, "text", concat(&t, concat(&t, what, m->callid), ":"));
+            putend(w);
+            putobject(w);
+            putstrkey(w, "type", "image_url");
+            putkey(w, "image_url");
+            putobject(w);
+            putkey(w, "url");
+            putb64(w, t, m->imgmime.len ? m->imgmime : Str("image/png"), m->imgb64);
+            putend(w);
+            putend(w);
+        } else if (m->imgalt.len) {
+            putobject(w);
+            putstrkey(w, "type", "text");
+            putstrkey(w, "text", m->imgalt);
+            putend(w);
+        }
+        for (iz k = 0; m->role==ROLE_TOOL && k<m->images.len; k++) {
+            // Each of several, after a caption naming it
+            MsgImage *g  = &m->images[k];
+            Arena     tk = t;
+            putobject(w);
+            putstrkey(w, "type", "text");
+            putstrkey(w, "text", g->b64.len ? toolimagecaption(&tk, m, k) : imagealt(g));
+            putend(w);
+            if (g->b64.len) {
                 putobject(w);
-                putstrkey(w, "type", "text");
-                putstrkey(w, "text", m->imgalt);
+                putstrkey(w, "type", "image_url");
+                putkey(w, "image_url");
+                putobject(w);
+                putkey(w, "url");
+                putb64(w, tk, g->mime, g->b64);
+                putend(w);
                 putend(w);
             }
-            continue;
         }
-        Arena t = tmp;
-        putobject(w);
-        putstrkey(w, "type", "text");
-        Str what = m->imgread ? Str("The image read by tool call ")
-                              : Str("The screenshot of tool call ");
-        putstrkey(w, "text", concat(&t, concat(&t, what, m->callid), ":"));
-        putend(w);
-        putobject(w);
-        putstrkey(w, "type", "image_url");
-        putkey(w, "image_url");
-        putobject(w);
-        putkey(w, "url");
-        Str url = concat(&t, "\"data:image/png;base64,", m->imgb64);
-        putraw(w, concat(&t, url, "\""));  // base64 needs no escapes
-        putend(w);
-        putend(w);
     }
     putend(w);
     putend(w);

@@ -4,6 +4,8 @@ output, structural variants of it, and hand-made oddities and damage.
 
     $ uv run tests/pdfcorpus.py OUT
     $ prospero eval -m MODEL -o pdf.jsonl OUT/eval
+    $ uv run tests/pdfcorpus.py --seeds SEEDS OUT
+
 
 OUT gets pdfs/ (the corpus), manifest.json (what each file is, what a
 reader should make of it, and facts only its content states), and
@@ -16,6 +18,13 @@ missing: pdflatex, xelatex and lualatex (TeX Live), Google Chrome
 (headless printing), cupsfilter (macOS Quartz), Ghostscript, qpdf, and
 tesseract through Ghostscript's pdfocr8. Poppler's pdftotext and pdfinfo
 check every file after (--check). Python's standard library only.
+
+With --seeds, it writes seeds for the PDF fuzz target (src/main_fuzz.cpp)
+into SEEDS from the corpus in OUT, building it first if OUT has no
+manifest.json: each file of 64 KiB or less, each file's qpdf --qdf form
+with streams uncompressed when that fits (its first page alone when the
+whole does not), so that AFL++ mutates structure rather than DEFLATE,
+and small hostile and one-filter files made here. Run afl-cmin on them.
 
 Facts are made-up words and numbers, seeded by file name, so no model
 knows them beforehand and no two files share them.
@@ -451,8 +460,9 @@ def article_tex(c, name, fontenc=None):
     (w0, n0), (w1, n1), (w2, n2), (w3, n3) = c.facts(name)
     lig = ligword(name)
     enc = f"\\usepackage[{fontenc}]{{fontenc}}\n" if fontenc else ""
-    tex = rf"""\documentclass[11pt]{{article}}
-{enc}\usepackage{{multicol}}
+    tex = rf"""\documentclass[11pt,letterpaper]{{article}}
+{enc}\usepackage[letterpaper,pass]{{geometry}}  % the PDF too, A4 or not by default
+\usepackage{{multicol}}
 \usepackage{{booktabs}}
 \pagestyle{{plain}}
 \begin{{document}}
@@ -546,8 +556,8 @@ def producers(c):
         c.skip("pdflatex documents", "pdflatex not found")
     if have("lualatex") and c.wanted("lualatex-article"):
         src, qs = article_tex(c, "lualatex-article")
-        src = src.replace(r"\documentclass[11pt]{article}",
-                          "\\documentclass[11pt]{article}\n\\usepackage{fontspec}")
+        src = src.replace(r"\documentclass[11pt,letterpaper]{article}",
+                          "\\documentclass[11pt,letterpaper]{article}\n\\usepackage{fontspec}")
         data = tex(c, "lualatex", "lualatex-article", src)
         c.add("lualatex-article", data, "producer", "LuaLaTeX article: OpenType "
               "Latin Modern as CID fonts (Identity-H) with ToUnicode", pages=3,
@@ -558,8 +568,8 @@ def producers(c):
         chrome(c)
     else:
         c.skip("Chrome documents", "Google Chrome not found")
-    if have("cupsfilter") and c.wanted("quartz-text"):
-        quartz(c)
+    if sys.platform == "darwin" and have("cupsfilter") and c.wanted("quartz-text"):
+        quartz(c)  # CUPS elsewhere has cupsfilter too, but not Quartz
     if have("gs"):
         postscript(c)
         if "article" in base:
@@ -572,7 +582,8 @@ def producers(c):
 def unicode_tex(c):
     name = "xelatex-scripts"
     (w0, n0), (w1, n1), (w2, n2), (w3, n3) = c.facts(name)
-    src = rf"""\documentclass[12pt]{{article}}
+    src = rf"""\documentclass[12pt,letterpaper]{{article}}
+\usepackage[letterpaper,pass]{{geometry}}
 \usepackage{{fontspec}}
 \setmainfont{{Times New Roman}}
 \newfontfamily\jp{{Hiragino Mincho ProN}}
@@ -594,7 +605,14 @@ Arabic: {{\ar\beginR الرمز هو \beginL{n3}\endL\endR}}
 German: Die Straße heißt Größenweg, Hausnummer {w1}.
 \end{{document}}
 """
-    data = tex(c, "xelatex", name, src)
+    try:
+        data = tex(c, "xelatex", name, src)
+    except RuntimeError as e:
+        if "cannot be found" not in str(e):
+            raise
+        # Its fonts are macOS's own (Times New Roman, Hiragino, Arial Hebrew)
+        c.skip(name, "a font it uses is not installed")
+        return
     qs = [("What room number does the Japanese sentence give?", [num(n0)]),
           ("What number does the Russian sentence give as the warehouse password?",
            [num(n1)]),
@@ -769,6 +787,7 @@ def scans(c, article, qs):
     (CCITT G4, by Ghostscript's pdfwrite)."""
     d = os.path.join(c.work, "scans")
     os.makedirs(d, exist_ok=True)
+    pics = [(q[0], q[1], "image") for q in qs]  # only the pixels hold it
     src = os.path.join(d, "article.pdf")
     with open(src, "wb") as f:
         f.write(article)
@@ -778,7 +797,7 @@ def scans(c, article, qs):
         with open(out, "rb") as f:
             c.add("scan-image", f.read(), "scan", "The article as page images "
                   "only (Flate RGB, 150 dpi): no text at all", expect="images", pages=3,
-                  questions=qs, producer="gs pdfimage24")
+                  questions=pics, producer="gs pdfimage24")
     if c.wanted("scan-ocr"):
         out = os.path.join(d, "ocr.pdf")
         try:
@@ -790,7 +809,7 @@ def scans(c, article, qs):
                       pages=3, questions=qs, producer="gs pdfocr8")
         except RuntimeError as e:
             c.skip("scan-ocr", str(e).splitlines()[0])
-    if c.wanted("scan-ccitt"):
+    if c.wanted("scan-ccitt") or c.wanted("scan-ccitt-g3"):
         pbm = os.path.join(d, "page.pbm")
         gs("-sDEVICE=pbmraw", "-r200", "-dFirstPage=1", "-dLastPage=1",
            f"-sOutputFile={pbm}", src)
@@ -804,14 +823,30 @@ def scans(c, article, qs):
         tmp = os.path.join(d, "mono.pdf")
         with open(tmp, "wb") as f:
             f.write(doc.write(root))
-        out = os.path.join(d, "ccitt.pdf")
-        gs("-sDEVICE=pdfwrite", "-dEncodeMonoImages=true",
-           "-dMonoImageFilter=/CCITTFaxEncode", "-dAutoFilterMonoImages=false",
-           f"-sOutputFile={out}", tmp)
-        with open(out, "rb") as f:
-            c.add("scan-ccitt", f.read(), "scan", "The article's first page as a "
-                  "black and white scan, CCITT G4 encoded: no text", expect="images",
-                  pages=1, questions=qs[:1] + qs[3:4], producer="gs pdfwrite")
+        if c.wanted("scan-ccitt"):
+            out = os.path.join(d, "ccitt.pdf")
+            gs("-sDEVICE=pdfwrite", "-dEncodeMonoImages=true",
+               "-dMonoImageFilter=/CCITTFaxEncode", "-dAutoFilterMonoImages=false",
+               f"-sOutputFile={out}", tmp)
+            with open(out, "rb") as f:
+                c.add("scan-ccitt", f.read(), "scan", "The article's first page as a "
+                      "black and white scan, CCITT G4 encoded: no text", expect="images",
+                      pages=1, questions=pics[:1] + pics[3:4], producer="gs pdfwrite")
+        if c.wanted("scan-ccitt-g3"):
+            # The same, G3 1-D (K 0) by the distiller parameter
+            out = os.path.join(d, "ccitt-g3.pdf")
+            gs("-sDEVICE=pdfwrite", "-dEncodeMonoImages=true",
+               "-dMonoImageFilter=/CCITTFaxEncode", "-dAutoFilterMonoImages=false",
+               f"-sOutputFile={out}", "-c",
+               "<< /MonoImageDict << /K 0 >> >> setdistillerparams", "-f", tmp)
+            with open(out, "rb") as f:
+                data = f.read()
+            if b"/K 0" not in data and b"/K -1" in data:
+                raise RuntimeError("gs wrote G4 for scan-ccitt-g3, not G3")
+            c.add("scan-ccitt-g3", data, "scan", "The article's first page as a "
+                  "black and white scan, CCITT G3 1-D encoded (K 0): no text",
+                  expect="images", pages=1, questions=pics[:1] + pics[3:4],
+                  producer="gs pdfwrite")
 
 
 def readpnm(path):
@@ -1348,9 +1383,10 @@ def oddities(c):
 # Files a reader should refuse, or give up on cleanly
 
 def hostile(c):
-    def keep(name, data, about, expect="bounded"):
+    def keep(name, data, about, expect="bounded", questions=()):
         if c.wanted(name):
-            c.add(name, data, "hostile", about, expect=expect, producer="pdfcorpus")
+            c.add(name, data, "hostile", about, expect=expect, producer="pdfcorpus",
+                  questions=questions)
 
     keep("not-pdf-html", b"<!doctype html><title>Not a PDF</title><p>Saved as .pdf.\n",
          "An HTML page named .pdf", expect="refuse")
@@ -1392,7 +1428,9 @@ def hostile(c):
     cs = [k for k, v in d.objs.items() if isinstance(v, tuple)][0]
     d.objs[cs] = (b"/Filter /FlateDecode", bytes(bomb))
     keep("flate-bomb", d.write(root), f"A content stream of {len(bomb)} bytes "
-         "that inflates to over 1 GiB")
+         "that inflates to over 1 GiB", expect="text", questions=[
+             ("What does the page say, and is all of it read?",
+              ["Before the bomb", "rest of this page is not shown"])])
 
     d, root = simple([text(["An object stream that contains itself."])], version="1.5")
     n = d.new()
@@ -1750,14 +1788,116 @@ def check(c):
               f"text={chk.get('text_chars', 0):<7} answers={flags}")
 
 
+SEEDMAX = 64 << 10  # the fuzz target's largest input
+
+
+def seeds(out, dst):
+    """Fuzz seeds from the corpus in out, into dst."""
+    os.makedirs(dst, exist_ok=True)
+    with open(os.path.join(out, "manifest.json")) as f:
+        entries = json.load(f)["files"]
+    n = 0
+
+    def put(name, data):
+        nonlocal n
+        if len(data) <= SEEDMAX:
+            with open(os.path.join(dst, name), "wb") as f:
+                f.write(data)
+            n += 1
+            return True
+        # Corpus files may be too large, but a hand-made seed must fit
+        assert not name.startswith("seed-"), f"{name}: {len(data)} bytes, over SEEDMAX"
+        return False
+
+    tmp = tempfile.mkdtemp()
+    try:
+        for e in entries:
+            src = os.path.join(out, e["file"])
+            with open(src, "rb") as f:
+                put(e["name"] + ".pdf", f.read())
+            if not have("qpdf"):
+                continue
+            # qpdf exits 3 for warnings, as damaged files give, its
+            # output still written
+            qdf = os.path.join(tmp, e["name"] + ".qdf.pdf")
+            for pages in ([], ["--pages", ".", "1", "--"]):
+                p = subprocess.run(["qpdf", "--qdf", "--object-streams=disable",
+                                    "--stream-data=uncompress", src, *pages, qdf],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if p.returncode in (0, 3) and os.path.exists(qdf):
+                    with open(qdf, "rb") as f:
+                        if put(e["name"] + (".qdf1" if pages else ".qdf") + ".pdf", f.read()):
+                            break
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    if not have("qpdf"):
+        print("  qpdf not found: no --qdf forms", flush=True)
+
+    # Hostile files shrunk to fit: a bomb of 32 MiB, nesting 30000 deep,
+    # 200 pages of a word each
+    z = zlib.compressobj(9)
+    bomb = bytearray(z.compress(text(["Before the bomb."])))
+    for _ in range(32):
+        bomb += z.compress(b" " * (1 << 20))
+    bomb += z.compress(text(["After the bomb."], y=680)) + z.flush()
+    d, root = simple([b""])
+    cs = [k for k, v in d.objs.items() if isinstance(v, tuple)][0]
+    d.objs[cs] = (b"/Filter /FlateDecode", bytes(bomb))
+    put("seed-bomb.pdf", d.write(root))
+    d, root = simple([text(["Deep."]) + b"\n" + b"[" * 30000 + b"]" * 30000])
+    put("seed-deep.pdf", d.write(root))
+    d, root = simple([text(["Dicts."])])
+    deep = d.add(b"<< /A " * 4000 + b"1" + b" >>" * 4000)
+    d.objs[root] = d.objs[root].replace(b" >>", f" /Deep {deep} 0 R >>".encode())
+    put("seed-deepdict.pdf", d.write(root))
+    d, root = simple([pdfstr(WORDS[i % len(WORDS)]) + b" Tj" for i in range(200)])
+    put("seed-pages.pdf", d.write(root))
+
+    # One filter each, or a chain, over a page of text
+    page = text([" ".join(WORDS[i:i + 8]) for i in range(0, 64, 8)])
+    for name, fl in [("lzw", ["LZWDecode"]), ("ahx", ["ASCIIHexDecode"]),
+                     ("a85", ["ASCII85Decode"]), ("rl", ["RunLengthDecode"]),
+                     ("flate", ["FlateDecode"]), ("chain", ["ASCII85Decode", "LZWDecode"])]:
+        d, root = simple([b""])
+        cs = [k for k, v in d.objs.items() if isinstance(v, tuple)][0]
+        d.objs[cs] = d.stream(b"", page, fl)
+        put(f"seed-{name}.pdf", d.write(root))
+    d, root = simple([b""])
+    cs = [k for k, v in d.objs.items() if isinstance(v, tuple)][0]
+    d.objs[cs] = (b"/Filter /LZWDecode /DecodeParms << /EarlyChange 0 >>", lzw(page, 0))
+    put("seed-lzw0.pdf", d.write(root))
+
+    # Object and xref streams, as qpdf makes them, over a small file
+    if have("qpdf"):
+        d, root = simple([text(["Object streams."]), text(["Page two."])], version="1.5")
+        src = os.path.join(tmp, "small.pdf")
+        os.makedirs(tmp, exist_ok=True)
+        with open(src, "wb") as f:
+            f.write(d.write(root))
+        for name, args in [("objstm", ["--object-streams=generate"]),
+                           ("objstm-plain", ["--object-streams=generate",
+                                             "--compress-streams=n"])]:
+            dst2 = os.path.join(tmp, name + ".pdf")
+            if subprocess.run(["qpdf", *args, src, dst2]).returncode in (0, 3):
+                with open(dst2, "rb") as f:
+                    put(f"seed-{name}.pdf", f.read())
+        shutil.rmtree(tmp, ignore_errors=True)
+    print(f"{n} seeds in {dst}", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("out", help="the directory to build in")
     ap.add_argument("--only", action="append", help="build only names matching "
                     "this regex (repeatable)")
     ap.add_argument("--no-check", action="store_true", help="skip the Poppler check")
+    ap.add_argument("--seeds", metavar="DIR", help="write fuzz seeds into DIR from "
+                    "the corpus in OUT, building it first if it is not there")
     args = ap.parse_args()
     out = os.path.abspath(args.out)
+    if args.seeds and os.path.exists(os.path.join(out, "manifest.json")):
+        seeds(out, args.seeds)
+        return
     shutil.rmtree(os.path.join(out, "pdfs"), ignore_errors=True)
     c = Corpus(out, args.only)
     print("producers")
@@ -1785,6 +1925,8 @@ def main():
     with open(os.path.join(out, "manifest.json"), "w") as f:
         json.dump({"files": c.entries, "skipped": c.skipped}, f, indent=1, ensure_ascii=False)
     print(f"{len(c.entries)} files in {c.pdfs}; manifest.json; {len(c.skipped)} skipped")
+    if args.seeds:
+        seeds(out, args.seeds)
 
 
 if __name__ == "__main__":

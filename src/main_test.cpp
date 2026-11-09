@@ -83,8 +83,11 @@ static void os_arenafault(Str msg)
 }
 
 // Reservations come from the C heap, with commits only bookkeeping.
+static i64 g_reserves;  // os_reserve calls, for tests that count them
+
 static Region *os_reserve(Os *, iz cap)
 {
+    g_reserves++;
     byte *p = (byte *)malloc((uz)cap);
     if (!p) {
         return 0;
@@ -231,8 +234,17 @@ static Listing os_listall(Os *os, Arena *a, Str path, b32 dirs, iz max)
     return r;
 }
 
-static Stat os_stat(Os *os, Arena, Str path)
+// Like the platforms' (cstr, widepath), it first writes
+// the path out in scratch, wide as on Windows, so that a path in the
+// scratch's own free space, from a copy of an arena taken before the
+// path went in it, comes out mangled, as it would there.
+static Stat os_stat(Os *os, Arena scratch, Str path)
 {
+    u8 *wide = alloc<u8>(&scratch, 2*path.len+2);
+    for (iz i = 0; i < path.len; i++) {
+        wide[2*i+0] = path[i];
+        wide[2*i+1] = 0;
+    }
     Stat   s = {};
     VFile *f = vfind(os, path, 0);
     if (f && f->exists) {
@@ -645,6 +657,9 @@ static Str istr(Arena *a, i64 v)
 #include "test/image_test.cpp"  // after deskhelp.cpp: dkpng
 #include "test/zip_test.cpp"
 #include "test/pdf_test.cpp"
+#include "test/pdfenc_test.cpp"
+#include "test/pdfimage_test.cpp"  // after image_test.cpp: fxbaseline, imgdiff
+#include "test/pdftext_test.cpp"   // after pdf_test.cpp: pdfbuild
 #include "test/delta_test.cpp"
 #include "test/relay_test.cpp"  // after config's test platform
 #include "test/term_test.cpp"
@@ -733,6 +748,17 @@ int main()
     test_image(&t);
     test_zip(&t);
     test_pdf(&t);
+    test_pdfreader(&t);
+    test_pdffilters(&t);
+    test_pdfdocument(&t);
+    test_pdfenc(&t);
+    test_pdfimage(&t);
+    test_pdftext(&t);
+    test_pdftextsweep(&t);
+    test_pdflayout(&t);
+    test_pdfbudget(&t);
+    test_pdfshow(&t);
+    test_pdfshowbig(&t);
     test_delta(&t);
     test_relay(&t);
     test_term(&t);

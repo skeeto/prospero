@@ -358,7 +358,8 @@ static void testlogimport(Test *t)
         "\"snap\":\"snap/1\"}\n"
         "{\"sid\":\"A\",\"seq\":9,\"ts\":8,\"ev\":\"tool.end\",\"call\":\"c1\",\"text\":\"t\","
         "\"spill\":\"../../x\",\"bytes\":3,\"image\":\"../../x\",\"width\":1,\"height\":1,"
-        "\"shot\":\"s\",\"child\":\"K\",\"job\":2,\"to\":\"K2\",\"to_title\":\"T\","
+        "\"shot\":\"s\",\"images\":[{\"name\":\"../x\",\"mime\":\"image/png\"}],"
+        "\"pdf\":\"../y\",\"pages\":2,\"child\":\"K\",\"job\":2,\"to\":\"K2\",\"to_title\":\"T\","
         "\"ms\":4}\n"
         "{\"sid\":\"B\",\"seq\":10,\"ts\":8,\"ev\":\"user\",\"text\":\"other\"}\n"
         "{\"sid\":\"A\",\"seq\":11,\"ts\":8,\"ev\":\"rewind\",\"undone\":[\"snap/1\"]}\n"
@@ -678,7 +679,7 @@ static void test_events(Test *t)
                "\"git\",\"answer.trust\",\"web\",\"question\",\"files\",\"worktree\",\"worktree.side\","
                "\"trash\",\"relay\",\"question.deadline\",\"ask.deadline\",\"shell.env\",\"call.stop\","
                "\"cut\",\"approve\",\"files.path\",\"sessions.mention\",\"fork.cwd\",\"endpoint.auth\",\"endpoint.copilot\","
-               "\"term\"]}");
+               "\"term\",\"pdf\"]}");
         b.len = 0;
         w = {&b};
         putobject(&w);

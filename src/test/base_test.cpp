@@ -44,6 +44,13 @@ static void test_base(Test *t)
         expect(t, "arena.nofit", istr(&a, fits(&g, 4*mb)), "0");
         Arena fixed = {g.beg, g.beg+10};
         expect(t, "arena.fixed", istr(&a, fits(&fixed, 11)), "0");
+
+        // A request ending exactly at the reservation's limit is refused
+        // by arenagrow, so fits must refuse it too.
+        allocbytes(&g, r->cap - (g.beg - r->base) - 100);
+        expect(t, "arena.exact", istr(&a, fits(&g, 100)), "0");
+        expect(t, "arena.nearly", istr(&a, fits(&g, 99)), "1");
+        allocbytes(&g, 99);
         os_release(os, r);
     }
 

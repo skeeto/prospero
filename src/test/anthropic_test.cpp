@@ -95,6 +95,42 @@ static void test_anthropic(Test *t)
 {
     Arena *a = &t->perm;
 
+    // An attached PDF's images, labelled, each after a caption naming it;
+    // one with no label, or not sent, has none
+    {
+        ModelConf mc = {};
+        mc.name = "m";
+        MsgImage g[3] = {};
+        g[0].mime  = "image/png";
+        g[0].b64   = "QUJD";
+        g[0].label = "image 3 (page 2) of x.pdf";
+        g[1].mime  = "image/jpeg";
+        g[1].b64   = "REVG";
+        g[2].mime  = "image/png";
+        g[2].label = "image 4 (page 2) of x.pdf";
+        g[2].alt   = "[image lost: img/3.png, its file could not be read]";
+        Msg h[1] = {};
+        h[0].role   = ROLE_USER;
+        h[0].text   = "look";
+        h[0].images = {g, 3, 3};
+        ChatReq r = {};
+        r.mc      = &mc;
+        r.tools   = "[]";
+        r.history = {h, 1, 1};
+        Arena tmp = *a;
+        tmp.beg  += (tmp.end - tmp.beg)/2;
+        Str  one  = anencode(a, tmp, &r);
+        Str  rest = cuthead(one, find(one, "\"messages\""));
+        expect(t, "user image captions", takehead(rest, find(rest, ",\"tools\"")),
+               "\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":"
+               "\"Image 3 (page 2) of x.pdf:\"},{\"type\":\"image\",\"source\":{\"type\":"
+               "\"base64\",\"media_type\":\"image/png\",\"data\":\"QUJD\"}},{\"type\":\"image\","
+               "\"source\":{\"type\":\"base64\",\"media_type\":\"image/jpeg\",\"data\":\"REVG\"}},"
+               "{\"type\":\"text\",\"text\":\"[image lost: img/3.png, its file could not be "
+               "read]\"},{\"type\":\"text\",\"text\":\"look\",\"cache_control\":{\"type\":"
+               "\"ephemeral\"}}]}]");
+    }
+
     // Requests: the history merged into alternating messages, reasoning
     // verbatim where it may go, and four breakpoints
     {

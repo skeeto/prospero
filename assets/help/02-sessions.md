@@ -126,12 +126,19 @@ or pick them with the paper clip. Images go to a model that takes
 them, as pictures. Any other file goes as text, as `read` shows it:
 numbered lines, the first 2000 or so, then a note to read on. The
 session keeps a copy in its own folder, so the agent can read the rest
-without asking. A binary file (one with a NUL byte) is refused. The
-transcript shows a folded "Attached:" line under the message.
+without asking. A PDF goes as its text, extracted, a `--- page N ---`
+line starting each page; the session keeps the PDF beside it, and a
+model that takes images also gets the pictures on the pages it is shown,
+as the message's own (at most ten images to a message). An encrypted
+PDF is refused, and so is any other binary file (one with a NUL byte).
+The transcript shows a folded "Attached:" line under the message.
 
 On an Anthropic endpoint the agent's `read` shows it a PDF whole, its
-text and an image of each page; other models are told only what the
-file is, and can extract its text with the shell.
+text and an image of each page. Other models, and a PDF too long to
+send whole, get its text, extracted, a `--- page N ---` line starting
+each page, read on 2000 lines at a time; a model that takes images
+also sees the pictures on the pages it reads, a scan's pages included.
+An encrypted PDF is refused.
 
 `@` in the prompt mentions a file or folder instead: a picked file's text is
 attached too, and the path stays in the message, so the agent can read the

@@ -561,6 +561,12 @@ if(NOT CMAKE_CROSSCOMPILING OR PROSPERO_CROSS_TESTS)
       add_test(NAME signcheck COMMAND ${UV} run
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/signcheck.py)
     endif()
+    # The built-in PDF reader over a corpus of generated PDFs, built once
+    # into the build tree (tests/pdfcorpus.py), skipped without pdflatex
+    add_test(NAME pdfcorpus COMMAND ${UV} run
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/pdfcheck.py --prospero $<TARGET_FILE:prospero>
+      --build ${CMAKE_BINARY_DIR})
+    set_tests_properties(pdfcorpus PROPERTIES SKIP_RETURN_CODE 77)
     # The sources, for one arena given to a call twice: as the place for
     # its results and, by value, as its scratch
     add_test(NAME arenalint COMMAND ${UV} run

@@ -1324,6 +1324,11 @@ static void test_viewpanels(Test *t)
                "Attached: a.txt, b_c.md1");
         apply(v, a, R"({"sid":"s","seq":2,"ts":0,"ev":"user","via":"prompt","text":"none"})");
         expect(t, "panels.nofiles", istr(&a, v->msgs.len), "3");
+        // A PDF's text is named as the PDF; a name too short is no crash
+        apply(v, a, R"({"sid":"s","seq":3,"ts":0,"ev":"user","via":"prompt","text":"pdf",)"
+                    R"("files":[{"name":"files/3-r.pdf.txt","bytes":9,"lines":2},)"
+                    R"({"name":"f","bytes":1,"lines":1}]})");
+        expect(t, "panels.pdfnote", v->msgs[v->msgs.len-1].label, "Attached: r.pdf, ");
     }
 
     // Instruction files, each once as last told; a task's report as

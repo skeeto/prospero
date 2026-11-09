@@ -369,7 +369,9 @@ static CfgKey cfgschema[] = {
      "image files read"},
     {"model", "pdf", CFG_BOOL, "true", {}, {}, "model",
      "Whether read sends a PDF to the model as a document, its text and "
-     "its pages' images (only on an endpoint of kind anthropic)"},
+     "its pages' images, on an endpoint of kind anthropic (not copilot, "
+     "even on the anthropic wire); else, or when off, read shows its text, "
+     "extracted, and the images on its pages"},
     {"model", "coordinates", CFG_ENUM, "pixels", {}, "pixels norm1000", "model",
      "How the model gives points in a screenshot: pixels of the image it "
      "was sent, or norm1000, thousandths of its width and height (Qwen-VL, "
