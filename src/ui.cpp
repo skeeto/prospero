@@ -395,10 +395,15 @@ static i32 uikeysup()
 // chords exactly, so Shift is let go around a press of V in the queued
 // input, before the frame reads it. The V's release follows at once,
 // on the next frame (trickled), and the real one finds V already up.
-static void uishiftpaste()
+// The terminal, holding the keyboard since last frame, pastes with
+// Ctrl+Shift+V as itself, its Ctrl+V being ^V.
+static void uishiftpaste(Gui *g)
 {
     ImGuiContext &c     = *GImGui;
     ImGuiIO      &io    = c.IO;
+    if (c.ActiveId && c.ActiveId==g->termid) {
+        return;
+    }
     b32           ctrl  = io.KeyCtrl;
     b32           shift = io.KeyShift;
     b32           other = io.KeyAlt || io.KeySuper;

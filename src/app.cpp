@@ -12269,7 +12269,7 @@ static void gui_frame(Gui *g)
         // the mouse is elsewhere: the script's mouse is the one
         io.AddMousePosEvent(g->drivex, g->drivey);
     }
-    uishiftpaste();
+    uishiftpaste(g);
     ImGui::NewFrame();
     i64 t1 = os_ticks(g->os);
     dockwindows(g);
