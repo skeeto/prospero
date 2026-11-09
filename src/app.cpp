@@ -15564,6 +15564,17 @@ static DriveOp settingsops[] = {
     {OP_CHECK, CHK_DARK, 0, 0, 0, ""},
     {OP_MOVE, T_EMPTY, 0, 0, 1000, ""},
     {OP_SHOT, 0, 0, 0, 500, "dark"},
+    // The session bar's toggles, Shell output on, Tool output off under
+    // the mouse, then Shell output on under it, each with its tooltip
+    {OP_MOVE, T_SHELLBTN, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 400, ""},
+    {OP_MOVE, T_TOOLSBTN, 0, 0, 1500, ""},
+    {OP_SHOT, 0, 0, 0, 300, "dark-toggle-off"},
+    {OP_MOVE, T_SHELLBTN, 0, 0, 1500, ""},
+    {OP_SHOT, 0, 0, 0, 300, "dark-toggle-on"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 400, ""},
     {OP_SNAPCFG, 0, 0, 0, 100, ""},
     {OP_MOVE, T_THEMECOMBO, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -15576,6 +15587,17 @@ static DriveOp settingsops[] = {
     {OP_CHECK, CHK_TITLEBAR, 0, 0, 0, ""},
     {OP_MOVE, T_EMPTY, 0, 0, 1000, ""},
     {OP_SHOT, 0, 0, 0, 500, "light"},
+    // The session bar's toggles, Shell output on, Tool output off under
+    // the mouse, then Shell output on under it, each with its tooltip
+    {OP_MOVE, T_SHELLBTN, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 400, ""},
+    {OP_MOVE, T_TOOLSBTN, 0, 0, 1500, ""},
+    {OP_SHOT, 0, 0, 0, 300, "light-toggle-off"},
+    {OP_MOVE, T_SHELLBTN, 0, 0, 1500, ""},
+    {OP_SHOT, 0, 0, 0, 300, "light-toggle-on"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 400, ""},
     // A configured theme stays when the system's changes: no frames
     {OP_MARK, 0, 0, 0, 0, ""},
     {OP_SYSTHEME, 0, 1, 0, 1000, ""},

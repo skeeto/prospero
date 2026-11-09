@@ -47,6 +47,8 @@ struct Palette {
     u32 btn;        // buttons: at rest, under the mouse, pressed
     u32 btnhover;
     u32 btnpress;
+    u32 btnon;      // a toggle that is on, and it under the mouse: a toggle
+    u32 btnonhover; // that is off has no fill, so on stands out from it
     u32 bar;        // progress bars, under paneltext
     // The transcript, on panel
     u32 text;
@@ -98,6 +100,8 @@ static Palette themedark = {
     .btn       = rgb( 36,  69, 110),
     .btnhover  = rgb( 46,  88, 140),
     .btnpress  = rgb( 30,  62, 104),
+    .btnon     = rgb( 24,  98, 184),
+    .btnonhover= rgb( 36, 112, 204),
     .bar       = rgb( 52,  96, 170),
     .text      = rgb(222, 222, 222),
     .dim       = rgb(160, 170, 190),
@@ -159,6 +163,8 @@ static Palette themelight = {
     .btn       = rgb(176, 206, 244),
     .btnhover  = rgb(150, 190, 244),
     .btnpress  = rgb(124, 172, 236),
+    .btnon     = rgb(100, 160, 240),
+    .btnonhover= rgb( 84, 144, 228),
     .bar       = rgb(150, 190, 240),
     .text      = rgb( 32,  33,  36),
     .dim       = rgb( 80,  88, 100),

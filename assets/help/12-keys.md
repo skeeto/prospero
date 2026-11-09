@@ -29,7 +29,8 @@ except Ctrl+G in the prompt box, which is Ctrl there too.
   output (the Tool output button above the transcript, a wrench and
   screwdriver).
 - **Ctrl+Shift+R**: show, or fold again, all of its reasoning (the
-  Reasoning button, a light bulb).
+  Reasoning button, a light bulb). Each of these three buttons is
+  filled while it is on, and its tooltip says whether it is.
 - **Ctrl+1** to **Ctrl+9**: a layout, as View → Layout lists them:
   Standard, Compact, Focus, then those you saved.
 - **Ctrl+=** and **Ctrl+-** zoom the text in and out, and **Ctrl+0**

@@ -1661,6 +1661,22 @@ static b32 iconbutton(char const *label, b32 on = 0)
     return r;
 }
 
+// An icon that toggles: flat with a dim icon while off, filled (btnon)
+// with a bright one while on, and still filled under the mouse, so its
+// state shows in either theme, hovered or not. Off, the mouse brings a
+// row's faint fill, not a button's, which would look on.
+static b32 togglebutton(Gui *g, char const *label, b32 on)
+{
+    Palette *p = g->pal;
+    ImGui::PushStyleColor(ImGuiCol_Text, on ? p->paneltext : p->paneldim);
+    ImGui::PushStyleColor(ImGuiCol_Button, on ? p->btnon : 0);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, on ? p->btnonhover : p->rowhover);
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, on ? p->btnonhover : p->rowpress);
+    b32 r = ImGui::Button(label, v2(iconw(), 0));
+    ImGui::PopStyleColor(4);
+    return r;
+}
+
 struct MsgAction {
     i32         kind;
     char const *label;
@@ -3288,8 +3304,9 @@ static void goup(Gui *g, GuiSession *s)
 }
 
 // A line above the transcript: up to a subagent's parent, or a side
-// chat's original; its branch, context gauge, the toggles that open all
-// its tool output and reasoning, and its details in a popup. Its model,
+// chat's original; its branch, context gauge, the toggles that fold all
+// its shell output and open its tool output and reasoning, and its
+// details in a popup. Its model,
 // shell and mode are the Prompt's (drawsesspicks).
 static void drawsessbar(Gui *g)
 {
@@ -3305,7 +3322,7 @@ static void drawsessbar(Gui *g)
     char const *sl    = ICON_SHELL;      // Shell output
     char const *tl    = ICON_TOOLS;      // Tool output
     char const *rl    = ICON_LIGHTBULB;  // Reasoning
-    f32         rest  = (gw>0 ? gw + gap : 0) + 4*iconw() + 3*gap;
+    f32         rest  = (gw>0 ? gw + gap : 0) + 4*iconw() + 4*gap;
     b32         lead  = 0;  // something on the line before the branch
     f32         right = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - rest;
     if (sessparent(s).len || sessside(s).len) {
@@ -3367,28 +3384,35 @@ static void drawsessbar(Gui *g)
         drawgauge(g, v, gw);
         ImGui::SameLine();
     }
-    if (iconbutton(sl, v->foldshell)) {
+    if (togglebutton(g, sl, v->foldshell)) {
         setsessionshell(g, s, !v->foldshell);
     }
     itemrect(g, RECT_SHELLBTN);
-    itemtip("Shell output: fold every shell command's output in this session, "
-                          "or show it again as the settings say (%s)", shortcutname(g, 2));
+    itemtip("Shell output: %s\n\nFold every shell command's output in this session, "
+            "or show it again as the settings say (%s)",
+            v->foldshell ? "on, all of it folded" : "off, as the settings say",
+            shortcutname(g, 2));
     ImGui::SameLine();
-    if (iconbutton(tl, v->showtools)) {
+    if (togglebutton(g, tl, v->showtools)) {
         setsessiontools(g, s, !v->showtools);
     }
     itemrect(g, RECT_TOOLSBTN);
-    itemtip("Tool output: open every tool row's output in this session, "
-                          "or fold them again as the settings say (%s)", shortcutname(g, 0));
+    itemtip("Tool output: %s\n\nOpen every tool row's output in this session, "
+            "or fold them again as the settings say (%s)",
+            v->showtools ? "on, all of it open" : "off, as the settings say",
+            shortcutname(g, 0));
     ImGui::SameLine();
-    if (iconbutton(rl, v->showthink)) {
+    if (togglebutton(g, rl, v->showthink)) {
         setsessionthink(g, s, !v->showthink);
     }
     itemrect(g, RECT_THINKBTN);
-    itemtip("Reasoning: show all of it in this session, even hidden, or "
-                          "fold it again as the settings say (%s)", shortcutname(g, 1));
-    ImGui::SameLine();
-    if (iconbutton(ICON_INFO)) {
+    itemtip("Reasoning: %s\n\nShow all of it in this session, even hidden, or "
+            "fold it again as the settings say (%s)",
+            v->showthink ? "on, all of it shown" : "off, as the settings say",
+            shortcutname(g, 1));
+    // Info opens a popup, not a toggle: apart from them, filled while open
+    ImGui::SameLine(0, 2*gap);
+    if (togglebutton(g, ICON_INFO, ImGui::IsPopupOpen("##sessinfo"))) {
         ImGui::OpenPopup("##sessinfo");
     }
     itemrect(g, RECT_INFOBTN);
