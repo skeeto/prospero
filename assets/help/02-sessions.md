@@ -61,6 +61,16 @@ ends its turn meanwhile moves once the pointer leaves, never from under
 a click. A session from before Prospero kept this time starts at when
 it was made, until its next turn.
 
+Every heading folds by a click, and so does a session with subagents,
+by its arrow. An open one has a thin rail down from its arrow, beside
+what it holds: click anywhere along the rail to fold it, which brings
+its heading back into view if it had scrolled away.
+
+The pointer on a session's row shows its actions at the right:
+**Archive** (Unarchive under Archived) and **Move to Trash**, or in the
+Trash, **Restore** and **Delete Permanently**. The grip at the far right
+says the row drags: drag it, or the row anywhere, as below.
+
 ## Going to a session
 
 Session → Go to... (Ctrl+K, Cmd+K on macOS) opens a palette over the
@@ -229,10 +239,11 @@ Right-click a session in the sidebar, or open the Session menu, for:
 - **Move to group**: an existing group, New group..., or Remove from
   group. Groups head the sidebar; a group's own menu renames,
   archives, ungroups, reorders or moves it to the Trash. Or drag the
-  session, with its subagents, onto a group's heading, onto Archived
-  (shown while you drag), onto another session to join it there, below
-  the list to take it out of its group, or onto the Move to Trash strip
-  at the foot of the sidebar. Escape cancels a drag. A session never moves
+  session, with its subagents, onto a group's heading, onto Archived,
+  onto another session to join it there, or below the list to take it
+  out of its group. While you drag, a strip at the foot of the sidebar
+  offers Archive, New group... (named as you drop it) and Move to Trash,
+  however long the list. Escape cancels a drag. A session never moves
   to another host, and dropping it never changes the sidebar's order.
 - **Fork**: a new session with a copy of this conversation, titled
   "(fork)", which starts in Build mode. A No folder session's fork gets
@@ -352,8 +363,8 @@ session, which can then review and merge its branch.
 
 ## The Trash
 
-A session moved to the Trash, by its menu, its group's, or a drag onto
-the strip at the foot of the sidebar, is kept under the Trash heading
+A session moved to the Trash, by its menu, its group's, its row's
+trash icon, or a drag onto the strip at the foot of the sidebar, is kept under the Trash heading
 for `[sessions] trash_days` (30 by default), then removed for good.
 Each row says how long it has left. It does not open there: its menu's
 **Restore** puts it back where it was, as does dragging it out onto a

@@ -7774,7 +7774,7 @@ static void droptarget(Gui *g, Arena a, GuiHost *h, Str group, b32 archived, Str
     ImVec2      m = ImGui::GetIO().MousePos;
     ImVec4      t = g->trashrect;
     if (!s || (m.x>=t.x && m.x<t.z && m.y>=t.y && m.y<t.w)) {
-        return;  // over the trash strip (dragtrash), drawn over this
+        return;  // over the drop strip (dragstrip), drawn over this
     } else if (!dropok(s, h, group, archived)) {
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) &&
                 h && h!=s->host) {
@@ -8057,6 +8057,135 @@ static b32 sessgo(Gui *g, GuiSession *s)
     return 1;
 }
 
+// A flat icon button, as a row's action: no fill until the mouse is on
+// it, its icon dim.
+static b32 rowicon(Gui *g, char const *label, Str why)
+{
+    Palette *p = g->pal;
+    ImGui::PushStyleColor(ImGuiCol_Text, p->paneldim);
+    ImGui::PushStyleColor(ImGuiCol_Button, 0);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, p->rowpress);
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, p->selrow);
+    ImGui::BeginDisabled(why.len > 0);
+    b32 r = ImGui::Button(label, v2(iconw(), 0));
+    ImGui::EndDisabled();
+    ImGui::PopStyleColor(4);
+    return r;
+}
+
+// A root's actions, at the right of its row while the pointer is on it,
+// over the end of its lines on a backdrop of the row's hover color:
+// Archive (or Unarchive) and Move to Trash (or Delete, where its host
+// keeps no Trash); in the Trash, Restore and Delete Permanently. Then a
+// grip, which says the row drags, and drags it too. Each does what its
+// context menu item does, and is left out where the row is too narrow.
+// Held, only the grip is there, unseen, as its drag's source.
+static void rowactions(Gui *g, Arena a, SideRow *r, GuiSession *s, ImVec2 r0, ImVec2 r1,
+                       b32 held)
+{
+    f32         sc   = g->scale;
+    ImDrawList *dl   = ImGui::GetWindowDrawList();
+    f32         bw   = iconw();
+    f32         bh   = ImGui::GetFrameHeight();
+    f32         gap  = 2*sc;
+    b32         grip = !dragwhy(g, s).len;
+    f32         gw   = grip ? ImGui::CalcTextSize(ICON_GRIPPER).x + 8*sc : 0;
+    f32         x1   = r1.x - 2*sc;
+    f32         x0   = x1 - (2*bw + gap + gw + 4*sc);
+    f32         y    = r0.y + (r1.y - r0.y - bh)/2;
+    if (x0 - r0.x < 96*sc) {
+        return;
+    }
+    ImGuiWindow *win  = ImGui::GetCurrentWindow();
+    ImVec2       back = win->DC.CursorPos;     // put back as it was, the
+    ImVec2       maxp = win->DC.CursorMaxPos;  // actions drawn over the row
+    if (!held) {
+        f32 fadew = 18*sc;
+        u32 c     = g->pal->rowhover;
+        u32 c0    = c & ~IM_COL32_A_MASK;
+        dl->AddRectFilledMultiColor(v2(x0 - fadew, r0.y), v2(x0, r1.y), c0, c, c, c0);
+        dl->AddRectFilled(v2(x0, r0.y), r1, c);
+
+        Str                 title = sesstitle(s);
+        Slice<GuiSession *> one   = {};
+        one = push(&a, one, s);
+        ImGui::SetCursorScreenPos(v2(x0 + 4*sc, y));
+        if (r->trashed) {
+            Str why = sesswhy(g, s, "trash", 0, 1);
+            if (rowicon(g, ICON_DISCARD "##restore", why)) {
+                guitrash(g, s, 0);
+            }
+            itemnamed(g, concat(&a, "restore ", title));
+            whytip(why.len ? why : Str("Restore: back where it was, with its subagents"));
+            ImGui::SameLine(0, gap);
+            why = sesswhy(g, s, "delete", 1, 0);
+            if (rowicon(g, ICON_TRASH "##delete", why)) {
+                askdelete(g, one, {});
+            }
+            itemnamed(g, concat(&a, "delete ", title));
+            whytip(why.len ? why : Str("Delete Permanently: remove it and its subagents "
+                                       "for good now, once you confirm"));
+        } else {
+            b32 arch = s->archived;
+            Str why  = sesswhy(g, s, "archive", 0, 1);
+            if (rowicon(g, arch ? ICON_UNARCHIVE "##archive" : ICON_ARCHIVE "##archive", why)) {
+                guiarchive(g, s, !arch);
+            }
+            itemnamed(g, concat(&a, "archive ", title));
+            whytip(why.len ? why : arch ? Str("Unarchive: back among the sessions above")
+                                        : Str("Archive: under Archived, at the end of "
+                                              "the sidebar"));
+            ImGui::SameLine(0, gap);
+            b32 on = trashon(s->host);
+            why = on ? sesswhy(g, s, "trash", 1, 1) : sesswhy(g, s, "delete", 1, 0);
+            if (rowicon(g, ICON_TRASH "##trash", why)) {
+                if (on) {
+                    trashroots(g, a, one);
+                } else {
+                    askdelete(g, one, {});
+                }
+            }
+            itemnamed(g, concat(&a, "trash ", title));
+            if (why.len) {
+                whytip(why);
+            } else if (on) {
+                Buf tip(&a, 128);
+                print(&tip, "Move to Trash, with its subagents, kept ");
+                print(&tip, (i64)s->host->trashdays);
+                print(&tip, s->host->trashdays==1 ? Str(" day") : Str(" days"));
+                print(&tip, ", then removed");
+                whytip(finish(&tip));
+            } else {
+                whytip("Delete: remove it and its subagents for good, once you confirm");
+            }
+        }
+    }
+    if (grip) {
+        f32 gx = x1 - gw;
+        ImGui::SetCursorScreenPos(v2(gx, r0.y));
+        ImGui::InvisibleButton("##grip", v2(gw, r1.y - r0.y));
+        itemnamed(g, concat(&a, "grip ", sesstitle(s)));
+        if (ImGui::IsItemActive()) {
+            g->gripsess = s;
+        } else if (g->gripsess==s && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            g->gripsess = 0;
+        }
+        b32 hov = ImGui::IsItemHovered() || ImGui::IsItemActive();
+        if (hov) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
+        }
+        if (!held) {
+            itemtip("Drag it into a group, Archived or the Trash");
+            ImVec2 ts = ImGui::CalcTextSize(ICON_GRIPPER);
+            dl->AddText(v2(gx + (gw - ts.x)/2, r0.y + (r1.y - r0.y - ts.y)/2),
+                        hov ? g->pal->paneltext : g->pal->paneldim, ICON_GRIPPER);
+        }
+        dragsource(g, a, s);
+    }
+    win->DC.CursorPos    = back;
+    win->DC.CursorMaxPos = maxp;
+}
+
 static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other, i64 nowms)
 {
     f32         sc    = g->scale;
@@ -8076,6 +8205,18 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other, 
     ImVec2 r0 = ImGui::GetItemRectMin();
     ImVec2 r1 = ImGui::GetItemRectMax();
     s->row = {r0.x, r0.y, r1.x, r1.y};
+    // A root's actions show while the pointer is on its row; a held
+    // grip stays, as the source of its drag
+    b32 held = g->gripsess==s && ImGui::IsMouseDown(ImGuiMouseButton_Left);
+    b32 acts = held || (!sessparent(s).len && !sessremote(s) && !dragged() &&
+                        !g->dragcancel && ImGui::IsMouseHoveringRect(r0, r1) &&
+                        ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows |
+                                               ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) &&
+                        !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId |
+                                                ImGuiPopupFlags_AnyPopupLevel));
+    if (acts && !held && !ImGui::IsItemHovered()) {
+        dl->AddRectFilled(r0, r1, g->pal->rowhover);  // the pointer on an action
+    }
     if (!*other && s!=g->sess) {
         itemrect(g, RECT_OTHERSESS);
         *other = 1;
@@ -8216,6 +8357,9 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other, 
     if (v && gaugewidth(g, v)>0 && p.x+w-4*sc-x >= 8) {
         gaugebar(g, dl, v, x, r1.y - 3*sc, p.x + w - 4*sc - x, 2*sc, sc);
     }
+    if (acts) {
+        rowactions(g, a, r, s, r0, r1, held);
+    }
     ImGui::PopID();
 }
 
@@ -8265,11 +8409,54 @@ static ImVec4 trashstrip(Gui *g)
     return {x0, y1-h, x1, y1};
 }
 
-// While a session is dragged, the strip to drop it on, into the Trash,
-// drawn over the rows; or, where its host keeps no Trash, to delete it
-// once confirmed. The pane scrolls as a whole, so its content keeps the
-// extent it had without the strip.
-static void dragtrash(Gui *g, Arena a, GuiSession *s)
+// One part of the drop strip, at x0..x1 of its rect t: a place to drop
+// the dragged session, named for the checklist by name, unless why says
+// why not. Its label shows if it fits, else only its icon; the drag's
+// tooltip says where either way. Returns 1 as the session is dropped.
+static b32 stripdrop(Gui *g, Arena a, ImVec4 t, f32 x0, f32 x1, char const *icon,
+                     Str label, Str to, Str why, u32 color, Str name)
+{
+    f32         sc = g->scale;
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    ImGui::SetCursorScreenPos(v2(x0, t.y));
+    ImGui::InvisibleButton(cstr0(&a, concat(&a, "##", name)), v2(x1-x0, t.w-t.y));
+    itemnamed(g, name);
+    b32 over = 0;
+    b32 drop = 0;
+    if (!why.len && ImGui::BeginDragDropTarget()) {
+        ImGuiPayload const *p = ImGui::AcceptDragDropPayload(
+            "SESS", ImGuiDragDropFlags_AcceptBeforeDelivery |
+                    ImGuiDragDropFlags_AcceptNoDrawDefaultRect);
+        over = p != 0;
+        if (p) {
+            fieldput(g->droplabel, concat(&a, "\xe2\x86\x92 ", to));  // a rightwards arrow
+        }
+        drop = p && p->IsDelivery();
+        ImGui::EndDragDropTarget();
+    } else if (why.len && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem)) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_NotAllowed);
+        fieldput(g->droplabel, why);
+    }
+    u32 fill = fade(color, why.len ? 0.12f : over ? 0.55f : 0.28f);
+    dl->AddRectFilled(v2(x0, t.y), v2(x1, t.w), fill, 6*sc);
+    dl->AddRect(v2(x0, t.y), v2(x1, t.w), fade(color, why.len ? 0.3f : 0.8f), 6*sc);
+    char  *z  = cstr0(&a, concat(&a, concat(&a, Str{(u8 *)icon, (iz)__builtin_strlen(icon)}, "  "), label));
+    ImVec2 ts = ImGui::CalcTextSize(z);
+    if (ts.x > x1 - x0 - 8*sc) {
+        z  = (char *)icon;
+        ts = ImGui::CalcTextSize(z);
+    }
+    dl->AddText(v2(x0 + (x1-x0-ts.x)/2, t.y + (t.w-t.y-ts.y)/2),
+                why.len ? g->pal->dim : g->pal->text, z);
+    return drop;
+}
+
+// While a session is dragged, the strip at the pane's foot, drawn over
+// the rows, so that where it can go is always in view, however long the
+// list: Archive (or Unarchive), New group, and Move to Trash; or, where
+// its host keeps no Trash, Delete, once confirmed. The pane scrolls as a
+// whole, so its content keeps the extent it had without the strip.
+static void dragstrip(Gui *g, Arena a, GuiSession *s)
 {
     ImVec4 t = g->trashrect;
     if (t.w <= t.y) {
@@ -8278,44 +8465,112 @@ static void dragtrash(Gui *g, Arena a, GuiSession *s)
     f32          sc   = g->scale;
     ImGuiWindow *w    = ImGui::GetCurrentWindow();
     ImVec2       maxp = w->DC.CursorMaxPos;
-    ImDrawList  *dl   = ImGui::GetWindowDrawList();
-    b32          on   = trashon(s->host);
-    Str          why  = on ? sesswhy(g, s, "trash", 1, 1) : sesswhy(g, s, "delete", 1, 0);
-    ImGui::SetCursorScreenPos(v2(t.x, t.y));
-    ImGui::InvisibleButton("##trash", v2(t.z-t.x, t.w-t.y));
-    itemnamed(g, "sessions trash");
-    b32 over = 0;
-    if (!why.len && ImGui::BeginDragDropTarget()) {
-        ImGuiPayload const *p = ImGui::AcceptDragDropPayload(
-            "SESS", ImGuiDragDropFlags_AcceptBeforeDelivery |
-                    ImGuiDragDropFlags_AcceptNoDrawDefaultRect);
-        over = p != 0;
-        if (p) {
-            fieldput(g->droplabel, on ? Str("\xe2\x86\x92 Trash")  // a rightwards arrow
-                                      : Str("\xe2\x86\x92 delete, once you confirm"));
-        }
-        if (p && p->IsDelivery()) {
-            Slice<GuiSession *> one = {};
-            one = push(&a, one, s);
-            if (on) {
-                trashroots(g, a, one);
-            } else {
-                askdelete(g, one, {});
-            }
-        }
-        ImGui::EndDragDropTarget();
-    } else if (why.len && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem)) {
-        ImGui::SetMouseCursor(ImGuiMouseCursor_NotAllowed);
-        fieldput(g->droplabel, why);
+    f32          gap  = 4*sc;
+    f32          part = (t.z - t.x - 2*gap) / 3;
+    f32          xa   = t.x + part;
+    f32          xb   = xa + gap + part;
+
+    b32 arch = s->archived;
+    if (stripdrop(g, a, t, t.x, xa, arch ? ICON_UNARCHIVE : ICON_ARCHIVE,
+                  arch ? Str("Unarchive") : Str("Archive"),
+                  arch ? Str("out of Archived") : Str("Archived"),
+                  sesswhy(g, s, "archive", 0, 1), g->pal->active, "sessions archive")) {
+        guiarchive(g, s, !arch);
     }
-    u32 fill = fade(g->pal->bad, why.len ? 0.12f : over ? 0.55f : 0.28f);
-    dl->AddRectFilled(v2(t.x, t.y), v2(t.z, t.w), fill, 6*sc);
-    dl->AddRect(v2(t.x, t.y), v2(t.z, t.w), fade(g->pal->bad, why.len ? 0.3f : 0.8f), 6*sc);
-    Str    label = concat(&a, ICON_TRASH "  ", on ? Str("Move to Trash") : Str("Delete..."));
-    char  *z     = cstr0(&a, label);
-    ImVec2 ts    = ImGui::CalcTextSize(z);
-    dl->AddText(v2(t.x + (t.z-t.x-ts.x)/2, t.y + (t.w-t.y-ts.y)/2),
-                why.len ? g->pal->dim : g->pal->text, z);
+    if (stripdrop(g, a, t, xa + gap, xb, ICON_NEWFOLDER, "New group...",
+                  "a new group, once named", sesswhy(g, s, "group", 0, 1),
+                  g->pal->active, "sessions newgroup")) {
+        namedialog(g, NAME_NEWGROUP, s, {}, {});
+    }
+    b32 on  = trashon(s->host);
+    Str why = on ? sesswhy(g, s, "trash", 1, 1) : sesswhy(g, s, "delete", 1, 0);
+    if (stripdrop(g, a, t, xb + gap, t.z, ICON_TRASH,
+                  on ? Str("Move to Trash") : Str("Delete..."),
+                  on ? Str("Trash") : Str("delete, once you confirm"),
+                  why, g->pal->bad, "sessions trash")) {
+        Slice<GuiSession *> one = {};
+        one = push(&a, one, s);
+        if (on) {
+            trashroots(g, a, one);
+        } else {
+            askdelete(g, one, {});
+        }
+    }
+    w->DC.CursorMaxPos = maxp;
+}
+
+// Where a sidebar row was drawn, for its rail.
+struct RowAt {
+    f32 x0, y0, x1, y1;
+    f32 ax;  // its fold arrow's left
+};
+
+// The fold rails: a thin line down from each open row that folds, under
+// its arrow and beside all it holds. As in the Transcript, a click
+// anywhere along it folds the row, and brings the row back into view if
+// it was above. Not while a session is dragged, when the rows are drop
+// targets; nor for a row kept open, which says why instead.
+static void drawrails(Gui *g, Arena a, Slice<SideRow> rows, Slice<RowAt> at, b32 drag)
+{
+    f32          sc  = g->scale;
+    ImDrawList  *dl  = ImGui::GetWindowDrawList();
+    ImGuiWindow *w   = ImGui::GetCurrentWindow();
+    f32          top = w->InnerRect.Min.y;
+    f32          bot = w->InnerRect.Max.y;
+    f32          fs  = ImGui::GetFontSize();
+    ImVec2       back = w->DC.CursorPos;     // put back as it was, the rails
+    ImVec2       maxp = w->DC.CursorMaxPos;  // drawn over the rows
+    for (iz i = 0; i < rows.len; i++) {
+        SideRow *r = &rows[i];
+        if (!r->key.len || r->folded) {
+            continue;
+        }
+        iz last = i;
+        for (iz k = i+1; k<rows.len && rows[k].depth>r->depth; k++) {
+            last = k;
+        }
+        if (last == i) {
+            continue;
+        }
+        f32 x  = at[i].ax + fs*0.5f;            // the arrow's middle
+        f32 ya = at[i].y0 + fs + 4*sc;          // below its first line
+        f32 yb = at[last].y1;
+        f32 c0 = ya>top ? ya : top;
+        f32 c1 = yb<bot ? yb : bot;
+        if (c1 - c0 < 1) {
+            continue;
+        }
+        b32 hov = 0;
+        b32 go  = 0;
+        if (!drag) {
+            pushstr(r->key);
+            ImGui::SetCursorScreenPos(v2(x - 5*sc, c0));
+            go  = ImGui::InvisibleButton("##rail", v2(10*sc, c1 - c0));
+            hov = ImGui::IsItemHovered() || ImGui::IsItemActive();
+            itemnamed(g, concat(&a, "rail ", r->key));
+            ImGui::PopID();
+        }
+        if (go && !r->forced) {
+            if (at[i].y0 < top) {
+                ImGui::SetScrollY(ImGui::GetScrollY() - (top - at[i].y0));  // its row at the top
+            }
+            foldrow(g, r);
+        }
+        if (hov && r->forced) {
+            tipnow("Open while something under it needs an answer");
+        } else if (hov) {
+            dl->AddRectFilled(v2(at[i].ax - 2*sc, at[i].y0), v2(at[i].x1, yb),
+                              fade(g->pal->active, 0.06f), 4*sc);
+            dl->AddRect(v2(at[i].ax - 2*sc, at[i].y0), v2(at[i].x1, yb),
+                        fade(g->pal->active, 0.5f), 4*sc, sc);
+            dl->AddRectFilled(v2(x - 1.5f*sc, ya), v2(x + 1.5f*sc, yb), g->pal->active);
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            itemtip("Fold");
+            continue;
+        }
+        dl->AddRectFilled(v2(x - 0.5f*sc, ya), v2(x + 0.5f*sc, yb), fade(g->pal->dim, 0.35f));
+    }
+    w->DC.CursorPos    = back;
     w->DC.CursorMaxPos = maxp;
 }
 
@@ -8329,6 +8584,9 @@ static void drawsessions(Gui *g)
     g->droplabel[0] = 0;
     if (g->dragcancel && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
         g->dragcancel = 0;
+    }
+    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        g->gripsess = 0;
     }
     if (drag && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
         ImGui::ClearDragDrop();  // nothing is dropped as the button comes up
@@ -8517,25 +8775,36 @@ static void drawsessions(Gui *g)
         g->sidelen = t.len<(iz)SIDEDUMP_MAX ? t.len : (iz)SIDEDUMP_MAX;
         copybytes(g->sidedump, t.data, g->sidelen);
     }
+    Slice<RowAt> at = {};
+    at.data = alloc<RowAt>(&a, rows.len);
+    at.len  = rows.len;
     for (iz i = 0; i < rows.len; i++) {
         SideRow *r = &rows[i];
+        if (r->kind!=SROW_SESSION && i && r->depth==0) {
+            ImGui::Spacing();
+        }
+        ImVec2 c = ImGui::GetCursorScreenPos();
+        at[i].x0 = c.x;
+        at[i].y0 = c.y;
+        at[i].x1 = c.x + ImGui::GetContentRegionAvail().x;
+        // Its fold arrow's left, as drawsessrow and drawheading place it
+        at[i].ax = c.x + (f32)r->depth*12*g->scale + (r->kind==SROW_SESSION ? 4*g->scale : 0);
         if (r->kind == SROW_SESSION) {
             drawsessrow(g, a, r, sess[r->sess], &other, nowms);
         } else {
-            if (i && r->depth==0) {
-                ImGui::Spacing();
-            }
             HostRef ref = r->kind==SROW_HOST ? refs[r->host] : HostRef{};
             drawheading(g, a, r, ref.h, ref.remote, nowms, ref.rt);
         }
+        at[i].y1 = ImGui::GetCursorScreenPos().y - ImGui::GetStyle().ItemSpacing.y;
     }
+    drawrails(g, a, rows, at, drag != 0);
     if (!sess.len) {
         ImGui::TextDisabled("No sessions yet.");
     }
     if (drag) {
         ImVec4 t = g->trashrect;
         dragrest(g, a, drag, t.w>t.y ? ImGui::GetCurrentWindow()->InnerRect.Max.y - t.y : 0);
-        dragtrash(g, a, drag);
+        dragstrip(g, a, drag);
     }
 }
 

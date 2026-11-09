@@ -1327,7 +1327,8 @@ struct Gui {
     b32                dragcancel; // a session's drag ended by Escape: none
                                    // again until the button is up
     char               droplabel[FIELD_MAX]; // where the dragged session would go, this frame
-    ImVec4             trashrect;  // the trash strip, x0 y0 x1 y1, while dragging (dragtrash)
+    ImVec4             trashrect;  // the drop strip, x0 y0 x1 y1, while dragging (dragstrip)
+    GuiSession        *gripsess;   // the session whose grip is held (rowactions)
     char              *namebuf;    // the naming dialog's field
     i32                nameask;    // NAME_*
     GuiSession        *namesess;
@@ -15944,6 +15945,35 @@ static DriveOp sessionsops[] = {
     {OP_CHECK, CHK_SIDE, 0, 0, 0, "H remote:far\n"},
     {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "remote:hidden"},
     {OP_SHOT, 0, 0, 0, 300, "sessions-tree"},
+    // A root's actions show while the pointer is on its row: archived
+    // from there, and back from under Archived
+    {OP_MOVE, T_SESSTITLE, 0, 0, 300, "Say hello."},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-hover"},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "archive Say hello."},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-hover-archive"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "\n S Say hello.\n"},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "\nA+\n"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "head a"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_SESSTITLE, 0, 0, 300, "Say hello."},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "archive Say hello."},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "\n S Say hello.\n"},
+    {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "\nA"},  // left open, empty
+    // A host's rail folds it, from beside its sessions
+    {OP_MOVE, T_NAMED, 0, 0, 300, "rail h:this"},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-rail"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "H this+\n"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "head h:this"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "H this\n S Start subagents.\n"},
     // A subagent whose parent is gone (gui.py made it) is a root, even
     // opened, its record naming that parent: to trash as one
     {OP_CHECK, CHK_SIDE, 0, 0, 0, "\n S Orphaned subagent\n"},
@@ -16032,13 +16062,18 @@ static DriveOp sessionsops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_SIDEINI, 0, 0, 0, "Opened=g:Work\n"},
-    // Archived: under the Archived heading, folded, opened; then back
+    // Archived: under the Archived heading (left open above), folded,
+    // opened; then back
     {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Greeting"},
     {OP_RDOWN, 0, 0, 0, 60, ""},
     {OP_RUP, 0, 0, 0, 500, ""},
     {OP_MOVE, T_NAMED, 0, 0, 100, "Archive"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 1500, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "A\n H this\n  S Greeting\n"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "head a"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_SIDE, 0, 0, 0, "A+\n"},
     {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "S Greeting"},
     {OP_MOVE, T_NAMED, 0, 0, 100, "head a"},
@@ -16229,6 +16264,22 @@ static DriveOp sessionsops[] = {
     {OP_UP, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_SIDE, 0, 0, 0, "H this\n S Start more subagents.\n"},
     {OP_CHECK, CHK_NOINI, 0, 0, 0, "Sort="},
+    // Dragged by its grip onto New group, at the pane's foot: named, and
+    // in it
+    {OP_MOVE, T_SESSTITLE, 0, 0, 300, "Whole fork"},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "grip Whole fork"},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-grip"},
+    {OP_DOWN, 0, 0, 0, 100, ""},
+    {OP_MOVE, T_NAMED, -4, -3, 100, "grip Whole fork"},
+    {OP_MOVE, T_NAMED, -14, -8, 300, "grip Whole fork"},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "sessions newgroup"},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-newgroupdrag"},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 200, "Dropped"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 1500, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "G Dropped\n H this\n  S Whole fork\n"},
     // Idle: no frames
     {OP_MOVE, T_EMPTY, 0, 0, 6000, ""},  // hover delays and the layout's save
     {OP_MARK, 0, 0, 0, 3000, ""},
