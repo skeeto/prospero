@@ -13276,6 +13276,7 @@ enum : i32 {
     CHK_TERMNONE,     // the session shown has no terminal
     CHK_TERMCOUNT,    // dx terminals are open, in every session
     CHK_TERMTABS,     // the shown root's tab labels, '|' between, '*' front
+    CHK_TERMKID,      // a subagent is shown, with its root's tabs
     CHK_TERMQUIET,    // no frames while idle, the terminal shown
     CHK_TERMFORCE,    // sets the grid to dx by dy, clipped to its pane
                       // (0 by 0: its pane's), and passes
@@ -13567,6 +13568,7 @@ static Str chknames[] = {
     "the terminal has the keyboard", "the terminal shows the text",
     "the terminal fills its pane", "the terminal is closed",
     "that many terminals are open", "the terminal tabs are as said",
+    "a subagent shows its root's terminal tabs",
     "no frames while idle, the terminal shown",
     "the terminal's grid is set", "the terminal is that size, in 32-bit indices",
     "the palette lists what it should",
@@ -17679,6 +17681,37 @@ static DriveOp termops[] = {
     {OP_WAIT, W_TERM, 0, 0, 10000, "tty$"},
     {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
     {OP_CHECK, CHK_TERMCOUNT, 1, 0, 0, ""},
+    // Each root has its own tabs, which its subagents show too; another
+    // root's are its own, and switching back finds the first's as left
+    {OP_TEXT, 0, 0, 0, 100, "echo rootwo"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\nrootwo"},
+    {OP_PROMPT, 0, 0, 0, 0, "Start subagents."},
+    {OP_WAIT, W_TASKS, 0, 0, 10000, ""},
+    {OP_WAIT, W_ALLIDLE, 0, 0, 20000, ""},
+    {OP_MOVE, T_TASKLINK, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_TERMKID, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*bash"},
+    {OP_CHECK, CHK_TERMSCREEN, 0, 0, 0, "\nrootwo"},
+    {OP_NEWSESSION, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_TERMNONE, 0, 0, 0, ""},
+    CTRLKEY(GKEY_GRAVE, 500),
+    {OP_WAIT, W_TERM, 0, 0, 10000, "tty$"},
+    {OP_TEXT, 0, 0, 0, 100, "echo third"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\nthird"},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*bash"},
+    {OP_CHECK, CHK_TERMCOUNT, 2, 0, 0, ""},
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Start subagents."},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*bash"},
+    {OP_CHECK, CHK_TERMSCREEN, 0, 0, 0, "\nrootwo"},
+    CTRLKEY(GKEY_GRAVE, 500),
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
     // Quitting hangs up the shell, whose trap leaves a file (gui.py), but
     // on Windows, where busybox's sh runs no trap for the hang-up (a
     // CTRL_CLOSE_EVENT), it only ends: gui.py checks its pid is gone
@@ -21451,6 +21484,11 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_TERMNONE: {
         TermTab *tt = termfront(g);
         return g->sess && (!tt || tt->state==TT_NONE);
+    }
+    case CHK_TERMKID: {
+        GuiSession *r = g->sess ? termroot(g, g->sess) : 0;
+        return r && r!=g->sess && g->sess->view && g->sess->view->parent==r->sid &&
+               r->terms.n && termfront(g)==termsetfront(&r->terms);
     }
     case CHK_TERMTABS: {
         GuiSession *s = g->sess ? termroot(g, g->sess) : 0;
