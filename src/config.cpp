@@ -644,7 +644,8 @@ static CfgKey cfgschema[] = {
 
     {"terminal", "shell", CFG_STRING, "", {}, {}, "terminal",
      "The program a terminal tab runs, with its arguments, a \"quoted\" "
-     "one holding blanks. Empty: the session's shell, unless it is the "
+     "one holding blanks, ~/ for the home directory where unquoted. "
+     "Empty: the session's shell, unless it is the "
      "system's sh, else $SHELL. A POSIX shell starts as a login shell, "
      "except on Linux for this computer's sessions, whose desktop login "
      "ran the profile already"},

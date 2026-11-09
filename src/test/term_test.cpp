@@ -93,12 +93,17 @@ static void test_term(Test *t)
             {"a\"b c", "a\"b|c"},          // a quote inside a word is a quote
             {"x \"\" y", "x||y"},          // an empty word, quoted
             {"tmux \"new -A\"", "tmux|new -A"},
+            {"~/bin/fish -C ~/x.fish", "/h/bin/fish|-C|/h/x.fish"},
+            {"~ ~user a~/b", "/h|~user|a~/b"},
+            {"\"~/my shell\" -l", "~/my shell|-l"},  // quoted, as written
         };
         for (iz i = 0; i < countof(cases); i++) {
             expect(t, concat(a, "termsplit ", cases[i].in),
-                   termwords(a, termsplit(a, cases[i].in)), cases[i].want);
+                   termwords(a, termsplit(a, cases[i].in, "/h", 0)), cases[i].want);
         }
-        expect(t, "termsplit open", istr(a, termsplit(a, "sh \"-c").len), "0");
+        expect(t, "termsplit open", istr(a, termsplit(a, "sh \"-c", "/h", 0).len), "0");
+        expect(t, "termsplit win", termwords(a, termsplit(a, "~\\bin\\nu.exe", "C:/Users/u", 1)),
+               "C:/Users/u\\bin\\nu.exe");
     }
 
     // The shell: configured, else the session's unless the system's
@@ -122,12 +127,12 @@ static void test_term(Test *t)
              "C:/Windows/system32/cmd.exe"},
         };
         for (iz i = 0; i < countof(cases); i++) {
-            Slice<Str> argv = termargv(a, cases[i].conf, cases[i].kind, cases[i].path,
+            Slice<Str> argv = termargv(a, cases[i].conf, "/h", cases[i].kind, cases[i].path,
                                        {}, cases[i].envshell, cases[i].win,
                                        cases[i].login);
             expect(t, concat(a, "termargv ", istr(a, i)), termwords(a, argv), cases[i].want);
         }
-        Slice<Str> wsl = termargv(a, {}, "wsl", "C:/Windows/system32/wsl.exe",
+        Slice<Str> wsl = termargv(a, {}, "/h", "wsl", "C:/Windows/system32/wsl.exe",
                                   "Ubuntu", {}, 1, 1);
         expect(t, "termargv wsl", termwords(a, wsl),
                "C:/Windows/system32/wsl.exe|-d|Ubuntu");

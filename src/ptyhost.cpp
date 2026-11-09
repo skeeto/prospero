@@ -39,7 +39,7 @@
 // session's closing, parking, or archiving.
 //
 // The shell: [terminal] shell, words with "quotes" for a word holding
-// blanks; else the session's shell, unless it is a POSIX system's
+// blanks, an unquoted ~/ for home; else the session's shell, unless it is a POSIX system's
 // default (termshell); else $SHELL; else that default; else /bin/sh. A
 // POSIX sh starts as a login shell, but in the GUI's own engine on
 // Linux, whose desktop session ran the profile already. Its environment
@@ -131,8 +131,9 @@ static TermAck termack(i64 sent, i64 acked, i64 off, b32 resend)
 }
 
 // Words, blank-separated, a word in double quotes holding anything but
-// a quote. Null if a quote is left open.
-static Slice<Str> termsplit(Arena *a, Str s)
+// a quote. An unquoted word starting with ~/ is in home, as a shell
+// would have it. Null if a quote is left open.
+static Slice<Str> termsplit(Arena *a, Str s, Str home, b32 win)
 {
     Slice<Str> r = {};
     for (iz i = 0; i < s.len;) {
@@ -151,7 +152,7 @@ static Slice<Str> termsplit(Arena *a, Str s)
         }
         iz j = i;
         for (; j<s.len && !whitespace(s[j]); j++) {}
-        r = push(a, r, Str{s.data+i, j-i});
+        r = push(a, r, expandhome(a, Str{s.data+i, j-i}, home, win));
         i = j;
     }
     return r;
@@ -209,14 +210,14 @@ static Slice<Str> termenv(Arena *a, Slice<Str> env, b32 win, b32 mac, Str term)
     return r;
 }
 
-// The shell's argv: the configured words, else the session's shell as
+// The shell's argv: the configured words, ~ for home, else the session's shell as
 // Open in terminal opens it, unless it is the system's default, else
 // $SHELL, else that default, else /bin/sh; a POSIX sh as a login shell
 // where login.
-static Slice<Str> termargv(Arena *a, Str conf, Str kind, Str path, Str distro,
-                           Str envshell, b32 win, b32 login)
+static Slice<Str> termargv(Arena *a, Str conf, Str home, Str kind, Str path,
+                           Str distro, Str envshell, b32 win, b32 login)
 {
-    Slice<Str> r = termsplit(a, conf);
+    Slice<Str> r = termsplit(a, conf, home, win);
     if (r.len) {
         return r;
     }
@@ -446,8 +447,9 @@ static Str termstart(Engine *e, Arena scratch, i64 id, Json *j, Session *s, Str 
     env = envsetpath(&scratch, env, path, win);
     env = shellover(s, &scratch, &sh, env, 1);
     Str        conf = trim(cfgget(e->cfg, "terminal", {}, "shell", 0));
-    Slice<Str> argv = termargv(&scratch, conf, shellkinds[sh.kind], sh.path,
-                               sh.distro, envget(env, "SHELL", win), win, login);
+    Slice<Str> argv = termargv(&scratch, conf, e->home, shellkinds[sh.kind],
+                               sh.path, sh.distro, envget(env, "SHELL", win),
+                               win, login);
     if (!argv.len) {
         return "[terminal] shell: a quote is left open";
     }
