@@ -1713,6 +1713,7 @@ struct Gui {
     u32                termserial;   // the last tab's serial
     b32                termfocus;    // focus the terminal when next drawn
     GuiSession        *termaddto;    // root wanting a new tab once sized
+    i32                closeterms;   // busy tabs the quit dialog counted
     TermTab           *termshowing;  // the tab drawn in front last
     u32                termshowingserial;  // its serial then
     i32                termlastcols; // the pane's size in cells last frame,
@@ -5772,6 +5773,7 @@ static void drawterm(Gui *);
 static void termhotkeys(Gui *);
 static void termsweep(Gui *);
 static Str  termaddwhy(Gui *, GuiSession *);
+static i32  termbusy(Gui *);
 static void termadd(Gui *, GuiSession *);
 static void termgrab(Gui *);
 static Str  termscreen(Gui *, Arena *);
@@ -11565,7 +11567,7 @@ static void gui_close(Gui *g)
         shedlater(g, 0);
         return;
     }
-    if (!g->quitting && !running(g) && !elsewhere(g)) {
+    if (!g->quitting && !running(g) && !elsewhere(g) && !termbusy(g)) {
         startquit(g);
         return;
     }
@@ -13277,6 +13279,7 @@ enum : i32 {
     CHK_TERMCOUNT,    // dx terminals are open, in every session
     CHK_TERMTABS,     // the shown root's tab labels, '|' between, '*' front
     CHK_TERMKID,      // a subagent is shown, with its root's tabs
+    CHK_TERMCLOSE,    // the quit dialog counted dx busy terminal tabs
     CHK_TERMQUIET,    // no frames while idle, the terminal shown
     CHK_TERMFORCE,    // sets the grid to dx by dy, clipped to its pane
                       // (0 by 0: its pane's), and passes
@@ -13569,6 +13572,7 @@ static Str chknames[] = {
     "the terminal fills its pane", "the terminal is closed",
     "that many terminals are open", "the terminal tabs are as said",
     "a subagent shows its root's terminal tabs",
+    "the quit dialog counts the busy terminal tabs",
     "no frames while idle, the terminal shown",
     "the terminal's grid is set", "the terminal is that size, in 32-bit indices",
     "the palette lists what it should",
@@ -13656,7 +13660,7 @@ enum : i32 {
     W_CTR,        // the container runtime, or the first container, is as
                   // text says (ctrwait)
     W_TERM,       // the shown session's terminal shows text
-    W_TERMBUSY,   // its front tab runs a program
+    W_TERMBUSY,   // its front tab runs a program, or not with "idle"
 };
 
 static Str waitnames[] = {
@@ -17712,6 +17716,22 @@ static DriveOp termops[] = {
     {OP_CHECK, CHK_TERMSCREEN, 0, 0, 0, "\nrootwo"},
     CTRLKEY(GKEY_GRAVE, 500),
     {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    // A program running in a tab makes quitting ask, counting it
+    {OP_TEXT, 0, 0, 0, 100, "sleep 30"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERMBUSY, 0, 0, 5000, ""},
+    {OP_CLOSE, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_CLOSEMODAL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMCLOSE, 1, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "terminal-quit"},
+    {OP_MOVE, T_CLOSECANCEL, 0, 0, 200, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    CTRLKEY(GKEY_GRAVE, 500),  // the dialog took the keyboard
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    CTRLKEY(GKEY_C, 300),
+    {OP_WAIT, W_TERMBUSY, 0, 0, 5000, "idle"},
     // Quitting hangs up the shell, whose trap leaves a file (gui.py), but
     // on Windows, where busybox's sh runs no trap for the hang-up (a
     // CTRL_CLOSE_EVENT), it only ends: gui.py checks its pid is gone
@@ -17721,7 +17741,7 @@ static DriveOp termops[] = {
     TERMKEY(GKEY_ENTER, 100),
     {OP_WAIT, W_TERM, 0, 0, 5000, "EXIT\ntty$"},  // set, at the next prompt
     {OP_SUMMARY, 0, 0, 0, 0, ""},
-    {OP_QUIT, 0, 0, 0, 0, ""},
+    {OP_CLOSE, 0, 0, 0, 0, ""},  // with nothing busy, it quits at once
 };
 
 static DriveOp changesops[] = {
@@ -19719,8 +19739,9 @@ static b32 drivewaitdone(Gui *g)
         return find(termscreen(g, &a), g->ops[g->drivepc-1].text) >= 0;
     }
     case W_TERMBUSY: {
-        TermTab *tt = termfront(g);
-        return tt && tt->busy;
+        TermTab *tt   = termfront(g);
+        b32      idle = g->ops[g->drivepc-1].text == Str("idle");
+        return tt && tt->busy!=idle;
     }
     case W_VIA:
         return g->sess && v->state==LIVE_STREAMING && v->relaylen>0 && v->deltas>0;
@@ -21485,6 +21506,8 @@ static b32 drivecheck(Gui *g, i32 chk)
         TermTab *tt = termfront(g);
         return g->sess && (!tt || tt->state==TT_NONE);
     }
+    case CHK_TERMCLOSE:
+        return (f32)g->closeterms == g->ops[g->drivepc-1].dx;
     case CHK_TERMKID: {
         GuiSession *r = g->sess ? termroot(g, g->sess) : 0;
         return r && r!=g->sess && g->sess->view && g->sess->view->parent==r->sid &&

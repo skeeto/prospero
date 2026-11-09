@@ -10444,7 +10444,7 @@ static void drawclose(Gui *g)
     f32 sc = g->scale;
     if (g->closereq) {
         g->closereq = 0;
-        if (!g->quitting && !running(g) && !elsewhere(g)) {
+        if (!g->quitting && !running(g) && !elsewhere(g) && !termbusy(g)) {
             startquit(g);
         } else if (!g->quitting) {
             g->hosterr = {};
@@ -10466,6 +10466,8 @@ static void drawclose(Gui *g)
     } else {
         i32 n = running(g);
         i32 m = elsewhere(g);
+        i32 t = termbusy(g);
+        g->closeterms = t;
         Buf b(&a, 128);
         print(&b, "Stop ");
         print(&b, (i64)n);
@@ -10475,8 +10477,16 @@ static void drawclose(Gui *g)
             ImGui::TextUnformatted("Turns are still running. Quitting stops them, and kills "
                                    "their commands; in the background they go on, with no "
                                    "window.");
-        } else {
+        } else if (!t) {
             ImGui::TextUnformatted("Nothing is running here any more.");
+        }
+        if (t) {
+            Buf e(&a, 128);
+            print(&e, (i64)t);
+            print(&e, t==1 ? Str(" terminal tab is running a program")
+                           : Str(" terminal tabs are running programs"));
+            print(&e, ", which quitting hangs up.");
+            ImGui::TextUnformatted(cstr0(&a, finish(&e)));
         }
         if (m) {
             Buf e(&a, 128);
@@ -10501,8 +10511,9 @@ static void drawclose(Gui *g)
             if (g->whynobg.len) {
                 itemtip("Not here: %s", cstr0(&a, g->whynobg));
             } else {
-                itemtip("Close the window, and keep this process running its "
-                                      "sessions, unattended, with a tray icon to bring it back");
+                itemtip("Close the window and its terminal tabs, and keep this "
+                        "process running its sessions, unattended, with a tray icon "
+                        "to bring it back");
             }
             if (bg) {
                 shedlater(g, 1);

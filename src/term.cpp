@@ -339,6 +339,19 @@ static void termdrop(Gui *g, GuiSession *s, i32 i, b32 kill)
     g->termspare = tt;
 }
 
+// Tabs whose shell runs a program, which quitting would hang up.
+static i32 termbusy(Gui *g)
+{
+    i32 n = 0;
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        for (i32 i = 0; i < s->terms.n; i++) {
+            TermTab *tt = s->terms.tabs[i];
+            n += tt->state==TT_LIVE && tt->busy;
+        }
+    }
+    return n;
+}
+
 // Hang up every terminal, as the window goes.
 static void termcloseall(Gui *g)
 {
