@@ -2,6 +2,7 @@ size 80x24 cursor 17,4 alt
   2              1  The quick brown cat jumps over the lazy dog.
 	0-3 sgr 0;93
   3              2  Ünïcödé: café, naïve, résumé, 中文字符, 日本語, 한국어 appen
+	 wrapped
 	0-3 sgr 0;93
     ded          
 	0-3 sgr 0;93
@@ -10,8 +11,10 @@ size 80x24 cursor 17,4 alt
 	40-45 sgr 0;38:5:81
 	48-53 sgr 0;38:5:81
   5      4  A long line that goes on and on past the edge of the terminal so tha
+	 wrapped
 	0-3 sgr 0;93
     t less has to wrap it onto the next row, and then some more words to be sure
+	 wrapped
 	0-3 sgr 0;93
      it wraps twice at eighty columns.
 	0-3 sgr 0;93

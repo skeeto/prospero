@@ -1,0 +1,93 @@
+# Export: the state as VT that rebuilds it in a fresh terminal. EXPORT
+# feeds the export to one and compares the dumps, history included.
+INIT 5,10
+
+!Text, styles and the cursor
+RESET
+PUSH "\e[1;31mred\e[m plain\r\n\e[4:3;58;5;9mcurly\e[m\e[3;4H"
+EXPORT
+
+!History and a line wrapped into it
+RESET
+PUSH "one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\n0123456789abcdefghijKLM\r\nx"
+  ?history 1 = "five"
+EXPORT
+
+!A line still wrapping onto the screen
+RESET
+PUSH "\e[5H0123456789ab\n\n\n\n"
+  ?history 1 = "0123456789"
+EXPORT
+
+!Erased cells inside wrapped rows keep their backgrounds
+RESET
+PUSH "\e[44m\e[2Kab\e[m\e[9Gcd\r\n\e[45m\e[K\e[m"
+PUSH "\e[3H0123456789\e[3;3H\e[42m\e[3X\e[m\e[4;1Hxyz"
+EXPORT
+
+!A wide character that wrapped leaves its spacer
+RESET
+PUSH "abcdefghi\xe4\xb8\x80z"
+  ?lineinfo 0 = wrapped
+EXPORT
+
+!An emoji that VS16 widened, wrapped onto the next row
+RESET
+RESIZE 5,4
+PUSH "\xe2\x9d\xa4\xe2\x9d\xa4\xef\xb8\x8f"
+RESIZE 5,3
+EXPORT
+RESIZE 5,10
+
+!Prompt marks on screen and in history
+RESET
+PUSH "\e]133;A\a$ ls\r\na\r\nb\r\nc\r\nd\r\n\e]133;A\a$ "
+EXPORT
+
+!The alternate screen with both saved cursors
+RESET
+PUSH "main\e[2;3H\e[32m\e7\e[?1049h\e[Halt\e[3;5H\e[1m\e7\e[H\e[m"
+EXPORT
+PUSH "\e[?1049l"
+EXPORT
+
+!Margins, origin mode, tab stops and modes
+RESET
+PUSH "\e[2;4r\e[?6h\e[2;2H\e[3g\e[1;4H\eH\e[?1h\e[?25l\e[4h\e[?2004h\e[?1006h\e[?1002h"
+EXPORT
+
+!Titles, the title stack, colors and the cursor's shape
+RESET
+PUSH "\e]2;first\a\e[22;0t\e]1;icon\a\e]2;second\a\e]4;1;rgb:12/34/56\a\e]11;#102030\a\e[5 q"
+EXPORT
+
+!A pending wrap and a cluster that can still grow
+RESET
+PUSH "0123456789"
+  ?cursor = 0,9
+EXPORT
+PUSH "\r\ne\xcc\x81"
+EXPORT
+
+!XTSAVE entries and kitty flags
+RESET
+PUSH "\e[?7l\e[?7s\e[?7h\e[?1049h\e[?1049s\e[?1049l\e[>5u\e[>1u"
+EXPORT
+
+!A margin spacer styled unlike the wide cell after it, overwritten since
+RESET
+PUSH "\e[41mabcdefghi\xe4\xb8\xad\e[m\e[2;1H\xe6\x97\xa5"
+  ?lineinfo 0 = wrapped
+EXPORT
+PUSH "\e[3H\e[1;44mabcdefghi\xe4\xb8\xad\e[m\e[4;1H\e[4m\xe6\x97\xa5\e[m"
+EXPORT
+
+!The same before a wide cell that a widened stand-in makes
+RESET
+RESIZE 5,4
+PUSH "\e[41mab\xe2\x9d\xa4\xef\xb8\x8f"
+RESIZE 5,3
+PUSH "\e[m\e[2;1H\xe2\x9d\xa4\xef\xb8\x8f"
+  ?lineinfo 0 = wrapped
+EXPORT
+RESIZE 5,10

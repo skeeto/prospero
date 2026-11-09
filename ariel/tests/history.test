@@ -1,0 +1,310 @@
+# History, the viewport, selection and copy
+INIT 5,10
+
+!Rows scrolling off the main screen enter history
+RESET
+PUSH "one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven"
+  ?history 1 = "two"
+  ?history 2 = "one"
+  ?history 3 = "<none>"
+  ?view = 0,7
+  ?screen_row 0 = "three"
+
+!The viewport scrolls back and returns
+SCROLL -1
+  ?view = 1,7
+  ?screen_row 0 = "two"
+  ?screen_row 1 = "three"
+  ?lineinfo 0 = history
+  ?cursor = -1,5
+SCROLL -10
+  ?view = 2,7
+  ?screen_row 0 = "one"
+SCROLL 1
+  ?screen_row 0 = "two"
+  ?cursor = -1,5
+SCROLL TO bottom
+  ?view = 0,7
+  ?cursor = 4,5
+
+!While scrolled back, the view holds still as history grows
+RESET
+PUSH "a\r\nb\r\nc\r\nd\r\ne\r\nf"
+SCROLL -1
+  ?screen_row 0 = "a"
+PUSH "\r\ng\r\nh"
+  ?view = 3,8
+  ?screen_row 0 = "a"
+  ?screen_row 1 = "b"
+
+!A wrapped line is one record, rewrapped at the history's width
+RESET
+PUSH "0123456789abcdefghijKLM\r\nx\r\ny\r\nz\r\nw\r\nv"
+  ?history 1 = "KLM"
+  ?history 2 = "abcdefghij"
+  ?history 3 = "0123456789"
+SCROLL -3
+  ?lineinfo 0 = history wrapped
+  ?lineinfo 1 = history wrapped
+  ?lineinfo 2 = history
+SCROLL TO bottom
+
+!A line still wrapping onto the screen continues there
+RESET
+PUSH "\e[5H0123456789ab\n\n\n\n"
+  ?history 1 = "0123456789"
+SCROLL -1
+  ?lineinfo 0 = history wrapped
+SCROLL TO bottom
+  ?screen_row 0 = "ab"
+
+!History takes only the main screen with the top margin at row 1
+RESET
+PUSH "a\r\nb\r\nc\r\nd\r\ne"
+PUSH "\e[2;5r\e[5H\n"
+  ?history 1 = "<none>"
+PUSH "\e[r\e[1;4r\e[4H\n"
+  ?history 1 = "a"
+PUSH "\e[r\e[?1049h\e[5H\n\n\n\e[?1049l"
+  ?history 1 = "a"
+  ?history 2 = "<none>"
+
+!SU pushes, IL and DL and SD don't
+RESET
+PUSH "a\r\nb\r\nc"
+PUSH "\e[S"
+  ?history 1 = "a"
+PUSH "\e[H\e[M\e[L\e[T"
+  ?history 1 = "a"
+  ?history 2 = "<none>"
+
+!ED 2 pushes the used rows, ED 3 and RIS clear history
+RESET
+PUSH "a\r\nb\r\nc\e[2J"
+  ?history 1 = "c"
+  ?history 3 = "a"
+  ?history 4 = "<none>"
+PUSH "\e[3J"
+  ?history 1 = "<none>"
+  ?view = 0,5
+PUSH "\e[Hx\r\ny\e[2J"
+  ?history 1 = "y"
+PUSH "\ec"
+  ?history 1 = "<none>"
+
+!Blank lines and styles survive history
+RESET
+PUSH "\e[31mred\e[m\r\n\r\n\e[44m\e[Kbar\e[m\r\nx\r\ny\r\nz\r\nw\r\nv"
+  ?history 3 = "red"
+  ?history 2 = ""
+  ?history 1 = "bar"
+SCROLL -3
+  ?screen_cell 0,0 = fg=idx(1)
+  ?screen_cell 0,3 = bg=idx(0)
+  ?screen_cell 2,0 = bg=idx(4)
+  ?screen_cell 2,9 = bg=idx(4)
+SCROLL TO bottom
+
+!A selection in the screen copies its text
+RESET
+PUSH "hello\r\nfoo bar"
+SELECT char 0,2
+SELECT extend 1,3
+  ?copy = "llo\nfoo"
+  ?screen_cell 0,1 = selected=0
+  ?screen_cell 0,2 = selected=1
+  ?screen_cell 1,3 = selected=0
+SELECT word 1,5
+  ?copy = "bar"
+SELECT line 0,3
+  ?copy = "hello"
+
+!Copy joins wrapped rows and drops trailing blanks
+RESET
+PUSH "0123456789abc   \r\nnext   "
+SELECT line 0,0
+  ?copy = "0123456789abc"
+SELECT extend 2,9
+  ?copy = "0123456789abc\nnext"
+SELECT clear 0,0
+  ?copy = ""
+
+!A block selection copies a rectangle
+RESET
+PUSH "abcdef\r\nghijkl\r\nmnopqr"
+SELECT char block 0,1
+SELECT extend 2,4
+  ?copy = "bcd\nhij\nnop"
+
+!A selection reaches into history and moves with its text
+RESET
+PUSH "a1\r\nb2\r\nc3\r\nd4\r\ne5"
+SELECT char 0,0
+SELECT extend 1,2
+  ?copy = "a1\nb2"
+PUSH "\r\nf6"
+  ?copy = "a1\nb2"
+SCROLL -1
+SELECT all 0,0
+  ?copy = "a1\nb2\nc3\nd4\ne5\nf6"
+SCROLL TO bottom
+
+!Moving to a new block keeps history, or its newest lines when smaller
+RESET
+PUSH "a\r\nb\r\nc\r\nd\r\ne\r\nf\r\ng"
+SCROLL -1
+MOVE 8,16
+  ?history 1 = "b"
+  ?history 2 = "a"
+  ?view = 1,7
+  ?screen_row 0 = "b"
+SCROLL TO bottom
+MOVE 8,16,1,1024
+  ?history 1 = "b"
+  ?history 2 = "<none>"
+  ?screen_row 0 = "c"
+PUSH "\r\nh"
+  ?history 1 = "c"
+  ?history 2 = "<none>"
+
+!A one-row screen pushes each line as it scrolls
+RESET
+RESIZE 1,10
+PUSH "0123456789ab\r\nx"
+  ?history 1 = "ab"
+  ?history 2 = "0123456789"
+  ?screen_row 0 = "x"
+RESIZE 1,5
+  ?history 1 = "ab"
+  ?history 2 = "56789"
+  ?history 3 = "01234"
+  ?screen_row 0 = "x"
+RESIZE 1,10
+  ?history 1 = "ab"
+  ?history 2 = "0123456789"
+
+!A scrolled-back view stays on its text through a reflow
+RESET
+RESIZE 5,10
+PUSH "one\r\n0123456789abcdefghijKLMNOPQRST\r\nx\r\ny\r\nz\r\nw\r\nv"
+SCROLL -2
+  ?screen_row 0 = "abcdefghij"
+RESIZE 5,4
+  ?screen_row 0 = "89ab"
+RESIZE 5,10
+  ?screen_row 0 = "0123456789"
+SCROLL TO bottom
+  ?screen_row 0 = "x"
+
+!Word and line selection cross the seams of a line split into records
+INIT 5,10
+HISTORY 1000,2368
+PUSH "ab "
+$REP 200: PUSH "0123456789"
+PUSH " ef\r\n1\r\n2\r\n3\r\n4"
+SCROLL TO top
+SCROLL 150
+SELECT word 2,5
+SCROLL TO top
+  ?screen_cell 0,2 = selected=0
+  ?screen_cell 0,3 = selected=1
+SCROLL 200
+  ?screen_cell 0,2 = selected=1
+  ?screen_cell 0,3 = selected=0
+SCROLL TO top
+SCROLL 100
+SELECT word 3,7
+SCROLL TO top
+  ?screen_cell 0,2 = selected=0
+  ?screen_cell 0,3 = selected=1
+SCROLL 200
+  ?screen_cell 0,2 = selected=1
+  ?screen_cell 0,3 = selected=0
+SELECT line 0,0
+  ?screen_cell 0,9 = selected=1
+  ?screen_cell 1,0 = selected=0
+SCROLL TO top
+  ?screen_cell 0,0 = selected=1
+SCROLL TO bottom
+
+!A selection under a scroll region with top 0 stays on its text
+RESET
+PUSH "a\r\nb\r\nc\r\nd\r\nstatus"
+PUSH "\e[1;4r\e[4H"
+SELECT char 4,0
+SELECT extend 4,6
+  ?copy = "status"
+PUSH "\n"
+  ?history 1 = "a"
+  ?copy = "status"
+  ?screen_cell 4,0 = selected=1
+  ?screen_cell 3,0 = selected=0
+PUSH "\n\n"
+  ?copy = "status"
+SELECT char 3,0
+SELECT extend 4,6
+PUSH "x\n"
+  ?copy = ""
+PUSH "\e[r"
+
+!Word and line selection on the alternate screen stop at its top
+RESET
+PUSH "\e[5H0123456789ab\n\n\n\n"
+  ?history 1 = "0123456789"
+SELECT word 0,0
+  ?copy = "0123456789ab"
+PUSH "\e[?1049h\e[Hyyy"
+SELECT word 0,0
+  ?copy = "yyy"
+SELECT line 0,1
+  ?copy = "yyy"
+SELECT char 0,0
+SELECT extend 0,3
+  ?copy = "yyy"
+PUSH "\e[?1049l"
+
+!Extending a selection after history evicted rows
+HISTORY 2,4096
+PUSH "a1\r\nb2\r\nc3\r\nd4\r\ne5\r\nf6\r\ng7\r\nh8"
+  ?history 2 = "b2"
+  ?history 3 = "<none>"
+SELECT char 0,1
+SELECT extend 1,1
+  ?copy = "4\ne"
+SELECT extend 2,2
+  ?copy = "4\ne5\nf6"
+SELECT extend 0,0
+  ?copy = "d"
+SELECT word 1,0
+SELECT extend 2,0
+  ?copy = "e5\nf6"
+PUSH "\r\ni9"
+  ?history 2 = "c3"
+  ?copy = "e5\nf6"
+SELECT extend 3,2
+  ?copy = "e5\nf6\ng7\nh8"
+HISTORY 0,0
+
+!Copy of a history row keeps every mark while the pool is full
+INIT 5,10
+MOVE 5,10
+PUSH "ae\xcc\x81\xcc\x82\r\n\n\n\n\n\e[H"
+  ?history 1 = "ae\xcc\x81\xcc\x82"
+PUSH "e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82"
+PUSH "e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82"
+PUSH "e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82"
+PUSH "e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82"
+PUSH "e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82"
+PUSH "\e[?47h\e[H"
+PUSH "e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82"
+PUSH "e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82"
+PUSH "e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82"
+PUSH "e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82"
+PUSH "e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82e\xcc\x81\xcc\x82"
+PUSH "\e[?47l"
+SCROLL -1
+SELECT line 0,0
+  ?copy = "ae\xcc\x81\xcc\x82"
+SCROLL TO bottom
+SELECT clear 0,0
+INIT 5,10

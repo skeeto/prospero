@@ -1,0 +1,315 @@
+# Reflow: the main screen's lines rewrapped when the width changes
+INIT 5,10
+
+!Narrowing wraps a line, widening joins it again
+RESET
+RESIZE 5,10
+PUSH "0123456789abc"
+  ?screen_row 0 = "0123456789"
+  ?screen_row 1 = "abc"
+  ?cursor = 1,3
+RESIZE 5,20
+  ?screen_row 0 = "0123456789abc"
+  ?screen_row 1 = ""
+  ?cursor = 0,13
+RESIZE 5,5
+  ?screen_row 0 = "01234"
+  ?screen_row 1 = "56789"
+  ?screen_row 2 = "abc"
+  ?lineinfo 0 = wrapped
+  ?lineinfo 2 = -
+  ?cursor = 2,3
+RESIZE 5,10
+  ?screen_row 0 = "0123456789"
+  ?screen_row 1 = "abc"
+  ?cursor = 1,3
+
+!A round trip through a narrow width restores the screen
+RESET
+RESIZE 5,10
+PUSH "aaaaaaaaaa\r\nbbbbbbbbbb\r\nc"
+RESIZE 5,4
+  ?screen_row 0 = "aa"
+  ?screen_row 4 = "c"
+  ?history 1 = "aaaa"
+RESIZE 5,10
+  ?screen_row 0 = "aaaaaaaaaa"
+  ?screen_row 1 = "bbbbbbbbbb"
+  ?screen_row 2 = "c"
+  ?cursor = 2,1
+  ?history 1 = "<none>"
+
+!Blank rows below go before anything leaves for history
+RESET
+RESIZE 5,10
+PUSH "x\r\nhello world"
+  ?cursor = 2,1
+RESIZE 5,5
+  ?screen_row 0 = "x"
+  ?screen_row 1 = "hello"
+  ?screen_row 2 = " worl"
+  ?screen_row 3 = "d"
+  ?cursor = 3,1
+  ?history 1 = "<none>"
+RESIZE 5,10
+  ?screen_row 0 = "x"
+  ?screen_row 1 = "hello worl"
+  ?screen_row 2 = "d"
+  ?cursor = 2,1
+
+!The cursor's line stays on the screen
+RESET
+RESIZE 5,10
+PUSH "$ \e[2H0123456789\r\nabcdefghij\r\nABCDEFGHIJ\e[1;3H"
+RESIZE 5,5
+  ?screen_row 0 = "$ "
+  ?cursor = 0,2
+  ?screen_row 1 = "01234"
+  ?screen_row 4 = "fghij"
+  ?history 1 = "<none>"
+
+!A wide character that doesn't fit leaves a spacer and wraps
+RESET
+RESIZE 5,10
+PUSH "abc\xe4\xb8\x80de"
+RESIZE 5,4
+  ?screen_row 0 = "abc"
+  ?screen_cell 1,0 = {0x4e00} width=2
+  ?screen_row 1 = "\xe4\xb8\x80de"
+  ?lineinfo 0 = wrapped
+RESIZE 5,10
+  ?screen_row 0 = "abc\xe4\xb8\x80de"
+
+!A coloured line keeps its colour out to the margin
+RESET
+RESIZE 5,10
+PUSH "\e[44m\e[Kbar\e[m"
+RESIZE 5,20
+  ?screen_cell 0,19 = bg=idx(4)
+RESIZE 5,4
+  ?screen_cell 0,3 = bg=idx(4)
+  ?screen_row 1 = ""
+
+!A line wrapped into history rejoins the screen
+RESET
+RESIZE 5,10
+PUSH "\e[5H0123456789abcdefghij\n\n\n\n"
+  ?history 1 = "0123456789"
+  ?screen_row 0 = "abcdefghij"
+RESIZE 5,20
+  ?history 1 = ""
+  ?screen_row 0 = "0123456789abcdefghij"
+RESIZE 5,15
+  ?history 1 = "0123456789abcde"
+  ?screen_row 0 = "fghij"
+RESIZE 5,10
+  ?history 1 = "0123456789"
+  ?screen_row 0 = "abcdefghij"
+
+!The cursor past a line's text keeps its column
+RESET
+RESIZE 5,10
+PUSH "ab\e[1;8H"
+RESIZE 5,5
+  ?cursor = 0,4
+RESIZE 5,10
+  ?cursor = 0,4
+
+!A pending wrap lands where the next character would go
+RESET
+RESIZE 5,10
+PUSH "0123456789"
+  ?cursor = 0,9
+RESIZE 5,20
+  ?cursor = 0,10
+RESIZE 5,5
+  ?cursor = 1,4
+PUSH "X"
+  ?screen_row 2 = "X"
+
+!The main screen reflows behind the alternate screen
+RESET
+RESIZE 5,10
+PUSH "0123456789abc\e[?1049h\e[Halt"
+RESIZE 5,5
+  ?screen_row 0 = "alt"
+PUSH "\e[?1049l"
+  ?screen_row 0 = "01234"
+  ?screen_row 2 = "abc"
+  ?cursor = 2,3
+
+!Taller pulls history back, shorter pushes it again
+RESET
+RESIZE 5,10
+PUSH "1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7"
+  ?history 1 = "2"
+RESIZE 7,10
+  ?screen_row 0 = "1"
+  ?screen_row 6 = "7"
+  ?cursor = 6,1
+RESIZE 5,10
+  ?screen_row 0 = "3"
+  ?history 1 = "2"
+  ?cursor = 4,1
+
+!Rows lent to history by narrowing all come back
+RESET
+RESIZE 5,10
+PUSH "0123456789abcdefghijklmnopqrstuv\r\nx"
+RESIZE 5,4
+  ?history 1 = "cdef"
+  ?screen_row 0 = "ghij"
+RESIZE 5,10
+  ?history 1 = "<none>"
+  ?screen_row 0 = "0123456789"
+  ?screen_row 3 = "uv"
+  ?screen_row 4 = "x"
+
+!A cursor below a full row stays there
+RESET
+RESIZE 5,10
+PUSH "0123456789a\b\e[K"
+  ?cursor = 1,0
+RESIZE 5,5
+  ?screen_row 1 = "56789"
+  ?lineinfo 1 = wrapped
+  ?cursor = 2,0
+RESIZE 5,10
+  ?cursor = 1,0
+  ?lineinfo 0 = wrapped
+
+!A prompt mark belongs to its whole line
+RESET
+RESIZE 5,10
+PUSH "\r\n0123456789ab\e]133;A\a\e[H0123456789x"
+  ?lineinfo 0 = wrapped
+  ?lineinfo 1 = wrapped prompt
+RESIZE 5,5
+  ?lineinfo 0 = wrapped prompt
+  ?lineinfo 1 = wrapped
+
+!Inserting or deleting lines breaks a wrapped line there
+RESET
+RESIZE 5,10
+PUSH "0123456789abc\e[L"
+  ?lineinfo 0 = -
+PUSH "\e[H0123456789abc\e[2H\e[M"
+  ?lineinfo 0 = -
+PUSH "\e[3;5r\e[3H0123456789abcdefghijABCDEFGHIJ\e[3H\eM"
+  ?lineinfo 3 = wrapped
+  ?lineinfo 4 = -
+
+!A wide character at the margin is text, not a fill to carry on
+RESET
+RESIZE 5,10
+PUSH "\e[41mxxxxxxxx\xe5\xa5\xbd\e[m\r\nx"
+RESIZE 5,20
+  ?screen_row 0 = "xxxxxxxx\xe5\xa5\xbd"
+  ?screen_cell 0,9 = bg=idx(1)
+  ?screen_cell 0,10 = bg=idx(0)
+  ?screen_cell 0,19 = bg=idx(0)
+
+!Nor does history carry one on behind it
+RESET
+RESIZE 5,10
+PUSH "\e[41mxxxxxxxx\xe5\xa5\xbd\e[m\r\n1\r\n2\r\n3\r\n4\r\n5"
+  ?history 1 = "xxxxxxxx\xe5\xa5\xbd"
+RESIZE 5,20
+SCROLL -1
+  ?screen_row 0 = "xxxxxxxx\xe5\xa5\xbd"
+  ?screen_cell 0,9 = bg=idx(1)
+  ?screen_cell 0,10 = bg=idx(0)
+  ?screen_cell 0,19 = bg=idx(0)
+SCROLL TO bottom
+
+!A lent wide character that wraps marks its own row
+RESET
+RESIZE 3,10
+PUSH "nnnnnnnnn\xe5\xa5\xbdabcdefg\r\nx\r\n\e[2;2H"
+  ?history 1 = "nnnnnnnnn"
+  ?screen_row 0 = "\xe5\xa5\xbdabcdefg"
+  ?cursor = 1,1
+RESIZE 3,4
+RESIZE 3,10
+  ?history 1 = "nnnnnnnnn"
+  ?screen_row 0 = "\xe5\xa5\xbdabcdefg"
+  ?screen_row 1 = "x"
+  ?screen_row 2 = ""
+  ?cursor = 1,1
+
+!A line split across records lays out as one when pulled back
+RESET
+HISTORY 1000,2368
+RESIZE 5,100
+PUSH "0\r\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n1\r\n2\r\n3\r\n4\r\n$ "
+  ?view = 0,12
+RESIZE 5,90
+  ?view = 0,14
+RESIZE 12,90
+  ?screen_row 0 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  ?screen_row 6 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  ?screen_row 7 = "1"
+  ?screen_row 11 = "$ "
+  ?cursor = 11,2
+  ?history 1 = "0"
+  ?view = 0,13
+HISTORY 0,0
+
+!A mark on a line that continues history goes on the line's first record
+RESET
+HISTORY 1000,2368
+RESIZE 5,10
+PUSH "ab"
+$REP 200: PUSH "0123456789"
+PUSH "\e]133;A\a"
+SCROLL TO top
+  ?lineinfo 0 = wrapped prompt history
+  ?lineinfo 1 = wrapped history
+RESIZE 5,9
+RESIZE 5,10
+SCROLL TO top
+  ?lineinfo 0 = wrapped prompt history
+  ?lineinfo 1 = wrapped history
+
+!A mark that a wrap left mid-line stays with the line's start in history
+RESET
+HISTORY 0,0
+RESIZE 3,10
+PUSH "\r\n\e]133;A\ax\e[H0123456789a\e[3H\n"
+  ?lineinfo 0 = prompt
+RESIZE 3,9
+SCROLL TO top
+  ?lineinfo 0 = wrapped prompt history
+  ?lineinfo 1 = -
+
+!Growing past a marked line's start pulls back an earlier line unmarked
+RESET
+RESIZE 3,10
+PUSH "EEEEEEEEEEEEEEEEEEEEEEEEE\r\n\r\n\r\n"
+PUSH "\e[2H\e]133;A\ax\e[H0123456789a\e[3H\n"
+RESIZE 5,10
+  ?screen_row 0 = "EEEEE"
+  ?lineinfo 0 = -
+  ?screen_row 1 = "0123456789"
+  ?lineinfo 1 = wrapped prompt
+  ?lineinfo 2 = -
+SCROLL TO top
+  ?lineinfo 0 = wrapped history
+  ?lineinfo 1 = wrapped history
+
+!Pulling back a whole split line keeps a mark from its screen rows
+INIT 9,300
+HISTORY 1000,2368
+RESIZE 5,300
+PUSH "\e[5H\e]133;A\a\e[Héééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+  ?lineinfo 1 = wrapped prompt
+SCROLL TO top
+  ?lineinfo 0 = wrapped history
+  ?lineinfo 1 = wrapped history
+  ?lineinfo 2 = wrapped history
+SCROLL TO bottom
+RESIZE 9,300
+  ?lineinfo 0 = wrapped prompt
+  ?lineinfo 1 = wrapped
+  ?lineinfo 7 = -
+  ?screen_row 8 = ""

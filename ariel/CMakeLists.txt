@@ -2,7 +2,9 @@
 # project through add_subdirectory:
 #
 #   target: ariel, an OBJECT library of ariel.c (include ariel.h)
-#   ARIEL_TESTS: tests/test.c as the ariel_unit test (top level: ON)
+#   ARIEL_TESTS: tests/test.c as the ariel_unit test, and the inputs in
+#                tests/fuzz/ replayed through the fuzz target's checks as
+#                ariel_fuzz (top level: ON)
 #   ARIEL_TOOLS: ariel-replay and the fuzz target (top level: ON)
 #
 # A parent may define ARIEL_TRAP on the target so assertions trap in
@@ -63,6 +65,13 @@ if(ARIEL_TESTS)
   add_test(NAME ariel_unit
     COMMAND ariel_test grapheme.txt emoji.txt ${ARIEL_SCRIPTS} ${ARIEL_RECORDINGS}
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+  # Minimized fuzz finds, kept as regressions
+  add_executable(ariel_fuzzcheck tests/fuzz.c)
+  ariel_flags(ariel_fuzzcheck)
+  add_test(NAME ariel_fuzz
+    COMMAND ${CMAKE_COMMAND} -DFUZZ=$<TARGET_FILE:ariel_fuzzcheck>
+            -DDIR=${CMAKE_CURRENT_SOURCE_DIR}/tests/fuzz
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/fuzz.cmake)
 endif()
 
 if(ARIEL_TOOLS)

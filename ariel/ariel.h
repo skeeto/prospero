@@ -268,7 +268,11 @@ void ariel_reset(ariel_Term *, int32_t what);
 
 // The state as a VT stream that rebuilds it when fed to a fresh terminal
 // of the same size, with up to histlines of history. Returns the length
-// needed.
+// needed. The replay prints history through the screen, where a cluster
+// with more than one combining mark takes a slot of a pool sized by
+// capacity: give the fresh terminal capcols*caprows of at least
+// 4*cols*(2*rows+1) or such clusters may lose marks. Rows a shrinking
+// resize lent to history come back as ordinary history.
 ptrdiff_t ariel_export(ariel_Term *, int32_t histlines, uint8_t *out, ptrdiff_t cap);
 
 // A diagnostic text dump of the screen (flags 0) or more. Returns the

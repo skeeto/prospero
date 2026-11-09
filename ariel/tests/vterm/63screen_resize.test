@@ -103,12 +103,18 @@ RESIZE 30,80
   sb_popline 80
   sb_popline 80
   sb_popline 80
-# ariel: TODO L3, history refills the screen when it grows
-#  ?screen_chars 0,0,1,80 = "ABCDE"
-#  ?screen_chars 5,0,6,80 = "Line 1"
-#  ?screen_chars 29,0,30,80 = "Bottom"
-#  ?cursor = 19,0
 WANTSCREEN -b
+# ariel: real history stands in for the harness's popped lines
+RESET
+RESIZE 25,80
+PUSH "ABCDE\r\nABCDE\r\nABCDE\r\nABCDE\r\nABCDE\r\n"
+PUSH "\e[25H\n\n\n\n\n"
+PUSH "\e[HLine 1\e[25HBottom\e[15H"
+RESIZE 30,80
+  ?screen_chars 0,0,1,80 = "ABCDE"
+  ?screen_chars 5,0,6,80 = "Line 1"
+  ?screen_chars 29,0,30,80 = "Bottom"
+  ?cursor = 19,0
 
 !Resize can operate on altscreen
 RESET

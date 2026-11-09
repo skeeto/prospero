@@ -36,7 +36,8 @@ PUSH "FGHI"
 
 !Resize shrink moves cursor
 RESIZE 25,80
-  ?cursor = 0,79
+# ariel: reflow carries the cursor with its line, which now wraps
+  ?cursor = 1,5
 
 !Resize grow doesn't cancel phantom
 RESET

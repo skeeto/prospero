@@ -29,7 +29,9 @@ typedef size_t    uz;
 typedef int32_t   b32;
 #endif
 
-#if defined(ARIEL_TRAP) || defined(ARIEL_TEST)
+#if defined(affirm)
+   // the includer's, e.g. to report the line
+#elif defined(ARIEL_TRAP) || defined(ARIEL_TEST)
 #  define affirm(c)  while (!(c)) __builtin_trap()
 #else
 #  define affirm(c)  while (!(c)) __builtin_unreachable()
@@ -1420,6 +1422,45 @@ typedef struct {
     u8 *more; i32 morelen;
 } Ev;
 
+// A history record: one logical line
+typedef struct {
+    u32 off, len;   // bytes in the ring
+    u32 width;      // cells, wide ones counted twice
+    u16 flags;      // HR_*
+    u16 rcols;      // rows was counted at this width
+    u32 rows;
+    u32 gen;
+} Hent;
+
+// A reading position inside a record
+typedef struct {
+    i32 pos, runend;
+    i32 ncells;     // in the current run
+    u8  mask;
+    Pen pen;
+} Hpos;
+
+// Where the last history row was read, so the next is cheap
+typedef struct {
+    u64  serial;    // the record
+    i64  abs;       // the number of its first row
+    i32  cols;      // at this width, 0: nothing cached
+    i32  sub;       // the sub-row that starts at at
+    Hpos at;
+} HView;
+
+// Cells from (y0, x0) to (y1, x1), x a column boundary
+typedef struct { i64 y0, y1; i32 x0, x1; } Span;
+
+// A selection, rows numbered from the oldest ever (hevicted)
+typedef struct {
+    Span a;         // the anchor's unit
+    i64  ay, py;    // from (ay, ax) to (py, px)
+    i32  ax, px;
+    i32  unit;      // ARIEL_SEL_CHAR, _WORD, _LINE, 0: none
+    b32  block;
+} Sel;
+
 struct ariel_Term {
     u32  magic;
     u32  flags;
@@ -1433,7 +1474,8 @@ struct ariel_Term {
     Grid grid[3];               // main, alternate, spare
     u32  pool;                  // u32[npool][POOLN+1]
     i32  npool, poolused, poolfree;
-    u32  hist, histidx;         // L3
+    i32  spare;                 // grid 2 slots holding cells, for poolgc
+    u32  hist, histidx;         // record ring, Hent[histlines]
 
     // Screen state
     u64  nextid;
@@ -1444,11 +1486,29 @@ struct ariel_Term {
     Cursor saved[2];
     i32  top, bot;              // scroll region rows, inclusive
     u8   tabs[MAXDIM/8];
-    i32  viewoff;
+    i32  viewoff;               // viewport rows above the bottom
     Seg  seg;                   // the cluster left of the cursor
     i32  segx, segy;            // its cell, segy < 0 when there is none
     u32  lastcp;                // for REP, 0 when the last action wasn't text
     i32  cursorshape;           // DECSCUSR value
+
+    // History
+    i32  hfirst, hcount;        // index ring: oldest entry, entries
+    u64  hserial;               // serial of the oldest record
+    u32  hw;                    // ring offset past the newest record
+    u32  hrun;                  // the newest record's last run, ring offset
+    b32  hopen;                 // the newest record continues on row 0
+    u64  hcontid;               //   which has this id
+    i32  hcols;                 // width of the row counts, 0: none yet
+    i32  hwcol;                 // the newest record's last row is this full
+    b32  hlent;                 // reflow pushed what's past this mark
+    u64  hlentser;              //   in this record
+    u32  hlentoff;              //   from this cell
+    i64  hrows;                 // history rows at hcols
+    i64  hevicted;              // rows evicted: the oldest row's number
+    u32  hgen;                  // every history row is at least this new
+    HView hv;                   // where the last history row was read
+    Sel  sel;
 
     // Modes
     u8   appcursor, reverse, origin, autowrap, cursorblink, cursorvisible;
@@ -1531,6 +1591,8 @@ static Layout layout(ariel_Config *cfg)
     if (l.histlines < 0) {
         l.histlines = 0;
         l.histbytes = 0;
+    } else if (l.histbytes>=0 && l.histbytes<(iz)l.capcols*16+256) {
+        l.histbytes = (iz)l.capcols*16 + 256;  // any row fits a record
     }
     if (l.cols<2 || l.rows<1 || l.capcols<l.cols || l.caprows<l.rows ||
         l.capcols>MAXDIM || l.caprows>MAXDIM || l.histlines>(1<<24) ||
@@ -1547,7 +1609,7 @@ static Layout layout(ariel_Config *cfg)
         l.grid[g][2] = (u32)off;  off = align16(off + l.caprows*(iz)sizeof(u16));
     }
     l.pool    = (u32)off;  off = align16(off + (iz)l.npool*(POOLN+1)*4);
-    l.histidx = (u32)off;  off = align16(off + (iz)l.histlines*16);
+    l.histidx = (u32)off;  off = align16(off + (iz)l.histlines*(iz)sizeof(Hent));
     l.hist    = (u32)off;  off = align16(off + l.histbytes);
     if (off > (iz)0xffffffff) {
         return l;
@@ -1650,9 +1712,9 @@ static void poolgc(ariel_Term *t)
     for (i32 i = 0; i < t->poolused; i++) {
         base[(iz)i*(POOLN+1)] |= 0x80000000u;   // tentatively unused
     }
-    for (i32 g = 0; g < 2; g++) {
+    for (i32 g = 0; g < 3; g++) {
         Cell *c = gridcells(t, g);
-        iz    n = (iz)t->capcols * t->caprows;
+        iz    n = (iz)t->capcols * (g<2 ? t->caprows : t->spare);
         for (iz i = 0; i < n; i++) {
             if (c[i].ext >= EXT_POOL) {
                 u32 s = c[i].ext - EXT_POOL;
@@ -1670,6 +1732,18 @@ static void poolgc(ariel_Term *t)
             s[1] = (u32)t->poolfree;
             t->poolfree = i;
         }
+    }
+}
+
+// Unpin spare rows [y0, y1) before refilling them: the gc counts their
+// stale cells as live, so what they last held (a decoded history row,
+// an old screen) would decide which clusters get a slot, and a read
+// such as a dump would change what a later full pool keeps
+static void sparewipe(ariel_Term *t, i32 y0, i32 y1)
+{
+    Cell *c = gridcells(t, 2);
+    for (iz i = (iz)y0*t->capcols; i < (iz)y1*t->capcols; i++) {
+        c[i].ext = 0;
     }
 }
 
@@ -1772,8 +1846,10 @@ static void gotoxy(ariel_Term *t, i32 x, i32 y)
     setcursor(t, x, y);
 }
 
-// Blank cells [x0, x1) of row y, mending wide characters cut at the ends
-static void erase(ariel_Term *t, i32 y, i32 x0, i32 x1)
+// Blank cells [x0, x1) of row y, mending wide characters cut at the ends.
+// Erasing through the margin ends a wrapped line, except for ECH, which
+// leaves the flag as xterm does.
+static void erase_(ariel_Term *t, i32 y, i32 x0, i32 x1, b32 unwrap)
 {
     x0 = clamp(x0, 0, t->cols);
     x1 = clamp(x1, 0, t->cols);
@@ -1788,17 +1864,876 @@ static void erase(ariel_Term *t, i32 y, i32 x0, i32 x1)
     }
     fillcells(r+x0, x1-x0, b);
     segclear(t);
-    if (x1 == t->cols) {
+    if (unwrap && x1==t->cols) {
         head(t, y)->flags &= ~(u32)ARIEL_R_WRAPPED;
     }
     touch(t, y);
 }
 
-// Rows leaving the top of the main screen. History arrives in L3.
-static void pushhistory(ariel_Term *t, i32 slot)
+static void erase(ariel_Term *t, i32 y, i32 x0, i32 x1)
 {
-    (void)t;
-    (void)slot;
+    erase_(t, y, x0, x1, 1);
+}
+
+
+// History: a ring of width-independent records, one per logical line
+//
+// A record is a sequence of runs, each a header and then text. The
+// header is u16 text bytes, u16 cells, u8 mask, then the fields the mask
+// names, little endian: u32 fg, bg, ul, u16 attr. The text holds each
+// cell as its code point in UTF-8, or H_ERASED for an erased cell, with
+// H_WIDE before a wide cell and H_EXTRA before each extra code point of
+// its cluster. Records are contiguous in the ring and lie in index order
+// cyclically, so the oldest is always the next in the way.
+
+enum {
+    HR_WIDE   = 1<<0,   // has a wide cell
+    HR_PROMPT = 1<<1,   // began on an OSC 133 A row
+    HR_JOIN   = 1<<2,   // the line continues in the next record
+    RUN_FG    = 1<<0,
+    RUN_BG    = 1<<1,
+    RUN_UL    = 1<<2,
+    RUN_ATTR  = 1<<3,
+    RUN_WIDE  = 1<<4,   // has a wide cell
+    H_ERASED  = 1,
+    H_WIDE    = 2,
+    H_EXTRA   = 3,
+    RUNMAX    = 0xffff,
+};
+
+static b32 histon(ariel_Term *t)
+{
+    return t->histlines>0 && t->histbytes>=256;
+}
+
+// Longest record: a longer line is split across records
+static u32 recmax(ariel_Term *t)
+{
+    return (u32)izmin(t->histbytes/4, 1<<16);
+}
+
+static Hent *hent(ariel_Term *t, i32 i)
+{
+    affirm(i>=0 && i<t->hcount);
+    Hent *base = at(t, t->histidx);
+    return base + (t->hfirst + i)%t->histlines;
+}
+
+static u8 *hbytes(ariel_Term *t, u32 off)
+{
+    return (u8 *)at(t, t->hist) + off;
+}
+
+static void put16(u8 *p, u32 v) { p[0] = (u8)v; p[1] = (u8)(v>>8); }
+static void put32(u8 *p, u32 v) { put16(p, v); put16(p+2, v>>16); }
+static u32  get16(u8 *p) { return (u32)p[0] | (u32)p[1]<<8; }
+static u32  get32(u8 *p) { return get16(p) | get16(p+2)<<16; }
+
+static i32 utf8len(u32 cp)
+{
+    return cp<0x80 ? 1 : cp<0x800 ? 2 : cp<0x10000 ? 3 : 4;
+}
+
+static i32 pututf8(u8 *p, u32 cp)
+{
+    switch (utf8len(cp)) {
+    case 1: p[0] = (u8)cp;
+            return 1;
+    case 2: p[0] = (u8)(0xc0 | cp>>6);
+            p[1] = (u8)(0x80 | (cp & 0x3f));
+            return 2;
+    case 3: p[0] = (u8)(0xe0 | cp>>12);
+            p[1] = (u8)(0x80 | (cp>>6 & 0x3f));
+            p[2] = (u8)(0x80 | (cp & 0x3f));
+            return 3;
+    }
+    p[0] = (u8)(0xf0 | cp>>18);
+    p[1] = (u8)(0x80 | (cp>>12 & 0x3f));
+    p[2] = (u8)(0x80 | (cp>>6 & 0x3f));
+    p[3] = (u8)(0x80 | (cp & 0x3f));
+    return 4;
+}
+
+// Decode our own, valid UTF-8
+typedef struct { u32 cp; i32 len; } Utf8;
+static Utf8 getutf8(u8 *p)
+{
+    Utf8 r = {p[0], 1};
+    if (r.cp >= 0xf0) {
+        r.cp  = (r.cp&7)<<18 | (p[1]&0x3fu)<<12 | (p[2]&0x3fu)<<6 | (p[3]&0x3fu);
+        r.len = 4;
+    } else if (r.cp >= 0xe0) {
+        r.cp  = (r.cp&15)<<12 | (p[1]&0x3fu)<<6 | (p[2]&0x3fu);
+        r.len = 3;
+    } else if (r.cp >= 0xc0) {
+        r.cp  = (r.cp&31)<<6 | (p[1]&0x3fu);
+        r.len = 2;
+    }
+    return r;
+}
+
+// Rows of a line at width w, filled as the screen would wrap it: a wide
+// cell that doesn't fit leaves a spacer and starts the next row.
+typedef struct { i32 rows, col; } Wrap;
+
+static void wrapnarrow(Wrap *w, i32 n, i32 cols)
+{
+    if (n <= 0) return;
+    if (w->col == cols) {
+        w->rows++;
+        w->col = 0;
+    }
+    w->col += n;
+    i32 extra = (w->col - 1)/cols;
+    w->rows += extra;
+    w->col  -= extra*cols;
+}
+
+static void wrapcell(Wrap *w, i32 width, i32 cols)
+{
+    if (width == 1) {
+        wrapnarrow(w, 1, cols);
+        return;
+    }
+    if (w->col+2 > cols) {
+        w->rows++;
+        w->col = 0;
+    }
+    w->col += 2;
+}
+
+static i32 hdrsize(u8 mask)
+{
+    return 5 + (mask&RUN_FG ? 4 : 0) + (mask&RUN_BG ? 4 : 0) +
+               (mask&RUN_UL ? 4 : 0) + (mask&RUN_ATTR ? 2 : 0);
+}
+
+static u8 penmask(Pen *p)
+{
+    return (u8)((p->fg ? RUN_FG : 0) | (p->bg ? RUN_BG : 0) |
+                (p->ul ? RUN_UL : 0) | (p->attr ? RUN_ATTR : 0));
+}
+
+// Read the run header at pos
+static Hpos hrunat(u8 *rec, i32 pos)
+{
+    Hpos r = {0};
+    u8  *p = rec + pos;
+    i32  n = (i32)get16(p);
+    r.ncells = (i32)get16(p+2);
+    r.mask   = p[4];
+    p += 5;
+    if (r.mask & RUN_FG)   { r.pen.fg   = get32(p);      p += 4; }
+    if (r.mask & RUN_BG)   { r.pen.bg   = get32(p);      p += 4; }
+    if (r.mask & RUN_UL)   { r.pen.ul   = get32(p);      p += 4; }
+    if (r.mask & RUN_ATTR) { r.pen.attr = (u16)get16(p); p += 2; }
+    r.pos    = (i32)(p - rec);
+    r.runend = r.pos + n;
+    return r;
+}
+
+// A decoded history cell
+typedef struct {
+    Cell c;         // ext is 0
+    i32  width;     // 1 or 2
+    i32  nextra;
+    i32  xpos;      // the extras, each H_EXTRA and UTF-8, in the record
+} Hcell;
+
+// The next cell of a record, 0 at its end
+static b32 hnext(u8 *rec, i32 len, Hpos *h, Hcell *o)
+{
+    while (h->pos == h->runend) {
+        if (h->pos >= len) return 0;
+        *h = hrunat(rec, h->pos);
+    }
+    Hcell r = {0};
+    r.c.fg   = h->pen.fg;
+    r.c.bg   = h->pen.bg;
+    r.c.ul   = h->pen.ul;
+    r.c.attr = h->pen.attr;
+    r.width  = 1;
+    u8 *p = rec + h->pos;
+    i32 i = 0;
+    if (p[0] == H_ERASED) {
+        i = 1;
+    } else {
+        if (p[0] == H_WIDE) {
+            r.width = 2;
+            i = 1;
+        }
+        Utf8 u = getutf8(p+i);
+        i += u.len;
+        r.c.cp = u.cp | (r.width==2 ? (u32)KIND_WIDE<<21 : 0);
+        r.xpos = h->pos + i;
+        for (; h->pos+i<h->runend && p[i]==H_EXTRA; r.nextra++) {
+            i += 1 + getutf8(p+i+1).len;
+        }
+    }
+    h->pos += i;
+    *o = r;
+    return 1;
+}
+
+// The extra code points of a decoded cell
+static i32 hextras(u8 *rec, Hcell *c, u32 *out, i32 cap)
+{
+    i32 pos = c->xpos;
+    for (i32 i = 0; i < c->nextra; i++) {
+        Utf8 u = getutf8(rec+pos+1);
+        if (i < cap) out[i] = u.cp;
+        pos += 1 + u.len;
+    }
+    return c->nextra;
+}
+
+static Wrap hwrap(ariel_Term *t, Hent *e, i32 cols)
+{
+    Wrap w = {1, 0};
+    if (!(e->flags&HR_WIDE) || e->width<=(u32)cols) {
+        // Wide cells matter only where they meet the margin
+        wrapnarrow(&w, (i32)e->width, cols);
+        return w;
+    }
+    u8 *rec = hbytes(t, e->off);
+    for (i32 pos = 0; pos < (i32)e->len;) {
+        Hpos h = hrunat(rec, pos);
+        if (!(h.mask & RUN_WIDE)) {
+            wrapnarrow(&w, (i32)get16(rec+pos+2), cols);
+        } else {
+            Hcell c;
+            while (h.pos < h.runend && hnext(rec, h.runend, &h, &c)) {
+                wrapcell(&w, c.width, cols);
+            }
+        }
+        pos = h.runend;
+    }
+    return w;
+}
+
+// Rows of record i at the history's width
+static i32 hrowsof(ariel_Term *t, i32 i)
+{
+    Hent *e = hent(t, i);
+    if (e->rcols != t->hcols) {
+        Wrap w = hwrap(t, e, t->hcols);
+        e->rcols = (u16)t->hcols;
+        e->rows  = (u32)w.rows;
+        if (i == t->hcount-1) t->hwcol = w.col;
+    }
+    return (i32)e->rows;
+}
+
+static void hgenall(ariel_Term *t)
+{
+    t->hgen  = t->gen + 1;
+    t->dirty = 1;
+}
+
+// Count history rows at the screen's width
+static void hsync(ariel_Term *t)
+{
+    if (t->hcols == t->cols) return;
+    t->hcols    = t->cols;
+    t->hrows    = 0;
+    t->hevicted = 0;
+    t->hv.cols  = 0;
+    t->sel.unit = 0;
+    for (i32 i = 0; i < t->hcount; i++) {
+        hrowsof(t, i);  // the newest last, for hwcol
+        t->hrows += hent(t, i)->rows;
+    }
+    hgenall(t);
+}
+
+static i32 hviewclamp(ariel_Term *t)
+{
+    if (t->viewoff > t->hrows) {
+        t->viewoff = (i32)t->hrows;
+        t->dirty   = 1;
+    }
+    return t->viewoff;
+}
+
+static void hevict(ariel_Term *t)
+{
+    i32 rows = hrowsof(t, 0);
+    t->hrows    -= rows;
+    t->hevicted += rows;
+    t->hfirst    = (t->hfirst + 1)%t->histlines;
+    t->hcount--;
+    t->hserial++;
+    if (t->sel.unit && t->sel.ay<t->hevicted) {
+        t->sel.unit = 0;    // its start is gone
+        hgenall(t);
+    }
+    if (!t->hcount) {
+        t->hopen = 0;
+        t->hw    = 0;
+    }
+    hviewclamp(t);
+}
+
+// Room for need more bytes at the end of the newest record, or at the
+// start of a new one when fresh: evict what's in the way, and move the
+// newest record to the ring's start when it would pass the end.
+static void hroom(ariel_Term *t, u32 need, b32 fresh)
+{
+    i32   keep = !fresh;
+    Hent *e    = fresh ? 0 : hent(t, t->hcount-1);
+    u32   beg  = e ? e->off : t->hw;
+    u32   len  = e ? e->len : 0;
+    if (beg+len+need <= (u32)t->histbytes) {
+        u32 end = beg + len + need;
+        while (t->hcount > keep) {
+            u32 off = hent(t, 0)->off;
+            if (off<t->hw || off>=end) break;
+            hevict(t);
+        }
+        return;
+    }
+
+    while (t->hcount>keep && hent(t, 0)->off>=t->hw) {
+        hevict(t);
+    }
+    while (t->hcount>keep && hent(t, 0)->off<len+need) {
+        hevict(t);
+    }
+    if (e) {
+        e = hent(t, t->hcount-1);
+        xmov(hbytes(t, 0), hbytes(t, e->off), e->len);
+        t->hrun -= e->off;
+        e->off   = 0;
+    }
+    t->hw = len;
+}
+
+// Appends cells to the newest record, or measures them (base 0)
+typedef struct {
+    u8  *base;
+    u32  pos;       // the next byte
+    u32  run;       // the open run's header
+    i32  nbytes, ncells;
+    u8   mask;
+    b32  inrun;
+    Pen  pen;
+    i32  mode;      // 0: everything, 1: no styles, 2: no extras either
+    u32  width;
+    b32  wide;
+    Wrap wrap;
+    i32  cols;
+} Henc;
+
+static void hencend(Henc *e)
+{
+    if (e->inrun && e->base) {
+        u8 *p = e->base + e->run;
+        put16(p+0, (u32)e->nbytes);
+        put16(p+2, (u32)e->ncells);
+        p[4] = e->mask;
+    }
+    e->inrun = 0;
+}
+
+// Start a run in style p
+static void hencrun(Henc *e, Pen p)
+{
+    hencend(e);
+    e->inrun  = 1;
+    e->run    = e->pos;
+    e->pen    = p;
+    e->mask   = penmask(&p);
+    e->nbytes = e->ncells = 0;
+    if (e->base) {
+        u8 *q = e->base + e->pos + 5;
+        if (p.fg)   { put32(q, p.fg);   q += 4; }
+        if (p.bg)   { put32(q, p.bg);   q += 4; }
+        if (p.ul)   { put32(q, p.ul);   q += 4; }
+        if (p.attr) { put16(q, p.attr); q += 2; }
+    }
+    e->pos += (u32)hdrsize(e->mask);
+}
+
+static b32 erased(Cell *c)
+{
+    return !cellcp(c) || cellkind(c)==KIND_SPACER;
+}
+
+static i32 hcellsize(ariel_Term *t, Cell *c, i32 mode, u32 *x, i32 *nx)
+{
+    u32 cp = cellcp(c);
+    *nx = 0;
+    if (erased(c)) return 1;
+    i32 n = (cellkind(c)==KIND_WIDE) + utf8len(cp);
+    if (mode<2 && c->ext) {
+        *nx = imin(cellextra(t, c, x, POOLN), POOLN);
+        for (i32 i = 0; i < *nx; i++) {
+            n += 1 + utf8len(x[i]);
+        }
+    }
+    return n;
+}
+
+static void henccell(ariel_Term *t, Henc *e, Cell *c)
+{
+    if (cellkind(c) == KIND_TAIL) return;
+    Pen p = {0};
+    if (!e->mode) {
+        p.fg   = c->fg;
+        p.bg   = c->bg;
+        p.ul   = c->ul;
+        p.attr = c->attr;
+    }
+    u32 x[POOLN];
+    i32 nx;
+    i32 size = hcellsize(t, c, e->mode, x, &nx);
+    if (!e->inrun || p.fg!=e->pen.fg || p.bg!=e->pen.bg || p.ul!=e->pen.ul ||
+        p.attr!=e->pen.attr || e->nbytes+size>RUNMAX || e->ncells==RUNMAX) {
+        hencrun(e, p);
+    }
+    b32 wide = cellkind(c)==KIND_WIDE && !erased(c);
+    if (e->base) {
+        u8 *q = e->base + e->pos;
+        if (erased(c)) {
+            *q = H_ERASED;
+        } else {
+            if (wide) *q++ = H_WIDE;
+            q += pututf8(q, cellcp(c));
+            for (i32 i = 0; i < nx; i++) {
+                *q++ = H_EXTRA;
+                q += pututf8(q, x[i]);
+            }
+        }
+    }
+    e->pos    += (u32)size;
+    e->nbytes += size;
+    e->ncells++;
+    e->width  += 1u + wide;
+    if (wide) {
+        e->mask |= RUN_WIDE;
+        e->wide  = 1;
+    }
+    wrapcell(&e->wrap, 1+wide, e->cols);
+}
+
+// How many of cells [0, n) are printable ASCII that continue the open
+// run, each one byte: the common case, encoded in bulk
+static i32 hplain(Henc *e, Cell *r, i32 n)
+{
+    if (!e->inrun) return 0;
+    n = imin(n, imin(RUNMAX-e->nbytes, RUNMAX-e->ncells));
+    Pen *p = &e->pen;
+    i32  i = 0;
+    if (e->mode) {
+        // Styles are dropped, so only an unstyled run continues
+        if (p->fg || p->bg || p->ul || p->attr) return 0;
+        for (; i<n && r[i].cp-1<0x7f && !r[i].ext; i++) {}
+    } else {
+        for (; i<n && r[i].cp-1<0x7f && !r[i].ext && r[i].fg==p->fg &&
+               r[i].bg==p->bg && r[i].ul==p->ul && r[i].attr==p->attr; i++) {}
+    }
+    return i;
+}
+
+// Append cells [0, n), or measure them, stopping once past max bytes
+static void hencrow(ariel_Term *t, Henc *e, Cell *r, i32 n, u32 max)
+{
+    for (i32 x = 0; x<n && e->pos<=max;) {
+        i32 k = hplain(e, r+x, n-x);
+        if (!k) {
+            henccell(t, e, r+x++);
+            continue;
+        }
+        if (e->base) {
+            u8 *q = e->base + e->pos;
+            for (i32 i = 0; i < k; i++) q[i] = (u8)r[x+i].cp;
+        }
+        e->pos    += (u32)k;
+        e->nbytes += k;
+        e->ncells += k;
+        e->width  += (u32)k;
+        wrapnarrow(&e->wrap, k, e->cols);
+        x += k;
+    }
+}
+
+// Bytes for cells [0, n) in a mode, 0 when over max
+static u32 hmeasure(ariel_Term *t, Cell *r, i32 n, i32 mode, u32 max)
+{
+    Henc e = {0};
+    e.mode = mode;
+    e.cols = t->hcols;
+    hencrow(t, &e, r, n, max);
+    return e.pos>max ? 0 : e.pos;
+}
+
+// A run header, maybe a split, and a fill run: the most beyond the text
+static u32 hslack(void)
+{
+    return 3*(u32)hdrsize(RUN_FG|RUN_BG|RUN_UL|RUN_ATTR);
+}
+
+// How many of cells [0, n) fit max bytes with everything kept
+static i32 hfits(ariel_Term *t, Cell *r, i32 n, u32 max)
+{
+    Henc e = {0};
+    e.cols = t->hcols;
+    i32  k = 0;
+    for (; k < n; k++) {
+        henccell(t, &e, r+k);
+        if (e.pos > max) break;
+    }
+    return k;
+}
+
+// The first record of the newest line, the start of its HR_JOIN chain
+static i32 hlinefirst(ariel_Term *t)
+{
+    i32 first = t->hcount - 1;
+    for (; first>0 && hent(t, first-1)->flags&HR_JOIN; first--) {}
+    return first;
+}
+
+// Append cells r[0, n) to history: to the newest record if cont, else to
+// a new record with flags (HR_PROMPT). A line too long for one record
+// continues in a new one, the old marked HR_JOIN. Styles, then extras,
+// go when the cells are too long for any record. A nonzero size is
+// their bytes with everything kept, already measured.
+static void hpiece(ariel_Term *t, Cell *r, i32 n, b32 cont, u16 flags,
+                   u32 size)
+{
+    u32 max  = recmax(t) - hslack();
+    i32 mode = 0;
+    for (; !size && mode < 3; mode++) {
+        size = hmeasure(t, r, n, mode, max);
+        if (size) break;
+    }
+    affirm(size || !n);     // layout makes room for any row
+    size += hslack();
+
+    cont = cont && t->hcount;
+    if (cont) {
+        // A prompt is a line attribute, on the line's first record
+        Hent *e = hent(t, hlinefirst(t));
+        if (flags&HR_PROMPT && !(e->flags&HR_PROMPT)) {
+            e->flags |= HR_PROMPT;
+            e->gen    = t->gen + 1;
+            t->dirty  = 1;
+        }
+        flags &= (u16)~HR_PROMPT;
+    }
+    b32 fresh = !cont || hent(t, t->hcount-1)->len+size>recmax(t);
+    if (!fresh) {
+        hrowsof(t, t->hcount-1);    // for hwcol
+    } else {
+        if (cont) {
+            hent(t, t->hcount-1)->flags |= HR_JOIN;
+        }
+        if (t->hcount == t->histlines) {
+            hevict(t);
+        }
+    }
+    hroom(t, size, fresh);
+    if (fresh) {
+        t->hcount++;
+        Hent *e  = hent(t, t->hcount-1);
+        e->off   = t->hw;
+        e->len   = 0;
+        e->width = 0;
+        e->flags = flags;
+        e->rcols = (u16)t->hcols;
+        e->rows  = 1;
+        t->hwcol  = 0;
+        t->hrows += 1;
+        if (t->viewoff) t->viewoff++;
+    }
+    if (t->hv.serial == t->hserial+(u64)t->hcount-1) {
+        t->hv.cols = 0;     // its runs may grow
+    }
+
+    Hent *e = hent(t, t->hcount-1);
+    Henc  w = {0};
+    w.base  = hbytes(t, 0);
+    w.pos   = t->hw;
+    w.wrap.rows = (i32)e->rows;
+    w.wrap.col  = t->hwcol;
+    w.cols  = t->hcols;
+    w.mode  = mode;
+    if (e->len) {
+        Hpos run = hrunat(w.base, t->hrun);
+        w.inrun  = 1;
+        w.run    = t->hrun;
+        w.pen    = run.pen;
+        w.mask   = run.mask;
+        w.nbytes = run.runend - run.pos;
+        w.ncells = run.ncells;
+    } else {
+        Pen p = {0};
+        hencrun(&w, p);     // every record has a byte
+    }
+    hencrow(t, &w, r, n, (u32)-1);
+    hencend(&w);
+
+    i32 added = w.wrap.rows - (i32)e->rows;
+    e->len   += w.pos - t->hw;
+    e->width += w.width;
+    e->flags |= w.wide ? HR_WIDE : 0;
+    e->rows   = (u32)w.wrap.rows;
+    e->gen    = t->gen + 1;
+    t->hw     = w.pos;
+    t->hrun   = w.run;
+    t->hwcol  = w.wrap.col;
+    t->hrows += added;
+    if (t->viewoff) {
+        t->viewoff = (i32)(t->viewoff + added);
+        hviewclamp(t);
+    }
+    t->dirty = 1;
+}
+
+// Append as hpiece does, a push too long for one record in pieces, so
+// styles and extras go only when one cell alone is too long
+static void happend(ariel_Term *t, Cell *r, i32 n, b32 cont, u16 flags)
+{
+    u32 max  = recmax(t) - hslack();
+    u32 size = 0;
+    b32 cut  = 0;
+    while (n && !(size = hmeasure(t, r, n, 0, max))) {
+        i32 k = hfits(t, r, n, max);
+        k = k ? k : 1 + (n>1 && cellkind(r+1)==KIND_TAIL);
+        hpiece(t, r, k, cont, flags, 0);
+        r    += k;
+        n    -= k;
+        cont  = 1;
+        flags = 0;
+        cut   = 1;
+    }
+    if (n || !cut) hpiece(t, r, n, cont, flags, size);
+}
+
+// End the newest record's line with a fill: the style of the erased
+// cells trimmed from its end, drawn out to the margin at any width.
+// It reserves its own room: a caller can't count on slack left by an
+// earlier hpiece, which a move packs away.
+static void hfill(ariel_Term *t, Pen p)
+{
+    if (!t->hcount || !penmask(&p)) return;
+    hroom(t, (u32)hdrsize(penmask(&p)), 0);     // may move the record
+    Henc w = {0};
+    w.base = hbytes(t, 0);
+    w.pos  = t->hw;
+    hencrun(&w, p);
+    hencend(&w);
+    Hent *e = hent(t, t->hcount-1);
+    e->len += w.pos - t->hw;
+    t->hw   = w.pos;
+    t->hrun = w.run;
+}
+
+// The style of a line's last row's trailing erased cells, which reflow
+// and history drop and redraw as a fill. Returns the cells kept. A wide
+// character's tail has no code point but is its text, never a fill.
+typedef struct { i32 n; Pen fill; } Trim;
+static b32 trimmable(Cell *c)
+{
+    return cellkind(c)!=KIND_TAIL && erased(c);
+}
+
+static Trim trimrow(Cell *r, i32 n)
+{
+    Trim t = {n, {0}};
+    if (!n || !trimmable(r+n-1)) return t;
+    Cell *c = r + n - 1;
+    for (; t.n>0 && trimmable(r+t.n-1) && r[t.n-1].fg==c->fg &&
+           r[t.n-1].bg==c->bg && r[t.n-1].ul==c->ul &&
+           r[t.n-1].attr==c->attr; t.n--) {}
+    t.fill.fg   = c->fg;
+    t.fill.bg   = c->bg;
+    t.fill.ul   = c->ul;
+    t.fill.attr = c->attr;
+    return t;
+}
+
+// A wrapped row's cells: a spacer at the margin goes when the next row
+// starts with the wide character that left it.
+static i32 wrappedlen(Cell *r, i32 n, b32 nextwide)
+{
+    return n && nextwide && cellkind(r+n-1)==KIND_SPACER ? n-1 : n;
+}
+
+// Push a row leaving the top of the main screen: cells r[0, n), head h,
+// and the id of the row that follows it on the screen, 0 if none.
+static void hpush(ariel_Term *t, Cell *r, i32 n, Head *h, u64 next, b32 nextwide)
+{
+    if (!histon(t)) return;
+    hsync(t);
+    t->hlent = 0;
+    b32 cont    = t->hopen && h->id==t->hcontid;
+    b32 wrapped = !!(h->flags & ARIEL_R_WRAPPED);
+    Trim tr = {wrappedlen(r, n, nextwide), {0}};
+    if (!wrapped) {
+        // A row continuing a line keeps a cell, so it still takes a row
+        tr = trimrow(r, n);
+        if (cont && !tr.n && n) tr.n = 1;
+    }
+    happend(t, r, tr.n, cont, h->flags&ARIEL_R_PROMPT ? HR_PROMPT : 0);
+    if (!wrapped) hfill(t, tr.fill);
+    t->hopen   = wrapped;
+    t->hcontid = next;
+}
+
+static void clearhistory(ariel_Term *t)
+{
+    t->hserial += (u64)t->hcount;
+    t->hfirst   = t->hcount = 0;
+    t->hw       = 0;
+    t->hopen    = 0;
+    t->hrows    = 0;
+    t->hevicted = 0;
+    t->hv.cols  = 0;
+    t->hlent    = 0;
+    t->viewoff  = 0;
+    t->sel.unit = 0;
+    hgenall(t);
+}
+
+// Cells of one row of a record, wrapped at cols
+typedef struct {
+    u8  *rec;
+    i32  len;
+    Hpos at;
+    i32  col, cols;
+} Hiter;
+
+static b32 hrowcell(Hiter *it, Hcell *c)
+{
+    Hpos save = it->at;
+    if (!hnext(it->rec, it->len, &it->at, c)) {
+        return 0;
+    } else if (it->col+c->width > it->cols) {
+        it->at = save;
+        return 0;
+    }
+    it->col += c->width;
+    return 1;
+}
+
+// History row v, 0 the oldest, at the history's width
+typedef struct {
+    i32   idx;      // the record
+    i32   sub;      // its sub-row
+    Hent *e;
+    Hiter it;       // the row's cells
+} Hrow;
+
+// The record holding history row v, and its first row, numbered as v
+static i32 hfind(ariel_Term *t, i64 v, i64 *first)
+{
+    affirm(v>=0 && v<t->hrows);
+    i64    abs = t->hevicted + v;
+    HView *c   = &t->hv;
+    b32    hit = c->cols==t->hcols && c->serial>=t->hserial &&
+                 c->serial-t->hserial < (u64)t->hcount;
+    i32 idx;
+    i64 start;
+    if (hit) {
+        idx   = (i32)(c->serial - t->hserial);
+        start = c->abs;
+    } else if (v < t->hrows/2) {
+        idx   = 0;
+        start = t->hevicted;
+    } else {
+        idx   = t->hcount - 1;
+        start = t->hevicted + t->hrows - hrowsof(t, idx);
+    }
+    while (abs < start) {
+        start -= hrowsof(t, --idx);
+    }
+    while (abs >= start+hrowsof(t, idx)) {
+        start += hrowsof(t, idx++);
+    }
+    *first = start - t->hevicted;
+    return idx;
+}
+
+static Hrow hlocate(ariel_Term *t, i64 v)
+{
+    HView *c     = &t->hv;
+    i64    first = 0;
+    i32    idx   = hfind(t, v, &first);
+    i64    start = t->hevicted + first;
+
+    Hrow r = {0};
+    r.idx  = idx;
+    r.e    = hent(t, idx);
+    r.it.rec  = hbytes(t, r.e->off);
+    r.it.len  = (i32)r.e->len;
+    r.it.cols = t->hcols;
+    i32 sub = (i32)(v - first);
+    if (c->cols==t->hcols && c->serial==t->hserial+(u64)idx && c->sub<=sub) {
+        r.sub   = c->sub;
+        r.it.at = c->at;
+    }
+    for (; r.sub < sub; r.sub++) {
+        Hcell cell;
+        r.it.col = 0;
+        while (hrowcell(&r.it, &cell)) {}
+    }
+    r.it.col  = 0;
+    c->serial = t->hserial + (u64)idx;
+    c->abs    = start;
+    c->cols   = t->hcols;
+    c->sub    = sub;
+    c->at     = r.it.at;
+    return r;
+}
+
+// The newest record continues on the main screen's first row
+static b32 hcontinues(ariel_Term *t)
+{
+    return t->hopen && t->hcontid==gridheads(t, 0)[gridmap(t, 0)[0]].id;
+}
+
+// After a row's cells: the style for the rest of it, the record's fill
+// when the record ended there
+static Cell hrowfill(Hiter *it)
+{
+    Cell c = {0};
+    if (it->at.pos>=it->len && !it->at.ncells) {
+        c.fg   = it->at.pen.fg;
+        c.bg   = it->at.pen.bg;
+        c.ul   = it->at.pen.ul;
+        c.attr = it->at.pen.attr;
+    }
+    return c;
+}
+
+static ariel_RowInfo hrowinfo(ariel_Term *t, Hrow *r)
+{
+    ariel_RowInfo i = {0};
+    i32 rows = (i32)r->e->rows;
+    b32 last = r->sub == rows-1;
+    i.id    = (i64)(1ull<<62 | (t->hserial+(u64)r->idx)<<20 | (u64)(r->sub&0xfffff));
+    i.gen   = r->e->gen - t->hgen < 0x80000000u ? r->e->gen : t->hgen;
+    i.flags = ARIEL_R_HISTORY;
+    if (!last || r->e->flags&HR_JOIN ||
+        (r->idx==t->hcount-1 && hcontinues(t))) {
+        i.flags |= ARIEL_R_WRAPPED;
+    }
+    if (!r->sub && r->e->flags&HR_PROMPT) {
+        i.flags |= ARIEL_R_PROMPT;
+    }
+    return i;
+}
+
+// Text moving under a selection, but not into history, clears it
+static void selclear(ariel_Term *t)
+{
+    if (t->sel.unit) {
+        t->sel.unit = 0;
+        hgenall(t);
+        for (i32 y = 0; y < t->rows; y++) touch(t, y);
+    }
 }
 
 static void reverse(u16 *a, i32 n)
@@ -1818,20 +2753,63 @@ static void rotate(u16 *a, i32 n, i32 k)
 
 // Scroll rows [top, bot] up by n, bringing in blank rows at the bottom.
 // Rows leaving the top of the main screen go to history if hist.
+// The row no longer continues on the row below it
+static void unwrap(ariel_Term *t, i32 y)
+{
+    if (head(t, y)->flags & ARIEL_R_WRAPPED) {
+        head(t, y)->flags &= ~(u32)ARIEL_R_WRAPPED;
+        touch(t, y);
+    }
+}
+
+// Scrolling a region changes the row after the one above it. The bottom
+// row moving up keeps its flag: autowrap set it just before the scroll
+// that brings in its continuation.
 static void scrollup(ariel_Term *t, i32 top, i32 bot, i32 n, b32 hist)
 {
     n = imin(n, bot-top+1);
     if (n <= 0) return;
     u16 *map = gridmap(t, t->scr);
-    if (hist && t->scr==0 && top==0) {
-        for (i32 i = 0; i < n; i++) {
-            pushhistory(t, map[i]);
+    b32  all = 0;   // the last row pushed continues on a new row
+    if (hist && t->scr==0 && top==0 && histon(t)) {
+        Cell *cells = gridcells(t, 0);
+        Head *heads = gridheads(t, 0);
+        // Rows below the region hold still while their numbers grow
+        hsync(t);
+        Sel *s     = &t->sel;
+        i64  base  = t->hevicted + t->hrows;
+        b32  below = s->unit && bot<t->rows-1 && s->py>base+bot;
+        if (below && s->ay<=base+bot) {
+            selclear(t);    // it spans the region's edge
+            below = 0;
         }
+        for (i32 i = 0; i < n; i++) {
+            // The bottom row continues on the blank row the scroll brings
+            // in, still to come, and its spacer is a wide cell's
+            u64   next = i<bot ? heads[map[i+1]].id : 0;
+            Cell *nr   = cells + (iz)map[i<bot ? i+1 : i]*t->capcols;
+            b32   wide = i<bot ? cellkind(nr)==KIND_WIDE : 1;
+            hpush(t, cells+(iz)map[i]*t->capcols, t->cols, heads+map[i], next, wide);
+            all = i == bot;
+        }
+        if (below && s->unit) {
+            i64 d = t->hevicted + t->hrows - base;
+            s->a.y0 += d;
+            s->a.y1 += d;
+            s->ay   += d;
+            s->py   += d;
+        }
+    } else {
+        selclear(t);
     }
+    if (top) unwrap(t, top-1);
     rotate(map+top, bot-top+1, n);
     Cell b = blank(t);
     for (i32 y = bot-n+1; y <= bot; y++) {
         clearrow(t, y, b);
+    }
+    if (all && t->hopen) {
+        t->hcontid = head(t, 0)->id;
     }
 }
 
@@ -1839,8 +2817,11 @@ static void scrolldown(ariel_Term *t, i32 top, i32 bot, i32 n)
 {
     n = imin(n, bot-top+1);
     if (n <= 0) return;
+    selclear(t);
     u16 *map = gridmap(t, t->scr);
+    if (top) unwrap(t, top-1);
     rotate(map+top, bot-top+1, bot-top+1-n);
+    unwrap(t, bot);     // its continuation fell off
     Cell b = blank(t);
     for (i32 y = top; y < top+n; y++) {
         clearrow(t, y, b);
@@ -1986,7 +2967,9 @@ static void restorecursor(ariel_Term *t)
 static void setscreen(ariel_Term *t, i32 scr)
 {
     if (t->scr == scr) return;
-    t->scr = scr;
+    t->scr      = scr;
+    t->viewoff  = 0;
+    t->sel.unit = 0;
     for (i32 y = 0; y < t->rows; y++) {
         touch(t, y);
     }
@@ -2087,6 +3070,7 @@ static void touchall(ariel_Term *t)
     for (i32 y = 0; y < t->rows; y++) {
         touch(t, y);
     }
+    hgenall(t);
 }
 
 
@@ -2244,16 +3228,16 @@ static Cell pencell(ariel_Term *t, u32 cp, i32 kind)
 }
 
 // About to overwrite cells [x, x+w) of r: blank wide halves cut apart
+// Orphaned halves become blanks, as erase leaves them, so an erased cell
+// never carries more than a background.
 static void mend(ariel_Term *t, Cell *r, i32 x, i32 w)
 {
     if (cellkind(r+x) == KIND_TAIL && x > 0) {
-        r[x-1].cp  = 0;
-        r[x-1].ext = 0;
+        r[x-1] = blank(t);
     }
     i32 e = x + w - 1;
     if (cellkind(r+e) == KIND_WIDE && e+1 < t->cols) {
-        r[e+1].cp  = 0;
-        r[e+1].ext = 0;
+        r[e+1] = blank(t);
     }
 }
 
@@ -2270,7 +3254,10 @@ static void advance(ariel_Term *t, i32 w)
 
 static void wrapline(ariel_Term *t)
 {
-    head(t, t->c.y)->flags |= ARIEL_R_WRAPPED;
+    if (t->c.y==t->bot || t->c.y<t->rows-1) {
+        // Not at the bottom below the region, writing over its own row
+        head(t, t->c.y)->flags |= ARIEL_R_WRAPPED;
+    }
     t->c.x = 0;
     lf(t);
 }
@@ -2789,11 +3776,6 @@ static void decaln(ariel_Term *t)
     setcursor(t, 0, 0);
 }
 
-static void clearhistory(ariel_Term *t)
-{
-    (void)t;    // L3
-}
-
 static void ris(ariel_Term *t)
 {
     setscreen(t, 1);
@@ -2940,9 +3922,12 @@ static void outcolor(Out *o, u8 *lead, u32 c, i32 base)
     if (c & COLOR_PAL) {
         i32 i = (i32)(c & 0xff);
         outs(o, (ariel_Str){lead, 1});
-        if (i < 8) {
+        if (base == 50) {
+            outs(o, S("58:5:"));    // underlines have no short forms
+            outi(o, i);
+        } else if (i < 8) {
             outi(o, base + i);
-        } else if (i<16 && base!=58) {
+        } else if (i < 16) {
             outi(o, base + 60 + i - 8);
         } else {
             outi(o, base + 8);
@@ -3505,7 +4490,7 @@ static void csidispatch(ariel_Term *t, u8 final)
         break;
     case 'X':
         t->c.wrapnext = 0;
-        erase(t, y, x, x+n);
+        erase_(t, y, x, x+n, 0);
         segclear(t);
         break;
     case 'Z':
@@ -3805,7 +4790,18 @@ static void oscdispatch(ariel_Term *t)
         i32 v = -1;
         if (k<'A' || k>'D') return;
         if (k=='A') {
-            head(t, t->c.y)->flags |= ARIEL_R_PROMPT;
+            // A line attribute, kept on its first row
+            i32 y = t->c.y;
+            for (; y>0 && head(t, y-1)->flags&ARIEL_R_WRAPPED; y--) {}
+            if (!y && !t->scr && hcontinues(t)) {
+                Hent *e = hent(t, hlinefirst(t));
+                e->flags |= HR_PROMPT;
+                e->gen    = t->gen + 1;
+                t->dirty  = 1;
+            } else {
+                head(t, y)->flags |= ARIEL_R_PROMPT;
+                touch(t, y);
+            }
         } else if (k=='D' && rest.len>2 && rest.data[1]==';') {
             Cut a = cut((ariel_Str){rest.data+2, rest.len-2}, ';');
             v = parseint(a.head);
@@ -3922,6 +4918,54 @@ ariel_Term *ariel_init(void *mem, ptrdiff_t len, ariel_Config *cfg)
     return t;
 }
 
+// Lay history into the new block, compact from the ring's start: the
+// newest records that fit the new limits, the rest evicted
+static void hmove(ariel_Term *n, ariel_Term *t)
+{
+    hsync(t);
+    n->hcols = t->hcols;
+    n->hfirst  = 0;
+    n->hcount  = 0;
+    n->hw      = 0;
+    n->hv.cols = 0;
+    i32 keep = 0;
+    u32 used = 0;
+    if (histon(n)) {
+        for (; keep<t->hcount && keep<n->histlines; keep++) {
+            u32 len = hent(t, t->hcount-1-keep)->len;
+            if (used+len > (u32)n->histbytes) break;
+            used += len;
+        }
+    }
+    i32 drop = t->hcount - keep;
+    i64 rows = 0;
+    for (i32 i = 0; i < drop; i++) {
+        rows += hrowsof(t, i);
+    }
+    for (i32 i = drop; i < t->hcount; i++) {
+        Hent *e = hent(t, i);
+        Hent *d = (Hent *)at(n, n->histidx) + n->hcount++;
+        *d = *e;
+        d->off = n->hw;
+        xcpy(hbytes(n, n->hw), hbytes(t, e->off), e->len);
+        if (i == t->hcount-1) {
+            n->hrun = d->off + (t->hrun - e->off);
+        }
+        n->hw += e->len;
+    }
+    n->hserial  = t->hserial + (u64)drop;
+    n->hrows    = t->hrows - rows;
+    n->hevicted = t->hevicted + rows;
+    if (!keep) {
+        n->hopen = 0;
+        n->hrows = 0;
+    }
+    if (n->sel.unit && n->sel.ay<n->hevicted) {
+        n->sel.unit = 0;
+    }
+    hviewclamp(n);
+}
+
 ariel_Term *ariel_move(ariel_Term *t, void *mem, ptrdiff_t len, ariel_Config *cfg)
 {
     affirm(t->magic == MAGIC);
@@ -3976,7 +5020,11 @@ ariel_Term *ariel_move(ariel_Term *t, void *mem, ptrdiff_t len, ariel_Config *cf
     for (i32 i = 0; i < t->poolused; i++) {
         oldpool[(iz)i*(POOLN+1)] &= 0x800000ffu;
     }
-    n->dirty = 1;
+    hmove(n, t);
+    // Clusters cut down and a dropped selection change rows: moves are
+    // rare, so every row changes, newer than any gen already reported
+    settle(n);
+    touchall(n);
     return n;
 }
 
@@ -4074,13 +5122,47 @@ static ariel_Cell outcell(ariel_Term *t, Cell *c)
     return r;
 }
 
+// Viewport row y as a virtual row: history rows first, then the screen
+static i64 vrow(ariel_Term *t, i32 y)
+{
+    hsync(t);
+    return t->hrows - t->viewoff + y;
+}
+
+static void selmark(ariel_Term *t, i64 abs, ariel_Cell *out, i32 n);
+
 int32_t ariel_row(ariel_Term *t, int32_t y, ariel_Cell *out, int32_t cap)
 {
     affirm(t->magic == MAGIC);
     settle(t);
     if (y<0 || y>=t->rows) return 0;
-    Cell *r = row(t, y);
-    i32   n = imin(cap, t->cols);
+    i64 v = vrow(t, y);
+    i32 n = imin(cap, t->cols);
+    if (v < t->hrows) {
+        Hrow  r = hlocate(t, v);
+        Hcell c;
+        i32   x = 0;
+        while (x<n && hrowcell(&r.it, &c)) {
+            out[x] = outcell(t, &c.c);
+            out[x].extra = (u8)c.nextra;
+            if (c.width==2 && ++x<n) {
+                out[x] = out[x-1];
+                out[x].cp    = 0;
+                out[x].width = 0;
+                out[x].extra = 0;
+            }
+            x++;
+        }
+        Cell       f = hrowfill(&r.it);
+        ariel_Cell o = outcell(t, &f);
+        for (; x < n; x++) {
+            out[x] = o;
+        }
+        selmark(t, t->hevicted+v, out, n);
+        return t->cols;
+    }
+
+    Cell *r = row(t, (i32)(v - t->hrows));
     for (i32 x = 0; x < n; x++) {
         Cell *c = r + x;
         if (x && c->fg==c[-1].fg && c->bg==c[-1].bg && c->ul==c[-1].ul &&
@@ -4096,6 +5178,7 @@ int32_t ariel_row(ariel_Term *t, int32_t y, ariel_Cell *out, int32_t cap)
             out[x] = outcell(t, c);
         }
     }
+    selmark(t, t->hevicted+v, out, n);
     return t->cols;
 }
 
@@ -4103,7 +5186,20 @@ ptrdiff_t ariel_cluster(ariel_Term *t, int32_t x, int32_t y, uint32_t *out, ptrd
 {
     affirm(t->magic == MAGIC);
     if (y<0 || y>=t->rows || x<0 || x>=t->cols) return 0;
-    Cell *c = row(t, y) + x;
+    i64 v = vrow(t, y);
+    if (v < t->hrows) {
+        Hrow  r = hlocate(t, v);
+        Hcell c;
+        for (i32 col = 0; hrowcell(&r.it, &c); col += c.width) {
+            if (x >= col+c.width) continue;
+            if (x>col || !cellcp(&c.c)) return 0;
+            if (cap > 0) out[0] = cellcp(&c.c);
+            i32 room = cap>1 ? (i32)izmin(cap-1, POOLN) : 0;
+            return 1 + hextras(r.it.rec, &c, out+1, room);
+        }
+        return 0;
+    }
+    Cell *c = row(t, (i32)(v - t->hrows)) + x;
     i32 kind = cellkind(c);
     if (kind==KIND_TAIL || kind==KIND_SPACER || !cellcp(c)) return 0;
     if (cap > 0) out[0] = cellcp(c);
@@ -4124,9 +5220,14 @@ ariel_RowInfo ariel_rowinfo(ariel_Term *t, int32_t y)
     settle(t);
     ariel_RowInfo r = {0};
     if (y<0 || y>=t->rows) return r;
-    Head *h = head(t, y);
+    i64 v = vrow(t, y);
+    if (v < t->hrows) {
+        Hrow h = hlocate(t, v);
+        return hrowinfo(t, &h);
+    }
+    Head *h = head(t, (i32)(v - t->hrows));
     r.id    = (int64_t)h->id;
-    r.gen   = h->gen;
+    r.gen   = h->gen - t->hgen < 0x80000000u ? h->gen : t->hgen;
     r.flags = h->flags;
     return r;
 }
@@ -4142,7 +5243,7 @@ ariel_Cursor ariel_cursor(ariel_Term *t)
     affirm(t->magic == MAGIC);
     ariel_Cursor r = {0};
     r.x = t->c.x;
-    r.y = t->viewoff ? -1 : t->c.y;
+    r.y = t->c.y+t->viewoff<t->rows ? t->c.y+t->viewoff : -1;
     i32 s = t->cursorshape;
     r.shape   = s<=2 ? ARIEL_CUR_BLOCK : s<=4 ? ARIEL_CUR_UNDERLINE : ARIEL_CUR_BAR;
     r.blink   = s ? (u8)(s & 1) : t->cursorblink;
@@ -4547,43 +5648,1336 @@ ariel_Str ariel_scheme(ariel_Term *t, int32_t dark)
 }
 
 
-// Viewport, selection, copy (history and selection arrive in L3)
+// Viewport, selection, copy
+
+// Like Out, but counts what doesn't fit
+typedef struct {
+    u8 *buf;
+    iz  len, cap;
+} Dump;
+
+static void dumpbytes(Dump *d, ariel_Str s)
+{
+    iz n = s.len;
+    if (d->len < d->cap) {
+        iz room = d->cap - d->len;
+        xcpy(d->buf+d->len, s.data, n<room ? n : room);
+    }
+    d->len += n;
+}
+
+static void dumpout(Dump *d, Out *o)
+{
+    ariel_Str s = {o->buf, o->len};
+    dumpbytes(d, s);
+}
+
+// Virtual row v's cells (history rows decoded into slot of the spare
+// grid) and its flags. Call spareend when done with the cells. Cells
+// end at end: a record's last row may be wrapped yet short, the record
+// split from a line too long for one, the rest in the next. A history
+// row's sub is its row within its record, 0 on the screen.
+typedef struct { Cell *cells; u32 flags; i32 end, sub; } Vrow;
+static Vrow vcells(ariel_Term *t, i64 v, i32 slot)
+{
+    Vrow r = {0};
+    if (v >= t->hrows) {
+        i32 y = (i32)(v - t->hrows);
+        r.cells = row(t, y);
+        r.flags = head(t, y)->flags;
+        r.end   = t->cols;
+        return r;
+    }
+    affirm(slot < t->caprows);
+    Hrow  h = hlocate(t, v);
+    Cell *c = gridcells(t, 2) + (iz)slot*t->capcols;
+    sparewipe(t, slot, slot+1);
+    t->spare = imax(t->spare, slot+1);
+    Hcell hc;
+    i32   x = 0;
+    for (; hrowcell(&h.it, &hc); x += hc.width) {
+        c[x] = hc.c;
+        u32 extra[POOLN];
+        i32 n = imin(hextras(h.it.rec, &hc, extra, POOLN), POOLN);
+        for (i32 i = 0; i < n; i++) {
+            celljoin(t, c+x, extra[i]);
+        }
+        if (hc.width == 2) {
+            c[x+1]    = hc.c;
+            c[x+1].cp = (u32)KIND_TAIL<<21;
+        }
+    }
+    fillcells(c+x, t->cols-x, hrowfill(&h.it));
+    b32 on = h.it.at.pos < h.it.len;
+    if (!on && x==t->cols-1 && h.idx==t->hcount-1 && hcontinues(t)) {
+        // The open record's end, continued on screen by a wide cell
+        Cell *r0 = gridcells(t, 0) + (iz)gridmap(t, 0)[0]*t->capcols;
+        on = cellkind(r0) == KIND_WIDE;
+    }
+    if (h.it.col<t->cols && on) {
+        c[t->cols-1].cp = (u32)KIND_SPACER<<21;    // a wide cell went on
+    }
+    r.cells = c;
+    r.flags = hrowinfo(t, &h).flags;
+    r.end   = t->cols;
+    r.sub   = h.sub;
+    if (h.sub == (i32)h.e->rows-1) r.end = x;
+    return r;
+}
+
+static void spareend(ariel_Term *t)
+{
+    t->spare = 0;
+}
 
 void ariel_scroll(ariel_Term *t, int32_t rows)
 {
     affirm(t->magic == MAGIC);
-    (void)rows;
+    if (t->scr) return;
+    hsync(t);
+    i64 off = t->viewoff - (i64)rows;
+    off = off<0 ? 0 : off>t->hrows ? t->hrows : off;
+    if (off != t->viewoff) {
+        t->viewoff = (i32)off;
+        t->dirty   = 1;
+    }
 }
 
+// The first row of each record and screen line that began at a prompt
 void ariel_scrollto(ariel_Term *t, int32_t where)
 {
     affirm(t->magic == MAGIC);
-    (void)where;
+    if (t->scr) return;
+    hsync(t);
+    i64 top  = t->hrows - t->viewoff;   // virtual row at the top
+    i64 dest = top;
+    switch (where) {
+    case ARIEL_TO_BOTTOM: dest = t->hrows;  break;
+    case ARIEL_TO_TOP:    dest = 0;         break;
+    case ARIEL_TO_PREVMARK:
+        dest = -1;
+        for (i64 y = top-t->hrows-1; dest<0 && y>=0; y--) {
+            if (head(t, (i32)y)->flags & ARIEL_R_PROMPT) dest = t->hrows + y;
+        }
+        for (i64 start = t->hrows, i = t->hcount-1; dest<0 && i>=0; i--) {
+            start -= hrowsof(t, (i32)i);
+            if (start<top && hent(t, (i32)i)->flags&HR_PROMPT) dest = start;
+        }
+        if (dest < 0) return;
+        break;
+    case ARIEL_TO_NEXTMARK:
+        dest = -1;
+        for (i64 start = 0, i = 0; dest<0 && i<t->hcount; i++) {
+            if (start>top && hent(t, (i32)i)->flags&HR_PROMPT) dest = start;
+            start += hrowsof(t, (i32)i);
+        }
+        for (i64 y = imax((i32)(top-t->hrows+1), 0); dest<0 && y<t->rows; y++) {
+            if (head(t, (i32)y)->flags & ARIEL_R_PROMPT) dest = t->hrows + y;
+        }
+        if (dest < 0) return;
+        break;
+    default:
+        return;
+    }
+    i64 off = t->hrows - dest;
+    t->viewoff = (i32)(off<0 ? 0 : off);
+    t->dirty   = 1;
 }
 
 ariel_View ariel_view(ariel_Term *t)
 {
     affirm(t->magic == MAGIC);
+    hsync(t);
     ariel_View r = {0};
+    i64 total = t->rows + (t->scr ? 0 : t->hrows);
     r.offset = t->viewoff;
-    r.total  = t->rows;
+    r.total  = (i32)(total>0x7fffffff ? 0x7fffffff : total);
     return r;
+}
+
+// Positions are (row, column boundary), rows numbered as hevicted
+static b32 before(i64 ay, i32 ax, i64 by, i32 bx)
+{
+    return ay<by || (ay==by && ax<bx);
+}
+
+static i32 cellclass(ariel_Term *t, Cell *r, i32 x)
+{
+    if (cellkind(r+x)==KIND_TAIL && x) x--;
+    u32 cp = cellcp(r+x);
+    if (!cp || cp==' ' || cellkind(r+x)==KIND_SPACER) return 0;
+    for (i32 i = 0; i < t->ndelims; i++) {
+        if (cp == t->delims[i]) return 1;
+    }
+    return 2;
+}
+
+// Flags of sub-row sub of history record idx, without decoding it
+static u32 hflags(ariel_Term *t, i32 idx, i32 sub)
+{
+    Hrow r = {0};
+    r.idx = idx;
+    r.sub = sub;
+    r.e   = hent(t, idx);
+    return hrowinfo(t, &r).flags;
+}
+
+// Where a word of class k runs leftward from column x of row r
+static i32 wordleft(ariel_Term *t, Cell *r, i32 x, i32 k)
+{
+    while (x>0 && cellclass(t, r, x-1)==k) {
+        x--;
+        if (cellkind(r+x)==KIND_TAIL && x) x--;
+    }
+    return x;
+}
+
+// A word of class k reaching (s->y0, 0), history row sub of a record,
+// walks left through the record's rows above in one pass forward from
+// its first, since each step back would rescan the record. Returns 0
+// when it reaches the record's first row, s->y0 left there.
+static b32 wordback(ariel_Term *t, Span *s, i32 sub, i32 k)
+{
+    i64 y    = s->y0;
+    b32 stop = 0;
+    for (i64 p = y-sub; p < y; p++) {
+        Vrow r = vcells(t, p, 0);
+        i32  e = t->cols;
+        if (cellkind(r.cells+e-1) == KIND_SPACER) e--;
+        if (!(r.flags&ARIEL_R_WRAPPED) || cellclass(t, r.cells, e-1)!=k) {
+            stop  = 1;
+            s->y0 = p + 1;
+            s->x0 = 0;
+        } else {
+            i32 x = wordleft(t, r.cells, e, k);
+            if (x) {
+                stop  = 1;
+                s->y0 = p;
+                s->x0 = x;
+            }
+        }
+    }
+    if (!stop) {
+        s->y0 = y - sub;
+        s->x0 = 0;
+    }
+    return stop;
+}
+
+// The unit around (v, x), in virtual rows. Each row decodes once, and
+// history lines go a record at a time, so a unit costs its length.
+static Span selunit(ariel_Term *t, i32 unit, i64 v, i32 x)
+{
+    Span s   = {v, v, x, x};
+    i64  top = t->scr ? t->hrows : 0;   // the alternate screen has no history
+    i64  end = t->hrows + t->rows;      // virtual rows
+    if (unit == ARIEL_SEL_LINE) {
+        s.x0 = 0;
+        s.x1 = t->cols;
+        while (s.y0 > t->hrows &&
+               head(t, (i32)(s.y0-1-t->hrows))->flags&ARIEL_R_WRAPPED) {
+            s.y0--;
+        }
+        if (s.y0>top && s.y0<=t->hrows) {
+            // A record's rows are wrapped but for its last
+            i64 first = 0;
+            i32 idx   = hfind(t, s.y0-1, &first);
+            while (hflags(t, idx, (i32)(s.y0-1-first)) & ARIEL_R_WRAPPED) {
+                s.y0 = first;
+                if (!idx) break;
+                first -= hrowsof(t, --idx);
+            }
+        }
+        if (s.y1 < t->hrows) {
+            i64 first = 0;
+            i32 idx   = hfind(t, s.y1, &first);
+            for (;;) {
+                i32 rows = hrowsof(t, idx);
+                s.y1 = first + rows - 1;
+                if (!(hflags(t, idx, rows-1) & ARIEL_R_WRAPPED)) break;
+                s.y1++;
+                first += rows;
+                if (++idx == t->hcount) break;
+            }
+        }
+        while (s.y1>=t->hrows && s.y1<end-1 &&
+               head(t, (i32)(s.y1-t->hrows))->flags&ARIEL_R_WRAPPED) {
+            s.y1++;
+        }
+    } else if (unit == ARIEL_SEL_WORD) {
+        i32  cx = imin(x, t->cols-1);
+        Vrow r  = vcells(t, v, 0);
+        i32  k  = cellclass(t, r.cells, cx);
+        if (cellkind(r.cells+cx)==KIND_TAIL && cx) cx--;
+        s.x0 = cx;
+        s.x1 = cx + (cellkind(r.cells+cx)==KIND_WIDE ? 2 : 1);
+        if (k == 1) return s;
+        for (Vrow c = r;;) {    // leftward, c the row at s.y0
+            s.x0 = wordleft(t, c.cells, s.x0, k);
+            if (s.x0 || s.y0==top) break;
+            if (c.sub) {
+                if (wordback(t, &s, c.sub, k)) break;
+                c.sub = 0;      // at the record's first row, x0 = 0
+                if (!s.y0) break;
+            }
+            Vrow p = vcells(t, s.y0-1, 0);
+            i32  e = t->cols;
+            if (!(p.flags & ARIEL_R_WRAPPED)) break;
+            if (cellkind(p.cells+e-1) == KIND_SPACER) e--;
+            if (cellclass(t, p.cells, e-1) != k) break;
+            s.y0--;
+            s.x0 = e;
+            c    = p;
+        }
+        Vrow r1 = vcells(t, s.y1, 0);
+        for (;;) {      // rightward, r1 the row at s.y1
+            i32 e = t->cols;
+            if (cellkind(r1.cells+e-1)==KIND_SPACER && r1.flags&ARIEL_R_WRAPPED) e--;
+            if (s.x1 >= e) {
+                if (!(r1.flags&ARIEL_R_WRAPPED) || s.y1==end-1) break;
+                Vrow n = vcells(t, s.y1+1, 0);
+                if (cellclass(t, n.cells, 0) != k) break;
+                s.y1++;
+                s.x1 = 0;
+                r1   = n;
+            }
+            if (cellclass(t, r1.cells, s.x1) != k) break;
+            s.x1 += cellkind(r1.cells+s.x1)==KIND_WIDE ? 2 : 1;
+        }
+    }
+    return s;
+}
+
+static void selset(ariel_Term *t, Span a, Span p)
+{
+    Sel *s = &t->sel;
+    if (before(p.y0, p.x0, a.y0, a.x0)) {
+        s->ay = p.y0;  s->ax = p.x0;
+        s->py = a.y1;  s->px = a.x1;
+    } else {
+        s->ay = a.y0;  s->ax = a.x0;
+        s->py = p.y1;  s->px = p.x1;
+    }
 }
 
 void ariel_select(ariel_Term *t, int32_t op, int32_t x, int32_t y)
 {
     affirm(t->magic == MAGIC);
-    (void)op;
-    (void)x;
-    (void)y;
+    hsync(t);
+    Sel *s    = &t->sel;
+    i32 kind  = op & 0xff;
+    b32 block = !!(op & ARIEL_SEL_BLOCK);
+    x = clamp(x, 0, t->cols);
+    y = clamp(y, 0, t->rows-1);
+    i64 v = vrow(t, y);
+    switch (kind) {
+    case ARIEL_SEL_CLEAR:
+        s->unit = 0;
+        break;
+    case ARIEL_SEL_ALL: {
+        Span a = {t->scr ? t->hrows : 0, t->hrows+t->rows-1, 0, t->cols};
+        s->unit  = ARIEL_SEL_CHAR;
+        s->block = 0;
+        s->a     = a;
+        selset(t, a, a);
+    } break;
+    case ARIEL_SEL_CHAR:
+    case ARIEL_SEL_WORD:
+    case ARIEL_SEL_LINE:
+        s->unit  = kind;
+        s->block = block && kind==ARIEL_SEL_CHAR;
+        s->a     = selunit(t, kind, v, x);
+        selset(t, s->a, s->a);
+        break;
+    case ARIEL_SEL_EXTEND:
+        if (!s->unit) {
+            s->unit  = ARIEL_SEL_CHAR;
+            s->block = block;
+            s->a     = selunit(t, ARIEL_SEL_CHAR, v, x);
+        } else {
+            s->a.y0 -= t->hevicted;     // back to virtual rows, as below
+            s->a.y1 -= t->hevicted;
+        }
+        s->block = s->block || (block && s->unit==ARIEL_SEL_CHAR);
+        selset(t, s->a, selunit(t, s->unit, v, x));
+        break;
+    default:
+        return;
+    }
+    // Rows are numbered from the oldest ever, so they hold still
+    s->a.y0 += t->hevicted;
+    s->a.y1 += t->hevicted;
+    s->ay   += t->hevicted;
+    s->py   += t->hevicted;
+    spareend(t);
+    touchall(t);
 }
 
+static void selmark(ariel_Term *t, i64 abs, ariel_Cell *out, i32 n)
+{
+    Sel *s = &t->sel;
+    if (!s->unit || abs<s->ay || abs>s->py) return;
+    i32 x0 = abs==s->ay ? s->ax : 0;
+    i32 x1 = abs==s->py ? s->px : t->cols;
+    if (s->block) {
+        x0 = imin(s->ax, s->px);
+        x1 = imax(s->ax, s->px);
+    }
+    if (x0>0 && x0<n && !out[x0].width) x0--;   // wide cells whole
+    if (x1>0 && x1<n && !out[x1].width) x1++;
+    for (i32 x = x0; x < imin(x1, n); x++) {
+        out[x].attr |= ARIEL_A_SELECTED;
+    }
+}
+
+// Selected text: a line's rows joined, its trailing blanks dropped, and
+// lines separated by LF. A block's rows are lines of their own.
 ptrdiff_t ariel_copy(ariel_Term *t, uint8_t *out, ptrdiff_t cap)
 {
     affirm(t->magic == MAGIC);
-    (void)out;
-    (void)cap;
+    hsync(t);
+    Sel *s = &t->sel;
+    Dump d = {out, 0, cap};
+    if (!s->unit) return 0;
+    i64 end = t->hevicted + t->hrows + t->rows;
+    i64 beg = s->ay<t->hevicted ? t->hevicted : s->ay;
+    for (i64 a = beg; a<=s->py && a<end; a++) {
+        i64   v  = a - t->hevicted;
+        Vrow  vr = vcells(t, v, 0);
+        Cell *r  = vr.cells;
+        u32   fl = vr.flags;
+        // A history row's extras come from its record, as the decoded
+        // cells hold only those the pool had room for
+        b32   hist = v < t->hrows;
+        Hrow  h    = {0};
+        Hcell hc   = {0};
+        i32   hx   = 0, hw = 0;     // the record's cell over [hx, hx+hw)
+        if (hist) h = hlocate(t, v);
+        i32   x0 = a==s->ay ? s->ax : 0;
+        i32   x1 = a==s->py ? s->px : t->cols;
+        if (s->block) {
+            x0 = imin(s->ax, s->px);
+            x1 = imax(s->ax, s->px);
+        }
+        x0 = imin(x0, t->cols);
+        x1 = imin(x1, t->cols);
+        if (x0>0 && x0<t->cols && cellkind(r+x0)==KIND_TAIL) x0--;
+        if (x1>0 && x1<t->cols && cellkind(r+x1)==KIND_TAIL) x1++;
+        b32 joined = !s->block && a<s->py && fl&ARIEL_R_WRAPPED && x1==t->cols;
+        i32 e = joined ? imax(x0, vr.end) : x1;
+        if (!joined) {
+            for (; e > x0; e--) {
+                Cell *c = r + e - 1;
+                if (cellkind(c) == KIND_TAIL) continue;
+                if (!erased(c) && cellcp(c)!=' ') break;
+            }
+        }
+        for (i32 x = x0; x < e; x++) {
+            Cell *c = r + x;
+            u8    buf[64];
+            Out   o = newout(buf, countof(buf));
+            i32   k = cellkind(c);
+            if (k==KIND_TAIL || k==KIND_SPACER) continue;
+            oututf8(&o, cellcp(c) ? cellcp(c) : ' ');
+            u32 extra[POOLN];
+            i32 n = 0;
+            if (hist) {
+                while (hx+hw<=x && hrowcell(&h.it, &hc)) {
+                    hx += hw;
+                    hw  = hc.width;
+                }
+                if (hx==x && hw) n = hextras(h.it.rec, &hc, extra, POOLN);
+            } else {
+                n = cellextra(t, c, extra, POOLN);
+            }
+            n = imin(n, POOLN);
+            for (i32 i = 0; i < n; i++) {
+                oututf8(&o, extra[i]);
+            }
+            dumpout(&d, &o);
+        }
+        if (!joined && a<s->py) {
+            dumpbytes(&d, S("\n"));
+        }
+    }
+    spareend(t);
+    return d.len;
+}
+
+
+// Reflow: the main screen's lines rewrapped at a new width
+//
+// The screen's lines, joined to the open record of history when the
+// first continues it, are walked as one stream of cells and line ends,
+// and laid into the spare grid at the new width, bottom-anchored. Rows
+// that no longer fit go to history, rows that now fit come back from it.
+// History records are never rewritten: an open record is appended to or
+// cut short in place.
+
+// Column of a record where cells reach coloff, as a reading position
+static Hpos hseek(u8 *rec, i32 len, i32 coloff)
+{
+    Hpos  h = {0};
+    Hcell c;
+    for (i32 col = 0; col < coloff;) {
+        Hpos save = h;
+        if (!hnext(rec, len, &h, &c)) break;
+        if (col+c.width > coloff) {
+            h = save;
+            break;
+        }
+        col += c.width;
+    }
+    return h;
+}
+
+// Cut history after the cells of record idx before column coloff
+static void htruncate(ariel_Term *t, i32 idx, i32 coloff)
+{
+    while (t->hcount > idx+1) {
+        t->hrows -= hrowsof(t, t->hcount-1);
+        t->hcount--;
+    }
+    Hent *e = hent(t, idx);
+    t->hrows -= hrowsof(t, idx);
+    if (coloff <= 0) {
+        t->hcount--;
+        t->hw   = 0;
+        t->hrun = 0;
+        if (t->hcount) {
+            // The newest now, it may reopen (HR_JOIN): find its last run
+            e = hent(t, t->hcount-1);
+            u8 *rec = hbytes(t, e->off);
+            u32 run = 0;
+            for (u32 pos = 0; pos < e->len; pos = (u32)hrunat(rec, (i32)pos).runend) {
+                run = pos;
+            }
+            t->hw    = e->off + e->len;
+            t->hrun  = e->off + run;
+            t->hwcol = hwrap(t, e, t->hcols).col;  // was the cut record's
+        }
+        t->hv.cols = 0;
+        return;
+    }
+
+    u8  *rec = hbytes(t, e->off);
+    Hpos h   = hseek(rec, (i32)e->len, coloff);
+    // Find h's run, and end it there
+    u32 run = 0;
+    for (u32 pos = 0; pos < e->len;) {
+        Hpos r = hrunat(rec, (i32)pos);
+        if (h.pos <= r.runend && h.pos >= r.pos) {
+            run = pos;
+            break;
+        }
+        pos = (u32)r.runend;
+    }
+    Hpos  r = hrunat(rec, (i32)run);
+    Hpos  q = r;
+    i32   n = 0;
+    Hcell c;
+    while (q.pos < h.pos && hnext(rec, r.runend, &q, &c)) n++;
+    put16(rec+run+0, (u32)(h.pos - r.pos));
+    put16(rec+run+2, (u32)n);
+    e->len   = (u32)h.pos;
+    e->width = (u32)coloff;
+    e->flags &= (u16)~HR_JOIN;  // the screen continues it now, if anything
+    e->rcols = 0;
+    e->gen   = t->gen + 1;
+    t->hw    = e->off + e->len;
+    t->hrun  = e->off + run;
+    t->hrows += hrowsof(t, idx);
+    t->hv.cols = 0;
+}
+
+// RI_SEAM: a line split for size goes on in the next record, its
+// columns counted from there (as anchors in the open record are)
+enum { RI_CELL, RI_EOL, RI_SEAM, RI_END };
+
+typedef struct {
+    i32   kind;
+    b32   hist;     // from history
+    i32   line;     // screen line, -1 for history's own lines
+    Cell  c;        // a screen cell keeps its pool reference
+    i32   width;
+    i32   y, x;     // a screen cell's old row and column
+    u8   *rec;      // a history cell's record
+    Hcell hc;
+    Pen   fill;     // RI_EOL
+} Ritem;
+
+typedef struct {
+    ariel_Term *t;
+    i32   oldcols, oldrows, used;
+    i32   nrec;     // records when the walk began
+    b32   cont;     // the newest record continues the screen's first line
+    // History part
+    i32   idx;      // record, hcount once past history
+    u8   *rec;
+    i32   len;
+    Hpos  at;
+    // Screen part
+    i32   y, x, end;
+    b32   ends;     // row y ends its line
+    Pen   fill;
+    // Lines
+    i32   line;     // screen line, -1 for history's own
+    b32   linestart;
+    b32   prompt;
+} Rwalk;
+
+static Cell *oldrow(Rwalk *w, i32 y)
+{
+    ariel_Term *t = w->t;
+    return gridcells(t, 0) + (iz)gridmap(t, 0)[y]*t->capcols;
+}
+
+static Head *oldhead(Rwalk *w, i32 y)
+{
+    ariel_Term *t = w->t;
+    return gridheads(t, 0) + gridmap(t, 0)[y];
+}
+
+// The cells of old row y that count, and how its line ends
+static void rwrow(Rwalk *w)
+{
+    i32   y = w->y;
+    Cell *r = oldrow(w, y);
+    Pen   z = {0};
+    w->x    = 0;
+    w->fill = z;
+    w->ends = !(oldhead(w, y)->flags & ARIEL_R_WRAPPED) || y==w->oldrows-1;
+    if (w->ends) {
+        Trim tr = trimrow(r, w->oldcols);
+        w->end  = tr.n;
+        w->fill = tr.fill;
+    } else {
+        b32 nextwide = cellkind(oldrow(w, y+1)) == KIND_WIDE;
+        w->end = wrappedlen(r, w->oldcols, nextwide);
+    }
+}
+
+// Whether the screen line from old row y is a prompt: a mark on any of
+// its rows, since writes may join rows into a line after the mark
+static b32 rwprompt(Rwalk *w, i32 y)
+{
+    for (; y < w->used; y++) {
+        u32 f = oldhead(w, y)->flags;
+        if (f & ARIEL_R_PROMPT) return 1;
+        if (!(f & ARIEL_R_WRAPPED)) break;
+    }
     return 0;
+}
+
+static void rwrecord(Rwalk *w, i32 idx, Hpos at)
+{
+    ariel_Term *t = w->t;
+    w->idx = idx;
+    if (idx < w->nrec) {
+        Hent *e = hent(t, idx);
+        w->rec  = hbytes(t, e->off);
+        w->len  = (i32)e->len;
+        w->at   = at;
+        w->line = idx==w->nrec-1 && w->cont ? 0 : -1;
+        w->prompt = !!(e->flags & HR_PROMPT);
+    } else {
+        w->y    = 0;
+        w->line = 0;
+        w->prompt = rwprompt(w, 0);
+        rwrow(w);
+    }
+}
+
+static Ritem rnext(Rwalk *w)
+{
+    ariel_Term *t = w->t;
+    Ritem r = {0};
+    r.line = w->line;
+    while (w->idx < w->nrec) {
+        if (hnext(w->rec, w->len, &w->at, &r.hc)) {
+            r.kind  = RI_CELL;
+            r.hist  = 1;
+            r.c     = r.hc.c;
+            r.width = r.hc.width;
+            r.rec   = w->rec;
+            return r;
+        }
+        Hiter it = {0};
+        it.at  = w->at;
+        it.len = w->len;
+        Cell f = hrowfill(&it);
+        Pen  fill = {f.fg, f.bg, f.ul, f.attr, 0};
+        b32  join = !!(hent(t, w->idx)->flags & HR_JOIN);
+        b32  cont = w->idx==w->nrec-1 && w->cont;
+        Hpos z = {0};
+        rwrecord(w, w->idx+1, z);
+        if (cont) {
+            break;      // into the screen's first line
+        } else if (join && w->idx<w->nrec) {
+            r.kind = RI_SEAM;
+            return r;
+        }
+        r.kind  = RI_EOL;
+        r.fill  = fill;
+        w->linestart = 1;
+        return r;
+    }
+
+    for (;;) {
+        if (w->y >= w->used) {
+            r.kind = RI_END;
+            return r;
+        }
+        Cell *row = oldrow(w, w->y);
+        for (; w->x<w->end && cellkind(row+w->x)==KIND_TAIL; w->x++) {}
+        if (w->x < w->end) {
+            Cell *c = row + w->x;
+            r.kind  = RI_CELL;
+            r.c     = *c;
+            r.width = cellkind(c)==KIND_WIDE && !erased(c) ? 2 : 1;
+            r.y     = w->y;
+            r.x     = w->x++;
+            if (cellkind(c) == KIND_SPACER) {
+                r.c.cp = 0;     // a spacer off the margin is a blank
+            }
+            return r;
+        }
+        b32 ends = w->ends;
+        Pen fill = w->fill;
+        if (++w->y < w->used) {
+            rwrow(w);
+        }
+        if (ends) {
+            r.kind  = RI_EOL;
+            r.fill  = fill;
+            w->line++;
+            w->linestart = 1;
+            if (w->y < w->used) {
+                w->prompt = rwprompt(w, w->y);
+            }
+            return r;
+        }
+    }
+}
+
+// A cursor carried through the reflow
+typedef struct {
+    Cursor *c;
+    i32     line, off;  // screen line and its logical column
+    i32     row, col;   // placed, row -1 until then
+    b32     wrapnext;
+} Anchor;
+
+// Where items land at the new width
+typedef struct {
+    i32 cols;
+    i32 rows;       // rows started
+    i32 col;
+    b32 open;       // the last row takes more cells
+    i32 off;        // logical column in the line
+} Place;
+
+static void anchorat(Anchor *a, i32 row, i32 col, i32 cols)
+{
+    a->row      = row;
+    a->col      = imin(col, cols-1);
+    a->wrapnext = col == cols;
+}
+
+// Place an item: returns the cell's column, -1 for the margin spacer
+// that a wide cell leaves when it wraps (*spacer), or -1 otherwise
+typedef struct { i32 col; b32 newrow, wrapped, spacer; } Spot;
+static Spot place(Place *p, Ritem *it, Anchor *a, i32 na)
+{
+    Spot s = {-1, 0, 0, 0};
+    switch (it->kind) {
+    case RI_CELL:
+        if (!p->open || p->col+it->width>p->cols) {
+            s.wrapped = p->open;
+            s.spacer  = p->open && it->width==2 && p->col==p->cols-1;
+            s.newrow  = 1;
+            p->rows++;
+            p->col  = 0;
+            p->open = 1;
+        }
+        s.col = p->col;
+        for (i32 i = 0; i < na; i++) {
+            if (a[i].row<0 && a[i].line==it->line && a[i].off>=p->off &&
+                a[i].off<p->off+it->width) {
+                anchorat(a+i, p->rows-1, p->col+a[i].off-p->off, p->cols);
+            }
+        }
+        p->col += it->width;
+        p->off += it->width;
+        break;
+    case RI_EOL:
+    case RI_END:
+        if (p->open && p->col==p->cols && it->kind==RI_EOL) {
+            // A cursor that was on an empty row below the line's text,
+            // after a full row, stays there rather than waiting to wrap
+            for (i32 i = 0; i < na; i++) {
+                Anchor *b = a + i;
+                if (b->row<0 && b->line==it->line && b->off==p->off &&
+                    b->off && !b->c->x && !b->c->wrapnext) {
+                    s.newrow  = 1;
+                    s.wrapped = 1;
+                }
+            }
+            if (s.newrow) {
+                p->rows++;
+                p->col = 0;
+            }
+        }
+        if (!p->open && it->kind==RI_EOL) {
+            s.newrow = 1;
+            p->rows++;
+            p->col  = 0;
+        }
+        for (i32 i = 0; i < na; i++) {
+            if (a[i].row<0 && a[i].line==it->line && p->rows) {
+                anchorat(a+i, p->rows-1, p->col+a[i].off-p->off, p->cols);
+            }
+        }
+        p->open = 0;
+        p->off  = 0;
+        break;
+    case RI_SEAM:
+        p->off = 0;
+        break;
+    }
+    return s;
+}
+
+// Rows of record idx before the one that holds column coloff: the row
+// the cell there lands on, as a wide one wraps from the last column
+static i32 hcolrow(ariel_Term *t, i32 idx, i32 coloff, i32 cols)
+{
+    Hent *e   = hent(t, idx);
+    u8   *rec = hbytes(t, e->off);
+    Hpos  h   = {0};
+    Hcell c;
+    Wrap  w   = {1, 0};
+    for (i32 off = 0; hnext(rec, (i32)e->len, &h, &c); off += c.width) {
+        wrapcell(&w, c.width, cols);
+        if (off >= coloff) return w.rows - 1;
+    }
+    return w.rows - 1 + (w.col==cols);  // past the end: the next row
+}
+
+// History rows after the lent mark, at the history's width
+static i64 hlentrows(ariel_Term *t)
+{
+    if (!t->hlent || !t->hcount) return 0;
+    i64 rows = 0;
+    for (i32 i = t->hcount-1; i >= 0; i--) {
+        u64 serial = t->hserial + (u64)i;
+        if (serial < t->hlentser) break;
+        if (serial > t->hlentser) {
+            rows += hrowsof(t, i);
+        } else {
+            rows += hrowsof(t, i) - hcolrow(t, i, (i32)t->hlentoff, t->hcols);
+        }
+    }
+    return rows;
+}
+
+// Where a walk from history row v begins: its record, and the row's
+// column within it
+typedef struct { i32 idx, off; } Rstart;
+static Rstart rstart(ariel_Term *t, i64 v)
+{
+    Hrow   h   = hlocate(t, v);
+    Rstart r   = {h.idx, 0};
+    u8    *rec = hbytes(t, h.e->off);
+    Hpos   q   = {0};
+    Hcell  c;
+    while (q.pos < h.it.at.pos && hnext(rec, (i32)h.e->len, &q, &c)) {
+        r.off += c.width;
+    }
+    return r;
+}
+
+// Whether a line split for size goes on past a record from idx
+static b32 hjoins(ariel_Term *t, i32 idx)
+{
+    for (i32 i = idx; i < t->hcount-1; i++) {
+        if (hent(t, i)->flags & HR_JOIN) return 1;
+    }
+    return 0;
+}
+
+// Whether a walk from st meets a seam of a line split for size: one
+// ahead of it, or one just behind it that a row more would join
+static b32 hseam(ariel_Term *t, Rstart st)
+{
+    b32 behind = !st.off && st.idx && hent(t, st.idx-1)->flags&HR_JOIN;
+    return behind || hjoins(t, st.idx);
+}
+
+// Rows a walk from st lays out at the new width, through the screen,
+// counted as the anchors place them: a cursor on an empty row after a
+// full one keeps a row of its own
+static i32 rrows(Rwalk w, Rstart st, i32 cols, Anchor *a, i32 na)
+{
+    ariel_Term *t = w.t;
+    Hent *e  = hent(t, st.idx);
+    Hpos  at = hseek(hbytes(t, e->off), (i32)e->len, st.off);
+    rwrecord(&w, st.idx, at);
+    Place  p = {cols, 0, 0, 0, st.off};
+    Anchor b[2];
+    xcpy(b, a, (iz)na*(iz)sizeof(*a));
+    for (;;) {
+        Ritem it = rnext(&w);
+        place(&p, &it, b, na);
+        if (it.kind == RI_END) return p.rows;
+    }
+}
+
+static b32 posbefore(u64 sa, i32 oa, u64 sb, i32 ob)
+{
+    return sa<sb || (sa==sb && oa<=ob);
+}
+
+// A record read row by row at its width
+static Hiter hiter(ariel_Term *t, Hent *e, i32 cols)
+{
+    Hiter it = {0};
+    it.rec  = hbytes(t, e->off);
+    it.len  = (i32)e->len;
+    it.cols = cols;
+    return it;
+}
+
+// Columns the next row takes, moving past it
+static i32 hrowskip(Hiter *it)
+{
+    Hcell c;
+    it->col = 0;
+    while (hrowcell(it, &c)) {}
+    return it->col;
+}
+
+// The text at the top of a scrolled-back view: a record, and the columns
+// of it above that row, so the view stays on its text through a reflow
+typedef struct { u64 serial; i64 col; b32 on; } Vanchor;
+
+static Vanchor vanchor(ariel_Term *t)
+{
+    Vanchor a = {0};
+    if (!hviewclamp(t)) return a;
+    hsync(t);
+    Hrow  h  = hlocate(t, t->hrows - t->viewoff);
+    Hiter it = hiter(t, h.e, t->hcols);
+    for (i32 i = 0; i < h.sub; i++) a.col += hrowskip(&it);
+    a.serial = t->hserial + (u64)h.idx;
+    a.on     = 1;
+    return a;
+}
+
+static void vrestore(ariel_Term *t, Vanchor a)
+{
+    if (!a.on) return;
+    hsync(t);
+    if (a.serial < t->hserial) {
+        t->viewoff = (i32)t->hrows;     // evicted: the oldest
+    } else if (a.serial-t->hserial >= (u64)t->hcount) {
+        t->viewoff = 0;                 // back on the screen
+    } else {
+        i32 idx = (i32)(a.serial - t->hserial);
+        i64 v   = 0;
+        for (i32 i = 0; i < idx; i++) v += hrowsof(t, i);
+        i32   rows = hrowsof(t, idx);
+        Hiter it   = hiter(t, hent(t, idx), t->hcols);
+        i64   col  = 0;
+        for (i32 sub = 0; sub < rows-1; sub++, v++) {
+            col += hrowskip(&it);
+            if (col > a.col) break;
+        }
+        t->viewoff = (i32)(t->hrows - v);
+    }
+    t->dirty = 1;
+}
+
+static void reflow(ariel_Term *t, i32 newcols, i32 newrows)
+{
+    Vanchor view = vanchor(t);
+    i32 oldcols = t->cols, oldrows = t->rows;
+    Rwalk w = {0};
+    w.t       = t;
+    w.oldcols = oldcols;
+    w.oldrows = oldrows;
+    w.cont    = histon(t) && hcontinues(t);
+    w.nrec    = t->hcount;
+
+    // Anchors: the main cursor, or the main screen's saved cursor
+    Anchor a[2] = {0};
+    i32    na   = 0;
+    if (!t->scr) a[na++].c = &t->c;
+    if (t->saved[0].valid) a[na++].c = t->saved+0;
+
+    // Rows in use: content, prompt marks, anchors, and the rest of a line
+    // they wrap
+    i32 used = 1;
+    for (i32 y = 0; y < oldrows; y++) {
+        Cell *r = gridcells(t, 0) + (iz)gridmap(t, 0)[y]*t->capcols;
+        if (gridheads(t, 0)[gridmap(t, 0)[y]].flags & ARIEL_R_PROMPT) {
+            used = y + 1;
+            continue;
+        }
+        for (i32 x = 0; x < oldcols; x++) {
+            if (r[x].cp || r[x].bg) {
+                used = y + 1;
+                break;
+            }
+        }
+    }
+    for (i32 i = 0; i < na; i++) {
+        used = imax(used, a[i].c->y + 1);
+    }
+    for (; used<oldrows && gridheads(t, 0)[gridmap(t, 0)[used-1]].flags&ARIEL_R_WRAPPED; used++) {}
+    w.used = used;
+    i32 gap = oldrows - used;
+
+    // A mark on the rows of a line that continues history goes on the
+    // line's first record, so the walk finds marks on records alone
+    if (w.cont && rwprompt(&w, 0)) {
+        hent(t, hlinefirst(t))->flags |= HR_PROMPT;
+        for (i32 y = 0; y < used; y++) {
+            Head *h = gridheads(t, 0) + gridmap(t, 0)[y];
+            h->flags &= ~(u32)ARIEL_R_PROMPT;
+            if (!(h->flags & ARIEL_R_WRAPPED)) break;
+        }
+    }
+
+    // Anchors as logical positions
+    i32 h0 = 0;     // the open record's columns
+    if (w.cont) h0 = (i32)hent(t, t->hcount-1)->width;
+    {
+        Rwalk s = w;
+        s.idx = t->hcount;
+        i32 line = 0, off = h0;
+        for (s.y = 0; s.y < used; s.y++) {
+            rwrow(&s);
+            for (i32 i = 0; i < na; i++) {
+                Cursor *c = a[i].c;
+                if (c->y != s.y) continue;
+                i32 x = c->x + !!c->wrapnext;
+                a[i].line = line;
+                a[i].off  = off + (s.ends ? x : imin(x, s.end));
+            }
+            off += s.end;
+            if (s.ends) {
+                line++;
+                off = 0;
+            }
+        }
+        for (i32 i = 0; i < na; i++) a[i].row = -1;
+    }
+
+    // History at the new width
+    t->cols = newcols;
+    t->rows = newrows;
+    hsync(t);
+
+    // The first new row holding screen cells (b0), from column b0off of
+    // the open record
+    i32 b0off = h0;
+    b32 b0hist = 0;     // b0's row starts in history
+    if (w.cont) {
+        Hent *e   = hent(t, t->hcount-1);
+        Wrap  end = hwrap(t, e, newcols);
+        Rwalk s   = w;
+        s.idx = t->hcount;
+        rwrecord(&s, t->hcount, s.at);
+        Ritem first = rnext(&s);
+        b32 fits = first.kind!=RI_CELL || end.col+first.width<=newcols;
+        if (fits && end.col) {
+            b0off  = h0 - end.col;
+            b0hist = 1;
+        }
+    }
+
+    // Count the stream's rows from b0, and where the cursor lands
+    i32 n = 0, crow = -1;
+    {
+        Rwalk s = w;
+        Hpos  at = {0};
+        if (b0hist) {
+            Hent *e = hent(t, t->hcount-1);
+            at = hseek(hbytes(t, e->off), (i32)e->len, b0off);
+        }
+        rwrecord(&s, b0hist ? t->hcount-1 : t->hcount, at);
+        Place p = {newcols, 0, 0, 0, b0hist ? b0off : h0};
+        Anchor b[2];
+        xcpy(b, a, (iz)sizeof(a));
+        for (;;) {
+            Ritem it = rnext(&s);
+            place(&p, &it, b, na);
+            if (it.kind == RI_END) break;
+        }
+        n = p.rows;
+        if (!t->scr && b[0].row>=0) crow = b[0].row;
+    }
+
+    // Bottom-anchored placement
+    i64 hrows = t->hrows - b0hist;  // history rows above b0
+    i32 over = 0, pull = 0;
+    i64 budget = n;     // rows the walk from pulled history may lay out
+    i64 lend   = 0;     // lent history rows above b0
+    if (n+gap > newrows) {
+        over = imax(0, n - newrows);
+        if (crow>=0 && crow<over) {
+            over = crow;    // the cursor's line stays: drop rows below
+        }
+    } else {
+        i64 room  = newrows - n - gap;
+        i64 lent  = hlentrows(t);   // a suffix, so b0's row if any
+        lend = lent ? lent-b0hist : 0;
+        i64 allow = lend + imax(0, newrows - oldrows);
+        i64 p     = room<allow ? room : allow;
+        p = p<hrows ? p : hrows;
+        pull   = (i32)p;
+        budget = n + p;
+        if (!pull && allow>0 && hrows>0) {
+            // No room, but a lent row past a seam joins the next for free
+            Rstart st = rstart(t, hrows-1);
+            pull = hjoins(t, st.idx) && rrows(w, st, newcols, a, na)<=n;
+        }
+    }
+
+    // Where the emission walk starts: pulled history, or b0
+    i32 startidx = b0hist ? t->hcount-1 : t->hcount;
+    i32 startoff = b0hist ? b0off : 0;
+    if (pull) {
+        Rstart st = rstart(t, hrows - pull);
+        // History counts a row for each record of a line split for size,
+        // but the walk joins the records at the seam, in fewer rows: pull
+        // more until the rows laid out fill the room. Each round's
+        // shortfall is the seams in the rows it added, so it soon ends;
+        // once there's none, one more row may still join at a seam for
+        // free. The cap bounds the walks for records of a row or two.
+        // Lent records lay out in fewer rows too, so they fill only those
+        // rows, plus any growth: rows dropped below the cursor when they
+        // were lent leave room that older history mustn't fill.
+        if (lend>0 && lend<hrows && hseam(t, st)) {
+            Rstart ls   = rstart(t, hrows - lend);
+            i64    fill = rrows(w, ls, newcols, a, na) +
+                          imax(0, newrows - oldrows);
+            budget = budget<fill ? budget : fill;
+        }
+        i64 k = pull;
+        for (i32 i = 0; i<8 && k<hrows && hseam(t, st); i++) {
+            i64    d  = budget - rrows(w, st, newcols, a, na);
+            i64    j  = k + (d>0 ? d : 1);
+            j = j<hrows ? j : hrows;
+            Rstart nx = rstart(t, hrows - j);
+            if (d<=0 && rrows(w, nx, newcols, a, na)>budget) break;
+            k  = j;
+            st = nx;
+        }
+        startidx = st.idx;
+        startoff = st.off;
+    }
+    Hpos at = {0};
+    if (startidx < t->hcount) {
+        Hent *e = hent(t, startidx);
+        at = hseek(hbytes(t, e->off), (i32)e->len, startoff);
+    }
+    u64 startser = t->hserial + (u64)startidx;
+    u64 lendser  = t->hserial + (u64)t->hcount - (u64)w.cont;  // before pushes
+
+    // Emit into the spare grid, rows [0, over) to history instead
+    u16 *map = gridmap(t, 2);
+    for (i32 i = 0; i < t->caprows; i++) map[i] = (u16)i;
+    Cell *cells = gridcells(t, 2);
+    Head *heads = gridheads(t, 2);
+    sparewipe(t, 0, t->caprows);  // all of it becomes the main grid
+    t->spare = newrows;
+
+    rwrecord(&w, startidx, at);
+    w.linestart = startoff==0 && !(startidx==t->hcount && w.cont) &&
+                  !(startidx && startidx<t->hcount &&
+                    hent(t, startidx-1)->flags&HR_JOIN);
+    i32   off0  = startidx==t->hcount && w.cont ? h0 : startoff;
+    Place p = {newcols, 0, 0, 0, off0};
+    i32   slot = -1;        // the screen row being filled
+    b32   hasrec = w.cont || b0hist;
+    i32   segy = -1, segx0 = 0, segx1 = 0;
+    b32   histdone = !over;
+    b32   lineprompt = w.prompt;
+    b32   dropped = 0;
+    i32   rowend  = 0;      // past the slot's last cell
+    for (;;) {
+        b32   start = w.linestart;
+        if (start) lineprompt = w.prompt;
+        w.linestart = 0;
+        Ritem it  = rnext(&w);
+        Spot  s   = place(&p, &it, a, na);
+        i32   r   = p.rows - 1;
+
+        if (r < over) {
+            // To history: the screen's cells, a segment of a row at a time
+            b32 flush = it.kind!=RI_CELL || it.hist || it.y!=segy || it.x!=segx1;
+            if (!histon(t)) {
+                // No history: these rows are gone
+            } else if (flush && segy>=0) {
+                happend(t, oldrow(&w, segy)+segx0, segx1-segx0, hasrec,
+                        lineprompt ? HR_PROMPT : 0);
+                hasrec = 1;
+                segy   = -1;
+            }
+            if (it.kind==RI_CELL && !it.hist && histon(t)) {
+                if (segy < 0) {
+                    segy  = it.y;
+                    segx0 = it.x;
+                }
+                segx1 = it.x + 1;
+                if (it.width == 2) segx1++;
+            } else if (it.kind==RI_EOL && histon(t)) {
+                if (!hasrec) happend(t, 0, 0, 0, lineprompt ? HR_PROMPT : 0);
+                hfill(t, it.fill);
+                hasrec = 0;
+            }
+            if (it.kind == RI_END) break;
+            continue;
+        }
+
+        if (!histdone) {
+            if (segy >= 0) {
+                happend(t, oldrow(&w, segy)+segx0, segx1-segx0, hasrec,
+                        lineprompt ? HR_PROMPT : 0);
+                hasrec = 1;
+            }
+            histdone = 1;
+            t->hopen = hasrec && histon(t);
+        }
+        if (it.kind == RI_END) break;
+        if (s.newrow || it.kind==RI_EOL) {
+            if (s.newrow) {
+                if (r-over >= newrows) {
+                    dropped = 1;    // below the cursor, no room
+                    if (slot >= 0) {
+                        Cell  b  = {0};
+                        Cell *rw = cells + (iz)slot*t->capcols;
+                        fillcells(rw+rowend, newcols-rowend, b);
+                    }
+                    break;
+                }
+                if (slot>=0 && s.wrapped) {
+                    Cell *prev = cells + (iz)slot*t->capcols;
+                    heads[slot].flags |= ARIEL_R_WRAPPED;
+                    if (s.spacer) {
+                        prev[newcols-1]    = it.c;
+                        prev[newcols-1].cp = (u32)KIND_SPACER<<21;
+                        prev[newcols-1].ext = 0;
+                    }
+                }
+                slot   = r - over;
+                rowend = 0;
+                Head *h  = heads + slot;
+                h->id    = t->nextid++;
+                h->gen   = t->gen + 1;
+                h->flags = start && lineprompt ? ARIEL_R_PROMPT : 0;
+            }
+        }
+        if (slot < 0) continue;
+        Cell *row = cells + (iz)slot*t->capcols;
+        if (it.kind == RI_CELL) {
+            Cell c = it.c;
+            if (it.hist) {
+                c.ext = 0;
+                u32 extra[POOLN];
+                i32 k = imin(hextras(it.rec, &it.hc, extra, POOLN), POOLN);
+                for (i32 i = 0; i < k; i++) celljoin(t, &c, extra[i]);
+            }
+            row[s.col] = c;
+            if (it.width == 2) {
+                Cell tail = c;
+                tail.cp   = (u32)KIND_TAIL<<21;
+                tail.ext  = 0;
+                row[s.col+1] = tail;
+            }
+            rowend = s.col + it.width;
+        } else if (it.kind == RI_EOL) {
+            Cell f = {0};
+            f.fg   = it.fill.fg;
+            f.bg   = it.fill.bg;
+            f.ul   = it.fill.ul;
+            f.attr = it.fill.attr;
+            fillcells(row+p.col, newcols-p.col, f);
+        }
+    }
+    // A last row the walk left open is filled with blanks, and the bottom
+    // row continues on nothing
+    if (slot == newrows-1) {
+        heads[slot].flags &= ~(u32)ARIEL_R_WRAPPED;
+    }
+    if (slot >= 0) {
+        Cell *row = cells + (iz)slot*t->capcols;
+        Cell  b   = {0};
+        if (p.open && !dropped) fillcells(row+p.col, newcols-p.col, b);
+    }
+    for (i32 y = slot+1; y < newrows; y++) {
+        Cell  b = {0};
+        fillcells(cells+(iz)y*t->capcols, newcols, b);
+        heads[y].id    = t->nextid++;
+        heads[y].gen   = t->gen + 1;
+        heads[y].flags = 0;
+    }
+
+    // History: what was pulled back, or b0's row, is cut from it
+    if (pull || (b0hist && !over)) {
+        htruncate(t, startidx, startoff);
+        t->hopen = startoff > 0;
+        if (!startoff && t->hcount && hent(t, t->hcount-1)->flags&HR_JOIN) {
+            hent(t, t->hcount-1)->flags &= (u16)~HR_JOIN;
+            t->hopen = 1;
+        }
+        if (t->hlent && posbefore(startser, startoff, t->hlentser, (i32)t->hlentoff)) {
+            t->hlent = 0;
+        }
+    } else if (over && !t->hlent && histon(t)) {
+        // Lend: what this reflow pushed comes back first when it grows
+        t->hlent    = 1;
+        t->hlentser = lendser;
+        t->hlentoff = (u32)(w.cont ? h0 : 0);
+    } else if (!over && !pull && !b0hist) {
+        t->hopen = w.cont;
+    }
+
+    // The spare becomes the main screen
+    Grid g = t->grid[0];
+    t->grid[0] = t->grid[2];
+    t->grid[2] = g;
+    t->spare   = 0;
+    if (t->hopen) t->hcontid = gridheads(t, 0)[gridmap(t, 0)[0]].id;
+
+    for (i32 i = 0; i < na; i++) {
+        Cursor *c = a[i].c;
+        if (a[i].row < 0) {
+            c->y = newrows - 1;     // dropped
+            c->x = imin(c->x, newcols-1);
+            c->wrapnext = 0;
+            continue;
+        }
+        i32 y = a[i].row - over;
+        if (y < 0) {
+            c->y = 0;               // into history
+            c->x = imin(c->x, newcols-1);
+            c->wrapnext = 0;
+        } else if (y >= newrows) {
+            c->y = newrows - 1;
+            c->x = imin(c->x, newcols-1);
+            c->wrapnext = 0;
+        } else {
+            c->y = y;
+            c->x = a[i].col;
+            c->wrapnext = a[i].wrapnext;
+        }
+    }
+    t->hv.cols = 0;
+    vrestore(t, view);
+    hviewclamp(t);
 }
 
 
@@ -4591,10 +6985,11 @@ ptrdiff_t ariel_copy(ariel_Term *t, uint8_t *out, ptrdiff_t cap)
 
 // Shrink one screen to rows, keeping its cursor row (y) in view: blank
 // rows below the cursor go first, then rows leave the top for history.
-static void resizerows(ariel_Term *t, i32 scr, i32 rows, i32 *y)
+// Returns the number of rows scrolled off the top.
+static i32 resizerows(ariel_Term *t, i32 scr, i32 rows, i32 *y)
 {
     i32 drop = t->rows - rows;
-    if (drop <= 0) return;
+    if (drop <= 0) return 0;
     i32 save = t->scr;
     t->scr = scr;
     i32 r = t->rows - 1;
@@ -4604,6 +6999,15 @@ static void resizerows(ariel_Term *t, i32 scr, i32 rows, i32 *y)
         *y = imax(*y - drop, 0);
     }
     t->scr = save;
+    return drop;
+}
+
+// A cursor that reflow doesn't carry, kept on the screen
+static void clampcursor(Cursor *c, i32 cols, i32 rows)
+{
+    c->x = imin(c->x, cols-1);
+    c->y = imin(c->y, rows-1);
+    c->wrapnext = c->wrapnext && c->x==cols-1;
 }
 
 int32_t ariel_resize(ariel_Term *t, int32_t cols, int32_t rows, int32_t cellw, int32_t cellh)
@@ -4618,51 +7022,49 @@ int32_t ariel_resize(ariel_Term *t, int32_t cols, int32_t rows, int32_t cellw, i
         return 1;
     }
 
-    i32 oldcols = t->cols, oldrows = t->rows;
-    b32 stepright = t->c.wrapnext && cols>oldcols;
-    i32 y = t->c.y;
-    resizerows(t, t->scr, rows, &y);
-    t->c.y = y;
-    i32 other = t->saved[!t->scr].y;
-    resizerows(t, !t->scr, rows, &other);
-    t->saved[!t->scr].y = other;
-
-    Cell b = {0};
-    t->cols = cols;
-    t->rows = rows;
-    for (i32 g = 0; g < 2; g++) {
-        Cell *cells = gridcells(t, g);
-        u16  *map   = gridmap(t, g);
-        for (i32 r = 0; r < rows; r++) {
-            if (r >= oldrows) {
-                clearslot(t, g, map[r], b);
-                continue;
-            }
-            Cell *c = cells + (iz)map[r]*t->capcols;
-            if (cols > oldcols) {
-                fillcells(c+oldcols, cols-oldcols, b);
-            } else if (cellkind(c+cols-1) == KIND_WIDE) {
-                c[cols-1].cp  = 0;
-                c[cols-1].ext = 0;
-            }
-            gridheads(t, g)[map[r]].gen = t->gen + 1;
-        }
+    // The alternate screen is cropped, keeping its cursor's row
+    i32     oldcols = t->cols, oldrows = t->rows;
+    Cursor *alt     = t->scr ? &t->c : t->saved+1;
+    b32     right   = alt->wrapnext && cols>oldcols;
+    i32     drop    = resizerows(t, 1, rows, &alt->y);
+    if (t->scr) {
+        // The alternate screen's saved cursor scrolls with its text
+        t->saved[1].y = imax(t->saved[1].y - drop, 0);
     }
+
+    // The main screen reflows
+    t->sel.unit = 0;
+    reflow(t, cols, rows);
+
+    Cell  b     = {0};
+    Cell *cells = gridcells(t, 1);
+    u16  *map   = gridmap(t, 1);
+    for (i32 r = 0; r < rows; r++) {
+        if (r >= oldrows) {
+            clearslot(t, 1, map[r], b);
+            continue;
+        }
+        Cell *c = cells + (iz)map[r]*t->capcols;
+        if (cols > oldcols) {
+            fillcells(c+oldcols, cols-oldcols, b);
+        } else if (cellkind(c+cols-1) == KIND_WIDE) {
+            c[cols-1].cp  = 0;
+            c[cols-1].ext = 0;
+        }
+        gridheads(t, 1)[map[r]].gen = t->gen + 1;
+    }
+    alt->x = imin(alt->x + right, cols-1);
+    alt->y = imin(alt->y, rows-1);
+    alt->wrapnext = alt->wrapnext && !right && alt->x==cols-1;
+    if (!t->saved[0].valid) clampcursor(t->saved+0, cols, rows);
+    if (t->scr) clampcursor(t->saved+1, cols, rows);
     if (cols > oldcols) {
         tabsreset(t, oldcols);
     }
-
     t->top = 0;
     t->bot = rows - 1;
-    t->c.x = imin(t->c.x + stepright, cols-1);
-    t->c.y = imin(t->c.y, rows-1);
-    t->c.wrapnext = 0;
-    for (i32 s = 0; s < 2; s++) {
-        t->saved[s].x = imin(t->saved[s].x, cols-1);
-        t->saved[s].y = imin(t->saved[s].y, rows-1);
-    }
     segclear(t);
-    t->dirty = 1;
+    hgenall(t);
     return 1;
 }
 
@@ -4706,35 +7108,807 @@ void ariel_reset(ariel_Term *t, int32_t what)
     }
 }
 
+// Export: VT that rebuilds the state in a fresh terminal of the same
+// size, flags and host colors
+//
+// The text comes first under canonical modes: the history's lines and
+// the main screen's rows printed in order, so the first rows scroll into
+// history, then the alternate screen's. A line's rows wrap as they did.
+// Erased cells print as spaces and are erased again (ECH) once the wrap
+// past their row is done, since erased cells never wrap a row. A wide
+// cell that wraps from the margin is printed first in the style of the
+// spacer it leaves, then again in its own. Then come the saved cursors,
+// tab stops, titles, colors, XTSAVE entries, margins and modes, and last
+// the cursor, by reprinting the cell under a pending wrap or the cluster
+// left of the cursor. Losses, which the fuzz target excuses: an erased
+// cell keeps only its background; a styled fill on a line whose text
+// fills its last row; a prompt mark off its line's first row; a one-row
+// screen's wrapped erased cells; and the few states noted as lossy
+// below. Not flagged lossy: rows lent to history by a shrinking resize
+// come back as plain history, so a later widening resize pulls back
+// fewer rows than it would have (hlent); and the replay holds a
+// screenful of history at once, so in a terminal with too small a
+// cluster pool (see ariel_export) clusters of three or more code points
+// lose marks.
+
+typedef struct {
+    ariel_Term *t;
+    Dump d;
+    Pen  pen;       // the replay's state
+    u8   g[4];
+    u8   gl;
+    i32  grapheme;
+    i32  y;         // cursor row
+    Seg  seg;       // the cluster left of the cursor
+    b32  segon;     //   when there is one
+    b32  lossy;     // something won't come back exactly
+} Exp;
+
+typedef struct {
+    Cell c;         // ext unused
+    i32  width;
+    i32  nx;
+    u32  x[POOLN];  // extra code points
+} Ecell;
+
+// The cells of a line: history records, a chain of joined ones, maybe
+// continued on the screen, or screen rows alone
+typedef struct {
+    i32  part;      // 0: records, 1: screen rows, 2: done
+    i32  idx;       // record
+    Hpos at;
+    Pen  fill;      // the line's fill, when it ends in a record
+    b32  screen;    // the records continue on the screen
+    b32  seam;      // the first cell on the screen after records
+    i32  g, y0, y, yend, x, rowend;
+} Esrc;
+
+static Cell *grow(ariel_Term *t, i32 g, i32 y)
+{
+    return gridcells(t, g) + (iz)gridmap(t, g)[y]*t->capcols;
+}
+
+static Head *ghead(ariel_Term *t, i32 g, i32 y)
+{
+    return gridheads(t, g) + gridmap(t, g)[y];
+}
+
+static b32 eerased(Cell *c)
+{
+    return cellkind(c)!=KIND_TAIL && erased(c);
+}
+
+static void eputs(Exp *e, ariel_Str s)
+{
+    dumpbytes(&e->d, s);
+}
+
+static void ecsi(Exp *e, u8 *lead, i32 a, i32 b, u8 *tail)
+{
+    u8  buf[32];
+    Out o = newout(buf, countof(buf));
+    outs(&o, S("\x1b["));
+    outs(&o, (ariel_Str){lead, lead[0] ? 1 : 0});
+    if (a >= 0) outi(&o, a);
+    if (b >= 0) {
+        outc(&o, ';');
+        outi(&o, b);
+    }
+    for (; *tail; tail++) outc(&o, *tail);
+    dumpout(&e->d, &o);
+}
+
+// Cursor to row y, column x, rows counted from top
+static void ecup(Exp *e, i32 y, i32 x, i32 top)
+{
+    ecsi(e, (u8 *)"", y-top+1, x+1, (u8 *)"H");
+    e->y     = y;
+    e->segon = 0;
+}
+
+static void esgr(Exp *e, Pen p)
+{
+    Pen *q = &e->pen;
+    if (p.fg==q->fg && p.bg==q->bg && p.ul==q->ul && p.attr==q->attr) {
+        return;
+    }
+    u8  buf[128];
+    Out o = newout(buf, countof(buf));
+    outs(&o, S("\x1b["));
+    outsgr(&o, &p);
+    outc(&o, 'm');
+    dumpout(&e->d, &o);
+    *q = p;
+}
+
+static Pen bgpen(u32 bg)
+{
+    Pen p = {0};
+    p.bg = bg;
+    return p;
+}
+
+static void emode(Exp *e, i32 mode, i32 on)
+{
+    ecsi(e, (u8 *)"?", mode, -1, on ? (u8 *)"h" : (u8 *)"l");
+    if (mode==6 || mode==47) e->segon = 0;
+}
+
+static void egrapheme(Exp *e, i32 on)
+{
+    if (e->grapheme != on) {
+        emode(e, 2027, on);
+        e->grapheme = on;
+        e->segon    = 0;
+    }
+}
+
+// End the cluster left of the cursor, leaving the cursor be
+static void ebreak(Exp *e)
+{
+    emode(e, 2027, !e->grapheme);
+    emode(e, 2027, e->grapheme);
+    e->segon = 0;
+}
+
+static void echarsets(Exp *e, u8 *g, u8 gl)
+{
+    for (i32 i = 0; i < 4; i++) {
+        if (e->g[i] != g[i]) {
+            u8 s[3] = {0x1b, (u8)('('+i), g[i]};
+            eputs(e, (ariel_Str){s, 3});
+            e->g[i] = g[i];
+        }
+    }
+    if (e->gl != gl) {
+        static u8 const *shift[] = {
+            (u8 const *)"\x0f", (u8 const *)"\x0e", (u8 const *)"\x1bn",
+            (u8 const *)"\x1bo",
+        };
+        eputs(e, (ariel_Str){(u8 *)shift[gl], gl<2 ? 1 : 2});
+        e->gl = gl;
+    }
+}
+
+// Whether printing c at column x with mode 2027 set to g makes its
+// cluster and width as they are, and the segmentation state it leaves
+static b32 clusterok(ariel_Term *t, Ecell *c, i32 x, i32 g, Seg *seg)
+{
+    u32 base = cellcp(&c->c);
+    i32 w    = cpwidth(t, uniprop(base));
+    if (!w) return 0;
+    Seg  s    = {0};
+    Cell k    = {0};
+    k.cp      = base;
+    b32  wide = w == 2;
+    segbreak(&s, uniprop(base));
+    for (i32 i = 0; i < c->nx; i++) {
+        u32 p = uniprop(c->x[i]);
+        if (g ? segbreak(&s, p) : cpwidth(t, p)!=0) {
+            return 0;   // starts a cluster of its own
+        }
+        if (g && !wide && x+1<t->cols && widens(&k, c->x[i])) {
+            wide = 1;
+        }
+        k.ext = 1;
+    }
+    *seg = s;
+    return wide == (c->width==2);
+}
+
+static void eprint(Exp *e, Ecell *c, i32 x)
+{
+    ariel_Term *t = e->t;
+    Seg s = {0};
+    if (!clusterok(t, c, x, e->grapheme, &s)) {
+        if (clusterok(t, c, x, !e->grapheme, &s)) {
+            egrapheme(e, !e->grapheme);
+        } else {
+            e->lossy = 1;
+        }
+    }
+    u32 base = cellcp(&c->c);
+    if (e->segon && e->grapheme) {
+        Seg p = e->seg;
+        if (!segbreak(&p, uniprop(base))) {
+            ebreak(e);  // it would join the cluster before it
+        }
+    }
+    Pen p = {c->c.fg, c->c.bg, c->c.ul, c->c.attr, 0};
+    esgr(e, p);
+    u8  buf[64];
+    Out o = newout(buf, countof(buf));
+    oututf8(&o, base);
+    for (i32 i = 0; i < c->nx; i++) {
+        oututf8(&o, c->x[i]);
+    }
+    dumpout(&e->d, &o);
+    e->seg   = s;
+    e->segon = 1;
+}
+
+static b32 segeq(Seg *a, Seg *b)
+{
+    return a->gcb==b->gcb && a->ri==b->ri && a->emoji==b->emoji && a->incb==b->incb;
+}
+
+static Ecell ecellof(ariel_Term *t, Cell *c)
+{
+    Ecell r = {0};
+    r.c     = *c;
+    r.c.ext = 0;
+    r.width = cellkind(c)==KIND_WIDE ? 2 : 1;
+    r.nx    = eerased(c) ? 0 : imin(cellextra(t, c, r.x, POOLN), POOLN);
+    return r;
+}
+
+// Cells of screen row y to print: all of a wrapped row but a margin
+// spacer that the wide cell after it makes again; the text of a line's
+// last row, and at least a cell to wrap onto it
+static i32 erowend(ariel_Term *t, Esrc *s, i32 y)
+{
+    Cell *r = grow(t, s->g, y);
+    i32   n = t->cols;
+    if (y < s->yend) {
+        Cell *next = grow(t, s->g, y+1);
+        return n - (cellkind(r+n-1)==KIND_SPACER && cellkind(next)==KIND_WIDE);
+    }
+    for (; n>0 && eerased(r+n-1); n--) {}
+    return imax(n, y>s->y0);
+}
+
+static b32 esrcnext(ariel_Term *t, Esrc *s, Ecell *o)
+{
+    while (s->part == 0) {
+        Hent *e   = hent(t, s->idx);
+        u8   *rec = hbytes(t, e->off);
+        Hcell hc;
+        if (hnext(rec, (i32)e->len, &s->at, &hc)) {
+            Ecell r = {0};
+            r.c     = hc.c;
+            r.width = hc.width;
+            r.nx    = imin(hextras(rec, &hc, r.x, POOLN), POOLN);
+            *o = r;
+            return 1;
+        }
+        if (e->flags&HR_JOIN && s->idx+1<t->hcount) {
+            Hpos z = {0};
+            s->idx++;
+            s->at = z;
+        } else {
+            if (!s->at.ncells) s->fill = s->at.pen;
+            s->part = s->screen ? 1 : 2;
+            s->seam = s->screen;
+        }
+    }
+    while (s->part == 1) {
+        if (s->x >= s->rowend) {
+            if (s->y == s->yend) {
+                s->part = 2;
+                break;
+            }
+            s->y++;
+            s->x      = 0;
+            s->rowend = erowend(t, s, s->y);
+            continue;
+        }
+        Cell *c = grow(t, s->g, s->y) + s->x;
+        *o = ecellof(t, c);
+        s->x += o->width;
+        return 1;
+    }
+    return 0;
+}
+
+// Erase again the erased cells among the n cells from s, on row y
+static void epatch(Exp *e, Esrc s, i32 n, i32 y)
+{
+    ariel_Term *t = e->t;
+    Ecell c;
+    i32   run = 0, x0 = 0;
+    u32   bg  = 0;
+    for (i32 i = 0, x = 0; i <= n; i++) {
+        b32 more = i<n && esrcnext(t, &s, &c);
+        b32 er   = more && eerased(&c.c);
+        if (run && (!er || c.c.bg!=bg)) {
+            if (y < 0) {
+                e->lossy = 1;   // scrolled away: a one-row screen
+            } else {
+                ecup(e, y, x0, 0);
+                esgr(e, bgpen(bg));
+                ecsi(e, (u8 *)"", run, -1, (u8 *)"X");
+            }
+            run = 0;
+        }
+        if (er) {
+            if (!run) x0 = x;
+            bg = c.c.bg;
+            run++;
+        }
+        if (more) x += c.width;
+    }
+}
+
+// Style c, about to make a margin spacer again, as the spacer that
+// erowend left out, which the wide cell may no longer match: it's
+// printed over in its own style once the wrap is done
+static void espacer(ariel_Term *t, Esrc *s, Ecell *c)
+{
+    if (s->part!=1 || s->x!=c->width || s->y<=imax(s->y0, 0)) return;
+    Cell *r = grow(t, s->g, s->y-1) + t->cols-1;
+    if (cellkind(r) == KIND_SPACER) {
+        c->c.fg   = r->fg;
+        c->c.bg   = r->bg;
+        c->c.ul   = r->ul;
+        c->c.attr = r->attr;
+    }
+}
+
+// Print a line from the cursor at the start of a row
+static void eline(Exp *e, Esrc s)
+{
+    ariel_Term *t = e->t;
+    Esrc  row = s;      // its current row's first cell
+    i32   col = 0;
+    i32   n   = 0;      // cells in the row
+    Ecell c;
+    for (Esrc at = s; esrcnext(t, &s, &c); at = s) {
+        b32 wrap = col + c.width > t->cols;
+        if (s.seam) {
+            // The record's last row must be full to continue on the screen
+            if (!wrap) e->lossy = 1;
+            s.seam = 0;
+        }
+        Ecell p = c;
+        if (eerased(&c.c)) {
+            Ecell z = {0};
+            p = z;
+            p.c.cp   = ' ';
+            p.c.fg   = e->pen.fg;
+            p.c.bg   = e->pen.bg;
+            p.c.ul   = e->pen.ul;
+            p.c.attr = e->pen.attr;
+            p.width  = 1;
+        }
+        b32 widened = c.width==2 && cpwidth(t, uniprop(cellcp(&c.c)))==1;
+        if (wrap && widened && col<t->cols) {
+            // At the margin its base would fit narrow: a wide stand-in
+            // leaves the spacer and wraps, and it's printed over that
+            Ecell w = c;
+            w.c.cp = 0x4e00 | (u32)KIND_WIDE<<21;
+            w.nx   = 0;
+            espacer(t, &s, &w);
+            eprint(e, &w, col);
+        } else if (wrap && col<t->cols) {
+            Ecell q = p;
+            espacer(t, &s, &q);
+            eprint(e, &q, 0);
+        } else {
+            eprint(e, &p, wrap ? 0 : col);
+        }
+        if (wrap) col = 0;
+        if (wrap) {
+            // Erase the last row's spaces and come back
+            i32 y = imin(e->y+1, t->rows-1);
+            epatch(e, row, n, y-1);
+            ecup(e, y, 0, 0);
+            eprint(e, &p, 0);
+            row = at;
+            n   = 0;
+        }
+        col += c.width;
+        n++;
+    }
+    if (col < t->cols) {
+        esgr(e, bgpen(s.screen ? 0 : s.fill.bg));
+        eputs(e, S("\x1b[K"));
+        e->segon = 0;
+    }
+    epatch(e, row, n, e->y);
+    if (s.screen) {
+        // Erased cells past the text keep their backgrounds
+        Cell *r = grow(t, s.g, s.yend);
+        for (i32 x = col; x < t->cols;) {
+            u32 bg = r[x].bg;
+            i32 x1 = x + 1;
+            for (; x1<t->cols && r[x1].bg==bg; x1++) {}
+            if (bg) {
+                ecup(e, e->y, x, 0);
+                esgr(e, bgpen(bg));
+                ecsi(e, (u8 *)"", x1-x, -1, (u8 *)"X");
+            }
+            x = x1;
+        }
+    }
+}
+
+static void enewline(Exp *e, b32 *any)
+{
+    if (*any) {
+        Pen z = {0};
+        esgr(e, z);
+        eputs(e, S("\r\n"));
+        e->y     = imin(e->y+1, e->t->rows-1);
+        e->segon = 0;
+    }
+    *any = 1;
+}
+
+static void eprompt(Exp *e)
+{
+    eputs(e, S("\x1b]133;A\x1b\\"));
+}
+
+// The screen line from row y on grid g, its last row
+static i32 elineend(ariel_Term *t, i32 g, i32 y)
+{
+    for (; y<t->rows-1 && ghead(t, g, y)->flags&ARIEL_R_WRAPPED; y++) {}
+    return y;
+}
+
+// The screen's lines from row y
+static void escreen(Exp *e, i32 g, i32 y, b32 *any)
+{
+    ariel_Term *t = e->t;
+    if (ghead(t, g, t->rows-1)->flags & ARIEL_R_WRAPPED) {
+        e->lossy = 1;   // printing it would scroll
+    }
+    while (y < t->rows) {
+        Esrc s = {0};
+        s.part = 1;
+        s.screen = 1;
+        s.g    = g;
+        s.y0   = s.y = y;
+        s.yend = elineend(t, g, y);
+        s.rowend = erowend(t, &s, y);
+        for (i32 k = y+1; k <= s.yend; k++) {
+            if (ghead(t, g, k)->flags & ARIEL_R_PROMPT) e->lossy = 1;
+        }
+        enewline(e, any);
+        if (ghead(t, g, y)->flags & ARIEL_R_PROMPT) eprompt(e);
+        eline(e, s);
+        y = s.yend + 1;
+    }
+}
+
+// Place the cursor, pending wrap too, by reprinting the cell under it
+static void eplace(Exp *e, i32 g, Cursor *c, i32 top)
+{
+    ariel_Term *t = e->t;
+    if (!c->wrapnext) {
+        ecup(e, c->y, c->x, top);
+        return;
+    }
+    Cell *r = grow(t, g, c->y);
+    i32   x = c->x;
+    if (cellkind(r+x) == KIND_TAIL) x--;
+    if (eerased(r+x)) {
+        e->lossy = 1;   // a pending wrap over an erased cell
+        ecup(e, c->y, c->x, top);
+        return;
+    }
+    ecup(e, c->y, x, top);
+    Ecell k = ecellof(t, r+x);
+    eprint(e, &k, x);
+}
+
+static void ekitty(Exp *e, i32 scr)
+{
+    ariel_Term *t = e->t;
+    for (i32 i = 0; i < t->nkitty[scr]; i++) {
+        ecsi(e, (u8 *)">", t->kitty[scr][i], -1, (u8 *)"u");
+    }
+}
+
+static void esaved(Exp *e, i32 scr)
+{
+    Cursor *c = e->t->saved + scr;
+    if (!c->valid) return;
+    if (c->ss) e->lossy = 1;    // a single shift pending
+    if (c->origin) emode(e, 6, 1);
+    eplace(e, scr, c, 0);
+    esgr(e, c->pen);
+    echarsets(e, c->g, c->gl);
+    eputs(e, S("\x1b" "7"));
+    if (c->origin) emode(e, 6, 0);
+    Pen z = {0};
+    u8  b[4] = {'B', 'B', 'B', 'B'};
+    esgr(e, z);
+    echarsets(e, b, 0);
+}
+
+static b32 altused(ariel_Term *t)
+{
+    if (t->scr || t->saved[1].valid || t->nkitty[1]) return 1;
+    for (i32 y = 0; y < t->rows; y++) {
+        Cell *r = grow(t, 1, y);
+        if (ghead(t, 1, y)->flags & (ARIEL_R_WRAPPED|ARIEL_R_PROMPT)) return 1;
+        for (i32 x = 0; x < t->cols; x++) {
+            if (!eerased(r+x) || r[x].bg) return 1;
+        }
+    }
+    return 0;
+}
+
+static void etitle(Exp *e, i32 k, u8 *s, i32 len)
+{
+    eputs(e, k ? S("\x1b]1;") : S("\x1b]2;"));
+    eputs(e, (ariel_Str){s, len});
+    eputs(e, S("\x1b\\"));
+}
+
+static void ecolor(Exp *e, u8 *lead, u32 rgb)
+{
+    u8  buf[48];
+    Out o = newout(buf, countof(buf));
+    outs(&o, S("\x1b]"));
+    for (; *lead; lead++) outc(&o, *lead);
+    outrgb(&o, rgb);
+    outs(&o, S("\x1b\\"));
+    dumpout(&e->d, &o);
+}
+
+static void emodes(Exp *e, b32 all)
+{
+    ariel_Term *t = e->t;
+    static struct { i16 mode; u8 def; } const modes[] = {
+        {1, 0}, {5, 0}, {12, 0}, {25, 1}, {66, 0}, {67, 0}, {1004, 0},
+        {1007, 1}, {2004, 0}, {2026, 0}, {2031, 0},
+    };
+    for (i32 i = 0; i < countof(modes); i++) {
+        i32 v = decmode(t, modes[i].mode, -1) == MODE_SET;
+        if (all || v!=modes[i].def) emode(e, modes[i].mode, v);
+    }
+    static i16 const mice[] = {9, 1000, 1002, 1003, 1005, 1006, 1015, 1016};
+    for (i32 i = 0; i < countof(mice); i++) {
+        if (all) emode(e, mice[i], 0);
+    }
+    if (t->mouse)    emode(e, t->mouse, 1);
+    if (t->mouseenc) emode(e, t->mouseenc, 1);
+    if (t->newline)  ecsi(e, (u8 *)"", 20, -1, (u8 *)"h");
+}
+
+static void efinal(Exp *e)
+{
+    ariel_Term *t = e->t;
+    i32 scr = t->scr;
+
+    // Tab stops
+    b32 deftabs = 1;
+    for (i32 x = 0; x < t->cols; x++) {
+        deftabs &= istab(t, x) == (x && !(x%8));
+    }
+    if (!deftabs) {
+        eputs(e, S("\x1b[3g"));
+        for (i32 x = 0; x < t->cols; x++) {
+            if (istab(t, x)) {
+                ecup(e, 0, x, 0);
+                eputs(e, S("\x1bH"));
+            }
+        }
+    }
+
+    // Titles, the stack first
+    for (i32 i = 0; i < t->ntstack; i++) {
+        i32 *len = t->tstacklen[i];
+        for (i32 k = 0; k < 2; k++) {
+            if (len[k] >= 0) etitle(e, k, t->tstack[i][k], len[k]);
+        }
+        i32 which = len[0]>=0 && len[1]>=0 ? 0 : len[1]>=0 ? 1 : len[0]>=0 ? 2 : 3;
+        ecsi(e, (u8 *)"", 22, which, (u8 *)"t");
+    }
+    for (i32 k = 0; k < 2; k++) {
+        if (t->ntstack || t->titlelen[k]) {
+            etitle(e, k, t->title[k], t->titlelen[k]);
+        }
+    }
+
+    // Colors
+    for (i32 i = 0; i < ARIEL_C_COUNT; i++) {
+        if (t->pal[i] == t->paldef[i]) continue;
+        u8  buf[16];
+        Out o = newout(buf, countof(buf)-1);
+        if (i < 256) {
+            outs(&o, S("4;"));
+            outi(&o, i);
+        } else {
+            outi(&o, 10 + i - ARIEL_C_FG);
+        }
+        outc(&o, ';');
+        buf[o.len] = 0;
+        ecolor(e, buf, t->pal[i]);
+    }
+    if (t->cursorshape) ecsi(e, (u8 *)"", t->cursorshape, -1, (u8 *)" q");
+    if (t->modkeys)     ecsi(e, (u8 *)">", 4, t->modkeys, (u8 *)"m");
+
+    // XTSAVE entries, each mode set to its saved value and saved
+    for (i32 i = 0; i < t->nxtsaved; i++) {
+        i32 mode = t->xtsaved[i][0];
+        i32 on   = t->xtsaved[i][1];
+        if (mode==47 || mode==1047 || mode==1049) {
+            emode(e, 47, on);
+        } else if (mode != 1048) {
+            emode(e, mode, on);
+        }
+        ecsi(e, (u8 *)"?", mode, -1, (u8 *)"s");
+    }
+    if (t->nxtsaved) {
+        emode(e, 47, scr);
+        emode(e, 6, 0);
+        emode(e, 7, 1);
+        e->grapheme = -1;   // unknown: set it again below
+    }
+
+    // Margins and modes, the cursor's after it's placed
+    if (t->top || t->bot!=t->rows-1) {
+        ecsi(e, (u8 *)"", t->top+1, t->bot+1, (u8 *)"r");
+        e->segon = 0;
+    }
+    emodes(e, t->nxtsaved>0);
+    if (t->origin) emode(e, 6, 1);
+    i32 top = t->origin ? t->top : 0;
+    Cursor *c = &t->c;
+    if (t->origin && (c->y<t->top || c->y>t->bot)) {
+        e->lossy = 1;   // origin mode with the cursor outside the region
+    }
+    if (e->grapheme < 0) {
+        emode(e, 2027, t->grapheme);
+        e->grapheme = t->grapheme;
+        e->segon    = 0;
+    }
+    if (t->segy >= 0) {
+        // Reprint the cluster left of the cursor, so the next can join it
+        egrapheme(e, t->grapheme);
+        Cell *r = grow(t, scr, t->segy);
+        Ecell k = ecellof(t, r+t->segx);
+        Seg   s = {0};
+        if (!clusterok(t, &k, t->segx, t->grapheme, &s) ||
+            !segeq(&s, &t->seg) || t->lastcp!=cellcp(r+t->segx)) {
+            e->lossy = 1;
+        }
+        i32 x  = t->segx + k.width;
+        b32 wn = x >= t->cols;
+        if (wn) x = t->cols - 1;
+        if (c->y!=t->segy || c->x!=x || c->wrapnext!=wn) {
+            e->lossy = 1;
+        }
+        ecup(e, t->segy, t->segx, top);
+        eprint(e, &k, t->segx);
+        if (e->grapheme != t->grapheme) e->lossy = 1;
+    } else {
+        egrapheme(e, t->grapheme);
+        eplace(e, scr, c, top);
+        if (e->grapheme != t->grapheme) {
+            // The reprinted cell needed the other mode: switching back
+            // also ends its cluster
+            egrapheme(e, t->grapheme);
+        } else if (c->wrapnext) {
+            ebreak(e);
+        }
+    }
+    if (!t->autowrap) emode(e, 7, 0);
+    if (t->insert) ecsi(e, (u8 *)"", 4, -1, (u8 *)"h");
+    esgr(e, c->pen);
+    echarsets(e, c->g, c->gl);
+    if (c->ss) eputs(e, c->ss==2 ? S("\x1bN") : S("\x1bO"));
+}
+
+// Export into out, returning the length needed and whether it's lossy
+typedef struct { iz len; b32 lossy; } Exported;
+
+static Exported exportstate(ariel_Term *t, i32 histlines, u8 *out, iz cap)
+{
+    Exp e = {0};
+    e.t        = t;
+    e.d.buf    = out;
+    e.d.cap    = cap;
+    e.g[0] = e.g[1] = e.g[2] = e.g[3] = 'B';
+    e.grapheme = !(t->flags & ARIEL_F_LEGACYWIDTH);
+    if (t->rows < 2) e.lossy = 1;
+
+    // The main screen with history
+    b32 any   = 0;
+    i32 first = t->hcount - imin(imax(histlines, 0), t->hcount);
+    i32 y     = 0;
+    for (i32 i = first; i < t->hcount;) {
+        i32 j = i;
+        b32 prompt = 0;
+        for (;; j++) {
+            prompt |= !!(hent(t, j)->flags & HR_PROMPT);
+            if (!(hent(t, j)->flags&HR_JOIN) || j+1==t->hcount) break;
+        }
+        Esrc s = {0};
+        s.idx = i;
+        if (j==t->hcount-1 && hcontinues(t)) {
+            s.screen = 1;
+            s.g      = 0;
+            s.y0     = -1;
+            s.yend   = elineend(t, 0, 0);
+            s.rowend = erowend(t, &s, 0);
+            for (i32 k = 0; k <= s.yend; k++) {
+                if (ghead(t, 0, k)->flags & ARIEL_R_PROMPT) e.lossy = 1;
+            }
+            y = s.yend + 1;
+        }
+        enewline(&e, &any);
+        if (prompt) eprompt(&e);
+        eline(&e, s);
+        i = j + 1;
+    }
+    escreen(&e, 0, y, &any);
+    ekitty(&e, 0);
+    esaved(&e, 0);
+
+    if (altused(t)) {
+        emode(&e, 47, 1);
+        ecup(&e, 0, 0, 0);
+        any = 0;
+        escreen(&e, 1, 0, &any);
+        ekitty(&e, 1);
+        esaved(&e, 1);
+        if (!t->scr) emode(&e, 47, 0);
+    }
+    efinal(&e);
+
+    Exported r = {e.d.len, e.lossy};
+    return r;
+}
+
 ptrdiff_t ariel_export(ariel_Term *t, int32_t histlines, uint8_t *out, ptrdiff_t cap)
 {
     affirm(t->magic == MAGIC);
-    (void)histlines;
-    (void)out;
-    (void)cap;
-    return 0;   // L3
+    affirm(cap >= 0);
+    return exportstate(t, histlines, out, cap).len;
 }
 
-// Like Out, but counts what doesn't fit
-typedef struct {
-    u8 *buf;
-    iz  len, cap;
-} Dump;
-
-static void dumpbytes(Dump *d, ariel_Str s)
+// One row of a dump: its text, and with attrs its style runs
+static void dumprow(ariel_Term *t, Dump *d, Cell *r, u32 rflags, i32 flags)
 {
-    iz n = s.len;
-    if (d->len < d->cap) {
-        iz room = d->cap - d->len;
-        xcpy(d->buf+d->len, s.data, n<room ? n : room);
+    u8  buf[256];
+    i32 end = t->cols;
+    for (; end>0 && !cellcp(r+end-1); end--) {}
+    for (i32 x = 0; x < end; x++) {
+        Out o = newout(buf, countof(buf));
+        i32 kind = cellkind(r+x);
+        if (kind == KIND_TAIL) continue;
+        u32 cp = cellcp(r+x);
+        oututf8(&o, cp && kind!=KIND_SPACER ? cp : ' ');
+        u32 extra[POOLN];
+        i32 n = cellextra(t, r+x, extra, POOLN);
+        for (i32 i = 0; i < imin(n, POOLN); i++) {
+            oututf8(&o, extra[i]);
+        }
+        dumpout(d, &o);
     }
-    d->len += n;
-}
-
-static void dumpout(Dump *d, Out *o)
-{
-    ariel_Str s = {o->buf, o->len};
-    dumpbytes(d, s);
+    dumpbytes(d, S("\n"));
+    if (!(flags & ARIEL_DUMP_ATTRS)) return;
+    if (rflags & (ARIEL_R_WRAPPED|ARIEL_R_PROMPT)) {
+        Out o = newout(buf, countof(buf));
+        outc(&o, '\t');    // never in a row's text
+        if (rflags & ARIEL_R_WRAPPED) outs(&o, S(" wrapped"));
+        if (rflags & ARIEL_R_PROMPT)  outs(&o, S(" prompt"));
+        outc(&o, '\n');
+        dumpout(d, &o);
+    }
+    for (i32 x = 0; x < t->cols;) {
+        Cell *c = r + x;
+        i32   e = x + 1;
+        for (; e<t->cols && r[e].fg==c->fg && r[e].bg==c->bg &&
+               r[e].ul==c->ul && r[e].attr==c->attr; e++) {}
+        if (c->fg || c->bg || c->ul || c->attr) {
+            Out o = newout(buf, countof(buf));
+            outc(&o, '\t');
+            outi(&o, x);
+            outc(&o, '-');
+            outi(&o, e-1);
+            Pen p = {c->fg, c->bg, c->ul, c->attr, 0};
+            outs(&o, S(" sgr "));
+            outsgr(&o, &p);
+            outc(&o, '\n');
+            dumpout(d, &o);
+        }
+        x = e;
+    }
 }
 
 ptrdiff_t ariel_dump(ariel_Term *t, int32_t flags, uint8_t *out, ptrdiff_t cap)
@@ -4757,44 +7931,17 @@ ptrdiff_t ariel_dump(ariel_Term *t, int32_t flags, uint8_t *out, ptrdiff_t cap)
         outc(&o, '\n');
         dumpout(&d, &o);
     }
+    if (flags & ARIEL_DUMP_HISTORY) {
+        hsync(t);
+        for (i64 v = 0; v < t->hrows; v++) {
+            Vrow r = vcells(t, v, 0);
+            dumprow(t, &d, r.cells, r.flags, flags);
+        }
+        spareend(t);
+        dumpbytes(&d, S("\t--\n"));
+    }
     for (i32 y = 0; y < t->rows; y++) {
-        Cell *r = row(t, y);
-        i32 end = t->cols;
-        for (; end>0 && !cellcp(r+end-1); end--) {}
-        for (i32 x = 0; x < end; x++) {
-            Out o = newout(buf, countof(buf));
-            i32 kind = cellkind(r+x);
-            if (kind == KIND_TAIL) continue;
-            u32 cp = cellcp(r+x);
-            oututf8(&o, cp && kind!=KIND_SPACER ? cp : ' ');
-            u32 extra[POOLN];
-            i32 n = cellextra(t, r+x, extra, POOLN);
-            for (i32 i = 0; i < imin(n, POOLN); i++) {
-                oututf8(&o, extra[i]);
-            }
-            dumpout(&d, &o);
-        }
-        dumpbytes(&d, S("\n"));
-        if (!(flags & ARIEL_DUMP_ATTRS)) continue;
-        for (i32 x = 0; x < t->cols;) {
-            Cell *c = r + x;
-            i32   e = x + 1;
-            for (; e<t->cols && r[e].fg==c->fg && r[e].bg==c->bg &&
-                   r[e].ul==c->ul && r[e].attr==c->attr; e++) {}
-            if (c->fg || c->bg || c->ul || c->attr) {
-                Out o = newout(buf, countof(buf));
-                outc(&o, '\t');    // never in a row's text
-                outi(&o, x);
-                outc(&o, '-');
-                outi(&o, e-1);
-                Pen p = {c->fg, c->bg, c->ul, c->attr, 0};
-                outs(&o, S(" sgr "));
-                outsgr(&o, &p);
-                outc(&o, '\n');
-                dumpout(&d, &o);
-            }
-            x = e;
-        }
+        dumprow(t, &d, row(t, y), head(t, y)->flags, flags);
     }
     return d.len;
 }

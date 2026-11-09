@@ -291,6 +291,31 @@ static Gen genplain(size_t len)
     return g;
 }
 
+// Lines of CJK text, 5 to max columns, a space now and then: every
+// history record holds wide cells
+static Gen gencjk(size_t len, int max)
+{
+    Gen g = {0};
+    while (g.len < len) {
+        int n = 5 + (int)(rand32()%(unsigned)(max-4));
+        for (int col = 0; col < n;) {
+            unsigned r = rand32();
+            if (r%9 == 0) {
+                gens(&g, " ");
+                col++;
+            } else {
+                unsigned cp = 0x4e00 + (r>>8)%0x5000;
+                char b[3] = {(char)(0xe0|cp>>12), (char)(0x80|(cp>>6&63)),
+                             (char)(0x80|(cp&63))};
+                genput(&g, b, 3);
+                col += 2;
+            }
+        }
+        gens(&g, "\r\n");
+    }
+    return g;
+}
+
 // Short words, each with its own colors and attributes, as from a
 // syntax highlighter or a coloured ls
 static Gen gensgr(size_t len)
@@ -402,11 +427,19 @@ static int benchsuite(double secs)
         if (sink == 1) puts("");   // keep the loop
     }
 
-    // Resize steps on a full 200x60 screen with history, back and forth
-    // across 160x40 to 200x60 inside a 256x96 capacity
-    {
+    // Resize steps on a full 200x60 screen with full history, back and
+    // forth across 160x40 to 200x60 inside a 256x96 capacity
+    // Lines that fit take a row; longer ones with wide cells are walked
+    // whenever the width changes, so that case has no target
+    Gen cjk  = gencjk(8<<20, 150);
+    Gen cjkl = gencjk(8<<20, 400);
+    Gen *fill[] = {&sgr, &cjk, &cjkl};
+    char *name[][2] = {{"resize step", "resize worst"},
+                       {"resize cjk", "cjk worst"},
+                       {"resize cjk400", "cjk400 worst"}};
+    for (int f = 0; f < 3; f++) {
         ariel_Term *t = benchterm(200, 60, 256, 96);
-        feedgen(t, &sgr);
+        feedgen(t, fill[f]);
         for (int i = 0; i < 80; i++) {
             int d = i<40 ? i : 79-i;   // warm up: touch the whole capacity
             ariel_resize(t, 200-d, 60-d/2, 8, 16);
@@ -424,9 +457,16 @@ static int benchsuite(double secs)
             }
             elapsed = now() - start;
         } while (elapsed < secs);
-        ok &= verdict("resize step", elapsed/(double)n*1e3, "ms", 1, 1);
-        printf("%-14s %10.2f ms     (preemption shows here)\n", "resize worst", worst*1e3);
+        double step = elapsed/(double)n*1e3;
+        if (f < 2) {
+            ok &= verdict(name[f][0], step, "ms", 1, 1);
+        } else {
+            printf("%-14s %10.2f ms     (no target)\n", name[f][0], step);
+        }
+        printf("%-14s %10.2f ms     (preemption shows here)\n", name[f][1], worst*1e3);
     }
+    free(cjk.data);
+    free(cjkl.data);
 
     free(plain.data);
     free(sgr.data);

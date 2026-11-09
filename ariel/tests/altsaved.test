@@ -1,0 +1,20 @@
+# The alternate screen's saved cursor through a height shrink
+INIT 24,20
+
+!A shrink scrolling the alternate screen carries its saved cursor
+RESET
+RESIZE 24,20
+PUSH "\e[?1049h\e[21;3HA\e[21;3H\e7\e[24HZ"
+RESIZE 10,20
+  ?screen_row 6 = "  A"
+  ?screen_row 9 = "Z"
+PUSH "\e8"
+  ?cursor = 6,2
+
+!The saved cursor stays at the top when its row scrolls off
+RESET
+RESIZE 24,20
+PUSH "\e[?1049h\e[2;5H\e7\e[24HZ"
+RESIZE 10,20
+PUSH "\e8"
+  ?cursor = 0,4

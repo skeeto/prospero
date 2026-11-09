@@ -50,6 +50,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #ifdef _WIN32
 #  include <malloc.h>
@@ -83,6 +84,8 @@ typedef struct {
     i32         nglyphs;
     i32         wantcur, curr, curc, curline;
     i32         nenc;
+    i32         histlines;          // 0: the runner's defaults
+    iz          histbytes;
 } Tester;
 
 static void tfree(Tester *s)
@@ -100,8 +103,8 @@ static void tinit(Tester *s, i32 rows, i32 cols)
     cfg.rows      = rows;
     cfg.capcols   = cols < 132 ? 132 : cols;
     cfg.caprows   = rows < 50 ? 50 : rows;
-    cfg.histlines = 1000;
-    cfg.histbytes = 1<<16;
+    cfg.histlines = s->histlines ? s->histlines : 1000;
+    cfg.histbytes = s->histbytes ? s->histbytes : 1<<16;
     cfg.flags     = s->flags;
     iz size = ariel_size(&cfg);
     if (!size) {
@@ -404,6 +407,13 @@ static int checkcell(Script *sc, Tester *s, char *p)
             int mask = ~(ARIEL_A_DEFBG | ARIEL_A_SELECTED);
             if ((cell->attr & mask) != want) {
                 fail(sc, "cell %d,%d: attrs %#x, want %#x", r, c, cell->attr & mask, want);
+            }
+        } else if (word(&p, "selected")) {
+            expect(&p, '=');
+            int want = (int)number(&p);
+            int got  = !!(cell->attr & ARIEL_A_SELECTED);
+            if (got != want) {
+                fail(sc, "cell %d,%d: selected %d, want %d", r, c, got, want);
             }
         } else if (word(&p, "fg") || word(&p, "bg")) {
             int isfg = p[-1] == 'g' && p[-2] == 'f';
@@ -733,6 +743,123 @@ static void runline(Script *sc, Tester *s, char *p)
         tinit(s, s->rows, s->cols);
         return;
     }
+    if (word(&p, "HISTORY")) {
+        s->histlines = (i32)number(&p);
+        comma(&p);
+        s->histbytes = number(&p);
+        tinit(s, s->rows, s->cols);
+        return;
+    }
+    if (word(&p, "MOVE")) {
+        ariel_Config cfg = {0};
+        cfg.caprows = (i32)number(&p);
+        comma(&p);
+        cfg.capcols = (i32)number(&p);
+        skipws(&p);
+        if (*p == ',') {
+            comma(&p);
+            cfg.histlines = (i32)number(&p);
+            comma(&p);
+            cfg.histbytes = number(&p);
+        }
+        cfg.flags = s->flags;
+        cfg.cols = s->t->cols;
+        cfg.rows = s->t->rows;
+        iz size  = ariel_size(&cfg);
+        void *mem = alignedalloc((size_t)size);
+        memset(mem, 0x5a, (size_t)size);
+        ariel_Term *n = ariel_move(s->t, mem, size, &cfg);
+        if (!n) {
+            alignedfree(mem);
+            fail(sc, "move refused");
+            return;
+        }
+        memset(s->mem, 0xa5, (size_t)s->t->len);
+        alignedfree(s->mem);
+        s->mem = mem;
+        s->t   = n;
+        return;
+    }
+    if (word(&p, "EXPORT")) {
+        // The export rebuilds the terminal: the same dump, history too
+        checks++;
+        ariel_Term  *t   = s->t;
+        ariel_Config cfg = {0};
+        cfg.cols      = t->cols;
+        cfg.rows      = t->rows;
+        cfg.capcols   = t->capcols;
+        cfg.caprows   = t->caprows;
+        cfg.histlines = t->histlines;
+        cfg.histbytes = t->histbytes;
+        cfg.flags     = t->flags;
+        iz    size = ariel_size(&cfg);
+        void *mem  = alignedalloc((size_t)size);
+        ariel_Term *n = ariel_init(mem, size, &cfg);
+        memcpy(n->paldef, t->paldef, sizeof(n->paldef));
+        memcpy(n->pal,    t->paldef, sizeof(n->pal));
+        iz  len = ariel_export(t, t->hcount, 0, 0);
+        u8 *e   = malloc((size_t)len + 1);
+        ariel_export(t, t->hcount, e, len);
+        ariel_Str in = {e, len};
+        while (in.len) {
+            in = ariel_feed(n, in).rest;
+        }
+        int flags = ARIEL_DUMP_ATTRS | ARIEL_DUMP_STATE | ARIEL_DUMP_HISTORY;
+        iz  al = ariel_dump(t, flags, 0, 0);
+        iz  bl = ariel_dump(n, flags, 0, 0);
+        u8 *ad = malloc((size_t)al + 1);
+        u8 *bd = malloc((size_t)bl + 1);
+        ariel_dump(t, flags, ad, al);
+        ariel_dump(n, flags, bd, bl);
+        if (al!=bl || memcmp(ad, bd, (size_t)al)) {
+            fail(sc, "export differs");
+            fprintf(stderr, "export:\n%.*s\nwant:\n%.*s\ngot:\n%.*s\n",
+                    (int)len, (char *)e, (int)al, (char *)ad, (int)bl, (char *)bd);
+        }
+        free(ad);
+        free(bd);
+        free(e);
+        alignedfree(mem);
+        return;
+    }
+    if (word(&p, "DUMP")) {
+        // Debugging: the state, history and screen to stderr
+        iz n = ariel_dump(s->t, ARIEL_DUMP_STATE|ARIEL_DUMP_HISTORY, buf, countof(buf));
+        fprintf(stderr, "%s:%d: DUMP\n%.*s", sc->file, sc->line,
+                (int)(n<countof(buf) ? n : countof(buf)), (char *)buf);
+        return;
+    }
+    if (word(&p, "SCROLL")) {
+        if (word(&p, "TO")) {
+            skipws(&p);
+            if (word(&p, "bottom")) ariel_scrollto(s->t, ARIEL_TO_BOTTOM);
+            else if (word(&p, "top")) ariel_scrollto(s->t, ARIEL_TO_TOP);
+            else if (word(&p, "prev")) ariel_scrollto(s->t, ARIEL_TO_PREVMARK);
+            else if (word(&p, "next")) ariel_scrollto(s->t, ARIEL_TO_NEXTMARK);
+            else goto syntax;
+            return;
+        }
+        ariel_scroll(s->t, (i32)number(&p));
+        return;
+    }
+    if (word(&p, "SELECT")) {
+        static struct { char *name; int op; } const ops[] = {
+            {"char", ARIEL_SEL_CHAR}, {"word", ARIEL_SEL_WORD},
+            {"line", ARIEL_SEL_LINE}, {"extend", ARIEL_SEL_EXTEND},
+            {"all", ARIEL_SEL_ALL}, {"clear", ARIEL_SEL_CLEAR},
+        };
+        int op = 0;
+        for (int i = 0; i < countof(ops) && !op; i++) {
+            if (word(&p, ops[i].name)) op = ops[i].op;
+        }
+        if (!op) goto syntax;
+        if (word(&p, "block")) op |= ARIEL_SEL_BLOCK;
+        int r = (int)number(&p);
+        comma(&p);
+        int c = (int)number(&p);
+        ariel_select(s->t, op, c, r);
+        return;
+    }
     if (word(&p, "RESET")) {
         ariel_reset(s->t, ARIEL_RESET_FULL);
         clearlog(s);
@@ -1013,11 +1140,61 @@ static void runline(Script *sc, Tester *s, char *p)
             return;
         }
         u32 want = 0;
-        if (word(&p, "wrapped")) want = ARIEL_R_WRAPPED;
-        else if (word(&p, "prompt")) want = ARIEL_R_PROMPT;
-        else if (!word(&p, "-")) goto syntax;
+        for (;;) {
+            if (word(&p, "wrapped")) want |= ARIEL_R_WRAPPED;
+            else if (word(&p, "prompt")) want |= ARIEL_R_PROMPT;
+            else if (word(&p, "history")) want |= ARIEL_R_HISTORY;
+            else break;
+        }
+        if (!want && !word(&p, "-")) goto syntax;
         u32 flags = ariel_rowinfo(s->t, r).flags;
         if (flags != want) fail(sc, "lineinfo %d is %#x, want %#x", r, flags, want);
+        return;
+    }
+    if (word(&p, "?history")) {
+        // History row n, 1 the newest, by scrolling it into view
+        int r = (int)number(&p);
+        if (!expect(&p, '=')) goto syntax;
+        int n = quoted(&p, buf, countof(buf));
+        if (n < 0) goto syntax;
+        i32 save = s->t->viewoff;
+        ariel_scrollto(s->t, ARIEL_TO_BOTTOM);
+        ariel_scroll(s->t, -r);
+        int m = 0;
+        if (ariel_view(s->t).offset == r) {
+            m = rowtext(s, 0, 0, 4096, got, countof(got));
+        } else {
+            m = snprintf((char *)got, sizeof(got), "<none>");
+        }
+        s->t->viewoff = save;
+        if (m != n || memcmp(got, buf, (size_t)n)) {
+            escape(tmp, sizeof(tmp), got, m);
+            escape(tmp2, sizeof(tmp2), buf, n);
+            fail(sc, "history %d \"%s\", want \"%s\"", r, tmp, tmp2);
+        }
+        return;
+    }
+    if (word(&p, "?view")) {
+        if (!expect(&p, '=')) goto syntax;
+        int off = (int)number(&p);
+        comma(&p);
+        int total = (int)number(&p);
+        ariel_View v = ariel_view(s->t);
+        if (v.offset!=off || v.total!=total) {
+            fail(sc, "view %d,%d, want %d,%d", v.offset, v.total, off, total);
+        }
+        return;
+    }
+    if (word(&p, "?copy")) {
+        if (!expect(&p, '=')) goto syntax;
+        int n = quoted(&p, buf, countof(buf));
+        if (n < 0) goto syntax;
+        iz m = ariel_copy(s->t, got, countof(got));
+        if (m != n || memcmp(got, buf, (size_t)n)) {
+            escape(tmp, sizeof(tmp), got, (int)m);
+            escape(tmp2, sizeof(tmp2), buf, n);
+            fail(sc, "copy \"%s\", want \"%s\"", tmp, tmp2);
+        }
         return;
     }
     if (word(&p, "output")) {
@@ -1310,8 +1487,14 @@ static void movetest(void)
         void *mem2  = alignedalloc((size_t)msize);
         iz    blen, alen;
         u8   *before = dumpall(t, &blen);
+        u32   gen1   = ariel_rowinfo(t, 1).gen;
         ariel_Term *n = ariel_move(t, mem2, msize, &c);
         u8   *after  = dumpall(n, &alen);
+        if (alt && ariel_rowinfo(n, 1).gen==gen1) {
+            // Clusters on row 1 degraded, so its gen must change
+            failures++;
+            fprintf(stderr, "movetest: degraded row kept its gen\n");
+        }
         if (!alt && (alen!=blen || memcmp(before, after, (size_t)alen))) {
             failures++;
             fprintf(stderr, "movetest: clusters lost in a move\n");
@@ -1334,11 +1517,90 @@ static void movetest(void)
         alignedfree(mem);
         alignedfree(mem2);
     }
+
+    // A move dropping the history that holds the selection's start
+    // clears the selection, which changes every selected row
+    checks++;
+    ariel_Config cfg = {0};
+    cfg.cols = 20;
+    cfg.rows = 10;
+    iz    size = ariel_size(&cfg);
+    void *mem  = alignedalloc((size_t)size);
+    ariel_Term *t = ariel_init(mem, size, &cfg);
+    for (int i = 0; i < 100; i++) {
+        feedstr(t, "line\r\n");
+    }
+    ariel_select(t, ARIEL_SEL_ALL, 0, 0);
+    u32 gen0 = ariel_rowinfo(t, 0).gen;
+    ariel_Config c = cfg;
+    c.histlines = 10;
+    iz    msize = ariel_size(&c);
+    void *mem2  = alignedalloc((size_t)msize);
+    ariel_Term *n = ariel_move(t, mem2, msize, &c);
+    if (!n || ariel_rowinfo(n, 0).gen==gen0) {
+        failures++;
+        fprintf(stderr, "movetest: dropped selection kept row gens\n");
+    }
+    alignedfree(mem);
+    alignedfree(mem2);
+}
+
+// A move packs history tight against the ring's end. Reflow then ends
+// the open record with a fill, which must reserve its own room rather
+// than write past the ring, which is the end of the block.
+static void hfilltest(void)
+{
+    checks++;
+    ariel_Config cfg = {0};
+    cfg.cols      = 20;
+    cfg.rows      = 5;
+    cfg.histlines = 1000;
+    cfg.histbytes = 4096;
+    iz    size = ariel_size(&cfg);
+    void *mem  = alignedalloc((size_t)size);
+    ariel_Term *t = ariel_init(mem, size, &cfg);
+
+    // Empty lines, 5-byte records, then a line wrapping off the top so
+    // row 0 continues the open record, then row 0 erased in a blue bg
+    for (int i = 0; i < 400; i++) feedstr(t, "\r\n");
+    feedstr(t, "\x1b[5;1Hxxxxxxxxxxxxxxxxxxxxyyy\r\n\r\n\r\n\r\n");
+    feedstr(t, "\x1b[H\x1b[44m\x1b[2K\x1b[m\x1b[5;1Hz");
+
+    // A ring the greedy packing fills to within a fill header of its end
+    ariel_Config c = cfg;
+    i32 best = -1;
+    for (i32 hb = 1024; hb >= 576; hb -= 16) {
+        u32 used = 0;
+        for (i32 k = 0; k < t->hcount; k++) {
+            u32 len = hent(t, t->hcount-1-k)->len;
+            if (used+len > (u32)hb) break;
+            used += len;
+        }
+        if ((u32)hb-used < 9) { best = hb; break; }
+    }
+    c.histbytes = best;
+    iz    msize = ariel_size(&c);
+    void *mem2  = alignedalloc((size_t)msize);
+    ariel_Term *n = best<0 ? 0 : ariel_move(t, mem2, msize, &c);
+    if (!n) {
+        failures++;
+        fprintf(stderr, "hfilltest: no tight move\n");
+    } else {
+        ariel_resize(n, 20, 3, 8, 16);
+        if (n->hw > (u32)n->histbytes) {
+            failures++;
+            fprintf(stderr, "hfilltest: ring written to %u of %d\n",
+                    n->hw, (int)n->histbytes);
+        }
+    }
+    alignedfree(mem);
+    alignedfree(mem2);
 }
 
 int main(int argc, char **argv)
 {
     movetest();
+    hfilltest();
     for (int i = 1; i < argc; i++) {
         char *name = argv[i];
         size_t n = strlen(name);

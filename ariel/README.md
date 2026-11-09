@@ -34,6 +34,7 @@ Define `ARIEL_TRAP` to make assertions trap in release builds too.
     tests/test.c          unit tests and the *.test script runner
     tests/*.test          scripts in a libvterm-like language
     tests/fuzz.c          AFL++ target with an invariant checker
+    tests/fuzz/           minimized fuzz finds, replayed by ctest
     tools/replay.c        ariel-replay: dump or benchmark a recording
     tools/gentables.py    Unicode tables, spliced into ariel.c (uv run)
 
