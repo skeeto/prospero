@@ -21303,12 +21303,13 @@ static b32 drivecheck(Gui *g, i32 chk)
                r->value==concat(&a, g->longval, "!");
     }
     case CHK_CFGKEPT:
-        // The field gone to by Tab kept the focus through the config.get
-        // after the edit left behind, and what was typed in it on either
-        // side of it
+        // The field gone to by Tab, the role's next after its prompt (which
+        // is whichever key the table puts there), kept the focus through
+        // the config.get after the edit left behind, and what was typed in
+        // it on either side of it
         for (iz i = 0; i < g->cfgrows.len; i++) {
             CfgRow *r = &g->cfgrows[i];
-            if (r->active && r->typed && r->key==Str("endpoint") &&
+            if (r->active && r->typed && r->key!=Str("prompt") &&
                     Str{(u8 *)r->buf, (iz)__builtin_strlen(r->buf)}==g->ops[g->drivepc-1].text) {
                 return 1;
             }
