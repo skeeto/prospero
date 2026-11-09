@@ -664,7 +664,7 @@ struct GuiSession {
     GuiSession  *toastsel;  // what a click on it selects, under it
     QForm       *qform;     // the answers to the agent's questions, null
                             // until it first asks
-    TermTab     *term;      // a root's terminal (term.cpp), null until one
+    TermSet      terms;     // a root's terminal tabs (term.cpp)
 };
 
 // A command awaiting its reply.
@@ -1707,6 +1707,8 @@ struct Gui {
     b32                openmodal;
     // The Terminal pane (term.cpp)
     b32                termhome;     // it has no home in the dock space yet
+    TermTab           *termspare;    // closed tabs, to reuse
+    u32                termserial;   // the last tab's serial
     b32                termfocus;    // focus the terminal when next drawn
     i32                termlastcols; // the pane's size in cells last frame,
     i32                termlastrows; //   before its shell starts
@@ -21286,13 +21288,15 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_TERMSIZE:
         return termsizecheck(g);
     case CHK_TERMNONE: {
-        GuiSession *s = g->sess ? sessroot(g, g->sess) : 0;
-        return s && (!s->term || s->term->state==TT_NONE);
+        TermTab *tt = termfront(g);
+        return g->sess && (!tt || tt->state==TT_NONE);
     }
     case CHK_TERMCOUNT: {
         i64 n = 0;
         for (GuiSession *s = g->sessions; s; s = s->next) {
-            n += s->term && s->term->state!=TT_NONE;
+            for (i32 i = 0; i < s->terms.n; i++) {
+                n += s->terms.tabs[i]->state != TT_NONE;
+            }
         }
         return (f32)n == g->ops[g->drivepc-1].dx;
     }
@@ -21306,8 +21310,7 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_TERMGRID: {
         DriveOp    *op = &g->ops[g->drivepc-1];
-        GuiSession *s  = g->sess ? sessroot(g, g->sess) : 0;
-        TermTab    *tt = s ? s->term : 0;
+        TermTab *tt = termfront(g);
         if (!tt || !tt->t) {
             return 0;
         }

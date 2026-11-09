@@ -1,6 +1,7 @@
 // The Terminal pane: a shell on a pseudo-terminal in the session's
-// engine (ptyhost.cpp), emulated here by ariel, one terminal per root
-// session, which subagents and side chats share.
+// engine (ptyhost.cpp), emulated here by ariel, in tabs: a set of up to
+// eight per root session (termset.cpp), which its subagents and side
+// chats share.
 //
 // The engine streams the shell's output as term records, each at its
 // offset; the pane feeds them to ariel and acks the offset, which opens
@@ -29,9 +30,12 @@ enum : i32 {
     TERMTAB_TEXT   = 160,       // bytes kept of its shell's name and errors
     TERMTAB_RESIZE = 100*1000,  // µs a new size waits to settle
     TERMTAB_INPUT  = 16 << 10,  // bytes per term.input (ptyhost's TERM_INPUT)
+    TERMTAB_OPEN   = 16,        // open on one engine (ptyhost's TERM_PERPEER)
 };
 
 struct TermTab {
+    TermTab    *next;      // on the spare list, once closed
+    u32         serial;    // its tab's ID, kept through a restart
     GuiHost    *host;
     i64         tid;       // the engine's, 0 until term.open's reply
     i64         openid;    // term.open in flight, else 0
@@ -58,6 +62,8 @@ struct TermTab {
     iz          shelllen;
     u8          err[TERMTAB_TEXT];    // why it failed or ended
     iz          errlen;
+    u8          title[TERMTITLECAP];  // its program's, as shown (termtitle)
+    iz          titlelen;
 };
 
 static iz termkeep(u8 *dst, Str s)
@@ -82,6 +88,8 @@ static Str termwhy(Gui *g, GuiSession *s)
 {
     if (!s) {
         return "No session is open";
+    } else if ((s->parent.len || (s->view && s->view->parent.len)) && !sessup(g, s)) {
+        return "Its parent session isn't listed yet";
     } else if (s->host->kind != GH_ENGINE) {
         return "Terminals run on this machine's sessions for now";
     } else if (g->enginekind == ENGINE_FAKE) {
@@ -168,14 +176,17 @@ static b32 termblock(Gui *g, TermTab *tt, i32 cols, i32 rows)
     return 1;
 }
 
+// Let go of a terminal's block and state, keeping its tab.
 static void termfree(Gui *g, TermTab *tt)
 {
     if (tt->region) {
         os_release(g->os, tt->region);
     }
-    GuiHost *h = tt->host;
+    GuiHost *h      = tt->host;
+    u32      serial = tt->serial;
     *tt = {};
-    tt->host = h;
+    tt->host   = h;
+    tt->serial = serial;
 }
 
 // Begin a terminal's command, which has no reply. Finish it with cmdsend.
@@ -249,12 +260,81 @@ static void termclose(Gui *g, TermTab *tt, b32 kill)
     scheddirty(&g->sched);
 }
 
+// The root whose terminal tabs a session shows: a subagent's, at the
+// top of its parents, and a side chat's original's, in the same folder.
+// A worktree session, in a folder of its own, has its own.
+static Str termcwd(GuiSession *s)
+{
+    return s->view && s->view->cwd.len ? s->view->cwd : s->cwd;
+}
+
+static GuiSession *termroot(Gui *g, GuiSession *s)
+{
+    s = sessroot(g, s);
+    for (i32 n = 0; n < 8; n++) {
+        Str side = sessside(s);
+        if (!side.len || s->wtname.len) {
+            break;
+        }
+        GuiSession *o = findsess(g, s->host, side);
+        if (!o || o==s || o->gone || !(termcwd(o) == termcwd(s))) {
+            break;
+        }
+        s = sessroot(g, o);
+    }
+    return s;
+}
+
+// The shown session's front tab, else null.
+static TermTab *termfront(Gui *g)
+{
+    GuiSession *s = g->sess ? termroot(g, g->sess) : 0;
+    return s ? termsetfront(&s->terms) : 0;
+}
+
+// The root whose set holds a tab.
+static GuiSession *termowner(Gui *g, TermTab *tt)
+{
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        if (termsetfind(&s->terms, tt) >= 0) {
+            return s;
+        }
+    }
+    return 0;
+}
+
+// Why a root can have no new tab now, else empty.
+static Str termfull(Gui *g, GuiSession *s)
+{
+    if (s->terms.n == TERMTABS) {
+        return "A session has at most 8 terminal tabs";
+    }
+    i32 open = 0;
+    for (GuiSession *o = g->sessions; o; o = o->next) {
+        for (i32 i = 0; i < o->terms.n; i++) {
+            TermTab *tt = o->terms.tabs[i];
+            open += tt->host==s->host && (tt->state==TT_OPENING || tt->state==TT_LIVE);
+        }
+    }
+    return open>=TERMTAB_OPEN ? Str("16 terminals are open already") : Str{};
+}
+
+// Close tab i of a root, which takes it out of the set, to the spares.
+static void termdrop(Gui *g, GuiSession *s, i32 i, b32 kill)
+{
+    TermTab *tt = s->terms.tabs[i];
+    termclose(g, tt, kill);
+    termsetdrop(&s->terms, i);
+    tt->next     = g->termspare;
+    g->termspare = tt;
+}
+
 // Hang up every terminal, as the window goes.
 static void termcloseall(Gui *g)
 {
     for (GuiSession *s = g->sessions; s; s = s->next) {
-        if (s->term) {
-            termclose(g, s->term, 0);
+        while (s->terms.n) {
+            termdrop(g, s, s->terms.n-1, 0);
         }
     }
 }
@@ -265,34 +345,30 @@ static void termcloseall(Gui *g)
 static void termsweep(Gui *g)
 {
     for (GuiSession *s = g->sessions; s; s = s->next) {
-        TermTab *tt = s->term;
-        if (!tt || tt->state==TT_NONE) {
+        if (s->gone || s->trashed) {
+            while (s->terms.n) {
+                termdrop(g, s, s->terms.n-1, 0);
+            }
             continue;
-        } else if (s->gone || s->trashed) {
-            termclose(g, tt, 0);
-        } else if (g->enginegone && tt->host->kind==GH_ENGINE &&
-                   (tt->state==TT_LIVE || tt->state==TT_OPENING)) {
-            tt->state  = TT_ENDED;
-            tt->tid    = 0;
-            tt->openid = 0;
-            tt->busy   = 0;
-            tt->errlen = termkeep(tt->err, "the engine stopped");
-            scheddirty(&g->sched);
+        }
+        for (i32 i = 0; i < s->terms.n; i++) {
+            TermTab *tt = s->terms.tabs[i];
+            if (g->enginegone && tt->host->kind==GH_ENGINE &&
+                (tt->state==TT_LIVE || tt->state==TT_OPENING)) {
+                tt->state  = TT_ENDED;
+                tt->tid    = 0;
+                tt->openid = 0;
+                tt->busy   = 0;
+                tt->errlen = termkeep(tt->err, "the engine stopped");
+                scheddirty(&g->sched);
+            }
         }
     }
 }
 
-// Start a session's terminal at a size.
-static void termstart(Gui *g, GuiSession *s, i32 cols, i32 rows)
+// Start a shell in a tab of root s, at a size.
+static void termlaunch(Gui *g, GuiSession *s, TermTab *tt, i32 cols, i32 rows)
 {
-    if (termwhy(g, s).len) {
-        return;
-    }
-    if (!s->term) {
-        s->term = alloc<TermTab>(&g->perm);
-    }
-    TermTab *tt = s->term;
-    termclose(g, tt, 0);    // a restart hangs up the old shell
     tt->host = s->host;
     cols = cols>0 ? cols : 80;
     rows = rows>0 ? rows : 24;
@@ -317,11 +393,45 @@ static void termstart(Gui *g, GuiSession *s, i32 cols, i32 rows)
     scheddirty(&g->sched);
 }
 
+// A new tab for root s, shown, its shell starting; null if it can have
+// none (termwhy, termfull).
+static TermTab *termnew(Gui *g, GuiSession *s, i32 cols, i32 rows)
+{
+    if (termwhy(g, s).len || termfull(g, s).len) {
+        return 0;
+    }
+    TermTab *tt = g->termspare;
+    if (tt) {
+        g->termspare = tt->next;
+        *tt = {};
+    } else {
+        tt = alloc<TermTab>(&g->perm);
+    }
+    tt->serial = ++g->termserial;
+    termsetadd(&s->terms, tt);
+    termlaunch(g, s, tt, cols, rows);
+    return tt;
+}
+
+// A new shell in the same tab, the old one hung up.
+static void termrestart(Gui *g, GuiSession *s, TermTab *tt, i32 cols, i32 rows)
+{
+    termclose(g, tt, 0);
+    if (!termwhy(g, s).len) {
+        termlaunch(g, s, tt, cols, rows);
+    }
+}
+
 // term.open's reply.
 static void termopened(Gui *g, GuiSession *s, i64 id, Json *j, b32 ok, Str err)
 {
-    TermTab *tt = s ? s->term : 0;
-    if (!tt || tt->openid!=id) {
+    TermTab *tt = 0;
+    for (i32 i = 0; s && i<s->terms.n; i++) {
+        if (s->terms.tabs[i]->openid == id) {
+            tt = s->terms.tabs[i];
+        }
+    }
+    if (!tt || !id) {
         // Abandoned while opening: hang it up
         i64 tid = jsonint(jsonget(j, "tid"), 0);
         if (ok && tid && s) {
@@ -354,9 +464,11 @@ static void termopened(Gui *g, GuiSession *s, i64 id, Json *j, b32 ok, Str err)
 static TermTab *termbytid(Gui *g, GuiHost *h, i64 tid)
 {
     for (GuiSession *s = g->sessions; tid && s; s = s->next) {
-        TermTab *tt = s->term;
-        if (tt && tt->host==h && tt->tid==tid) {
-            return tt;
+        for (i32 i = 0; i < s->terms.n; i++) {
+            TermTab *tt = s->terms.tabs[i];
+            if (tt->host==h && tt->tid==tid) {
+                return tt;
+            }
         }
     }
     return 0;
@@ -428,8 +540,10 @@ static void termapply(Gui *g, GuiHost *h, Arena scratch, EvRec *r)
             termack(g, tt, off<tt->fed ? off : tt->fed, 0);
         }
         if (!tt->code && !tt->signal && !err.len && off==tt->fed) {
-            termfree(g, tt);  // a clean exit closes it
-            if (g->panes[PANE_TERMINAL] && g->termfocused) {
+            // A clean exit closes its tab
+            GuiSession *o = termowner(g, tt);
+            termdrop(g, o, termsetfind(&o->terms, tt), 0);
+            if (!o->terms.n && g->panes[PANE_TERMINAL] && g->termfocused) {
                 g->promptfocus = 1;
             }
             return;
@@ -1012,10 +1126,10 @@ static void termbanner(Gui *g, GuiSession *s, TermTab *tt, Arena a, i32 cols, i3
     b32 close = ImGui::Button("Close");
     restart |= ImGui::IsWindowFocused() && ImGui::IsKeyPressed(ImGuiKey_Enter, false);
     if (restart) {
-        termstart(g, s, cols, rows);
+        termrestart(g, s, tt, cols, rows);
         g->termfocus = 1;
     } else if (close) {
-        termclose(g, tt, 0);
+        termdrop(g, s, termsetfind(&s->terms, tt), 0);
     }
 }
 
@@ -1024,8 +1138,8 @@ static void termbanner(Gui *g, GuiSession *s, TermTab *tt, Arena a, i32 cols, i3
 static void drawterm(Gui *g)
 {
     Arena        a  = g->frame;
-    GuiSession  *s  = g->sess ? sessroot(g, g->sess) : 0;
-    TermTab     *tt = s ? s->term : 0;
+    GuiSession  *s  = g->sess ? termroot(g, g->sess) : 0;
+    TermTab     *tt = s ? termsetfront(&s->terms) : 0;
     ImGuiWindow *win = ImGui::GetCurrentWindow();
     ImGuiID      id  = win->GetID("##grid");
     g->termid      = id;
@@ -1059,9 +1173,11 @@ static void drawterm(Gui *g)
         if (g->termfocus && !held) {
             return;
         } else if (g->termfocus || ImGui::Button("Start a shell")) {
-            termstart(g, s, cols, rows);
             g->termfocus = 1;
-            tt = s->term;
+            tt = termnew(g, s, cols, rows);
+            if (!tt) {
+                return;
+            }
         } else {
             ImGui::TextDisabled("Ctrl+` starts one, and comes back to it");
             return;
@@ -1165,8 +1281,7 @@ static void drawterm(Gui *g)
 // empty.
 static Str termscreen(Gui *g, Arena *a)
 {
-    GuiSession *s  = g->sess ? sessroot(g, g->sess) : 0;
-    TermTab    *tt = s ? s->term : 0;
+    TermTab *tt = termfront(g);
     if (!tt || !tt->t) {
         return {};
     }
@@ -1190,8 +1305,7 @@ static Str termscreen(Gui *g, Arena *a)
 // engine was told, with no new size waiting.
 static b32 termsizecheck(Gui *g)
 {
-    GuiSession  *s  = g->sess ? sessroot(g, g->sess) : 0;
-    TermTab     *tt = s ? s->term : 0;
+    TermTab     *tt = termfront(g);
     ImGuiWindow *w  = ImGui::FindWindowByName("Terminal");
     if (!tt || !tt->t || !w || tt->state!=TT_LIVE) {
         guilog(g, "drive: no live terminal shown");
