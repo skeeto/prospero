@@ -7,16 +7,23 @@ static void test_container(Test *t)
     Arena  a = t->perm;
     CfgEnv v = newcfgenv(&a);
 
-    // Finding a runtime on the PATH, docker before podman
+    // Finding a runtime on the PATH, docker before podman. Windows splits
+    // PATH at semicolons and looks for .exe programs.
+    Str sep = HOST_WINDOWS ? Str(";") : Str(":");
+    Str exe = HOST_WINDOWS ? Str(".exe") : Str("");
+    Str podman = concat(&a, "/u/bin/podman", exe);
+    Str docker = concat(&a, "/d/bin/docker", exe);
     os_write(v.os, a, "/u/bin/podman", "x");
-    os_write(v.os, a, "/d/bin/docker", "x");
-    CtrRuntime rt = ctrfind(v.os, &a, v.scratch, "auto", "/none:/u/bin");
+    os_write(v.os, a, podman, "x");
+    os_write(v.os, a, docker, "x");
+    CtrRuntime rt = ctrfind(v.os, &a, v.scratch, "auto",
+                            concat(&a, "/none", concat(&a, sep, "/u/bin")));
     expect(t, "ctrfind podman", concat(&a, rt.name, concat(&a, " ", rt.path)),
-           "podman /u/bin/podman");
-    rt = ctrfind(v.os, &a, v.scratch, "", "/u/bin:/d/bin");
-    expect(t, "ctrfind docker first", rt.path, "/d/bin/docker");
-    rt = ctrfind(v.os, &a, v.scratch, "podman", "/d/bin:/u/bin");
-    expect(t, "ctrfind named", rt.path, "/u/bin/podman");
+           concat(&a, "podman ", podman));
+    rt = ctrfind(v.os, &a, v.scratch, "", concat(&a, "/u/bin", concat(&a, sep, "/d/bin")));
+    expect(t, "ctrfind docker first", rt.path, docker);
+    rt = ctrfind(v.os, &a, v.scratch, "podman", concat(&a, "/d/bin", concat(&a, sep, "/u/bin")));
+    expect(t, "ctrfind named", rt.path, podman);
     rt = ctrfind(v.os, &a, v.scratch, "docker", "/u/bin");
     expect(t, "ctrfind missing", concat(&a, rt.name, concat(&a, ":", rt.path)), "docker:");
     rt = ctrfind(v.os, &a, v.scratch, "/u/bin/podman", "");
