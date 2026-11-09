@@ -5762,6 +5762,7 @@ static void termapply(Gui *, GuiHost *, Arena, EvRec *);
 static void termcloseall(Gui *);
 static void drawterm(Gui *);
 static void termhotkeys(Gui *);
+static void termsweep(Gui *);
 static void termgrab(Gui *);
 static Str  termscreen(Gui *, Arena *);
 static b32  termsizecheck(Gui *);
@@ -13264,6 +13265,7 @@ enum : i32 {
     CHK_TERMSCREEN,   // the terminal's screen has text
     CHK_TERMSIZE,     // the terminal fills its pane, the engine told its size
     CHK_TERMNONE,     // the session shown has no terminal
+    CHK_TERMCOUNT,    // dx terminals are open, in every session
     CHK_TERMQUIET,    // no frames while idle, the terminal shown
     CHK_TERMFORCE,    // sets the grid to dx by dy, clipped to its pane
                       // (0 by 0: its pane's), and passes
@@ -13554,6 +13556,7 @@ static Str chknames[] = {
     "the '@' picker's pick says it is attached, or does not",
     "the terminal has the keyboard", "the terminal shows the text",
     "the terminal fills its pane", "the terminal is closed",
+    "that many terminals are open",
     "no frames while idle, the terminal shown",
     "the terminal's grid is set", "the terminal is that size, in 32-bit indices",
     "the palette lists what it should",
@@ -17496,6 +17499,26 @@ static DriveOp termops[] = {
     {OP_TEXT, 0, 0, 0, 100, "echo fresh"},
     TERMKEY(GKEY_ENTER, 100),
     {OP_WAIT, W_TERM, 0, 0, 5000, "\nfresh"},
+    // Moving its session to the Trash hangs up its shell (gui.py checks
+    // the trap's file, or the pid on Windows) and closes its terminal;
+    // the next session's terminal is its own
+    {OP_TEXT, 0, 0, 0, 100, "echo $$ >trash.pid; trap 'echo hup >hup-trash.txt; exit' HUP EXIT"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "EXIT\ntty$"},
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, ""},  // untitled, the only one
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Move to Trash"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_TERMCOUNT, 0, 0, 1000, ""},
+    {OP_NEWSESSION, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_TERMNONE, 0, 0, 0, ""},
+    CTRLKEY(GKEY_GRAVE, 500),
+    {OP_WAIT, W_TERM, 0, 0, 10000, "tty$"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMCOUNT, 1, 0, 0, ""},
     // Quitting hangs up the shell, whose trap leaves a file (gui.py), but
     // on Windows, where busybox's sh runs no trap for the hang-up (a
     // CTRL_CLOSE_EVENT), it only ends: gui.py checks its pid is gone
@@ -21264,6 +21287,13 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_TERMNONE: {
         GuiSession *s = g->sess ? sessroot(g, g->sess) : 0;
         return s && (!s->term || s->term->state==TT_NONE);
+    }
+    case CHK_TERMCOUNT: {
+        i64 n = 0;
+        for (GuiSession *s = g->sessions; s; s = s->next) {
+            n += s->term && s->term->state!=TT_NONE;
+        }
+        return (f32)n == g->ops[g->drivepc-1].dx;
     }
     case CHK_TERMQUIET:
         return g->panes[PANE_TERMINAL] && drivequiet(g, "idle with the terminal shown", 2);

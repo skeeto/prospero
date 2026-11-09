@@ -230,13 +230,19 @@ static void termsize(Gui *g, TermTab *tt, i32 cols, i32 rows, f32 cw, f32 ch)
 }
 
 // Hang up a terminal and forget it: its shell gets SIGHUP, as a closed
-// terminal window's would.
-static void termclose(Gui *g, TermTab *tt)
+// terminal window's would. With kill, its whole process tree goes too.
+// An ended terminal is closed as well, so the engine lets go of it now
+// rather than when its unacked output gives up.
+static void termclose(Gui *g, TermTab *tt, b32 kill)
 {
-    if (tt->tid && (tt->state==TT_LIVE || tt->state==TT_OPENING)) {
+    if (tt->tid && tt->state>=TT_OPENING && tt->state<=TT_ENDED) {
         Arena a = newarena(g->cmdr);
         Buf   b(&a, 128);
         EvOut w = termbegin(g, &b, CMD_TERMCLOSE, tt);
+        if (kill) {
+            putkey(&w.json, "kill");
+            putbool(&w.json, 1);
+        }
         cmdsend(g, &w, a);
     }
     termfree(g, tt);
@@ -248,7 +254,30 @@ static void termcloseall(Gui *g)
 {
     for (GuiSession *s = g->sessions; s; s = s->next) {
         if (s->term) {
-            termclose(g, s->term);
+            termclose(g, s->term, 0);
+        }
+    }
+}
+
+// Each frame: close the terminals of sessions deleted or put in the
+// Trash, here or by another window (their engine hung them up already),
+// and end those of an engine that stopped, which says nothing more.
+static void termsweep(Gui *g)
+{
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        TermTab *tt = s->term;
+        if (!tt || tt->state==TT_NONE) {
+            continue;
+        } else if (s->gone || s->trashed) {
+            termclose(g, tt, 0);
+        } else if (g->enginegone && tt->host->kind==GH_ENGINE &&
+                   (tt->state==TT_LIVE || tt->state==TT_OPENING)) {
+            tt->state  = TT_ENDED;
+            tt->tid    = 0;
+            tt->openid = 0;
+            tt->busy   = 0;
+            tt->errlen = termkeep(tt->err, "the engine stopped");
+            scheddirty(&g->sched);
         }
     }
 }
@@ -263,7 +292,7 @@ static void termstart(Gui *g, GuiSession *s, i32 cols, i32 rows)
         s->term = alloc<TermTab>(&g->perm);
     }
     TermTab *tt = s->term;
-    termfree(g, tt);
+    termclose(g, tt, 0);    // a restart hangs up the old shell
     tt->host = s->host;
     cols = cols>0 ? cols : 80;
     rows = rows>0 ? rows : 24;
@@ -300,7 +329,7 @@ static void termopened(Gui *g, GuiSession *s, i64 id, Json *j, b32 ok, Str err)
             gone.host  = s->host;
             gone.tid   = tid;
             gone.state = TT_LIVE;
-            termclose(g, &gone);
+            termclose(g, &gone, 0);
         }
         return;
     }
@@ -363,7 +392,7 @@ static void termapply(Gui *g, GuiHost *h, Arena scratch, EvRec *r)
             gone.host  = h;
             gone.tid   = tid;
             gone.state = TT_LIVE;
-            termclose(g, &gone);
+            termclose(g, &gone, 0);
         }
         return;
     }
@@ -986,7 +1015,7 @@ static void termbanner(Gui *g, GuiSession *s, TermTab *tt, Arena a, i32 cols, i3
         termstart(g, s, cols, rows);
         g->termfocus = 1;
     } else if (close) {
-        termfree(g, tt);
+        termclose(g, tt, 0);
     }
 }
 

@@ -14521,6 +14521,7 @@ static b32 beginpane(Gui *g, i32 pane)
 
 static void dockwindows(Gui *g)
 {
+    termsweep(g);
     termhotkeys(g);
     menukeys(g);
     termgrab(g);

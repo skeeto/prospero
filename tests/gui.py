@@ -2104,23 +2104,25 @@ def main():
                 if not os.path.exists(os.path.join(args.shots, name + ".png")):
                     problems.append(f"no {name}.png")
     if args.mode == "terminal":
-        # The shell's HUP trap, as quitting hung it up, or on Windows,
-        # where busybox's sh runs no trap for it, the shell gone
-        def hungup():
+        # The shell's HUP trap, as quitting (or the Trash) hung it up, or
+        # on Windows, where busybox's sh runs no trap for it, the shell gone
+        def hungup(trapfile, pidfile):
             if os.name != "nt":
-                return os.path.exists(os.path.join(work, "hup.txt"))
+                return os.path.exists(os.path.join(work, trapfile))
             try:
-                pid = int(open(os.path.join(work, "shell.pid")).read())
+                pid = int(open(os.path.join(work, pidfile)).read())
             except (OSError, ValueError):
                 return False
             return not alive(pid)
-        deadline = time.monotonic() + 5
-        while not hungup() and time.monotonic() < deadline:
-            time.sleep(0.1)
-        if not hungup():
-            problems.append("quitting did not hang up the terminal's shell")
-        else:
-            print("terminal: quitting hung up the shell")
+        for trapfile, pidfile, what in (("hup-trash.txt", "trash.pid", "the Trash"),
+                                        ("hup.txt", "shell.pid", "quitting")):
+            deadline = time.monotonic() + 5
+            while not hungup(trapfile, pidfile) and time.monotonic() < deadline:
+                time.sleep(0.1)
+            if not hungup(trapfile, pidfile):
+                problems.append(f"{what} did not hang up the terminal's shell")
+            else:
+                print(f"terminal: {what} hung up the shell")
     if args.mode == "terminal" and args.shots and os.name != "nt":  # SDL's alone
         for name in ("terminal", "terminal-small", "terminal-vim", "terminal-big",
                      "terminal-ended"):
