@@ -1087,6 +1087,15 @@ def barelaunch(host):
     return problems, lines
 
 
+def hungupfile(host, trapfile, pidfile):
+    """Whether a terminal's shell was hung up: its HUP trap's file, or on
+    Windows, where busybox's sh runs no trap for it, its pid gone."""
+    if os.name != "nt":
+        return bool(host.read(host.path("work", trapfile)))
+    found = P.parse(host.read(host.path("work", pidfile)) or "")
+    return bool(found) and not alive(found[0])
+
+
 def background(args, host, guiargs, guicwd):
     """--mode background: the first window keeps its turn running in the
     background and goes, its process keeping the state directory's
@@ -1149,6 +1158,11 @@ def background(args, host, guiargs, guicwd):
             problems.append("the turn did not end in the background")
         else:
             print("the turn ended in the background", flush=True)
+        # The window's terminal tab went with it, its shell hung up
+        if not waitfor(lambda: hungupfile(host, "hup-bg.txt", "bg.pid"), 5, 0.1):
+            problems.append("going to the background did not hang up the terminal's shell")
+        else:
+            print("going to the background hung up the terminal's shell", flush=True)
         # Launched again: the shed window comes back, and this one goes
         status, lines = host.run(guiargs, 60, guicwd, tag="[2] ")
         problems += handoffproblems(status, lines, "the second launch")
@@ -1869,7 +1883,7 @@ def main():
     elif args.mode == "changes":
         gitrepo(work)
         before = config(curl, model)
-    elif args.mode == "terminal":
+    elif args.mode in ("terminal", "background"):
         # bash without the user's rc files, for its line editing (Ubuntu's
         # /bin/sh, dash, has none), with a known prompt; else a plain sh
         shell = "/bin/bash --norc --noprofile" if os.path.exists("/bin/bash") else "/bin/sh"

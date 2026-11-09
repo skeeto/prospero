@@ -16200,6 +16200,28 @@ static DriveOp stopops[] = {
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
 
+// Physical Ctrl and a key, pressed and let go
+#define CTRLKEY(key, ms) \
+    {OP_KEYDOWN, 0, GKEY_CTRL, KEY_CTRL, 50, ""}, \
+    {OP_KEYDOWN, 0, key, KEY_CTRL, 50, ""}, \
+    {OP_KEYUP, 0, key, KEY_CTRL, 50, ""}, \
+    {OP_KEYUP, 0, GKEY_CTRL, 0, ms, ""}
+// Physical Ctrl+Shift and a key
+#define CTRLSHIFTKEY(key, ms) \
+    {OP_KEYDOWN, 0, GKEY_CTRL, KEY_CTRL, 50, ""}, \
+    {OP_KEYDOWN, 0, GKEY_SHIFT, KEY_CTRL|KEY_SHIFT, 50, ""}, \
+    {OP_KEYDOWN, 0, key, KEY_CTRL|KEY_SHIFT, 50, ""}, \
+    {OP_KEYUP, 0, key, KEY_CTRL|KEY_SHIFT, 50, ""}, \
+    {OP_KEYUP, 0, GKEY_SHIFT, KEY_CTRL, 50, ""}, \
+    {OP_KEYUP, 0, GKEY_CTRL, 0, ms, ""}
+// A program in the foreground that leaves a child ignoring SIGHUP, its
+// pid in a file, its command line naming the folder for gui.py's checks
+#define TERMSTRAY(file) \
+    "sh -c 'trap \"\" HUP; sh -c \"while :; do sleep 1; done\" stray \"$PWD\" & " \
+    "echo $! >" file "; wait'"
+#define TERMKEY(key, ms) \
+    {OP_KEYDOWN, 0, key, 0, 50, ""}, {OP_KEYUP, 0, key, 0, ms, ""}
+
 // M5, keeping a turn running in the background (--background,
 // tests/gui.py --mode background): the window goes partway through a
 // streaming turn, and this process hosts its engine, keeping the state
@@ -16227,6 +16249,13 @@ static DriveOp bgops[] = {
     {OP_CHECK, CHK_SESSION, 0, 0, 0, ""},
     {OP_PROMPT, 0, 0, 0, 100, "Stream in the background."},
     {OP_WAIT, W_STREAMING, 0, 0, 10000, ""},
+    // A terminal tab, which goes with the window: its shell hung up
+    // (gui.py checks the trap's file, or the pid on Windows)
+    CTRLKEY(GKEY_GRAVE, 500),
+    {OP_WAIT, W_TERM, 0, 0, 10000, "tty$"},
+    {OP_TEXT, 0, 0, 0, 100, "echo $$ >bg.pid; trap 'echo hup >hup-bg.txt; exit' HUP EXIT"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "EXIT\ntty$"},
     {OP_TOASTMARK, 0, 0, 0, 0, ""},
     {OP_GEOMMARK, 0, 0, 0, 0, ""},
     {OP_MARK, 0, 0, 0, 800, ""},
@@ -17393,27 +17422,6 @@ static DriveOp planops[] = {
 // both, no frames while idle with it shown, a file made elsewhere listed
 // once the window has the focus back and not before, another click
 // hiding the pane.
-// Physical Ctrl and a key, pressed and let go
-#define CTRLKEY(key, ms) \
-    {OP_KEYDOWN, 0, GKEY_CTRL, KEY_CTRL, 50, ""}, \
-    {OP_KEYDOWN, 0, key, KEY_CTRL, 50, ""}, \
-    {OP_KEYUP, 0, key, KEY_CTRL, 50, ""}, \
-    {OP_KEYUP, 0, GKEY_CTRL, 0, ms, ""}
-// Physical Ctrl+Shift and a key
-#define CTRLSHIFTKEY(key, ms) \
-    {OP_KEYDOWN, 0, GKEY_CTRL, KEY_CTRL, 50, ""}, \
-    {OP_KEYDOWN, 0, GKEY_SHIFT, KEY_CTRL|KEY_SHIFT, 50, ""}, \
-    {OP_KEYDOWN, 0, key, KEY_CTRL|KEY_SHIFT, 50, ""}, \
-    {OP_KEYUP, 0, key, KEY_CTRL|KEY_SHIFT, 50, ""}, \
-    {OP_KEYUP, 0, GKEY_SHIFT, KEY_CTRL, 50, ""}, \
-    {OP_KEYUP, 0, GKEY_CTRL, 0, ms, ""}
-// A program in the foreground that leaves a child ignoring SIGHUP, its
-// pid in a file, its command line naming the folder for gui.py's checks
-#define TERMSTRAY(file) \
-    "sh -c 'trap \"\" HUP; sh -c \"while :; do sleep 1; done\" stray \"$PWD\" & " \
-    "echo $! >" file "; wait'"
-#define TERMKEY(key, ms) \
-    {OP_KEYDOWN, 0, key, 0, 50, ""}, {OP_KEYUP, 0, key, 0, ms, ""}
 
 // The Terminal pane (--terminal), on [terminal] shell = /bin/sh with
 // PS1 "tty$ ": Ctrl+` shows it, starting a shell, typing and editing
