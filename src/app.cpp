@@ -1713,6 +1713,8 @@ struct Gui {
     u32                termserial;   // the last tab's serial
     b32                termfocus;    // focus the terminal when next drawn
     GuiSession        *termaddto;    // root wanting a new tab once sized
+    TermTab           *termshowing;  // the tab drawn in front last
+    u32                termshowingserial;  // its serial then
     i32                termlastcols; // the pane's size in cells last frame,
     i32                termlastrows; //   before its shell starts
     b32                termfocused;  // it has the keyboard, as last drawn
@@ -5764,7 +5766,7 @@ static void guiofferask(Gui *);
 static void onoffer(Gui *, Arena, Json *, b32);
 static void ontermenv(Gui *, Arena, Json *, b32);
 static void termopened(Gui *, GuiSession *, i64, Json *, b32, Str);
-static void termapply(Gui *, GuiHost *, Arena, EvRec *);
+static b32  termapply(Gui *, GuiHost *, Arena, EvRec *);
 static void termcloseall(Gui *);
 static void drawterm(Gui *);
 static void termhotkeys(Gui *);
@@ -7277,8 +7279,7 @@ static b32 guiapply(Gui *g, GuiHost *h, Arena a, EvRec *r, Str line)
     case EV_TERM:
     case EV_TERMEND:
     case EV_TERMBUSY:
-        termapply(g, h, a, r);
-        return 1;
+        return termapply(g, h, a, r);
     case EV_OVERFLOW:
         if (!r->sid.len && h->kind==GH_ENGINE) {
             // The engine process lost records, replies among them
@@ -17624,6 +17625,22 @@ static DriveOp termops[] = {
     {OP_TEXT, 0, 0, 0, 100, "exit"},
     TERMKEY(GKEY_ENTER, 1000),
     {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*onetwo"},
+    // A tab behind another draws nothing while it prints (in one
+    // program, so that its busy dot holds still)
+    {OP_TEXT, 0, 0, 0, 100, "sh -c 'while :; do date; sleep 0.2; done'"},
+    TERMKEY(GKEY_ENTER, 300),
+    CTRLSHIFTKEY(GKEY_GRAVE, 500),
+    {OP_WAIT, W_TERM, 0, 0, 10000, "tty$"},
+    {OP_MOVE, T_EMPTY, 0, 0, 4500, ""},
+    {OP_MARK, 0, 0, 0, 3000, ""},
+    {OP_CHECK, CHK_TERMQUIET, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 100, "exit"},
+    TERMKEY(GKEY_ENTER, 1000),
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*onetwo"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    CTRLKEY(GKEY_C, 500),
+    {OP_TEXT, 0, 0, 0, 100, "true"},  // a clean status for exit's
+    TERMKEY(GKEY_ENTER, 300),
     // exit closes it; a failing exit leaves its screen under a banner,
     // and Enter starts another shell
     {OP_TEXT, 0, 0, 0, 100, "exit"},

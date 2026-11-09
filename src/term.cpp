@@ -484,6 +484,17 @@ static TermTab *termbytid(Gui *g, GuiHost *h, i64 tid)
     return 0;
 }
 
+// Whether tab tt shows: as the shown root's front tab with the pane
+// visible (front), else as a tab in its bar.
+static b32 termshown(Gui *g, TermTab *tt, b32 front)
+{
+    GuiSession *s = g->sess ? termroot(g, g->sess) : 0;
+    if (!s || !g->panes[PANE_TERMINAL]) {
+        return 0;
+    }
+    return front ? termsetfront(&s->terms)==tt : termsetfind(&s->terms, tt)>=0;
+}
+
 // Feed the shell's output to ariel, sending its replies back.
 static void termfeed(Gui *g, TermTab *tt, Str data)
 {
@@ -499,9 +510,15 @@ static void termfeed(Gui *g, TermTab *tt, Str data)
             break;
         case ARIEL_EV_TITLE:
             if (!f.ev.arg) {
-                // The window's title names its tab
+                // The window's title names its tab, drawn again if shown
+                u8 was[TERMTITLECAP];
+                iz waslen = tt->titlelen;
+                __builtin_memcpy(was, tt->title, (uz)waslen);
                 tt->titlelen = termtitle(tt->title, {f.ev.data.data, f.ev.data.len});
-                scheddirty(&g->sched);
+                if (!(Str{was, waslen} == Str{tt->title, tt->titlelen}) &&
+                    termshown(g, tt, 0)) {
+                    scheddirty(&g->sched);
+                }
             }
             break;
         }
@@ -509,7 +526,8 @@ static void termfeed(Gui *g, TermTab *tt, Str data)
 }
 
 // A term, term.end or term.busy record from a host.
-static void termapply(Gui *g, GuiHost *h, Arena scratch, EvRec *r)
+// A record from a host, applied; true when it changed what shows.
+static b32 termapply(Gui *g, GuiHost *h, Arena scratch, EvRec *r)
 {
     Json    *j   = r->root;
     i64      tid = jsonint(jsonget(j, "tid"), 0);
@@ -523,29 +541,30 @@ static void termapply(Gui *g, GuiHost *h, Arena scratch, EvRec *r)
             gone.state = TT_LIVE;
             termclose(g, &gone, 0);
         }
-        return;
+        return 0;
     }
 
     switch (r->ev) {
     case EV_TERM: {
         if (tt->state != TT_LIVE) {
-            return;
+            return 0;
         }
         i64      off = jsonint(jsonget(j, "off"), -1);
         Unbase64 u   = unbase64(&scratch, jsonstr(jsonget(j, "data")));
         if (!u.ok || off<0) {
-            return;
+            return 0;
         } else if (off > tt->fed) {
             termack(g, tt, tt->fed, 1);  // a gap: from where it was lost
-            return;
+            return 0;
         } else if (off+u.data.len <= tt->fed) {
-            return;  // sent again, already had
+            return 0;  // sent again, already had
         }
         Str fresh = cuthead(u.data, (iz)(tt->fed - off));
         termfeed(g, tt, fresh);
         tt->fed += fresh.len;
         termack(g, tt, tt->fed, 0);
-    } break;
+        return termshown(g, tt, 1);  // hidden tabs parse, unseen
+    }
 
     case EV_TERMEND: {
         i64 off = jsonint(jsonget(j, "off"), -1);
@@ -563,16 +582,20 @@ static void termapply(Gui *g, GuiHost *h, Arena scratch, EvRec *r)
             if (!o->terms.n && g->panes[PANE_TERMINAL] && g->termfocused) {
                 g->promptfocus = 1;
             }
-            return;
+            return 1;
         }
         tt->state  = TT_ENDED;
         tt->errlen = termkeep(tt->err, err);
-    } break;
-
-    case EV_TERMBUSY:
-        tt->busy = jsonflag(jsonget(j, "busy"), 0);
-        break;
+        return 1;
     }
+
+    case EV_TERMBUSY: {
+        b32 was  = tt->busy;
+        tt->busy = jsonflag(jsonget(j, "busy"), 0);
+        return was!=tt->busy && termshown(g, tt, 0);  // its dot
+    }
+    }
+    return 0;
 }
 
 
@@ -889,6 +912,26 @@ static b32 termkeptpressed(Gui *g)
 }
 
 // The mouse over the grid, or holding a button pressed there: reported
+// A tab leaving the front lets go of what it held: the app sees its
+// mouse buttons released, and its partial wheel and held keys forgotten.
+static void termletgo(Gui *g, TermTab *tt)
+{
+    static i32 const buttons[] = {1, 3, 2};  // ImGui's left, right, middle
+    for (i32 b = 0; b<3 && tt->t && tt->state==TT_LIVE; b++) {
+        if (tt->mheld & 1u<<b) {
+            ariel_Mouse e = {};
+            e.action = ARIEL_RELEASE;
+            e.button = buttons[b];
+            ariel_Str s = ariel_mouse(tt->t, &e);
+            terminput(g, tt, {s.data, s.len});
+        }
+    }
+    tt->mheld    = 0;
+    tt->wheel    = 0;
+    tt->pasteins = 0;
+    tt->textkey  = 0;
+}
+
 // when the app asks (mouse modes), unless Shift is held, which keeps it
 // local for selection (I6). The wheel, also when reported, otherwise
 // sends arrows on the alternate screen (mode 1007, on by default), and
@@ -1388,6 +1431,17 @@ static void drawterm(Gui *g)
     if (tt->pal != g->pal) {
         termcolors(g, tt);  // the theme changed
     }
+    // Another tab in front: the last lets go, and a size that differs
+    // applies at once rather than settling
+    TermTab *was   = g->termshowing;
+    b32      fresh = was!=tt || g->termshowingserial!=tt->serial;
+    if (fresh) {
+        if (was && was->serial==g->termshowingserial && termowner(g, was)) {
+            termletgo(g, was);
+        }
+        g->termshowing       = tt;
+        g->termshowingserial = tt->serial;
+    }
 
     // The grid, an item that takes the keyboard once clicked
     ImVec2 pos = ImGui::GetCursorScreenPos();
@@ -1424,7 +1478,7 @@ static void drawterm(Gui *g)
         } else if (cols!=tt->wantcols || rows!=tt->wantrows) {
             tt->wantcols = cols;
             tt->wantrows = rows;
-            tt->wantat   = g->sched.now;
+            tt->wantat   = g->sched.now - (fresh ? TERMTAB_RESIZE : 0);
         }
         if (tt->wantcols) {
             i64 at = tt->wantat + TERMTAB_RESIZE;
