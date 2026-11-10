@@ -1191,7 +1191,7 @@ enum : i32 {
 // Item rectangles by name, for the checklist: menu items by label,
 // headings and fold arrows by what they are for.
 enum : i32 {
-    NAMED_MAX    = 256,
+    NAMED_MAX    = 1024,
     SIDEDUMP_MAX = 1<<14,  // bytes of the sidebar's tree as text
 };
 
@@ -1219,8 +1219,12 @@ struct Gui {
     f32                scale;      // DPI content scale
     b32                mac;
     b32                quit;
-    Palette           *pal;        // the theme in effect
+    Palette           *pal;        // the theme in effect, palnow
+    Palette            palnow;
     i32                themeset;   // THEME_*, from [ui] theme
+    Str                themename;  // or a [theme NAME] of the configuration's
+    Palette            themecustom;  // that theme's palette
+    b32                themehas;   // themename names one, so it is in effect
     i32                thinkset;   // THINK_*, from [ui] thinking
     i32                toolset;    // TOOLS_*, from [ui] tools
     i32                countset;   // COUNT_*, from [ui] count
@@ -4687,7 +4691,8 @@ static void startquit(Gui *g)
 
 // Records from the engine
 
-static void settheme(Gui *, i32);
+static void settheme(Gui *, Str);
+static b32  themehead(Gui *, iz);
 static void setthinking(Gui *, i32);
 static void setcount(Gui *, i32);
 static void settools(Gui *, i32);
@@ -4760,7 +4765,9 @@ static void loadcfg(Gui *g, Str line)
         d.own  = jsonint(jsonget(h, "own"), 0) != 0;
         g->cfgheads = push(a, g->cfgheads, d);
     }
-    Json *schema = jsonget(j, "schema");
+    Json *schema    = jsonget(j, "schema");
+    Str   themewant = {};
+    b32   themerow  = 0;
     for (Json *s = jsonget(j, "settings")->child; s; s = s->next) {
         CfgRow r = {};
         r.kind    = jsonstr(jsonget(s, "kind"));
@@ -4792,7 +4799,13 @@ static void loadcfg(Gui *g, Str line)
             }
         }
         if (r.kind=="ui" && r.key=="theme") {
-            settheme(g, themeparse(r.value));
+            themewant = r.value;  // once the rows of its [theme NAME] are in
+            themerow  = 1;
+            for (iz i = 0; i < g->cfgheads.len; i++) {
+                if (themehead(g, i)) {
+                    r.choices = push(a, r.choices, g->cfgheads[i].name);
+                }
+            }
         } else if (r.kind=="ui" && r.key=="thinking") {
             setthinking(g, thinkparse(r.value));
         } else if (r.kind=="ui" && r.key=="tools") {
@@ -4836,6 +4849,9 @@ static void loadcfg(Gui *g, Str line)
         r.buf = alloc<char>(a, r.cap);
         copybytes(r.buf, v.data, v.len);
         g->cfgrows = push(a, g->cfgrows, r);
+    }
+    if (themerow) {
+        settheme(g, themewant);  // its colors as they are now, too
     }
     wslremotes(g);
     if (g->palw.shown) {
@@ -13091,6 +13107,7 @@ enum : i32 {
     CHK_LIGHT,
     CHK_DARK,
     CHK_THEMEQUIET,
+    CHK_THEMENAMED,
     CHK_TITLEBAR,
     CHK_LONGFIELD,
     CHK_LONGEDIT,
@@ -13429,6 +13446,7 @@ static Str chknames[] = {
     "a read-only session's turn runs elsewhere, with no clock here",
     "the light theme is in effect", "the dark theme is in effect",
     "the theme changed in a few frames, then none",
+    "the configuration's theme is in effect, by its name, its colors as set",
     "the window's frame follows the theme",
     "a setting longer than a field's slack is in its field whole",
     "the long setting, edited, was saved whole",
@@ -15663,6 +15681,38 @@ static DriveOp settingsops[] = {
     {OP_SHOT, 0, 0, 0, 300, "dark-toggle-on"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 400, ""},
+    // A theme of the configuration's, from an include, picked by its
+    // name; a color of it changed in Settings recolors at once
+    {OP_MOVE, T_THEMECOMBO, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "cfg ui  theme=gruvbox"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_CONFIGSET, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_THEMENAMED, 0, 0, 0, "gruvbox"},
+    {OP_MOVE, T_EMPTY, 0, 0, 1000, ""},
+    {OP_SHOT, 0, 0, 0, 500, "gruvbox"},
+    {OP_SHOWPAGE, 0, 0, 0, 300, "theme gruvbox"},
+    {OP_MOVE, T_PAGEITEM, 0, 0, 100, "theme gruvbox"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PAGE, 0, 0, 0, "theme gruvbox"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "cfg theme gruvbox panel"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 200, ""},
+    {OP_TEXT, 0, 0, 0, 200, "#3c3836"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_CONFIGSET, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_THEMENAMED, 0, 0, 0, "gruvbox|#3c3836"},
+    {OP_MOVE, T_EMPTY, 0, 0, 1000, ""},
+    {OP_SHOT, 0, 0, 0, 500, "settings-theme"},
+    {OP_SHOWPAGE, 0, 0, 0, 300, "ui"},
+    {OP_MOVE, T_PAGEITEM, 0, 0, 100, "ui"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_REVEAL, RECT_THEMECOMBO, 0, 0, 500, ""},
     {OP_SNAPCFG, 0, 0, 0, 100, ""},
     {OP_MOVE, T_THEMECOMBO, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -20589,7 +20639,8 @@ static b32 checksetting(Gui *g)
 static b32 themeshown(Gui *g, Palette *p)
 {
     ImVec4 bg = ImGui::GetStyle().Colors[ImGuiCol_WindowBg];
-    return g->pal==p && ImGui::ColorConvertFloat4ToU32(bg)==p->panel;
+    return g->pal && !__builtin_memcmp(g->pal, p, sizeof(*p)) &&
+           ImGui::ColorConvertFloat4ToU32(bg)==p->panel;
 }
 
 // The settings row whose value is longer than a field's slack, or null.
@@ -21582,6 +21633,13 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_LIGHT: return themeshown(g, &themelight);
     case CHK_DARK:  return themeshown(g, &themedark);
+    case CHK_THEMENAMED: {
+        // "NAME", or "NAME|#rrggbb", its panel's color
+        Cut      c   = cut(g->ops[g->drivepc-1].text, '|');
+        CfgColor col = cfgcolor(c.tail);
+        return g->themehas && g->themename==c.head && themeshown(g, &g->themecustom) &&
+               (!c.ok || (col.ok && g->pal->panel==rgb(col.r, col.g, col.b)));
+    }
     case CHK_THEMEQUIET: {
         // Two frames recolor (docked windows take their background a
         // frame late), one settles; with the probe's, the overlay's new
@@ -24059,8 +24117,15 @@ static void readconfig(Gui *g, Arena scratch)
     if (!cfg) {
         return;
     }
-    i32 theme = themeparse(cfgget(cfg, "ui", "", "theme", 0));
+    Str name  = cfgget(cfg, "ui", "", "theme", 0);
+    i32 theme = themeparse(name);
     g->themeset = theme<0 ? THEME_SYSTEM : theme;
+    if (theme<0 && inisection(cfg->ini, "theme", name)) {
+        g->themename   = clone(&g->perm, name);
+        g->themecustom = themebuild(cfgget(cfg, "theme", name, "base", 0),
+                                    [&](Str key) { return cfgget(cfg, "theme", name, key, 0); });
+        g->themehas    = 1;
+    }
     i32 think = thinkparse(cfgget(cfg, "ui", "", "thinking", 0));
     g->thinkset = think<0 ? THINK_FOLD : think;
     i32 tools = toolsparse(cfgget(cfg, "ui", "", "tools", 0));

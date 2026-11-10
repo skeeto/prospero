@@ -33,6 +33,17 @@ static f64 contrast(u32 a, u32 b)
     return x>y ? x/y : y/x;
 }
 
+#ifdef __clang__
+#  pragma clang diagnostic push
+#  pragma clang diagnostic ignored "-Wc23-extensions"
+#endif
+static u8 const gruvini[] = {
+    #embed "../../assets/themes/gruvbox.ini"
+};
+#ifdef __clang__
+#  pragma clang diagnostic pop
+#endif
+
 static void test_theme(Test *t)
 {
     Arena a = t->perm;
@@ -76,10 +87,25 @@ static void test_theme(Test *t)
         P(paneldim, rowhover), P(termfg, termbg),
         #undef P
     };
-    Palette *pals[] = {&themedark, &themelight};
+    // The shipped Gruvbox, included as a user's configuration would, held
+    // to the built-in themes' contrast
+    CfgEnv v = newcfgenv(&a);
+    os_write(v.os, a, "/c/themes/gruvbox.ini", Str{(u8 *)gruvini, countof(gruvini)});
+    os_write(v.os, a, "/c/prospero.ini",
+             "include = themes/gruvbox.ini\n[ui]\ntheme = gruvbox\n");
+    Config *c = newconfig(v.os, &a, v.scratch, "/c/prospero.ini", 0);
+    expect(t, "theme.gruvbox.diags", inidiags(&a, c->ini), "");
+    Palette gruvbox = themebuild(cfgget(c, "theme", "gruvbox", "base", 0),
+                                 [&](Str key) { return cfgget(c, "theme", "gruvbox", key, 0); });
+    expect(t, "theme.gruvbox.panel", istr(&a, gruvbox.panel), istr(&a, rgb(29, 32, 33)));
+    expect(t, "theme.gruvbox.blue", istr(&a, gruvbox.ansi[4]), istr(&a, rgb(69, 133, 136)));
+    cfgfree(c);
+
+    Palette *pals[]  = {&themedark, &themelight, &gruvbox};
+    Str      names[] = {"theme.dark ", "theme.light ", "theme.gruvbox "};
     for (iz p = 0; p < countof(pals); p++) {
         Palette *pal  = pals[p];
-        Str      name = pal->dark ? Str("theme.dark ") : Str("theme.light ");
+        Str      name = names[p];
         for (iz i = 0; i < countof(pairs); i++) {
             u32 fg = *(u32 *)((byte *)pal + pairs[i].fg);
             u32 bg = *(u32 *)((byte *)pal + pairs[i].bg);
@@ -136,5 +162,65 @@ static void test_theme(Test *t)
             print(&n, " on codebg");
             expect(t, finish(&n), finish(&b), "AA");
         }
+    }
+
+    // [theme NAME] keys: config.cpp's, in order, each a palette color of
+    // its own, all of them but the unused hl[HL_PLAIN] and dark
+    {
+        iz n = 0;
+        for (iz i = 0; i < countof(cfgschema); i++) {
+            CfgKey *k = &cfgschema[i];
+            if (k->kind=="theme" && k->key!="base") {
+                Str want = n<countof(themekeys) ? themekeys[n].key : Str("(none)");
+                expect(t, "theme.keys.order", k->key, want);
+                n++;
+            }
+        }
+        expect(t, "theme.keys.count", istr(&a, n), istr(&a, countof(themekeys)));
+        iz colors = (iz)(sizeof(Palette) - sizeof(b32))/(iz)sizeof(u32) - 1;
+        expect(t, "theme.keys.all", istr(&a, countof(themekeys)), istr(&a, colors));
+        for (iz i = 0; i < countof(themekeys); i++) {
+            for (iz k = 0; k < i; k++) {
+                if (themekeys[i].off == themekeys[k].off) {
+                    expect(t, "theme.keys.twice", themekeys[i].key, themekeys[k].key);
+                }
+            }
+            if (themekeys[i].off==__builtin_offsetof(Palette, hl) ||
+                    themekeys[i].off < (iz)sizeof(b32)) {
+                expect(t, "theme.keys.unused", themekeys[i].key, "");
+            }
+        }
+    }
+
+    // Building: the base whole, colors over it, shades that follow a
+    // button's color, and what is not a color left alone
+    {
+        auto none = [](Str) { return Str{}; };
+        Palette l = themebuild("light", none);
+        Palette d = themebuild("sepia", none);
+        expect(t, "theme.build.light", istr(&a, !__builtin_memcmp(&l, &themelight, sizeof(l))), "1");
+        expect(t, "theme.build.dark", istr(&a, !__builtin_memcmp(&d, &themedark, sizeof(d))), "1");
+
+        Palette p = themebuild("dark", [](Str key) {
+            return key=="link"      ? Str("#abc")    :
+                   key=="button"    ? Str("#405060") :
+                   key=="toggle_on" ? Str("#123456") :
+                   key=="toggle_on_hover" ? Str("#654321") :
+                   key=="text"      ? Str("blue")    : Str{};
+        });
+        expect(t, "theme.build.link", istr(&a, p.link), istr(&a, rgb(0xaa, 0xbb, 0xcc)));
+        expect(t, "theme.build.text", istr(&a, p.text), istr(&a, themedark.text));
+        expect(t, "theme.build.btn", istr(&a, p.btn), istr(&a, rgb(0x40, 0x50, 0x60)));
+        // dark's button is (36,69,110), its hover (46,88,140): +10,+19,+30
+        expect(t, "theme.build.btnhover", istr(&a, p.btnhover),
+               istr(&a, rgb(0x40+10, 0x50+19, 0x60+30)));
+        // and pressed (30,62,104): -6,-7,-6
+        expect(t, "theme.build.btnpress", istr(&a, p.btnpress),
+               istr(&a, rgb(0x40-6, 0x50-7, 0x60-6)));
+        expect(t, "theme.build.onhover", istr(&a, p.btnonhover), istr(&a, rgb(0x65, 0x43, 0x21)));
+
+        expect(t, "theme.shift.clamp", istr(&a, themeshift(rgb(250, 5, 128), rgb(0, 10, 0), rgb(10, 0, 0))),
+               istr(&a, rgb(255, 0, 128)));
+        expect(t, "theme.put.unknown", istr(&a, themeput(&p, "nope", "#fff")), "0");
     }
 }

@@ -19,7 +19,12 @@
 //
 // The setting, [ui] theme, is dark, light, or system, the default, which
 // follows the operating system's preference as the platform reports it,
-// at startup and whenever it changes (gui_systheme).
+// at startup and whenever it changes (gui_systheme). It may instead name
+// a [theme NAME] section, a theme of the configuration's: a base, dark
+// or light, whose palette it starts from, and colors laid over it by
+// key (themekeys), as #rgb or #rrggbb. A button or toggle given a color
+// of its own whose hover and pressed shades are left unset gets shades
+// that differ from it as the base's differ from its own (themebuild).
 //
 // This is free and unencumbered software released into the public domain.
 
@@ -212,6 +217,138 @@ static Palette themelight = {
     .termbg     = rgb(255, 255, 255),
     .termcursor = rgb( 32,  33,  36),
 };
+
+// A [theme NAME] key and the palette color it sets, in config.cpp's
+// order there (theme_test checks the two lists agree).
+struct ThemeKey {
+    Str key;
+    iz  off;  // into Palette, of a u32
+};
+
+#define TK(k, f)     {k, __builtin_offsetof(Palette, f)}
+#define TKA(k, f, i) {k, __builtin_offsetof(Palette, f) + (i)*(iz)sizeof(u32)}
+static ThemeKey themekeys[] = {
+    TK("gap", clear),
+    TK("panel", panel),
+    TK("panel_text", paneltext),
+    TK("panel_dim", paneldim),
+    TK("field", frame),
+    TK("row_selected", selrow),
+    TK("row_hover", rowhover),
+    TK("row_pressed", rowpress),
+    TK("button", btn),
+    TK("button_hover", btnhover),
+    TK("button_pressed", btnpress),
+    TK("toggle_on", btnon),
+    TK("toggle_on_hover", btnonhover),
+    TK("progress", bar),
+    TK("text", text),
+    TK("text_dim", dim),
+    TK("reasoning", reasoning),
+    TK("link", link),
+    TK("code", code),
+    TK("code_block", codebg),
+    TK("code_block_text", codetext),
+    TK("table_header", headerbg),
+    TK("quote", quote),
+    TK("rule", rule),
+    TK("list_marker", marker),
+    TK("selection", sel),
+    TK("selection_text", seltext),
+    TK("user_message", userbg),
+    TK("tool_row", toolbg),
+    TK("ask_card", askbg),
+    TK("tool_summary", summary),
+    TKA("syntax_comment", hl, 1),
+    TKA("syntax_keyword", hl, 2),
+    TKA("syntax_type", hl, 3),
+    TKA("syntax_string", hl, 4),
+    TKA("syntax_number", hl, 5),
+    TKA("syntax_preprocessor", hl, 6),
+    TKA("syntax_variable", hl, 7),
+    TKA("syntax_function", hl, 8),
+    TKA("diff_inserted", hl, 9),
+    TKA("diff_deleted", hl, 10),
+    TKA("diff_header", hl, 11),
+    TK("ok", ok),
+    TK("error", bad),
+    TK("waiting", amber),
+    TK("running", active),
+    TK("alarm", stale),
+    TKA("term_black", ansi, 0),
+    TKA("term_red", ansi, 1),
+    TKA("term_green", ansi, 2),
+    TKA("term_yellow", ansi, 3),
+    TKA("term_blue", ansi, 4),
+    TKA("term_magenta", ansi, 5),
+    TKA("term_cyan", ansi, 6),
+    TKA("term_white", ansi, 7),
+    TKA("term_bright_black", ansi, 8),
+    TKA("term_bright_red", ansi, 9),
+    TKA("term_bright_green", ansi, 10),
+    TKA("term_bright_yellow", ansi, 11),
+    TKA("term_bright_blue", ansi, 12),
+    TKA("term_bright_magenta", ansi, 13),
+    TKA("term_bright_cyan", ansi, 14),
+    TKA("term_bright_white", ansi, 15),
+    TK("term_text", termfg),
+    TK("term_background", termbg),
+    TK("term_cursor", termcursor),
+};
+#undef TK
+#undef TKA
+
+static u32 *themecolor(Palette *p, iz off)
+{
+    return (u32 *)((u8 *)p + off);
+}
+
+// Set a palette's color by its [theme NAME] key. Returns whether the key
+// names one and the value is a color: else the palette is unchanged.
+static b32 themeput(Palette *p, Str key, Str value)
+{
+    CfgColor c = cfgcolor(value);
+    for (iz i = 0; c.ok && i < countof(themekeys); i++) {
+        if (themekeys[i].key == key) {
+            *themecolor(p, themekeys[i].off) = rgb(c.r, c.g, c.b);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// A color moved as far, channel by channel, as from base to to.
+static u32 themeshift(u32 c, u32 from, u32 to)
+{
+    u32 r = 0xff000000u;
+    for (i32 s = 0; s < 24; s += 8) {
+        i32 x = (i32)(c>>s & 255) + (i32)(to>>s & 255) - (i32)(from>>s & 255);
+        x = x<0 ? 0 : x>255 ? 255 : x;
+        r |= (u32)x << s;
+    }
+    return r;
+}
+
+// A theme of the configuration's: its base (dark unless light), then
+// the colors get(key) gives, each key of themekeys asked, then the
+// shades of a button or toggle colored but not shaded (see the top).
+template<typename F>
+static Palette themebuild(Str base, F get)
+{
+    Palette const *b = base=="light" ? &themelight : &themedark;
+    Palette        p = *b;
+    for (iz i = 0; i < countof(themekeys); i++) {
+        themeput(&p, themekeys[i].key, get(themekeys[i].key));
+    }
+    if (p.btn != b->btn) {
+        p.btnhover = p.btnhover==b->btnhover ? themeshift(p.btn, b->btn, b->btnhover) : p.btnhover;
+        p.btnpress = p.btnpress==b->btnpress ? themeshift(p.btn, b->btn, b->btnpress) : p.btnpress;
+    }
+    if (p.btnon!=b->btnon && p.btnonhover==b->btnonhover) {
+        p.btnonhover = themeshift(p.btnon, b->btnon, b->btnonhover);
+    }
+    return p;
+}
 
 // The setting's value from its name, or -1 if it names none.
 static i32 themeparse(Str s)

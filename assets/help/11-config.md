@@ -76,6 +76,42 @@ cannot choose what runs, so these are ignored in one:
   `cmd`;
 - `[ui] editor` and `[ui] terminal`.
 
+## Color themes
+
+A `[theme NAME]` section is a color theme of your own, which
+`[ui] theme = NAME` or View → Theme picks:
+
+```ini
+[ui]
+theme = dusk
+
+[theme dusk]
+base = dark
+panel = #1e2030
+text = #c8d3f5
+link = #82aaff
+```
+
+Colors are `#rgb` or `#rrggbb`. A theme starts from the built-in theme
+its `base` names, `dark` (the default) or `light`, so it sets only the
+colors it changes. Hover and pressed shades of buttons follow the
+button's color unless set too. The Settings pane lists every color of
+a theme with a swatch, the base's color as the hint, and a change there
+recolors the window at once. `system`, `dark` and `light` name the
+built-in themes and cannot be reused.
+
+A theme is an ordinary section, so it may come from an include. The
+[Gruvbox](https://github.com/skeeto/prospero/blob/master/assets/themes/gruvbox.ini)
+theme, by Arthur Cnops (accnops) after Pavel Pertsev's palette, lists
+every color there is to set:
+
+```ini
+include = themes/gruvbox.ini
+
+[ui]
+theme = gruvbox
+```
+
 ## Approving web includes' urls
 
 A file included by URL can change at any time, so a url it gives an
@@ -245,6 +281,7 @@ fails with a link to sign up for Copilot Free.
 - **[`[ui] font_size`](settings:ui#font_size)**: the text's size in
   pixels, 8 to 40 (17 by default). The View menu's zoom scales it until Prospero exits.
 - **[`[ui] theme`](settings:ui#theme)**: `system`, `dark` or `light`,
+  or the name of a theme of your own (see [Color themes](help:config#color-themes)),
   also in View → Theme.
 - **`[ui] thinking`** and **`[ui] tools`**: whether reasoning and tool
   output show folded or open in the transcript.

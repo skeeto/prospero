@@ -518,28 +518,83 @@ static void themestyle(ImGuiStyle *st, Palette *p)
 // Put the theme in effect: the one configured, or the system's. A change
 // recolors everything in one presented frame, and the window's frame
 // follows where the platform can make it do so; no change, no frame.
+// The palette is a copy (palnow), since a configured theme's colors may
+// change in place.
 static void applytheme(Gui *g)
 {
-    Palette *p = themepalette(g->themeset, g->sysdark);
-    if (p == g->pal) {
+    Palette p = g->themehas ? g->themecustom : *themepalette(g->themeset, g->sysdark);
+    if (g->pal && !__builtin_memcmp(&p, g->pal, sizeof(p))) {
         return;
     }
-    g->pal = p;
-    themestyle(&g->basestyle, p);  // where a new DPI scale starts
+    g->palnow = p;
+    g->pal    = &g->palnow;
+    themestyle(&g->basestyle, g->pal);  // where a new DPI scale starts
     ImGuiStyle &st = ImGui::GetStyle();
     for (i32 i = 0; i < ImGuiCol_COUNT; i++) {
         st.Colors[i] = g->basestyle.Colors[i];
     }
-    g->titleok = os_guitheme(g->os, p->dark);
+    g->titleok = os_guitheme(g->os, g->pal->dark);
     g->woke |= WOKE_FORCE;
     schedforce(&g->sched);
 }
 
-// The configured theme: THEME_*, or -1 for an unknown name, which means
-// the system's.
-static void settheme(Gui *g, i32 theme)
+// A setting of a configured section as the configuration has it now, or
+// null if unset or not valid.
+static Str cfgrowval(Gui *g, Str kind, Str name, Str key)
 {
+    for (iz i = 0; i < g->cfgrows.len; i++) {
+        CfgRow *r = &g->cfgrows[i];
+        if (r->kind==kind && r->name==name && r->key==key) {
+            return r->valid ? r->value : Str{};
+        }
+    }
+    return {};
+}
+
+// Whether the configuration has a [theme NAME] of that name.
+static b32 themelisted(Gui *g, Str name)
+{
+    for (iz i = 0; name.len && i < g->cfgheads.len; i++) {
+        if (g->cfgheads[i].kind=="theme" && g->cfgheads[i].name==name) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Whether the configuration's header i is the first of a [theme NAME]
+// that may be picked: named, not as a built-in theme, and not again
+// after a header of the same theme in an earlier file.
+static b32 themehead(Gui *g, iz i)
+{
+    CfgHead *h = &g->cfgheads[i];
+    if (h->kind!="theme" || !h->name.len || themeparse(h->name)>=0) {
+        return 0;
+    }
+    for (iz k = 0; k < i; k++) {
+        if (g->cfgheads[k].kind=="theme" && g->cfgheads[k].name==h->name) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+// The configured theme by name: a built-in one, a [theme NAME] of the
+// configuration's, with its colors as they are now, or else the
+// system's.
+static void settheme(Gui *g, Str name)
+{
+    i32 theme   = themeparse(name);
     g->themeset = theme<0 ? THEME_SYSTEM : theme;
+    g->themehas = 0;
+    if (theme<0 && themelisted(g, name)) {
+        if (!(g->themename == name)) {
+            g->themename = clone(&g->perm, name);  // rarely changed
+        }
+        g->themecustom = themebuild(cfgrowval(g, "theme", name, "base"),
+                                    [&](Str key) { return cfgrowval(g, "theme", name, key); });
+        g->themehas    = 1;
+    }
     applytheme(g);
 }
 
@@ -11596,7 +11651,7 @@ static void drawcfgrow(Gui *g, CfgRow *r, i32 target, b32 wide)
         }
         if (pick.len && pick!=shown && !(r->sent && pick==r->sentval)) {
             if (theme) {
-                settheme(g, themeparse(pick));
+                settheme(g, pick);
             } else if (r->kind=="ui" && r->key=="thinking") {
                 setthinking(g, thinkparse(pick));
             } else if (r->kind=="ui" && r->key=="tools") {
@@ -11642,8 +11697,41 @@ static void drawcfgrow(Gui *g, CfgRow *r, i32 target, b32 wide)
         ImGui::PopTextWrapPos();
     } else {
         Str hint  = r->isdflt || r->like.len ? r->value : Str{};
+        // A theme's color: its base's as the hint, and a swatch after the
+        // field of the color typed, else the base's
+        u32 swatch = 0;
+        f32 sw     = ImGui::GetFrameHeight();
+        if (r->kind=="theme" && r->type=="color") {
+            Palette base = themebuild(cfgrowval(g, "theme", r->name, "base"),
+                                      [](Str) { return Str{}; });
+            for (iz i = 0; i < countof(themekeys); i++) {
+                if (themekeys[i].key == r->key) {
+                    swatch = *themecolor(&base, themekeys[i].off);
+                }
+            }
+            if (swatch) {
+                Buf h(&a, 8);
+                putbyte(&h, '#');
+                for (i32 s = 0; s < 24; s += 8) {
+                    printhex(&h, swatch>>s & 255, 2);
+                }
+                hint = finish(&h);
+            }
+            CfgColor typed = cfgcolor({(u8 *)r->buf, (iz)__builtin_strlen(r->buf)});
+            swatch = typed.ok ? rgb(typed.r, typed.g, typed.b) : swatch;
+            ImGui::SetNextItemWidth(-(sw + ImGui::GetStyle().ItemSpacing.x));
+        }
         b32 enter = ImGui::InputTextWithHint("##v", hint.len ? cstr0(&a, hint) : "", r->buf, (uz)r->cap,
                                              ImGuiInputTextFlags_EnterReturnsTrue|ImGuiInputTextFlags_AutoSelectAll);
+        if (swatch) {
+            ImVec2 fmin = ImGui::GetItemRectMin();
+            ImVec2 fmax = ImGui::GetItemRectMax();
+            ImVec2 p0   = v2(fmax.x + ImGui::GetStyle().ItemSpacing.x, fmin.y);
+            ImVec2 p1   = v2(p0.x + sw, fmin.y + sw);
+            ImDrawList *dl = ImGui::GetWindowDrawList();
+            dl->AddRectFilled(p0, p1, swatch, 3*g->scale);
+            dl->AddRect(p0, p1, g->pal->rule, 3*g->scale);
+        }
         itemnamed(g, concat(&a, concat(&a, concat(&a, "cfg ", r->kind), " "),
                             concat(&a, concat(&a, r->name, " "), r->key)));
         r->typed |= ImGui::IsItemEdited();
@@ -14803,15 +14891,35 @@ static void drawmenubar(Gui *g)
         }
         ImGui::Separator();
         if (ImGui::BeginMenu("Theme")) {
+            // The built-in themes, then the configuration's, by name
             static char const *labels[] = {"System", "Dark", "Light"};
             static_assert(countof(labels) == THEME_COUNT);
+            Str pick = {};
             for (i32 i = 0; i < THEME_COUNT; i++) {
-                if (ImGui::MenuItem(labels[i], 0, g->themeset==i) && g->themeset!=i) {
-                    // As the settings window picks it: at once, then kept
-                    settheme(g, i);
-                    if (g->enginekind!=ENGINE_FAKE && engineup(g)) {
-                        guiconfigset(g, "ui", "", "theme", themenames[i]);
-                    }
+                b32 on = !g->themehas && g->themeset==i;
+                if (ImGui::MenuItem(labels[i], 0, on) && !on) {
+                    pick = themenames[i];
+                }
+            }
+            b32 sep = 0;
+            for (iz i = 0; i < g->cfgheads.len; i++) {
+                CfgHead *h = &g->cfgheads[i];
+                if (!themehead(g, i)) {
+                    continue;
+                } else if (!sep) {
+                    ImGui::Separator();
+                    sep = 1;
+                }
+                b32 on = g->themehas && g->themename==h->name;
+                if (ImGui::MenuItem(cstr0(&a, h->name), 0, on) && !on) {
+                    pick = clone(&a, h->name);
+                }
+            }
+            if (pick.len) {
+                // As the settings window picks it: at once, then kept
+                settheme(g, pick);
+                if (g->enginekind!=ENGINE_FAKE && engineup(g)) {
+                    guiconfigset(g, "ui", "", "theme", pick);
                 }
             }
             ImGui::EndMenu();

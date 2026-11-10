@@ -216,12 +216,13 @@ enum : i32 {
     CFG_TIMES,    // seconds, each above 0, separated by blanks
     CFG_TEMPLATE, // a chat template argument: true, false, a number, else
                   // a string (always, when quoted)
+    CFG_COLOR,    // #rgb or #rrggbb
     CFG_NTYPES,
 };
 
 static Str cfgtypenames[] = {
     "string", "int", "number", "seconds", "bool", "enum", "url", "secret",
-    "list", "paths", "times", "template",
+    "list", "paths", "times", "template", "color",
 };
 static_assert(countof(cfgtypenames) == CFG_NTYPES);
 
@@ -246,6 +247,7 @@ static CfgKind cfgkinds[] = {
     {"worktree", 0, "Worktree sessions: each in a git worktree and branch of its own"},
     {"sessions", 0, "Sessions deleted: how long the Trash keeps them"},
     {"ui",       0, "How the GUI looks, and when it tells you of a session"},
+    {"theme",    1, "A color theme, which [ui] theme picks: colors laid over a built-in theme's"},
     {"terminal", 0, "The Terminal pane: the shell its tabs run, their history and copying"},
     {"desktop",  0, "The desktop tool: seeing the screen, and the mouse and keyboard"},
     {"web",      0, "Web search and reading web pages: the web_search and web_fetch tools"},
@@ -609,7 +611,8 @@ static CfgKey cfgschema[] = {
      "steps; 0 leaves one out at each new image"},
 
     {"ui", "theme", CFG_ENUM, "system", {}, "system dark light", "ui",
-     "Colors: dark, light, or system to follow the operating system"},
+     "Colors: dark, light, system to follow the operating system, or "
+     "the name of a [theme NAME]"},
     {"ui", "thinking", CFG_ENUM, "fold", {}, "fold open hide", "ui",
      "Reasoning in the transcript: fold to a line that counts it as it "
      "streams, open, or hide"},
@@ -656,6 +659,77 @@ static CfgKey cfgschema[] = {
      "ask waits for you (a permission, a plan to approve, the agent's "
      "questions), done when a session stops by itself "
      "(finished, failed or out of budget); none for neither"},
+
+    // [theme NAME]: theme.cpp maps each color to the palette (themekeys),
+    // and theme_test checks that the two lists agree
+    {"theme", "base", CFG_ENUM, "dark", {}, "dark light", "theme",
+     "The built-in theme it starts from, dark or light, which also picks the window frame's and the stock controls' shading; every color not set here is that theme's"},
+    {"theme", "gap", CFG_COLOR, "", {}, {}, "theme", "Between docked panes"},
+    {"theme", "panel", CFG_COLOR, "", {}, {}, "theme", "Panes' background, and menus'"},
+    {"theme", "panel_text", CFG_COLOR, "", {}, {}, "theme", "Text in panes, menus and dialogs"},
+    {"theme", "panel_dim", CFG_COLOR, "", {}, {}, "theme", "Hints and disabled text, on panel and field"},
+    {"theme", "field", CFG_COLOR, "", {}, {}, "theme", "Text fields' background"},
+    {"theme", "row_selected", CFG_COLOR, "", {}, {}, "theme", "A selected row, as the session shown in the sidebar"},
+    {"theme", "row_hover", CFG_COLOR, "", {}, {}, "theme", "A row under the pointer"},
+    {"theme", "row_pressed", CFG_COLOR, "", {}, {}, "theme", "A row pressed"},
+    {"theme", "button", CFG_COLOR, "", {}, {}, "theme", "Buttons; unset, button_hover and button_pressed follow it"},
+    {"theme", "button_hover", CFG_COLOR, "", {}, {}, "theme", "A button under the pointer"},
+    {"theme", "button_pressed", CFG_COLOR, "", {}, {}, "theme", "A button pressed"},
+    {"theme", "toggle_on", CFG_COLOR, "", {}, {}, "theme", "A toggle that is on; unset, toggle_on_hover follows it"},
+    {"theme", "toggle_on_hover", CFG_COLOR, "", {}, {}, "theme", "A toggle that is on, under the pointer"},
+    {"theme", "progress", CFG_COLOR, "", {}, {}, "theme", "Progress bars, under panel_text"},
+    {"theme", "text", CFG_COLOR, "", {}, {}, "theme", "The transcript's text"},
+    {"theme", "text_dim", CFG_COLOR, "", {}, {}, "theme", "Headers and secondary text in the transcript"},
+    {"theme", "reasoning", CFG_COLOR, "", {}, {}, "theme", "Reasoning and notes"},
+    {"theme", "link", CFG_COLOR, "", {}, {}, "theme", "Links"},
+    {"theme", "code", CFG_COLOR, "", {}, {}, "theme", "Code spans"},
+    {"theme", "code_block", CFG_COLOR, "", {}, {}, "theme", "Code blocks' background"},
+    {"theme", "code_block_text", CFG_COLOR, "", {}, {}, "theme", "Plain text in code blocks"},
+    {"theme", "table_header", CFG_COLOR, "", {}, {}, "theme", "Table header rows' background"},
+    {"theme", "quote", CFG_COLOR, "", {}, {}, "theme", "A quote's bar"},
+    {"theme", "rule", CFG_COLOR, "", {}, {}, "theme", "Rules, table grids and borders"},
+    {"theme", "list_marker", CFG_COLOR, "", {}, {}, "theme", "List bullets and numbers"},
+    {"theme", "selection", CFG_COLOR, "", {}, {}, "theme", "Selected text's background"},
+    {"theme", "selection_text", CFG_COLOR, "", {}, {}, "theme", "Selected text"},
+    {"theme", "user_message", CFG_COLOR, "", {}, {}, "theme", "Your messages' background"},
+    {"theme", "tool_row", CFG_COLOR, "", {}, {}, "theme", "Tool rows' background"},
+    {"theme", "ask_card", CFG_COLOR, "", {}, {}, "theme", "Ask cards' background"},
+    {"theme", "tool_summary", CFG_COLOR, "", {}, {}, "theme", "A tool row's arguments, an ask's path"},
+    {"theme", "syntax_comment", CFG_COLOR, "", {}, {}, "theme", "Comments in code blocks"},
+    {"theme", "syntax_keyword", CFG_COLOR, "", {}, {}, "theme", "Keywords in code blocks"},
+    {"theme", "syntax_type", CFG_COLOR, "", {}, {}, "theme", "Types in code blocks"},
+    {"theme", "syntax_string", CFG_COLOR, "", {}, {}, "theme", "Strings in code blocks"},
+    {"theme", "syntax_number", CFG_COLOR, "", {}, {}, "theme", "Numbers in code blocks"},
+    {"theme", "syntax_preprocessor", CFG_COLOR, "", {}, {}, "theme", "Preprocessor lines in code blocks"},
+    {"theme", "syntax_variable", CFG_COLOR, "", {}, {}, "theme", "Variables in code blocks"},
+    {"theme", "syntax_function", CFG_COLOR, "", {}, {}, "theme", "Function names in code blocks"},
+    {"theme", "diff_inserted", CFG_COLOR, "", {}, {}, "theme", "Lines a diff adds"},
+    {"theme", "diff_deleted", CFG_COLOR, "", {}, {}, "theme", "Lines a diff removes"},
+    {"theme", "diff_header", CFG_COLOR, "", {}, {}, "theme", "A diff's headers"},
+    {"theme", "ok", CFG_COLOR, "", {}, {}, "theme", "Succeeded and done, as text"},
+    {"theme", "error", CFG_COLOR, "", {}, {}, "theme", "Failed, as text"},
+    {"theme", "waiting", CFG_COLOR, "", {}, {}, "theme", "Waiting, asking and stalled, as text"},
+    {"theme", "running", CFG_COLOR, "", {}, {}, "theme", "Running and streaming, as text"},
+    {"theme", "alarm", CFG_COLOR, "", {}, {}, "theme", "The metrics overlay's alarm"},
+    {"theme", "term_black", CFG_COLOR, "", {}, {}, "theme", "Terminal color 0, black"},
+    {"theme", "term_red", CFG_COLOR, "", {}, {}, "theme", "Terminal color 1, red"},
+    {"theme", "term_green", CFG_COLOR, "", {}, {}, "theme", "Terminal color 2, green"},
+    {"theme", "term_yellow", CFG_COLOR, "", {}, {}, "theme", "Terminal color 3, yellow"},
+    {"theme", "term_blue", CFG_COLOR, "", {}, {}, "theme", "Terminal color 4, blue"},
+    {"theme", "term_magenta", CFG_COLOR, "", {}, {}, "theme", "Terminal color 5, magenta"},
+    {"theme", "term_cyan", CFG_COLOR, "", {}, {}, "theme", "Terminal color 6, cyan"},
+    {"theme", "term_white", CFG_COLOR, "", {}, {}, "theme", "Terminal color 7, white"},
+    {"theme", "term_bright_black", CFG_COLOR, "", {}, {}, "theme", "Terminal color 8, bright black"},
+    {"theme", "term_bright_red", CFG_COLOR, "", {}, {}, "theme", "Terminal color 9, bright red"},
+    {"theme", "term_bright_green", CFG_COLOR, "", {}, {}, "theme", "Terminal color 10, bright green"},
+    {"theme", "term_bright_yellow", CFG_COLOR, "", {}, {}, "theme", "Terminal color 11, bright yellow"},
+    {"theme", "term_bright_blue", CFG_COLOR, "", {}, {}, "theme", "Terminal color 12, bright blue"},
+    {"theme", "term_bright_magenta", CFG_COLOR, "", {}, {}, "theme", "Terminal color 13, bright magenta"},
+    {"theme", "term_bright_cyan", CFG_COLOR, "", {}, {}, "theme", "Terminal color 14, bright cyan"},
+    {"theme", "term_bright_white", CFG_COLOR, "", {}, {}, "theme", "Terminal color 15, bright white"},
+    {"theme", "term_text", CFG_COLOR, "", {}, {}, "theme", "The terminal's text"},
+    {"theme", "term_background", CFG_COLOR, "", {}, {}, "theme", "The terminal's background"},
+    {"theme", "term_cursor", CFG_COLOR, "", {}, {}, "theme", "The terminal's cursor"},
 
     {"terminal", "shell", CFG_STRING, "", {}, {}, "terminal",
      "The program a terminal tab runs, with its arguments, a \"quoted\" "
@@ -1201,6 +1275,43 @@ static Url loopbackuri(Str v)
 
 // How a value fares as a setting of its key. A shared value comes from
 // an included file. An empty value means the default, and is fine.
+// A color as #rgb or #rrggbb, its channels 0 to 255.
+struct CfgColor {
+    u8  r, g, b;
+    b32 ok;
+};
+
+static CfgColor cfgcolor(Str v)
+{
+    CfgColor c = {};
+    v = trim(v);
+    if ((v.len!=4 && v.len!=7) || v[0]!='#') {
+        return c;
+    }
+    i32 d[6] = {};
+    for (iz i = 1; i < v.len; i++) {
+        u8 x = v[i] | 0x20;  // lower case, as for a letter
+        if (v[i]>='0' && v[i]<='9') {
+            d[i-1] = v[i] - '0';
+        } else if (x>='a' && x<='f') {
+            d[i-1] = x - 'a' + 10;
+        } else {
+            return c;
+        }
+    }
+    if (v.len == 4) {
+        c.r = (u8)(d[0]*17);
+        c.g = (u8)(d[1]*17);
+        c.b = (u8)(d[2]*17);
+    } else {
+        c.r = (u8)(d[0]<<4 | d[1]);
+        c.g = (u8)(d[2]<<4 | d[3]);
+        c.b = (u8)(d[4]<<4 | d[5]);
+    }
+    c.ok = 1;
+    return c;
+}
+
 static i32 cfgjudge(CfgKey *k, Str v, b32 shared)
 {
     v = trim(v);
@@ -1225,6 +1336,8 @@ static i32 cfgjudge(CfgKey *k, Str v, b32 shared)
         return cfgeffortas(v) ? CFG_OK : CFG_BAD;
     } else if (k->kind=="model" && k->key=="effort_map") {
         return cfgeffortmap(v) ? CFG_OK : CFG_BAD;
+    } else if (k->kind=="ui" && k->key=="theme") {
+        return CFG_OK;  // or a [theme NAME], which cfgvalidate checks
     }
     switch (k->type) {
     case CFG_STRING:
@@ -1282,6 +1395,8 @@ static i32 cfgjudge(CfgKey *k, Str v, b32 shared)
             }
         }
         return CFG_OK;
+    case CFG_COLOR:
+        return cfgcolor(v).ok ? CFG_OK : CFG_BAD;
     }
     return CFG_OK;
 }
@@ -1354,6 +1469,7 @@ static Str cfgproblem(Arena *a, CfgKey *k, Str v, b32 shared)
     case CFG_SECONDS: print(&b, "expected seconds, a number above 0");  break;
     case CFG_TIMES:   print(&b, "expected seconds, numbers above 0");   break;
     case CFG_BOOL:    print(&b, "expected true or false");              break;
+    case CFG_COLOR:   print(&b, "expected a color, #rgb or #rrggbb");   break;
     case CFG_URL:
         print(&b, "expected a URL starting with http:// or https://");
         break;
@@ -2226,7 +2342,9 @@ static void cfgsectionline(Ini *ini, Arena *perm, IniFile *f, IniFile *user,
     IniEntry *search = k && l->key=="web" ? inientry(l->section, "search") : 0;
     b32      webbad  = search && trim(search->value)=="searxng" &&
                        !inientry(l->section, "url");
-    if (k && !unnamed && !named && !nourl && !mcpbad && !webbad) {
+    b32      themebad = k && l->key=="theme" &&
+                        cfghasword("system dark light", trim(l->value));
+    if (k && !unnamed && !named && !nourl && !mcpbad && !webbad && !themebad) {
         return;
     } else if (cfgmuted(f)) {
         cfgreport(ini, perm, f, l, INI_WARNING, 0, {});
@@ -2260,6 +2378,10 @@ static void cfgsectionline(Ini *ini, Arena *perm, IniFile *f, IniFile *user,
     } else if (webbad) {
         print(&b, "[web] search is searxng but has no url: set it to the "
                   "instance's URL");
+    } else if (themebad) {
+        print(&b, "system, dark and light are the built-in themes, which [ui] "
+                  "theme picks first, so this theme is never used: name it "
+                  "otherwise");
     } else {
         print(&b, "endpoint ");
         print(&b, l->value);
@@ -2463,6 +2585,16 @@ static void cfgvalidate(Config *c, Ini *ini, IniFile *user, Arena *perm)
             }
             if (s->kind=="model" && e->key=="like" && v.len) {
                 cfglikecheck(ini, perm, s->name, e);
+            }
+            if (s->kind=="ui" && e->key=="theme" && v.len && !cfghasword(k->choices, v) &&
+                    !inisection(ini, "theme", v)) {
+                Str msg = {};
+                if (!cfgmuted(e->file)) {
+                    msg = concat(perm, "no [theme ", v);
+                    msg = concat(perm, msg, "], so the system's theme is used");
+                }
+                cfgreport(ini, perm, e->file, e->line, INI_WARNING,
+                          e->line->valbeg, msg);
             }
             if (k && k->type==CFG_SECRET && startswith(v, "file:") &&
                     cfgjudge(k, v, e->file!=user)==CFG_OK) {

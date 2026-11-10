@@ -456,8 +456,8 @@ static void testcfgvalidate(Test *t)
         "web_search, web_fetch, desktop, *, default\n"
         "/c/prospero.ini:21:2: warning: unknown section kind \"provider\", "
         "expected endpoint, model, role, guard, tools, shell, instructions, "
-        "skills, memory, worktree, sessions, ui, terminal, desktop, web, host, "
-        "remote, container or mcp\n"
+        "skills, memory, worktree, sessions, ui, theme, terminal, desktop, web, "
+        "host, remote, container or mcp\n"
         "/c/prospero.ini:23:8: warning: [guard] takes no name, or its "
         "settings are unused\n"
         "/c/team.ini:4:7: error: a plaintext secret in an included file is "
@@ -2476,9 +2476,61 @@ static void testcfgeffort(Test *t)
     }
 }
 
+// [theme NAME] sections: colors, names [ui] theme may pick, and a theme
+// from an include
+static void testcfgtheme(Test *t)
+{
+    Arena a = t->perm;
+
+    expect(t, "color.short", istr(&a, cfgcolor("#abc").ok), "1");
+    expect(t, "color.short.g", istr(&a, cfgcolor("#abc").g), "187");
+    expect(t, "color.long.b", istr(&a, cfgcolor(" #1A2b3C ").b), "60");
+    expect(t, "color.name", istr(&a, cfgcolor("blue").ok), "0");
+    expect(t, "color.five", istr(&a, cfgcolor("#12345").ok), "0");
+    expect(t, "color.hash", istr(&a, cfgcolor("123456").ok), "0");
+    expect(t, "color.digit", istr(&a, cfgcolor("#12g").ok), "0");
+
+    CfgEnv v = newcfgenv(&a);
+    os_write(v.os, a, "/c/prospero.ini",
+        "include = themes.ini\n"               // 1
+        "[ui]\n"
+        "theme = sunset\n"
+        "[theme dark]\n"
+        "link = #fff\n"                        // 5
+        "[theme bad]\n"
+        "link = blue\n"
+        "panel = #abc\n"
+        "nope = #fff\n"
+        "base = sepia\n");                     // 10
+    os_write(v.os, a, "/c/themes.ini",
+        "[theme sunset]\n"
+        "base = light\n"
+        "link = #f80\n");
+    Config *c = newconfig(v.os, &a, v.scratch, "/c/prospero.ini", 0);
+    expect(t, "theme.diags", inidiags(&a, c->ini),
+        "/c/prospero.ini:4:2: warning: system, dark and light are the "
+        "built-in themes, which [ui] theme picks first, so this theme is "
+        "never used: name it otherwise\n"
+        "/c/prospero.ini:7:8: error: expected a color, #rgb or #rrggbb, so "
+        "this is ignored\n"
+        "/c/prospero.ini:9:1: warning: unknown key \"nope\" in [theme]\n"
+        "/c/prospero.ini:10:8: warning: unknown value \"sepia\", expected "
+        "one of: dark, light");
+    expect(t, "theme.included", cfgget(c, "theme", "sunset", "link", 0), "#f80");
+    cfgfree(c);
+
+    os_write(v.os, a, "/c/prospero.ini", "[ui]\ntheme = missing\n");
+    c = newconfig(v.os, &a, v.scratch, "/c/prospero.ini", 0);
+    expect(t, "theme.missing", inidiags(&a, c->ini),
+        "/c/prospero.ini:2:9: warning: no [theme missing], so the system's "
+        "theme is used");
+    cfgfree(c);
+}
+
 static void test_config(Test *t)
 {
     testcfgeffort(t);
+    testcfgtheme(t);
     testcfgwsl(t);
     testcfgsha256(t);
     testcfgurls(t);

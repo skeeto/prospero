@@ -1723,7 +1723,7 @@ def main():
                     help="the engine as prospero --headless")
     ap.add_argument("--inbox-cap", type=int,
                     help="the GUI's inbox, small to force lost records (default "
-                         "65536, but the GUI's own for --mode bench, which "
+                         "256 KiB, but the GUI's own for --mode bench, which "
                          "measures how fast a history arrives)")
     ap.add_argument("--mode", default="drive",
                     choices=["drive", "idle", "streamtest", "e2e", "signals",
@@ -1799,11 +1799,16 @@ def main():
     elif args.mode == "settings":
         # Asks wait out the screenshots; a role holds the long value; an
         # included model, which cannot be deleted here, an endpoint to
-        # delete, and a remote, never connected
+        # delete, and a remote, never connected; and the shipped Gruvbox,
+        # included, for [ui] theme to pick by name
         host.write(host.path("team.ini"), "# Shared\n[model shared]\ntemperature = 0.1\n")
+        gruvbox = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                               "assets", "themes", "gruvbox.ini")
+        with open(gruvbox) as f:
+            host.write(host.path("gruvbox.ini"), f.read())
         before = config(curl, model, 120, SETTINGS_EXTRA)
         head, _, rest = before.partition("\n")
-        before = f"{head}\ninclude = team.ini\n{rest}"
+        before = f"{head}\ninclude = team.ini\ninclude = gruvbox.ini\n{rest}"
     elif args.mode == "enginestop":
         before = config(curl, model, 60)
     elif args.mode == "compose":
@@ -1982,7 +1987,9 @@ def main():
             host.mkdir(host.path("work", "pick", *d.split("/")))
         host.write(host.path("work", "pick", "alfile"), "a file\n")
     if args.inbox_cap or args.mode not in ("bench", "background"):
-        guiargs += ["--inbox-cap", str(args.inbox_cap or 65536)]
+        # Small, to lose records, yet over the largest single message:
+        # a config.get reply carries the whole schema, near 64 KiB alone
+        guiargs += ["--inbox-cap", str(args.inbox_cap or 1 << 18)]
     if far:
         guiargs += ["--rcwd", far.work]
     if args.mode == "containers":
@@ -2109,6 +2116,7 @@ def main():
         want = want.replace("temp = ask\n", "temp = ask\nroots = ~/a; ~/b\n")
         want = want.replace(SETTINGS_GONE + "\n", "")
         want += ("\n[ui]\ntheme = light\nnotify = allow\n"
+                 "\n[theme gruvbox]\npanel = #3c3836\n"
                  "\n[model fresh]\nreasoning = reasoning_content\n"
                  "\n[remote box]\nssh = me@box.example\npath = ~/bin/prospero\n"
                  "\n[endpoint gpt]\nkind = anthropic\nurl = http://gpt.example/v1\n"
@@ -2119,12 +2127,13 @@ def main():
                                         "expected", "saved", lineterm="", n=1)
             problems.append("the configuration is not the edits alone:\n" + "\n".join(diff))
         else:
-            print("configuration: the long value, the theme, notify, the roots, a section "
-                  "deleted and four added, nothing else")
+            print("configuration: the long value, the theme and a color of one, notify, "
+                  "the roots, a section deleted and four added, nothing else")
         if host.read(host.path("team.ini")) != "# Shared\n[model shared]\ntemperature = 0.1\n":
             problems.append("the included file changed")
         if args.shots and not args.host:
-            for name in ("dark", "light", "settings-narrow", "settings-wide", "delete",
+            for name in ("dark", "gruvbox", "settings-theme", "light", "settings-narrow",
+                         "settings-wide", "delete",
                          "settings-narrowest"):
                 if not os.path.exists(os.path.join(args.shots, name + ".png")):
                     problems.append(f"no {name}.png")
