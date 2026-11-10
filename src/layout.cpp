@@ -447,6 +447,84 @@ static TableShape tableshape(Doc *d, i32 bi)
     return r;
 }
 
+// The widest word of a cell's pieces, as wrappieces breaks them: at
+// spaces and line breaks, and between CJK characters.
+static f32 cellword(Measure *m, Piece *pieces, i32 npiece)
+{
+    f32 best = 0;
+    f32 word = 0;
+    i32 prev = ' ';
+    for (i32 k = 0; k < npiece; k++) {
+        Piece *pc = &pieces[k];
+        if (pc->flags & (PIECE_HARD|PIECE_SOFT)) {
+            word = 0;
+            prev = ' ';
+            continue;
+        }
+        for (iz i = 0; i < pc->text.len;) {
+            i32 cp = utf8decode(pc->text, &i);
+            if (cp=='\n' || piecespace(cp)) {
+                word = 0;
+            } else {
+                word = cjkbreak(prev, cp) ? 0 : word;
+                word += m->advance(m->ctx, pc->style, cp);
+                best = word>best ? word : best;
+            }
+            prev = cp;
+        }
+    }
+    return best;
+}
+
+// Column widths in avail, from each column's natural and least widths,
+// much as a browser sizes a table: natural widths if they fit; else
+// each column its least, and the room left shared by how much more each
+// would take, so a column of short words is never wrapped to make room
+// for a column of prose. Least widths that don't fit go to the narrow
+// columns whole, the rest sharing what is left evenly.
+static f32 *columnwidths(Arena *perm, f32 *natural, f32 *least, i32 ncols, f32 avail)
+{
+    f32 *w     = alloc<f32>(perm, ncols);
+    f32  total = 0;
+    f32  lsum  = 0;
+    for (i32 c = 0; c < ncols; c++) {
+        total += natural[c];
+        lsum  += least[c];
+    }
+    if (total <= avail) {
+        for (i32 c = 0; c < ncols; c++) {
+            w[c] = natural[c];
+        }
+    } else if (lsum <= avail) {
+        f32 room = avail - lsum;
+        f32 more = total - lsum;
+        for (i32 c = 0; c < ncols; c++) {
+            w[c] = least[c] + (more>0 ? room*(natural[c]-least[c])/more : 0);
+        }
+    } else {
+        b32 *fixed = alloc<b32>(perm, ncols);
+        f32  left  = avail;
+        i32  open  = ncols;
+        for (b32 again = 1; again && open;) {
+            again = 0;
+            f32 share = left / (f32)open;
+            for (i32 c = 0; c < ncols; c++) {
+                if (!fixed[c] && least[c]<=share) {
+                    fixed[c] = 1;
+                    w[c]     = least[c];
+                    left    -= least[c];
+                    open--;
+                    again    = 1;
+                }
+            }
+        }
+        for (i32 c = 0; c < ncols; c++) {
+            w[c] = fixed[c] ? w[c] : left/(f32)open;
+        }
+    }
+    return w;
+}
+
 // Lay out the table whose first cell is block bi.
 static BlockLayout *layouttable(Arena *perm, Measure *m, Doc *d, i32 bi,
                                 f32 width, f32 scale)
@@ -469,8 +547,10 @@ static BlockLayout *layouttable(Arena *perm, Measure *m, Doc *d, i32 bi,
     f32     avail = width - x0;
     Piece  *base  = d->pieces.data + first->piece0;
 
-    // Natural column widths: each cell on one line.
+    // Natural column widths, each cell on one line, and least widths,
+    // each cell's widest word on a line of its own
     f32 *natural = alloc<f32>(perm, ncols);
+    f32 *least   = alloc<f32>(perm, ncols);
     for (i32 i = 0; i < n; i++) {
         DocBlock *c  = &d->blocks[bi+i];
         f32    cw = 2*sp.pad;
@@ -481,17 +561,18 @@ static BlockLayout *layouttable(Arena *perm, Measure *m, Doc *d, i32 bi,
                 : measure(m, pc->style, pc->text);
         }
         natural[c->col] = cw>natural[c->col] ? cw : natural[c->col];
+        f32 lw = 2*sp.pad + cellword(m, d->pieces.data+c->piece0, c->npiece);
+        least[c->col] = lw>least[c->col] ? lw : least[c->col];
     }
-    f32 total = 0;
     for (i32 c = 0; c < ncols; c++) {
         natural[c] = natural[c]<3*sp.em ? 3*sp.em : natural[c];
-        total += natural[c];
+        least[c]   = least[c]>natural[c] ? natural[c] : least[c];
     }
-    f32 shrink = total>avail && total>0 ? avail/total : 1;
-    f32 *colx  = alloc<f32>(perm, ncols+1);
+    f32 *colw = columnwidths(perm, natural, least, ncols, avail);
+    f32 *colx = alloc<f32>(perm, ncols+1);
     colx[0] = x0;
     for (i32 c = 0; c < ncols; c++) {
-        colx[c+1] = colx[c] + natural[c]*shrink;
+        colx[c+1] = colx[c] + colw[c];
     }
 
     // Rows: lay out each cell in its column, then size the row.

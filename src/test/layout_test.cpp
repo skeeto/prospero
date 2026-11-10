@@ -93,7 +93,15 @@ static void test_layout(Test *t)
         {"layout.table", "| a | b |\n|---|---|\n| 1 | 2 |", 200,
          "8:8[a] 8:68[b] 44:8[1] 44:68[2] h=72"},
         {"layout.tableshrink", "| aaaa bbbb | c |\n|---|---|\n| 1 | 2 |", 100,
-         "8:8[aaaa ] 28:8[bbbb] 8:71[c] 64:8[1] 64:71[2] h=92"},
+         "8:8[aaaa ] 28:8[bbbb] 8:74[c] 64:8[1] 64:74[2] h=92"},
+        // A column of one short word keeps it whole beside a column of
+        // prose, which wraps instead
+        {"layout.tableword", "| abcdef | ab ab ab ab ab ab ab ab ab ab |\n|---|---|\n| x | y |", 200,
+         "8:8[abcdef] 8:84[ab ab ab ] 28:84[ab ab ab ] 48:84[ab ab ab ] 68:84[ab] 104:8[x] 104:84[y] h=132"},
+        // Words too wide for the table: the narrow column keeps its
+        // word, the wide one takes what is left
+        {"layout.tablewide", "| abcd | abcdefghijklmnop |\n|---|---|\n| x | y |", 120,
+         "8:8[abcd] 8:64[abcd] 28:64[efgh] 48:64[ijkl] 68:64[mnop] 104:8[x] 104:64[y] h=132"},
         {"layout.empty", "", 200, "h=0"},
         // CJK breaks between its characters, not only at spaces, but
         // never before a closing mark (kinsoku)
