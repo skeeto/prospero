@@ -4504,23 +4504,24 @@ static void drawtoast(Gui *g, GuiSession *s, ImVec2 r0, ImVec2 r1)
     }
 }
 
-// A failed deployment's toast (deployfailed), over the foot of a pane:
-// the one its deployment began from (Sessions, unless it was Hosts), or
-// the other where that one was not drawn last frame, as when the user
-// has gone to another tab. It stays until dismissed, or until the host
-// is reached or deployed to again. The pane's window scrolls as a
-// whole, so its content keeps the extent it had without the toast. Its
-// height, if drawn here, for a toast above it.
-static f32 drawdeploytoast(Gui *g, i32 pane)
+// A host's toast (hostfailed): a failed connect, deployment or update,
+// over the foot of a pane: the one it began from (Sessions, unless it
+// was Hosts), or the other where that one was not drawn last frame, as
+// when the user has gone to another tab. It stays until dismissed, or
+// until the host is reached or tried again. A connect that failed for
+// want of an engine there offers to deploy one. The pane's window
+// scrolls as a whole, so its content keeps the extent it had without the
+// toast. Its height, if drawn here, for a toast above it.
+static f32 drawhosttoast(Gui *g, i32 pane)
 {
     GuiHost *h = 0;
-    for (GuiHost *k = g->hosts; k && g->dtoasthost; k = k->next) {
-        h = k->uid==g->dtoasthost ? k : h;
+    for (GuiHost *k = g->hosts; k && g->htoasthost; k = k->next) {
+        h = k->uid==g->htoasthost ? k : h;
     }
     if (!h) {
         return 0;
     }
-    i32 home  = h->deployfrom==PANE_HOSTS ? PANE_HOSTS : PANE_SESSIONS;
+    i32 home  = h->toastfrom==PANE_HOSTS ? PANE_HOSTS : PANE_SESSIONS;
     i32 other = home==PANE_HOSTS ? PANE_SESSIONS : PANE_HOSTS;
     b32 shown = g->panedrawn[home] >= g->total.frames-1;
     if (pane != (shown ? home : other)) {
@@ -4530,12 +4531,28 @@ static f32 drawdeploytoast(Gui *g, i32 pane)
     ImVec2       maxp = w->DC.CursorMaxPos;
     ImVec2       r0   = ImGui::GetWindowPos();
     ImVec2       r1   = v2(r0.x + ImGui::GetWindowWidth(), r0.y + ImGui::GetWindowHeight());
-    ToastBtn     x    = {"\xc3\x97", "deploy dismiss", "Dismiss"};  // a multiplication sign
-    ToastOut     out  = {};
-    if (toastbtns(g, "##toast", g->dtoasttext, g->pal->bad, g->pal->bad, {&x, 1}, -1,
-                  r0, r1, 0, &out) == 0) {
-        g->dtoasthost = 0;
+    ToastBtn     btns[2] = {};
+    iz           n       = 0;
+    b32          deploy  = h->kind==GH_REMOTE && h->state==RS_FAILED && h->deploys &&
+                           !h->deployfail && !h->r && !remoteset(g, h->name, "path").len &&
+                           !deploywhy(g, h, h->name).len;
+    if (deploy) {
+        // In the frame itself: toastbtns takes its scratch from there
+        btns[n++] = {"Deploy engine", concat(&g->frame, "toast deploy ", h->name),
+                     "Copy this version's engine there, as prospero deploy does, "
+                     "then connect to it"};
     }
+    btns[n++] = {"\xc3\x97", "host dismiss", "Dismiss"};  // a multiplication sign
+    ToastOut out = {};
+    i32      b   = toastbtns(g, "##toast", g->htoasttext, g->pal->bad, g->pal->bad,
+                             {btns, n}, -1, r0, r1, 0, &out);
+    if (b>=0 && deploy && b==0) {
+        guideploy(g, h->name);
+    }
+    if (b >= 0) {
+        g->htoasthost = 0;
+    }
+    g->failshown |= h->state == RS_FAILED;
     w->DC.CursorMaxPos = maxp;
     return out.height;
 }
@@ -11202,8 +11219,11 @@ static void drawremote(Gui *g, Arena a, Str name, i32 rect)
     print(&b, h ? hoststatus(g, &a, h, left) : Str("not connected"));
     char const *label = live ? "Disconnect" : "Connect";
     f32         bw    = ImGui::CalcTextSize(label).x + 2*st.FramePadding.x;
+    // Why it is down or failed, in its tooltip: a failure a click began
+    // is told in the host toast (drawhosttoast), so nothing here moves
+    Str why_ = h && h->msg.len && h->state!=RS_UP ? h->msg : Str{};
     ImGui::AlignTextToFramePadding();
-    textfit(a, finish(&b), ImGui::GetContentRegionAvail().x - bw - st.ItemSpacing.x, 0);
+    textfit(a, finish(&b), ImGui::GetContentRegionAvail().x - bw - st.ItemSpacing.x, 0, why_);
     ImGui::SameLine();
     ImGui::BeginDisabled(closing && h->reconnect);
     b32 click = ImGui::SmallButton(label);
@@ -11235,13 +11255,6 @@ static void drawremote(Gui *g, Arena a, Str name, i32 rect)
         itemtip("Give it a [remote %s] section of its own, with "
                               "wsl = %s, and show it in Settings",
                               cstr0(&a, name), cstr0(&a, auto_->wsl));
-    }
-    // Not a failed deployment's, which its toast tells (drawdeploytoast)
-    if (h && h->msg.len && h->state!=RS_UP && !h->deployfail) {
-        ImGui::PushStyleColor(ImGuiCol_Text, h->state==RS_FAILED ? g->pal->bad : g->pal->amber);
-        ImGui::TextWrapped("%s", cstr0(&a, h->msg));
-        ImGui::PopStyleColor();
-        g->failshown |= h->state == RS_FAILED;
     }
     if (h && live && h->thin) {
         ImGui::PushStyleColor(ImGuiCol_Text, g->pal->dim);
@@ -14958,7 +14971,7 @@ static b32 beginpane(Gui *g, i32 pane)
         setpane(g, pane, 0);
     }
     // What is drawn now is this pane's, which a deployment begun from it
-    // notes (deploystart); and it was shown this frame (drawdeploytoast)
+    // notes (deploystart); and it was shown this frame (drawhosttoast)
     g->inpane = pane + 1;
     if (vis) {
         g->panedrawn[pane] = g->total.frames;
@@ -15051,7 +15064,7 @@ static void dockwindows(Gui *g)
             escapecancel(g);
             backgroundkey(g);
             drawsessions(g);
-            drawtrashtoast(g, PANE_SESSIONS, drawdeploytoast(g, PANE_SESSIONS));
+            drawtrashtoast(g, PANE_SESSIONS, drawhosttoast(g, PANE_SESSIONS));
         }
         ImGui::End();
     }
@@ -15143,7 +15156,7 @@ static void dockwindows(Gui *g)
         }
         if (beginpane(g, PANE_HOSTS)) {
             drawhosts(g);
-            drawtrashtoast(g, PANE_HOSTS, drawdeploytoast(g, PANE_HOSTS));
+            drawtrashtoast(g, PANE_HOSTS, drawhosttoast(g, PANE_HOSTS));
         }
         ImGui::End();
     }

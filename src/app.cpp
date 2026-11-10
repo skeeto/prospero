@@ -447,10 +447,11 @@ struct GuiHost {
     Remote  *r;         // GH_LOCAL and GH_REMOTE while connected, else null
     Mailbox *inbox;     // its records, which wake the GUI
     i32      state;     // RS_*, from its "remote" records
-    Str      msg;       // why it is down, or failed
+    Str      msg;       // why it is down, or failed (the host toast, a tooltip)
     b32      deploys;   // failed, where deploying an engine would help
-    b32      deployfail; // a deployment there failed, said in the deploy toast
-    i32      deployfrom; // the pane its latest deployment began from (PANE_*)
+    b32      deployfail; // a deployment there failed, said in the host toast
+    i32      toastfrom; // the pane its latest connect or deployment began from
+    b32      asked;     // a click began its latest connect: its failure a toast
     i64      retryat;   // epoch ms: it tries again then, while down
     b32      up;        // it answered hello
     b32      closing;   // asked to close: its records are let go
@@ -1667,10 +1668,11 @@ struct Gui {
     b32                panes[PANE_COUNT];  // shown, as the View menu says
     i64                panedrawn[PANE_COUNT];  // total.frames when last drawn
     i32                inpane;     // PANE_*+1 while drawing it, else 0
-    // A failed deployment (deployfailed), told in a toast in the pane it
-    // began from, or the other where that is not shown (drawdeploytoast)
-    u64                dtoasthost;  // its host's uid, 0 if none
-    Str                dtoasttext;
+    // A failed connect, deployment or update (hostfailed), told in a
+    // toast in the pane it began from, or the other where that is not
+    // shown (drawhosttoast)
+    u64                htoasthost;  // its host's uid, 0 if none
+    Str                htoasttext;
     // Sessions just moved to the Trash (guitrash), told in a toast with
     // Undo, in the Sessions pane or else Hosts, above any deploy toast
     TrashToast         trashtoast;
@@ -8320,27 +8322,35 @@ static b32 remoteignored(Gui *g, Str name, Str key)
     return 0;
 }
 
-// A deployment to h begins, or may (a connect that deploys as needed):
-// from the pane being drawn, if a click there began it, whose toast
-// tells if it fails; and an earlier failure's toast there goes.
-static void deploystart(Gui *g, GuiHost *h)
+// A connect to h or a deployment there begins: from the pane being
+// drawn, if a click there began it, whose toast tells if it fails; and
+// an earlier failure's toast there goes.
+static void hoststart(Gui *g, GuiHost *h)
 {
     if (g->inpane) {
-        h->deployfrom = g->inpane - 1;
+        h->toastfrom = g->inpane - 1;
+        h->asked     = 1;  // until it fails or is up: a deploy's connect too
     }
     h->deployfail = 0;
-    if (g->dtoasthost == h->uid) {
-        g->dtoasthost = 0;
+    if (g->htoasthost == h->uid) {
+        g->htoasthost = 0;
     }
 }
 
-// A deployment to h failed: why, in the deploy toast, which replaces
+// Something asked of h failed: why, in the host toast, which replaces
 // any other's.
+static void hostfailed(Gui *g, GuiHost *h, Str why)
+{
+    h->asked      = 0;
+    g->htoasthost = h->uid;
+    g->htoasttext = clone(&g->perm, why);
+}
+
+// A deployment to h failed, which its status line notes.
 static void deployfailed(Gui *g, GuiHost *h, Str why)
 {
     h->deployfail = 1;
-    g->dtoasthost = h->uid;
-    g->dtoasttext = clone(&g->perm, why);
+    hostfailed(g, h, why);
 }
 
 // Connect to a [remote NAME] over ssh, or into its WSL distro, as its
@@ -8377,19 +8387,21 @@ static GuiHost *remoteconnect(Gui *g, Arena scratch, Str name, b32 deploy = 0)
     rc.localstate = g->statedir;
     rc.deploy     = deploy || remotedeploys(g, name);
     h->deploys    = 0;
-    if (rc.deploy) {
-        deploystart(g, h);
-    }
+    hoststart(g, h);
     b32 none = !rc.ssh.len && !rc.wsl.len && !rc.exec.len;
     if (none && (remoteignored(g, name, "ssh") || remoteignored(g, name, "wsl") ||
                  remoteignored(g, name, "exec"))) {
         h->state = RS_FAILED;
         h->msg   = "its ssh, wsl or exec is set in an included file, which "
                    "cannot choose what runs where: set it in your own file";
-        return h;
     } else if (none) {
         h->state = RS_FAILED;
         h->msg   = "no ssh destination: set ssh (or wsl, or exec) in its section";
+    }
+    if (none) {
+        if (h->asked) {
+            hostfailed(g, h, concat(&scratch, concat(&scratch, name, ": "), h->msg));
+        }
         return h;
     }
     hostconnect(g, h, &rc, scratch);
@@ -8448,6 +8460,7 @@ static void findhosts(Gui *g, Arena a)
 
 static b32  updating(GuiHost *);
 static void guiupdate(Gui *, GuiHost *);
+static Str  hostlabel(Gui *, Arena *, GuiHost *);
 
 // A host's connection changed: connecting, up, down until a retry,
 // failed or closed, as the library says.
@@ -8474,12 +8487,17 @@ static void onremote(Gui *g, GuiHost *h, Arena a, EvRec *r)
         // A connect's deployment failed: its library says why ("cannot
         // deploy an engine: ...")
         deployfailed(g, h, concat(&a, concat(&a, h->name, ": "), msg));
+    } else if (h->state==RS_FAILED && was!=RS_FAILED && h->asked && !h->taskexec.len) {
+        // A connect a click began: why, in a toast, which moves nothing;
+        // one begun otherwise, as at launch, says why in its tooltip
+        hostfailed(g, h, concat(&a, concat(&a, hostlabel(g, &a, h), ": "), msg));
     }
     if (h->up) {
         hostcaps(g, h, r->root);
         h->deployfail = 0;
-        if (g->dtoasthost == h->uid) {
-            g->dtoasthost = 0;
+        h->asked      = 0;
+        if (g->htoasthost == h->uid) {
+            g->htoasthost = 0;
         }
         if (jsonflag(jsonget(r->root, "anew"), 0)) {
             termhostlost(g, h);  // the old one's shells went with it
@@ -9646,7 +9664,7 @@ static void guiupdate(Gui *g, GuiHost *h)
     }
     h->updating = UPD_DEPLOYING;
     h->updmsg   = "deploying the engine";
-    deploystart(g, h);
+    hoststart(g, h);
     scheddirty(&g->sched);
 }
 
@@ -16759,17 +16777,22 @@ static DriveOp remoteops[] = {
     {OP_MARK, 0, 0, 0, 1000, ""},
     {OP_CHECK, CHK_REMOTEUP, 0, 0, 0, ""},
     // One whose destination ssh would take for an option fails, saying why
+    // in a toast at the pane's foot
     {OP_MOVE, T_CONNECT2, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 5000, ""},
     {OP_CHECK, CHK_REMOTEFAILED, 0, 0, 0, ""},
-    // One with no engine there fails too, offering to deploy one, which
-    // the checklist leaves alone
+    {OP_SHOT, 0, 0, 0, 300, "remote-failtoast"},
+    // One with no engine there fails too, offering to deploy one, in its
+    // toast as under it, which the checklist leaves alone
     {OP_MOVE, T_NAMED, 0, 0, 100, "connect missing"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 100, ""},
     {OP_WAIT, W_DEPLOYOFFER, 0, 0, 30000, ""},
     {OP_CHECK, CHK_DEPLOYOFFER, 0, 0, 0, ""},
+    {OP_IFSCP, 0, 2, 0, 0, ""},
+    {OP_WAIT, W_NAMED, 0, 0, 5000, "toast deploy missing"},
+    {OP_SHOT, 0, 0, 0, 300, "remote-deploytoast"},
     // Deploy engine there (into a fake home, through a stand-in for scp),
     // then connected: its engine leaves out a cap (PROSPERO_TEST_DROPCAP),
     // so is older, and Update engine deploys again and restarts it
@@ -22705,7 +22728,7 @@ static b32 drivecheck(Gui *g, i32 chk)
         Arena    a = g->frame;
         GuiHost *h = findhost(g, GH_REMOTE, "Deb");
         return h && h->up && h->r && h->deploying==1 && !h->deployfail &&
-               !g->dtoasthost && hostlabel(g, &a, h)=="Deb (WSL)";
+               !g->htoasthost && hostlabel(g, &a, h)=="Deb (WSL)";
     }
     case CHK_WSLSECTION:
         return cfghas(g, "remote", "Deb") && remoterow(g, "Deb", "wsl")=="Deb" &&

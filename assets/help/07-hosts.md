@@ -34,8 +34,13 @@ host is, with Connect and Deploy engine, as the Hosts pane does.
 Connect, in the Hosts pane or the host's menu in the sidebar, runs
 `ssh` and `prospero attach` there, which starts a host that outlives
 the connection. ssh runs in batch mode, so it cannot ask for a
-password: use a key, or an ssh agent. A connection that breaks is
-taken up again, and the host keeps your place for three hours.
+password: use a key, or an ssh agent. A connect that fails says why
+in a toast, at the foot of the Sessions or Hosts pane, where it began,
+with Deploy engine when the machine has no engine. A connection that
+breaks is taken up again, and the host keeps your place for three
+hours. Meanwhile its line says when it tries again; hover over it, or
+over the host's heading in the sidebar, for why it went down, or why a
+connect not begun by a click (as at launch) failed.
 
 ## WSL distros
 
@@ -209,7 +214,7 @@ when the machine has none, or one of another protocol (`deploy = auto`,
 the default), as for a WSL distro the first time. A deploy that fails
 says why in a toast, at the foot of the Sessions or Hosts pane, where it
 began. With `deploy = ask` in the remote's section, the connection fails
-instead, saying why.
+instead, saying why, and its toast offers Deploy engine.
 
 Deploy engine, in the Hosts pane under a remote that is not connected
 and in its menu in the sidebar, deploys this version's engine there and
