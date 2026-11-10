@@ -1329,6 +1329,10 @@ struct Gui {
     char               droplabel[FIELD_MAX]; // where the dragged session would go, this frame
     ImVec4             trashrect;  // the drop strip, x0 y0 x1 y1, while dragging (dragstrip)
     GuiSession        *gripsess;   // the session whose grip is held (rowactions)
+    Str                dothot;     // the fold key of the session whose dot the
+                                   // mouse is on, this frame: its rail lights
+    ImVec2             dragoff;    // where the dragged row was taken hold of,
+    b32                dragoffset; // from its corner, once set (dragcard)
     char              *namebuf;    // the naming dialog's field
     i32                nameask;    // NAME_*
     GuiSession        *namesess;

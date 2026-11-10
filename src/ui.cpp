@@ -7689,12 +7689,23 @@ static void hostitems(Gui *g, Arena a, GuiHost *h, Str remote)
 }
 
 // A fold arrow at x on the line at y, pointing right when folded.
-static void foldarrow(Gui *g, ImDrawList *dl, f32 x, f32 y, b32 folded, b32 forced)
+// A sidebar row's dot, centered at c in col: a session's or a host's
+// state, else dim. A row that folds has no arrow: open, its rail runs
+// down from the dot (drawrails); folded, a ring goes around it.
+static void folddot(Gui *g, ImDrawList *dl, ImVec2 c, u32 col, b32 folded)
 {
-    f32 lineh = ImGui::GetTextLineHeight();
-    u32 col   = forced ? fade(g->pal->dim, 0.45f) : g->pal->dim;
-    ImGui::RenderArrow(dl, v2(x, y + lineh*0.15f), col,
-                       folded ? ImGuiDir_Right : ImGuiDir_Down, 0.7f);
+    f32 sc = g->scale;
+    drawdot(dl, c, 3.5f*sc, col);
+    if (folded) {
+        dl->AddCircle(c, 6.5f*sc, col, 0, 1.25f*sc);
+    }
+}
+
+// Where a sidebar row's dot goes, from the row's left and its depth:
+// its center's x, and the left of the text after it.
+static f32 sidedotx(Gui *g, f32 left, i32 depth)
+{
+    return left + 8*g->scale + (f32)depth*12*g->scale;
 }
 
 // Flip a row's fold, kept with the layout, unless it stays open.
@@ -7760,6 +7771,11 @@ static void dragsource(Gui *g, Arena a, GuiSession *s)
         return;
     }
     if (!g->dragcancel && ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceNoPreviewTooltip)) {
+        if (!g->dragoffset) {
+            ImVec2 m      = ImGui::GetIO().MouseClickedPos[0];
+            g->dragoff    = v2(m.x - s->row.x0, m.y - s->row.y0);
+            g->dragoffset = 1;
+        }
         ImGui::SetDragDropPayload("SESS", &s, sizeof(s));
         ImGui::EndDragDropSource();
     }
@@ -7830,8 +7846,8 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
     f32         sc    = g->scale;
     ImDrawList *dl    = ImGui::GetWindowDrawList();
     f32         lineh = ImGui::GetTextLineHeight();
-    f32         x0    = ImGui::GetCursorScreenPos().x + (f32)r->depth*12*sc;
     ImVec2      p     = ImGui::GetCursorScreenPos();
+    f32         dx    = sidedotx(g, p.x, r->depth);  // its dot's middle
     f32         w     = ImGui::GetContentRegionAvail().x;
     ImGuiStyle &st    = ImGui::GetStyle();
 
@@ -7908,9 +7924,8 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
         ImGui::EndPopup();
     }
 
-    foldarrow(g, dl, x0, p.y + 2*sc, r->folded, r->forced);
-    f32 x = x0 + 14*sc;
-    Pen t = {dl, &g->fonts, x, p.y + 2*sc, p.x + w - bw, g->fonts.size};
+    ImVec2 dc = v2(dx, p.y + 2*sc + lineh/2);
+    Pen    t  = {dl, &g->fonts, dx + 11*sc, p.y + 2*sc, p.x + w - bw, g->fonts.size};
     Buf c(&a, 32);
     if (r->count || r->kind!=SROW_HOST) {
         print(&c, "  ");
@@ -7918,18 +7933,22 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
     }
     switch (r->kind) {
     case SROW_GROUP:
+        folddot(g, dl, dc, g->pal->dim, r->folded);
         pen(&t, r->group, STYLE_BOLD, g->pal->text);
         pen(&t, finish(&c), 0, g->pal->dim);
         break;
     case SROW_ARCHIVED:
+        folddot(g, dl, dc, g->pal->dim, r->folded);
         pen(&t, "Archived", STYLE_BOLD, g->pal->dim);
         pen(&t, finish(&c), 0, g->pal->dim);
         break;
     case SROW_TRASH:
+        folddot(g, dl, dc, g->pal->dim, r->folded);
         pen(&t, "Trash", STYLE_BOLD, g->pal->dim);
         pen(&t, finish(&c), 0, g->pal->dim);
         break;
     case SROW_DONE:
+        folddot(g, dl, dc, g->pal->dim, r->folded);
         c.len = 0;
         print(&c, (i64)r->count);
         print(&c, " finished");
@@ -7938,8 +7957,7 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
     case SROW_HOST: {
         if (rt) {
             u32 dot = g->ctrrt.up ? g->pal->ok : g->pal->dim;
-            drawdot(dl, v2(t.x + 4*sc, p.y + 2*sc + lineh/2), 3.5f*sc, dot);
-            t.x += 13*sc;
+            folddot(g, dl, dc, dot, r->folded);
             pen(&t, ctrtitle(g->ctrrt.name), STYLE_BOLD,
                 g->ctrrt.up ? g->pal->text : g->pal->dim);
             pen(&t, "  ", 0, g->pal->dim);
@@ -7951,8 +7969,7 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
         i64 left = h && h->state==RS_DOWN ? countdown(g, h->retryat, nowms) : 0;
         g->downshown |= h && h->state==RS_DOWN && left>0;
         u32 dot = h ? hostcolor(g, h) : g->pal->dim;
-        drawdot(dl, v2(t.x + 4*sc, p.y + 2*sc + lineh/2), 3.5f*sc, dot);
-        t.x += 13*sc;
+        folddot(g, dl, dc, dot, r->folded);
         pen(&t, h ? hostlabel(g, &a, h) : remote, STYLE_BOLD, g->pal->text);
         pen(&t, "  ", 0, g->pal->dim);
         Str status = h ? hoststatus(g, &a, h, left) : Str("not connected");
@@ -8264,22 +8281,24 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other, 
     droptarget(g, a, s->host, r->group, r->archived,
                r->archived ? Str("Archived") : r->group.len ? r->group : Str("out of groups"));
 
-    f32 x = p.x + 4*sc + (f32)r->depth*12*sc;
+    f32 dx = sidedotx(g, p.x, r->depth);  // its dot's middle
     if (r->kids) {
-        // The arrow, over the row, folds its subagents
+        // The dot folds its subagents (and while open, its rail does)
         ImVec2 back = ImGui::GetCursorScreenPos();
-        ImGui::SetCursorScreenPos(v2(x - 2*sc, p.y));
+        ImGui::SetCursorScreenPos(v2(dx - 7*sc, p.y));
         ImGui::InvisibleButton("##fold", v2(14*sc, lineh + 4*sc));
-        if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Left) && !r->forced) {
             foldrow(g, r);
+        }
+        if (ImGui::IsItemHovered() && !r->forced) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            g->dothot = r->key;  // its rail lights too (drawrails)
         }
         itemnamed(g, concat(&a, "fold ", sesstitle(s)));
         whytip(r->forced ? Str("Open while a subagent works or asks") :
                r->folded ? Str("Show its subagents") : Str("Hide its subagents"));
         ImGui::SetCursorScreenPos(back);
-        foldarrow(g, dl, x, p.y + 2*sc, r->folded, r->forced);
     }
-    x += 14*sc;
 
     // A dot in the color of its state, amber when it, or a subagent
     // below it, waits for the user
@@ -8287,8 +8306,8 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other, 
     b32 asks  = v && v->asks;
     s->kidask = r->asks && !asks;
     u32 color = ro || asks || s->kidask ? g->pal->amber : livecolor(g->pal, state);
-    drawdot(dl, v2(x + 4*sc, p.y + 2*sc + lineh/2), 3.5f*sc, color);
-    x += 13*sc;
+    folddot(g, dl, v2(dx, p.y + 2*sc + lineh/2), color, r->kids && r->folded);
+    f32 x = dx + 11*sc;
 
     Pen t = {dl, &g->fonts, x, p.y + 2*sc, p.x + w, g->fonts.size};
     pen(&t, sesstitle(s), 0, g->pal->text);
@@ -8360,7 +8379,62 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other, 
     if (acts) {
         rowactions(g, a, r, s, r0, r1, held);
     }
+    if (dragged() == s) {
+        dl->AddRectFilled(r0, r1, fade(g->pal->panel, 0.6f));  // lifted out (dragcard)
+    }
     ImGui::PopID();
+}
+
+// The dragged session's card, held under the pointer where its row was
+// taken hold of, as if lifted out of the list, with a shadow: its dot,
+// its title, and below, where it would go if dropped now. It moves up
+// and down only, level with the list, as every place to drop it is in
+// the pane; and it lets what is under it show through a little. The row
+// it came from stays, faded (drawsessrow). It stops above the strip at
+// the pane's foot (dragstrip), so that the pointer on the strip leaves
+// the strip in view.
+static void dragcard(Gui *g, Arena a, GuiSession *s)
+{
+    f32         sc    = g->scale;
+    ImDrawList *dl    = ImGui::GetForegroundDrawList();
+    ImGuiIO    &io    = ImGui::GetIO();
+    f32         lineh = ImGui::GetTextLineHeight();
+    f32         w     = s->row.x1 - s->row.x0;
+    f32         h     = s->row.y1 - s->row.y0;
+    if (w<=0 || h<=0) {
+        return;
+    }
+    ImVec2 c0 = v2(s->row.x0, io.MousePos.y - g->dragoff.y);
+    ImVec4 st = g->trashrect;
+    if (st.w>st.y && c0.y+h > st.y-4*sc) {
+        c0.y = st.y - 4*sc - h;
+    }
+    ImVec2 c1 = v2(c0.x + w, c0.y + h);
+    f32    rd = 6*sc;
+    for (i32 i = 4; i >= 1; i--) {
+        f32 d = (f32)i*2*sc;
+        dl->AddRectFilled(v2(c0.x - d/2, c0.y + d/2), v2(c1.x + d/2, c1.y + d),
+                          IM_COL32(0, 0, 0, 16), rd + d);
+    }
+    dl->AddRectFilled(c0, c1, fade(g->pal->rowhover, 0.88f), rd);
+    dl->AddRect(c0, c1, fade(g->pal->active, 0.7f), rd, sc);
+
+    View *v     = s->view;
+    i32   state = v ? v->state : s->state;
+    drawdot(dl, v2(c0.x + 12*sc, c0.y + 2*sc + lineh/2), 3.5f*sc, livecolor(g->pal, state));
+    Pen t = {dl, &g->fonts, c0.x + 23*sc, c0.y + 2*sc, c1.x - 8*sc, g->fonts.size};
+    pen(&t, sesstitle(s), 0, g->pal->text);
+    Str where = {(u8 *)g->droplabel, (iz)__builtin_strlen(g->droplabel)};
+    Pen b = {dl, &g->fonts, c0.x + 23*sc, c0.y + 2*sc + lineh, c1.x - 8*sc,
+             smallsize(&g->fonts)};
+    if (where.len) {
+        b32 no   = startswith(where, "not to ");
+        b32 gone = startswith(where, "\xe2\x86\x92 Trash") ||  // the strip's
+                   startswith(where, "\xe2\x86\x92 delete");    // right part
+        pen(&b, where, STYLE_BOLD, no ? g->pal->amber : gone ? g->pal->bad : g->pal->active);
+    } else {
+        pen(&b, sesswhere(&a, s), 0, g->pal->dim);
+    }
 }
 
 // While a session is dragged: the space below the rows, out of its
@@ -8376,9 +8450,6 @@ static void dragrest(Gui *g, Arena a, GuiSession *s, f32 foot)
     itemnamed(g, "sessions empty");
     droptarget(g, a, s->host, {}, 0, "out of groups");
 
-    Str   t     = shorten(&a, sesstitle(s), 60);
-    Str   where = {(u8 *)g->droplabel, (iz)__builtin_strlen(g->droplabel)};
-    tipnow("%s", cstr0(&a, where.len ? concat(&a, concat(&a, t, "  "), where) : t));
 
     ImGuiWindow *w    = ImGui::GetCurrentWindow();
     f32          y    = ImGui::GetIO().MousePos.y;
@@ -8502,7 +8573,7 @@ static void dragstrip(Gui *g, Arena a, GuiSession *s)
 // Where a sidebar row was drawn, for its rail.
 struct RowAt {
     f32 x0, y0, x1, y1;
-    f32 ax;  // its fold arrow's left
+    f32 ax;  // its dot's middle (sidedotx)
 };
 
 // The fold rails: a thin line down from each open row that folds, under
@@ -8532,10 +8603,10 @@ static void drawrails(Gui *g, Arena a, Slice<SideRow> rows, Slice<RowAt> at, b32
         if (last == i) {
             continue;
         }
-        f32 x  = at[i].ax + fs*0.5f;            // the arrow's middle
-        f32 ya = at[i].y0 + fs + 4*sc;          // below its first line
+        f32 x  = at[i].ax;                           // the dot's middle
+        f32 ya = at[i].y0 + 2*sc + fs/2 + 6*sc;      // just below the dot
         f32 yb = at[last].y1;
-        f32 c0 = ya>top ? ya : top;
+        f32 c0 = ya>top ? ya : top;                  // the dot has a button of its own
         f32 c1 = yb<bot ? yb : bot;
         if (c1 - c0 < 1) {
             continue;
@@ -8544,9 +8615,9 @@ static void drawrails(Gui *g, Arena a, Slice<SideRow> rows, Slice<RowAt> at, b32
         b32 go  = 0;
         if (!drag) {
             pushstr(r->key);
-            ImGui::SetCursorScreenPos(v2(x - 5*sc, c0));
-            go  = ImGui::InvisibleButton("##rail", v2(10*sc, c1 - c0));
-            hov = ImGui::IsItemHovered() || ImGui::IsItemActive();
+            ImGui::SetCursorScreenPos(v2(x - 6*sc, c0));
+            go  = ImGui::InvisibleButton("##rail", v2(12*sc, c1 - c0));
+            hov = ImGui::IsItemHovered() || ImGui::IsItemActive() || r->key==g->dothot;
             itemnamed(g, concat(&a, "rail ", r->key));
             ImGui::PopID();
         }
@@ -8559,9 +8630,9 @@ static void drawrails(Gui *g, Arena a, Slice<SideRow> rows, Slice<RowAt> at, b32
         if (hov && r->forced) {
             tipnow("Open while something under it needs an answer");
         } else if (hov) {
-            dl->AddRectFilled(v2(at[i].ax - 2*sc, at[i].y0), v2(at[i].x1, yb),
+            dl->AddRectFilled(v2(x - 8*sc, at[i].y0), v2(at[i].x1, yb),
                               fade(g->pal->active, 0.06f), 4*sc);
-            dl->AddRect(v2(at[i].ax - 2*sc, at[i].y0), v2(at[i].x1, yb),
+            dl->AddRect(v2(x - 8*sc, at[i].y0), v2(at[i].x1, yb),
                         fade(g->pal->active, 0.5f), 4*sc, sc);
             dl->AddRectFilled(v2(x - 1.5f*sc, ya), v2(x + 1.5f*sc, yb), g->pal->active);
             ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
@@ -8588,6 +8659,10 @@ static void drawsessions(Gui *g)
     if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
         g->gripsess = 0;
     }
+    if (!drag) {
+        g->dragoffset = 0;  // taken hold of anew by the next drag
+    }
+    g->dothot = {};
     if (drag && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
         ImGui::ClearDragDrop();  // nothing is dropped as the button comes up
         g->dragcancel = 1;
@@ -8787,8 +8862,7 @@ static void drawsessions(Gui *g)
         at[i].x0 = c.x;
         at[i].y0 = c.y;
         at[i].x1 = c.x + ImGui::GetContentRegionAvail().x;
-        // Its fold arrow's left, as drawsessrow and drawheading place it
-        at[i].ax = c.x + (f32)r->depth*12*g->scale + (r->kind==SROW_SESSION ? 4*g->scale : 0);
+        at[i].ax = sidedotx(g, c.x, r->depth);
         if (r->kind == SROW_SESSION) {
             drawsessrow(g, a, r, sess[r->sess], &other, nowms);
         } else {
@@ -8805,6 +8879,7 @@ static void drawsessions(Gui *g)
         ImVec4 t = g->trashrect;
         dragrest(g, a, drag, t.w>t.y ? ImGui::GetCurrentWindow()->InnerRect.Max.y - t.y : 0);
         dragstrip(g, a, drag);
+        dragcard(g, a, drag);  // after the strip, which says where it goes
     }
 }
 

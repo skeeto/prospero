@@ -62,14 +62,17 @@ a click. A session from before Prospero kept this time starts at when
 it was made, until its next turn.
 
 Every heading folds by a click, and so does a session with subagents,
-by its arrow. An open one has a thin rail down from its arrow, beside
-what it holds: click anywhere along the rail to fold it, which brings
-its heading back into view if it had scrolled away.
+by its dot. A folded one's dot has a ring around it; an open one has a
+thin rail down from its dot, beside what it holds: click anywhere along
+the rail to fold it, which brings its heading back into view if it had
+scrolled away.
 
 The pointer on a session's row shows its actions at the right:
 **Archive** (Unarchive under Archived) and **Move to Trash**, or in the
 Trash, **Restore** and **Delete Permanently**. The grip at the far right
-says the row drags: drag it, or the row anywhere, as below.
+says the row drags: drag it, or the row anywhere, as below. The row
+lifts out as a card that follows the pointer and says where it would
+go.
 
 ## Going to a session
 
