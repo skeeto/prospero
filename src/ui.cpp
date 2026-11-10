@@ -8448,7 +8448,9 @@ static void dragcard(Gui *g, Arena a, GuiSession *s)
 
 // While a session is dragged: the space below the rows, out of its
 // group; the drag's tooltip; and the pane scrolled near its edges, above
-// the trash strip at its foot (foot high).
+// the trash strip at its foot (foot high). It scrolls once the pointer
+// has stayed at an edge a moment, not as it passes on its way to the
+// strip.
 static void dragrest(Gui *g, Arena a, GuiSession *s, f32 foot)
 {
     f32 sc    = g->scale;
@@ -8470,9 +8472,18 @@ static void dragrest(Gui *g, Arena a, GuiSession *s, f32 foot)
                ImGui::GetScrollY() < ImGui::GetScrollMaxY()) {
         step = 8*sc;
     }
-    if (step != 0) {
+    i64 now   = g->sched.now;
+    i64 dwell = 300000;  // µs
+    if (step == 0) {
+        g->edgeat = 0;
+    } else if (!g->edgeat) {
+        g->edgeat = now;
+        schedat(&g->sched, now + dwell, DUE_APP);
+    } else if (now - g->edgeat < dwell) {
+        schedat(&g->sched, g->edgeat + dwell, DUE_APP);
+    } else {
         ImGui::SetScrollY(ImGui::GetScrollY() + step);
-        schedat(&g->sched, g->sched.now + 16000, DUE_APP);  // on, the mouse still
+        schedat(&g->sched, now + 16000, DUE_APP);  // on, the mouse still
     }
 }
 
@@ -8534,7 +8545,10 @@ static b32 stripdrop(Gui *g, Arena a, ImVec4 t, f32 x0, f32 x1, char const *icon
 // While a session is dragged, the strip at the pane's foot, drawn over
 // the rows, so that where it can go is always in view, however long the
 // list: Archive (or Unarchive), New group, and Move to Trash; or, where
-// its host keeps no Trash, Delete, once confirmed. The pane scrolls as a
+// its host keeps no Trash, Delete, once confirmed. It is opaque, on the
+// pane's background, so the rows under it don't muddle its labels; and
+// while the list goes on below, a shadow and an arrow above it say that
+// holding the drag there scrolls down (dragrest). The pane scrolls as a
 // whole, so its content keeps the extent it had without the strip.
 static void dragstrip(Gui *g, Arena a, GuiSession *s)
 {
@@ -8549,6 +8563,24 @@ static void dragstrip(Gui *g, Arena a, GuiSession *s)
     f32          part = (t.z - t.x - 2*gap) / 3;
     f32          xa   = t.x + part;
     f32          xb   = xa + gap + part;
+    ImDrawList  *dl   = ImGui::GetWindowDrawList();
+    f32          top  = t.y - gap;
+    if (ImGui::GetScrollY() < ImGui::GetScrollMaxY()) {
+        f32 lineh = ImGui::GetTextLineHeight();
+        f32 sh    = lineh;
+        u32 c0    = IM_COL32(0, 0, 0, 0);
+        u32 c1    = IM_COL32(0, 0, 0, g->pal->dark ? 140 : 60);
+        dl->AddRectFilledMultiColor(v2(w->InnerRect.Min.x, top - sh),
+                                    v2(w->InnerRect.Max.x, top), c0, c0, c1, c1);
+        b32    at  = g->edgeat && ImGui::GetIO().MousePos.y > top - 3*lineh;  // held there
+        f32    cx  = (t.x + t.z) / 2;
+        f32    cy  = top - sh/2;
+        f32    hw  = 0.45f*lineh;
+        f32    hh  = 0.25f*lineh;
+        ImVec2 chev[] = {v2(cx - hw, cy - hh), v2(cx, cy + hh), v2(cx + hw, cy - hh)};
+        dl->AddPolyline(chev, 3, at ? g->pal->active : g->pal->text, 2*sc);
+    }
+    dl->AddRectFilled(v2(w->InnerRect.Min.x, top), w->InnerRect.Max, g->pal->panel);
 
     b32 arch = s->archived;
     if (stripdrop(g, a, t, t.x, xa, arch ? ICON_UNARCHIVE : ICON_ARCHIVE,
@@ -8682,6 +8714,9 @@ static void drawsessions(Gui *g)
         ImGui::MarkIniSettingsDirty();
     }
     g->trashrect = drag && !drag->trashed ? trashstrip(g) : ImVec4{};
+    if (!drag) {
+        g->edgeat = 0;
+    }
     ImGui::BeginDisabled(!cannew(g));
     if (iconbutton(ICON_ADD)) {
         g->newhost = 0;  // the default host

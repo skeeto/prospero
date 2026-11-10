@@ -249,7 +249,9 @@ Right-click a session in the sidebar, or open the Session menu, for:
   onto another session to join it there, or below the list to take it
   out of its group. While you drag, a strip at the foot of the sidebar
   offers Archive, New group... (named as you drop it) and Move to Trash,
-  however long the list. Escape cancels a drag. A session never moves
+  however long the list. Hold the drag just above it, or just under the
+  pane's top, to scroll the list; an arrow over the strip says there is
+  more below. Escape cancels a drag. A session never moves
   to another host, and dropping it never changes the sidebar's order.
 - **Fork**: a new session with a copy of this conversation, titled
   "(fork)", which starts in Build mode. A No folder session's fork gets

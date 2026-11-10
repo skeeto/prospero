@@ -1328,6 +1328,8 @@ struct Gui {
                                    // again until the button is up
     char               droplabel[FIELD_MAX]; // where the dragged session would go, this frame
     ImVec4             trashrect;  // the drop strip, x0 y0 x1 y1, while dragging (dragstrip)
+    i64                edgeat;     // when the dragging pointer came to an edge
+                                   // that scrolls, 0 if not at one (dragrest)
     GuiSession        *gripsess;   // the session whose grip is held (rowactions)
     Str                dothot;     // the fold key of the session whose dot the
                                    // mouse is on, this frame: its rail lights
