@@ -37,10 +37,11 @@ static void test_dock(Test *t)
 {
     Arena a = t->perm;
 
-    // Standard is the layout the window always had
+    // Standard is the layout the window always had, and the terminal
+    // as a tab beside Plan
     DockLayout std = dockpreset(PRESET_STANDARD);
     expect(t, "dock.standard", dockstr(&a, &std),
-           "Shown=Sessions,Transcript,Prompt,Todo,Plan,Jobs,Log\n"
+           "Shown=Sessions,Transcript,Prompt,Todo,Plan,Jobs,Log,Terminal\n"
            "Split=X,0.75\n"
            "Split=X,0.44\n"
            "Split=Y,0.75\n"
@@ -51,20 +52,23 @@ static void test_dock(Test *t)
            "Tabs=Prompt\n"
            "Split=Y,0.5\n"
            "Tabs=*Jobs,Log,Help,Settings,Hosts\n"
-           "Tabs=Plan,Changes\n");
+           "Tabs=*Plan,Terminal,Changes\n");
 
-    // Compact keeps the left column's width, with no right column
+    // Compact keeps the left column's width, with no right column, and
+    // the terminal under the prompt, as tall as it
     DockLayout compact = dockpreset(PRESET_COMPACT);
     expect(t, "dock.compact", dockstr(&a, &compact),
-           "Shown=Sessions,Transcript,Prompt,Todo,Plan,Jobs\n"
+           "Shown=Sessions,Transcript,Prompt,Todo,Plan,Jobs,Terminal\n"
            "Split=X,0.33\n"
            "Split=Y,0.75\n"
            "Tabs=Sessions\n"
            "Tabs=*Todo,Jobs,Log\n"
-           "Split=Y,0.72\n"
+           "Split=Y,0.44\n"
            "Center=*Transcript,Plan,Changes,Help,Settings,Hosts\n"
+           "Split=Y,0.5\n"
            "Tabs=Prompt\n"
-           "TabBar=Hidden\n");
+           "TabBar=Hidden\n"
+           "Tabs=Terminal\n");
 
     // Focus shows four panes, and is home to the rest above the prompt
     DockLayout focus = dockpreset(PRESET_FOCUS);
@@ -76,8 +80,9 @@ static void test_dock(Test *t)
            "TabBar=Hidden\n");
 
     // Every preset is whole, places every pane but the metrics and the
-    // terminal once, and reads back as written; only Focus hides Help
-    // and the rest, and every preset leaves the terminal as it is
+    // terminal once (Focus leaves it out), and reads back as written;
+    // only Focus hides Help and the rest; none keeps the terminal as it
+    // is
     u32 all = (1u<<PANE_COUNT) - 1;
     for (i32 i = 0; i < PRESET_COUNT; i++) {
         DockLayout l    = dockpreset(i);
@@ -88,20 +93,41 @@ static void test_dock(Test *t)
             tabs += l.parts[p].ntabs;
         }
         expect(t, concat(&a, name, ".bad"), istr(&a, l.bad), "0");
-        expect(t, concat(&a, name, ".placed"), istr(&a, dockplaced(&l)),
-               istr(&a, all & ~(1u<<PANE_METRICS | 1u<<PANE_TERMINAL)));
-        expect(t, concat(&a, name, ".once"), istr(&a, tabs), istr(&a, PANE_COUNT-2));
+        b32 focus = i == PRESET_FOCUS;
+        u32 out   = 1u<<PANE_METRICS | (focus ? 1u<<PANE_TERMINAL : 0);
+        expect(t, concat(&a, name, ".placed"), istr(&a, dockplaced(&l)), istr(&a, all & ~out));
+        expect(t, concat(&a, name, ".once"), istr(&a, tabs),
+               istr(&a, focus ? PANE_COUNT-2 : PANE_COUNT-1));
         expect(t, concat(&a, name, ".again"), dockagain(&a, text), text);
-        expect(t, concat(&a, name, ".keep"), istr(&a, l.keep==1u<<PANE_TERMINAL),
+        expect(t, concat(&a, name, ".keep"), istr(&a, l.keep==0),
                i==PRESET_FOCUS ? Str("1") : Str("0"));
-        expect(t, concat(&a, name, ".keepterm"), istr(&a, l.keep>>PANE_TERMINAL & 1), "1");
+        expect(t, concat(&a, name, ".keepterm"), istr(&a, l.keep>>PANE_TERMINAL & 1), "0");
         b32 done = dockdone(&l);
         expect(t, concat(&a, name, ".done"), istr(&a, done), "1");
         expect(t, concat(&a, name, ".pruned"), dockstr(&a, &l), text);
     }
 
-    // The terminal's home: under the transcript and prompt, once
-    DockLayout withterm = dockpreset(PRESET_STANDARD);
+    // The terminal's home: under the transcript and prompt, once, in a
+    // layout that has none (Standard's before it had one)
+    DockLayout withterm = {};
+    {
+        b32 ok = 0;
+        withterm = dockread("Shown=Sessions,Transcript,Prompt,Todo,Plan,Jobs,Log\n"
+                            "Split=X,0.75\n"
+                            "Split=X,0.44\n"
+                            "Split=Y,0.75\n"
+                            "Tabs=Sessions\n"
+                            "Tabs=Todo\n"
+                            "Split=Y,0.72\n"
+                            "Center=Transcript\n"
+                            "Tabs=Prompt\n"
+                            "Split=Y,0.5\n"
+                            "Tabs=*Jobs,Log,Help,Settings,Hosts\n"
+                            "Tabs=Plan,Changes\n", &ok);
+        expect(t, "dock.addterm.read", istr(&a, ok), "1");
+    }
+    DockLayout standard = dockpreset(PRESET_STANDARD);
+    expect(t, "dock.addterm.placed", istr(&a, dockaddterm(&standard)), "0");
     expect(t, "dock.addterm", istr(&a, dockaddterm(&withterm)), "1");
     expect(t, "dock.addterm.again", istr(&a, dockaddterm(&withterm)), "0");
     expect(t, "dock.addterm.standard", dockstr(&a, &withterm),

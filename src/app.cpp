@@ -13591,7 +13591,7 @@ static Str chknames[] = {
     "the window opened at its first size, maximized on a small display",
     "a first run's Help floats centered in front, its tab selected",
     "the layout is as built: its panes' places and shares, Jobs selected",
-    "the Compact layout is as built: two columns, Plan with Transcript",
+    "the Compact layout is as built: two columns, Plan with Transcript, Terminal under Prompt",
     "the Focus layout is as built: one session, four panes",
     "the layout saved is back as it was saved",
     "Help shows the topic picked, its page from the top",
@@ -16783,6 +16783,10 @@ static DriveOp remoteops[] = {
     {OP_UP, 0, 0, 0, 5000, ""},
     {OP_CHECK, CHK_REMOTEFAILED, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "remote-failtoast"},
+    // Dismissed, as it can cover the hosts below it in a small window
+    {OP_MOVE, T_NAMED, 0, 0, 100, "host dismiss"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
     // One with no engine there fails too, offering to deploy one, in its
     // toast as under it, which the checklist leaves alone
     {OP_MOVE, T_NAMED, 0, 0, 100, "connect missing"},
@@ -17838,8 +17842,9 @@ static DriveOp termops[] = {
     FIRSTRUN(0),
     {OP_NEWSESSION, 0, 0, 0, 0, ""},
     {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
-    {OP_CHECK, CHK_PANECLOSED, 0, 0, 0, "Terminal"},
-    // The prompt's terminal button shows the pane and starts a shell
+    // Standard shows it as a tab beside Plan, where a first run finds it
+    {OP_CHECK, CHK_TERMHOME, 1, 0, 0, ""},
+    // The prompt's terminal button brings it forward and starts a shell
     // there, as Ctrl+` does (below)
     {OP_MOVE, T_NAMED, 0, 0, 100, "prompt terminal"},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -17883,13 +17888,12 @@ static DriveOp termops[] = {
     // the pane staying where it is
     CTRLKEY(GKEY_GRAVE, 500),
     {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Terminal"},
-    {OP_CHECK, CHK_TERMHOME, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMHOME, 1, 0, 0, ""},
     {OP_CHECK, CHK_NEWTYPED, 0, 0, 0, ""},
     CTRLKEY(GKEY_GRAVE, 500),
     {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
     // Floating, hidden from the terminal, then back as it was, with the
-    // keyboard; then home again by the layout, its own node having closed
-    // as it floated
+    // keyboard; then home again by the layout, beside Plan
     {OP_FLOAT, 0, 700, 400, 700, "Terminal"},
     {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
     CTRLKEY(GKEY_GRAVE, 500),
@@ -17898,9 +17902,9 @@ static DriveOp termops[] = {
     {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Terminal"},
     {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
     LAYOUT("Standard"),
-    {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Terminal"},
-    {OP_CHECK, CHK_TERMHOME, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMHOME, 1, 0, 0, ""},
     CTRLKEY(GKEY_GRAVE, 500),  // the menu took the keyboard
+    {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Terminal"},
     {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
     {OP_CHECK, CHK_TERMSCREEN, 0, 0, 0, "\nafter"},
     // vim: an edit, resized mid-edit, written and quit
@@ -17989,8 +17993,10 @@ static DriveOp termops[] = {
     TERMKEY(GKEY_ENTER, 100),
     {OP_WAIT, W_TERM, 0, 0, 5000, "\nkeyed"},
     {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "onetwo|*" TERMSH},
-    // Each layout picked keeps the terminal, under the prompt, its tabs
-    // as they were, its size following
+    // Each layout picked puts the terminal in its place, its tabs as they
+    // were, its size following: Compact under the prompt, as tall as it;
+    // Focus leaves it out, and Ctrl+` brings it back under the prompt;
+    // Standard beside Plan
     LAYOUT("Compact"),
     {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Terminal"},
     {OP_CHECK, CHK_TERMHOME, 0, 0, 0, ""},
@@ -17998,18 +18004,20 @@ static DriveOp termops[] = {
     {OP_CHECK, CHK_TERMSIZE, 0, 0, 1500, ""},
     {OP_SHOT, 0, 0, 0, 300, "terminal-compact"},
     LAYOUT("Focus"),
+    {OP_CHECK, CHK_PANECLOSED, 0, 0, 0, "Terminal"},
+    CTRLKEY(GKEY_GRAVE, 500),
     {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Terminal"},
     {OP_CHECK, CHK_TERMHOME, 0, 0, 0, ""},
     {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "onetwo|*" TERMSH},
     {OP_CHECK, CHK_TERMSIZE, 0, 0, 1500, ""},
     {OP_SHOT, 0, 0, 0, 300, "terminal-focus"},
     LAYOUT("Standard"),
+    {OP_CHECK, CHK_TERMHOME, 1, 0, 0, ""},
+    CTRLKEY(GKEY_GRAVE, 500),  // the menu took the keyboard
     {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Terminal"},
-    {OP_CHECK, CHK_TERMHOME, 0, 0, 0, ""},
     {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "onetwo|*" TERMSH},
     {OP_CHECK, CHK_TERMSIZE, 0, 0, 1500, ""},
     // History as [terminal] scrollback says (gui.py's 100)
-    CTRLKEY(GKEY_GRAVE, 500),  // the menu took the keyboard
     {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
     {OP_TEXT, 0, 0, 0, 100, "seq 1 300"},
     TERMKEY(GKEY_ENTER, 100),
@@ -19785,13 +19793,15 @@ static b32 docktreecheck(Gui *g)
         {PANE_JOBS,       rtop},
         {PANE_LOG,        rtop},
         {PANE_PLAN,       right->ChildNodes[1]},
+        {PANE_TERMINAL,   right->ChildNodes[1]},
         {PANE_CHANGES,    right->ChildNodes[1]},
         {PANE_HELP,       rtop},
         {PANE_SETTINGS,   rtop},
         {PANE_HOSTS,      rtop},
     };
     return dockplacescheck(g, places, countof(places)) &&
-           tabselected("Jobs") && !g->panes[PANE_METRICS];
+           tabselected("Jobs") && tabselected("Plan") && g->panes[PANE_TERMINAL] &&
+           !g->panes[PANE_METRICS];
 }
 
 // The layout saved under the name text, back as it was saved: the same
@@ -19840,14 +19850,16 @@ static b32 compactcheck(Gui *g)
     ImGuiDockNode *left = root ? root->ChildNodes[0] : 0;
     ImGuiDockNode *center = root ? root->ChildNodes[1] : 0;
     ImGuiDockNode *top = center ? center->ChildNodes[0] : 0;
-    if (!left || !top) {
+    ImGuiDockNode *foot = center ? center->ChildNodes[1] : 0;  // Prompt over Terminal
+    if (!left || !top || !foot || !foot->ChildNodes[0] || !foot->ChildNodes[1]) {
         guilog(g, "drive: the dock space is not split in two columns");
         return 0;
     }
     if (!dockshare(root, ImGuiAxis_X, 0, dockcapped(LAYOUT_LEFT*(1-LAYOUT_RIGHT),
                                                     LAYOUT_LEFTMAX, root->Size.x, g->scale)) ||
         !dockshare(left, ImGuiAxis_Y, 1, LAYOUT_TODO) ||
-        !dockshare(center, ImGuiAxis_Y, 1, LAYOUT_PROMPT)) {
+        !dockshare(center, ImGuiAxis_Y, 1, 2*LAYOUT_PROMPT) ||
+        !dockshare(foot, ImGuiAxis_Y, 0, 0.5f)) {
         guilog(g, "drive: the compact layout's splits are not in their shares");
         return 0;
     }
@@ -19862,13 +19874,14 @@ static b32 compactcheck(Gui *g)
         {PANE_HELP,       top},
         {PANE_SETTINGS,   top},
         {PANE_HOSTS,      top},
-        {PANE_PROMPT,     center->ChildNodes[1]},
+        {PANE_PROMPT,     foot->ChildNodes[0]},
+        {PANE_TERMINAL,   foot->ChildNodes[1]},
     };
     return dockplacescheck(g, places, countof(places)) &&
            top->IsCentralNode() && tabselected("Todo") &&
            tabselected("Transcript") && g->panes[PANE_JOBS] &&
-           g->panes[PANE_PLAN] && !g->panes[PANE_LOG] &&
-           center->ChildNodes[1]->IsHiddenTabBar();
+           g->panes[PANE_PLAN] && !g->panes[PANE_LOG] && g->panes[PANE_TERMINAL] &&
+           foot->ChildNodes[0]->IsHiddenTabBar();
 }
 
 // The Focus layout, as applied: Transcript, Todo and Plan as tabs in
@@ -22190,12 +22203,17 @@ static b32 drivecheck(Gui *g, i32 chk)
         return (f32)(v.total - tt->rows) == g->ops[g->drivepc-1].dx;
     }
     case CHK_TERMHOME: {
-        // The lower side of a vertical split, near its share, whose
-        // upper side holds the prompt
+        // With dx, a tab of Plan's node (Standard); else the lower side of
+        // a vertical split, near its share, whose upper side holds the
+        // prompt (Compact's even split, or dockaddterm's)
         ImGuiWindow   *w = ImGui::FindWindowByName(panenames[PANE_TERMINAL]);
         ImGuiWindow   *p = ImGui::FindWindowByName(panenames[PANE_PROMPT]);
         ImGuiDockNode *n = w ? w->DockNode : 0;
         ImGuiDockNode *s = n ? n->ParentNode : 0;
+        if (g->ops[g->drivepc-1].dx != 0) {
+            ImGuiWindow *plan = ImGui::FindWindowByName(panenames[PANE_PLAN]);
+            return n && plan && plan->DockNode==n;
+        }
         if (!s || !p || !p->DockNode || s->SplitAxis!=ImGuiAxis_Y || s->ChildNodes[1]!=n) {
             return 0;
         }
@@ -22209,7 +22227,7 @@ static b32 drivecheck(Gui *g, i32 chk)
         print(&b, "drive: the terminal's split gives the prompt's side ");
         printfloat(&b, share, 2);
         guilog(g, finish(&b));
-        return under && share>0.5f && share<0.7f;
+        return under && share>0.45f && share<0.7f;
     }
     case CHK_TERMKID: {
         GuiSession *r = g->sess ? termroot(g, g->sess) : 0;

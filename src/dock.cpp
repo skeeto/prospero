@@ -14,9 +14,9 @@
 //
 // The presets:
 //   Standard  Sessions over Todo, Transcript over Prompt, and a right
-//             column of Jobs and Log over Plan
+//             column of Jobs and Log over Plan and Terminal
 //   Compact   Standard without its right column: Jobs behind Todo, Plan
-//             behind Transcript, and Log closed
+//             behind Transcript, Log closed, and Terminal under Prompt
 //   Focus     a session alone: Transcript, Todo and Plan as tabs, over
 //             Prompt
 // Compact and Focus hide Prompt's tab bar, for room; Standard, the
@@ -482,17 +482,19 @@ static Str docknamewhy(Str name)
 
 // A preset, as if read from the layout file. Help, Settings and Hosts
 // stay shown or hidden in Standard and Compact, whose side columns have
-// little room for them. No preset places the terminal, nor shows or
-// hides it: dockaddterm gives it a home under the prompt.
+// little room for them. Standard shows the terminal as a tab beside
+// Plan, where a first run finds it; Compact, under the prompt, as tall
+// as it, for a command or two; Focus leaves it out, and Ctrl+` brings it
+// back, its shells having run on, in the home dockaddterm gives it under
+// the prompt.
 static DockLayout dockpreset(i32 preset)
 {
-    u32        term   = 1u << PANE_TERMINAL;
-    u32        extras = 1u<<PANE_HELP | 1u<<PANE_SETTINGS | 1u<<PANE_HOSTS | term;
+    u32        extras = 1u<<PANE_HELP | 1u<<PANE_SETTINGS | 1u<<PANE_HOSTS;
     DockLayout l      = {};
     l.name = presetnames[preset];
     switch (preset) {
     case PRESET_STANDARD:
-        dockline(&l, "Shown", "Sessions,Transcript,Prompt,Todo,Plan,Jobs,Log");
+        dockline(&l, "Shown", "Sessions,Transcript,Prompt,Todo,Plan,Jobs,Log,Terminal");
         docksplit(&l, DOCK_X, 1 - LAYOUT_RIGHT);
         docksplit(&l, DOCK_X, LAYOUT_LEFT);
         l.parts[l.nparts-1].most = LAYOUT_LEFTMAX;
@@ -504,20 +506,22 @@ static DockLayout dockpreset(i32 preset)
         dockline(&l, "Tabs", "Prompt");
         docksplit(&l, DOCK_Y, 1 - LAYOUT_PLAN);
         dockline(&l, "Tabs", "*Jobs,Log,Help,Settings,Hosts");
-        dockline(&l, "Tabs", "Plan,Changes");
+        dockline(&l, "Tabs", "*Plan,Terminal,Changes");
         l.keep = extras;
         break;
     case PRESET_COMPACT:
-        dockline(&l, "Shown", "Sessions,Transcript,Prompt,Todo,Plan,Jobs");
+        dockline(&l, "Shown", "Sessions,Transcript,Prompt,Todo,Plan,Jobs,Terminal");
         docksplit(&l, DOCK_X, LAYOUT_LEFT*(1 - LAYOUT_RIGHT));  // as Standard's
         l.parts[l.nparts-1].most = LAYOUT_LEFTMAX;
         docksplit(&l, DOCK_Y, 1 - LAYOUT_TODO);
         dockline(&l, "Tabs", "Sessions");
         dockline(&l, "Tabs", "*Todo,Jobs,Log");
-        docksplit(&l, DOCK_Y, 1 - LAYOUT_PROMPT);
+        docksplit(&l, DOCK_Y, 1 - 2*LAYOUT_PROMPT);  // the terminal as tall
         dockline(&l, "Center", "*Transcript,Plan,Changes,Help,Settings,Hosts");
+        docksplit(&l, DOCK_Y, 0.5f);
         dockline(&l, "Tabs", "Prompt");
         dockline(&l, "TabBar", "Hidden");
+        dockline(&l, "Tabs", "Terminal");
         l.keep = extras;
         break;
     case PRESET_FOCUS:
@@ -527,7 +531,6 @@ static DockLayout dockpreset(i32 preset)
                                "Help,Settings,Hosts");
         dockline(&l, "Tabs", "Prompt");
         dockline(&l, "TabBar", "Hidden");
-        l.keep = term;
         break;
     }
     return l;

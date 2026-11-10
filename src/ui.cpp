@@ -15217,9 +15217,15 @@ static void dockwindows(Gui *g)
         b32 known = saveddock("Terminal") || ImGui::FindWindowByName("Terminal") ||
                     ImGui::FindWindowSettingsByID(ImHashStr("Terminal"));
         if ((g->termhome || !known) && !g->layoutpending && !g->layoutnow) {
+            b32 left = g->termhome;
             g->termhome = 0;
             b32        ok = 0;
             DockLayout l  = capturelayout(g, &ok);
+            if (left) {
+                // Floating only as its node went with the layout, where
+                // a terminal floated by hand would have kept it
+                l.floats &= ~(1u << PANE_TERMINAL);
+            }
             if (ok && dockaddterm(&l)) {
                 l.name = g->layout.name;
                 l.keep = ~(u32)0;
