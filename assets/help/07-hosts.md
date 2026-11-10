@@ -102,9 +102,9 @@ after `trash_days` does. A mounted folder is never removed.
 
 A session's Open working folder opens the mounted folder here, where
 its folder is in it; with a copy or an empty workspace its files are
-only in the container. Open in external terminal, and the terminal
-button beside the prompt box, open a shell inside the container, in the
-session's folder, while it runs.
+only in the container. Open in external terminal, and a Terminal pane
+tab (the terminal button beside the prompt box), open a shell inside
+the container, in the session's folder, while it runs.
 
 Whatever user the image names, the engine and the agent run as root in
 the container, which is you, not root, on this computer with Docker
@@ -145,6 +145,16 @@ session here.... A remote's sessions use the models of its own
 configuration, or this computer's when it has none (below). With
 `list = connected` in its section, a remote is left out of the sidebar
 until connected.
+
+A Terminal pane tab for a session on another host, a remote, a
+container or a background host, runs its shell there, by that host's
+engine, in the session's folder. While the connection is broken the
+tab says Reconnecting, keeps its shell, and shows what it printed
+meanwhile once the connection is back; typing meanwhile is lost. A
+host that was disconnected, or that started over, ends its tabs. A
+host whose engine is older than this window says so: deploy an engine
+(below) to have terminal tabs there. Closing the window to run in the
+background hangs up this window's terminal tabs.
 
 ## A remote with no models of its own
 

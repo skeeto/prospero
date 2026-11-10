@@ -79,7 +79,11 @@ echo, a cat -v key round trip, a resize, less and vim, no frames once
 output stops, a forced 300x80 grid past 64K vertices (an imgui
 assertion fails the run), the shell's exit, and a quit that hangs up
 the next shell, which a HUP trap writes down (on Windows, which busybox's
-sh traps no hang-up in, its pid is gone).
+sh traps no hang-up in, its pid is gone). Before that it connects a
+remote host "r" over ssh to this computer (as hosttask does) and opens
+a tab for a session there: its shell runs in the remote's folder, goes
+busy and idle, says Reconnecting while the link is dropped and shows
+what it printed meanwhile once it's back, and quitting hangs it up too.
 
 Every checklist starts as a first run, its state directory fresh: the
 window at its first size, and Help in front, then View → Layout → Standard. The
@@ -1461,7 +1465,7 @@ class Far:
     host started here for the test. Either way, in directories of its own
     that go at the end."""
 
-    def __init__(self, args, host, url, model, nonce, ask=3, thin=False):
+    def __init__(self, args, host, url, model, nonce, ask=3, thin=False, extra=""):
         self.args = args
         self.host = host
         self.local = not args.ssh
@@ -1482,6 +1486,7 @@ class Far:
                                    f"[model fake:far:{nonce}]\ncontext = 100000\n"
         if thin:
             cfg = "# No endpoint: a thin host\n[host]\nidle_exit = 5\n"
+        cfg += extra
         if self.local:
             host.mkdir(self.work)
             host.mkdir(self.state)
@@ -1558,7 +1563,7 @@ class Far:
     def env(self):
         if not self.local:
             return {}
-        elif self.args.mode in ("hosttask", "thin"):
+        elif self.args.mode in ("hosttask", "thin", "terminal"):
             return {"PROSPERO_TEST_SSH": self.ssh, "PROSPERO_TEST_SCP": self.scp}
         elif self.windows:
             return {"PROSPERO_TEST_SSH": self.ssh}
@@ -1890,7 +1895,8 @@ def main():
         if os.name == "nt":
             # busybox's sh from w64devkit, with its vim, less, seq and tr
             shell = shword(shutil.which("sh").replace("\\", "/"))
-        before = config(curl, model) + f"\n[terminal]\nshell = {shell}\nscrollback = 100\n"
+        termcfg = f"\n[terminal]\nshell = {shell}\nscrollback = 100\n"
+        before = config(curl, model) + termcfg
         os.environ["PS1"] = "tty$ "
         os.environ["HISTFILE"] = ""  # not the user's history
     elif args.mode == "drive" and not args.fake:
@@ -1920,6 +1926,11 @@ def main():
         far = Far(args, host, curl, model, nonce, ask=60)
         before += far.hostsection()
         os.environ["HOSTTASK_WORK"] = far.work
+    elif args.mode == "terminal":
+        # r, a host here through the fake ssh, started with this
+        # environment (PS1), runs the same shell for its sessions' tabs
+        far = Far(args, host, curl, model, nonce, extra=termcfg)
+        before += far.hostsection().replace("[remote far]", "[remote r]")
     elif args.mode == "thin":
         # r has no endpoint: it runs on this window's models
         far = Far(args, host, curl, model, nonce, thin=True)
@@ -2120,20 +2131,23 @@ def main():
     if args.mode == "terminal":
         # The shell's HUP trap, as quitting (or the Trash) hung it up, or
         # on Windows, where busybox's sh runs no trap for it, the shell gone
-        def hungup(trapfile, pidfile):
+        def hungup(where, trapfile, pidfile):
             if os.name != "nt":
-                return os.path.exists(os.path.join(work, trapfile))
+                return os.path.exists(os.path.join(where, trapfile))
             try:
-                pid = int(open(os.path.join(work, pidfile)).read())
+                pid = int(open(os.path.join(where, pidfile)).read())
             except (OSError, ValueError):
                 return False
             return not alive(pid)
-        for trapfile, pidfile, what in (("hup-trash.txt", "trash.pid", "the Trash"),
-                                        ("hup.txt", "shell.pid", "quitting")):
+        # The remote host's shell, through its host, which quitting left
+        for where, trapfile, pidfile, what in (
+                (work, "hup-trash.txt", "trash.pid", "the Trash"),
+                (work, "hup.txt", "shell.pid", "quitting"),
+                (far.work, "hup-remote.txt", "remote.pid", "quitting, on the remote,")):
             deadline = time.monotonic() + 5
-            while not hungup(trapfile, pidfile) and time.monotonic() < deadline:
+            while not hungup(where, trapfile, pidfile) and time.monotonic() < deadline:
                 time.sleep(0.1)
-            if not hungup(trapfile, pidfile):
+            if not hungup(where, trapfile, pidfile):
                 problems.append(f"{what} did not hang up the terminal's shell")
             else:
                 print(f"terminal: {what} hung up the shell")
@@ -2174,8 +2188,10 @@ def main():
         else:
             print("terminal: a child ignoring SIGHUP outlived a tab's Close")
             P.signal_ours(pid, P.KILL, lambda q: ours(q, host.root), "stray")
+        problems += far.close(args.keep)
     if args.mode == "terminal" and args.shots and os.name != "nt":  # SDL's alone
         for name in ("terminal", "terminal-small", "terminal-vim", "terminal-big",
+                     "terminal-reconnecting",
                      "terminal-ended", "terminal-tabs", "terminal-quit",
                      "terminal-selected", "terminal-paste"):
             if not os.path.exists(os.path.join(args.shots, name + ".png")):

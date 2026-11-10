@@ -11,9 +11,11 @@
 //   term.resize {tid, cols, rows, xpx?, ypx?}
 //   term.ack {tid, off, resend?}      output taken up to off
 //   term.close {tid, kill?}           a hang-up, or with kill a sweep
+//   term.close {all}                  a hang-up of all the frontend's
 //
 // None but term.open has an id or a reply. Records, transient, with no
-// sid, and the peer of a host's client (host.cpp stamps its commands):
+// sid, and the peer of a host's client (host.cpp stamps its commands,
+// and gives each record to the client its peer names):
 //
 //   term {tid, off, data}             output at byte offset off, base64
 //   term.end {tid, off, code, signal, err?}   the shell exited, its
@@ -27,14 +29,19 @@
 // in the platform's ring (TERM_RING) until acked, so a frontend that
 // finds a gap acks what it has with resend, and output goes again from
 // there (go-back-N), as it does after TERM_STALL seconds of no ack at
-// all, TERM_TRIES times, before the terminal is given up as stalled. A
+// all, TERM_TRIES times, before the terminal is given up as stalled.
+// While a host's client has no stream (relay.peer away), its terminals
+// count no stalls: their output waits in the client's link, and the
+// count starts over once it is back. A
 // full ring stops reading the terminal, holding the shell back: a slow
 // frontend slows the shell, and typing still goes through.
 //
 // Closing hangs up, as a terminal's window closing does: the shell gets
 // SIGHUP, and what ignores it (nohup) lives on, as does what it
 // disowned; only close {kill} sweeps the tree. A quit hangs up every
-// terminal, a client of a host gone for good hangs up its own, and a
+// terminal, a client of a host gone for good hangs up its own (as does
+// a window going to the background, by close {all}, so a term.open
+// still in flight leaves no shell behind), and a
 // session deleted or trashed hangs up its own. A terminal outlives its
 // session's closing, parking, or archiving.
 //
@@ -81,6 +88,7 @@ struct Term {
     b32   ended;    // term.end sent
     b32   closed;   // hung up or killed: waits for exit and EOF, silent
     b32   busy;     // as last told
+    b32   away;     // its frontend's link is down: no stalls meanwhile
     i64   stallat;  // ticks: send again, 0 while nothing is unacked
     i32   tries;
 };
@@ -337,7 +345,9 @@ static void termpump(Engine *e, Arena scratch, Term *t)
             break;
         }
         t->sent    += s.len;
-        t->stallat  = t->stallat ? t->stallat : os_ticks(e->os) + (i64)TERM_STALL*SEC;
+        if (!t->away && !t->stallat) {
+            t->stallat = os_ticks(e->os) + (i64)TERM_STALL*SEC;
+        }
     }
     if (t->exited && t->eof && !t->ended && t->sent==t->total && !e->terms->held) {
         Buf   b(&scratch, 256);
@@ -527,8 +537,12 @@ static void termopen(Engine *e, Arena scratch, i64 id, Json *j)
 // frontend's is dropped, as after its end.
 static void termcmd(Engine *e, Arena scratch, i32 cmd, Json *j)
 {
-    i64   peer = jsonint(jsonget(j, "peer"), 0);
-    Term *t    = termbytid(e, jsonint(jsonget(j, "tid"), 0), peer);
+    i64 peer = jsonint(jsonget(j, "peer"), 0);
+    if (cmd==CMD_TERMCLOSE && jsonflag(jsonget(j, "all"), 0)) {
+        termhangupall(e, peer<0 ? 0 : peer, {});  // a frontend's every one
+        return;
+    }
+    Term *t = termbytid(e, jsonint(jsonget(j, "tid"), 0), peer);
     if (!t || t->closed) {
         return;
     }
@@ -552,7 +566,7 @@ static void termcmd(Engine *e, Arena scratch, i32 cmd, Json *j)
         t->acked   = off;
         t->sent    = k.sent;
         t->tries   = k.take ? 0 : t->tries;
-        t->stallat = t->sent>t->acked ? os_ticks(e->os) + (i64)TERM_STALL*SEC : 0;
+        t->stallat = t->sent>t->acked && !t->away ? os_ticks(e->os) + (i64)TERM_STALL*SEC : 0;
         termpump(e, scratch, t);
     } break;
     case CMD_TERMCLOSE:
@@ -651,6 +665,24 @@ static i64 termnext(Engine *e, i64 now)
         }
     }
     return next;
+}
+
+// A frontend's link went down (away), or came back: its terminals stop
+// counting stalls while it is away, and what it sends meanwhile waits
+// in its host's link; back, they count from now, and a gap the link
+// left (frames lost) is filled once the frontend finds it or stalls.
+static void termaway(Engine *e, i64 peer, b32 away)
+{
+    i64 now = os_ticks(e->os);
+    for (i32 i = 0; e->terms && i < TERM_MAX; i++) {
+        Term *t = &e->terms->slots[i];
+        if (!t->tid || t->peer!=peer || t->closed) {
+            continue;
+        }
+        t->away    = away;
+        t->tries   = 0;
+        t->stallat = !away && t->sent>t->acked ? now + (i64)TERM_STALL*SEC : 0;
+    }
 }
 
 // Hang up every terminal (a quit), a frontend's (peer, gone for good),

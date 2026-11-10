@@ -12,8 +12,14 @@
 // from the terminal goes back to the prompt, hiding the pane only where
 // it covers the prompt or floats.
 //
-// For now only the local engine runs terminals: the routing of remote
-// hosts' term records comes later.
+// A session on another host (a remote, a background host, a container)
+// has its shells in that host's engine, which relays the commands and
+// records of each client's terminals (host.cpp, cap term.host); a
+// subagent on a host apart from its parent's has its own tabs there.
+// While that host's link is down, its tabs keep their screens under
+// "Reconnecting", typing goes nowhere, and the shells run on, their
+// output waiting in the link; a host that comes back new (anew), or
+// disconnects, has hung them up, and they end.
 //
 // This is free and unencumbered software released into the public domain.
 
@@ -107,19 +113,36 @@ static Str termlabel(TermTab *tt)
     return shell.len ? shell : Str("Terminal");
 }
 
-// Why a session can have no terminal now, else empty.
+// Whether a tab's host takes its commands now: this machine's engine
+// always, another host while its link is up. One whose link is down
+// keeps its terminals for when it comes back (termhostlost if not).
+static b32 termup(TermTab *tt)
+{
+    GuiHost *h = tt->host;
+    return h->kind==GH_ENGINE || (h->r && !h->closing && h->up);
+}
+
+// Why a session can have no terminal now, else empty. Another host's
+// engine must relay terminals to its clients (term.host), which one
+// with only term (0.16) does not.
 static Str termwhy(Gui *g, GuiSession *s)
 {
     if (!s) {
         return "No session is open";
     } else if ((s->parent.len || (s->view && s->view->parent.len)) && !sessup(g, s)) {
         return "Its parent session isn't listed yet";
-    } else if (s->host->kind != GH_ENGINE) {
-        return "Terminal tabs aren't available yet for sessions on other hosts";
-    } else if (g->enginekind == ENGINE_FAKE) {
+    } else if (g->enginekind==ENGINE_FAKE && s->host->kind==GH_ENGINE) {
         return "The fake agent has no terminals";
     }
-    return hostwhy(g, s, "term");
+    GuiHost *h = s->host;
+    if (h->kind == GH_ENGINE) {
+        return hostwhy(g, s, "term");
+    } else if (!h->r || h->closing) {
+        return "Its host is not connected";
+    } else if (!h->up) {
+        return "Waiting for its host to connect";
+    }
+    return hostwhy(g, s, "term.host");
 }
 
 // ariel's colors in its own form, 0xRRGGBB, from a palette's ABGR.
@@ -225,7 +248,8 @@ static EvOut termbegin(Gui *g, Buf *b, i32 cmd, TermTab *tt)
 {
     EvOut w = cmdbegin(b, cmd, 0);
     putintkey(&w.json, "tid", tt->tid);
-    g->cmdhost = tt->host;
+    g->cmdhost  = tt->host;
+    g->cmdquiet = 1;
     return w;
 }
 
@@ -245,8 +269,8 @@ static void termack(Gui *g, TermTab *tt, i64 off, b32 resend)
 // Bytes for the shell, in as many term.input as they need.
 static void terminput(Gui *g, TermTab *tt, Str data)
 {
-    if (tt->state!=TT_LIVE || !tt->tid) {
-        return;
+    if (tt->state!=TT_LIVE || !tt->tid || !termup(tt)) {
+        return;  // typed while reconnecting: lost, not sent late
     }
     while (data.len) {
         Str   part = takehead(data, data.len<TERMTAB_INPUT ? data.len : (iz)TERMTAB_INPUT);
@@ -303,16 +327,32 @@ static void termclose(Gui *g, TermTab *tt, b32 kill)
 }
 
 // The root whose terminal tabs a session shows: a subagent's, at the
-// top of its parents, and a side chat's original's, in the same folder.
+// top of its parents on its host, and a side chat's original's, in the
+// same folder.
 // A worktree session, in a folder of its own, has its own.
 static Str termcwd(GuiSession *s)
 {
     return s->view && s->view->cwd.len ? s->view->cwd : s->cwd;
 }
 
+// The top of a session's parents on its own host: a subagent elsewhere,
+// on a remote or in a container of its own, has its own tabs there, as
+// Open in terminal opens its shell there.
+static GuiSession *termtop(Gui *g, GuiSession *s)
+{
+    for (i32 n = 0; n < 16; n++) {
+        GuiSession *up = sessup(g, s);
+        if (!up || up==s || up->host!=s->host) {
+            break;
+        }
+        s = up;
+    }
+    return s;
+}
+
 static GuiSession *termroot(Gui *g, GuiSession *s)
 {
-    s = sessroot(g, s);
+    s = termtop(g, s);
     for (i32 n = 0; n < 8; n++) {
         Str side = sessside(s);
         if (!side.len || s->wtname.len) {
@@ -322,7 +362,7 @@ static GuiSession *termroot(Gui *g, GuiSession *s)
         if (!o || o==s || o->gone || !(termcwd(o) == termcwd(s))) {
             break;
         }
-        s = sessroot(g, o);
+        s = termtop(g, o);
     }
     return s;
 }
@@ -394,9 +434,56 @@ static void termcloseall(Gui *g)
     }
 }
 
+// A running terminal ends for want of its engine, its screen kept: the
+// engine there hung it up already, or will.
+static void termlost(Gui *g, TermTab *tt, Str why)
+{
+    if (tt->state==TT_LIVE || tt->state==TT_OPENING) {
+        tt->state  = TT_ENDED;
+        tt->tid    = 0;
+        tt->openid = 0;
+        tt->busy   = 0;
+        tt->errlen = termkeep(tt->err, why);
+        scheddirty(&g->sched);
+    }
+}
+
+// A host came up that is not the one the tabs were on: it started over,
+// or forgot this window after its grace, hanging their shells up.
+static void termhostlost(Gui *g, GuiHost *h)
+{
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        for (i32 i = 0; i < s->terms.n; i++) {
+            if (s->terms.tabs[i]->host == h) {
+                termlost(g, s->terms.tabs[i], "the host there started over");
+            }
+        }
+    }
+}
+
+// As the window goes to the background, hang up every terminal it has
+// in this process's engine, those whose term.open is still in flight
+// too: their replies would go to the host, which never asked for them.
+static void termcloseengine(Gui *g)
+{
+    if (g->enginekind == ENGINE_FAKE) {
+        return;
+    }
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 64);
+    EvOut w = cmdbegin(&b, CMD_TERMCLOSE, 0);
+    putkey(&w.json, "all");
+    putbool(&w.json, 1);
+    g->cmdhost  = g->hosts;  // the engine's
+    g->cmdquiet = 1;
+    cmdsend(g, &w, a);
+}
+
 // Each frame: close the terminals of sessions deleted or put in the
 // Trash, here or by another window (their engine hung them up already),
-// and end those of an engine that stopped, which says nothing more.
+// and end those of an engine that stopped, which says nothing more, or
+// of a host disconnected, which hangs them up as it forgets this window.
+// A host whose link is down only waits (termup).
 static void termsweep(Gui *g)
 {
     for (GuiSession *s = g->sessions; s; s = s->next) {
@@ -408,14 +495,11 @@ static void termsweep(Gui *g)
         }
         for (i32 i = 0; i < s->terms.n; i++) {
             TermTab *tt = s->terms.tabs[i];
-            if (g->enginegone && tt->host->kind==GH_ENGINE &&
-                (tt->state==TT_LIVE || tt->state==TT_OPENING)) {
-                tt->state  = TT_ENDED;
-                tt->tid    = 0;
-                tt->openid = 0;
-                tt->busy   = 0;
-                tt->errlen = termkeep(tt->err, "the engine stopped");
-                scheddirty(&g->sched);
+            GuiHost *h  = tt->host;
+            if (h->kind==GH_ENGINE && g->enginegone) {
+                termlost(g, tt, "the engine stopped");
+            } else if (h->kind!=GH_ENGINE && (!h->r || h->closing)) {
+                termlost(g, tt, h->msg.len ? h->msg : Str("the host was disconnected"));
             }
         }
     }
@@ -1478,6 +1562,30 @@ static void termbanner(Gui *g, GuiSession *s, TermTab *tt, Arena a, i32 cols, i3
     }
 }
 
+// A note over a terminal whose host's link is down, in the grid's top
+// right corner, which leaves the screen and its size as they were: the
+// shell runs on there, and its output waits for the link.
+static void termwaiting(Gui *g, TermTab *tt, ImDrawList *dl, ImRect bb, Arena a)
+{
+    GuiHost *h = tt->host;
+    Buf      b(&a, 128 + h->name.len);
+    print(&b, "Reconnecting to ");
+    print(&b, h->kind==GH_REMOTE ? h->name : Str("the background host"));
+    print(&b, "...");
+    char  *text = cstr0(&a, finish(&b));
+    ImVec2 pad  = ImGui::GetStyle().FramePadding;
+    ImVec2 ts   = ImGui::CalcTextSize(text);
+    ImVec2 max  = v2(bb.Max.x - pad.x, bb.Min.y + pad.y + ts.y + 2*pad.y);
+    ImVec2 min  = v2(max.x - ts.x - 2*pad.x, bb.Min.y + pad.y);
+    min.x = min.x>bb.Min.x ? min.x : bb.Min.x;
+    dl->AddRectFilled(min, max, g->pal->panel, ImGui::GetStyle().FrameRounding);
+    dl->AddRect(min, max, g->pal->amber, ImGui::GetStyle().FrameRounding);
+    dl->PushClipRect(min, max, true);
+    dl->AddText(v2(min.x + pad.x, min.y + pad.y), g->pal->amber, text);
+    dl->PopClipRect();
+    g->termwaitshown = 1;
+}
+
 // What the tab bar asks of its caller, which knows the size.
 struct TermBar {
     i32 closed;   // the tab to close, else -1
@@ -1608,9 +1716,10 @@ static void drawterm(Gui *g)
     GuiSession  *s   = g->sess ? termroot(g, g->sess) : 0;
     ImGuiWindow *win = ImGui::GetCurrentWindow();
     ImGuiID      id  = win->GetID("##grid");
-    g->termid      = id;
-    g->termfocused = 0;
-    g->termgrid    = {};
+    g->termid        = id;
+    g->termfocused   = 0;
+    g->termwaitshown = 0;
+    g->termgrid      = {};
 
     Str why = termwhy(g, s);
     if (why.len && (!s || !s->terms.n)) {
@@ -1778,6 +1887,9 @@ static void drawterm(Gui *g)
             ariel_scroll(tt->t, (i32)(at - was));  // positive: newer
             scheddirty(&g->sched);
         }
+    }
+    if (!termup(tt) && (tt->state==TT_LIVE || tt->state==TT_OPENING)) {
+        termwaiting(g, tt, dl, bb, a);
     }
     g->termverts = dl->VtxBuffer.Size;
     if (tt->state == TT_LIVE) {

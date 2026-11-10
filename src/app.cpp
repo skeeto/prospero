@@ -1287,6 +1287,7 @@ struct Gui {
     Slice<Str>         skillsdirs; // --skillsdir DIR, each absolute
     i64                nextid;
     GuiHost           *cmdhost;    // where the command being written goes
+    b32                cmdquiet;   // and it has no id nor reply: lost, not failed
     Request            reqs[REQ_MAX];
     b32                engineok;   // it said hello
     b32                enginegone; // it stopped
@@ -1724,6 +1725,7 @@ struct Gui {
     i32                closeterms;   // busy tabs the quit dialog counted
     i32                termscroll;   // [terminal] scrollback, for new tabs
     i32                termregions;  // tabs' blocks reserved, for the drive
+    b32                termwaitshown; // the front tab showed Reconnecting, for the drive
     Region            *termpasteregion;  // a paste waiting to be confirmed
     Str                termpastetext;    //   in it
     TermTab           *termpastetab;     //   for this tab
@@ -2123,11 +2125,17 @@ static void cmdfail(Gui *g, GuiHost *h, Arena scratch, i64 id, Str err)
 // follow the command's buffer.
 static void cmdsend(Gui *g, EvOut *w, Arena scratch)
 {
-    Str      line = evend(w);
-    GuiHost *h    = g->cmdhost;
+    Str      line  = evend(w);
+    GuiHost *h     = g->cmdhost;
+    b32      quiet = g->cmdquiet;
+    g->cmdquiet = 0;
     if (h->kind != GH_ENGINE) {
         // The library holds it while the host has not answered hello
-        if (!h->r || h->closing) {
+        if (quiet) {
+            if (h->r && !h->closing) {
+                remotetry(h->r, cuttail(line, 1));
+            }
+        } else if (!h->r || h->closing) {
             cmdfail(g, h, scratch, g->nextid, "not connected to the host");
         } else if (!remotetry(h->r, cuttail(line, 1))) {
             cmdfail(g, h, scratch, g->nextid, "too much is waiting to go to the host");
@@ -5801,6 +5809,8 @@ static void ontermenv(Gui *, Arena, Json *, b32);
 static void termopened(Gui *, GuiSession *, i64, Json *, b32, Str);
 static b32  termapply(Gui *, GuiHost *, Arena, EvRec *);
 static void termcloseall(Gui *);
+static void termhostlost(Gui *, GuiHost *);
+static void termcloseengine(Gui *);
 static void drawterm(Gui *);
 static void termhotkeys(Gui *);
 static void termsweep(Gui *);
@@ -8471,7 +8481,11 @@ static void onremote(Gui *g, GuiHost *h, Arena a, EvRec *r)
         if (g->dtoasthost == h->uid) {
             g->dtoasthost = 0;
         }
+        if (jsonflag(jsonget(r->root, "anew"), 0)) {
+            termhostlost(g, h);  // the old one's shells went with it
+        }
     }
+    scheddirty(&g->sched);  // its terminals' note, waiting or not
     if (!h->up) {
         guirelaydrop(g, a, h);
     }
@@ -10751,6 +10765,7 @@ static b32 gobackground(Gui *g)
         // having no window to show them.
         guirelaylostall(g, newarena(g->cmdr), "this computer's window closed");
         termcloseall(g);
+        termcloseengine(g);  // and those whose term.open is still in flight
         Arena hp = newarena(os_reserve(g->os, (iz)1<<30));
         g->host  = hp.beg ? newhost(g->os, &hp, g->frame, &hc, &why) : 0;
         why      = g->host ? Str{} : why.len ? why : Str("out of memory");
@@ -13332,6 +13347,7 @@ enum : i32 {
                       // vertices (32-bit indices)
     CHK_PALETTE,      // the palette is open, listing dx rows (0: any), the
                       // first titled text if any (dy 1: any row)
+    CHK_TERMWAIT,     // the front tab shows Reconnecting (dx 1), or not (0)
     CHK_COUNT,
 };
 
@@ -13628,6 +13644,7 @@ static Str chknames[] = {
     "no frames while idle, the terminal shown",
     "the terminal's grid is set", "the terminal is that size, in 32-bit indices",
     "the palette lists what it should",
+    "the terminal shows Reconnecting, or not, as said",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -17031,6 +17048,15 @@ static DriveOp ctrops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_CHECK, CHK_TERMRAN, 1, 0, 0, " exec -it "},
+    // And a Terminal pane's shell inside it, which its engine there
+    // runs, in its folder: the Trash then hangs it up with the session
+    CTRLKEY(GKEY_GRAVE, 500),
+    {OP_WAIT, W_TERM, 0, 0, 20000, "/work"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 100, "test -d /prospero/state && echo \"inside $PWD\""},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\ninside /work"},
+    {OP_SHOT, 0, 0, 0, 300, "containers-terminal"},
     {OP_MOVE, T_SESSTITLE, 0, 0, 100, ""},  // untitled, the only one
     {OP_RDOWN, 0, 0, 0, 60, ""},
     {OP_RUP, 0, 0, 0, 500, ""},
@@ -17590,7 +17616,10 @@ static DriveOp planops[] = {
 // draws nothing while idle, Ctrl+` goes to the prompt and back with
 // the pane docked, and floating hides it and brings it back as it was, vim edits and writes a file through a resize, less pages, exit
 // closes it, a failing exit leaves a banner to restart, and quitting
-// hangs the shell up.
+// hangs the shell up. A session on the remote "r" (over ssh to this
+// computer) has a tab of its own: its shell runs there in its folder,
+// goes busy and idle, says Reconnecting while the link is down, shows
+// what it printed meanwhile, and is hung up by quitting too.
 static DriveOp termops[] = {
     {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
     {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
@@ -18015,6 +18044,70 @@ static DriveOp termops[] = {
     {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
     CTRLKEY(GKEY_C, 300),
     {OP_WAIT, W_TERMBUSY, 0, 0, 5000, "idle"},
+    // A session on a remote host (tests/gui.py's fake ssh, --rcwd its
+    // folder) has its own tabs there, its shell run by that host's
+    // engine: busy comes back through the host, a dropped link shows
+    // Reconnecting over the screen while the shell runs on, its output
+    // arriving once the link is back, and quitting hangs it up (gui.py
+    // checks its trap's file)
+    {OP_MOVE, T_NAMED, 0, 0, 100, "connect h:remote:r"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 100, ""},
+    {OP_WAIT, W_NAMEDUP, 0, 0, 60000, "r"},
+    {OP_MOVE, T_SESSMENU, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NEWBTN, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1000, ""},
+    {OP_MOVE, T_HOSTCOMBO, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_HOSTITEM, 0, 0, 100, "r"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_WAIT, W_NEWLISTED, 0, 0, 30000, ""},
+    {OP_MOVE, T_NEWCWD, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},  // selects it all, to be typed over
+    {OP_TEXTRCWD, 0, 0, 0, 300, ""},
+    {OP_MOVE, T_NEWCREATE, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 30000, ""},
+    {OP_CHECK, CHK_REMOTESESSION, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMNONE, 0, 0, 0, ""},
+    CTRLKEY(GKEY_GRAVE, 500),
+    {OP_WAIT, W_TERM, 0, 0, 15000, "tty$"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMCOUNT, 3, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 100, "echo \"at $PWD\""},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "far/work\ntty$"},
+    {OP_TEXT, 0, 0, 0, 100, "sleep 30"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERMBUSY, 0, 0, 5000, ""},
+    CTRLKEY(GKEY_C, 300),
+    {OP_WAIT, W_TERMBUSY, 0, 0, 5000, "idle"},
+    {OP_TEXT, 0, 0, 0, 100, "sleep 2; echo late"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_DROPLINK, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_REMOTEDOWN, 0, 0, 10000, ""},
+    {OP_MARK, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_TERMWAIT, 1, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 0, "terminal-reconnecting"},
+    {OP_WAIT, W_REMOTEUP, 0, 0, 60000, ""},
+    {OP_WAIT, W_TERM, 0, 0, 10000, "\nlate\ntty$"},
+    {OP_CHECK, CHK_TERMWAIT, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 100, "echo $$ >remote.pid; trap 'echo hup >hup-remote.txt; exit' HUP EXIT"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "EXIT\ntty$"},
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Start subagents."},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_CHECK, CHK_TERMSCREEN, 0, 0, 0, "\nrootwo"},
+    CTRLKEY(GKEY_GRAVE, 500),
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
     // Quitting hangs up the shell, whose trap leaves a file (gui.py), but
     // on Windows, where busybox's sh runs no trap for the hang-up (a
     // CTRL_CLOSE_EVENT), it only ends: gui.py checks its pid is gone
@@ -21815,6 +21908,8 @@ static b32 drivecheck(Gui *g, i32 chk)
         TermTab *tt = termfront(g);
         return g->sess && (!tt || tt->state==TT_NONE);
     }
+    case CHK_TERMWAIT:
+        return termfront(g) && g->termwaitshown==(g->ops[g->drivepc-1].dx!=0);
     case CHK_TERMCLOSE: {
         Arena a = g->frame;
         Buf   b(&a, 64);

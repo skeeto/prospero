@@ -51,7 +51,9 @@
 // record tells the frontend how the link is: state connecting, up, down
 // (retry_ms until the next try), failed or closed, with msg saying why.
 // Since the library keeps the host's hello to itself, up passes on what
-// it said of the engine there: its version, cmds and caps.
+// it said of the engine there: its version, cmds and caps, and anew
+// when that host is not the one up before (it started over, or forgot
+// this client), so that what lived only there, terminals, is gone.
 //
 // remoteclose ends the link with a disconnect frame: the host forgets
 // this client, and its sessions run on without it. remotefinish does so
@@ -186,6 +188,8 @@ struct Remote {
     i64               drainby;  // ticks: closing once commands are answered
     b32               fresh;    // no host known: start one (no --reconnect)
     b32               everup;
+    b32               anew;     // up since on a new host, or one that forgot
+                                // this client: up's "anew" says so once
     b32               hellook;  // this host's hello matched
     b32               wanthello;// the next hello record answers the library's
     b32               gotbye;
@@ -248,6 +252,11 @@ static void remotestatus(Remote *r, Arena scratch, i32 state, Str msg, i64 retry
         putkey(&w.json, "caps");
         putraw(&w.json, r->caps);
     }
+    if (state==RS_UP && r->anew) {
+        putkey(&w.json, "anew");  // what lived only in the old one is gone
+        putbool(&w.json, 1);
+        r->anew = 0;
+    }
     if (state==RS_FAILED && r->need) {
         putstrkey(&w.json, "deploy", remoteneeds[r->need]);
     }
@@ -284,6 +293,9 @@ static void dropid(Slice<i64> *ids, i64 id)
 // A reply to the frontend, made here.
 static void remotereply(Remote *r, Arena scratch, i64 id, Str err)
 {
+    if (!id) {
+        return;  // a command with no reply (term.input), lost
+    }
     Buf   b(&scratch, 256 + err.len);
     EvOut w = evbegin(&b, {}, 0, os_time(r->os), EV_REPLY);
     putintkey(&w.json, "id", id);
@@ -774,6 +786,7 @@ static void remoteup(Remote *r, Arena scratch, i32 ev)
         }
         r->pending.len = 0;
         r->news.len    = 0;
+        r->anew        = r->everup;
     }
     if (!r->hellook || catchup || !r->everup) {
         remoteown(r, scratch, CMD_HELLO, {}, -1, -1);

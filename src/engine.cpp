@@ -2105,6 +2105,7 @@ static void termtick(Engine *, Arena);
 static i64  termnext(Engine *, i64 now);
 static i32  termcount(Engine *, i64 peer);
 static void termhangupall(Engine *, i64 peer, Str sid);
+static void termaway(Engine *, i64 peer, b32 away);
 static Terms *newterms(Arena *);
 
 // Start a request to an endpoint, its records to req->mbox with its id,
@@ -22876,6 +22877,9 @@ static void command(Engine *e, Arena scratch, Str line)
     case CMD_RELAYPEER:
         if (jsonstr(jsonget(j, "state")) == "gone") {
             termhangupall(e, jsonint(jsonget(j, "peer"), 0), {});
+        } else {
+            termaway(e, jsonint(jsonget(j, "peer"), 0),
+                     jsonstr(jsonget(j, "state")) == "away");
         }
         relaypeernews(e, scratch, j);
         return;

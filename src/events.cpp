@@ -361,7 +361,12 @@ static Str capnames[] = {
                        // output in term records, acked, then term.end;
                        // term.busy; hello's pty, whether the system can
                        // run one at all
-    "pdf",             // upload {kind:"file"} of a PDF: kept as
+    "term.host",       // a host relays term commands and records to and
+                       // from its clients by peer, and term.close {all}
+                       // hangs up all of a client's terminals; a client's
+                       // terminals wait while its link is down, and keep
+                       // the host from exiting idle
+    "pdf",            // upload {kind:"file"} of a PDF: kept as
                        // files/N-NAME.pdf, its text extracted beside it as
                        // files/N-NAME.pdf.txt, which the reply names; a
                        // model with vision gets its images too, as the

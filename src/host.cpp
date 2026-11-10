@@ -35,10 +35,16 @@
 // endpoints do, and git once git is done), to whoever asked under the
 // asker's ids;
 // records without a session (the sessions list) go to the asker of the
-// command they answer. Session records go to the clients that opened
-// the session (open or new), or one it is a subagent of, under the
-// session's own sequence numbers: a client's records for a session come
-// live from the engine while they follow on from what it has, and from
+// command they answer. A terminal's commands (ptyhost.cpp) go stamped
+// with the client's peer, and its records to the client their peer
+// names; the engine hears when a client that opened one loses its
+// stream, gets it back, or goes for good (relay.peer), and the host
+// does not exit idle while terminals are open, a client away keeping
+// its own for as long as its grace. Session records go to the clients
+// that opened the session (open or new), or one it is a subagent of,
+// under the session's own sequence numbers: a client's records for a
+// session come live from the engine while they follow on from what it
+// has, and from
 // the session's log otherwise, as after an open from a seq (the engine
 // replays nothing itself), records lost to a full inbox, or a link too
 // backed up to take more (said in the log). A client catching up from
@@ -258,6 +264,8 @@ struct HostClient {
     i64         peer;      // the host's number for it, as a thin engine knows it
     b32         offered;   // it offered to relay model calls (relay.offer)
     b32         away;      // and the engine was told it has no stream
+    b32         termed;    // it opened a terminal: the engine hears of its
+                           // link too (relay.peer)
 };
 
 struct HostConn {
@@ -694,8 +702,8 @@ static void hostdrop(Host *h, HostClient *c, Arena scratch)
     if (c->conn) {
         connfree(h, c->conn);
     }
-    if (c->offered) {
-        hostrelaypeer(h, scratch, c, "gone");  // its calls are lost
+    if (c->offered || c->termed) {
+        hostrelaypeer(h, scratch, c, "gone");  // its calls lost, terminals hung up
     }
     for (i32 i = 0; i < HOST_RELAYS; i++) {
         if (h->relays[i].client == c) {
@@ -1077,6 +1085,20 @@ static void hostcommand(Host *h, HostClient *c, Arena scratch, Str line)
         return;  // no ids, and no replies
     }
     switch (cmd) {
+    case CMD_TERMINPUT:
+    case CMD_TERMRESIZE:
+    case CMD_TERMACK:
+    case CMD_TERMCLOSE:
+        // No ids and no replies either: as the peer it is, so that the
+        // engine finds only its own terminals
+        enginecmd(h->e, hoststamp(&scratch, j, "peer", c->peer, {}, {}, 0));
+        return;
+    case CMD_TERMOPEN: {
+        Str     line = hoststamp(&scratch, j, "peer", c->peer, {}, {}, 0);
+        JsonDoc pd   = jsonparse(&scratch, line);
+        q = hostforward(h, scratch, pd.root, cmd, HOSTCMD_CLIENT, -1, -1);
+        c->termed |= q != 0;
+    } break;
     case CMD_HELLO:
         hosthello(h, c, scratch, cid, j);
         return;
@@ -1234,7 +1256,8 @@ static void hostreplied(Host *h, Arena scratch, EvRec *r, Str line)
             i64 now = os_ticks(h->os);
             i64 turns = jsonint(jsonget(r->root, "turns"), 0);
             i64 jobs  = jsonint(jsonget(r->root, "jobs"), 0);
-            if (turns || jobs) {
+            i64 terms = jsonint(jsonget(r->root, "terms"), 0);  // away clients'
+            if (turns || jobs || terms) {
                 h->busyat = now;
             }
             hostquiet(h, scratch, now, 1);
@@ -1344,6 +1367,22 @@ static void hosttoasts(Host *h, Arena scratch)
     h->done = keep;
 }
 
+// A terminal's record, for the client its peer names, if it is still
+// here. Output goes only with room to spare, else it is lost, and the
+// engine sends it again once the client finds the gap or stalls; the
+// end goes while there is any room at all. A record of no client's (a
+// window's before it went to the background) goes nowhere.
+static void hostterm(Host *h, EvRec *r, Str line)
+{
+    i64 peer = jsonint(jsonget(r->root, "peer"), 0);
+    for (HostClient *c = h->clients; peer && c; c = c->next) {
+        if (!c->gone && c->peer==peer) {
+            hostput(c, line, r->ev==EV_TERMEND ? 0 : hostreserve(c));
+            return;
+        }
+    }
+}
+
 static void hostrecord(Host *h, Arena scratch, Str line)
 {
     EvRec r = evparse(&scratch, line);
@@ -1368,6 +1407,9 @@ static void hostrecord(Host *h, Arena scratch, Str line)
                 hostput(c, line, hostreserve(c));
             }
         }
+        return;
+    } else if (r.ev==EV_TERM || r.ev==EV_TERMEND || r.ev==EV_TERMBUSY) {
+        hostterm(h, &r, line);
         return;
     } else if (!r.sid.len) {
         // The sessions list: the asker's, the command at the front
@@ -1782,8 +1824,9 @@ static i32 hostloop(Host *h)
         now = os_ticks(os);
         hosttimers(h, now);
         for (HostClient *c = h->clients; c; c = c->next) {
-            if (c->offered && !c->gone && !c->conn && !c->away) {
-                // No stream this round: none relays through it meanwhile
+            if ((c->offered || c->termed) && !c->gone && !c->conn && !c->away) {
+                // No stream this round: none relays through it meanwhile,
+                // and its terminals wait for it
                 c->away = 1;
                 hostrelaypeer(h, newarena(h->scratch), c, "away");
             }
