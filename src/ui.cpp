@@ -2647,15 +2647,6 @@ static void drawinfo(Gui *g, GuiSession *s, View *v)
         inforow("Session", s->sid);
         inforow("Title", sesstitle(s));
         inforow("Directory", v->nofolder ? Str("No folder") : v->cwd);
-        Str why = termplan(g, &a, s).why;
-        ImGui::SameLine();
-        ImGui::BeginDisabled(why.len);
-        if (iconbutton(ICON_TERMINAL "##terminal")) {
-            termopen(g, a, s);
-        }
-        ImGui::EndDisabled();
-        itemnamed(g, "Terminal");
-        whytip(why.len ? why : Str("Terminal: open one in this folder"));
         Str model = v->model;
         if (model.len && hostcan(s->host, "models")) {
             model = modelshown(&a, s->host, v->endpoint, model);  // ENDPOINT/MODEL
@@ -6586,16 +6577,27 @@ static void drawprompt(Gui *g)
         ImGui::EndDisabled();
         itemnamed(g, "prompt folder");
         whytip(wwhy.len ? wwhy : concat(&a, "Open working folder: ", cwd));
-        Str why = termplan(g, &a, s).why;
+        // The Terminal pane where it can run the session's shell, else
+        // an external terminal, as other hosts' sessions have no tabs yet
+        b32 pane = !termwhy(g, s).len;
+        Str why  = pane ? Str{} : termplan(g, &a, s).why;
         ImGui::BeginDisabled(why.len > 0);
         if (ImGui::Button(ICON_TERMINAL "##terminal", v2(bw, 0))) {
-            termopen(g, a, s);
+            if (pane) {
+                termgo(g);
+            } else {
+                termopen(g, a, s);
+            }
         }
         ImGui::EndDisabled();
         itemnamed(g, "prompt terminal");
-        whytip(why.len ? why : s->host->kind==GH_REMOTE
-                   ? Str("Open in terminal: a shell in its folder there, in a terminal here")
-                   : Str("Open in terminal: its shell in its folder"));
+        whytip(why.len ? why :
+               pane ? Str("Terminal: its shell in its folder, in the Terminal pane (Ctrl+`)") :
+               s->host->kind==GH_REMOTE
+               ? Str("Open in external terminal: a shell in its folder there, in a "
+                     "terminal here, as the Terminal pane has no tabs for other hosts yet")
+               : Str("Open in external terminal: its shell in its folder, as the "
+                     "Terminal pane has no tabs for other hosts yet"));
     }
     if (s->hist) {
         // Which of the session's messages the box holds: oldest is 1
@@ -7485,7 +7487,7 @@ static void sessitems(Gui *g, Arena a, GuiSession *s)
         }
     }
     Str term = termplan(g, &a, s).why;
-    if (menutip(g, &a, "Open in terminal", term,
+    if (menutip(g, &a, "Open in external terminal", term,
                 h->kind==GH_REMOTE ? Str("A shell in its folder there, in a terminal here")
                                    : Str("Its shell in its folder, in a terminal"))) {
         termopen(g, a, s);
@@ -14652,7 +14654,7 @@ static void drawmenubar(Gui *g)
             ImGui::MenuItem("Archive");
             ImGui::MenuItem("Move to Trash");
             ImGui::Separator();
-            ImGui::MenuItem("Open in terminal");
+            ImGui::MenuItem("Open in external terminal");
             ImGui::MenuItem("New terminal tab", "Ctrl+Shift+`");
             ImGui::MenuItem("Close");
             ImGui::EndDisabled();

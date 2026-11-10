@@ -640,7 +640,7 @@ static CfgKey cfgschema[] = {
      "lack the editor, so name it in full here, or add its directory to "
      "[tools] path_prepend"},
     {"ui", "terminal", CFG_STRING, "", {}, {}, "ui",
-     "The terminal that a session's Open in terminal opens in its folder: "
+     "The terminal that a session's Open in external terminal opens in its folder: "
      "on macOS an application's name (Terminal, iTerm, Ghostty), elsewhere "
      "a program (wt.exe, konsole, kitty). Empty: Terminal on macOS, Windows "
      "Terminal or else a console of its own on Windows, and elsewhere "

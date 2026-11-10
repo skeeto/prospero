@@ -211,7 +211,7 @@ static Slice<Str> termenv(Arena *a, Slice<Str> env, b32 win, b32 mac, Str term)
 }
 
 // The shell's argv: the configured words, ~ for home, else the session's shell as
-// Open in terminal opens it, unless it is the system's default, else
+// Open in external terminal opens it, unless it is the system's default, else
 // $SHELL, else that default, else /bin/sh; a POSIX sh as a login shell
 // where login.
 static Slice<Str> termargv(Arena *a, Str conf, Str home, Str kind, Str path,

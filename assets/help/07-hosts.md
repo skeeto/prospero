@@ -102,8 +102,9 @@ after `trash_days` does. A mounted folder is never removed.
 
 A session's Open working folder opens the mounted folder here, where
 its folder is in it; with a copy or an empty workspace its files are
-only in the container. Open in terminal opens a shell inside the
-container, in the session's folder, while it runs.
+only in the container. Open in external terminal, and the terminal
+button beside the prompt box, open a shell inside the container, in the
+session's folder, while it runs.
 
 Whatever user the image names, the engine and the agent run as root in
 the container, which is you, not root, on this computer with Docker

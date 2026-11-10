@@ -115,7 +115,7 @@ static Str termwhy(Gui *g, GuiSession *s)
     } else if ((s->parent.len || (s->view && s->view->parent.len)) && !sessup(g, s)) {
         return "Its parent session isn't listed yet";
     } else if (s->host->kind != GH_ENGINE) {
-        return "Terminals run on this machine's sessions for now";
+        return "Terminal tabs aren't available yet for sessions on other hosts";
     } else if (g->enginekind == ENGINE_FAKE) {
         return "The fake agent has no terminals";
     }
@@ -1396,6 +1396,15 @@ static void termhotkeys(Gui *g)
     scheddirty(&g->sched);
 }
 
+
+// The prompt's terminal button: the pane shown and the terminal
+// focused, as Ctrl+` does, which starts a shell if the session has none.
+static void termgo(Gui *g)
+{
+    setpane(g, PANE_TERMINAL, 1);
+    g->termfocus = 1;
+    scheddirty(&g->sched);
+}
 
 // Why session s can have no new tab now, else empty.
 static Str termaddwhy(Gui *g, GuiSession *s)

@@ -3309,7 +3309,7 @@ static Slice<Str> envdel(Arena *a, Slice<Str> env, Str name, b32 windows)
     return r;
 }
 
-// The command that opens a session's shell by hand (Open in terminal,
+// The command that opens a session's shell by hand (Open in external terminal,
 // and a terminal tab), as its records give its kind (shellkinds) and
 // program: a POSIX sh as a login shell, so its profile sets it up; wsl
 // in its section's distro, if any. None for a POSIX system's bash or

@@ -105,7 +105,10 @@ mouse over a message, its header shows when it was sent, or when the
 agent finished it, in local time, with the date if not today. The buttons
 beside the prompt box are icons,
 named in their tooltips: Send (a paper plane), Attach (a paper clip),
-Open working folder (a folder) and Open in terminal. While the agent
+Open working folder (a folder) and Terminal, which shows the Terminal
+pane with the session's shell in its folder, as Ctrl+` does (for a
+session on another host, which has no terminal tabs yet, it opens an
+external terminal instead, as Open in external terminal does). While the agent
 works, Send becomes Steer (a curved arrow), and Stop (a square) shows
 below it. The status line above the box begins with the session's
 mode, model and shell, each a list to switch it. What you send while it works waits at
@@ -285,9 +288,8 @@ Right-click a session in the sidebar, or open the Session menu, for:
   or Explorer, as the folder button beside the prompt box opens it (in
   a container, only a folder here mounted at `/work`). **Open session records**: its folder in the state
   directory, with its log, plan and command output.
-- **Open in terminal**: a terminal window in the folder the session
-  works in, as the terminal button beside the prompt box and the Info
-  popup's open one, running the
+- **Open in external terminal**: a terminal window in the folder the
+  session works in, apart from the Terminal pane, running the
   session's shell (a POSIX sh as a login shell), or where that is
   `/bin/sh` or bash on Linux and macOS, the terminal's own. Its
   `[shell]` section's `env.NAME`, `path_prepend` and `path_append`
@@ -300,6 +302,8 @@ Right-click a session in the sidebar, or open the Session menu, for:
   `[ui] terminal`, else Terminal on macOS, Windows Terminal (or a
   console) on Windows, and elsewhere `$TERMINAL` or the first of the
   usual ones found.
+- **New terminal tab** (Ctrl+Shift+`): another shell in its folder, in
+  a tab of the Terminal pane.
 - **Close**: stop its background jobs and subagents, deny what it asks
   from then on, and let it go from memory in this window. Opening it
   again reads it back.

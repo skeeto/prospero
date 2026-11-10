@@ -5803,6 +5803,8 @@ static void drawterm(Gui *);
 static void termhotkeys(Gui *);
 static void termsweep(Gui *);
 static Str  termaddwhy(Gui *, GuiSession *);
+static Str  termwhy(Gui *, GuiSession *);
+static void termgo(Gui *);
 static i32  termbusy(Gui *);
 static void termadd(Gui *, GuiSession *);
 static void termgrab(Gui *);
@@ -13536,7 +13538,7 @@ static Str chknames[] = {
     "the plan is open in the editor, Approve held meanwhile",
     "the plan's ask shows the plan as the editor left it",
     "Reveal showed the plan file in the file manager",
-    "Open in terminal opened one in its folder, as said",
+    "Open in external terminal opened one in its folder, as said",
     "the plan is open in the editor, with no plan waiting",
     "the session is idle and asks nothing: the agent was not told",
     "the agent heard that the plan it carries out was revised by hand",
@@ -16032,12 +16034,13 @@ static DriveOp sessionsops[] = {
     {OP_UP, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_SIDE, 0, 0, 0, " S Start more subagents.\n  D 3+\n"},
     {OP_TOASTMARK, 0, 0, 0, 0, ""},  // its turn's end was news, rightly
-    // A terminal in its folder, from its context menu (noted, not opened)
+    // An external terminal in its folder, from its context menu (noted,
+    // not opened)
     {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Say hello."},
     {OP_RDOWN, 0, 0, 0, 60, ""},
     {OP_RUP, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_POPUP, 0, 0, 0, ""},
-    {OP_MOVE, T_NAMED, 0, 0, 100, "Open in terminal"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Open in external terminal"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_TERMRAN, 1, 1, 0, ""},
@@ -16681,17 +16684,14 @@ static DriveOp remoteops[] = {
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_WAIT, W_SESSION, 0, 0, 30000, ""},
     {OP_CHECK, CHK_REMOTESESSION, 0, 0, 0, ""},
-    // A terminal in its folder there, over ssh, from its Info
-    {OP_MOVE, T_INFOBTN, 0, 0, 100, ""},
-    {OP_DOWN, 0, 0, 0, 60, ""},
-    {OP_UP, 0, 0, 0, 300, ""},
-    {OP_MOVE, T_NAMED, 0, 0, 100, "Terminal"},
+    // A terminal in its folder there, over ssh, from the prompt's
+    // button: an external one, as the Terminal pane has no tabs for
+    // other hosts yet
+    {OP_MOVE, T_NAMED, 0, 0, 100, "prompt terminal"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_CHECK, CHK_TERMRAN, 1, 0, 0, "ssh -t -- here cd "},
     {OP_SHOT, 0, 0, 0, 300, "remote-terminal"},
-    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
-    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
     // Its model picker lists the models of the host's own configuration
     {OP_MOVE, T_NAMED, 0, 0, 100, "model picker"},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -17597,7 +17597,11 @@ static DriveOp termops[] = {
     {OP_NEWSESSION, 0, 0, 0, 0, ""},
     {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
     {OP_CHECK, CHK_PANECLOSED, 0, 0, 0, "Terminal"},
-    CTRLKEY(GKEY_GRAVE, 500),
+    // The prompt's terminal button shows the pane and starts a shell
+    // there, as Ctrl+` does (below)
+    {OP_MOVE, T_NAMED, 0, 0, 100, "prompt terminal"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Terminal"},
     {OP_WAIT, W_TERM, 0, 0, 10000, "tty$"},
     {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},

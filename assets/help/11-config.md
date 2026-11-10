@@ -182,7 +182,7 @@ fails with a link to sign up for Copilot Free.
   gets HOME as w64devkit's own window sets it, `%USERPROFILE%`, when
   Prospero has none, as when started from the Start menu (a home set
   in `w64devkit.ini` needs `env.HOME`). `env.NAME` sets a variable for
-  its commands, and Open in terminal's (a value, or `env:VAR` from
+  its commands, and Open in external terminal's (a value, or `env:VAR` from
   Prospero's own environment). `path_prepend` and
   `path_append` add directories around `[tools]`'s, and `description`
   tells the agent what the shell is for:
@@ -225,7 +225,7 @@ fails with a link to sign up for Copilot Free.
   else on macOS the default text editor, which you then quit. Started
   from the Finder or a desktop menu, Prospero has no `$VISUAL` or
   `$EDITOR`: set this, with a full path if need be.
-- **[`[ui] terminal`](settings:ui#terminal)**: the terminal that Open in terminal opens: on
+- **[`[ui] terminal`](settings:ui#terminal)**: the terminal that Open in external terminal opens: on
   macOS an application's name (`iTerm`, `Ghostty`), elsewhere a program
   (`wt.exe`, `konsole`, `kitty`, `wezterm`), whose options for its
   folder and command Prospero knows; another gets `-e`.
