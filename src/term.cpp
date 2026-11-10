@@ -1710,6 +1710,36 @@ static TermBar termtabs(Gui *g, GuiSession *s)
 
 // The Terminal pane's contents: the current session's tabs, the front
 // one's grid filling the pane, which takes the keyboard once clicked.
+// The grid's size in cells, COLS×ROWS, centered over it while the
+// pane's size changes and a moment after, as other terminals show it,
+// to aim a resize at a width. Not as it first shows, nor for a tab
+// switched to, nor a zoom: only the pane resized while in view.
+enum : i64 { TERM_SIZESHOW = 1000*1000 };  // µs
+
+static void termsizetip(Gui *g, ImDrawList *dl, ImRect bb, i32 cols, i32 rows, Arena a)
+{
+    i64 until = g->termsizeat + TERM_SIZESHOW;
+    if (!g->termsizeat || g->sched.now>=until) {
+        return;
+    }
+    schedat(&g->sched, until, DUE_CLOCK);
+    g->termsizeshown = 1;
+    Buf b(&a, 32);
+    print(&b, (i64)cols);
+    print(&b, "\xc3\x97");  // a multiplication sign
+    print(&b, (i64)rows);
+    char const *s   = cstr0(&a, finish(&b));
+    f32         sc  = g->scale;
+    ImVec2      ts  = ImGui::CalcTextSize(s);
+    ImVec2      c   = bb.GetCenter();
+    ImVec2      pad = v2(12*sc, 6*sc);
+    ImVec2      p0  = v2(c.x - ts.x/2 - pad.x, c.y - ts.y/2 - pad.y);
+    ImVec2      p1  = v2(c.x + ts.x/2 + pad.x, c.y + ts.y/2 + pad.y);
+    dl->AddRectFilled(p0, p1, g->pal->frame, 6*sc);
+    dl->AddRect(p0, p1, g->pal->rule, 6*sc, 1*sc);
+    dl->AddText(v2(p0.x + pad.x, p0.y + pad.y), g->pal->paneltext, s);
+}
+
 static void drawterm(Gui *g)
 {
     Arena        a   = g->frame;
@@ -1719,6 +1749,7 @@ static void drawterm(Gui *g)
     g->termid        = id;
     g->termfocused   = 0;
     g->termwaitshown = 0;
+    g->termsizeshown = 0;
     g->termgrid      = {};
 
     Str why = termwhy(g, s);
@@ -1757,7 +1788,15 @@ static void drawterm(Gui *g)
     // waits until the size holds for a frame.
     b32 held = !win->Appearing && !g->layoutpending && !g->layoutnow &&
                cols==g->termlastcols && rows==g->termlastrows;
-    g->termlastcols = cols;
+    // The pane resized changes it, which termsizetip says; not a zoom,
+    // which changes the cells, nor the pane's first showing
+    b32 resized = avail.x!=g->termlastavail.x || avail.y!=g->termlastavail.y;
+    if (g->termlastcols && !win->Appearing && resized &&
+            (cols!=g->termlastcols || rows!=g->termlastrows)) {
+        g->termsizeat = g->sched.now;
+    }
+    g->termlastavail = avail;
+    g->termlastcols  = cols;
     g->termlastrows = rows;
     if (bar.plus) {
         termnew(g, s, cols, rows);
@@ -1891,6 +1930,7 @@ static void drawterm(Gui *g)
     if (!termup(tt) && (tt->state==TT_LIVE || tt->state==TT_OPENING)) {
         termwaiting(g, tt, dl, bb, a);
     }
+    termsizetip(g, dl, bb, cols, rows, a);
     g->termverts = dl->VtxBuffer.Size;
     if (tt->state == TT_LIVE) {
         termmouse(g, tt, &m, pos, id, hovered);

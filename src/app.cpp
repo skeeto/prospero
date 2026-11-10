@@ -1728,6 +1728,7 @@ struct Gui {
     i32                termscroll;   // [terminal] scrollback, for new tabs
     i32                termregions;  // tabs' blocks reserved, for the drive
     b32                termwaitshown; // the front tab showed Reconnecting, for the drive
+    b32                termsizeshown; // its size was shown over it (termsizetip)
     Region            *termpasteregion;  // a paste waiting to be confirmed
     Str                termpastetext;    //   in it
     TermTab           *termpastetab;     //   for this tab
@@ -1738,6 +1739,8 @@ struct Gui {
     u32                termshowingserial;  // its serial then
     i32                termlastcols; // the pane's size in cells last frame,
     i32                termlastrows; //   before its shell starts
+    i64                termsizeat;   // µs: that size last changed, shown a while
+    ImVec2             termlastavail; // the pane's room for the grid last frame
     b32                termfocused;  // it has the keyboard, as last drawn
     ImGuiID            termid;       // its grid's item
     i32                termforcecols;  // the checklist's grid size, past
@@ -13366,6 +13369,7 @@ enum : i32 {
     CHK_PALETTE,      // the palette is open, listing dx rows (0: any), the
                       // first titled text if any (dy 1: any row)
     CHK_TERMWAIT,     // the front tab shows Reconnecting (dx 1), or not (0)
+    CHK_TERMSIZETIP,  // the terminal's size shows over it (dx 1), or not (0)
     CHK_COUNT,
 };
 
@@ -13663,6 +13667,7 @@ static Str chknames[] = {
     "the terminal's grid is set", "the terminal is that size, in 32-bit indices",
     "the palette lists what it should",
     "the terminal shows Reconnecting, or not, as said",
+    "the terminal's size shows over it while it changes, or not, as said",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -17870,8 +17875,12 @@ static DriveOp termops[] = {
     TERMKEY(GKEY_ENTER, 100),
     {OP_WAIT, W_TERM, 0, 0, 5000, "\nafter"},
     {OP_SHOT, 0, 0, 0, 300, "terminal"},
-    // A new size, which the shell hears of
-    {OP_RESIZE, 0, 1100, 700, 1000, ""},
+    // A new size, which the shell hears of, shown over it as it changes
+    {OP_RESIZE, 0, 1100, 700, 300, ""},
+    {OP_CHECK, CHK_TERMSIZETIP, 1, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 0, "terminal-sizetip"},
+    {OP_MARK, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_TERMSIZETIP, 0, 0, 0, ""},
     {OP_CHECK, CHK_TERMSIZE, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "terminal-small"},
     {OP_TEXT, 0, 0, 0, 100, "echo cols=$(tput cols)"},
@@ -22134,6 +22143,8 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_TERMWAIT:
         return termfront(g) && g->termwaitshown==(g->ops[g->drivepc-1].dx!=0);
+    case CHK_TERMSIZETIP:
+        return termfront(g) && g->termsizeshown==(g->ops[g->drivepc-1].dx!=0);
     case CHK_TERMCLOSE: {
         Arena a = g->frame;
         Buf   b(&a, 64);
