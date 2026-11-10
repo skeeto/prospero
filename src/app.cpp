@@ -15968,6 +15968,20 @@ static DriveOp sessionsops[] = {
     {OP_UP, 0, 0, 0, 1000, ""},
     {OP_CHECK, CHK_SIDE, 0, 0, 0, "\n S Say hello.\n"},
     {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "\nA"},  // left open, empty
+    // Into the Trash by its row's icon, its view open, and back by Undo
+    {OP_MOVE, T_SESSTITLE, 0, 0, 300, "Say hello."},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "trash Say hello."},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "\n S Say hello.\n"},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "\nT+\n"},
+    {OP_CHECK, CHK_TRASHTOAST, 1, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "trash undo"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1500, ""},
+    {OP_CHECK, CHK_TRASHTOAST, 0, 0, 0, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "\n S Say hello.\n"},
+    {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "\nT"},
     // A host's rail folds it, from beside its sessions
     {OP_MOVE, T_NAMED, 0, 0, 300, "rail h:this"},
     {OP_SHOT, 0, 0, 0, 300, "sessions-rail"},

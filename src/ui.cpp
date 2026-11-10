@@ -8129,7 +8129,8 @@ static void rowactions(Gui *g, Arena a, SideRow *r, GuiSession *s, ImVec2 r0, Im
         dl->AddRectFilledMultiColor(v2(x0 - fadew, r0.y), v2(x0, r1.y), c0, c, c, c0);
         dl->AddRectFilled(v2(x0, r0.y), r1, c);
 
-        Str                 title = sesstitle(s);
+        // Copied, as trashing it closes its view, where the title is
+        Str                 title = clone(&a, sesstitle(s));
         Slice<GuiSession *> one   = {};
         one = push(&a, one, s);
         ImGui::SetCursorScreenPos(v2(x0 + 4*sc, y));
