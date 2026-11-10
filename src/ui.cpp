@@ -7868,6 +7868,12 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
     ImGui::InvisibleButton("##head", v2(w>1 ? w : 1, lineh + 4*sc));
     b32 click = ImGui::IsItemClicked(ImGuiMouseButton_Left);
     itemnamed(g, concat(&a, "head ", r->key));
+    if (r->key.len && !r->forced && ImGui::IsItemHovered() &&
+            ImGui::GetIO().MousePos.x < dx + 7*sc) {
+        // On its dot, which folds it as its rail does, and lights the rail
+        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        g->dothot = r->key;
+    }
     if (r->forced && ImGui::IsItemHovered()) {
         tipnow("Open while something under it needs an answer");
     } else if (r->kind==SROW_HOST && h && h->msg.len && h->state!=RS_UP) {
