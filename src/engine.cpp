@@ -5613,6 +5613,7 @@ static b32 askcall(Session *s, Arena scratch, i32 tool, GuardPath *gp)
     k->tool        = tool;
     k->gp.path     = clone(&s->perm, gp->path);
     k->gp.real     = gp->real.data ? clone(&s->perm, gp->real) : Str{};
+    k->gp.inside   = gp->inside;
     k->gp.diverged = gp->diverged;
     k->gp.config   = gp->config;
     k->hint.path   = h.path.data ? clone(&s->perm, h.path) : Str{};
@@ -5630,11 +5631,6 @@ static b32 askcall(Session *s, Arena scratch, i32 tool, GuardPath *gp)
     }
     {
         Str   why = guardwhy(&scratch, toolnames[tool], gp, s->guard.cwd);
-        if (gp->config) {
-            why = concat(&scratch, why, " It is Prospero's own configuration, "
-                         "which chooses what runs and where the agent may go, "
-                         "so each change to it is asked about.");
-        }
         Buf   b(&scratch, 512 + why.len);
         EvOut w = sbegin(s, &b, EV_ASK);
         putstrkey(&w.json, "req", k->req);

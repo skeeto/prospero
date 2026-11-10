@@ -538,14 +538,26 @@ static Str guardwhy(Arena *a, Str tool, GuardPath *gp, Str cwd)
     print(&b, tool);
     print(&b, " of ");
     print(&b, gp->path);
-    if (gp->diverged) {
-        print(&b, " leads through a symbolic link to ");
-        print(&b, gp->real.data ? gp->real : Str("an unknown place"));
-        print(&b, ", which is outside the working directory ");
+    if (gp->config && gp->inside) {
+        // Inside the working directory, yet asked about
+        print(&b, " changes Prospero's own configuration");
     } else {
-        print(&b, " is outside the working directory ");
+        if (gp->diverged) {
+            print(&b, " leads through a symbolic link to ");
+            print(&b, gp->real.data ? gp->real : Str("an unknown place"));
+            print(&b, ", which is outside the working directory ");
+        } else {
+            print(&b, " is outside the working directory ");
+        }
+        print(&b, cwd);
+        if (gp->config) {
+            print(&b, ", and changes Prospero's own configuration");
+        }
     }
-    print(&b, cwd);
+    if (gp->config) {
+        print(&b, ", which chooses what runs and where the agent may go, "
+                  "so each change to it is asked about");
+    }
     return finish(&b);
 }
 

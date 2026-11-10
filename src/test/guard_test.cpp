@@ -348,6 +348,23 @@ static void test_guard(Test *t)
     d.hint = {};
     deny   = guarddenial(a, &d);
     expect(t, "denial symlink", istr(a, find(deny, "symbolic link to /etc/passwd")>0), "1");
+
+    // Prospero's configuration is asked about wherever it is, and inside
+    // the working directory is not called outside it
+    GuardPath cg = {};
+    cg.path   = "/w/themes.ini";
+    cg.inside = 1;
+    cg.config = 1;
+    expect(t, "why config inside", guardwhy(a, "edit", &cg, "/w"),
+           "edit of /w/themes.ini changes Prospero's own configuration, which "
+           "chooses what runs and where the agent may go, so each change to it "
+           "is asked about");
+    cg.path   = "/q/prospero.ini";
+    cg.inside = 0;
+    expect(t, "why config outside", guardwhy(a, "edit", &cg, "/w"),
+           "edit of /q/prospero.ini is outside the working directory /w, and "
+           "changes Prospero's own configuration, which chooses what runs and "
+           "where the agent may go, so each change to it is asked about");
     d.gp   = guardpath(os, a, &g, "/new.txt", 0);
     d.hint = guardhint(os, a, &g, d.gp.path, 0, 1);
     deny   = guarddenial(a, &d);
