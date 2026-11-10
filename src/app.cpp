@@ -16999,7 +16999,8 @@ static b32 ctrcheck(Gui *g, Str what)
 // Containers made for sessions (--containers, tests/gui.py --mode
 // containers), against a real Docker or Podman: the runtime's row in
 // the sidebar; its New session, an image from [container] images,
-// --rcwd copied in, no network; a turn there, relayed; its session to
+// --rcwd copied in, no network; a turn there, relayed; Open in terminal
+// and a Terminal tab, both a shell inside it in /work; its session to
 // the Trash stops it; its + starts it again for New session, the session
 // left in the Trash; restored, and Delete removes it. Then a session here
 // starts a subagent in a container of its own, which the window reaches
@@ -17049,7 +17050,7 @@ static DriveOp ctrops[] = {
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_CHECK, CHK_TERMRAN, 1, 0, 0, " exec -it "},
     // And a Terminal pane's shell inside it, which its engine there
-    // runs, in its folder: the Trash then hangs it up with the session
+    // runs, in its folder
     CTRLKEY(GKEY_GRAVE, 500),
     {OP_WAIT, W_TERM, 0, 0, 20000, "/work"},
     {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
