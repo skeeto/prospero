@@ -7581,6 +7581,17 @@ static void reissue(Gui *g)
                 gitstale(g, q.s);
             }
             break;
+        case CMD_MODELS:
+            // Else listid stays and hostlist thinks one under way, so
+            // the new session dialog asks for its models forever
+            if (e->listid == q.id) {
+                e->listid = 0;
+                hostlist(g, e);
+            }
+            break;
+        case CMD_SHELLS:
+            e->shellsid = e->shellsid==q.id ? 0 : e->shellsid;  // asked again when wanted
+            break;
         case CMD_DIR:
             for (i32 k = 0; k < DIRLISTS; k++) {
                 DirList *l = &g->pc.lists[k];
