@@ -16703,10 +16703,12 @@ static DriveOp remoteops[] = {
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_WAIT, W_SESSION, 0, 0, 30000, ""},
     {OP_CHECK, CHK_REMOTESESSION, 0, 0, 0, ""},
-    // A terminal in its folder there, over ssh, from the prompt's
-    // button: an external one, as the Terminal pane has no tabs for
-    // other hosts yet
-    {OP_MOVE, T_NAMED, 0, 0, 100, "prompt terminal"},
+    // An external terminal in its folder there, over ssh, from the
+    // Session menu
+    {OP_MOVE, T_SESSMENU, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Open in external terminal"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_CHECK, CHK_TERMRAN, 1, 0, 0, "ssh -t -- here cd "},
@@ -17042,16 +17044,21 @@ static DriveOp ctrops[] = {
     {OP_WAIT, W_IDLE, 0, 0, 60000, ""},
     {OP_MARK, 0, 0, 0, 1000, ""},
     {OP_SHOT, 0, 0, 0, 300, "containers-2-turn"},
-    // Its files copied in, so no folder here to open, but a terminal in
-    // its folder inside it, by its runtime
+    // Its files copied in, so no folder here to open, but an external
+    // terminal in its folder inside it, by its runtime
     {OP_CHECK, CHK_CTR, 0, 0, 0, "nofolder"},
-    {OP_MOVE, T_NAMED, 0, 0, 100, "prompt terminal"},
+    {OP_MOVE, T_SESSMENU, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Open in external terminal"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_CHECK, CHK_TERMRAN, 1, 0, 0, " exec -it "},
-    // And a Terminal pane's shell inside it, which its engine there
-    // runs, in its folder
-    CTRLKEY(GKEY_GRAVE, 500),
+    // And the prompt's button: a Terminal pane's shell inside it, which
+    // its engine there runs, in its folder
+    {OP_MOVE, T_NAMED, 0, 0, 100, "prompt terminal"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
     {OP_WAIT, W_TERM, 0, 0, 20000, "/work"},
     {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
     {OP_TEXT, 0, 0, 0, 100, "test -d /prospero/state && echo \"inside $PWD\""},

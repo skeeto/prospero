@@ -6577,27 +6577,24 @@ static void drawprompt(Gui *g)
         ImGui::EndDisabled();
         itemnamed(g, "prompt folder");
         whytip(wwhy.len ? wwhy : concat(&a, "Open working folder: ", cwd));
-        // The Terminal pane where it can run the session's shell, else
-        // an external terminal, as other hosts' sessions have no tabs yet
-        b32 pane = !termwhy(g, s).len;
-        Str why  = pane ? Str{} : termplan(g, &a, s).why;
+        // The Terminal pane, on any host, else why not; only the fake
+        // agent, which has no terminals, opens an external one instead
+        b32 fake = g->enginekind==ENGINE_FAKE && s->host->kind==GH_ENGINE;
+        Str why  = fake ? termplan(g, &a, s).why : termwhy(g, s);
         ImGui::BeginDisabled(why.len > 0);
         if (ImGui::Button(ICON_TERMINAL "##terminal", v2(bw, 0))) {
-            if (pane) {
-                termgo(g);
-            } else {
+            if (fake) {
                 termopen(g, a, s);
+            } else {
+                termgo(g);
             }
         }
         ImGui::EndDisabled();
         itemnamed(g, "prompt terminal");
         whytip(why.len ? why :
-               pane ? Str("Terminal: its shell in its folder, in the Terminal pane (Ctrl+`)") :
-               s->host->kind==GH_REMOTE
-               ? Str("Open in external terminal: a shell in its folder there, in a "
-                     "terminal here, as the Terminal pane has no tabs for other hosts yet")
-               : Str("Open in external terminal: its shell in its folder, as the "
-                     "Terminal pane has no tabs for other hosts yet"));
+               fake ? Str("Open in external terminal: its shell in its folder, as the "
+                          "fake agent has no terminal tabs")
+                    : Str("Terminal: its shell in its folder, in the Terminal pane (Ctrl+`)"));
     }
     if (s->hist) {
         // Which of the session's messages the box holds: oldest is 1

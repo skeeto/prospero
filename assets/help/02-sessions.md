@@ -106,9 +106,8 @@ agent finished it, in local time, with the date if not today. The buttons
 beside the prompt box are icons,
 named in their tooltips: Send (a paper plane), Attach (a paper clip),
 Open working folder (a folder) and Terminal, which shows the Terminal
-pane with the session's shell in its folder, as Ctrl+` does (for a
-session on another host, which has no terminal tabs yet, it opens an
-external terminal instead, as Open in external terminal does). While the agent
+pane with the session's shell in its folder, as Ctrl+` does, on
+whatever host the session runs ([Hosts](help:hosts)). While the agent
 works, Send becomes Steer (a curved arrow), and Stop (a square) shows
 below it. The status line above the box begins with the session's
 mode, model and shell, each a list to switch it. What you send while it works waits at
