@@ -136,6 +136,15 @@ tokens sent, read from the cache and received, the requests, and the
 output's rate after the first token. Once a session was opened, its
 tooltip in the sidebar gives its time too.
 
+The session bar's gauge is how much of the model's context the
+conversation takes, a tick where compaction begins, amber as it nears;
+its tooltip has the numbers. A server that does not report the window
+shows a count of tokens instead, and the session compacts only once
+the server refuses a prompt as too long. If that refusal states the
+window, the session keeps it from then on, reopened too, and compacts
+ahead of it. Set the model's `context` in Settings to compact ahead
+from the start.
+
 Attach adds files to the message: drop them on the window, paste them,
 or pick them with the paper clip. Images go to a model that takes
 them, as pictures. Any other file goes as text, as `read` shows it:

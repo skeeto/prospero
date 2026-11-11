@@ -2867,11 +2867,19 @@ static void drawinfo(Gui *g, GuiSession *s, View *v)
 
 // The context gauge: a thin bar of the tokens the context holds, on the
 // scale of the model's window, with a tick where compaction begins, amber
-// from 90% of the way there. Nothing without the numbers.
+// from 90% of the way there. With no window known, a bar has no scale,
+// so the count alone (issue #43); nothing before there is a count.
+static b32 gaugescaled(View *v)
+{
+    return v->tokens>0 && (v->ctx>0 || v->compactat>0);
+}
+
+static char const gaugewidest[] = "999k tokens";
+
 static f32 gaugewidth(Gui *g, View *v)
 {
-    b32 any = v->tokens>0 && (v->ctx>0 || v->compactat>0);
-    return any ? 64*g->scale : 0;
+    return gaugescaled(v) ? 64*g->scale :
+           v->tokens>0    ? ImGui::CalcTextSize(gaugewidest).x : 0;
 }
 
 // The bar itself, bh high from (x, y), w wide: the session bar's, and
@@ -2978,6 +2986,10 @@ static void gaugetip(Buf *b, View *v)
     if (v->ctx > 0) {
         print(b, "\nWindow: ");
         printgrouped(b, v->ctx);
+    } else if (v->compactat <= 0) {
+        print(b, "\nWindow: unknown, as the server does not report it, so "
+                 "compaction waits until it refuses a prompt as too long. Set "
+                 "the model's context in Settings to compact ahead of that.");
     }
     print(b, "\nCached in the last request: ");
     printgrouped(b, v->cached);
@@ -2989,12 +3001,25 @@ static void drawgauge(Gui *g, View *v, f32 w)
     f32         sc    = g->scale;
     f32         h     = ImGui::GetFrameHeight();
     ImVec2      p0    = ImGui::GetCursorScreenPos();
-    f32         bh    = 5*sc;
-    b32         near  = gaugebar(g, ImGui::GetWindowDrawList(), v, p0.x, p0.y + (h - bh)/2,
-                                 w, bh, 2*sc);
+    if (gaugescaled(v)) {
+        f32 bh   = 5*sc;
+        b32 near = gaugebar(g, ImGui::GetWindowDrawList(), v, p0.x, p0.y + (h - bh)/2,
+                            w, bh, 2*sc);
+        g->gaugeshown = 1 + near;
+    } else {
+        Buf b(&a, 32);
+        printcount(&b, v->tokens);
+        print(&b, " tokens");
+        Str    label = finish(&b);
+        ImVec2 ts    = ImGui::CalcTextSize((char *)label.data, (char *)label.data+label.len);
+        ImGui::GetWindowDrawList()->AddText(v2(p0.x + w - ts.x, p0.y + (h - ts.y)/2),
+                                            ImGui::GetColorU32(ImGuiCol_TextDisabled),
+                                            (char *)label.data,
+                                            (char *)label.data+label.len);
+        g->gaugeshown = 3;
+    }
     ImGui::Dummy(v2(w, h));
     itemrect(g, RECT_GAUGE);
-    g->gaugeshown = 1 + near;
     if (ImGui::BeginItemTooltip()) {
         Buf b(&a, 256);
         gaugetip(&b, v);
@@ -8380,7 +8405,7 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other, 
             print(&tip, "\nWorked ");
             printwork(&tip, worktotal(v));
         }
-        if (v && gaugewidth(g, v)>0) {
+        if (v && gaugescaled(v)) {
             putbyte(&tip, '\n');
             gaugetip(&tip, v);
         }
@@ -8487,7 +8512,7 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other, 
     pen(&b, "  ", 0, g->pal->dim);
     pen(&b, sesswhere(&a, s), 0, g->pal->dim);
     // Its context gauge, thin along the row's foot, where a view has it
-    if (v && gaugewidth(g, v)>0 && p.x+w-4*sc-x >= 8) {
+    if (v && gaugescaled(v) && p.x+w-4*sc-x >= 8) {
         gaugebar(g, dl, v, x, r1.y - 3*sc, p.x + w - 4*sc - x, 2*sc, sc);
     }
     if (acts) {

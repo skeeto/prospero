@@ -1842,7 +1842,8 @@ struct Gui {
     b32                workedshown;  // a turn's work, in its last message's header
     i32                railfold;     // the message the fold rail last folded, plus one
     b32                railseen;     //   its header drawn in view this frame
-    i32                gaugeshown;   // the gauge drew: 1, 2 if amber
+    i32                gaugeshown;   // the gauge drew: 1, 2 if amber, 3 a count
+                                     // alone (no window known)
     i32                drivecodemsg; // the code block selectcode chose, or
     i32                drivecodeblk; //   -1 for any
     Anchor             driveanchor;  // the top edge before a resize
@@ -13436,6 +13437,7 @@ enum : i32 {
     CHK_DIAGCOPY,     // the clipboard holds the diagnostics as text, the
                       // Diagnostics page shown
     CHK_CFGSAVED,     // the settings' last edit was saved
+    CHK_GAUGECOUNT,   // the gauge is a count of tokens alone, no window known
     CHK_COUNT,
 };
 
@@ -13738,6 +13740,7 @@ static Str chknames[] = {
     "the terminal's size shows over it while it changes, or not, as said",
     "Copy all copies the diagnostics as text",
     "the settings edit was saved",
+    "with no window known, the gauge is the count of tokens",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -14743,6 +14746,14 @@ static DriveOp m3ops[] = {
     {OP_MOVE, T_GAUGE, 0, 0, 1500, ""},
     {OP_SHOT, 0, 0, 0, 300, "24-gauge"},
     {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    // No window known: the count alone, and why in its tooltip (#43)
+    {OP_GAUGE, 0, 0, 0, 300, "42000"},
+    {OP_CHECK, CHK_GAUGECOUNT, 0, 0, 0, ""},
+    {OP_MOVE, T_GAUGE, 0, 0, 1500, ""},
+    {OP_SHOT, 0, 0, 0, 300, "24-gauge-count"},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_GAUGE, 0, 131072, 104857, 300, "42000"},
+    {OP_CHECK, CHK_GAUGE, 0, 0, 0, ""},
     // An ask, allowed through its card, while the window has no focus:
     // a toast tells of it, withdrawn as it is allowed, and another of
     // the turn's end, withdrawn once the window has the focus again
@@ -21157,6 +21168,7 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_GAUGE:      return g->gaugeshown == 1;
     case CHK_GAUGEAMBER: return g->gaugeshown == 2;
+    case CHK_GAUGECOUNT: return g->gaugeshown == 3;
     case CHK_IMGQUIET: {
         // The probe's, and the overlay's numbers if shown
         i64   n     = g->total.frames - g->driveframes;

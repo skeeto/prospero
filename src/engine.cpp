@@ -788,6 +788,9 @@ struct Session {
     Str          cpfocus;    // and what to keep of it
     i64          ctxhint;    // the window as the log last gave it, shown
                              // until discovery tells (gauge)
+    i64          ovctx;      // the window a server gave in refusing a
+                             // prompt as too long, this model's, logged
+                             // (overflow_ctx) to hold when reopened
     i32          overflows;  // this step's prompts rejected as too long
     i64          ovsize;     // tokens of the first, 0 if none
     Overflow     ovinfo;     // the sizes the latest rejection gave
@@ -1128,7 +1131,19 @@ static void putgauge(Session *s, JsonOut *w, i64 tokens)
         putintkey(w, "ctx", ctx);
         putintkey(w, "compact_at", compactat(ctx));
     }
+    if (s->ovctx > 0) {
+        putintkey(w, "overflow_ctx", s->ovctx);
+    }
     putintkey(w, "tokens", tokens);
+}
+
+// A window a server gave in refusing a prompt (ovctx) caps the model's,
+// configured or discovered, from then on.
+static void ctxheed(Session *s)
+{
+    if (s->ovctx>0 && (!s->mc.ctx || s->ovctx<s->mc.ctx)) {
+        s->mc.ctx = s->ovctx;
+    }
 }
 
 static i64 estimate(Session *);
@@ -2753,6 +2768,7 @@ static void discovered(Session *s, Arena scratch, b32 ok)
                 // A configured limit holds until a server reports one
                 s->mc.ctx = s->mc.ctx && !mi.learned ? s->mc.ctx : mi.ctx;
             }
+            ctxheed(s);
             s->mc.maxout = mi.maxout;
             if (s->ep.kind == EP_COPILOT) {
                 s->ep.wire = mi.wire;  // each model its own format
@@ -2892,12 +2908,14 @@ static b32 usetarget(Session *s, Str which, Str model)
         return 0;
     }
     ModelConf mc = {};
+    s->ovctx = model==s->model ? s->ovctx : 0;
     s->ep    = ep;
     s->model = clone(&s->perm, model);
     modelconf(e, &s->perm, ep.name, s->model, &mc);
     s->mc         = mc;
     s->info       = {};
     s->discovered = 0;
+    ctxheed(s);
     s->retries    = 0;
     return 1;
 }
@@ -2991,9 +3009,10 @@ static void overflowed(Session *s, Arena scratch, Str msg)
     static i32 const pct[] = {70, 50, 35};
     Overflow o = s->ovinfo;
     s->ovinfo = {};
-    if (o.ctx>0 && (!s->mc.ctx || o.ctx<s->mc.ctx)) {
-        s->mc.ctx = o.ctx;
+    if (o.ctx>0 && (!s->ovctx || o.ctx<s->ovctx)) {
+        s->ovctx = o.ctx;
     }
+    ctxheed(s);
     if (o.prompt>0 && s->sentbytes>0) {
         s->rate.tokens = o.prompt;
         s->rate.bytes  = s->sentbytes;
@@ -18913,10 +18932,12 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             storedurl    = clone(&s->perm, jsonstr(jsonget(j, "endpoint")));
             s->thinkfrom = r.seq;
             s->ctxhint   = jsonint(jsonget(j, "ctx"), 0);
+            s->ovctx     = 0;
             break;
         case EV_ATTEMPT:
         case EV_TURNEND:
             s->ctxhint = jsonint(jsonget(j, "ctx"), s->ctxhint);
+            s->ovctx   = jsonint(jsonget(j, "overflow_ctx"), s->ovctx);
             break;
         case EV_MODE: {
             // A mode unknown here, a newer engine's, is Build
@@ -19105,6 +19126,8 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
         return 0;
     }
     modelconf(e, &s->perm, s->ep.name, s->model, &s->mc);
+    s->ovctx = s->model==storedmodel ? s->ovctx : 0;  // another model's
+    ctxheed(s);
     replayjobs(s, scratch);
     sessionready(s, scratch);
     planheed(s, scratch);  // a notice of the mode lost with its process
@@ -22905,6 +22928,7 @@ static void reconfigure(Engine *e, Arena scratch)
         mc.llamacpp = s->mc.llamacpp;  // learned by discovery
         mc.ctx      = mc.ctx ? mc.ctx : s->mc.ctx;
         s->mc = mc;
+        ctxheed(s);
     }
 }
 

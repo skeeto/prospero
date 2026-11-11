@@ -1515,6 +1515,16 @@ def sc_overflow_compact(model, n, req):
         yield from real_answer(model, req, "Fits now.")
 
 
+def sc_overflow_learned(model, n, req):
+    # As overflow_compact, then (resumed) four more reads and an answer
+    if n < 6:
+        yield from sc_overflow_compact(model, n, req)
+    elif n < 10:
+        yield from real_tool(model, req, n, "read", {"path": f"f{n-2}.txt"})
+    else:
+        yield from real_answer(model, req, "Read four more.")
+
+
 def sc_queue(model, n, req):
     # Two seconds of streaming, while another model waits its turn
     yield S.head()

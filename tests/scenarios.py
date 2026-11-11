@@ -4606,6 +4606,35 @@ def overflow_compact(t):
     t.check(r.text() == "Fits now.", f"text {r.text()!r}")
 
 
+# A server that tells no window: no n_ctx, nor --ctx-size
+NOWINDOW = {"_listing": {"meta": {}, "status": {"value": "loaded",
+                                                "args": ["llama-server"]}}}
+
+
+@scenario(conf=NOWINDOW, bound=30, alone=True)
+def overflow_learned(t):
+    """The window a server gave in refusing a prompt holds for the rest
+    of the session, reopened too: it compacts ahead of it, at the
+    threshold, where the server reports no window of its own."""
+    bigfiles(t, 8, 100)
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    t.check([c["why"] for c in r.all("compact")] == ["overflow"],
+            f"compacted for the refusal: {r.all('compact')}")
+    tries = r.all("attempt")
+    t.check(tries and "ctx" not in tries[0], f"no window at first: {tries[:1]}")
+    sid = r.events[0].get("sid")
+    ends = r.all("turn.end")
+    t.check(ends and ends[-1].get("overflow_ctx", 0) > 0 and
+            ends[-1].get("ctx") == ends[-1]["overflow_ctx"],
+            f"the window learned, logged: {ends[-1:]}")
+    r2 = t.run("again", resume=sid)
+    t.check(r2.rc == 0, f"resume exit {r2.rc}: {r2.stderr}")
+    t.check([c["why"] for c in r2.all("compact")] == ["threshold"],
+            f"reopened, compacted ahead of it: {r2.all('compact')}")
+    t.check(r2.text() == "Read four more.", f"text {r2.text()!r}")
+
+
 @scenario(conf={"_path": "router1/"}, bound=20)
 def queue(t):
     """A router with --models-max 1: a session on another model waits its
