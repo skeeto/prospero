@@ -362,15 +362,17 @@ static void test_a11ytext(Test *t)
     expect(t, "a11ytext.take", axeditstr(&a, x, 77, "hello world", 1000),
            "5-11 \" there\\nfriend !\" 20:20");
     expect(t, "a11ytext.taken", axeditstr(&a, x, 77, "hello there\nfriend !", 1000), "none");
-    expect(t, "a11ytext.emptied", istr(&a, x->mem[AXM_QUEUE].beg == x->base[AXM_QUEUE]), "1");
+    expect(t, "a11ytext.alltaken", istr(&a, axqueued(x, 77)), "0");
     rev = x->text.rev;
     axtestsync(x, &a, 0, 1, "hello there\nfriend !", 20, 20);
     expect(t, "a11ytext.caughtup", istr(&a, x->text.rev), istr(&a, rev));
     expect(t, "a11ytext.fresh", axrectstr(&a, axcharrect(x, 13)), "110,70 120,90");
 
-    // Stale: typed keys changed the bytes, so it and the next go
+    // Stale: typed keys changed the bytes, so it and the next go. The
+    // queue, all taken, starts over.
     axtestsync(x, &a, 0, 1, "hello world", 0, 0);
     axedit(x, 0, 5, "HELLO", 0, 5, 1000);
+    expect(t, "a11ytext.emptied", istr(&a, x->mem[AXM_QUEUE].beg - x->base[AXM_QUEUE] < 2048), "1");
     axedit(x, 6, 11, "WORLD", AX_AFTER, AX_AFTER, 1000);
     expect(t, "a11ytext.twoedits", x->text.text, "HELLO WORLD");
     expect(t, "a11ytext.changed", axeditstr(&a, x, 77, "jello world", 1000), "none");

@@ -1919,6 +1919,7 @@ MODES = {
     "thin":       dict(timeout=600,  default=True,  whole=False),
     "containers": dict(timeout=600,  default=False, whole=True),
     "terminal":   dict(timeout=600,  default=True,  whole=False),
+    "a11y":       dict(timeout=600,  default=True,  whole=False),
 }
 
 

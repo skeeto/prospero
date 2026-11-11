@@ -1518,6 +1518,7 @@ struct Named {
 };
 
 struct DriveOp;
+struct AxGui;
 
 struct Gui {
     Os                *os;
@@ -1924,6 +1925,8 @@ struct Gui {
     // Desktop notifications ([ui] notify, toastpass)
     u32                notify;     // NOTIFY_*
     b32                nomentions; // [ui] mentions = false: '@' is plain text
+    i32                axset;      // [ui] accessibility (AXSET_*)
+    AxGui             *ax;         // accessibility (a11y_imgui.cpp), unless off
     i32                toastids;   // the last id given a root
     b32                toastprep;  // the platform made ready
     Str                toastwhy;   // the latest refusal, said in the log
@@ -14111,6 +14114,7 @@ enum : i32 {
     OP_SHOWFILES, // Files in front, as opening a file puts it
     OP_FILESROOT, // show the first session on the remote text whose Files
                   // tabs are not empty, Files in front; none fails
+    OP_A11Y,      // an accessibility command, text (driveax)
 };
 // OP_TEXTCWD with text types the --cwd directory and text after it, on
 // Windows with backslashes, as a Windows user types a path.
@@ -22369,6 +22373,25 @@ static DriveOp idleops[] = {
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
 
+// Accessibility (--a11y): the tree an assistive tool sees, with a
+// session's prompt focused.
+static DriveOp a11yops[] = {
+    {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
+    {OP_NEWSESSION, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_A11Y, 0, 0, 0, 500, "on"},
+    {OP_A11Y, 0, 0, 0, 0, "dump"},
+    {OP_A11Y, 0, 0, 0, 0, "has menubar"},
+    {OP_A11Y, 0, 0, 0, 0, "has menuitem Session"},
+    {OP_A11Y, 0, 0, 0, 0, "has group Transcript"},
+    {OP_A11Y, 0, 0, 0, 0, "has button Send"},
+    {OP_A11Y, 0, 0, 0, 0, "focus textarea "},
+    // What is typed is the field's value, each frame
+    {OP_TEXT, 0, 0, 0, 300, "hello there"},
+    {OP_A11Y, 0, 0, 0, 0, "value hello there"},
+    {OP_QUIT, 0, 0, 0, 0, ""},
+};
+
 // With an engine: a session with a finished turn, then the same.
 static DriveOp m3idleops[] = {
     {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
@@ -27621,6 +27644,9 @@ static void drivestep(Gui *g)
         }
         filesopen(g, g->sess, 0, p.path, ref.line0, ref.line1, ref.section);
     } break;
+    case OP_A11Y:
+        driveax(g, op->text);
+        break;
     case OP_PLACE:
         if (op->dx != 0) {
             // As if saved on a display right of every display there is
@@ -27920,6 +27946,7 @@ static Str guiusage =
 "  --changes      the branch on the session bar and the Changes pane, in a\n"
 "                 --cwd that is a git repository\n"
 "  --terminal     the Terminal pane: Ctrl+`, typing, a resize, exit\n"
+"  --a11y         accessibility: the tree a tool sees, its names, focus\n"
 "  --mcp          an MCP server's page in Settings: its state, Sign in\n"
 "                 (a stand-in browser), a call from a session, Sign out\n"
 "  --hosttask     subagents on another host: opened and answered here, a\n"
@@ -28019,6 +28046,8 @@ static void readconfig(Gui *g, Arena scratch)
     g->terminal   = clone(&g->perm, cfgget(cfg, "ui", "", "terminal", 0));
     g->notify     = notifyparse(cfgget(cfg, "ui", "", "notify", 0));
     g->nomentions = cfgbool(cfgget(cfg, "ui", "", "mentions", 0)) == 0;
+    i32 axset = axsetparse(cfgget(cfg, "ui", "", "accessibility", 0));
+    g->axset = axset<0 ? AXSET_AUTO : axset;
     g->termscroll  = termscrollparse(cfgget(cfg, "terminal", "", "scrollback", 0));
     g->termcopysel = cfgbool(cfgget(cfg, "terminal", "", "copy_on_select", 0)) == 1;
     g->pathpre    = clone(&g->perm, cfgget(cfg, "tools", "", "path_prepend", 0));
@@ -28130,7 +28159,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     b32 subprocess = 0, fake = 0, e2e = 0, settings = 0, enginestop = 0;
     b32 background = 0, attach = 0, remote = 0, compose = 0, sidebar = 0, plan = 0;
     b32 launch = 0, first = 0, mcp = 0, hosttask = 0, changes = 0, thin = 0;
-    b32 terminal = 0;
+    b32 terminal = 0, a11y = 0;
     b32 containers = 0;
     i64 history = 0;
     Str opendir = {};  // prospero DIR, as given
@@ -28181,6 +28210,8 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
             changes = probe = 1;
         } else if (a == "--terminal") {
             terminal = probe = 1;
+        } else if (a == "--a11y") {
+            a11y = probe = 1;
         } else if (a == "--mcp") {
             mcp = probe = 1;
         } else if (a == "--hosttask") {
@@ -28263,9 +28294,12 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->enginekind = fake ? ENGINE_FAKE : subprocess ? ENGINE_SUBPROCESS : ENGINE_INPROC;
     if (drive || idle || streamtest || e2e || settings || enginestop ||
             background || attach || remote || compose || sidebar || plan || launch ||
-            first || mcp || hosttask || changes || thin || containers || terminal) {
+            first || mcp || hosttask || changes || thin || containers || terminal || a11y) {
         g->drive = 1;
-        if (terminal) {
+        if (a11y) {
+            g->ops  = a11yops;
+            g->nops = countof(a11yops);
+        } else if (terminal) {
             g->ops  = termops;
             g->nops = countof(termops);
         } else if (containers) {
@@ -28510,6 +28544,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     io.ConfigErrorRecoveryEnableAssert = 0;
     // Panes close from their tabs alone, not each dock node as well
     ImGui::GetStyle().DockingNodeHasCloseButton = 0;
+    axinit(g, g->axset);
     g->basestyle = ImGui::GetStyle();
     g->sysdark   = 1;  // until the window opens and the platform says
     applytheme(g);
