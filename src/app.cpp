@@ -1734,6 +1734,7 @@ struct Gui {
     b32                termfocus;    // focus the terminal when next drawn
     GuiSession        *termaddto;    // root wanting a new tab once sized
     i32                closeterms;   // busy tabs the quit dialog counted
+    i32                closejobs;    // sessions with jobs it counted
     i32                termscroll;   // [terminal] scrollback, for new tabs
     i32                termregions;  // tabs' blocks reserved, for the drive
     b32                termwaitshown; // the front tab showed Reconnecting, for the drive
@@ -4625,6 +4626,23 @@ static i32 running(Gui *g)
     i32 n = 0;
     for (GuiSession *s = g->sessions; s; s = s->next) {
         n += s->host->kind==GH_ENGINE && sessbusy(s);
+    }
+    return n;
+}
+
+// Sessions of this process's engine between turns, but with background
+// jobs running, which quitting would kill (#39). A job's end starts the
+// agent's next turn, so the session's work isn't done, and it may go on
+// in the background as a turn does.
+static i32 jobbing(Gui *g)
+{
+    if (g->enginegone || g->host) {
+        return 0;
+    }
+    i32 n = 0;
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        n += s->host->kind==GH_ENGINE && !sessbusy(s) && s->view &&
+             !s->readonly && s->view->jobsrun>0;
     }
     return n;
 }
@@ -11676,7 +11694,7 @@ static void gui_close(Gui *g)
         shedlater(g, 0);
         return;
     }
-    if (!g->quitting && !running(g) && !elsewhere(g) && !termbusy(g)) {
+    if (!g->quitting && !running(g) && !jobbing(g) && !elsewhere(g) && !termbusy(g)) {
         startquit(g);
         return;
     }
@@ -13151,6 +13169,7 @@ enum : i32 {
     CHK_JOBSDRAWN,
     CHK_JOBSQUIET,
     CHK_CLOSEBG,
+    CHK_CLOSEJOBS,
     CHK_SHED,
     CHK_REOPENED,
     CHK_BGDONE,
@@ -13492,6 +13511,7 @@ static Str chknames[] = {
     "a job's output drawn a few times a second, the Jobs tab shown",
     "no frames for a job's output, the Jobs tab hidden",
     "closing offers to keep the turn running in the background",
+    "closing between turns, a job running, offers the background",
     "the window is gone, and this process hosts its engine, registered",
     "the window came back, a client of its own host",
     "the turn finished in the background, its whole answer shown",
@@ -14946,6 +14966,15 @@ static DriveOp m3ops[] = {
     {OP_UP, 0, 0, 0, 1500, ""},
     {OP_MARK, 0, 0, 0, 5000, ""},
     {OP_CHECK, CHK_JOBSQUIET, 0, 0, 0, ""},
+    // Closing between turns, the job running, asks first, offering the
+    // background (#39); Cancel goes back
+    {OP_CLOSE, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_CLOSEJOBS, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "10b-close-jobs"},
+    {OP_MOVE, T_CLOSECANCEL, 0, 0, 200, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
     {OP_MOVE, T_JOBSTAB, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 500, ""},
@@ -22169,6 +22198,14 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_CLOSEBG: {
         Rect r = g->rects[RECT_CLOSEBG];
         return r.x1>r.x0 && !g->whynobg.len && running(g)==1;
+    }
+    case CHK_CLOSEJOBS: {
+        // Asked for by a session between turns, its job running: the
+        // background offered (enabled or not, as the engine allows)
+        ImGuiWindow *w = ImGui::GetTopMostPopupModal();
+        Rect         r = g->rects[RECT_CLOSEBG];
+        return w && find({(u8 *)w->Name, (iz)__builtin_strlen(w->Name)}, "Quit")>=0 &&
+               r.x1>r.x0 && !running(g) && jobbing(g)==1 && g->closejobs==1;
     }
     case CHK_SHED: {
         // Registered, listening, and nothing drawn any more

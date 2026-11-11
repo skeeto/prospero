@@ -10974,15 +10974,17 @@ static void drawnew(Gui *g)
     ImGui::EndPopup();
 }
 
-// Closing the window with turns running asks first: stop them and quit,
-// or keep them running in the background, this process a host of them
-// with no window. Sessions at work on other hosts run on either way.
+// Closing the window with turns, or background jobs, running asks
+// first: stop them and quit, or keep them running in the background,
+// this process a host of them with no window. Sessions at work on other
+// hosts run on either way.
 static void drawclose(Gui *g)
 {
     f32 sc = g->scale;
     if (g->closereq) {
         g->closereq = 0;
-        if (!g->quitting && !running(g) && !elsewhere(g) && !termbusy(g)) {
+        if (!g->quitting && !running(g) && !jobbing(g) && !elsewhere(g) &&
+                !termbusy(g)) {
             startquit(g);
         } else if (!g->quitting) {
             g->hosterr = {};
@@ -11003,19 +11005,31 @@ static void drawclose(Gui *g)
         ImGui::TextUnformatted("Going to the background...");
     } else {
         i32 n = running(g);
+        i32 j = jobbing(g);
         i32 m = elsewhere(g);
         i32 t = termbusy(g);
         g->closeterms = t;
+        g->closejobs  = j;
         Buf b(&a, 128);
         print(&b, "Stop ");
-        print(&b, (i64)n);
-        print(&b, n==1 ? Str(" session and quit") : Str(" sessions and quit"));
+        print(&b, (i64)(n + j));
+        print(&b, n+j==1 ? Str(" session and quit") : Str(" sessions and quit"));
         Str label = finish(&b);
         if (n) {
             ImGui::TextUnformatted("Turns are still running. Quitting stops them, and kills "
                                    "their commands; in the background they go on, with no "
                                    "window.");
-        } else if (!t) {
+        }
+        if (j) {
+            Buf e(&a, 256);
+            print(&e, (i64)j);
+            print(&e, j==1 ? Str(" session between turns has background jobs running")
+                           : Str(" sessions between turns have background jobs running"));
+            print(&e, ", which quitting kills. In the background they go on, and "
+                      "an agent waiting for one picks up when it ends.");
+            ImGui::TextUnformatted(cstr0(&a, finish(&e)));
+        }
+        if (!n && !j && !t) {
             ImGui::TextUnformatted("Nothing is running here any more.");
         }
         if (t) {
@@ -11035,12 +11049,12 @@ static void drawclose(Gui *g)
             ImGui::TextUnformatted(cstr0(&a, finish(&e)));
             g->elseshown = 1;
         }
-        b32 stop = ImGui::Button(cstr0(&a, n ? label : Str("Quit")));
+        b32 stop = ImGui::Button(cstr0(&a, n+j ? label : Str("Quit")));
         itemrect(g, RECT_CLOSESTOP);
         if (stop) {
             startquit(g);
         }
-        if (n) {
+        if (n + j) {
             ImGui::SameLine();
             ImGui::BeginDisabled(g->whynobg.len != 0);
             b32 bg = ImGui::Button("Keep running in background");
