@@ -377,6 +377,19 @@ static void axtipv(char const *fmt, __builtin_va_list ap)
     }
 }
 
+// The last item is checked now or not, as a checkbox or a radio is (its
+// role, axrole): a checkbox's press toggles it.
+static void axchecked(Gui *g, b32 on)
+{
+    AxItem *it = axlastitem(g);
+    if (it) {
+        it->state = on ? it->state|AXS_CHECKED : it->state&~AXS_CHECKED;
+        if (it->role==AX_CHECKBOX && (it->actions & AXA_PRESS)) {
+            it->actions = (it->actions & ~AXA_PRESS) | AXA_TOGGLE;
+        }
+    }
+}
+
 static void axname(Gui *g, Str name)
 {
     AxItem *it = axlastitem(g);
@@ -402,6 +415,12 @@ static void axrole(Gui *g, AxRole role)
     if (it) {
         it->role = role;
         it->info = 1;
+        if (role==AX_NONE || role==AX_TEXT || role==AX_IMAGE || role==AX_GROUP) {
+            // Nothing to press, though ImGui's flags said a button: a
+            // menu (axmenu) and the keyboard (axfocusable) stay
+            it->actions &= ~(AXA_PRESS|AXA_TOGGLE|AXA_EXPAND);
+            it->state   &= ~(AXS_CHECKED|AXS_EXPANDED);
+        }
     }
 }
 
@@ -774,6 +793,7 @@ static void axstart(Gui *g)
 //   focus ROLE NAME  check that the focus has them
 //   value TEXT       check the focus's value
 //   help ROLE NAME   check that a node has them, and help
+//   can ACTS ROLE NAME  check the node's actions: press,menu, or nothing
 //   edit LO HI TEXT  edit the focused field: check that it's taken
 //   noedit LO HI TEXT  ... or refused
 //   select A C       select in the focused field
@@ -854,6 +874,33 @@ static void driveax(Gui *g, Str cmd)
             found |= axmatch(t->nodes+i, r.head, r.tail) && t->nodes[i].help.len;
         }
         axcheck(g, &a, found, concat(&a, "accessible help: ", c.tail));
+    } else if (verb == "can") {
+        // can ACTIONS ROLE NAME: the first node so named offers just those
+        // actions, a comma between, or "nothing"
+        static Str const acts[] = {"press", "toggle", "expand", "focus", "edit", "select", "menu"};
+        Cut  rn   = cut(r.tail, ' ');
+        u32  want = 0;
+        for (Cut w = cut(r.head, ','); w.head.len; w = cut(w.tail, ',')) {
+            for (i32 k = 0; k < countof(acts); k++) {
+                want |= w.head==acts[k] ? 1u<<k : 0;
+            }
+        }
+        i32 i = 0;
+        for (; i<t->len && !axmatch(t->nodes+i, rn.head, rn.tail); i++) {}
+        u32 got  = i<t->len ? t->nodes[i].actions : ~0u;
+        Str what = concat(&a, "accessible actions: ", c.tail);
+        if (i<t->len && got!=want) {
+            Buf b(&a, 64);
+            print(&b, ", not");
+            for (i32 k = 0; k < countof(acts); k++) {
+                if (got & (1u<<k)) {
+                    putbyte(&b, ' ');
+                    print(&b, acts[k]);
+                }
+            }
+            what = concat(&a, what, finish(&b));
+        }
+        axcheck(g, &a, got==want, what);
     } else if (verb == "focus") {
         b32 ok = t->focus>=0 && axmatch(t->nodes+t->focus, r.head, r.tail);
         Str what = concat(&a, "accessible focus: ", c.tail);

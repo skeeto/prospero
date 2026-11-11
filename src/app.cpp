@@ -20806,6 +20806,16 @@ static DriveOp a11yops[] = {
     KEY(GKEY_BACKSPACE, 0, 300),
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
 
+    // The transcript's text, a group named for it beside the pane of
+    // that name, and its menu, asked for by the tool, on no message: its
+    // menu all it offers, made a button though it is
+    {OP_A11Y, 0, 0, 0, 0, "can menu group Transcript"},
+    {OP_A11Y, 0, 0, 0, 0, "can press button Send"},
+    {OP_A11Y, 0, 0, 0, 300, "menu group Transcript"},
+    {OP_A11Y, 0, 0, 0, 0, "has menuitem Copy Message"},
+    {OP_A11Y, 0, 0, 0, 0, "has menuitem Select All"},
+    KEY(GKEY_ESCAPE, 0, 300),
+
     // Then quiet: nothing pending asks for frames
     {OP_MARK, 0, 0, 0, 11000, ""},
     {OP_MARK, 0, 0, 0, 3000, ""},

@@ -84,6 +84,7 @@ static void axtipv(char const *fmt, __builtin_va_list ap);
 static void axkey(Gui *, u32);
 // Names and roles that a label and ImGui's flags can't give the last
 // item, and its context menu (a11y_imgui.cpp)
+static void axchecked(Gui *, b32 on);
 static void axname(Gui *, Str);
 static void axrole(Gui *, AxRole);
 static void axmenu(Gui *);
@@ -1278,6 +1279,20 @@ static Str markwhat(Gui *g, Arena *a, ViewMsg *m)
     return m->text;
 }
 
+// What a foldable message's header says first, as drawheader pens it:
+// its toggle's name.
+static Str headername(View *v, ViewMsg *m)
+{
+    b32 live = v->busy && v->stream>=0 && &v->msgs[v->stream]==m &&
+               v->streamkind==VIEW_THINK && !m->faded;
+    switch (m->role) {
+    case VIEW_TOOL:    return m->tool->name.len ? m->tool->name : Str("call");
+    case VIEW_COMPACT: return "Compacted";
+    case VIEW_THINK:   return live ? Str("Thinking\xe2\x80\xa6") : Str("Reasoning");
+    default:           return m->label.len ? m->label : rolename(m->role);
+    }
+}
+
 // Returns where a tool row's summary went along the line, x0 to x1, to
 // be a link to its file; empty for none.
 static ImVec2 drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
@@ -2129,6 +2144,7 @@ static void drawthumb(Gui *g, GuiSession *s, ImDrawList *dl, Str path, i32 w, i3
     if (ImGui::InvisibleButton("##thumb", v2(th.w, th.h))) {
         imgopen(g, s, path, w, h);
     }
+    axname(g, user || !path.len ? Str("Open pasted image") : concat(&a, "Open ", basename(path)));
     if (user) {
         itemnamed(g, "user image");
     } else {
@@ -2364,7 +2380,10 @@ static f32 questionform(Gui *g, GuiSession *s, ViewMsg *m, f32 width, b32 draw,
                 ImGui::PushID((i32)(i*8 + k));
                 ImGui::SetCursorScreenPos(v2(o.x, o.y+y));
                 ImGui::BeginDisabled(off);
-                if (ImGui::InvisibleButton("##opt", v2(width, rowh))) {
+                b32 pick = ImGui::InvisibleButton("##opt", v2(width, rowh));
+                axname(g, q->header.len ? concat(&a, concat(&a, q->header, ": "), opt->label)
+                                        : opt->label);
+                if (pick) {
                     touched = 1;
                     if (q->multi) {
                         f->pick[i][k] = !on;
@@ -2375,6 +2394,8 @@ static f32 questionform(Gui *g, GuiSession *s, ViewMsg *m, f32 width, b32 draw,
                         f->other[i] = 0;
                     }
                 }
+                axrole(g, q->multi ? AX_CHECKBOX : AX_RADIO);
+                axchecked(g, f->pick[i][k]);
                 ImGui::EndDisabled();
                 Buf nb(&a, 64);
                 print(&nb, "question ");
@@ -2434,13 +2455,17 @@ static f32 questionform(Gui *g, GuiSession *s, ViewMsg *m, f32 width, b32 draw,
             ImVec2 c   = v2(o.x + 11*sc, o.y + y + 2*sc + frame/2);
             ImGui::SetCursorScreenPos(v2(o.x, o.y+y+2*sc));
             ImGui::BeginDisabled(off);
-            if (ImGui::InvisibleButton("##otherpick", v2(indent, frame))) {
+            b32 pick = ImGui::InvisibleButton("##otherpick", v2(indent, frame));
+            axname(g, q->header.len ? concat(&a, q->header, ": Other") : Str("Other"));
+            if (pick) {
                 touched = 1;
                 f->other[i] = !f->other[i];
                 for (iz j = 0; j<4 && f->other[i] && !q->multi; j++) {
                     f->pick[i][j] = 0;
                 }
             }
+            axrole(g, q->multi ? AX_CHECKBOX : AX_RADIO);
+            axchecked(g, f->other[i]);
             if (q->multi) {
                 ImVec2 c0 = v2(c.x-6*sc, c.y-6*sc), c1 = v2(c.x+6*sc, c.y+6*sc);
                 if (f->other[i]) {
@@ -2670,6 +2695,7 @@ static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
         if (penbutton(g, "##always", runs, styles, countof(runs))) {
             guianswer(g, s, t->req, "always", {});
         }
+        axname(g, concat(&a, runs[0], concat(&a, runs[1], runs[2])));
         if (latest) itemrect(g, RECT_ALWAYS);
         if (desk) {
             itemtip("Allow this action, and every %s action from now on in "
@@ -3849,8 +3875,8 @@ struct TextHit {
 // double click a word, a triple click a block, with Shift extending)
 // and a drag extends it, scrolling past an edge toward the mouse,
 // faster the further. Right clicks are the caller's, on the button,
-// which stays the last item.
-static TextHit textmouse(Gui *g, TextArea *ta)
+// which stays the last item, named for the document (assistive tools).
+static TextHit textmouse(Gui *g, TextArea *ta, Str name)
 {
     View       *v     = ta->v;
     f32         sc    = g->scale;
@@ -3862,6 +3888,8 @@ static TextHit textmouse(Gui *g, TextArea *ta)
     ImGui::SetNextItemAllowOverlap();
     ImGui::InvisibleButton("##text", v2(ImGui::GetWindowWidth() - st.ScrollbarSize, ta->winh),
                            ImGuiButtonFlags_MouseButtonLeft|ImGuiButtonFlags_MouseButtonRight);
+    axrole(g, AX_GROUP);  // not a control: its text isn't a tool's yet, its menu is
+    axname(g, name);
     ImGuiIO &io = ImGui::GetIO();
     b32 hovered = ImGui::IsItemHovered();
     b32 active  = ImGui::IsItemActive();
@@ -3888,6 +3916,7 @@ static TextHit textmouse(Gui *g, TextArea *ta)
         }
     }
 
+    // a11y: the mouse's selection, at the place under it
     if (r.hit && ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
         i32 clicks = ImGui::GetMouseClickedCount(ImGuiMouseButton_Left);
         if (io.KeyShift && v->sel.active) {
@@ -3935,12 +3964,16 @@ static Str  codelinkat(Gui *, Arena, View *, TextHit, LinkFrom *);
 static void codelinkhostend(Gui *, u64);
 static void filelinkitems(Gui *);
 
-// The text's context menu, if it opened on the last item: Copy and Copy
-// as Markdown, which the caller may follow with items of its own before
-// endtextmenu. With copyrect not negative, Copy is that RECT_*.
-static b32 begintextmenu(Gui *g, View *v, i32 copyrect)
+// The text's context menu, if it opened on the last item, or asked
+// opens it: Copy and Copy as Markdown, which the caller may follow with
+// items of its own before endtextmenu. With copyrect not negative, Copy
+// is that RECT_*.
+static b32 begintextmenu(Gui *g, View *v, i32 copyrect, b32 asked = 0)
 {
-    if (!ImGui::BeginPopupContextItem("##textmenu")) {
+    if (uirclicked(g) || asked) {
+        ImGui::OpenPopup("##textmenu");
+    }
+    if (!ImGui::BeginPopup("##textmenu")) {
         return 0;
     }
     filelinkitems(g);
@@ -4172,13 +4205,16 @@ static Str textlink(Gui *g, View *v, TextHit hit, u64 *press, i32 *pressmsg, Lin
         }
     }
     // The release that opens the text's menu, even over a menu open
-    // already (which the press closed): what it is over is the menu's
+    // already (which the press closed): what it is over is the menu's.
+    // a11y: a menu a tool opens is over no link, and has no file's items
     if (ImGui::IsMouseReleased(ImGuiMouseButton_Right) &&
             ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByPopup)) {
         Str at = hit.hit && hit.body ? doclinkat(msgdoc(v, hit.at.msg), hit.at.off) : Str{};
         at = at.len ? at : codelinkat(g, a, v, hit, from);
         filelinkmark(g, at, from);
     }
+    // a11y: links are spans of the text, not items, until its text is a
+    // tool's: each would need its runs' rectangles, which only drawing has
     if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
         b32 on = link.len && !ImGui::GetIO().KeyShift &&
                  ImGui::GetMouseClickedCount(ImGuiMouseButton_Left)==1;
@@ -4207,6 +4243,7 @@ static void toolpathlink(Gui *g, View *v, i32 i, f32 x0, f32 x1, f32 top, f32 h,
     ViewTool *t = v->msgs[i].tool;
     ImGui::SetCursorScreenPos(v2(x0, top));
     b32 go = ImGui::InvisibleButton("##path", v2(x1 - x0, h));
+    axname(g, concat(&a, "Open ", t->file.path));
     if (g->drive) {
         Buf b(&a, 32);
         print(&b, "toolpath ");
@@ -4287,7 +4324,7 @@ static f64 lineslay(View *v, Gui *g, f32 width, f32 charw, f32 lineh, f64 y0, f6
     return viewtops(v, width, charw, lineh);
 }
 
-static Str drawlines(Gui *g, DocView *d, char const *id, DocLines *dl)
+static Str drawlines(Gui *g, DocView *d, char const *id, Str name, DocLines *dl)
 {
     View       *v     = d->v;
     f32         sc    = g->scale;
@@ -4408,7 +4445,7 @@ static Str drawlines(Gui *g, DocView *d, char const *id, DocLines *dl)
     f32    sx   = dl->wrap ? 0 : ImGui::GetScrollX();
     TextArea ta = {v, wpos, wh, width, pad, pad, ImGui::GetScrollY(), &d->dragging,
                    &d->scrollto, gutter, sx, 1, 0, 0};
-    TextHit hit  = textmouse(g, &ta);
+    TextHit hit  = textmouse(g, &ta, name);
     Str     link = textlink(g, v, hit, &d->press, &d->pressmsg, &d->from);
     if (begintextmenu(g, v, -1)) {
         endtextmenu(g, v);
@@ -4545,10 +4582,10 @@ static Str drawlines(Gui *g, DocView *d, char const *id, DocLines *dl)
 // once laid out. Returns the destination of a link clicked, if any,
 // which is the caller's to follow. With dl, it is a file's lines,
 // drawn by drawlines.
-static Str drawdoc(Gui *g, DocView *d, char const *id, f32 fit = 0, DocLines *lines = 0)
+static Str drawdoc(Gui *g, DocView *d, char const *id, Str name, f32 fit = 0, DocLines *lines = 0)
 {
     if (lines) {
-        return drawlines(g, d, id, lines);
+        return drawlines(g, d, id, name, lines);
     }
     View       *v     = d->v;
     f32         sc    = g->scale;
@@ -4601,7 +4638,7 @@ static Str drawdoc(Gui *g, DocView *d, char const *id, f32 fit = 0, DocLines *li
     ImVec2   wpos = ImGui::GetWindowPos();
     TextArea ta   = {v, wpos, ImGui::GetWindowHeight(), width, pad, pad,
                      ImGui::GetScrollY(), &d->dragging, &d->scrollto, 0, 0, 0, &d->from, 0};
-    TextHit hit  = textmouse(g, &ta);
+    TextHit hit  = textmouse(g, &ta, name);
     Str     link = textlink(g, v, hit, &d->press, &d->pressmsg, &d->from);
     if (begintextmenu(g, v, -1)) {
         endtextmenu(g, v);
@@ -4721,9 +4758,11 @@ static void drawfind(Gui *g, View *v, f64 scrolly, ImVec2 r0, ImVec2 r1)
 
     ImGui::SameLine();
     b32 prev = ImGui::ArrowButton("##findprev", ImGuiDir_Up);
+    axname(g, "Previous match");
     itemtip("The previous match (Shift+Enter)");
     ImGui::SameLine();
     b32 next = ImGui::ArrowButton("##findnext", ImGuiDir_Down);
+    axname(g, "Next match");
     itemrect(g, RECT_FINDNEXT);
     itemtip("The next match (Enter)");
     ImGui::SameLine();
@@ -5253,7 +5292,7 @@ static void drawgreeting(Gui *g, ImVec2 wpos, f32 winh, f32 width)
         docset(g->greeting, {(u8 *)greetingmd, countof(greetingmd)});
     }
     ImGui::SetCursorScreenPos(v2(wpos.x + (width - wrap)/2, wpos.y + winh/3));
-    Str link = drawdoc(g, g->greeting, "##greeting", wrap);
+    Str link = drawdoc(g, g->greeting, "##greeting", "Welcome", wrap);
     if (link.len) {
         followlink(g, link);
     }
@@ -5488,17 +5527,18 @@ static void drawtranscript(Gui *g)
     // headers' toggles and the asks' buttons, made later, overlap.
     TextArea ta  = {v, wpos, winh, width, pad, head, scrolly, &g->dragging, &g->scrollto,
                     0, 0, 0, 0, 1};
-    TextHit  hit  = textmouse(g, &ta);
+    TextHit  hit  = textmouse(g, &ta, "Transcript");
     LinkFrom from = filelinkfrom(g->sess, hit.hit ? msgcwd(v, hit.at.msg) : v->cwd);
     Str      link = textlink(g, v, hit, &g->linkpress, &g->linkmsg, &from);
     itemrect(g, RECT_TRANSCRIPT);
     if (link.len) {
         followlink(g, link, &from);
     }
-    if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
-        g->menumsg = hit.hit ? hit.at.msg : -1;  // the popup takes the hover from here on
+    b32 asked = axmenuasked(g, ImGui::GetItemID());  // a11y: a tool's or the keyboard's, on no message
+    if (ImGui::IsItemClicked(ImGuiMouseButton_Right) || asked) {
+        g->menumsg = hit.hit && !asked ? hit.at.msg : -1;  // the popup takes the hover from here on
     }
-    if (begintextmenu(g, v, RECT_COPYITEM)) {
+    if (begintextmenu(g, v, RECT_COPYITEM, asked)) {
         b32 onmsg = g->menumsg>=0 && g->menumsg<v->msgs.len;
         if (ImGui::MenuItem("Copy Message", 0, false, onmsg)) {
             copymessage(g, g->menumsg);
@@ -5614,6 +5654,7 @@ static void drawtranscript(Gui *g)
             if (ImGui::InvisibleButton("##toggle", v2(width - actw, head))) {
                 togglemsg(v, i);
             }
+            axname(g, headername(v, m));
             if (m->role == VIEW_COMPACT) {
                 itemrect(g, RECT_COMPACTHDR);
             } else if (m->role == VIEW_THINK) {
@@ -5639,6 +5680,7 @@ static void drawtranscript(Gui *g)
         if (folds && r1-r0>=1) {
             ImGui::SetCursorScreenPos(v2(wpos.x, r0));
             b32 go  = ImGui::InvisibleButton("##rail", v2(x - wpos.x, r1 - r0));
+            axrole(g, AX_NONE);  // the header's toggle, at its side
             b32 hov = ImGui::IsItemHovered() || ImGui::IsItemActive();
             itemrect(g, RECT_RAIL);
             if (hov) {
@@ -5736,6 +5778,7 @@ static void drawtranscript(Gui *g)
         ImGui::SetNextItemWidth(360*sc);
         b32 go = ImGui::InputText("##note", g->denynote, FIELD_MAX,
                                   ImGuiInputTextFlags_EnterReturnsTrue);
+        axname(g, "Note for the agent");
         // Opening the note, then writing it, starts the ask's clock over,
         // so its deadline cannot deny the call mid-sentence
         if (g->denytimed && (ImGui::IsWindowAppearing() || ImGui::IsItemEdited())) {
@@ -10074,7 +10117,7 @@ static void drawplan(Gui *g)
         return;  // on its way
     }
     f->doc->from = filelinkfrom(s, termcwd(s));
-    Str link = drawdoc(g, f->doc, "##plan");
+    Str link = drawdoc(g, f->doc, "##plan", "Plan");
     if (link.len) {
         followlink(g, link, &f->doc->from);
     }
@@ -13277,7 +13320,7 @@ static void drawcfgdiags(Gui *g)
         docset(g->diagdoc, doc);
         g->diaghash = hash(doc);
     }
-    Str link = drawdoc(g, g->diagdoc, "##diags");
+    Str link = drawdoc(g, g->diagdoc, "##diags", "Diagnostics");
     if (link.len) {
         followlink(g, link);
     }
@@ -14467,7 +14510,7 @@ static void drawlog(Gui *g)
         docset(g->logdoc, mdcodeblock(&a, g->logs));
         g->logshown = g->logn;
     }
-    drawdoc(g, g->logdoc, "##log");
+    drawdoc(g, g->logdoc, "##log", "Log");
 }
 
 // The fonts' licenses, which their files ask to be shown.
@@ -14623,7 +14666,7 @@ static void drawhelp(Gui *g)
         }
         namedrect(g, "help topics", at, v2(at.x+w, at.y+ImGui::GetFrameHeight()));
     }
-    Str link = drawdoc(g, g->helpdoc, "##helppage");
+    Str link = drawdoc(g, g->helpdoc, "##helppage", "Help");
     itemnamed(g, "help text");
     helppick(g, pick);
     if (hit >= 0) {

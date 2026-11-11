@@ -2454,7 +2454,7 @@ static void drawfiles(Gui *g)
         d->from.win   = ft->win;
         d->from.opens = 1;
         d->from.file  = ft->path;
-        Str link = drawdoc(g, d, "##filetext");
+        Str link = drawdoc(g, d, "##filetext", "File");
         itemnamed(g, "file text");
         if (link.len) {
             followlink(g, link, &d->from);
@@ -2477,7 +2477,7 @@ static void drawfiles(Gui *g)
     dl->band1 = fileclamp(ft->band1, lines);
     dl->jump0 = ft->jump && !ft->jumped ? fileclamp(ft->band0, lines) : 0;
     dl->jump1 = dl->jump0 ? fileclamp(ft->band1, lines) : 0;
-    drawdoc(g, b->text, "##filetext", 0, dl);
+    drawdoc(g, b->text, "##filetext", "File", 0, dl);
     itemnamed(g, "file text");
     if (dl->jumped) {
         ft->jumped  = 1;
