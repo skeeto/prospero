@@ -72,6 +72,8 @@ struct AxAct {
     u32 id;
     i32 kind;
     i64 when;
+    i32 tries;  // deliveries so far
+    b32 seen;   // its item was submitted since the last delivery
     b32 done;
 };
 
@@ -124,8 +126,11 @@ void ImGuiTestEngineHook_ItemAdd(ImGuiContext *ctx, ImGuiID id, ImRect const &bb
     it.itemflags = item->ItemFlags;
     x->items = push(&x->mem, x->items, it);
     x->last  = x->items.len - 1;
-    if (x->nacts && x->acts[0].id==id && ctx->NavActivateId==id) {
-        x->acts[0].done = 1;  // it landed
+    if (x->nacts && x->acts[0].id==id) {
+        x->acts[0].seen = 1;
+        if (ctx->NavActivateId == id) {
+            x->acts[0].done = 1;  // it landed
+        }
     }
 }
 
@@ -214,6 +219,8 @@ extern "C" int prospero_axedit(unsigned id, char const *text, int len, ProsperoA
     return 1;
 }
 
+enum { AXVALUE_MAX = 1<<16 };
+
 extern "C" void prospero_axfield(ProsperoAxField const *f)
 {
     AxGui *x = axgui(ImGui::GetCurrentContext());
@@ -221,11 +228,21 @@ extern "C" void prospero_axfield(ProsperoAxField const *f)
         return;
     }
     AxFieldDraw d = {};
+    // Only the active field's text is needed whole, for editing; the
+    // others are their values, of which a start says enough.
+    Str text = {(u8 *)f->text, f->text && !f->toolong ? f->len : 0};
+    if (!f->active && text.len>AXVALUE_MAX) {
+        iz n = AXVALUE_MAX;
+        while (n>0 && (text[n]&0xc0)==0x80) {
+            n--;
+        }
+        text = takehead(text, n);
+    }
     d.id       = f->id;
-    d.flags    = f->flags;
+    d.flags    = f->flags | (f->toolong ? ImGuiInputTextFlags_ReadOnly : 0);
     d.active   = f->active;
     d.password = !f->text;
-    d.text     = clone(&x->mem, Str{(u8 *)f->text, f->text ? f->len : 0});
+    d.text     = clone(&x->mem, text);
     d.hint     = clone(&x->mem, axcstr(f->hint));
     d.anchor   = f->anchor;
     d.caret    = f->caret;
@@ -385,12 +402,13 @@ static void axbuild(AxGui *x, ImGuiContext *ctx)
         if (w->DockIsActive) {
             role   = AX_GROUP;  // a pane, docked in its host
             parent = w->ParentWindow ? w->ParentWindow->ID : 0;
+        } else if (flags & ImGuiWindowFlags_ChildMenu) {
+            role   = AX_MENU;  // a submenu, under the menu it opened from
+            parent = w->ParentWindow ? w->ParentWindow->ID : 0;
         } else if (flags & ImGuiWindowFlags_ChildWindow) {
             role   = AX_GROUP;
             parent = w->ParentWindow ? w->ParentWindow->ID : 0;
             name   = {};
-        } else if (flags & ImGuiWindowFlags_ChildMenu) {
-            role = AX_MENU;
         } else if (flags & ImGuiWindowFlags_Modal) {
             role   = AX_DIALOG;
             state |= AXS_MODAL;
@@ -470,8 +488,9 @@ static void axbuild(AxGui *x, ImGuiContext *ctx)
     x->publishes++;
 }
 
-// Whether a modal dialog is open, and the node isn't in it: ImGui's
-// activation ignores modals, as a click on what is under one never does.
+// Whether a modal dialog is open and the node is under it: neither in it
+// nor in a popup or menu over it. ImGui's activation ignores modals, as a
+// click on what is under one never does.
 static b32 axblocked(AxGui *x, u32 key)
 {
     ImGuiWindow *m = ImGui::GetTopMostPopupModal();
@@ -480,7 +499,8 @@ static b32 axblocked(AxGui *x, u32 key)
     }
     AxTree *t = x->ax->pub;
     for (i32 i = axfind(t, key); i >= 0; i = t->nodes[i].parent) {
-        if (t->nodes[i].key == m->ID) {
+        ImGuiWindow *w = ImGui::FindWindowByID(t->nodes[i].key);
+        if (w && (w->RootWindow==m || ImGui::IsWindowAbove(w->RootWindow, m))) {
             return 0;
         }
     }
@@ -489,14 +509,15 @@ static b32 axblocked(AxGui *x, u32 key)
 
 // The first pending action, as ImGui's activation of its item, unless the
 // app asked for one already, for this frame. Until ItemAdd sees it land,
-// it is asked again each frame, for as long as an edit may wait.
+// it is asked again, a few times: not when its item went unsubmitted.
 static void axdeliver(AxGui *x, ImGuiContext *ctx)
 {
     Gui *g = x->g;
     i32  n = 0;
     for (i32 i = 0; i < x->nacts; i++) {
         AxAct *a = x->acts + i;
-        if (!a->done && g->sched.now-a->when<=AXEDIT_TTL) {
+        b32 gone = a->tries>0 && !a->seen;
+        if (!a->done && !gone && a->tries<8 && g->sched.now-a->when<=AXEDIT_TTL) {
             x->acts[n++] = *a;
         }
     }
@@ -509,8 +530,11 @@ static void axdeliver(AxGui *x, ImGuiContext *ctx)
         a->done = 1;  // refused, as a click would be
     } else if (!ctx->NavNextActivateId && !ctx->NavMoveSubmitted) {
         ctx->NavNextActivateId    = a->id;
-        ctx->NavNextActivateFlags = a->kind==AXACT_FOCUS ? ImGuiActivateFlags_TryToPreserveState
-                                                         : ImGuiActivateFlags_None;
+        ctx->NavNextActivateFlags = a->kind==AXACT_FOCUS
+                                  ? ImGuiActivateFlags_PreferInput|ImGuiActivateFlags_TryToPreserveState
+                                  : ImGuiActivateFlags_None;
+        a->tries++;
+        a->seen = 0;
     }
     scheddirty(&g->sched);  // until it lands
 }

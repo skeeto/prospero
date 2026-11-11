@@ -380,10 +380,23 @@ static void test_a11ytext(Test *t)
     axtestsync(x, &a, 0, 1, "jello world", 1, 1);
     expect(t, "a11ytext.resync", x->text.text, "jello world");
 
-    // Waiting too long for its field
+    // Waiting too long for its field: it and the edits counting on it go
     axedit(x, 0, 0, ">", AX_AFTER, AX_AFTER, 0);
+    axedit(x, 1, 1, "<", AX_AFTER, AX_AFTER, AXEDIT_TTL);
     expect(t, "a11ytext.expired", axeditstr(&a, x, 77, "jello world", AXEDIT_TTL+1), "none");
     expect(t, "a11ytext.expiredgone", istr(&a, axqueued(x, 77)), "0");
+
+    // An insertion, after a key typed first: the length tells
+    axtestsync(x, &a, 0, 1, "hello", 0, 0);
+    axedit(x, 5, 5, "x", AX_AFTER, AX_AFTER, 0);
+    expect(t, "a11ytext.typedfirst", axeditstr(&a, x, 77, "Qhello", 0), "none");
+    axtestsync(x, &a, 0, 1, "Qhello", 1, 1);
+    expect(t, "a11ytext.typedtext", x->text.text, "Qhello");
+
+    // Bytes not UTF-8 are U+FFFD, as ImGui takes them
+    axedit(x, 6, 6, "\xff!", AX_AFTER, AX_AFTER, 0);
+    expect(t, "a11ytext.notutf8", x->text.text, "Qhello\xef\xbf\xbd!");
+    axeditstr(&a, x, 77, "Qhello", 0);
 
     // Ranges not in the text; a selection set with the caret given
     // after the text as it was put in, before cleaning
