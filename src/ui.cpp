@@ -82,6 +82,12 @@ static void tipv(char const *fmt, __builtin_va_list ap)
 static void axtip(Str);
 static void axtipv(char const *fmt, __builtin_va_list ap);
 static void axkey(Gui *, u32);
+// Names and roles that a label and ImGui's flags can't give the last
+// item, and its context menu (a11y_imgui.cpp)
+static void axname(Gui *, Str);
+static void axrole(Gui *, AxRole);
+static void axmenu(Gui *);
+static b32  axmenuasked(Gui *, u32);
 
 // The last item clicked, or pressed by other means: the keyboard's Space
 // on it, or an assistive tool (ImGui's activation)
@@ -89,6 +95,18 @@ static b32 uiclicked()
 {
     ImGuiID id = ImGui::GetItemID();
     return ImGui::IsItemClicked(ImGuiMouseButton_Left) || (id && GImGui->NavActivateId==id);
+}
+
+// The last item's context menu asked for, as ImGui's
+// BeginPopupContextItem takes it (a right click's release, or the Menu
+// key or Shift+F10 on the keyboard's item), or by an assistive tool:
+// open it then. Marks the item as having one.
+static b32 uirclicked(Gui *g)
+{
+    axmenu(g);
+    ImGuiID id = ImGui::GetItemID();
+    return ImGui::IsPopupOpenRequestForItem(ImGuiPopupFlags_MouseButtonRight, id) ||
+           axmenuasked(g, id);
 }
 
 static void itemtip(char const *fmt, ...) IM_FMTARGS(1);

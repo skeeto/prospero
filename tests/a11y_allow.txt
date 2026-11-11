@@ -1,0 +1,6 @@
+# Controls an assistive tool may see with no name, for tests/gui.py
+# --a11y-lint: one pattern a line (fnmatch, * and ?), matched against
+# what the GUI logs, "ROLE in WINDOW: LABEL", where WINDOW and LABEL are
+# ImGui's own (with their ## parts). Prefer naming the control (axname,
+# a visible label, an icon in a11y.cpp's table) to a line here; each
+# line says why it can't be.

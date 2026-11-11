@@ -577,6 +577,10 @@ if(NOT CMAKE_CROSSCOMPILING OR PROSPERO_CROSS_TESTS)
     add_test(NAME slots COMMAND ${UV} run
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/slots.py)
     set_tests_properties(slots PROPERTIES SKIP_RETURN_CODE 77)
+    # The sources, for controls drawn by hand or clicks read from the
+    # mouse that the accessibility tree can't name or press
+    add_test(NAME a11ylint COMMAND ${UV} run
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/a11ylint.py)
     # The suites bound how long the harness takes, which a machine kept
     # busy by other suites can miss through no fault of the harness's: a
     # Raspberry Pi's SD card stalls for seconds under writes from several
