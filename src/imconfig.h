@@ -25,3 +25,47 @@
 // process, so one GUI mistake must not end every session.
 extern "C" void prospero_imassert(char const *expr, char const *file, int line);
 #define IM_ASSERT(e) ((e) ? (void)0 : prospero_imassert(#e, __FILE__, __LINE__))
+
+// Accessibility (a11y_imgui.cpp). With the test engine's hooks compiled
+// in, ImGui reports each item as it adds it, but only while its context
+// has TestEngineHookItems set: otherwise each costs one branch.
+#define IMGUI_ENABLE_TEST_ENGINE
+
+// The patched copy of imgui_widgets.cpp (FetchGui.cmake, imgui_a11y.h)
+// asks for the edits an assistive tool queued for the active text
+// field, and tells where each text field drew its text. Both only while
+// TestEngineHookItems is set.
+
+// An edit to a text field: bytes [lo, hi) of its text become the given
+// text, then the selection runs from anchor to caret (bytes, in the
+// text after). With lo < 0 it only sets the selection.
+struct ProsperoAxEdit {
+    int         lo, hi;
+    char const *text;
+    int         len;
+    int         anchor, caret;
+};
+// The next edit for field id, given its text now; 0 when none is left.
+extern "C" int prospero_axedit(unsigned id, char const *text, int len, ProsperoAxEdit *);
+
+// A text field as drawn: its text and where each line went, in the
+// window's coordinates. Offsets are bytes of text.
+struct ProsperoAxField {
+    unsigned     id;
+    int          flags;         // its ImGuiInputTextFlags
+    int          active;        // being edited, with a caret
+    char const  *text;          // null for a password field
+    int          len;
+    char const  *hint;          // the placeholder showing, or null
+    float        x, y;          // the first line's top left, scrolled
+    float        clip[4];       // what shows of it: x0, y0, x1, y1
+    float        lineh;
+    int const   *lines;         // where each line starts, when active
+    int          nlines;
+    int          vis0, vis1;    // the lines that show, [vis0, vis1)
+    float const *xs;            // for each line that shows, in order, the
+    int          nxs;           // x of each byte from its start through
+                                // its end (one more than its length)
+    int          anchor, caret; // the selection, when active
+};
+extern "C" void prospero_axfield(ProsperoAxField const *);

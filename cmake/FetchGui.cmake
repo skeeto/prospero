@@ -149,12 +149,46 @@ file(COPY_FILE ${imgui_draw_patched}.new ${imgui_draw_patched} ONLY_IF_DIFFERENT
 file(REMOVE ${imgui_draw_patched}.new)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${IMGUI}/imgui_draw.cpp)
 
+# Accessibility: InputTextEx applies the edits an assistive tool queued
+# for the active field, and tells where each field drew its text
+# (src/imgui_a11y.h). A copy of imgui_widgets.cpp has the calls spliced
+# in, made at configure time as imgui_draw.cpp's is. Each anchor must
+# appear exactly once.
+function(imgui_splice var anchor code what)
+  string(FIND "${${var}}" "${anchor}" first)
+  string(FIND "${${var}}" "${anchor}" last REVERSE)
+  if(first LESS 0 OR NOT first EQUAL last)
+    message(FATAL_ERROR "imgui_widgets.cpp: ${what} has changed; "
+                        "update the accessibility patch in FetchGui.cmake")
+  endif()
+  string(REPLACE "${anchor}" "${code}${anchor}" text "${${var}}")
+  set(${var} "${text}" PARENT_SCOPE)
+endfunction()
+file(READ ${IMGUI}/imgui_widgets.cpp imgui_widgets_text)
+imgui_splice(imgui_widgets_text
+  "bool ImGui::InputTextEx("
+  "#include \"${PROJECT_SOURCE_DIR}/src/imgui_a11y.h\"  // prospero\n\n"
+  "InputTextEx's definition")
+imgui_splice(imgui_widgets_text
+  "        // Update render selection flag after events have been handled"
+  "        if (g.TestEngineHookItems && !is_readonly)  // prospero\n            prospero_axinput(g, state, id, callback, callback_user_data);\n\n"
+  "the comment after InputTextEx's paste")
+imgui_splice(imgui_widgets_text
+  "    // Render blinking cursor"
+  "    if (g.TestEngineHookItems)  // prospero\n        prospero_axdraw(g, state, id, flags, is_password, hint, buf_display, buf_display_end,\n                        draw_pos - draw_scroll, clip_rect, wrap_width);\n\n"
+  "the comment before InputTextEx's caret")
+set(imgui_widgets_patched ${CMAKE_CURRENT_BINARY_DIR}/imgui-patched/imgui_widgets.cpp)
+file(WRITE ${imgui_widgets_patched}.new "${imgui_widgets_text}")
+file(COPY_FILE ${imgui_widgets_patched}.new ${imgui_widgets_patched} ONLY_IF_DIFFERENT)
+file(REMOVE ${imgui_widgets_patched}.new)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${IMGUI}/imgui_widgets.cpp)
+
 add_library(imgui STATIC
   ${IMGUI}/imgui.cpp
   ${IMGUI}/imgui_demo.cpp
   ${imgui_draw_patched}
   ${IMGUI}/imgui_tables.cpp
-  ${IMGUI}/imgui_widgets.cpp
+  ${imgui_widgets_patched}
   ${IMGUI}/misc/freetype/imgui_freetype.cpp
 )
 target_include_directories(imgui SYSTEM PUBLIC ${IMGUI} ${IMGUI}/backends)
