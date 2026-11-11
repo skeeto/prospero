@@ -1419,6 +1419,17 @@ def sc_compaction(model, n, req):
         yield from real_answer(model, req, "All files read.")
 
 
+def sc_compact_reasoning(model, n, req):
+    # sc_compaction's reads, each step reasoning but never replying
+    if n < 8:
+        yield S.head()
+        yield from think(model, f"Clue {n}: the bug is near line {n}.")
+        yield from call(model, 0, f"call_{n}", "read", {"path": f"f{n}.txt"}, 2)
+        yield from real_finish(model, req, "tool_calls")
+    else:
+        yield from real_answer(model, req, "All files read.")
+
+
 def sc_compact_heed_now(model, n, req):
     # Two turns of sc_compaction's reads, each compacting
     if n % 9 < 8:

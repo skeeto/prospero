@@ -126,6 +126,95 @@ static void test_compact(Test *t)
                istr(a, endswith(newest, taketail(all, 40))), "1");
     }
 
+    // Reasoning the agent never surfaced in a text, within each user
+    // turn, goes in, its end (issue #41)
+    {
+        // Messages of one block each, or a think and then a block
+        auto user = [&](Str text) {
+            Msg m = {};
+            m.role = ROLE_USER;
+            m.text = text;
+            return m;
+        };
+        auto said = [&](Str think, i32 type, Str text) {
+            Msg m = {};
+            m.role = ROLE_ASSISTANT;
+            Block k[2] = {};
+            k[0].type = BLOCK_THINK;
+            k[0].text = think;
+            k[1].type = type;
+            k[1].text = text;
+            k[1].name = "read";
+            k[1].args = "{}";
+            Block *p = alloc<Block>(a, 2);
+            p[0] = k[0];
+            p[1] = k[1];
+            m.blocks = {p, 2, 2};
+            return m;
+        };
+        Msg tool = testmsg(a, ROLE_TOOL, 10, {});
+
+        // Silent: every step's reasoning
+        Slice<Msg> h = {};
+        h = push(a, h, user("Find the bug."));
+        h = push(a, h, said("think one", BLOCK_CALL, {}));
+        h = push(a, h, tool);
+        h = push(a, h, said("think two", BLOCK_CALL, {}));
+        h = push(a, h, tool);
+        Str s = transcript(a, tmp, h, 0, h.len, 0);
+        expect(t, "silent one", istr(a, find(s, "[assistant reasoning]\nthink one\n") > 0), "1");
+        expect(t, "silent two", istr(a, find(s, "[assistant reasoning]\nthink two\n") > 0), "1");
+
+        // A reply later in the turn surfaces what came before it
+        h = push(a, h, said("think three", BLOCK_TEXT, "Found it."));
+        s = transcript(a, tmp, h, 0, h.len, 0);
+        expect(t, "said", istr(a, find(s, "[assistant reasoning]")), "-1");
+
+        // A new user turn starts again: the earlier turn's silence kept
+        Slice<Msg> g = {};
+        g = push(a, g, user("Find the bug."));
+        g = push(a, g, said("think one", BLOCK_CALL, {}));
+        g = push(a, g, tool);
+        g = push(a, g, user("And?"));
+        g = push(a, g, said("think two", BLOCK_TEXT, "Here."));
+        s = transcript(a, tmp, g, 0, g.len, 0);
+        expect(t, "turn kept", istr(a, find(s, "think one") > 0), "1");
+        expect(t, "turn said", istr(a, find(s, "think two")), "-1");
+
+        // In one message: reasoning after its text is kept
+        Slice<Msg> f = {};
+        f = push(a, f, user("Go."));
+        Msg m = said("before", BLOCK_TEXT, "Reading.");
+        Block *p = alloc<Block>(a, 3);
+        p[0] = m.blocks[0];
+        p[1] = m.blocks[1];
+        p[2].type = BLOCK_THINK;
+        p[2].text = "after";
+        m.blocks = {p, 3, 3};
+        f = push(a, f, m);
+        s = transcript(a, tmp, f, 0, f.len, 0);
+        expect(t, "message before", istr(a, find(s, "before")), "-1");
+        expect(t, "message after", istr(a, find(s, "[assistant reasoning]\nafter\n") > 0), "1");
+
+        // Long reasoning: its end, marked as cut
+        Buf lb(a, 5000);
+        for (i32 i = 0; i < 400; i++) print(&lb, "pondering ");
+        print(&lb, "so the fix is in parse.c");
+        Slice<Msg> l = {};
+        l = push(a, l, user("Go."));
+        l = push(a, l, said(finish(&lb), BLOCK_CALL, {}));
+        s = transcript(a, tmp, l, 0, l.len, 0);
+        expect(t, "long end", istr(a, find(s, "so the fix is in parse.c\n") > 0), "1");
+        expect(t, "long cut", istr(a, find(s, "[assistant reasoning]\n[... ") > 0), "1");
+        expect(t, "long bounded", istr(a, s.len < 3000), "1");
+
+        // The prompt says what it is only when there is some
+        Str with = summaryprompt(a, {}, s, 300, {}, 0);
+        Str none = summaryprompt(a, {}, "[user]\nhi\n\n", 300, {}, 0);
+        expect(t, "prompt with", istr(a, find(with, "unseen by the user") > 0), "1");
+        expect(t, "prompt none", istr(a, find(none, "unseen by the user")), "-1");
+    }
+
     // The request: text only, the template, the previous summary
     {
         ModelConf mc = {};

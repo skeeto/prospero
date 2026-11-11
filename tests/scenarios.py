@@ -4415,6 +4415,23 @@ SMALL = {"_listing": {"meta": {"n_ctx": 25500, "n_ctx_train": 262144}}}
 
 
 @scenario(conf=SMALL, bound=25, alone=True)
+def compact_reasoning(t):
+    """A model that reasons between its calls and never replies: the
+    summarizer is given that reasoning, as nothing else says it (#41)."""
+    bigfiles(t, 8, 150)
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    cps = r.all("compact")
+    t.check(len(cps) == 1 and cps[0]["kind"] == "summary", f"one summary: {cps}")
+    asks = t.compactions()
+    t.check(asks, "the summarizer was asked")
+    ask = str(asks[0]["body"]["messages"][-1]["content"]) if asks else ""
+    t.check("[assistant reasoning]\nClue 0: the bug is near line 0." in ask,
+            f"the reasoning given: {ask[-2000:]!r}")
+    t.check("unseen by the user" in ask, "and said what it is")
+
+
+@scenario(conf=SMALL, bound=25, alone=True)
 def compaction(t):
     """A small window: the older reads are summarized, the newest stay
     verbatim, the turn carries on, and a resumed session replays the

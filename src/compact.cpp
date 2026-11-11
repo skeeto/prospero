@@ -16,7 +16,9 @@
 //    prunes a little less each time and never summarizes.
 // 2. Summarize: the older messages go to the compactor, a model asked
 //    for text only, which writes a summary in fixed sections; a later
-//    compaction updates the previous summary. The newest 20k tokens
+//    compaction updates the previous summary. It is given the texts,
+//    calls and results, and of the reasoning only the end of what no
+//    text of its user turn followed (transcript). The newest 20k tokens
 //    stay verbatim, cut at a message that is not a tool result, so that
 //    a call keeps its result. The summary ends with the files the calls
 //    read and wrote, kept by the harness. One over 16384 tokens, or
@@ -43,6 +45,7 @@ enum : i64 {
     COMPACT_TOOLIN   = 3 << 10,   // bytes of a tool result summarized
     COMPACT_TEXTIN   = 16 << 10,  // bytes of a message summarized
     COMPACT_ARGSIN   = 2 << 10,   // bytes of a call's arguments
+    COMPACT_THINKIN  = 2 << 10,   // bytes of reasoning, its end
     COMPACT_MINUSER  = 4096,      // tokens a compaction the user asks
                                   // for must summarize, at least
 };
@@ -217,12 +220,48 @@ static Str clip(Arena *a, Str s, iz max)
     return finish(&b);
 }
 
-// The messages h[beg, cut) as plain text for the summarizer: reasoning
-// left out, long texts clipped, and at most the newest limit bytes of
-// it (0 for no limit).
+// A text's last max bytes or so, marked as cut.
+static Str cliptail(Arena *a, Str s, iz max)
+{
+    if (s.len <= max) {
+        return s;
+    }
+    Str tail = utf8tail(s, max);
+    Buf b(a, tail.len + 64);
+    print(&b, "[... ");
+    print(&b, (i64)(s.len - tail.len));
+    print(&b, " bytes omitted ...]\n");
+    print(&b, tail);
+    return finish(&b);
+}
+
+static Str const thinkmark = "[assistant reasoning]\n";
+
+// The messages h[beg, cut) as plain text for the summarizer: long texts
+// clipped, and at most the newest limit bytes of it (0 for no limit).
+// Reasoning is left out but for what the agent never surfaced: within
+// each user turn, the reasoning after its last text, or all of it with
+// none, each block's end. A model that works in its reasoning, between
+// tool calls, can go a whole compaction without a reply (issue #41),
+// which would leave the summary its calls and results alone.
 static Str transcript(Arena *a, Arena scratch, Slice<Msg> h, iz beg, iz cut,
                       iz limit)
 {
+    // Walking back: whether a later message of the same user turn has a
+    // text, after which this one's reasoning is left out
+    b32 *later = alloc<b32>(&scratch, cut>beg ? cut-beg : 1);
+    b32  said  = 0;
+    for (iz i = cut-1; i >= beg; i--) {
+        Msg *m = &h[i];
+        later[i-beg] = said;
+        if (m->role == ROLE_USER) {
+            said = 0;
+        }
+        for (iz k = 0; k<m->blocks.len && m->role==ROLE_ASSISTANT; k++) {
+            said |= m->blocks[k].type==BLOCK_TEXT && trim(m->blocks[k].text).len;
+        }
+    }
+
     Slice<Str> parts = {};
     for (iz i = beg; i < cut; i++) {
         Msg *m = &h[i];
@@ -241,10 +280,20 @@ static Str transcript(Arena *a, Arena scratch, Slice<Msg> h, iz beg, iz cut,
             print(&b, clip(&scratch, m->text, COMPACT_TOOLIN));
             print(&b, "\n\n");
             break;
-        case ROLE_ASSISTANT:
+        case ROLE_ASSISTANT: {
+            iz lasttext = -1;
             for (iz k = 0; k < m->blocks.len; k++) {
                 Block *bk = &m->blocks[k];
-                if (bk->type==BLOCK_TEXT && trim(bk->text).len) {
+                lasttext = bk->type==BLOCK_TEXT && trim(bk->text).len ? k : lasttext;
+            }
+            for (iz k = 0; k < m->blocks.len; k++) {
+                Block *bk  = &m->blocks[k];
+                b32    raw = !later[i-beg] && k>lasttext;  // never surfaced
+                if (bk->type==BLOCK_THINK && raw && trim(bk->text).len) {
+                    print(&b, thinkmark);
+                    print(&b, cliptail(&scratch, trim(bk->text), COMPACT_THINKIN));
+                    print(&b, "\n\n");
+                } else if (bk->type==BLOCK_TEXT && trim(bk->text).len) {
                     print(&b, "[assistant]\n");
                     print(&b, clip(&scratch, bk->text, COMPACT_TEXTIN));
                     print(&b, "\n\n");
@@ -256,7 +305,7 @@ static Str transcript(Arena *a, Arena scratch, Slice<Msg> h, iz beg, iz cut,
                     print(&b, "\n\n");
                 }
             }
-            break;
+        } break;
         }
         parts = push(&scratch, parts, finish(&b));
     }
@@ -344,6 +393,12 @@ static Str summaryprompt(Arena *a, Str prev, Str convo, i64 words, Str focus,
                   "<previous-summary>\n");
         print(&u, prev);
         print(&u, "\n</previous-summary>\n");
+    }
+    if (find(convo, thinkmark) >= 0) {
+        print(&u, "\nThe agent's reasoning, under " "[assistant reasoning]" ", is "
+                  "its own, unseen by the user: the end of each part it "
+                  "wrote no reply after. Keep its findings and decisions "
+                  "as you would a reply's.\n");
     }
     print(&u, "\n<conversation>\n");
     print(&u, convo);
