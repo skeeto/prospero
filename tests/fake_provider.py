@@ -986,6 +986,9 @@ def sc_resume_cap(model, n, req):
         yield from answer(model, "Saw: " + last_user(req)[:60])
 
 
+sc_resume_unlimited = sc_resume_cap
+
+
 def sc_instructions_changed(model, n, req):
     yield from answer(model, f"Answer number {n}.")
 

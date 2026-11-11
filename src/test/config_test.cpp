@@ -1086,7 +1086,7 @@ static void testcfgjson(Test *t)
         "guard//temp=allow*\n"
         "tools//job_timeout=1800*\n"
         "tools//job_timeout_max=7200*\n"
-        "tools//auto_resume=5*\n"
+        "tools//auto_resume=30*\n"
         "tools//stop_grace=*\n"
         "tools//shell=auto*\n"
         "tools//shells=*\n"

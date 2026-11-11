@@ -6059,16 +6059,30 @@ static void jobstop(Session *s, Job *j, i32 why)
     jobarm(s);
 }
 
-static b32 canresume(Session *s)
+// [tools] auto_resume: turns an hour, 0 for none, or negative for no
+// limit.
+static i64 resumecap(Engine *e)
 {
-    Engine *e   = s->e;
-    i64     cap = parseint(trim(cfgget(e->cfg, "tools", "", "auto_resume", 0))).val;
-    i64     now = os_ticks(e->os);
-    i64     n   = 0;
+    return parseint(trim(cfgget(e->cfg, "tools", "", "auto_resume", 0))).val;
+}
+
+// Turns the session started by itself in the last hour.
+static i64 resumedhour(Session *s)
+{
+    i64 now = os_ticks(s->e->os);
+    i64 n   = 0;
     for (iz i = 0; i < s->resumed.len; i++) {
         n += now - s->resumed[i] < 3600*SEC;
     }
-    return !e->quitting && !s->readonly && !s->closed && n<cap;
+    return n;
+}
+
+static b32 canresume(Session *s)
+{
+    Engine *e   = s->e;
+    i64     cap = resumecap(e);
+    b32     ok  = cap<0 || resumedhour(s)<cap;
+    return !e->quitting && !s->readonly && !s->closed && ok;
 }
 
 // The hop of the messages waiting that may wake the session, the most
@@ -6106,6 +6120,27 @@ static void autoresume(Session *s, Arena scratch)
     s->resumed = push(&s->perm, s->resumed, os_ticks(s->e->os));
     s->wake    = 0;
     beginturn(s, scratch, "job");
+}
+
+// Why a job's end started no turn, and what to do about it.
+static Str resumespent(Session *s, Arena *a)
+{
+    i64 cap = resumecap(s->e);
+    Buf b(a, 512);
+    print(&b, "a background job ended while this session was idle, ");
+    if (cap == 0) {
+        print(&b, "and [tools] auto_resume = 0 keeps it from starting a turn "
+                  "by itself");
+    } else {
+        print(&b, "but it already started ");
+        print(&b, resumedhour(s));
+        print(&b, " turns by itself in the last hour, as many as [tools] "
+                  "auto_resume allows");
+    }
+    print(&b, ". The agent hears of it at the next prompt. Raise "
+              "auto_resume, or set it to -1 for no limit, to have the "
+              "session go on by itself.");
+    return finish(&b);
 }
 
 static Str jobnotice(Session *s, Arena *a, Job *j, i64 bytes)
@@ -6238,9 +6273,8 @@ static void jobend(Session *s, Arena scratch, Job *j)
     if (resume) {
         autoresume(s, scratch);
     } else if (!busy(s) && !s->closed && !s->e->quitting) {
-        note(s, scratch, "info", "a background job ended while this "
-             "session already resumed by itself as often as allowed "
-             "([tools] auto_resume); the agent hears of it at the next prompt");
+        Str why = resumespent(s, &scratch);
+        note(s, scratch, "info", why);
     }
     taskcheck(s, scratch, "done", {});  // a subagent waiting for its jobs
 }
@@ -16001,7 +16035,7 @@ static void jobconf(Session *s)
     max = max<1 ? 1 : max;
     s->te.jobmax     = max;
     s->te.jobtimeout = dft<1 ? 1 : dft>max ? max : dft;
-    s->te.resume     = parseint(trim(cfgget(cfg, "tools", "", "auto_resume", 0))).val > 0;
+    s->te.resume     = parseint(trim(cfgget(cfg, "tools", "", "auto_resume", 0))).val != 0;
 }
 
 // Discover the session's instruction files, unless its log told which

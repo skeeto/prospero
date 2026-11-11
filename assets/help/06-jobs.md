@@ -34,7 +34,8 @@ agent is told.
   for another limit (1800 by default, at most `job_timeout_max`, 7200).
 - `[tools] auto_resume`: when a job ends while the session is idle,
   the session starts a turn by itself to report it, at most this many
-  times an hour (5 by default; 0 for never).
+  times an hour (30 by default; 0 for never, -1 for no limit). Past
+  that, the job's end waits for your next message, and a note says so.
 
 While it may resume, the agent is told so, and that it may end its turn
 to wait for a job rather than check on it. One that reads a running

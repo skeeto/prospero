@@ -1440,7 +1440,8 @@ def resume_cap(t):
         je = h.wait(lambda e: e.get("ev") == "job.end" and e.get("job") == 2)
         t.check(not je.get("resume"), f"the second does not: {je}")
         note = h.wait(lambda e: e.get("ev") == "note" and e.get("sid") == sid)
-        t.check("auto_resume" in note["text"], f"note {note}")
+        t.check("auto_resume" in note["text"] and "1 turns" in note["text"] and
+                "-1 for no limit" in note["text"], f"note {note}")
         time.sleep(0.3)
         t.check(len(h.all("turn", sid)) == 2, "no third turn by itself")
         h.send("prompt", sid=sid, text="what happened?")
@@ -1448,6 +1449,23 @@ def resume_cap(t):
         last = t.requests()[-1]["body"]["messages"]
         t.check("Background job 2 ended" in last[-1]["content"] and
                 last[-2]["content"] == "what happened?", f"told at the prompt: {last[-2:]}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf={"_tools": {"auto_resume": -1}}, bound=15)
+def resume_unlimited(t):
+    """auto_resume = -1 sets no limit: each job's end starts a turn."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="go")
+        for job, turn in ((1, 2), (2, 3)):
+            je = h.wait(lambda e: e.get("ev") == "job.end" and e.get("job") == job)
+            t.check(je.get("resume") == 1, f"job {job} resumes: {je}")
+            h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid and e.get("turn") == turn)
+        t.check(not h.all("note", sid), f"no note: {h.all('note', sid)}")
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")
