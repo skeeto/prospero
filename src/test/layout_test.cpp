@@ -6,6 +6,13 @@ static f32 fixedadvance(void *, i32 style, i32)
     return style&STYLE_HMASK ? 20 : 10;
 }
 
+// Code wider than prose, 12 units a character: tab stops in code are
+// its own spaces
+static f32 wideadvance(void *, i32 style, i32)
+{
+    return style&STYLE_HMASK ? 20 : style&STYLE_CODE ? 12 : 10;
+}
+
 static FontMetrics fixedfont(void *, i32 style)
 {
     FontMetrics f = {};
@@ -185,6 +192,18 @@ static void test_layout(Test *t)
         MsgLayout    ml    = layoutmsg(&cache, &a, &m, d, 200, 1);
         expect(t, "layout.hittab", istr(&a, msghit(&m, d, &ml, 20, 10)), "5");
         expect(t, "layout.hitb", istr(&a, msghit(&m, d, &ml, 46, 10)), "6");
+    }
+
+    // Tab stops in code are 4 of the code font's spaces, not prose's
+    {
+        Arena        a     = perm;
+        Measure      m     = fixedmeasure();
+        LayoutCache *cache = 0;
+        m.advance = wideadvance;
+        Doc         *d     = parsedoc(&a, "```\na\tb\n```", 0);
+        MsgLayout    ml    = layoutmsg(&cache, &a, &m, d, 200, 1);
+        expect(t, "layout.tabmono", layoutshow(&a, d, &ml.blocks[0]),
+               "8:8[a]20[>]56[b]68[/] ");
     }
 
     // The cache: one layout per (content, width), surviving re-parses

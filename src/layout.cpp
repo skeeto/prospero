@@ -222,8 +222,7 @@ static void addrun(Wrap *w, i32 piece, iz b0, iz b1, f32 adv, u32 flags)
 // Lay out pieces [p0, p1) of the layout's pieces from the current pen.
 static void wrappieces(Wrap *w, i32 p0, i32 p1)
 {
-    Measure *m      = w->m;
-    f32      spacew = m->advance(m->ctx, 0, ' ');
+    Measure *m = w->m;
     for (i32 p = p0; p < p1; p++) {
         Piece *pc = &w->pieces[p];
         wrapfont(w, pc->style);
@@ -257,7 +256,9 @@ static void wrappieces(Wrap *w, i32 p0, i32 p1)
             f32 adv   = 0;
             u32 flags = 0;
             if (cp=='\t' && w->code) {
-                f32 tab = 4*spacew;
+                // Stops every 4 of its own font's spaces: code's, not
+                // the prose font's
+                f32 tab = 4*m->advance(m->ctx, pc->style, ' ');
                 f32 col = w->x - w->x0;
                 adv   = tab*(f32)((i32)(col/tab) + 1) - col;
                 flags = RUN_NODRAW;
