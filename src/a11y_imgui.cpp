@@ -45,6 +45,7 @@ struct AxItem {
     Str    label;
     Str    name;       // from axname
     b32    named;
+    Str    help;       // its tooltip's text
 };
 
 // A text field as drawn this frame, copied from its report
@@ -234,13 +235,49 @@ extern "C" void prospero_axfield(ProsperoAxField const *f)
 // Names and roles that labels and flags cannot give, right after the
 // item. A no-op while off.
 
+// ImGui's last item, if it had an ID, so hooks; among the last few
+// added, since a widget may add parts after itself (a multiline field's
+// child window).
 static AxItem *axlastitem(Gui *g)
 {
-    AxGui *x = g->ax && g->ax->on ? g->ax : 0;
-    if (!x || x->last<0 || x->items[x->last].id!=ImGui::GetItemID()) {
-        return 0;  // the last item had no ID, so no hooks
+    AxGui *x  = g && g->ax && g->ax->on ? g->ax : 0;
+    u32    id = x ? ImGui::GetItemID() : 0;
+    if (!id) {
+        return 0;
     }
-    return &x->items[x->last];
+    for (iz i = x->items.len-1, stop = i-8; i>=0 && i>stop; i--) {
+        if (x->items[i].id == id) {
+            return &x->items[i];
+        }
+    }
+    return 0;
+}
+
+static Gui *axguiof()
+{
+    return (Gui *)ImGui::GetIO().UserData;
+}
+
+// The last item's help: its tooltip's text, formatted only while on,
+// for an item with a node.
+static void axtip(Str help)
+{
+    Gui    *g  = axguiof();
+    AxItem *it = axlastitem(g);
+    if (it) {
+        it->help = clone(&g->ax->mem, help);
+    }
+}
+
+static void axtipv(char const *fmt, __builtin_va_list ap)
+{
+    Gui    *g  = axguiof();
+    AxItem *it = axlastitem(g);
+    if (it) {
+        char const *beg, *end;
+        ImFormatStringToTempBufferV(&beg, &end, fmt, ap);
+        it->help = clone(&g->ax->mem, span((u8 *)beg, (u8 *)end));
+    }
 }
 
 static void axname(Gui *g, Str name)
@@ -353,6 +390,9 @@ static void axbuild(AxGui *x, ImGuiContext *ctx)
         if (f && !f->password) {
             axsetvalue(b, n, f->text);
         }
+        if (it->help.len) {
+            axsethelp(b, n, it->help);  // read when asked: no event
+        }
     }
 
     // The field being edited is the focus, else the keyboard's item, else
@@ -459,6 +499,7 @@ static void axstart(Gui *g)
 //   has ROLE NAME    check that a node has the role and name
 //   focus ROLE NAME  check that the focus has them
 //   value TEXT       check the focus's value
+//   help ROLE NAME   check that a node has them, and help
 //   lint             check that nothing actionable is unnamed, logging
 //                    what is
 
@@ -503,6 +544,12 @@ static void driveax(Gui *g, Str cmd)
             found |= axmatch(t->nodes+i, r.head, r.tail);
         }
         axcheck(g, &a, found, concat(&a, "accessible: ", c.tail));
+    } else if (verb == "help") {
+        b32 found = 0;
+        for (i32 i = 0; i < t->len; i++) {
+            found |= axmatch(t->nodes+i, r.head, r.tail) && t->nodes[i].help.len;
+        }
+        axcheck(g, &a, found, concat(&a, "accessible help: ", c.tail));
     } else if (verb == "focus") {
         b32 ok = t->focus>=0 && axmatch(t->nodes+t->focus, r.head, r.tail);
         Str what = concat(&a, "accessible focus: ", c.tail);
