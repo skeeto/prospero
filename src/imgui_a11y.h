@@ -63,11 +63,16 @@ static void prospero_axinput(ImGuiContext &g, ImGuiInputTextState *state, ImGuiI
             }
 
             // The selection was given for the text unfiltered, so what
-            // was past the replacement moves with its end.
+            // was at or past the replacement's end moves with its end,
+            // and none is left within a character.
             int shift = add - e.len;
             auto fix = [&](int p) {
-                p = p>lo+e.len ? p+shift : p>lo+add ? lo+add : p;
-                return ImClamp(p, 0, state->TextLen);
+                p = p>=lo+e.len && p>lo ? p+shift : p>lo+add ? lo+add : p;
+                p = ImClamp(p, 0, state->TextLen);
+                while (p>0 && p<state->TextLen && (state->TextA[p]&0xc0)==0x80) {
+                    p--;
+                }
+                return p;
             };
             state->SetSelection(fix(e.anchor), fix(e.caret));
         }
@@ -109,7 +114,11 @@ static void prospero_axdraw(ImGuiContext &g, ImGuiInputTextState *state, ImGuiID
     f.clip[3] = clip.Max.y;
     f.lineh   = g.FontSize;
 
-    if (f.active && f.text) {
+    // Past a megabyte the active field is too long to describe each
+    // frame, and while its lines show, only so many bytes of them.
+    enum { MAXTEXT = 1<<20, MAXXS = 1<<16 };
+    f.toolong = f.active && f.text && f.len>MAXTEXT;
+    if (f.active && f.text && !f.toolong) {
         ImU64 h = 0x100;
         for (int i = 0; i < f.len; i++) {
             h ^= (unsigned char)buf[i];
@@ -139,6 +148,10 @@ static void prospero_axdraw(ImGuiContext &g, ImGuiInputTextState *state, ImGuiID
             int   b = f.lines[k];
             int   e = k+1<f.nlines ? f.lines[k+1] : f.len;
             float x = 0.0f;
+            if (xs.Size + (e - b) + 1 > MAXXS) {
+                f.vis1 = k;  // the lines after show, but go undescribed
+                break;
+            }
             for (char const *s = buf+b; s < buf+e;) {
                 unsigned int c;
                 int n = ImTextCharFromUtf8(&c, s, buf+e);

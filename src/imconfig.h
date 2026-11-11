@@ -54,6 +54,7 @@ struct ProsperoAxField {
     unsigned     id;
     int          flags;         // its ImGuiInputTextFlags
     int          active;        // being edited, with a caret
+    int          toolong;       // active, but too long to describe: no text
     char const  *text;          // null for a password field
     int          len;
     char const  *hint;          // the placeholder showing, or null

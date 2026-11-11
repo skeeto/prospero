@@ -198,12 +198,13 @@ struct AxText {
     i32     nnl;
 };
 
-// An edit queued for ImGui: bytes [lo, hi), which held expect, become
-// text, then the selection is anchor to caret. With lo < 0 only the
-// selection is set.
+// An edit queued for ImGui: bytes [lo, hi), which held expect, of a
+// text before bytes long, become text, then the selection is anchor to
+// caret. With lo < 0 only the selection is set.
 struct AxEdit {
     u32  id;
     i32  lo, hi;
+    i32  before;
     Str  expect;
     Str  text;
     i32  anchor, caret;
@@ -1225,12 +1226,24 @@ static void axtextnone(A11y *x)
 }
 
 // Text as a field takes it: CRLF and CR as LF, tabs as spaces, other
-// control characters dropped, and newlines too in a field of one line.
+// control characters dropped, and newlines too in a field of one line;
+// a byte not UTF-8 as U+FFFD, as ImGui decodes it.
 static Str axclean(Arena *a, Str s, b32 multiline)
 {
     Buf b(a, s.len);
     for (iz i = 0; i < s.len; i++) {
         u8 c = s[i];
+        if (c >= 0x80) {
+            iz j = i;
+            utf8decode(s, &j);
+            if (j-i == 1) {
+                print(&b, "\xef\xbf\xbd");
+            } else {
+                print(&b, span(s.data+i, s.data+j));
+                i = j - 1;
+            }
+            continue;
+        }
         if (c == '\r') {
             c = '\n';
             i += i+1<s.len && s[i+1]=='\n';
@@ -1282,6 +1295,7 @@ static b32 axedit(A11y *x, i32 lo, i32 hi, Str text, i32 anchor, i32 caret, i64 
     e.id     = t->id;
     e.lo     = lo;
     e.hi     = hi;
+    e.before = len;
     e.when   = now;
     e.expect = clone(q, span(t->text.data+lo, t->text.data+hi));
     e.text   = axclean(q, text, t->multiline);
@@ -1290,7 +1304,7 @@ static b32 axedit(A11y *x, i32 lo, i32 hi, Str text, i32 anchor, i32 caret, i64 
     i32  add   = (i32)e.text.len;
     i32  after = len - (hi - lo) + add;
     auto fix   = [&](i32 p) {
-        p = p==AX_AFTER ? lo+add : p>lo+raw ? p-raw+add : p>lo+add ? lo+add : p;
+        p = p==AX_AFTER ? lo+add : p>=lo+raw && p>lo ? p-raw+add : p>lo+add ? lo+add : p;
         return axclamp(p, 0, after);
     };
     e.anchor = fix(anchor);
@@ -1317,6 +1331,7 @@ static b32 axselect(A11y *x, i32 anchor, i32 caret, i64 now)
     AxEdit e = {};
     e.id     = t->id;
     e.lo     = -1;
+    e.before = axtextlen(x);
     e.when   = now;
     e.anchor = axtobyte(x, AXU_BYTE, anchor);
     e.caret  = axtobyte(x, AXU_BYTE, caret);
@@ -1327,23 +1342,25 @@ static b32 axselect(A11y *x, i32 anchor, i32 caret, i64 now)
 }
 
 // The next edit for field id, whose text is now text, for ImGui to
-// apply. An edit whose bytes changed under it is dropped, with those
-// after it for the field, which counted on it; one waiting longer than
-// AXEDIT_TTL for its field is dropped.
+// apply. An edit whose text changed under it (its length, or the bytes
+// it replaces), or that waited longer than AXEDIT_TTL, is dropped, with
+// those after it for the field, which counted on it. Keys typed before
+// it lands change the length, so even an insertion knows.
 static b32 axnextedit(A11y *x, u32 id, Str text, i64 now, AxEdit *out)
 {
     b32 r = 0;
     for (iz i = x->qhead; i < x->queue.len; i++) {
-        AxEdit *e = &x->queue[i];
-        if (e->id && now-e->when>AXEDIT_TTL) {
+        AxEdit *e     = &x->queue[i];
+        b32     stale = now-e->when > AXEDIT_TTL;
+        if (e->id && e->id!=id && stale) {
             e->id = 0;
         }
         if (!e->id || e->id!=id || r) {
             continue;
         }
         e->id = 0;
-        if (e->lo>=0 && (e->hi>text.len ||
-                !(span(text.data+e->lo, text.data+e->hi) == e->expect))) {
+        if (stale || text.len!=e->before || (e->lo>=0 && (e->hi>text.len ||
+                !(span(text.data+e->lo, text.data+e->hi) == e->expect)))) {
             for (iz j = i+1; j < x->queue.len; j++) {
                 x->queue[j].id = x->queue[j].id==id ? 0 : x->queue[j].id;
             }
