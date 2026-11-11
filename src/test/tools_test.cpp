@@ -29,6 +29,11 @@ static Str argsshow(Arena *a, i32 tool, Str raw)
         print(&b, r.command);
         putbyte(&b, ' ');
         print(&b, r.timeout);
+        if (r.desc.data) {
+            print(&b, " [");
+            print(&b, r.desc);
+            putbyte(&b, ']');
+        }
         break;
     case TOOL_WRITE:
         print(&b, r.path);
@@ -115,6 +120,23 @@ static void test_tools(Test *t)
                                                           "\"background\":true}"), "ls 7200");
         expect(t, "job clamped", argsshow(a, TOOL_SHELL, "{\"command\":\"ls\",\"timeout\":9999,"
                                                           "\"background\":\"yes\"}"), "ls 7200");
+        // A description is a job's name: one line, spaces collapsed,
+        // cut on a UTF-8 boundary, nothing if only space
+        expect(t, "shell desc", argsshow(a, TOOL_SHELL, "{\"command\":\"ls\","
+                                                         "\"description\":\"  Run\\n\\tthe  tests \"}"),
+               "ls -1 [Run the tests]");
+        expect(t, "shell desc blank", argsshow(a, TOOL_SHELL, "{\"command\":\"ls\","
+                                                               "\"description\":\" \\n \"}"), "ls -1");
+        {
+            Buf d(a, 256);
+            print(&d, "{\"command\":\"ls\",\"description\":\"");
+            for (i32 i = 0; i < 39; i++) print(&d, "x");
+            for (i32 i = 0; i < 30; i++) print(&d, "\xc3\xa9");  // é, 2 bytes
+            print(&d, "\"}");
+            Str r = argsshow(a, TOOL_SHELL, finish(&d));
+            // 39 + 2*20 = 79 bytes: the 80th would split an é
+            expect(t, "shell desc cut", istr(a, r.len - 8), "79");
+        }
         expect(t, "grep pattern", argsshow(a, TOOL_GREP, "{\"pattern\":\"\"}"),
                "pattern: must not be empty; ");
         expect(t, "grep no pattern", argsshow(a, TOOL_GREP, "{\"path\":\"x\"}"),

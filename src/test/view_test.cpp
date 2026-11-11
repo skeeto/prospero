@@ -962,11 +962,13 @@ static void test_viewpanels(Test *t)
         apply(v, a, R"({"sid":"s","seq":4,"ts":0,"ev":"tool.end","call":"c1","status":"ok",)"
                     R"("text":"Started background job 1.","job":1,"ms":3})");
         apply(v, a, R"({"sid":"s","seq":5,"ts":0,"ev":"job.start","job":2,"call":"c2",)"
-                    R"("command":"b","spill":"out/c1b.log","deadline":9000})");
+                    R"("command":"b","description":" Build it\n","spill":"out/c1b.log","deadline":9000})");
         b32 out = apply(v, a, R"({"sid":"s","ts":0,"ev":"job.out","job":1,"call":"c1","tail":"one\ntwo\n","bytes":8})");
         ViewJob *j = findjob(v, 1);
         expect(t, "panels.jobout", concat(&a, istr(&a, out), Str{j->tail, j->taillen}), "1one\ntwo\n");
         expect(t, "panels.jobsummary", j->summary, "make\xe2\x80\xa6");
+        expect(t, "panels.jobnodesc", istr(&a, j->desc.data != 0), "0");
+        expect(t, "panels.jobdesc", findjob(v, 2)->desc, "Build it");
         expect(t, "panels.jobrun", istr(&a, v->jobsrun), "2");
         expect(t, "panels.jobrow", istr(&a, v->msgs[0].tool->job*10 + v->msgs[0].collapsed), "11");
         apply(v, a, R"({"sid":"s","seq":6,"ts":0,"ev":"job.end","job":1,"call":"c1","status":"exited",)"

@@ -22,9 +22,13 @@ as for any job. Only you can do this; the agent cannot. With 16 jobs
 running already in the session, it is refused. Or Stop, right of it,
 kills the command, and the agent goes on with its output so far.
 
-The Jobs pane lists the session's jobs, with their state, run time and
-output size. Kill stops a job and what it started, and the agent is
-told.
+The Jobs pane lists the session's jobs, newest first. Each is named
+by the agent's description of its command, if it gave one, with the
+command under it; else the command is its name. Hover for all of the
+command and the job's number, which the agent knows it by ("how is job
+3 doing?"). Right of it are its output size and run time, and Kill while
+it runs (else how it ended). Kill stops a job and what it started, and the
+agent is told.
 
 - `[tools] job_timeout`: seconds a job may run, unless the agent asks
   for another limit (1800 by default, at most `job_timeout_max`, 7200).

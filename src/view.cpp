@@ -367,6 +367,7 @@ struct ViewJob {
     Str  call;
     Str  command;
     Str  summary;   // its first line
+    Str  desc;      // the agent's name for it, one line, or null
     Str  spill;     // the full output, relative to the session directory
     i64  start;     // epoch ms
     i64  deadline;  // epoch ms: the job limit stops it then
@@ -2940,6 +2941,8 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         jb.call     = clone(&v->aux, jsonstr(jsonget(j, "call")));
         jb.command  = clone(&v->aux, jsonstr(jsonget(j, "command")));
         jb.summary  = oneline(&v->aux, jb.command);
+        Str desc    = jsonstr(jsonget(j, "description"));
+        jb.desc     = trim(desc).len ? oneline(&v->aux, desc) : Str{};
         jb.spill    = clone(&v->aux, jsonstr(jsonget(j, "spill")));
         jb.start    = r->ts;
         jb.deadline = jsonint(jsonget(j, "deadline"), 0);

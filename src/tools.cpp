@@ -86,6 +86,7 @@ enum : i64 {
     JOB_MAX        = 7200,
     JOB_RUNNING    = 16,              // jobs at once, per session
     JOB_NOTICE     = 2 << 10,         // output tail in an end notice
+    JOB_DESC       = 80,              // bytes of a command's description
     JOBOUT_LINES   = 100,
     SEARCH_RESULTS = 100,             // lines or files shown
     SEARCH_TIMEOUT = 30,              // seconds
@@ -671,6 +672,8 @@ static Str tooljson(Arena *a, ToolEnv *te)
                  "background, 1 to 600 (default 120); with background, "
                  "seconds the job may run", 0, {}},
                 {"background", "boolean", "Start it as a job at once", 0, {}},
+                {"description", "string", "What it is for, in a few words "
+                 "(\"Run the tests\"): the user sees it as a job's name", 0, {}},
                 // Only where there are shells to pick, else as before
                 {te->shells.len ? Str("shell") : Str{}, "string",
                  "A shell above for this command; default the current one",
@@ -1173,7 +1176,8 @@ struct Args {
     Str             glob;
     Str             from;       // job_output: "head" or "tail"
     Str             desc;       // task: what the subagent does, in brief;
-                                // memory: its line in the index
+                                // memory: its line in the index;
+                                // shell: its job's name, one line
     Str             prompt;
     Str             role;       // null if absent
     Str             model;
@@ -1222,6 +1226,29 @@ static void issue(Arena *a, Args *r, Str key, Str msg)
     print(&b, ": ");
     print(&b, msg);
     r->issues = push(a, r->issues, finish(&b));
+}
+
+// A shell command's description as a job's name: one line, its
+// whitespace runs and control characters each one space, at most
+// JOB_DESC bytes. Null if nothing is left.
+static Str jobdesc(Arena *a, Str s)
+{
+    Buf b(a, JOB_DESC+2);
+    b32 space = 0;
+    for (iz i = 0; i<s.len && b.len<=JOB_DESC; i++) {
+        u8 c = s[i];
+        if (c<0x20 || c==0x7f || c==' ') {
+            space = b.len > 0;
+            continue;
+        }
+        if (space) {
+            putbyte(&b, ' ');
+            space = 0;
+        }
+        putbyte(&b, c);
+    }
+    Str r = utf8head(finish(&b), JOB_DESC);
+    return r.len ? trimright(r) : Str{};
 }
 
 static Str argstr(Arena *a, Args *r, Json *root, Str key, b32 required)
@@ -2105,6 +2132,7 @@ static Args parseargs(Arena *a, i32 tool, Str raw, i32 edit)
         r.timeout    = argint(a, &r, j, "timeout", -1);
         r.background = argbool(a, &r, j, "background");
         r.shell      = trim(argstr(a, &r, j, "shell", 0));
+        r.desc       = jobdesc(a, argstr(a, &r, j, "description", 0));
         i64 max = r.background ? JOB_MAX : SHELL_MAX;
         if (r.command.data && !trim(r.command).len) {
             issue(a, &r, "command", "must not be empty");

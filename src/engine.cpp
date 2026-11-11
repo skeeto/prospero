@@ -319,6 +319,7 @@ struct Job {
     i64   n;         // number within the session, from 1
     Str   call;
     Str   command;
+    Str   desc;      // the agent's name for it, or null
     Str   spill;     // absolute
     Str   rel;       // relative to the session directory
     Proc *proc;
@@ -461,6 +462,7 @@ struct ShellRun {
     b32  nojob;     // timed out with too many jobs to move it to one
     i32  tool;      // TOOL_SHELL, or TOOL_GREP or TOOL_GLOB searching
     Str  command;   // the shell's
+    Str  desc;      // and its description, should it become a job
     Str  root;      // a search's directory, normalized
     Str  pattern;   // a search's, as given
     Str  glob;      // grep's file filter, or glob's pattern
@@ -6000,14 +6002,16 @@ static void jobarm(Session *s)
     s->timers[T_JOBS] = at;
 }
 
-static Job *newjob(Session *s, Arena scratch, Str call, Str command, Proc *proc,
-                   u64 procid, Str spill, Str rel, i64 start, i64 timeout, b32 hidden)
+static Job *newjob(Session *s, Arena scratch, Str call, Str command, Str desc,
+                   Proc *proc, u64 procid, Str spill, Str rel, i64 start,
+                   i64 timeout, b32 hidden)
 {
     Os  *os = s->e->os;
     Job *j  = alloc<Job>(&s->perm);
     j->n        = hidden ? 0 : ++s->njobs;
     j->call     = clone(&s->perm, call);
     j->command  = clone(&s->perm, command);
+    j->desc     = clone(&s->perm, desc);
     j->spill    = spill;
     j->rel      = rel;
     j->proc     = proc;
@@ -6021,11 +6025,14 @@ static Job *newjob(Session *s, Arena scratch, Str call, Str command, Proc *proc,
     s->jobs     = j;
     if (!hidden) {
         i64   now = os_ticks(os);
-        Buf   b(&scratch, 512 + command.len);
+        Buf   b(&scratch, 512 + command.len + desc.len);
         EvOut w = sbegin(s, &b, EV_JOBSTART);
         putintkey(&w.json, "job", j->n);
         putstrkey(&w.json, "call", call);
         putstrkey(&w.json, "command", command);
+        if (desc.len) {
+            putstrkey(&w.json, "description", desc);
+        }
         putstrkey(&w.json, "spill", rel);
         putintkey(&w.json, "deadline", os_time(os) + (j->deadline - now)/MS);
         ssend(s, &w);
@@ -6102,6 +6109,11 @@ static Str jobnotice(Session *s, Arena *a, Job *j, i64 bytes)
     Buf b(a, 1024);
     print(&b, "Background job ");
     print(&b, j->n);
+    if (j->desc.len) {
+        print(&b, " (");
+        print(&b, j->desc);
+        putbyte(&b, ')');
+    }
     print(&b, " ended: ");
     switch (j->why) {
     case JOBEND_EXIT:
@@ -6360,8 +6372,8 @@ static void startjob(Session *s, Arena scratch, Args *args)
         toolend(s, scratch, "error", text, 0, 0, {}, 0);
         return;
     }
-    Job *j = newjob(s, scratch, c->id, args->command, p, id, spill, rel,
-                    os_ticks(e->os), timeout, 0);
+    Job *j = newjob(s, scratch, c->id, args->command, args->desc, p, id,
+                    spill, rel, os_ticks(e->os), timeout, 0);
     Buf b(&scratch, 512);
     print(&b, "Started background job ");
     print(&b, j->n);
@@ -6410,8 +6422,9 @@ static void movetojob(Session *s, Arena scratch, b32 user)
     disarm(s, T_TOOL);
     disarm(s, T_KILL);
     disarm(s, T_DRAIN);
-    Job *j = newjob(s, scratch, c->id, s->sh.command, s->proc, s->procid,
-                    s->sh.spill, s->sh.rel, s->sh.start, s->te.jobtimeout, 0);
+    Job *j = newjob(s, scratch, c->id, s->sh.command, s->sh.desc, s->proc,
+                    s->procid, s->sh.spill, s->sh.rel, s->sh.start,
+                    s->te.jobtimeout, 0);
     jobadopt(s, j);
     s->proc   = 0;
     s->procid = 0;
@@ -6603,6 +6616,7 @@ static b32 startshell(Session *s, Arena scratch, Args *args)
     sh.timeout = args->timeout>0 ? args->timeout : SHELL_DEFAULT;
     sh.start   = os_ticks(e->os);
     sh.command = clone(&s->perm, args->command);
+    sh.desc    = clone(&s->perm, args->desc);
     sh.spill   = spillfile(s, scratch, c->id, &sh.rel);
     s->sh = sh;
 
@@ -6719,8 +6733,8 @@ static void finishshell(Session *s, Arena scratch, b32 cancelled, b32 stopped = 
     disarm(s, T_DRAIN);
     if (s->proc && (cancelled || stopped) && !e->quitting) {
         // Stopped as a job is, asked first, while the turn goes on
-        Job *j = newjob(s, scratch, {}, {}, s->proc, s->procid, s->sh.spill,
-                        s->sh.rel, os_ticks(e->os), 0, 1);
+        Job *j = newjob(s, scratch, {}, {}, {}, s->proc, s->procid,
+                        s->sh.spill, s->sh.rel, os_ticks(e->os), 0, 1);
         jobadopt(s, j);
         jobstop(s, j, JOBEND_KILLED);
     } else if (s->proc) {
@@ -18653,6 +18667,7 @@ static void replaytools(Session *s, Arena scratch, EvRec *r)
         jb->n       = jsonint(jsonget(j, "job"), 0);
         jb->call    = clone(&s->perm, call);
         jb->command = clone(&s->perm, jsonstr(jsonget(j, "command")));
+        jb->desc    = clone(&s->perm, jsonstr(jsonget(j, "description")));
         jb->rel     = clone(&s->perm, jsonstr(jsonget(j, "spill")));
         jb->spill   = clone(&s->perm, join(&scratch, s->dir, jb->rel));
         jb->state   = JOB_RUN;  // until its end

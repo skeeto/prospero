@@ -9740,8 +9740,68 @@ static Str lastlines(Str s, i32 n)
 
 static void guijobkill(Gui *, GuiSession *, i64);
 
-// The session's background jobs, newest first: state, number, how long,
-// a Kill button while it runs, its command, and its output's end. A
+static f32 textw(Str s)
+{
+    return ImGui::CalcTextSize(s.cdata, s.cdata+s.len).x;
+}
+
+// s cut at its end to fit w pixels in the current font, with an
+// ellipsis when cut.
+static Str elidewidth(Arena *a, Str s, f32 w)
+{
+    if (textw(s) <= w) {
+        return s;
+    }
+    Str dots = "\xe2\x80\xa6";
+    w -= textw(dots);
+    iz lo = 0, hi = s.len;  // the most of s that fits, by bisection
+    while (lo < hi) {
+        iz mid = lo + (hi - lo + 1)/2;
+        if (textw(takehead(s, mid)) <= w) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    for (; lo>0 && lo<s.len && (s[lo]&0xc0)==0x80; lo--) {}
+    return concat(a, clone(a, trimright(takehead(s, lo))), dots);
+}
+
+// How a job ended, where a running one's Kill is: "exited 1", "killed".
+static Str jobstate(Arena *a, ViewJob *j)
+{
+    Buf b(a, 64);
+    switch (j->status) {
+    case VJOB_EXITED:
+        print(&b, "exited ");
+        print(&b, (i64)j->exit);
+        break;
+    case VJOB_KILLED:
+        print(&b, j->signal ? Str("killed, signal ") : Str("killed"));
+        if (j->signal) print(&b, (i64)j->signal);
+        break;
+    default:
+        print(&b, vjobnames[j->status]);
+    }
+    return finish(&b);
+}
+
+// A job's item's tooltip: its number, as the agent knows it, its whole
+// command, and where all its output is.
+static void jobtip(Arena *a, ViewJob *j, Str spill)
+{
+    if (spill.len) {
+        itemtip("Job %lld\n%s\nFull output: %s", (long long)j->n,
+                cstr0(a, j->command), cstr0(a, spill));
+    } else {
+        itemtip("Job %lld\n%s", (long long)j->n, cstr0(a, j->command));
+    }
+}
+
+// The session's background jobs, newest first: a dot in its state's
+// color, the agent's name for it, its output size and how long,
+// a Kill button while it runs (else how it ended), its command under a
+// name, and its output's end. A
 // running job's clock asks for a frame a second, only while shown.
 static void drawjobs(Gui *g)
 {
@@ -9766,47 +9826,76 @@ static void drawjobs(Gui *g)
     f32         killw = ImGui::CalcTextSize("Stopping...").x + 2*st.FramePadding.x;
     b32         can   = !g->sess->readonly && hostlive(g, g->sess) && !g->quitting;
     b32         first = 1;
+    f32         endw  = killw;  // the last column, as wide as its widest
+    for (iz i = 0; i < v->jobs.len; i++) {
+        if (v->jobs[i].status != VJOB_RUNNING) {
+            Arena t = a;
+            f32   w = textw(jobstate(&t, &v->jobs[i]));
+            endw = w>endw ? w : endw;
+        }
+    }
     for (iz i = v->jobs.len-1; i >= 0; i--) {
         ViewJob *j = &v->jobs[i];
         ImGui::PushID((i32)i);
-        Buf b(&a, 64);
-        switch (j->status) {
-        case VJOB_EXITED:
-            print(&b, "exited ");
-            print(&b, (i64)j->exit);
-            break;
-        case VJOB_KILLED:
-            print(&b, j->signal ? Str("killed, signal ") : Str("killed"));
-            if (j->signal) print(&b, (i64)j->signal);
-            break;
-        default:
-            print(&b, vjobnames[j->status]);
-        }
-        ImGui::AlignTextToFramePadding();
-        ImGui::PushStyleColor(ImGuiCol_Text, jobcolor(g->pal, j));
-        text(finish(&b));
-        ImGui::PopStyleColor();
-        b.len = 0;
-        print(&b, "job ");
-        print(&b, j->n);
-        print(&b, "  ");
-        if (j->status == VJOB_RUNNING) {
+        b32 running = j->status == VJOB_RUNNING;
+        u32 col     = jobcolor(g->pal, j);
+
+        Str state = jobstate(&a, j);
+        Str size  = j->bytes ? bytesize(&a, j->bytes) : Str{};
+        Str time = {};
+        if (running) {
             i64 el = nowms - j->start;
             el = el<0 ? 0 : el;
             schedat(&g->sched, g->sched.now + (1000 - el%1000)*1000 + 1000, DUE_CLOCK);
-            print(&b, secstext(&a, el/1000));
+            time = secstext(&a, el/1000);
         } else if (j->ms) {
-            print(&b, duration(&a, j->ms));
+            time = duration(&a, j->ms);
         }
-        if (j->bytes) {
-            print(&b, "  ");
-            print(&b, bytesize(&a, j->bytes));
+
+        // Its name left, cut to fit; size, time and Kill (or its end)
+        // right, each in a column of fixed width, so neither a growing
+        // clock nor a long name moves the other, and rows line up. Its
+        // number, which the agent knows it by, is in the tooltip.
+        f32 gap   = st.ItemSpacing.x;
+        f32 x0    = ImGui::GetCursorPosX();
+        f32 avail = ImGui::GetContentRegionAvail().x;
+        f32 sizew = textw("888.8 KiB");
+        f32 timew = textw("88 min 88 s");
+        timew     = textw(time)>timew ? textw(time) : timew;
+        f32 rightw = sizew + gap + timew + gap + endw;
+        f32 dotw  = ImGui::GetFontSize();
+
+        ImGui::AlignTextToFramePadding();
+        ImVec2 p  = ImGui::GetCursorScreenPos();
+        f32    lh = ImGui::GetFrameHeight();
+        drawdot(ImGui::GetWindowDrawList(), v2(p.x + dotw*0.35f, p.y + lh/2),
+                dotw*0.22f, col);
+        ImGui::SetCursorPosX(x0 + dotw);
+        Str  title = j->desc.len ? j->desc : j->summary;
+        b32  mono  = !j->desc.len;
+        if (mono) ImGui::PushFont(g->fonts.mono, 0);
+        title = elidewidth(&a, title, avail - dotw - rightw - gap);
+        if (mono) {
+            ImGui::PushStyleColor(ImGuiCol_Text, g->pal->summary);
+            text(title);
+            ImGui::PopStyleColor();
+            ImGui::PopFont();
+        } else {
+            text(title);
         }
-        ImGui::SameLine();
-        ImGui::TextDisabled("%s", cstr0(&a, finish(&b)));
-        if (j->status==VJOB_RUNNING && can) {
-            f32 right = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - killw;
-            ImGui::SameLine(right > rightof() ? right : 0);
+        Str spill = j->spill.len && v->dir.len ? join(&a, v->dir, j->spill) : j->spill;
+        jobtip(&a, j, spill);
+
+        f32 x = x0 + avail - rightw;
+        x = x>rightof() ? x : rightof();
+        ImGui::SameLine(x + sizew - textw(size));
+        ImGui::TextDisabled("%s", cstr0(&a, size));
+        x += sizew + gap;
+        ImGui::SameLine(x + timew - textw(time));
+        ImGui::TextDisabled("%s", cstr0(&a, time));
+        x += timew + gap;
+        if (running && can) {
+            ImGui::SameLine(x);
             ImGui::BeginDisabled(j->killing);
             b32 kill = ImGui::Button(j->killing ? "Stopping..." : "Kill", v2(killw, 0));
             ImGui::EndDisabled();
@@ -9819,15 +9908,20 @@ static void drawjobs(Gui *g)
                 j->killing = 1;
                 guijobkill(g, g->sess, j->n);
             }
+        } else if (!running) {
+            ImGui::SameLine(x);
+            ImGui::PushStyleColor(ImGuiCol_Text, col);
+            text(state);
+            ImGui::PopStyleColor();
         }
 
         ImGui::PushFont(g->fonts.mono, 0);
-        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->summary);
-        text(j->summary);
-        ImGui::PopStyleColor();
-        if (ImGui::IsItemHovered() && j->spill.len) {
-            Str full = v->dir.len ? join(&a, v->dir, j->spill) : j->spill;
-            itemtip("%s\nFull output: %s", cstr0(&a, j->command), cstr0(&a, full));
+        if (!mono) {
+            // A name is the agent's word for it: what runs shows under it
+            ImGui::PushStyleColor(ImGuiCol_Text, g->pal->summary);
+            text(j->summary);
+            ImGui::PopStyleColor();
+            jobtip(&a, j, spill);
         }
         Str tail = lastlines({j->tail, j->taillen}, 4);
         if (tail.len) {

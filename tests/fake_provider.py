@@ -741,7 +741,8 @@ def sc_job_notice(model, n, req):
     # A background job, then the end of the turn; its end starts the next
     if n == 0:
         cmd = "sleep 1; echo done-$((40+2))"
-        yield from tool(model, n, "shell", {"command": cmd, "background": True})
+        yield from tool(model, n, "shell", {"command": cmd, "background": True,
+                                            "description": "Wait,\n then print"})
     elif n == 1:
         yield from answer(model, "Waiting for the job.")
     else:
@@ -3290,7 +3291,7 @@ def sc_gui(model, n, req):
             yield from call(model, 1, f"call_{n}_b", "shell", {
                 "command": "echo $$ > job.pid; for i in 1 2 3; do echo tick $i; "
                            "sleep 0.2; done; while :; do echo more; sleep 0.05; done",
-                "background": True})
+                "background": True, "description": "Tick, then print until killed"})
             yield from finish(model, "tool_calls")
         elif step == 1:
             yield from answer(model, "Started two jobs.")
