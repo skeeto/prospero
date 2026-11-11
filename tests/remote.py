@@ -451,7 +451,8 @@ def durable(lines, sid):
 
 
 # The last line of a subagent's call: how long it worked.
-WORKED = re.compile(r"\n\n\[The subagent worked for [0-9][0-9. a-z]*\.\]\Z")
+WORKED = re.compile(r"\n\n\[The subagent worked for [0-9][0-9. a-z]*\."
+                    r"( Its context peaked at [^]\n]* requests?\.)?\]\Z")
 
 
 def report(text):

@@ -1388,8 +1388,48 @@ static void testdeskkeep2(Test *t)
     }
 }
 
+// What a subagent spent, as its parent reads it after the report
+// (issue #40): its context's peak against the window, its compactions,
+// its requests; and the line it goes in.
+static void testtaskspent(Test *t)
+{
+    Arena    a = t->perm;
+    Session *s = alloc<Session>(&a);
+    s->mc.ctx = 131072;
+    s->tpeak  = 118000;
+    s->treqs  = 41;
+    expect(t, "spent", taskspent(&a, s),
+           "Its context peaked at 118k of 131k tokens (90%), over 41 requests.");
+    s->tsumms = 1;
+    expect(t, "spent once", taskspent(&a, s),
+           "Its context peaked at 118k of 131k tokens (90%), compacted once, "
+           "over 41 requests.");
+    s->tsumms = 2;
+    expect(t, "spent twice", taskspent(&a, s),
+           "Its context peaked at 118k of 131k tokens (90%), compacted twice, "
+           "over 41 requests.");
+    s->tsumms = 3;
+    s->mc.ctx = 0;
+    s->tpeak  = 8540;
+    s->treqs  = 1;
+    expect(t, "spent unknown", taskspent(&a, s),
+           "Its context peaked at 8.5k tokens, its window unknown, compacted "
+           "3 times, over 1 request.");
+    s->mc.ctx  = 0;
+    s->ctxhint = 32768;
+    s->tsumms  = 0;
+    expect(t, "spent hint", taskspent(&a, s),
+           "Its context peaked at 8.5k of 33k tokens (26%), over 1 request.");
+    expect(t, "line", spentline(&a, 372000, "Its context peaked at 8.5k."),
+           "[The subagent worked for 6 min 12 s. Its context peaked at 8.5k.]");
+    expect(t, "line old", spentline(&a, 1500, {}), "[The subagent worked for 1.5 s.]");
+    expect(t, "line untimed", spentline(&a, 0, "Its context peaked at 8.5k."),
+           "[Its context peaked at 8.5k.]");
+}
+
 static void test_engine(Test *t)
 {
+    testtaskspent(t);
     testcallimages(t);
     testdeskkeepset(t);
     testdeskkeep2(t);

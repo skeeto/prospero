@@ -763,8 +763,10 @@ def compact(names):
     return out
 
 
-# The last line of a subagent's call: how long it worked.
-WORKED = re.compile(r"\n\n\[The subagent worked for [0-9][0-9. a-z]*\.\]\Z")
+# The last line of a subagent's call: how long it worked, and what its
+# context and requests came to (issue #40).
+WORKED = re.compile(r"\n\n\[The subagent worked for [0-9][0-9. a-z]*\."
+                    r"( Its context peaked at [^]\n]* requests?\.)?\]\Z")
 
 
 def report(text):
@@ -1615,9 +1617,10 @@ def bgheard(t, h, sid, kid, turn):
     n = [e for e in h.all("notice", sid) if e.get("kind") == "task"]
     t.check(len(n) == 1 and n[0].get("child") == kid and
             n[0].get("child_title") == "Slow child" and
-            n[0]["text"] == f"The subagent \"Slow child\" (session {kid}), which the user "
-                            f"moved to the background, finished. Its report:\n\n"
-                            f"Child report: flagged", f"notice {n}")
+            report(n[0]["text"]) == f"The subagent \"Slow child\" (session {kid}), "
+                                    f"which the user moved to the background, "
+                                    f"finished. Its report:\n\nChild report: flagged",
+            f"notice {n}")
     last = t.requests()[-1]["body"]["messages"]
     t.check(last[-1]["role"] == "user" and "Child report: flagged" in last[-1]["content"],
             f"the agent read it: {last[-1]}")
@@ -5347,6 +5350,10 @@ def task_ask(t):
         t.check(outside_file(t) == "from the child\n", "written outside")
         te = h.all("tool.end", sid)
         t.check(te and report(te[0]["text"]) == "The child wrote it.", f"report {te}")
+        # What it spent, for the parent to size its next task by (#40)
+        t.check(re.search(r"Its context peaked at [0-9.]+k of 66k tokens \([0-9]+%\), "
+                          r"over 2 requests\.\]\Z", te[0]["text"]),
+                f"what it spent: {te[0]['text']!r}")
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")
@@ -5565,6 +5572,9 @@ def task_remote(t):
         rep = farreport(h, sid)
         t.check(rep["status"] == "ok" and
                 rep["text"] == "Remote report (wsl): Do the thing.", f"report {rep}")
+        t.check(re.fullmatch(r"Its context peaked at \S+ of \S+ tokens \([0-9]+%\), "
+                             r"over [0-9]+ requests?\.", rep.get("spent", "")),
+                f"and what it spent, apart: {rep}")
         ses = h.all("session", sid)[0]
         want = {"parent": FARPARENT, "call": "call_7_0", "depth": 1, "remote": 1,
                 "via": "wsl", "distro": "Ubuntu", "role": "general"}

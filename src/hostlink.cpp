@@ -593,7 +593,7 @@ static void fardrop(HostLink *l, HostKid *k)
 // notice gives its parent the report once in the background. It is
 // closed and forgotten there.
 static void farend(Engine *e, Arena scratch, HostLink *l, HostKid *k,
-                   Str status, Str text)
+                   Str status, Str text, Str spent = {})
 {
     Session *p = 0;
     TaskRun *t = fartaskrun(e, k, &p);
@@ -606,6 +606,7 @@ static void farend(Engine *e, Arena scratch, HostLink *l, HostKid *k,
         text = reportcut(p, &scratch, call, text, &t->spill, &t->bytes);
         t->status = clone(&p->perm, status);
         t->text   = clone(&p->perm, text);
+        t->spent  = clone(&p->perm, spent);
         t->took   = os_ticks(e->os) - t->start;
         t->done   = 1;
         arm(p, T_TASK, 0);
@@ -613,6 +614,8 @@ static void farend(Engine *e, Arena scratch, HostLink *l, HostKid *k,
     } else if (k->bg && !e->quitting) {
         Session *q = bgparent(e, scratch, k->psid);
         if (q) {
+            text = spent.len ? concat(&scratch, concat(&scratch, text, "\n\n"),
+                                      spentline(&scratch, 0, spent)) : text;
             bgnotice(q, scratch, k->call, k->sid, k->title, l->name, status, text);
         }
     }
@@ -843,8 +846,9 @@ static void farmail(Engine *e, Arena scratch, HostLink *l, Record r)
         if (k) {
             Str status = jsonstr(jsonget(j, "status"));
             Str text   = jsonstr(jsonget(j, "text"));
+            Str spent  = jsonstr(jsonget(j, "spent"));  // none from older
             status = status=="ok" || status=="cancelled" ? status : Str("error");
-            farend(e, scratch, l, k, status, text);
+            farend(e, scratch, l, k, status, text, spent);
             return;
         }
     } break;

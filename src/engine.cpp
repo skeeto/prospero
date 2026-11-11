@@ -394,6 +394,7 @@ struct TaskRun {
     u64 far;     // a subagent on another host: its HostKid's serial
     Str host;    // and that host's name
     i64 took;    // ticks it worked, once it reported or was cancelled
+    Str spent;   // its context and requests (taskspent), once reported
     Slice<Str> urls;  // the report's URLs the subagent saw (webvouch)
 };
 
@@ -889,6 +890,9 @@ struct Session {
                              // background, and the report goes to psid
                              // as a notice (bgreport)
     i64          treqs;      // requests made for the task
+    i64          tpeak;      // the most context a request of it sent, est.
+    i64          tsumms;     // its compactions by summary
+    i64          tbegan;     // epoch ms it began
     Slice<TaskRun> tasks;    // the subagents of the calls running
     Slice<TaskAsk> taskasks; // the user's answers for the task calls about
                              // to start, by call (taskasks)
@@ -2529,6 +2533,7 @@ static void sendchat(Session *s, Arena scratch)
     s->attempts++;
     s->sentbytes = s->system.len + s->tools.len + s->bytes;
     s->sentest   = estimate(s);
+    s->tpeak     = s->sentest>s->tpeak ? s->sentest : s->tpeak;
     {
         Arena a = scratch;
         Buf   b(&a, 256 + s->ep.url.len + s->model.len);
@@ -14457,6 +14462,7 @@ static void compacted(Session *s, Arena scratch, Partial *p)
     i64 cutseq  = cp.cut<s->history.len ? s->history[cp.cut].seq : s->log.seq+1;
     summarize(s, summary, cutseq, s->log.seq+1);
 
+    s->tsumms++;
     Buf   b(&scratch, 512 + summary.len*2);
     EvOut w = sbegin(s, &b, EV_COMPACT);
     compactevent(s, &w, "summary", cp.why, cp.before);
@@ -16778,6 +16784,7 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err)
     s->psid    = clone(&s->perm, p->sid);
     s->pcall   = clone(&s->perm, c->id);
     s->intask  = 1;
+    s->tbegan  = os_time(e->os);
     // As new asked of the parent, as an eval's
     s->projinstr  = p->projinstr;
     s->nofallback = p->nofallback;
@@ -17015,6 +17022,72 @@ static Str lastreport(Session *s, Arena *a)
     return {};
 }
 
+// Tokens as "118k", or under 10k "8.5k", or under 1000 as they are.
+static void printktokens(Buf *b, i64 n)
+{
+    if (n < 1000) {
+        print(b, n);
+    } else if (n < 10000) {
+        print(b, n/1000);
+        putbyte(b, '.');
+        print(b, n/100%10);
+        putbyte(b, 'k');
+    } else {
+        print(b, (n + 500)/1000);
+        putbyte(b, 'k');
+    }
+}
+
+// What a subagent's task took, for a parent that sizes the next slice
+// of work by it (issue #40): its context at its peak against its window,
+// its compactions, and its requests. A sentence; its time is the
+// parent's to say (spentline).
+static Str taskspent(Arena *a, Session *c)
+{
+    Buf  bb(a, 256);
+    Buf *b   = &bb;
+    i64  ctx = c->mc.ctx ? c->mc.ctx : c->ctxhint;
+    print(b, "Its context peaked at ");
+    printktokens(b, c->tpeak);
+    if (ctx > 0) {
+        print(b, " of ");
+        printktokens(b, ctx);
+        print(b, " tokens (");
+        print(b, c->tpeak*100/ctx);
+        print(b, "%)");
+    } else {
+        print(b, " tokens, its window unknown");
+    }
+    if (c->tsumms) {
+        print(b, c->tsumms==1 ? Str(", compacted once") :
+                 c->tsumms==2 ? Str(", compacted twice") : Str(", compacted "));
+        if (c->tsumms > 2) {
+            print(b, c->tsumms);
+            print(b, " times");
+        }
+    }
+    print(b, ", over ");
+    print(b, c->treqs);
+    print(b, c->treqs==1 ? Str(" request.") : Str(" requests."));
+    return finish(b);
+}
+
+// The line after a subagent's report: how long it worked (ms, 0 if not
+// known) and what it spent (taskspent, empty from an older engine).
+static Str spentline(Arena *a, i64 ms, Str spent)
+{
+    Buf b(a, 128 + spent.len);
+    putbyte(&b, '[');
+    if (ms > 0) {
+        print(&b, "The subagent worked for ");
+        printelapsed(&b, ms);
+        print(&b, spent.len ? Str(". ") : Str("."));
+    }
+    print(&b, spent);
+    putbyte(&b, ']');
+    return finish(&b);
+}
+
 // A subagent's report as its parent reads it, and the status of the
 // call it ends. why and err are as its last turn ended.
 static Str reporttext(Session *c, Arena *a, Str why, Str err, Str *status)
@@ -17061,10 +17134,12 @@ static void logtaskreport(Session *c, Arena scratch, Str why, Str err)
         text = concat(&scratch, utf8head(text, FARREPORT_MAX),
                       "\n\n[The report was cut here at 512 KiB.]");
     }
-    Buf   b(&scratch, 256 + text.len + text.len/8);
+    Str   spent = taskspent(&scratch, c);
+    Buf   b(&scratch, 256 + spent.len + text.len + text.len/8);
     EvOut w = sbegin(c, &b, EV_TASKREPORT);
     putstrkey(&w.json, "status", status);
     putstrkey(&w.json, "text", text);
+    putstrkey(&w.json, "spent", spent);
     ssend(c, &w);
 }
 
@@ -17128,6 +17203,7 @@ static void taskreport(Session *c, Arena scratch, Str why, Str err)
     Str text = reporttext(c, &scratch, why, err, &t->status);
     text = reportcut(p, &scratch, p->calls[t->call].id, text, &t->spill, &t->bytes);
     t->text = clone(&p->perm, text);
+    t->spent = clone(&p->perm, taskspent(&scratch, c));
     t->urls = webvouch(c, &p->perm, text);  // for the parent's webseen
     t->took = os_ticks(p->e->os) - t->start;
     t->done = 1;
@@ -17164,13 +17240,9 @@ static void taskflush(Session *s, Arena scratch)
         Arena    a = scratch;
         TaskRun *t = &s->tasks[i];
         Str      text = t->text;
-        if (t->took) {
-            Buf b(&a, text.len + 64);
-            print(&b, text);
-            print(&b, "\n\n[The subagent worked for ");
-            printelapsed(&b, t->took/MS);
-            print(&b, ".]");
-            text = finish(&b);
+        if (t->took || t->spent.len) {
+            text = concat(&a, concat(&a, text, "\n\n"),
+                          spentline(&a, t->took/MS, t->spent));
         }
         s->callstart = t->start;
         s->callurls  = t->urls;
@@ -17317,6 +17389,9 @@ static void bgreport(Session *c, Arena scratch, Str why, Str err)
     }
     Str status = {};
     Str text   = reporttext(c, &scratch, why, err, &status);
+    i64 ms     = c->tbegan>0 ? os_time(e->os) - c->tbegan : 0;
+    text = concat(&scratch, concat(&scratch, text, "\n\n"),
+                  spentline(&scratch, ms, taskspent(&scratch, c)));
     bgnotice(p, scratch, c->pcall, c->sid, c->title, {}, status, text,
              webvouch(c, &p->perm, text));
 }
@@ -18538,6 +18613,7 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
         s->rdistro  = clone(&s->perm, task.distro);
         s->rrelay   = clone(&s->perm, task.relay);
         s->intask   = 1;
+        s->tbegan   = os_time(e->os);
         s->hop      = task.hop;
         s->te.deny |= (s->depth>=TASK_DEPTH ? (u32)1<<TOOL_TASK : 0) | TOOL_PLANMASK;
     }
@@ -18950,6 +19026,11 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             s->ovctx     = 0;
             break;
         case EV_ATTEMPT:
+            {
+                i64 sent = jsonint(jsonget(j, "tokens"), 0);
+                s->tpeak = sent>s->tpeak ? sent : s->tpeak;
+            }
+            [[fallthrough]];
         case EV_TURNEND:
             s->ctxhint = jsonint(jsonget(j, "ctx"), s->ctxhint);
             s->ovctx   = jsonint(jsonget(j, "overflow_ctx"), s->ovctx);
@@ -19025,6 +19106,7 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             if (sum->type == JSON_STRING) {
                 Str summary = clone(&s->perm, jsonstr(sum));
                 summarize(s, summary, jsonint(jsonget(j, "cutseq"), 0), r.seq);
+                s->tsumms++;
             }
             countbytes(s);
             s->thinkfrom = r.seq;

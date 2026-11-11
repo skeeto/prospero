@@ -77,6 +77,11 @@ the subagent's own transcript goes back to its parent. That bar also
 shows the subagent's model. A subagent has its parent's mode and
 allowed directories, and cancelling the parent cancels it.
 
+After a subagent's report, the parent is told what the task took: how
+long it worked, the most of its context window it used, how often it
+compacted, and how many requests it made. A parent that hands out a
+large job in pieces can size the next piece by it.
+
 ### Subagents in the background
 
 The parent waits for its subagents to report. Run in background, on a
