@@ -77,11 +77,19 @@ static void tipv(char const *fmt, __builtin_va_list ap)
     ImGui::EndTooltip();
 }
 
+// A tooltip's text is also the item's help for assistive tools, shown
+// or not (a11y_imgui.cpp)
+static void axtip(Str);
+static void axtipv(char const *fmt, __builtin_va_list ap);
+
 static void itemtip(char const *fmt, ...) IM_FMTARGS(1);
 static void itemtip(char const *fmt, ...)
 {
+    __builtin_va_list ap;
+    __builtin_va_start(ap, fmt);
+    axtipv(fmt, ap);
+    __builtin_va_end(ap);
     if (ImGui::BeginItemTooltip()) {
-        __builtin_va_list ap;
         __builtin_va_start(ap, fmt);
         tipv(fmt, ap);
         __builtin_va_end(ap);
@@ -7512,6 +7520,9 @@ static void itemnamed(Gui *g, Str name)
 // A tooltip for the last item, disabled or not: why it is disabled.
 static void whytip(Str why)
 {
+    if (why.len) {
+        axtip(why);
+    }
     if (why.len && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
         tipnow("%.*s", (int)why.len, why.cdata);
     }

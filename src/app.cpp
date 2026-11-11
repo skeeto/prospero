@@ -20687,6 +20687,27 @@ static DriveOp firstops[] = {
     {OP_SUMMARY, 0, 0, 0, 0, ""},
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
+// Accessibility (--a11y): the tree an assistive tool sees, with a
+// session's prompt focused.
+static DriveOp a11yops[] = {
+    {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
+    {OP_NEWSESSION, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_A11Y, 0, 0, 0, 500, "on"},
+    {OP_A11Y, 0, 0, 0, 0, "dump"},
+    {OP_A11Y, 0, 0, 0, 0, "has menubar"},
+    {OP_A11Y, 0, 0, 0, 0, "has menuitem Session"},
+    {OP_A11Y, 0, 0, 0, 0, "has group Transcript"},
+    {OP_A11Y, 0, 0, 0, 0, "has button Send"},
+    {OP_A11Y, 0, 0, 0, 0, "help button Send"},
+    {OP_A11Y, 0, 0, 0, 0, "focus textarea "},
+    // What is typed is the field's value, each frame
+    {OP_TEXT, 0, 0, 0, 300, "hello there"},
+    {OP_A11Y, 0, 0, 0, 0, "value hello there"},
+    {OP_SUMMARY, 0, 0, 0, 0, ""},
+    {OP_QUIT, 0, 0, 0, 0, ""},
+};
+
 #undef KEY
 #undef CLICK
 #undef RCLICK
@@ -20702,25 +20723,6 @@ static DriveOp idleops[] = {
     {OP_MARK, 0, 0, 0, 10000, ""},  // startup settles
     {OP_MARK, 0, 0, 0, 60000, "idle"},
     {OP_RATES, 0, 0, 0, 3000, "idle 60 s"},
-    {OP_QUIT, 0, 0, 0, 0, ""},
-};
-
-// Accessibility (--a11y): the tree an assistive tool sees, with a
-// session's prompt focused.
-static DriveOp a11yops[] = {
-    {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
-    {OP_NEWSESSION, 0, 0, 0, 0, ""},
-    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
-    {OP_A11Y, 0, 0, 0, 500, "on"},
-    {OP_A11Y, 0, 0, 0, 0, "dump"},
-    {OP_A11Y, 0, 0, 0, 0, "has menubar"},
-    {OP_A11Y, 0, 0, 0, 0, "has menuitem Session"},
-    {OP_A11Y, 0, 0, 0, 0, "has group Transcript"},
-    {OP_A11Y, 0, 0, 0, 0, "has button Send"},
-    {OP_A11Y, 0, 0, 0, 0, "focus textarea "},
-    // What is typed is the field's value, each frame
-    {OP_TEXT, 0, 0, 0, 300, "hello there"},
-    {OP_A11Y, 0, 0, 0, 0, "value hello there"},
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
 

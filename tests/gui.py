@@ -2163,7 +2163,7 @@ def main():
             print(f"copilot: signed in by the device flow, polled {len(cp) - 1} times")
     if args.mode in ("drive", "e2e", "settings", "enginestop", "sessions", "plan",
                      "firstrun", "mcp", "hosttask", "changes", "thin", "containers",
-                     "terminal"):
+                     "terminal", "a11y"):
         summary = [l for l in lines if "drive:" in l and " checks, " in l]
         if not summary:
             problems.append("no checklist summary")
