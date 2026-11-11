@@ -96,8 +96,8 @@ link = #82aaff
 
 Colors are `#rgb` or `#rrggbb`. A theme starts from the built-in theme
 its `base` names, `dark` (the default) or `light`, so it sets only the
-colors it changes. Hover and pressed shades of buttons follow the
-button's color unless set too. The Settings pane lists every color of
+colors it changes. Hover and pressed shades of buttons, fields and
+scrollbars follow their color unless set too. The Settings pane lists every color of
 a theme with a swatch, the base's color as the hint, and a change there
 recolors the window at once. `system`, `dark` and `light` name the
 built-in themes and cannot be reused.

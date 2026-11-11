@@ -85,6 +85,11 @@ static void test_theme(Test *t)
         P(paneltext, rowhover), P(paneltext, btn), P(paneltext, btnhover),
         P(paneltext, btnpress), P(paneltext, btnon), P(paneltext, btnonhover),
         P(paneldim, rowhover), P(termfg, termbg),
+        // Tabs, the bars behind them, the menu bar, and a field under the
+        // mouse or active, all under paneltext
+        P(paneltext, tab), P(paneltext, tabsel), P(paneltext, tabbar),
+        P(paneltext, tabbaron), P(paneltext, menubar),
+        P(paneltext, framehover), P(paneltext, frameactive),
         #undef P
     };
     // The shipped Gruvbox, included as a user's configuration would, held
@@ -218,6 +223,15 @@ static void test_theme(Test *t)
         expect(t, "theme.build.btnpress", istr(&a, p.btnpress),
                istr(&a, rgb(0x40-6, 0x50-7, 0x60-6)));
         expect(t, "theme.build.onhover", istr(&a, p.btnonhover), istr(&a, rgb(0x65, 0x43, 0x21)));
+        // A field and a scrollbar shade as a button does; unchanged, not
+        expect(t, "theme.build.framehover", istr(&a, p.framehover), istr(&a, themedark.framehover));
+        Palette f = themebuild("dark", [](Str key) {
+            return key=="field" ? Str("#203040") : key=="field_active" ? Str("#010203") : Str{};
+        });
+        // dark's field is (30,47,74), its hover (48,64,79): +18,+17,+5
+        expect(t, "theme.build.fieldhover", istr(&a, f.framehover),
+               istr(&a, rgb(0x20+18, 0x30+17, 0x40+5)));
+        expect(t, "theme.build.fieldactive", istr(&a, f.frameactive), istr(&a, rgb(1, 2, 3)));
 
         expect(t, "theme.shift.clamp", istr(&a, themeshift(rgb(250, 5, 128), rgb(0, 10, 0), rgb(10, 0, 0))),
                istr(&a, rgb(255, 0, 128)));

@@ -490,7 +490,9 @@ static void uideadlines(Gui *g, Sched *s)
 // Themes
 
 // ImGui's colors for a palette: its stock dark or light style, with the
-// palette's panels, text, fields, selected rows and bars.
+// palette's panels, text, fields, rows, buttons, bars, tabs, borders,
+// scrollbars and accent. What is left of the stock style is translucent
+// (dimming, table rows' stripes), so it suits any theme on its base.
 static void themestyle(ImGuiStyle *st, Palette *p)
 {
     if (p->dark) {
@@ -499,6 +501,40 @@ static void themestyle(ImGuiStyle *st, Palette *p)
         ImGui::StyleColorsLight(st);
     }
     ImVec4 *c = st->Colors;
+    auto    v = [](u32 x, f32 alpha = 1) {
+        ImVec4 r = ImGui::ColorConvertU32ToFloat4(x);
+        r.w = alpha;
+        return r;
+    };
+    c[ImGuiCol_FrameBgHovered]   = v(p->framehover);
+    c[ImGuiCol_FrameBgActive]    = v(p->frameactive);
+    c[ImGuiCol_CheckboxSelectedBg] = ImLerp(v(p->frame), v(p->framehover), 0.65f);
+    c[ImGuiCol_TitleBg]          = v(p->tabbar);
+    c[ImGuiCol_TitleBgActive]    = v(p->tabbaron);
+    c[ImGuiCol_MenuBarBg]        = v(p->menubar);
+    // The dimmed tabs, of panes without focus, as the stock styles have them
+    c[ImGuiCol_Tab]              = v(p->tab);
+    c[ImGuiCol_TabSelected]      = v(p->tabsel);
+    c[ImGuiCol_TabDimmed]        = ImLerp(v(p->tab),    v(p->tabbar), 0.80f);
+    c[ImGuiCol_TabDimmedSelected]= ImLerp(v(p->tabsel), v(p->tabbar), 0.40f);
+    c[ImGuiCol_TabSelectedOverline] = v(p->accent);
+    c[ImGuiCol_CheckMark]        = v(p->accent);
+    c[ImGuiCol_SliderGrab]       = v(p->accent);
+    c[ImGuiCol_SliderGrabActive] = v(p->accent);
+    c[ImGuiCol_NavCursor]        = v(p->accent);
+    c[ImGuiCol_DockingPreview]   = v(p->accent, 0.70f);
+    c[ImGuiCol_SeparatorHovered] = v(p->accent, 0.78f);
+    c[ImGuiCol_SeparatorActive]  = v(p->accent);
+    c[ImGuiCol_ResizeGrip]       = v(p->accent, 0.20f);
+    c[ImGuiCol_ResizeGripHovered]= v(p->accent, 0.67f);
+    c[ImGuiCol_ResizeGripActive] = v(p->accent, 0.95f);
+    c[ImGuiCol_Border]           = v(p->border);
+    c[ImGuiCol_Separator]        = v(p->border);
+    c[ImGuiCol_TreeLines]        = v(p->border);
+    c[ImGuiCol_ScrollbarGrab]    = v(p->scroll);
+    c[ImGuiCol_ScrollbarGrabHovered] = v(p->scrollhover);
+    c[ImGuiCol_ScrollbarGrabActive]  = v(p->scrollpress);
+    c[ImGuiCol_TextSelectedBg]   = v(p->sel);
     c[ImGuiCol_WindowBg]      = ImGui::ColorConvertU32ToFloat4(p->panel);
     c[ImGuiCol_Text]          = ImGui::ColorConvertU32ToFloat4(p->paneltext);
     c[ImGuiCol_TextDisabled]  = ImGui::ColorConvertU32ToFloat4(p->paneldim);

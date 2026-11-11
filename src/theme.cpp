@@ -24,7 +24,8 @@
 // or light, whose palette it starts from, and colors laid over it by
 // key (themekeys), as #rgb or #rrggbb. A button or toggle given a color
 // of its own whose hover and pressed shades are left unset gets shades
-// that differ from it as the base's differ from its own (themebuild).
+// that differ from it as the base's differ from its own (themebuild), as
+// do a field and a scrollbar.
 //
 // This is free and unencumbered software released into the public domain.
 
@@ -45,7 +46,9 @@ struct Palette {
     u32 panel;      // window background
     u32 paneltext;
     u32 paneldim;   // disabled text and hints
-    u32 frame;      // fields, opaque
+    u32 frame;      // fields, opaque: at rest, under the mouse, active
+    u32 framehover;
+    u32 frameactive;
     u32 selrow;     // a selected row (the sidebar's session), opaque
     u32 rowhover;   // a row under the mouse, and pressed, opaque
     u32 rowpress;
@@ -55,6 +58,17 @@ struct Palette {
     u32 btnon;      // a toggle that is on, and it under the mouse: a toggle
     u32 btnonhover; // that is off has no fill, so on stands out from it
     u32 bar;        // progress bars, under paneltext
+    u32 tabbar;     // behind panes' tabs (and floating windows' titles)
+    u32 tabbaron;   // that of the pane with focus
+    u32 tab;        // a pane's tab, and the one selected, under paneltext
+    u32 tabsel;
+    u32 accent;     // check marks, sliders, the focused tab's line, a
+                    // splitter under the mouse, docking's preview
+    u32 border;     // borders and separators, opaque on panel
+    u32 scroll;     // scrollbars' grab: at rest, under the mouse, pressed
+    u32 scrollhover;
+    u32 scrollpress;
+    u32 menubar;    // the main menu bar, under paneltext
     // The transcript, on panel
     u32 text;
     u32 dim;        // headers and secondary text
@@ -99,6 +113,8 @@ static Palette themedark = {
     .paneltext = rgb(255, 255, 255),
     .paneldim  = rgb(153, 153, 153),
     .frame     = rgb( 30,  47,  74),
+    .framehover  = rgb( 48,  64,  79),
+    .frameactive = rgb( 54,  84, 120),
     .selrow    = rgb( 32,  58,  89),
     .rowhover  = rgb( 28,  46,  70),
     .rowpress  = rgb( 36,  54,  80),
@@ -108,6 +124,16 @@ static Palette themedark = {
     .btnon     = rgb( 24,  98, 184),
     .btnonhover= rgb( 36, 112, 204),
     .bar       = rgb( 52,  96, 170),
+    .tabbar    = rgb( 10,  10,  10),
+    .tabbaron  = rgb( 41,  74, 122),
+    .tab       = rgb( 45,  87, 144),
+    .tabsel    = rgb( 51, 105, 173),
+    .accent    = rgb( 66, 150, 250),
+    .border    = rgb( 62,  62,  72),
+    .scroll    = rgb( 79,  79,  79),
+    .scrollhover = rgb(105, 105, 105),
+    .scrollpress = rgb(130, 130, 130),
+    .menubar   = rgb( 36,  36,  36),
     .text      = rgb(222, 222, 222),
     .dim       = rgb(160, 170, 190),
     .reasoning = rgb(150, 150, 150),
@@ -162,6 +188,8 @@ static Palette themelight = {
     .paneltext = rgb(  0,   0,   0),
     .paneldim  = rgb( 98,  98,  98),
     .frame     = rgb(255, 255, 255),
+    .framehover  = rgb(171, 204, 244),
+    .frameactive = rgb(124, 180, 247),
     .selrow    = rgb(186, 212, 243),
     .rowhover  = rgb(206, 224, 246),
     .rowpress  = rgb(190, 212, 240),
@@ -171,6 +199,16 @@ static Palette themelight = {
     .btnon     = rgb(100, 160, 240),
     .btnonhover= rgb( 84, 144, 228),
     .bar       = rgb(150, 190, 240),
+    .tabbar    = rgb(209, 209, 209),
+    .tabbaron  = rgb(255, 255, 255),
+    .tab       = rgb(237, 245, 255),
+    .tabsel    = rgb(180, 213, 253),
+    .accent    = rgb( 66, 150, 250),
+    .border    = rgb(153, 153, 153),
+    .scroll    = rgb(189, 189, 189),
+    .scrollhover = rgb(148, 148, 148),
+    .scrollpress = rgb(125, 125, 125),
+    .menubar   = rgb(219, 219, 219),
     .text      = rgb( 32,  33,  36),
     .dim       = rgb( 80,  88, 100),
     .reasoning = rgb( 92,  92,  96),
@@ -233,6 +271,8 @@ static ThemeKey themekeys[] = {
     TK("panel_text", paneltext),
     TK("panel_dim", paneldim),
     TK("field", frame),
+    TK("field_hover", framehover),
+    TK("field_active", frameactive),
     TK("row_selected", selrow),
     TK("row_hover", rowhover),
     TK("row_pressed", rowpress),
@@ -242,6 +282,16 @@ static ThemeKey themekeys[] = {
     TK("toggle_on", btnon),
     TK("toggle_on_hover", btnonhover),
     TK("progress", bar),
+    TK("tab_bar", tabbar),
+    TK("tab_bar_focused", tabbaron),
+    TK("tab", tab),
+    TK("tab_selected", tabsel),
+    TK("accent", accent),
+    TK("border", border),
+    TK("scrollbar", scroll),
+    TK("scrollbar_hover", scrollhover),
+    TK("scrollbar_pressed", scrollpress),
+    TK("menu_bar", menubar),
     TK("text", text),
     TK("text_dim", dim),
     TK("reasoning", reasoning),
@@ -340,12 +390,23 @@ static Palette themebuild(Str base, F get)
     for (iz i = 0; i < countof(themekeys); i++) {
         themeput(&p, themekeys[i].key, get(themekeys[i].key));
     }
-    if (p.btn != b->btn) {
-        p.btnhover = p.btnhover==b->btnhover ? themeshift(p.btn, b->btn, b->btnhover) : p.btnhover;
-        p.btnpress = p.btnpress==b->btnpress ? themeshift(p.btn, b->btn, b->btnpress) : p.btnpress;
-    }
-    if (p.btnon!=b->btnon && p.btnonhover==b->btnonhover) {
-        p.btnonhover = themeshift(p.btnon, b->btnon, b->btnonhover);
+    // Each color with its shades, as offsets into Palette
+    static constexpr iz shades[][3] = {
+        #define S(f) __builtin_offsetof(Palette, f)
+        {S(btn),    S(btnhover),    S(btnpress)},
+        {S(btnon),  S(btnonhover),  -1},
+        {S(frame),  S(framehover),  S(frameactive)},
+        {S(scroll), S(scrollhover), S(scrollpress)},
+        #undef S
+    };
+    for (iz i = 0; i < countof(shades); i++) {
+        u32 c = *themecolor(&p, shades[i][0]);
+        u32 o = *themecolor((Palette *)b, shades[i][0]);
+        for (iz k = 1; c!=o && k<3 && shades[i][k]>=0; k++) {
+            u32 *s  = themecolor(&p, shades[i][k]);
+            u32  bs = *themecolor((Palette *)b, shades[i][k]);
+            *s = *s==bs ? themeshift(c, o, bs) : *s;
+        }
     }
     return p;
 }
