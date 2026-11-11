@@ -1117,6 +1117,7 @@ static void testcfgjson(Test *t)
         "ui//editor_line=*\n"
         "ui//terminal=*\n"
         "ui//mentions=true*\n"
+        "ui//accessibility=auto*\n"
         "ui//notify=allow done*\n"
         "terminal//shell=*\n"
         "terminal//scrollback=10000*\n"

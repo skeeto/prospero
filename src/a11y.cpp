@@ -218,7 +218,7 @@ enum : i32 {
     AXM_TEXT0,  // the focused field's text and offsets, in turn
     AXM_TEXT1,
     AXM_GEOM,   // its geometry, emptied each frame
-    AXM_QUEUE,  // queued edits, emptied once all are taken
+    AXM_QUEUE,  // queued edits, emptied at the next once all are taken
     AXM_N
 };
 
@@ -1228,6 +1228,17 @@ static b32 axeditable(AxText *t)
     return t->live && !(t->state & (AXS_READONLY|AXS_PASSWORD));
 }
 
+// The queue's arena, emptied first if every edit in it was taken.
+static Arena *axqueue(A11y *x)
+{
+    if (x->qhead == x->queue.len) {
+        x->queue = {};
+        x->qhead = 0;
+        return axempty(x, AXM_QUEUE);
+    }
+    return &x->mem[AXM_QUEUE];
+}
+
 // Replace bytes [lo, hi) of the focused field's text, then select from
 // anchor to caret, both in the text after, or AX_AFTER. Refused (0) for
 // a field not editable, or a range not in its text.
@@ -1241,7 +1252,7 @@ static b32 axedit(A11y *x, i32 lo, i32 hi, Str text, i32 anchor, i32 caret, i64 
     lo = axtobyte(x, AXU_BYTE, lo);
     hi = axtobyte(x, AXU_BYTE, hi);
 
-    Arena *q = &x->mem[AXM_QUEUE];
+    Arena *q = axqueue(x);
     AxEdit e = {};
     e.id     = t->id;
     e.lo     = lo;
@@ -1284,7 +1295,7 @@ static b32 axselect(A11y *x, i32 anchor, i32 caret, i64 now)
     e.when   = now;
     e.anchor = axtobyte(x, AXU_BYTE, anchor);
     e.caret  = axtobyte(x, AXU_BYTE, caret);
-    x->queue = push(&x->mem[AXM_QUEUE], x->queue, e);
+    x->queue = push(axqueue(x), x->queue, e);
     t->anchor = e.anchor;
     t->caret  = e.caret;
     return 1;
@@ -1319,10 +1330,5 @@ static b32 axnextedit(A11y *x, u32 id, Str text, i64 now, AxEdit *out)
     while (x->qhead<x->queue.len && !x->queue[x->qhead].id) {
         x->qhead++;
     }
-    if (x->qhead == x->queue.len) {
-        axempty(x, AXM_QUEUE);
-        x->queue = {};
-        x->qhead = 0;
-    }
-    return r;
+    return r;  // the queue's arena is kept: out's text is in it
 }

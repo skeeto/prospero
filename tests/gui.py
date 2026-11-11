@@ -1801,7 +1801,7 @@ def main():
                              "settings", "enginestop", "bench", "background", "remote",
                              "compose", "sessions", "plan", "launch", "firstrun",
                              "mcp", "hosttask", "changes", "thin", "containers",
-                             "terminal"])
+                             "terminal", "a11y"])
     ap.add_argument("--ssh", help="with --mode remote: the remote host, over real ssh "
                                   "(default: this machine, through a fake ssh)")
     ap.add_argument("--remote-prospero", help="with --ssh: the harness built there")

@@ -669,6 +669,11 @@ static CfgKey cfgschema[] = {
      "Whether @ at a word's start in the compose box opens the picker of "
      "the session's files and folders and other sessions; false leaves @ "
      "as plain text, and a message carries no mentioned sessions' ids"},
+    {"ui", "accessibility", CFG_ENUM, "auto", {}, "auto on off", "ui",
+     "What assistive tools see of the window, its panes, controls and the "
+     "text being edited, for dictation, voice control and screen readers: "
+     "auto from when one first asks, on from the start, off for nothing. "
+     "Read at startup"},
     {"ui", "notify", CFG_LIST, "allow done", {}, "allow done none", "ui",
      "Desktop notifications while you look elsewhere: allow when an "
      "ask waits for you (a permission, a plan to approve, the agent's "

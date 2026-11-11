@@ -315,6 +315,11 @@ fails with a link to sign up for Copilot Free.
 - **[`[ui] mentions`](settings:ui#mentions)**: `false` turns off the
   `@` picker of files, folders and sessions in the compose box, leaving
   `@` as plain text. On by default.
+- **[`[ui] accessibility`](settings:ui#accessibility)**: what assistive
+  tools (dictation, voice control, screen readers) see of the window:
+  its panes, its controls and the text being edited. `auto`, the
+  default, from when one first asks; `on` from the start; `off` for
+  nothing. Read at startup.
 - **[`[ui] font_size`](settings:ui#font_size)**: the text's size in
   pixels, 8 to 40 (17 by default). The View menu's zoom scales it until Prospero exits.
 - **[`[ui] theme`](settings:ui#theme)**: `system`, `dark` or `light`,
