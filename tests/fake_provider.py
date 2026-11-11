@@ -308,6 +308,43 @@ def is_compaction(req):
         str(msgs[0].get("content", "")).startswith(COMPACT_MARK)
 
 
+TITLE_SYSTEM = "You name coding sessions"
+TITLE_ASK = "Name this session for the user's list of sessions"
+
+
+def is_title(req):
+    """A request for the session's title: the titler's (its system prompt)
+    or the session's own model's, its last message the engine's ask."""
+    msgs = req.get("messages", [])
+    system = req.get("system")
+    if isinstance(system, list):  # Anthropic
+        if system and str(system[0].get("text", "")).startswith(TITLE_SYSTEM):
+            return True
+    elif msgs and msgs[0].get("role") == "system" and \
+            str(msgs[0].get("content", "")).startswith(TITLE_SYSTEM):
+        return True
+    if not msgs or msgs[-1].get("role") != "user":
+        return False
+    content = msgs[-1].get("content", "")
+    if isinstance(content, list):  # parts
+        content = "".join(str(c.get("text", "")) for c in content if isinstance(c, dict))
+    return str(content).startswith(TITLE_ASK)
+
+
+def title_default(model, n, req):
+    """No title, unless a scenario has its own (NAME_title): the engine
+    keeps the prompt's, and scenarios that don't test titles see them
+    unchanged."""
+    yield S.head()
+    yield from finish(model)
+
+
+def an_title_default(model, n, req):
+    yield S.head()
+    yield an_start(model, req)
+    yield from an_end()
+
+
 def compact_default(model, n, req):
     yield S.head()
     yield from text(model, f"## Goal\nRead the files.\n\n## Progress\n### Done\n"
@@ -4850,6 +4887,54 @@ def sc_compact_heed(model, n, req):
         yield from real_answer(model, req, "All files read.")
 
 
+# Titles (scenarios title_*): the session's turns answer at once, and
+# its title's requests (#title) as each scenario needs.
+
+def sc_an_title(model, n, req):
+    yield from an_answer(model, req, f"Done {n}.")
+
+
+def sc_an_title_title(model, n, req):
+    yield from an_answer(model, req, "Fix the parser")
+
+
+def sc_title_fork(model, n, req):
+    yield from answer(model, f"Done {n}.")
+
+
+def sc_title_fork_title(model, n, req):
+    yield from answer(model, "**Title: Fix the parser's crash.**")
+
+
+sc_title_titler = sc_title_fork
+sc_title_none = sc_title_fork
+sc_title_slow = sc_title_fork
+sc_title_rename = sc_title_fork
+
+
+def sc_title_small(model, n, req):
+    yield from answer(model, "The titler is not asked to chat.")
+
+
+def sc_title_small_title(model, n, req):
+    yield from answer(model, "Add a dark theme")
+
+
+def sc_title_slow_title(model, n, req):
+    # Slow enough that the next prompt comes first, then at once
+    yield S.head()
+    yield S.sleep(30 if n == 0 else 0)
+    yield from text(model, "Titled at last", 2)
+    yield from finish(model)
+
+
+def sc_title_rename_title(model, n, req):
+    yield S.head()
+    yield S.sleep(1.5)
+    yield from text(model, "A model's title", 2)
+    yield from finish(model)
+
+
 def sc_compact_cancel_compact(model, n, req):
     # A summarizer slow enough to cancel, then one quick, but not so
     # quick that it ends before the prompt sent after it is queued
@@ -5925,6 +6010,9 @@ def rs_handle(handler, prefix, raw, rotate=False):
     if is_compaction(chat):
         key = model + "#compact"
         fn = SCENARIOS.get(name + "_compact", compact_default)
+    elif is_title(chat):
+        key = model + "#title"
+        fn = SCENARIOS.get(name + "_title", title_default)
     headers = {k.lower(): v for k, v in handler.headers.items()}
     n = STATE.take(key, req, headers)
     STATE.begin(prefix, model)
@@ -6695,6 +6783,9 @@ class Handler(BaseHTTPRequestHandler):
         if is_compaction(req):
             key = model + "#compact"
             fn = SCENARIOS.get(name + "_compact", compact_default)
+        elif is_title(req):
+            key = model + "#title"
+            fn = SCENARIOS.get(name + "_title", title_default)
         n = STATE.take(key, req)
         STATE.begin(prefix, model)
         try:
@@ -6734,6 +6825,9 @@ class Handler(BaseHTTPRequestHandler):
         if is_compaction(req):
             key = model + "#compact"
             fn = SCENARIOS.get(name + "_compact", an_compact_default)
+        elif is_title(req):
+            key = model + "#title"
+            fn = SCENARIOS.get(name + "_title", an_title_default)
         headers = {k.lower(): v for k, v in self.headers.items() if k.lower() != "x-api-key"}
         n = STATE.take(key, req, headers)
         STATE.begin(prefix, model)

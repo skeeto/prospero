@@ -1053,6 +1053,7 @@ static void testcfgjson(Test *t)
         "model/m/reasoning=reasoning_content*\n"
         "model/m/context=*\n"
         "model/m/compactor=*\n"
+        "model/m/titler=*\n"
         "model/m/fallback=*\n"
         "model/m/fallback_cooldown=600*\n"
         "model/m/subagent_model=*\n"

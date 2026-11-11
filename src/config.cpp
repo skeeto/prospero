@@ -340,6 +340,10 @@ static CfgKey cfgschema[] = {
     {"model", "compactor", CFG_STRING, "", {}, {}, "model",
      "Model that summarizes long conversations, MODEL or ENDPOINT/MODEL, "
      "by default this one"},
+    {"model", "titler", CFG_STRING, "", {}, {}, "model",
+     "Model that titles a session after its first turn, MODEL or "
+     "ENDPOINT/MODEL, by default this one on the conversation so far, or "
+     "none to keep the first prompt as the title"},
     {"model", "fallback", CFG_STRING, "", {}, {}, "model",
      "Models to use in turn when this one fails or hits a usage limit, "
      "each MODEL or ENDPOINT/MODEL"},

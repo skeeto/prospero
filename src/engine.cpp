@@ -220,6 +220,7 @@ static_assert(countof(nudgeinfo) == N_COUNT);
 enum : i32 {
     REQ_CHAT,     // what a request is for: a step of the turn
     REQ_COMPACT,  // a summary of older messages
+    REQ_TITLE,    // the session's title, after its turn (titling)
 };
 
 enum : i32 {
@@ -613,6 +614,17 @@ struct Compact {
     i64       began;     // ticks
 };
 
+// A title being made for the session (REQ_TITLE), by the titler, or by
+// the session's own model on its conversation so far (fork), which
+// shares that conversation's cached prefix.
+struct Titler {
+    Endpoint  ep;
+    Str       model;
+    ModelConf mc;
+    b32       fork;
+    i64       began;  // ticks
+};
+
 // A message from the user waiting to be taken in, which the user may
 // withdraw until then (unqueue) by its id, unique in its session.
 struct Queued {
@@ -766,6 +778,12 @@ struct Session {
     i64          thinkfrom;  // seq of the latest compaction, which leaves
                              // older reasoning bound to what it changed
     Compact      cp;         // with REQ_COMPACT
+    Titler       tt;         // with REQ_TITLE
+    b32          titling;    // a title's request holds the slot, while
+                             // the session is idle as far as all else
+                             // can tell (busy, live): a turn stops it
+    b32          titled;     // by a model, or the user: never again
+    i32          titletries; // in this process
     b32          compactnext;  // the turn compacts, as asked (compact)
     Str          cpfocus;    // and what to keep of it
     i64          ctxhint;    // the window as the log last gave it, shown
@@ -1088,7 +1106,15 @@ static i64 tps10(Session *s)
 // The endpoint of the current request.
 static Endpoint *reqep(Session *s)
 {
-    return s->purpose==REQ_COMPACT ? &s->cp.ep : &s->ep;
+    return s->purpose==REQ_COMPACT ? &s->cp.ep :
+           s->purpose==REQ_TITLE   ? &s->tt.ep : &s->ep;
+}
+
+// The model of the current request.
+static Str reqmodel(Session *s)
+{
+    return s->purpose==REQ_COMPACT ? s->cp.model :
+           s->purpose==REQ_TITLE   ? s->tt.model : s->model;
 }
 
 // The context's gauge: the window (ctx) and the prompt size at which it
@@ -1118,13 +1144,14 @@ static void live(Session *s)
     Os   *os  = s->e->os;
     i64   now = os_ticks(os);
     EvOut w   = sbegin(s, &b, EV_LIVE);
-    b32   cp  = s->purpose==REQ_COMPACT && requesting(s->state);
-    putstrkey(&w.json, "state", cp ? Str("compacting") : statenames[s->state]);
-    putgauge(s, &w.json, requesting(s->state) ? s->sentest : estimate(s));
+    i32   st  = s->titling ? (i32)S_IDLE : s->state;  // titling: idle
+    b32   cp  = s->purpose==REQ_COMPACT && requesting(st);
+    putstrkey(&w.json, "state", cp ? Str("compacting") : statenames[st]);
+    putgauge(s, &w.json, requesting(st) ? s->sentest : estimate(s));
     if (s->mc.novision) {
         putintkey(&w.json, "novision", 1);  // its model takes no images
     }
-    if (requesting(s->state)) {
+    if (requesting(st)) {
         Endpoint *ep = reqep(s);
         putintkey(&w.json, "idle_ms", (now - s->lastbyte)/MS);
         putkey(&w.json, "tps");
@@ -1224,6 +1251,10 @@ static void sendqueue(Session *s, Arena scratch)
 
 static void setstate(Session *s, i32 state)
 {
+    if (s->titling) {
+        s->state = state;  // the session is idle to all else
+        return;
+    }
     if (s->state != state) {
         s->state = state;
         live(s);
@@ -2016,7 +2047,8 @@ static b32 onprobe(Engine *e, Arena scratch, Record r)
 
 static ModelConf *reqmc(Session *s)
 {
-    return s->purpose==REQ_COMPACT ? &s->cp.mc : &s->mc;
+    return s->purpose==REQ_COMPACT ? &s->cp.mc :
+           s->purpose==REQ_TITLE   ? &s->tt.mc : &s->mc;
 }
 
 static i32 confint(Config *cfg, Str kind, Str name, Str key)
@@ -2037,7 +2069,7 @@ static b32 admit(Session *s, Arena scratch)
     Engine   *e     = s->e;
     Config   *cfg   = e->cfg;
     Endpoint *ep    = reqep(s);
-    Str       model = s->purpose==REQ_COMPACT ? s->cp.model : s->model;
+    Str       model = reqmodel(s);
     Str       id    = reqmc(s)->name;  // variants of a model share it
     if (ep->relay.len) {
         return 1;  // the computer relaying it admits it there
@@ -2304,11 +2336,11 @@ struct CpHint {
 static CpHint cphint(Session *s)
 {
     CpHint h  = {};
-    b32    cp = s->purpose == REQ_COMPACT;
+    b32    cp = s->purpose != REQ_CHAT;
     iz     n  = s->history.len;
     b32    us = !cp && n && s->history[n-1].role==ROLE_USER;
     h.initiator   = us ? Str("user") : Str("agent");
-    h.interaction = cp         ? Str("conversation-compaction") :
+    h.interaction = s->purpose==REQ_COMPACT ? Str("conversation-compaction") :
                     s->depth>0 ? Str("conversation-subagent")
                                : Str("conversation-agent");
     for (iz i = 0; !cp && i < n; i++) {
@@ -2520,10 +2552,14 @@ static void sendchat(Session *s, Arena scratch)
     setstate(s, S_HEAD);
 }
 
+static void sendtitle(Session *, Arena);
+
 static void sendreq(Session *s, Arena scratch)
 {
     if (s->purpose == REQ_COMPACT) {
         sendcompact(s, scratch);
+    } else if (s->purpose == REQ_TITLE) {
+        sendtitle(s, scratch);
     } else {
         sendchat(s, scratch);
     }
@@ -2765,7 +2801,7 @@ enum : i32 {
 static void retryevent(Session *s, Arena scratch, i32 kind, i32 cls,
                        i32 status, i64 delayms, Str msg)
 {
-    Str   model = s->purpose==REQ_COMPACT ? s->cp.model : s->model;
+    Str   model = reqmodel(s);
     Buf   b(&scratch, 512 + msg.len);
     EvOut w = sbegin(s, &b, EV_RETRY);
     putintkey(&w.json, "turn", s->turn);
@@ -3030,8 +3066,14 @@ static b32 refusepdf(Session *, Str);
 // nothing visible has streamed, and otherwise commit what streamed and
 // ask the agent to continue. Once quick retries are spent, fallbacks and
 // slow retries follow (above). retryms is the server's wish, -1 if none.
+static void titleend(Session *, Arena);
+
 static void fail(Session *s, Arena scratch, i32 cls, i32 status, Str msg, i64 retryms)
 {
+    if (s->purpose == REQ_TITLE) {
+        titleend(s, scratch);  // no retries: the prompt's title stays
+        return;
+    }
     if (cls == CLASS_RELAY) {
         // Lost by the computer relaying it, not by the endpoint: with
         // nothing visible, sent again at no cost (to another computer if
@@ -3310,6 +3352,9 @@ static PrefillLine *prefillline(Engine *e, u64 key)
 
 static void emitprogress(Session *s, Arena scratch, Chunk *c)
 {
+    if (s->titling) {
+        return;  // the session is idle to its frontends
+    }
     // The server's clock if it gives one (llama.cpp's time_ms), which
     // the network's delays leave out, else this one
     Prefill *p = &s->pf;
@@ -3319,7 +3364,7 @@ static void emitprogress(Session *s, Arena scratch, Chunk *c)
     i64 eta = -1, tps10 = 0;
     if (!p->server || c->pms>=0) {
         i64 ms    = p->server ? c->pms : os_ticks(s->e->os)/MS;
-        Str model = s->purpose==REQ_COMPACT ? s->cp.model : s->model;
+        Str model = reqmodel(s);
         u64 key   = (hash(reqep(s)->url)*3 ^ hash(model)) | 1;
         eta = prefilleta(p, prefillline(s->e, key), key, c->pdone, c->ptotal, ms);
         // Tokens per second, tenths, as the output's (tps10): the tokens
@@ -14440,6 +14485,267 @@ static i64 stephard(Session *s)
     return s->stepmax && (!h || s->stepmax<h) ? s->stepmax : h;
 }
 
+static Str  cleantitle(Arena *, Str, iz);
+static i64  parkafter(Engine *);
+static void settitle(Session *, Arena, Str, Str, Usage *);
+static void cool(Session *);
+static b32  endpointconf(Engine *, Arena *, Str, Endpoint *);
+
+enum : i32 {
+    TITLE_WORDS = 6,  // a first prompt this short is title enough
+    TITLE_TRIES = 2,  // requests for a session's title, at most, a run
+    TITLE_TURNS = 3,  // user messages after which none is asked for
+};
+
+// The fork's request: the conversation as it stands, then this.
+static Str const titleask =
+    "Name this session for the user's list of sessions: reply with a "
+    "title of at most 6 words saying what the session is about, as plain "
+    "text with no quotes, markdown or closing period, and nothing else. "
+    "Do not call a tool.";
+
+// The titler's own request: a system prompt, and the user's first
+// message and the agent's latest reply.
+static Str const titlesystem =
+    "You name coding sessions for the user's list of sessions. Reply with "
+    "a title of at most 6 words saying what the session below is about, "
+    "as plain text with no quotes, markdown or closing period, and "
+    "nothing else.";
+
+// Stop the title's request, if one is under way, the session idle as it
+// was. The prompt's title stays.
+static void titleend(Session *s, Arena scratch)
+{
+    (void)scratch;
+    if (!s->titling) {
+        return;
+    }
+    stopreq(s);
+    release(s, 0);
+    cool(s);
+    disarm(s, T_BACKOFF);
+    disarm(s, T_ADMIT);
+    disarm(s, T_RELAY);
+    s->part    = 0;
+    s->purpose = REQ_CHAT;
+    s->tt      = {};
+    s->state   = S_IDLE;  // never shown otherwise (setstate)
+    s->titling = 0;
+}
+
+// The text before its first line break with something in it.
+static Str firstline(Str t)
+{
+    for (Str rest = t; rest.len;) {
+        Cut c    = cut(rest, '\n');
+        Str line = trim(c.head);
+        if (line.len) {
+            return line;
+        }
+        rest = c.tail;
+    }
+    return {};
+}
+
+// A model's title, as models write them: its first line, without a
+// "Title:" label, quotes, markdown emphasis or a closing period.
+static Str titletext(Arena *a, Str t)
+{
+    Str line = firstline(t);
+    for (b32 again = 1; again && line.len;) {
+        again = 0;
+        if (line.len>=6 && (takehead(line, 6)=="Title:" || takehead(line, 6)=="title:")) {
+            line  = trim(cuthead(line, 6));
+            again = 1;
+        }
+        static char const marks[] = "\"'`*_#";
+        for (char const *m = marks; *m; m++) {
+            if (line[0]==(u8)*m || line[line.len-1]==(u8)*m) {
+                line  = trim(line[0]==(u8)*m ? cuthead(line, 1) : line);
+                line  = line.len && line[line.len-1]==(u8)*m
+                      ? trim(takehead(line, line.len-1)) : line;
+                again = 1;
+            }
+        }
+        if (line.len && line[line.len-1]=='.') {
+            line  = trim(takehead(line, line.len-1));
+            again = 1;
+        }
+    }
+    return cleantitle(a, line, TITLE_MAX);
+}
+
+// Whether the turn just ended should be followed by a request for the
+// session's title: its first turns, a top-level session titled by its
+// prompt, at more words than a title.
+static b32 titlewant(Session *s)
+{
+    if (s->titled || s->usertitle || s->titletries>=TITLE_TRIES ||
+            s->depth>0 || s->readonly || s->e->quitting || !s->title.len) {
+        return 0;
+    }
+    iz users = 0;
+    for (iz i = 0; i < s->history.len; i++) {
+        users += s->history[i].role == ROLE_USER;
+    }
+    if (!users || users>TITLE_TURNS) {
+        return 0;
+    }
+    i32 words = 0;
+    for (Str rest = s->title; rest.len;) {
+        Cut c = cut(rest, ' ');
+        words += c.head.len > 0;
+        rest   = c.tail;
+    }
+    b32 cutshort = endswith(s->title, "\xe2\x80\xa6");  // cleantitle's
+    if (words<=TITLE_WORDS && !cutshort) {
+        s->titled = 1;  // as good as a title already
+        return 0;
+    }
+    return 1;
+}
+
+// After a turn ends, idle: ask for the session's title, from [model]
+// titler (MODEL or ENDPOINT/MODEL), else from the session's own model on
+// its conversation, or not at all with titler = none.
+static void titlestart(Session *s, Arena scratch)
+{
+    if (!titlewant(s)) {
+        return;
+    }
+    Engine *e    = s->e;
+    Str     own  = s->ep.name.len ? s->ep.name : s->ep.url;
+    Str     mine = epmodel(e, &scratch, own, s->model);
+    Str     spec = trim(cfgget(e->cfg, "model", mine, "titler", 0));
+    if (spec == "none") {
+        s->titled = 1;
+        return;
+    }
+    Titler tt = {};
+    tt.fork = !spec.len;
+    if (tt.fork) {
+        tt.ep    = s->ep;
+        tt.model = s->model;
+        tt.mc    = s->mc;
+    } else {
+        Target t = targetof(e, spec, own);
+        if (t.which==own || t.which==s->ep.url) {
+            tt.ep = s->ep;  // as discovery left it
+        } else if (!endpointconf(e, &s->perm, t.which, &tt.ep)) {
+            return;
+        }
+        tt.model = clone(&s->perm, t.model);
+        if (tt.model==s->model && tt.ep.url==s->ep.url) {
+            tt.mc = s->mc;
+        } else {
+            modelconf(e, &s->perm, tt.ep.name, tt.model, &tt.mc);
+            i64 *k = upsert(&e->kinds, kindkey(&scratch, tt.ep.url, tt.mc.name), (Arena *)0);
+            tt.mc.llamacpp = k && (*k&1);
+        }
+    }
+    // Nothing is waited for: no relay, no sign-in
+    Str why = {};
+    if (tt.ep.relay.len ? !relaychoose(s, &tt.ep) :
+            epsigned(tt.ep.kind) && epauth(e, &scratch, &tt.ep, 0, &why)!=EPAUTH_OK) {
+        return;
+    }
+    tt.began      = os_ticks(e->os);
+    s->tt         = tt;
+    s->titletries++;
+    s->titling    = 1;
+    s->purpose    = REQ_TITLE;
+    s->retries    = 0;
+    request(s, scratch);
+}
+
+// The text of a message's text blocks, or a user message's text.
+static Str msgtext(Arena *a, Msg *m)
+{
+    if (m->role != ROLE_ASSISTANT) {
+        return m->text;
+    }
+    Buf b(a, 256);
+    for (iz i = 0; i < m->blocks.len; i++) {
+        if (m->blocks[i].type == BLOCK_TEXT) {
+            print(&b, m->blocks[i].text);
+            putbyte(&b, '\n');
+        }
+    }
+    return finish(&b);
+}
+
+static void sendtitle(Session *s, Arena scratch)
+{
+    Titler *tt = &s->tt;
+    newattempt(s);
+
+    ChatReq req = {};
+    Msg     m   = {};
+    req.mc      = &tt->mc;
+    if (tt->fork) {
+        // As the turn's requests went, so that their cached prefix serves
+        Msg ask = {};
+        ask.role      = ROLE_USER;
+        ask.text      = titleask;
+        req.system    = s->system;
+        req.tools     = s->tools;
+        req.history   = push(&scratch, deskimages(s, &scratch), ask);
+        req.thinkfrom = s->thinkfrom;
+        req.cachekey  = s->sid;
+    } else {
+        Str first = {}, last = {};
+        for (iz i = 0; i < s->history.len; i++) {
+            Msg *m = &s->history[i];
+            if (m->role==ROLE_USER && !first.len) {
+                first = m->text;
+            } else if (m->role == ROLE_ASSISTANT) {
+                Str t = trim(msgtext(&scratch, m));
+                last  = t.len ? t : last;
+            }
+        }
+        Buf b(&scratch, 4096 + 2048);
+        print(&b, "The user's first message:\n\n");
+        print(&b, utf8head(first, 4000));
+        if (last.len) {
+            print(&b, "\n\nThe agent's latest reply:\n\n");
+            print(&b, utf8head(last, 2000));
+        }
+        m.role      = ROLE_USER;
+        m.text      = finish(&b);
+        req.system  = titlesystem;
+        req.history = {&m, 1, 1};
+    }
+    i32 wire = tt->ep.wire;
+    Str body = wire==EP_ANTHROPIC ? anencode(&s->attempt, scratch, &req) :
+               epresponses(wire)  ? rsencode(&s->attempt, scratch, &req,
+                                             tt->ep.kind==EP_CHATGPT)
+                                  : encodechat(&s->attempt, scratch, &req);
+    Str url  = callurl(&scratch, &tt->ep);
+    if (!startreq(s, scratch, &tt->ep, "POST", url, body, "text/event-stream", 0)) {
+        titleend(s, scratch);
+        return;
+    }
+    arm(s, T_FIRSTBYTE, tt->ep.firstbyte);
+    setstate(s, S_HEAD);
+}
+
+// The title's response: the session titled by it, unless renamed
+// meanwhile, or by nothing that makes a title, the prompt's title kept.
+static void titled(Session *s, Arena scratch, Partial *p)
+{
+    Str   text = p->finish=="refusal" || p->calls.len ? Str{}
+               : titletext(&scratch, finish(&p->text));
+    Usage u    = p->usage;
+    b32   has  = p->hasusage;
+    titleend(s, scratch);
+    if (text.len && !s->usertitle) {
+        settitle(s, scratch, text, "model", has ? &u : 0);
+    }
+    if (!busy(s)) {
+        arm(s, T_PARK, parkafter(s->e));
+    }
+}
+
 static void finalize(Session *s, Arena scratch)
 {
     Partial *p = s->part;
@@ -14449,6 +14755,9 @@ static void finalize(Session *s, Arena scratch)
     s->slown    = 0;
     if (s->purpose == REQ_COMPACT) {
         compacted(s, scratch, p);
+        return;
+    } else if (s->purpose == REQ_TITLE) {
+        titled(s, scratch, p);
         return;
     }
     if (p->finish == "refusal") {
@@ -14653,19 +14962,32 @@ static Str cleantitle(Arena *a, Str text, iz max)
 static Str sidecarput(Engine *, Arena, Str sid, Str name, Str data);
 static Str sidecarget(Engine *, Arena *, Str sid, Str name, iz max);
 
-// Title the session, by "auto" (its first prompt, or a subagent's task)
-// or by "user" (rename), which no automatic title replaces.
-static void settitle(Session *s, Arena scratch, Str title, Str by)
+// Title the session, by "auto" (its first prompt, or a subagent's task),
+// by "model" (titling, with what its request used) or by "user"
+// (rename), which no other title replaces.
+static void settitle(Session *s, Arena scratch, Str title, Str by, Usage *u)
 {
     if (!title.len) {
         return;
     }
     s->title     = clone(&s->perm, title);
     s->usertitle = by == "user";
-    Buf   b(&scratch, 128 + title.len);
+    s->titled   |= s->usertitle || by=="model";
+    Buf   b(&scratch, 256 + title.len);
     EvOut w = sbegin(s, &b, EV_TITLE);
     putstrkey(&w.json, "text", title);
     putstrkey(&w.json, "by", by);
+    if (u) {
+        putkey(&w.json, "usage");
+        putobject(&w.json);
+        putintkey(&w.json, "in", u->in);
+        putintkey(&w.json, "out", u->out);
+        putintkey(&w.json, "cached", u->cached);
+        if (u->written) {
+            putintkey(&w.json, "written", u->written);
+        }
+        putend(&w.json);
+    }
     ssend(s, &w);
     sidecarput(s->e, scratch, s->sid, "title", s->title);
 }
@@ -14677,6 +14999,7 @@ static void settitle(Session *s, Arena scratch, Str title, Str by)
 // only work), else is null.
 static void beginturn(Session *s, Arena scratch, Str via)
 {
+    titleend(s, scratch);  // the turn has the slot
     s->apprno    = {};  // refused for that turn: asked again
     s->cancelled = 0;
     s->authretried = 0;
@@ -14733,7 +15056,7 @@ static void startturn(Session *s, Arena scratch, Str text, Str via,
     adduser(s, scratch, text, via, images, files, refs);
     if (!s->title.len) {
         Str title = cleantitle(&scratch, text, TITLE_MAX);
-        settitle(s, scratch, title, "auto");
+        settitle(s, scratch, title, "auto", 0);
     }
     beginturn(s, scratch, {});
 }
@@ -14833,6 +15156,9 @@ static void endturn(Session *s, Arena scratch, Str why, Str err)
     } else if (resume) {
         autoresume(s, scratch);
     }
+    if (!busy(s) && why=="done") {
+        titlestart(s, scratch);
+    }
     if (!busy(s)) {
         arm(s, T_PARK, parkafter(s->e));
     }
@@ -14846,11 +15172,12 @@ static void endturn(Session *s, Arena scratch, Str why, Str err)
 
 static b32 busy(Session *s)
 {
-    return s->state!=S_IDLE || s->calls.len;
+    return (s->state!=S_IDLE && !s->titling) || s->calls.len;
 }
 
 static void cancelturn(Session *s, Arena scratch)
 {
+    titleend(s, scratch);
     if (!busy(s)) {
         return;
     }
@@ -16442,7 +16769,7 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err)
     // Complete before scratch is passed on, which copies it
     Str title = cleantitle(&scratch, args->desc.len ? args->desc : args->prompt,
                            TITLE_MAX);
-    settitle(s, scratch, title, "auto");
+    settitle(s, scratch, title, "auto", 0);
     return s;
 }
 
@@ -18255,7 +18582,7 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
     if (task.ok) {
         Str title = task.title.len ? task.title : task.prompt;
         title = cleantitle(&scratch, title, TITLE_MAX);
-        settitle(s, scratch, title, "auto");
+        settitle(s, scratch, title, "auto", 0);
     }
     reply(e, scratch, id, 1, {}, s->sid);
 
@@ -18569,6 +18896,7 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
         case EV_TITLE:
             s->title     = clone(&s->perm, jsonstr(jsonget(j, "text")));
             s->usertitle = jsonstr(jsonget(j, "by")) == "user";
+            s->titled    = s->usertitle || jsonstr(jsonget(j, "by"))=="model";
             break;
         case EV_MODEL:
             // Switched (model): the model from here on, whose requests
@@ -19833,7 +20161,7 @@ static void cmdrename(Engine *e, Arena scratch, i64 id, Json *j)
     Str      err       = !s          ? Str("no such session") :
                          s->readonly ? Str("open in another process") : Str{};
     if (!err.len) {
-        settitle(s, scratch, title, "user");
+        settitle(s, scratch, title, "user", 0);
     }
     if (transient) {
         forget(e, s);
@@ -20381,6 +20709,9 @@ static Str treebusy(Engine *e, Arena *a, SessScan *sc, Slice<iz> tree)
         ListEntry *en = &sc->list[tree[i]];
         Session   *s  = findsession(e, en->sid);
         Str        of = en->sid==root ? Str{} : concat(a, ": its subagent ", en->sid);
+        if (s && s->titling) {
+            titleend(s, *a);  // never worth keeping it for
+        }
         if (s && !s->readonly && !forgettable(s)) {
             return concat(a, "busy: cancel its turn and stop its jobs first", of);
         } else if (en->locked) {

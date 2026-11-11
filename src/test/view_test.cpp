@@ -1104,6 +1104,18 @@ static void test_viewpanels(Test *t)
         expect(t, "panels.cut", concat(&a, c->card->why, istr(&a, v->cutseq)), "overflow5");
     }
 
+    // A model's title: no mark, and its tokens count with the session's
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        apply(v, a, R"({"sid":"s","seq":1,"ts":0,"ev":"session","cwd":"/w","model":"m","endpoint":"http://a/"})");
+        apply(v, a, R"({"sid":"s","seq":2,"ts":0,"ev":"title","text":"Fix it","by":"model",)"
+                    R"("usage":{"in":900,"out":5,"cached":880}})");
+        expect(t, "title.model", concat(&a, v->title, istr(&a, v->msgs.len)), "Fix it0");
+        expect(t, "title.usage", concat(&a, istr(&a, v->work.in), istr(&a, v->work.cached)),
+               "900880");
+    }
+
     // A compaction the user asked for: its turn starts at no message,
     // the prompt before keeps its own turn, and the card says manual; a
     // model switch, and titles by whoever set them

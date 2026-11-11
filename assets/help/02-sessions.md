@@ -239,8 +239,11 @@ host's git run there.
 
 Right-click a session in the sidebar, or open the Session menu, for:
 
-- **Rename...**. A session is titled from its first prompt until you
-  rename it.
+- **Rename...**. A session is titled from its first prompt at once,
+  and after its first turn by its model, which names what the session
+  turned out to be about (a first prompt of six words or fewer stays
+  the title). Your own title replaces either, and nothing replaces
+  yours. See [Session titles](help:config#session-titles).
 - **Move to group**: an existing group, New group..., or Remove from
   group. Groups head the sidebar; a group's own menu renames,
   archives, ungroups, reorders or moves it to the Trash. Or drag the

@@ -112,6 +112,28 @@ include = themes/gruvbox.ini
 theme = gruvbox
 ```
 
+## Session titles
+
+After a session's first turn, its model is asked for a title, on the
+conversation as it stands: a server with a prompt cache already holds
+nearly all of it, so the request costs little more than the title it
+writes. It runs only while the session is idle, and a prompt sent
+meanwhile goes at once, the title asked for again after that turn.
+Its tokens count in the session's usage.
+
+A model of its own, small and fast, may title sessions instead, from
+the first prompt and the reply, with `titler` in the model's section,
+as `MODEL` or `ENDPOINT/MODEL`; `titler = none` keeps the first prompt
+as the title:
+
+```ini
+[model claude-opus-5-5]
+titler = claude-haiku-5-5
+
+[model local-model]
+titler = none
+```
+
 ## Approving web includes' urls
 
 A file included by URL can change at any time, so a url it gives an

@@ -636,6 +636,9 @@ class T:
     def compactions(self):
         return fake_provider.STATE.log(self.model + "#compact")
 
+    def titles(self):
+        return fake_provider.STATE.log(self.model + "#title")
+
     def check(self, cond, msg):
         if not cond:
             raise Failure(msg)
@@ -7555,6 +7558,184 @@ def ended(h, sid, turn):
 def sidms(sid):
     """When a session was made, as its id says: epoch ms, to the second."""
     return calendar.timegm(time.strptime(sid[:15], "%Y%m%d-%H%M%S")) * 1000
+
+
+LONG_PROMPT = "please find out why the parser crashes on an empty file and fix it"
+
+
+def titled(h, sid, by="model", timeout=20):
+    return h.wait(lambda e: e.get("ev") == "title" and e.get("sid") == sid and
+                  e.get("by") == by, timeout)
+
+
+@scenario(bound=20)
+def title_fork(t):
+    """After the first turn, the session's own model titles it on the
+    conversation as it stands: the turn's own request, its reply, then
+    the ask, so that a prompt cache serves it. The title comes cleaned
+    of a label, markdown and a period, by "model", with its usage, and
+    the listing has it; the session is never busy for it, and no later
+    turn asks again."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text=LONG_PROMPT)
+        t.check(ended(h, sid, 1)["why"] == "done", "the turn")
+        ev = titled(h, sid)
+        t.check(ev.get("text") == "Fix the parser's crash", f"the title {ev}")
+        t.check(ev.get("usage", {}).get("in", 0) > 0, f"its usage {ev}")
+        with h.cond:
+            evs = [e for e in h.events if e.get("sid") == sid]
+        at = next(i for i, e in enumerate(evs) if e.get("ev") == "turn.end")
+        after = [e.get("state") for e in evs[at:] if e.get("ev") == "live"]
+        t.check(all(st == "idle" for st in after), f"idle all along {after}")
+        reqs, asks = t.requests(), t.titles()
+        t.check(len(reqs) == 1 and len(asks) == 1, f"requests {len(reqs)}, {len(asks)}")
+        chat, ask = reqs[0]["body"], asks[0]["body"]
+        t.check(ask["messages"][:len(chat["messages"])] == chat["messages"],
+                "the turn's messages, as they went")
+        t.check(ask.get("tools") == chat.get("tools"), "the same tools")
+        t.check(ask["messages"][-2].get("role") == "assistant" and
+                ask["messages"][-1]["content"].startswith("Name this session"),
+                f"its reply, then the ask: {ask['messages'][-2:]}")
+        h.call("list")
+        listed = [s for s in h.all("sessions")[-1]["list"] if s["sid"] == sid]
+        t.check(listed and listed[0].get("title") == "Fix the parser's crash",
+                f"listed {listed}")
+
+        h.send("prompt", sid=sid, text=LONG_PROMPT + " again")
+        ended(h, sid, 2)
+        time.sleep(0.5)
+        t.check(len(t.titles()) == 1, "asked once")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+    # Opened again, its title stands: no turn asks for another
+    h = t.headless()
+    try:
+        h.call("open", sid=sid)
+        h.send("prompt", sid=sid, text=LONG_PROMPT + " once more")
+        ended(h, sid, 3)
+        time.sleep(0.5)
+        t.check(len(t.titles()) == 1, "never asked again")
+    finally:
+        h.close()
+
+
+@scenario(conf=AN, bound=20)
+def an_title(t):
+    """The fork's title over the Messages API: the turn's system prompt,
+    tools and first message as they went, breakpoints included, so that
+    its cached prefix serves the title's request."""
+    h = t.headless(env=ANENV)
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text=LONG_PROMPT)
+        ended(h, sid, 1)
+        t.check(titled(h, sid).get("text") == "Fix the parser", "titled")
+        chat, ask = t.requests()[0]["body"], t.titles()[0]["body"]
+        t.check(ask["system"] == chat["system"] and ask["tools"] == chat["tools"],
+                "the same system prompt and tools, breakpoints included")
+        t.check(ask["messages"][0] == chat["messages"][0], "the first message as it went")
+        t.check([m["role"] for m in ask["messages"]] == ["user", "assistant", "user"],
+                f"its reply, then the ask {ask['messages']}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf={"_extra": "[model {model}]\ntitler = fake:title_small:{nonce}\n"},
+          bound=20)
+def title_titler(t):
+    """[model] titler: a request of its own to that model, without tools,
+    from the first prompt and the reply."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text=LONG_PROMPT)
+        ended(h, sid, 1)
+        ev = titled(h, sid)
+        t.check(ev.get("text") == "Add a dark theme", f"the title {ev}")
+        model = "fake:title_small:" + t.nonce
+        asks = fake_provider.STATE.log(model + "#title")
+        t.check(len(asks) == 1 and not t.titles(), "asked of the titler alone")
+        body = asks[0]["body"]
+        t.check("tools" not in body, "no tools")
+        user = body["messages"][-1]["content"]
+        t.check(body["messages"][0]["content"].startswith("You name coding sessions") and
+                LONG_PROMPT in user and "Done 0." in user, f"its request {body}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf={"_extra": "[model {model}]\ntitler = none\n"}, bound=20)
+def title_none(t):
+    """titler = none, and a first prompt short enough to be a title: the
+    prompt's title stays, and nothing is asked."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text=LONG_PROMPT)
+        ended(h, sid, 1)
+        sid2 = h.call("new", cwd=t.work, model="fake:title_fork:" + t.nonce,
+                      endpoint="fake")["sid"]
+        h.send("prompt", sid=sid2, text="fix the parser")
+        ended(h, sid2, 1)
+        time.sleep(0.5)
+        t.check(not t.titles() and
+                not fake_provider.STATE.log("fake:title_fork:" + t.nonce + "#title"),
+                "nothing asked")
+        t.check(not [e for e in h.all("title") if e.get("by") == "model"], "no title")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=40)
+def title_slow(t):
+    """A prompt while the title's request runs: the turn goes at once, the
+    request given up, and the title asked for again after that turn."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text=LONG_PROMPT)
+        ended(h, sid, 1)
+        deadline = time.monotonic() + 10
+        while not t.titles() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        t.check(t.titles(), "asked")
+        start = time.monotonic()
+        h.send("prompt", sid=sid, text="and the empty line case")
+        t.check(ended(h, sid, 2)["why"] == "done", "the next turn")
+        t.check(time.monotonic() - start < 10, "without waiting for the title")
+        ev = titled(h, sid)
+        t.check(ev.get("text") == "Titled at last" and len(t.titles()) == 2,
+                f"asked again {ev}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=20)
+def title_rename(t):
+    """Renamed while its title is asked for: the user's title stays."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text=LONG_PROMPT)
+        ended(h, sid, 1)
+        t.check(h.call("rename", sid=sid, title="Mine").get("ok") == 1, "renamed")
+        time.sleep(3)
+        t.check(not [e for e in h.all("title", sid) if e.get("by") == "model"],
+                "no model's title")
+        h.call("list")
+        listed = [s for s in h.all("sessions")[-1]["list"] if s["sid"] == sid]
+        t.check(listed and listed[0].get("title") == "Mine", f"listed {listed}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
 
 
 @scenario(bound=20)

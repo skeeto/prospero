@@ -2232,6 +2232,13 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         if (jsonstr(jsonget(j, "by")) == "user") {
             addmark(v, r->seq, "Renamed", v->title);
         }
+        if (Json *u = jsonget(j, "usage"); u->type == JSON_OBJECT) {
+            // A model's title: its tokens count, as any request's
+            v->work.in      += jsonint(jsonget(u, "in"), 0);
+            v->work.out     += jsonint(jsonget(u, "out"), 0);
+            v->work.cached  += jsonint(jsonget(u, "cached"), 0);
+            v->work.written += jsonint(jsonget(u, "written"), 0);
+        }
         return 1;
 
     case EV_MODEL: {
