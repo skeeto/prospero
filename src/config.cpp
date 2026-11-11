@@ -3538,6 +3538,7 @@ static b32 cfgloadini(Config *c, Arena scratch, Arena *a, Ini *ini, i32 nlayer)
     Stat     pre  = {};
     ini->fetch    = cfgsource;
     ini->fetchctx = c;
+    ini->home     = userhome(c->os, a);
     c->loading    = c->rev + 1;
     if (c->path.len) {
         // The default file need not exist: none is empty, quietly

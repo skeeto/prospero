@@ -614,6 +614,28 @@ static void testiniinclude(Test *t)
                "/g/base.ini:4 /g/base.ini:3 /g/base.ini:4 /g/base.ini:3");
     }
 
+    // "~/" includes from the home directory, either slash; with no home
+    // known, a warning
+    os_write(os, a, "/t/root.ini", "include = ~/themes/a.ini\ninclude = ~\\b.ini\n");
+    os_write(os, a, "/home/u/themes/a.ini", "[theme a]\n");
+    os_write(os, a, "/home/u/b.ini", "[theme b]\n");
+    {
+        Ini ini = {};
+        ini.home = "/home/u";
+        iniload(&ini, os, &a, "/t/root.ini");
+        expect(t, "tilde.files", inishowfiles(&a, &ini),
+               "/t/root.ini@0 /home/u/themes/a.ini<-/t/root.ini:1@1 "
+               "/home/u/b.ini<-/t/root.ini:2@1");
+        expect(t, "tilde.diags", inidiags(&a, &ini), "");
+    }
+    {
+        Ini ini = {};
+        iniload(&ini, os, &a, "/t/root.ini");
+        expect(t, "tilde.nohome", inidiags(&a, &ini),
+               "/t/root.ini:1:11: warning: no home directory is known for ~\n"
+               "/t/root.ini:2:11: warning: no home directory is known for ~");
+    }
+
     // Different problems from each copy are all kept
     os_write(os, a, "/h/root.ini", "include = team.ini\ninclude = base.ini\n");
     os_write(os, a, "/h/team.ini", "include = base.ini\n");

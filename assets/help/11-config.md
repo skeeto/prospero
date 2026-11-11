@@ -61,7 +61,8 @@ change. A session on a remote host changes that host's file.
 
 Above the first section, `include = FILE` adds a shared file, such as
 a team's endpoints and models, whose settings yours may override
-below it. An include may be an http or https URL, fetched at startup,
+below it. A relative path is from your file's directory, and `~/` is
+your home directory. An include may be an http or https URL, fetched at startup,
 kept, refreshed in the background, and optionally pinned to a
 SHA-256.
 

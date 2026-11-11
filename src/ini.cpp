@@ -33,7 +33,9 @@
 // previous component, and only /, // (UNC), and a drive with a slash
 // (C:/) start an absolute path, so C:x.ini is a relative name. Device
 // paths (\\.\ and \\?\) are not supported. Includes nest at most 8 deep,
-// a cycle is skipped, an include is skipped once the Ini holds 64 files,
+// "~/x" or "~\x" is x in the home directory (Ini.home), and a warning
+// with no home known. A cycle is skipped, an include is skipped once the
+// Ini holds 64 files,
 // and reads, roots included, stop at 1 MiB of text in total. Inside a
 // section, "include" is an error rather than a key, so no section can
 // use it.
@@ -189,6 +191,7 @@ struct Ini {
     // skipped with a warning.
     IniSource     (*fetch)(void *ctx, Arena *perm, Str url, Str pin);
     void           *fetchctx;
+    Str             home;         // for "~/" in includes, empty if unknown
 };
 
 struct IniParser {
@@ -972,7 +975,14 @@ static void iniinclude(IniParser *p, IniLine *l)
         return;  // text only
     }
 
-    Str path = inipath(p->perm, inidir(f->path), l->value);
+    Str name = l->value;
+    b32 home = name.len>=2 && name[0]=='~' && inisep(name[1]);
+    if (home && !p->ini->home.len) {
+        inireport(p, INI_WARNING, l->valbeg, "no home directory is known for ~");
+        return;
+    }
+    Str path = home ? inipath(p->perm, p->ini->home, cuthead(name, 2))
+                    : inipath(p->perm, inidir(f->path), name);
     if (!inifollow(p, l, path)) {
         return;
     }
