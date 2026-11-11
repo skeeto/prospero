@@ -2612,6 +2612,17 @@ def shell_profile(t):
     t.check(not any("[tools] shell" in n.get("text", "") for n in r.all("note")),
             "no warning for a shell found")
 
+    if not t.host.windows:
+        # A shell by a path in the home directory, ~/
+        hbin = t.host.join(t.home, "bin")
+        t.host.mkdir(hbin)
+        shutil.copy("/bin/sh", t.host.join(hbin, "mysh"))
+        t.host.write(t.config, base + "[tools]\nshell = ~/bin/mysh\n")
+        r = t.run(timeout=60)
+        t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+        warns = [n.get("text", "") for n in r.all("note") if "[tools] shell" in n.get("text", "")]
+        t.check(not warns, f"~/bin/mysh found: {warns}")
+
     t.host.write(t.config, base + "[tools]\nshell = prospero-no-such-shell\n")
     r = t.run(timeout=60)
     t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
@@ -11672,6 +11683,20 @@ def mcp_policy(t):
     t.check(end["status"] == "denied" and "need the user's approval" in end["text"],
             f"denied {end}")
     t.check(not mcpcalls(t), "nothing called")
+
+
+@scenario(conf=mcpconf(command=f"~/mcpbin/py '{FAKE_MCP}'"), bound=15)
+def mcp_home(t):
+    """A server's command in the home directory, ~/: it starts, and the
+    call is asked about as any."""
+    if t.host.windows:
+        raise Skip("a symbolic link to Python")
+    t.host.mkdir(t.host.join(t.home, "mcpbin"))
+    os.symlink(sys.executable, t.host.join(t.home, "mcpbin", "py"))
+    r = t.run(env=mcpenv(t))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    ask = r.last("ask")
+    t.check(ask.get("tool") == "mcp__fake__echo", f"its tool, asked {ask}")
 
 
 @scenario(conf=mcpconf(command="/nonexistent/mcp-server"), bound=15)

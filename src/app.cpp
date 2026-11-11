@@ -6520,8 +6520,9 @@ static Slice<Str> guienv(Gui *g, Arena *a)
 
 static Str editorcmd(Gui *g, Arena *a)
 {
-    return editorpick(g->editor, os_getenv(g->os, a, "VISUAL"),
-                      os_getenv(g->os, a, "EDITOR"), g->mac);
+    Str cmd = editorpick(g->editor, os_getenv(g->os, a, "VISUAL"),
+                         os_getenv(g->os, a, "EDITOR"), g->mac);
+    return HOST_WINDOWS ? cmdhome(a, cmd, userhome(g->os, a)) : cmd;
 }
 
 // Why no file can go out to the editor now, for session s (null for the
@@ -7926,8 +7927,12 @@ static i32 termos(Gui *g)
 // none is found (TERM_WIN: a console of its own).
 static Str termprog(Gui *g, Arena *a)
 {
-    if (trim(g->terminal).len || g->mac) {
-        return trim(g->terminal);
+    Str set = trim(g->terminal);
+    if (!g->mac && cfgtilde(set)) {
+        Str home = userhome(g->os, a);
+        return home.len ? concat(a, home, cuthead(set, 1)) : set;
+    } else if (set.len || g->mac) {
+        return set;  // on macOS, an application's name
     }
     Str   path = guipath(g, a);
     Arena tmp  = carve(a, 1<<20);

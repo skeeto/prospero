@@ -837,6 +837,26 @@ static Str editorname(Str cmd)
     return prog.len ? prog : Str("the editor");
 }
 
+// A command for cmd.exe, which leaves ~ alone, its program in the home
+// directory where it starts ~/ or ~\, quoted, since a home directory may
+// hold blanks. sh expands ~ itself, so elsewhere this is not needed.
+static Str cmdhome(Arena *a, Str cmd, Str home)
+{
+    cmd = trim(cmd);
+    if (!home.len || cmd.len<2 || cmd[0]!='~' || (cmd[1]!='/' && cmd[1]!='\\')) {
+        return cmd;
+    }
+    iz n = 0;
+    while (n<cmd.len && !whitespace(cmd[n])) n++;
+    Buf b(a, cmd.len + home.len + 4);
+    putbyte(&b, '"');
+    print(&b, home);
+    print(&b, cuthead(takehead(cmd, n), 1));
+    putbyte(&b, '"');
+    print(&b, cuthead(cmd, n));
+    return finish(&b);
+}
+
 // The shell command that runs the editor on a file: the command, then
 // the path as one more word, quoted for sh, or for cmd.exe in double
 // quotes (a Windows path holds none).

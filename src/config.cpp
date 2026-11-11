@@ -484,8 +484,8 @@ static CfgKey cfgschema[] = {
      "Windows) and killing it (default: 2, or 3 on Windows)"},
     {"tools", "shell", CFG_STRING, "auto", {}, {}, "tools",
      "The agent's shell for new sessions: auto, sh, powershell, cmd, a "
-     "[shell] section by its name, or an executable, by its path or its "
-     "name on PATH. auto is a POSIX sh, or on Windows sh.exe or busybox.exe "
+     "[shell] section by its name, or an executable, by its path (~/ the "
+     "home directory) or its name on PATH. auto is a POSIX sh, or on Windows sh.exe or busybox.exe "
      "next to Prospero or on PATH, then PowerShell, then cmd"},
     {"tools", "shells", CFG_STRING, "", {}, {}, "tools",
      "Shells the agent may run a command in, besides the session's: "
@@ -512,7 +512,8 @@ static CfgKey cfgschema[] = {
      "report; it is stopped at half as many again"},
 
     {"shell", "program", CFG_STRING, "", {}, {}, "shell",
-     "Its executable, by its path or its name on PATH, or sh, powershell "
+     "Its executable, by its path (~/ the home directory) or its name on "
+     "PATH, or sh, powershell "
      "or cmd as [tools] shell finds them; by default the section's name. "
      "wsl runs commands in WSL's sh"},
     {"shell", "distro", CFG_STRING, "", {}, {}, "shell",
@@ -649,7 +650,7 @@ static CfgKey cfgschema[] = {
     {"ui", "terminal", CFG_STRING, "", {}, {}, "ui",
      "The terminal that a session's Open in external terminal opens in its folder: "
      "on macOS an application's name (Terminal, iTerm, Ghostty), elsewhere "
-     "a program (wt.exe, konsole, kitty). Empty: Terminal on macOS, Windows "
+     "a program (wt.exe, konsole, kitty), ~/ the home directory. Empty: Terminal on macOS, Windows "
      "Terminal or else a console of its own on Windows, and elsewhere "
      "$TERMINAL or the first found of ptyxis, gnome-terminal, kgx, konsole, "
      "xfce4-terminal, x-terminal-emulator, alacritty, kitty, wezterm, foot, "
@@ -816,7 +817,8 @@ static CfgKey cfgschema[] = {
 
     {"mcp", "command", CFG_STRING, "", {}, {}, "mcp",
      "The server's program and its arguments, run without a shell (quote "
-     "words with blanks in them), speaking MCP on its standard input and "
+     "words with blanks in them; ~/ starts a program in the home "
+     "directory), speaking MCP on its standard input and "
      "output"},
     {"mcp", "url", CFG_STRING, "", {}, {}, "mcp",
      "Instead of a command, the URL of a server that speaks MCP over HTTP "

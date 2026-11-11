@@ -10559,7 +10559,12 @@ static void mcpstart(Engine *e, Arena scratch, McpServer *m, Session *s)
     if (m->project.len) {
         w.words = m->argv;
     } else {
-        w = mcpwords(&m->arena, trim(cfgget(c, "mcp", m->name, "command", 0)));
+        Str cmd = trim(cfgget(c, "mcp", m->name, "command", 0));
+        w = mcpwords(&m->arena, cmd);
+        if (w.words.len && cfgtilde(w.words[0]) && cmd[0]=='~' && e->home.len) {
+            // Its program in the home directory, unless the ~ was quoted
+            w.words[0] = concat(&m->arena, e->home, cuthead(w.words[0], 1));
+        }
     }
     if (w.err.len) {
         m->state   = MCP_FAILED;
@@ -15772,6 +15777,9 @@ static Shell shellnamed(Engine *e, Arena *perm, Arena scratch, Str name,
         Str pre  = cfgget(e->cfg, "shell", name, "path_prepend", 0);
         Str post = cfgget(e->cfg, "shell", name, "path_append", 0);
         path = searchpath(&scratch, pre, path, post, e->home, win);
+    }
+    if (cfgtilde(want) && e->home.len) {
+        want = concat(&scratch, e->home, cuthead(want, 1));  // ~/bin/fish
     }
 
     Shell sh = {};

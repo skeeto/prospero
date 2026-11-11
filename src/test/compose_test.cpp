@@ -335,6 +335,10 @@ static void test_compose(Test *t)
     expect(t, "editor.name", editorname("/usr/local/bin/code --wait"), "code");
     expect(t, "editor.quoted", editorname("\"C:\\Program Files\\Sub\\subl.exe\" -w"), "subl.exe");
     expect(t, "editor.open", editorname("open -W -n -t"), "the default text editor");
+    expect(t, "editor.home", cmdhome(&a, "~\\bin\\ed.exe -w", "C:\\Users\\J S"),
+               "\"C:\\Users\\J S\\bin\\ed.exe\" -w");
+    expect(t, "editor.homealone", cmdhome(&a, " ~/ed.exe ", "C:/U"), "\"C:/U/ed.exe\"");
+    expect(t, "editor.nohome", cmdhome(&a, "~x -w", "C:/U"), "~x -w");
     expect(t, "editor.sh", editorline(&a, "code --wait", "/tmp/it's here.md", 0),
            "code --wait '/tmp/it'\\''s here.md'");
     expect(t, "editor.cmd", editorline(&a, "notepad", "C:\\Temp\\d.md", 1),

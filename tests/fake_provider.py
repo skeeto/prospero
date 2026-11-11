@@ -2800,6 +2800,9 @@ sc_mcp_off = sc_mcp_policy
 sc_mcp_plan = sc_mcp_flow
 
 
+
+sc_mcp_home = sc_mcp_policy
+
 def sc_mcp_ask(model, n, req):
     # Two turns, the second in a later process
     yield from mcp_steps(model, n, req, [
