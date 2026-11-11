@@ -74,15 +74,22 @@ endif()
 
 if(NOT WIN32 AND PROSPERO_DEPS STREQUAL "FETCH")
   fetch_content_bundled(SDL3 sdl3)
+  # A fix of its own to the macOS clipboard, downloaded or bundled, for
+  # macOS alone: only it compiles that file, and elsewhere a bundled
+  # deps/sdl3 may be read-only (the container builds mount it so)
+  set(prospero_sdl3_patch)
+  if(APPLE)
+    set(prospero_sdl3_patch
+      PATCH_COMMAND ${CMAKE_COMMAND} -DSRC=<SOURCE_DIR>
+                    -P ${CMAKE_CURRENT_LIST_DIR}/patches/sdl3-clipboard.cmake)
+  endif()
   FetchContent_Declare(SDL3
     URL https://github.com/libsdl-org/SDL/releases/download/release-3.4.18/SDL3-3.4.18.tar.gz
     URL_HASH SHA256=9c75cf16330322c217dedd2e0609f1124f1b54b8633e763467b4684d0f4334a3
-    # A fix of its own to the macOS clipboard, downloaded or bundled
-    PATCH_COMMAND ${CMAKE_COMMAND} -DSRC=<SOURCE_DIR>
-                  -P ${CMAKE_CURRENT_LIST_DIR}/patches/sdl3-clipboard.cmake
+    ${prospero_sdl3_patch}
     SYSTEM
   )
-  if(FETCHCONTENT_SOURCE_DIR_SDL3)
+  if(APPLE AND FETCHCONTENT_SOURCE_DIR_SDL3)
     execute_process(
       COMMAND ${CMAKE_COMMAND} -DSRC=${FETCHCONTENT_SOURCE_DIR_SDL3}
               -P ${CMAKE_CURRENT_LIST_DIR}/patches/sdl3-clipboard.cmake
