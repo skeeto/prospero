@@ -826,6 +826,7 @@ int main()
     test_viewthinking(&t);
     test_viewwords(&t);
     test_viewtranscript(&t);
+    test_viewlines(&t);
     test_theme(&t);
     test_thumb(&t);
     test_fonts(&t);

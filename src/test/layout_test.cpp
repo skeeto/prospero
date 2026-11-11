@@ -21,6 +21,17 @@ static FontMetrics fixedfont(void *, i32 style)
     return f;
 }
 
+// A code font shorter than prose, 14 tall with the baseline at 11
+static FontMetrics smallcodefont(void *ctx, i32 style)
+{
+    FontMetrics f = fixedfont(ctx, style);
+    if (style & STYLE_CODE) {
+        f.lineh  = 14;
+        f.ascent = 11;
+    }
+    return f;
+}
+
 static Measure fixedmeasure()
 {
     Measure m = {};
@@ -240,5 +251,40 @@ static void test_layout(Test *t)
         Arena a = perm;
         Str   s = msgshow(&a, "ab cd", 1);
         expect(t, "layout.narrow", s, "0:0[a] 20:0[b ] 40:0[c] 60:0[d] h=80");
+    }
+
+    // A file's lines: every row the code font's height, empty lines
+    // and wrapped rows too, and no gaps, so that line k is Placed k
+    {
+        Arena        a     = perm;
+        Measure      m     = fixedmeasure();
+        m.font = smallcodefont;
+        LayoutCache *cache = 0;
+        Doc         *d     = parsesource(&a, "abcdefg\n\n\txy\n", {}, 0);
+        MsgLayout    ml    = layoutmsg(&cache, &a, &m, d, 50, 1);
+        Buf          b(&a, 256);
+        for (iz i = 0; i < ml.blocks.len; i++) {
+            Placed *p = &ml.blocks[i];
+            print(&b, (i64)p->block);
+            putbyte(&b, '=');
+            for (iz k = 0; k < p->bl->lines.len; k++) {
+                Line *l = &p->bl->lines[k];
+                print(&b, (i64)(p->y + l->y));
+                putbyte(&b, '+');
+                print(&b, (i64)l->h);
+                putbyte(&b, '/');
+                print(&b, (i64)l->base);
+                putbyte(&b, ' ');
+            }
+        }
+        print(&b, "h=");
+        print(&b, (i64)ml.h);
+        expect(t, "layout.lines", finish(&b),
+               "0=0+14/11 14+14/11 1=28+14/11 2=42+14/11 56+14/11 h=70");
+        expect(t, "layout.linetab", layoutshow(&a, d, &ml.blocks[2]), "42:0[>]40[x] 56:0[y] ");
+        Doc       *e  = parsesource(&a, "ab\n\n\nc", {}, 0);
+        MsgLayout  el = layoutmsg(&cache, &a, &m, e, 50, 1);
+        expect(t, "layout.liney", istr(&a, (i64)msgy(e, &el, 4)), "28");
+        expect(t, "layout.linehit", istr(&a, msghit(&m, e, &el, 30, 30)), "4");
     }
 }

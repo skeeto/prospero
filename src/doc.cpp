@@ -17,6 +17,9 @@
 // code exactly, tabs and trailing spaces included, which is what makes
 // copied code byte-exact.
 //
+// A source file's text is no markdown: parsesource makes a DOC_LINE
+// block of each line, highlighted from tokens over the whole file.
+//
 // This is free and unencumbered software released into the public domain.
 
 enum : i32 {
@@ -27,6 +30,7 @@ enum : i32 {
     DOC_HR,
     DOC_CELL,   // a table cell
     DOC_PLAIN,  // a line of plain text, not markdown
+    DOC_LINE,   // a line of a source file, highlighted (parsesource)
 };
 
 enum : i32 {
@@ -50,6 +54,7 @@ enum : u8 {
 enum : i32 {
     DOC_MAXDEPTH = 32,        // list and quote nesting tracked
     DOC_MAXSIZE  = 1 << 20,   // larger messages are shown as plain text
+    DOC_HLMAX    = 2 << 20,   // source text past this is not highlighted
 };
 
 struct Piece {
@@ -717,6 +722,86 @@ static Doc *parseshell(Arena *perm, Str src, iz cmdlen, HlMemo **memo)
     return d;
 }
 
+// A source file's tokens, for parsesource: the whole text highlighted at
+// once, so that comments and strings spanning lines come out right, but
+// only its lines within the first DOC_HLMAX bytes. The rest is plain.
+static Slice<HlTok> hlsource(Arena *perm, Str lang, Str text)
+{
+    if (text.len > DOC_HLMAX) {
+        iz n = DOC_HLMAX;
+        for (; n>0 && text[n-1]!='\n'; n--) {}
+        text = takehead(text, n);
+    }
+    return highlight(perm, lang, text).toks;
+}
+
+// Source text as a file shows it: a DOC_LINE block per line, which '\n'
+// ends (a final '\n' starts no line of its own; "" is one empty line),
+// its pieces split at the tokens' boundaries. The tokens cover the text
+// src lies within, at offset tokoff, so that the chunks of one file
+// share them; text they don't cover is plain. A piece never holds the
+// '\n', and an empty line's block, with no pieces, is at its own offset.
+static Doc *parsesource(Arena *perm, Str src, Slice<HlTok> toks, i32 tokoff)
+{
+    Doc     *d = alloc<Doc>(perm);
+    DocParse p = {};
+    p.perm  = perm;
+    p.doc   = d;
+    p.cur   = -1;
+    p.base  = src.data;
+    p.size  = src.len;
+    d->src   = src;
+    d->plain = 1;
+
+    // The first token that ends past src's start
+    iz t = 0;
+    for (iz hi = toks.len; t < hi;) {
+        iz mid = t + (hi - t)/2;
+        if (toks[mid].end <= tokoff) {
+            t = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+
+    for (i32 ls = 0;;) {
+        i32 le = lineend(src, ls);
+        p.lastoff = ls;
+        openblock(&p, DOC_LINE);
+        for (i32 at = ls; at < le;) {
+            i32 pos = tokoff + at;
+            for (; t<toks.len && toks[t].end<=pos; t++) {}
+            i32 cls = HL_PLAIN;
+            i32 end = le;
+            if (t < toks.len) {
+                if (toks[t].beg > pos) {
+                    i32 gap = toks[t].beg - tokoff;  // uncovered: plain
+                    end = gap<le ? gap : le;
+                } else {
+                    i32 te = toks[t].end - tokoff;
+                    cls = toks[t].cls;
+                    end = te<le ? te : le;
+                }
+            }
+            Piece pc = {};
+            pc.off   = at;
+            pc.len   = end - at;
+            pc.text  = {src.data+at, (iz)(end-at)};
+            pc.style = STYLE_CODE;
+            pc.hl    = (u8)cls;
+            pc.link  = -1;
+            addpiece(&p, pc);
+            at = end;
+        }
+        closeblock(&p);
+        if (le+1 >= src.len) {
+            break;  // the last line, or no line follows its '\n'
+        }
+        ls = le + 1;
+    }
+    return d;
+}
+
 // Parse markdown into a document in perm, referring into src. Messages
 // past DOC_MAXSIZE are shown as plain text. The memo, if given, keeps
 // highlighted code across parses of a growing message. With hardbreaks,
@@ -759,6 +844,9 @@ static Doc *parsedoc(Arena *perm, Str src, HlMemo **memo, b32 hardbreaks = 0)
 // image's source is no link to follow.
 static Str doclinkat(Doc *d, i32 off)
 {
+    if (!d->links.len) {
+        return {};  // a file's lines: nothing to look through
+    }
     for (iz i = 0; i < d->pieces.len; i++) {
         Piece *pc = &d->pieces[i];
         if (pc->link>=0 && off>=pc->off && off<pc->off+pc->len) {

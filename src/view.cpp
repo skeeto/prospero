@@ -484,6 +484,10 @@ struct ViewMsg {
     b32       fold;       // its header shows and hides the rest
     i32       cuts;       // cuts in force that hide it: rewound away
     b32       md;         // markdown, not plain text
+    b32       lines;      // a chunk of a file's lines (addlines)
+    i32       line0;      //   and its first line's number
+    i64       estper;     //   its rows when wrapped at estper bytes a
+    i64       estrows;    //   row, as estimate last counted them
     i32       startsturn; // the turn this message began, 0 if none
     i64       chars;      // reasoning: code points in its text
     i64       words;      //   and words, both kept as it streams
@@ -576,6 +580,8 @@ struct View {
     b32             showthink;
     f32             lastw;      // the width laid out last
     f32             head;       // a message's header line, as drawn
+    Str             body;       // a lines view: the text its chunks slice
+    Slice<HlTok>    toks;       //   and its tokens, over the whole of it
 
     // Ordering
     i64             lastseq;    // the last durable record applied
@@ -874,6 +880,24 @@ static i32 addmsg(View *v, i32 role, Str text)
     v->provmixed = 1;
     v->stream   += v->stream >= 0;
     return v->prov++;
+}
+
+// A chunk of a lines view, a file's: text is a slice of v->body, not a
+// copy, ending at a line's end with its '\n' kept (but for the file's
+// last line), and its first line is numbered line0.
+static i32 addlines(View *v, Str text, i32 line0)
+{
+    assert(text.data>=v->body.data && text.data+text.len<=v->body.data+v->body.len);
+    ViewMsg m = {};
+    m.role   = VIEW_NOTE;
+    m.text   = text;
+    m.nl     = countnl(text);
+    m.lines  = 1;
+    m.line0  = line0;
+    m.estper = -1;
+    v->msgs = push(&v->meta, v->msgs, m);
+    v->topsdirty = 1;
+    return (i32)v->msgs.len - 1;
 }
 
 // A change to the session, as a line of the transcript that the agent
@@ -3400,6 +3424,13 @@ static Doc *msgdoc(View *v, i32 i)
     if (m->doc && m->docver==m->ver && m->docgen==c->gen) {
         return m->doc;
     }
+    if (m->lines) {
+        i32 tokoff = (i32)(m->text.data - v->body.data);
+        m->doc    = parsesource(&c->arena, m->text, v->toks, tokoff);
+        m->docver = m->ver;
+        m->docgen = c->gen;
+        return m->doc;
+    }
     switch (m->role) {
     case VIEW_USER:
         // What the user typed, or a parent's task: markdown, each line
@@ -3573,6 +3604,33 @@ static f32 estimate(ViewMsg *m, f32 width, f32 charw, f32 lineh)
         return 0;
     }
     i64 perline = width>charw ? (i64)(width/charw) : 1;
+    if (m->lines) {
+        // A file's lines: a row each, a chunk's final '\n' ending its
+        // last, and more for each line wider than a row, in columns as
+        // layout counts code (a code point each, tabs to stops of 4,
+        // trailing spaces hanging past the edge), so that it's exact for
+        // lines that fit, as all do unwrapped
+        if (m->estper != perline) {
+            m->estper  = perline;
+            m->estrows = 0;
+            for (Str rest = m->text;;) {
+                Cut c    = cut(rest, '\n');
+                i64 col  = 0;
+                i64 used = 0;  // columns up to the last non-space
+                for (iz i = 0; i < c.head.len;) {
+                    i32 cp = utf8decode(c.head, &i);
+                    col  = cp=='\t' ? (col/4 + 1)*4 : col+1;
+                    used = cp==' ' ? used : col;
+                }
+                m->estrows += used>perline ? (used+perline-1)/perline : 1;
+                if (!c.ok || !c.tail.len) {
+                    break;
+                }
+                rest = c.tail;
+            }
+        }
+        return (f32)m->estrows * lineh;
+    }
     i64 lines   = m->nl + 1 + m->text.len/perline;
     return (f32)lines * lineh;
 }
@@ -4002,6 +4060,14 @@ static Str copysel(View *v, Arena *perm, i32 how)
         ViewMsg *m = &v->msgs[i];
         i32  s = i==r.beg.msg ? r.beg.off : 0;
         i32  e = i==r.end.msg ? r.end.off : (i32)m->text.len;
+        if (m->lines) {
+            // A file's lines: the source bytes exactly, blank lines and
+            // all, with chunks, each ending in its '\n', joined as is
+            s = s<0 ? 0 : s>m->text.len ? (i32)m->text.len : s;
+            e = e<s ? s : e>m->text.len ? (i32)m->text.len : e;
+            print(&b, span(m->text.data+s, m->text.data+e));
+            continue;
+        }
         if (i > r.beg.msg) {
             print(&b, "\n\n");
         }

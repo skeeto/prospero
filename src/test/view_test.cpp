@@ -2129,3 +2129,82 @@ static void test_viewtranscript(Test *t)
         expect(t, "anchor.headery", istr(&a, (i64)(anchory(v, h, &m, 250, 1, head) - v->msgs[2].top)), "5");
     }
 }
+
+// A lines view, a file's: chunks sliced from one text, sharing its tokens
+static void test_viewlines(Test *t)
+{
+    Arena perm = t->perm;
+
+    // Copy is the selection's source bytes: blank lines kept, chunks
+    // joined with nothing between
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        v->body = "a\n\n\nb\n\n\nc\nd";
+        i32 m0 = addlines(v, takehead(v->body, 6), 1);
+        i32 m1 = addlines(v, cuthead(v->body, 6), 5);
+        expect(t, "view.lines.add", istr(&a, m0*10 + m1), "1");
+        expect(t, "view.lines.shared",
+               istr(&a, v->msgs[1].text.data == v->body.data+6), "1");
+        expect(t, "view.lines.line0", istr(&a, v->msgs[1].line0), "5");
+        selset(v, 0, 0, 0, 5);
+        expect(t, "view.copylines.blanks", copysel(v, &a, COPY_TEXT), "a\n\n\nb");
+        selset(v, 0, 2, 0, 5);
+        expect(t, "view.copylines.fromblank", copysel(v, &a, COPY_TEXT), "\n\nb");
+        selset(v, 0, 4, 1, 3);
+        expect(t, "view.copylines.chunks", copysel(v, &a, COPY_TEXT), "b\n\n\nc");
+        selset(v, 1, 3, 0, 1);
+        expect(t, "view.copylines.rev", copysel(v, &a, COPY_MARKDOWN), "\n\n\nb\n\n\nc");
+        selset(v, 0, 0, 1, 5);
+        expect(t, "view.copylines.all", copysel(v, &a, COPY_TEXT), v->body);
+
+        Doc *d = msgdoc(v, m1);
+        expect(t, "view.lines.doc", docshow(&a, d), "S:\nS:\nS: c:c\nS: c:d\n");
+    }
+
+    // A chunk's Doc takes its slice of the view's tokens
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        v->body = "/* a\nb */ x\n";
+        v->toks = hlsource(&a, "c", v->body);
+        addlines(v, takehead(v->body, 5), 1);
+        addlines(v, cuthead(v->body, 5), 2);
+        expect(t, "view.lines.toks", docshow(&a, msgdoc(v, 1)), "S: c/c:b */|c: x\n");
+    }
+
+    // Heights: a row a line, a final '\n' ending the last line, more for
+    // lines longer than a row; exact when nothing wraps
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        v->body = "a\n\n\nb\n" "0123456789abcdefghijklmnopqrstu\n\n" "";
+        addlines(v, takehead(v->body, 6), 1);
+        addlines(v, cuthead(v->body, 6), 5);
+        addlines(v, cuthead(v->body, v->body.len), 7);
+        Buf b(&a, 64);
+        for (i32 i = 0; i < 3; i++) {
+            print(&b, (i64)estimate(&v->msgs[i], 100, 10, 14));
+            putbyte(&b, ' ');
+            print(&b, (i64)estimate(&v->msgs[i], 10000, 10, 14));
+            putbyte(&b, ' ');
+        }
+        expect(t, "view.estimate.lines", finish(&b), "56 56 70 28 14 14 ");
+    }
+
+    // Columns as layout counts them: tabs to stops of 4, a code point
+    // each, trailing spaces never wrapping
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        v->body = "\t\t\tabc\n"
+                  "\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\n"
+                  "x                         \n";
+        addlines(v, v->body, 1);
+        Buf b(&a, 64);
+        print(&b, (i64)estimate(&v->msgs[0], 100, 10, 14));
+        putbyte(&b, ' ');
+        print(&b, (i64)estimate(&v->msgs[0], 10000, 10, 14));
+        expect(t, "view.estimate.columns", finish(&b), "56 42");
+    }
+}

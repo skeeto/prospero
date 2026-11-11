@@ -951,7 +951,7 @@ static void drawblock(Gui *g, ImDrawList *dl, ImDrawListSplitter *sp,
     f32          oy     = origin.y + p->y;
     Fonts       *f      = &g->fonts;
     Palette     *pal    = g->pal;
-    b32          code   = b->type == DOC_CODE;
+    b32          code   = b->type==DOC_CODE || b->type==DOC_LINE;
 
     for (iz i = 0; i < bl->decos.len; i++) {
         Deco *dc = &bl->decos[i];
@@ -3896,7 +3896,9 @@ static void textkeys(Gui *g, View *v)
 
 // A message's text, laid out in ml, from origin: its blocks within the
 // window's [top, bot], with the selection and its find hits, then its
-// code blocks' Copy buttons.
+// code blocks' Copy buttons. A chunk of a file's lines has hundreds of
+// blocks, so the first on screen is found by its bottom, which grows
+// block by block, and none past the window's bottom is looked at.
 static void drawmsgtext(Gui *g, ImDrawList *dl, ImDrawListSplitter *sp, TextArea *ta,
                         i32 i, MsgLayout *ml, ImVec2 origin, Range sel, Marks *mk,
                         f32 alpha, b32 aim)
@@ -3905,12 +3907,25 @@ static void drawmsgtext(Gui *g, ImDrawList *dl, ImDrawListSplitter *sp, TextArea
     Doc  *d   = msgdoc(v, i);
     f32   top = ta->wpos.y;
     f32   bot = ta->wpos.y + ta->winh;
-    for (iz k = 0; k < ml->blocks.len; k++) {
+    iz    k0  = 0;
+    for (iz hi = ml->blocks.len; k0 < hi;) {
+        iz      mid = k0 + (hi - k0)/2;
+        Placed *pl  = &ml->blocks[mid];
+        if (origin.y+pl->y+pl->bl->h < top) {
+            k0 = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    for (iz k = k0; k < ml->blocks.len; k++) {
         Placed *pl = &ml->blocks[k];
-        if (origin.y+pl->y > bot || origin.y+pl->y+pl->bl->h < top) {
-            continue;
+        if (origin.y+pl->y > bot) {
+            break;
         }
         drawblock(g, dl, sp, d, i, pl, origin, sel, mk, top, bot, alpha);
+    }
+    if (v->msgs[i].lines) {
+        return;  // no code blocks, no Copy buttons
     }
     ImGui::PushID(i);
     for (iz k = 0; k < ml->blocks.len; k++) {

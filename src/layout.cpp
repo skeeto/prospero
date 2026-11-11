@@ -159,6 +159,7 @@ struct Wrap {
     f32          ascent;
     i32          run0;    // first run of the current line
     b32          code;    // wrap anywhere, tabs to stops
+    i32          basestyle;  // the font a line starts in: prose, or a file's code
     i32          prev;    // the code point before, for cjkbreak
     // Last break opportunity on this line: just after a space, or
     // between CJK characters
@@ -189,7 +190,7 @@ static void endline(Wrap *w)
     w->x        = w->x0;
     w->run0     = (i32)bl->runs.len;
     w->canbreak = 0;
-    FontMetrics f = w->m->font(w->m->ctx, 0);
+    FontMetrics f = w->m->font(w->m->ctx, w->basestyle);
     w->lineh  = f.lineh;
     w->ascent = f.ascent;
 }
@@ -388,6 +389,15 @@ static BlockLayout *layoutblock(Arena *perm, Measure *m, Doc *d, i32 bi,
         w.x      = w.x0;
         w.width -= 2*sp.pad;
         w.y      = sp.pad;
+        FontMetrics f = m->font(m->ctx, STYLE_CODE);
+        w.lineh  = f.lineh;
+        w.ascent = f.ascent;
+    }
+    if (b->type == DOC_LINE) {
+        // A file's line: code, but with no box around it, every row
+        // in the code font's height
+        w.code      = 1;
+        w.basestyle = STYLE_CODE;
         FontMetrics f = m->font(m->ctx, STYLE_CODE);
         w.lineh  = f.lineh;
         w.ascent = f.ascent;
@@ -684,6 +694,8 @@ static f32 blockgap(Spacing *sp, DocBlock *prev, DocBlock *b)
 {
     if (prev->type==DOC_PLAIN && b->type==DOC_PLAIN) {
         return 0;
+    } else if (prev->type==DOC_LINE && b->type==DOC_LINE) {
+        return 0;  // so that a chunk's line k is its Placed k
     } else if (b->type==DOC_ITEM && (prev->type==DOC_ITEM || prev->depth<b->depth)) {
         return sp->tight;
     } else if (b->type == DOC_HEADING) {
@@ -864,13 +876,18 @@ static f32 msgy(Doc *d, MsgLayout *ml, i32 off)
     for (iz k = 0; k < ml->blocks.len; k++) {
         Placed      *p      = &ml->blocks[k];
         BlockLayout *bl     = p->bl;
-        Piece       *pieces = d->pieces.data + d->blocks[p->block].piece0;
+        DocBlock    *blk    = &d->blocks[p->block];
+        Piece       *pieces = d->pieces.data + blk->piece0;
         for (iz i = 0; i < bl->lines.len; i++) {
             Line *l = &bl->lines[i];
-            if (!l->nrun) {
+            i32   b = 0;
+            if (l->nrun) {
+                b = runbeg(pieces, &bl->runs[l->run0]);
+            } else if (blk->type == DOC_LINE) {
+                b = blk->off0;  // an empty line of a file, at its own offset
+            } else {
                 continue;
             }
-            i32 b = runbeg(pieces, &bl->runs[l->run0]);
             if (b<=off && b>best) {
                 best = b;
                 y    = p->y + l->y;

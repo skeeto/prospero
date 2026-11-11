@@ -11,7 +11,7 @@ static Str docshow(Arena *a, Doc *d)
     Buf b(a, 256);
     for (iz i = 0; i < d->blocks.len; i++) {
         DocBlock *k = &d->blocks[i];
-        static char const types[] = "PHCIRTL";
+        static char const types[] = "PHCIRTLS";
         putbyte(&b, (u8)types[k->type]);
         if (k->type == DOC_HEADING) print(&b, (i64)k->level);
         if (k->depth) { print(&b, " d"); print(&b, (i64)k->depth); }
@@ -114,6 +114,86 @@ static Str mdshow(Arena *a, Str src)
     Doc *d   = parsedoc(a, src, 0);
     Str  bad = doccheck(a, d);
     return bad.len ? bad : docshow(a, d);
+}
+
+// A source document's blocks' ranges: "off0-off1 ..."
+static Str sourceranges(Arena *a, Doc *d)
+{
+    Buf b(a, 64);
+    for (iz i = 0; i < d->blocks.len; i++) {
+        if (i) putbyte(&b, ' ');
+        print(&b, (i64)d->blocks[i].off0);
+        putbyte(&b, '-');
+        print(&b, (i64)d->blocks[i].off1);
+    }
+    return finish(&b);
+}
+
+static Str sourceshow(Arena *a, Str src, Slice<HlTok> toks, i32 tokoff)
+{
+    Doc *d   = parsesource(a, src, toks, tokoff);
+    Str  bad = doccheck(a, d);
+    return bad.len ? bad : docshow(a, d);
+}
+
+// Source files' lines (parsesource), as a Files tab shows them
+static void test_docsource(Test *t)
+{
+    Arena perm = t->perm;
+
+    {
+        Arena a = perm;
+        struct { Str name, src, want; } cases[] = {
+            {"doc.source.lines", "a\nbb\n\n\tc ", "S: c:a\nS: c:bb\nS:\nS: c:\tc \n"},
+            {"doc.source.final", "a\n", "S: c:a\n"},
+            {"doc.source.blank", "a\n\n", "S: c:a\nS:\n"},
+            {"doc.source.newline", "\n", "S:\n"},
+            {"doc.source.empty", "", "S:\n"},
+        };
+        for (iz i = 0; i < countof(cases); i++) {
+            expect(t, cases[i].name, sourceshow(&a, cases[i].src, {}, 0), cases[i].want);
+        }
+    }
+
+    // Empty lines are at their own offsets, not the previous line's end
+    {
+        Arena a = perm;
+        Doc  *d = parsesource(&a, "ab\n\n\nc\n", {}, 0);
+        expect(t, "doc.source.offsets", sourceranges(&a, d), "0-2 3-3 4-4 5-6");
+        expect(t, "doc.source.nolinks", doclinkat(d, 0), "");
+    }
+
+    // Chunks share the file's tokens: a comment spanning a chunk
+    // boundary is a comment in both
+    {
+        Arena        a    = perm;
+        Str          text = "int x; /* one\ntwo\nthree */ y;\n";
+        Slice<HlTok> toks = hlsource(&a, "c", text);
+        i32          at   = (i32)(cut(cut(text, '\n').tail, '\n').tail.data - text.data);
+        Str          one  = takehead(text, at);
+        Str          two  = cuthead(text, at);
+        expect(t, "doc.source.chunk0", sourceshow(&a, one, toks, 0),
+               "S: c/t:int|c: x; |c/c:/* one\nS: c/c:two\n");
+        expect(t, "doc.source.chunk1", sourceshow(&a, two, toks, at),
+               "S: c/c:three */|c: y;\n");
+    }
+
+    // Text past DOC_HLMAX is plain
+    {
+        Arena a   = perm;
+        Str   cmt = "/* c */\n";
+        iz    n   = DOC_HLMAX/cmt.len + 2;
+        Str   src = {allocbytes(&a, n*cmt.len), n*cmt.len};
+        for (iz i = 0; i < n; i++) {
+            copybytes(src.data+i*cmt.len, cmt.data, cmt.len);
+        }
+        Slice<HlTok> toks = hlsource(&a, "c", src);
+        i32          last = (i32)(src.len - cmt.len);
+        expect(t, "doc.source.hlhead", sourceshow(&a, takehead(src, cmt.len), toks, 0),
+               "S: c/c:/* c */\n");
+        expect(t, "doc.source.hlmax", sourceshow(&a, cuthead(src, last), toks, last),
+               "S: c:/* c */\n");
+    }
 }
 
 static void test_doc(Test *t)
@@ -320,4 +400,6 @@ static void test_doc(Test *t)
         Doc *d = parsedoc(&a, src, 0);
         expect(t, "doc.huge", istr(&a, d->plain), "1");
     }
+
+    test_docsource(t);
 }
