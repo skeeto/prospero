@@ -36,10 +36,19 @@ static AxNode *axitem(AxBuild *b, u32 parent, u32 key, AxRole role, Str name,
     return n;
 }
 
+static A11y *newtesta11y(Arena *a)
+{
+    Arena mem[AXM_N];
+    for (i32 i = 0; i < AXM_N; i++) {
+        mem[i] = carve(a, 1<<20);
+    }
+    return newa11y(a, mem);
+}
+
 static void test_a11y(Test *t)
 {
     Arena a = t->perm;
-    A11y *x = newa11y(&a, carve(&a, 1<<20), carve(&a, 1<<20));
+    A11y *x = newtesta11y(&a);
 
     // An empty tree before the first frame
     expect(t, "a11y.empty", axdumpstr(&a, x->pub, 1), "");
@@ -167,7 +176,7 @@ static void test_a11y(Test *t)
     expect(t, "a11y.manylen", istr(&a, x->pub->len), "2001");
 
     // Frame after frame, the arenas are reused, not grown
-    byte *hi[2] = {x->mem[0].beg, x->mem[1].beg};
+    byte *hi[2] = {x->mem[AXM_TREE0].beg, x->mem[AXM_TREE1].beg};
     for (i32 frame = 0; frame < 10; frame++) {
         b = axbegin(x);
         for (u32 k = 0; k < 2000; k++) {
@@ -175,7 +184,7 @@ static void test_a11y(Test *t)
         }
         axpublish(x, 0);
     }
-    expect(t, "a11y.reuse", istr(&a, x->mem[0].beg<=hi[0] && x->mem[1].beg<=hi[1]), "1");
+    expect(t, "a11y.reuse", istr(&a, x->mem[AXM_TREE0].beg<=hi[0] && x->mem[AXM_TREE1].beg<=hi[1]), "1");
 }
 
 static void test_a11yname(Test *t)
@@ -203,4 +212,225 @@ static void test_a11yname(Test *t)
         }
     }
     expect(t, "a11yname.everyicon", finish(&missing), "");
+}
+
+// Geometry as a monospace field would draw s, every line showing, each
+// code point 10 wide, at 100,50 with lines 20 high.
+static AxGeom axtestgeom(Arena *a, Str s)
+{
+    AxGeom g = {};
+    g.x      = 100;
+    g.y      = 50;
+    g.lineh  = 20;
+    g.clip   = {0, 0, 1000, 1000};
+    g.lines  = alloc<i32>(a, s.len+1);
+    g.xs     = alloc<f32>(a, s.len*2+2);
+    g.lines[g.nlines++] = 0;
+    for (iz i = 0; i < s.len; i++) {
+        if (s[i] == '\n') {
+            g.lines[g.nlines++] = (i32)i+1;
+        }
+    }
+    g.vis1 = g.nlines;
+    for (i32 k = 0; k < g.nlines; k++) {
+        i32 e  = k+1<g.nlines ? g.lines[k+1] : (i32)s.len;
+        f32 px = 0;
+        for (iz i = g.lines[k]; i < e;) {
+            iz  beg = i;
+            i32 c   = utf8decode(s, &i);
+            for (iz j = beg; j < i; j++) {
+                g.xs[g.nxs++] = px;
+            }
+            px += c=='\n' ? 0 : 10;
+        }
+        g.xs[g.nxs++] = px;
+    }
+    return g;
+}
+
+static void axtestsync(A11y *x, Arena *a, u32 state, b32 multiline, Str s,
+                       i32 anchor, i32 caret)
+{
+    AxGeom g = axtestgeom(a, s);
+    axtextsync(x, 7, 77, state, multiline, s, anchor, caret, &g);
+}
+
+static Str axspanstr(Arena *a, AxSpan s)
+{
+    Buf b(a, 32);
+    print(&b, (i64)s.lo);
+    putbyte(&b, '-');
+    print(&b, (i64)s.hi);
+    return finish(&b);
+}
+
+static Str axrectstr(Arena *a, AxRect r)
+{
+    Buf b(a, 64);
+    print(&b, axround(r.x0));
+    putbyte(&b, ',');
+    print(&b, axround(r.y0));
+    putbyte(&b, ' ');
+    print(&b, axround(r.x1));
+    putbyte(&b, ',');
+    print(&b, axround(r.y1));
+    return finish(&b);
+}
+
+static Str axeditstr(Arena *a, A11y *x, u32 id, Str text, i64 now)
+{
+    AxEdit e;
+    if (!axnextedit(x, id, text, now, &e)) {
+        return "none";
+    }
+    Buf b(a, 64);
+    print(&b, (i64)e.lo);
+    putbyte(&b, '-');
+    print(&b, (i64)e.hi);
+    putbyte(&b, ' ');
+    axquote(&b, e.text);
+    putbyte(&b, ' ');
+    print(&b, (i64)e.anchor);
+    putbyte(&b, ':');
+    print(&b, (i64)e.caret);
+    return finish(&b);
+}
+
+static void test_a11ytext(Test *t)
+{
+    Arena a = t->perm;
+    A11y *x = newtesta11y(&a);
+
+    // UTF-8, UTF-16 and code points: an emoji past U+FFFF is a
+    // surrogate pair, a CJK character one unit
+    Str s = "a\xf0\x9f\x98\x80" "b\xe4\xb8\xad\n";  // a😀b中\n
+    axtestsync(x, &a, 0, 1, s, 0, 0);
+    expect(t, "a11ytext.len",     istr(&a, axunitlen(x, AXU_BYTE)),  "10");
+    expect(t, "a11ytext.len16",   istr(&a, axunitlen(x, AXU_UTF16)), "6");
+    expect(t, "a11ytext.lencp",   istr(&a, axunitlen(x, AXU_CP)),    "5");
+    expect(t, "a11ytext.to16",    istr(&a, axtounit(x, AXU_UTF16, 5)), "3");
+    expect(t, "a11ytext.to16mid", istr(&a, axtounit(x, AXU_UTF16, 3)), "1");
+    expect(t, "a11ytext.to16cjk", istr(&a, axtounit(x, AXU_UTF16, 6)), "4");
+    expect(t, "a11ytext.tocp",    istr(&a, axtounit(x, AXU_CP, 9)),    "4");
+    expect(t, "a11ytext.lowhalf", istr(&a, axtobyte(x, AXU_UTF16, 2)), "1");
+    expect(t, "a11ytext.from16",  istr(&a, axtobyte(x, AXU_UTF16, 4)), "6");
+    expect(t, "a11ytext.fromcp",  istr(&a, axtobyte(x, AXU_CP, 3)),    "6");
+    expect(t, "a11ytext.snap",    istr(&a, axtobyte(x, AXU_BYTE, 7)),  "6");
+    expect(t, "a11ytext.past",    istr(&a, axtobyte(x, AXU_UTF16, 99)), "10");
+    expect(t, "a11ytext.lines",   istr(&a, axlinecount(x)), "2");
+    expect(t, "a11ytext.lastline", istr(&a, axlineat(x, 10)), "1");
+
+    // Geometry: the emoji is one character, 10 wide, and a point on
+    // its right half is after it
+    expect(t, "a11ytext.rect0", axrectstr(&a, axcharrect(x, 0)), "100,50 110,70");
+    expect(t, "a11ytext.rectemoji", axrectstr(&a, axcharrect(x, 3)), "110,50 120,70");
+    expect(t, "a11ytext.rectnl", axrectstr(&a, axcharrect(x, 9)), "140,50 140,70");
+    expect(t, "a11ytext.rectend", axrectstr(&a, axcharrect(x, 10)), "100,70 100,90");
+    expect(t, "a11ytext.hitleft", istr(&a, axoffsetat(x, 114, 55)), "1");
+    expect(t, "a11ytext.hitright", istr(&a, axoffsetat(x, 117, 55)), "5");
+    expect(t, "a11ytext.hitpast", istr(&a, axoffsetat(x, 900, 55)), "9");
+    expect(t, "a11ytext.hitbelow", istr(&a, axoffsetat(x, 0, 900)), "10");
+
+    // Words and paragraphs
+    Str w = "hello, world  foo_bar\nnext";
+    expect(t, "a11ytext.word0",     axspanstr(&a, axwordat(w, 0)),  "0-5");
+    expect(t, "a11ytext.wordin",    axspanstr(&a, axwordat(w, 3)),  "0-5");
+    expect(t, "a11ytext.wordpunct", axspanstr(&a, axwordat(w, 5)),  "5-6");
+    expect(t, "a11ytext.wordspace", axspanstr(&a, axwordat(w, 12)), "12-14");
+    expect(t, "a11ytext.wordunder", axspanstr(&a, axwordat(w, 16)), "14-21");
+    expect(t, "a11ytext.wordend",   axspanstr(&a, axwordat(w, 26)), "22-26");
+    expect(t, "a11ytext.wordnone",  axspanstr(&a, axwordat("", 0)), "0-0");
+    expect(t, "a11ytext.wordcjk",   axspanstr(&a, axwordat(s, 6)),  "0-9");
+    expect(t, "a11ytext.para0",     axspanstr(&a, axparaat(w, 3)),  "0-22");
+    expect(t, "a11ytext.para1",     axspanstr(&a, axparaat(w, 23)), "22-26");
+
+    // An edit: shadowed at once, CRLF and tabs cleaned, queued for
+    // ImGui with the bytes it replaces
+    axtestsync(x, &a, 0, 1, "hello world", 11, 11);
+    i64 rev = x->text.rev;
+    expect(t, "a11ytext.edit", istr(&a, axedit(x, 5, 11, " there\r\nfriend\t!", AX_AFTER, AX_AFTER, 1000)), "1");
+    expect(t, "a11ytext.shadow", x->text.text, "hello there\nfriend !");
+    expect(t, "a11ytext.shadowsel", istr(&a, x->text.caret), "20");
+    expect(t, "a11ytext.shadowrev", istr(&a, x->text.rev > rev), "1");
+    expect(t, "a11ytext.shadowlines", istr(&a, axlinecount(x)), "2");
+
+    // ImGui's text, until it takes the edit, doesn't undo the shadow
+    axtestsync(x, &a, 0, 1, "hello world", 11, 11);
+    expect(t, "a11ytext.ahead", x->text.text, "hello there\nfriend !");
+    expect(t, "a11ytext.stale", axrectstr(&a, axcharrect(x, 13)), "100,70 100,90");
+    expect(t, "a11ytext.other", axeditstr(&a, x, 78, "hello world", 1000), "none");
+    expect(t, "a11ytext.take", axeditstr(&a, x, 77, "hello world", 1000),
+           "5-11 \" there\\nfriend !\" 20:20");
+    expect(t, "a11ytext.taken", axeditstr(&a, x, 77, "hello there\nfriend !", 1000), "none");
+    expect(t, "a11ytext.emptied", istr(&a, x->mem[AXM_QUEUE].beg == x->base[AXM_QUEUE]), "1");
+    rev = x->text.rev;
+    axtestsync(x, &a, 0, 1, "hello there\nfriend !", 20, 20);
+    expect(t, "a11ytext.caughtup", istr(&a, x->text.rev), istr(&a, rev));
+    expect(t, "a11ytext.fresh", axrectstr(&a, axcharrect(x, 13)), "110,70 120,90");
+
+    // Stale: typed keys changed the bytes, so it and the next go
+    axtestsync(x, &a, 0, 1, "hello world", 0, 0);
+    axedit(x, 0, 5, "HELLO", 0, 5, 1000);
+    axedit(x, 6, 11, "WORLD", AX_AFTER, AX_AFTER, 1000);
+    expect(t, "a11ytext.twoedits", x->text.text, "HELLO WORLD");
+    expect(t, "a11ytext.changed", axeditstr(&a, x, 77, "jello world", 1000), "none");
+    expect(t, "a11ytext.dropped", axeditstr(&a, x, 77, "jello world", 1000), "none");
+    axtestsync(x, &a, 0, 1, "jello world", 1, 1);
+    expect(t, "a11ytext.resync", x->text.text, "jello world");
+
+    // Waiting too long for its field
+    axedit(x, 0, 0, ">", AX_AFTER, AX_AFTER, 0);
+    expect(t, "a11ytext.expired", axeditstr(&a, x, 77, "jello world", AXEDIT_TTL+1), "none");
+    expect(t, "a11ytext.expiredgone", istr(&a, axqueued(x, 77)), "0");
+
+    // Ranges not in the text; a selection set with the caret given
+    // after the text as it was put in, before cleaning
+    axtestsync(x, &a, 0, 1, "hello world", 0, 0);
+    expect(t, "a11ytext.backwards", istr(&a, axedit(x, 3, 2, "", 0, 0, 0)), "0");
+    expect(t, "a11ytext.beyond", istr(&a, axedit(x, 0, 12, "", 0, 0, 0)), "0");
+    expect(t, "a11ytext.negative", istr(&a, axedit(x, -1, 0, "", 0, 0, 0)), "0");
+    axedit(x, 0, 0, "ab\r\ncd", 2, 6, 0);
+    expect(t, "a11ytext.crlf", axeditstr(&a, x, 77, "hello world", 0), "0-0 \"ab\\ncd\" 2:5");
+    axselect(x, 1, 3, 0);
+    expect(t, "a11ytext.select", axeditstr(&a, x, 77, "ab\ncdhello world", 0), "-1-0 \"\" 1:3");
+    expect(t, "a11ytext.selected", axspanstr(&a, axselection(&x->text)), "1-3");
+
+    // One line: newlines dropped
+    axtestsync(x, &a, 0, 0, "name", 4, 4);
+    axedit(x, 4, 4, " two\nlines", AX_AFTER, AX_AFTER, 0);
+    expect(t, "a11ytext.oneline", x->text.text, "name twolines");
+    expect(t, "a11ytext.onelineedit", axeditstr(&a, x, 77, "name", 0), "4-4 \" twolines\" 13:13");
+
+    // Read-only and password fields refuse edits
+    axtestsync(x, &a, AXS_READONLY, 1, "fixed", 0, 0);
+    expect(t, "a11ytext.readonly", istr(&a, axedit(x, 0, 0, "x", 0, 0, 0)), "0");
+    expect(t, "a11ytext.readonlysel", istr(&a, axselect(x, 0, 1, 0)), "0");
+    axtextnone(x);
+    expect(t, "a11ytext.none", istr(&a, axedit(x, 0, 0, "x", 0, 0, 0)), "0");
+
+    // Deleting the emoji by its UTF-16 range
+    axtestsync(x, &a, 0, 1, "a\xf0\x9f\x98\x80" "b", 0, 0);
+    axedit(x, axtobyte(x, AXU_UTF16, 1), axtobyte(x, AXU_UTF16, 3), "", AX_AFTER, AX_AFTER, 0);
+    expect(t, "a11ytext.emojigone", x->text.text, "ab");
+    expect(t, "a11ytext.emojiedit", axeditstr(&a, x, 77, "a\xf0\x9f\x98\x80" "b", 0), "1-5 \"\" 1:1");
+
+    // Marked text in place of the selection, the document around it
+    axtestsync(x, &a, 0, 1, "hello world", 6, 11);
+    axmark(x, "wor", 3, 3);
+    expect(t, "a11ytext.doc", axdoc(x, &a), "hello wor");
+    expect(t, "a11ytext.doclen", istr(&a, axdoclen(x, AXU_UTF16)), "9");
+    expect(t, "a11ytext.doctext", istr(&a, axdoctext(x, 8)), "6");
+    expect(t, "a11ytext.docafter", istr(&a, axdoctext(x, 9)), "11");
+    axmark(x, "\xf0\x9f\x98\x80x", 5, 5);
+    expect(t, "a11ytext.doc16", istr(&a, axdoclen(x, AXU_UTF16)), "9");
+    expect(t, "a11ytext.docbyte", istr(&a, axdocbyte(x, AXU_UTF16, 8)), "10");
+    expect(t, "a11ytext.docunit", istr(&a, axdocunit(x, AXU_UTF16, 10)), "8");
+    expect(t, "a11ytext.docmid", istr(&a, axdocbyte(x, AXU_UTF16, 7)), "6");
+
+    // It stays while the field's text changes, and goes with the field
+    axtestsync(x, &a, 0, 1, "hello world!", 6, 11);
+    expect(t, "a11ytext.markkept", axdoc(x, &a), "hello \xf0\x9f\x98\x80x!");
+    AxGeom g = axtestgeom(&a, "other");
+    axtextsync(x, 8, 88, 0, 1, "other", 0, 0, &g);
+    expect(t, "a11ytext.markgone", axdoc(x, &a), "other");
 }

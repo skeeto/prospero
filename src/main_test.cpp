@@ -848,6 +848,7 @@ int main()
     test_palette(&t);
     test_a11y(&t);
     test_a11yname(&t);
+    test_a11ytext(&t);
     test_viewexport(&t);
     #endif
 

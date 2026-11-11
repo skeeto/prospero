@@ -148,26 +148,110 @@ struct AxBuild {
     Slice<AxNode>   nodes;
 };
 
-struct A11y {
-    Arena    mem[2];
-    byte    *base[2];
-    i32      cur;     // which arena the published tree lives in
-    AxTree  *pub;
-    AxBuild  build;
-    b32      building;
+// Offsets into text count bytes of UTF-8 here. The OS counts UTF-16
+// units (macOS, UIA) or code points (AT-SPI): see axtounit.
+enum AxUnit : i32 {
+    AXU_BYTE,
+    AXU_UTF16,
+    AXU_CP,
+    AXU_N
 };
 
-// The trees' two arenas are given whole: nothing else may use them.
-static A11y *newa11y(Arena *perm, Arena m0, Arena m1)
+// Where the focused field drew its text: lines are where each starts,
+// for all of the text, and xs the x of each byte of the lines that show
+// ([vis0, vis1)), from its start through its end, so one more than its
+// length. Coordinates are the window's, the first line's top left at x,
+// y, scrolled.
+struct AxGeom {
+    f32     x, y, lineh;
+    AxRect  clip;
+    i32    *lines;
+    i32     nlines;
+    i32     vis0, vis1;
+    f32    *xs;
+    i32     nxs;
+    i64     rev;      // the text's revision it was drawn from
+};
+
+// The focused text field: its text, selection, and the text an input
+// method is composing (marked), which stays out of the text: to the OS
+// the document is the text with the marked text in place of the
+// selection (axdoc).
+struct AxText {
+    b32     live;      // a field is focused
+    u32     key;       // its node
+    u32     id;        // its ImGuiID, which edits are for
+    u32     state;     // AXS_READONLY, AXS_PASSWORD
+    b32     multiline;
+    i64     rev;       // bumped by every change to the text
+    Str     text;
+    i32     anchor, caret;
+    Str     marked;
+    i32     mlo, mhi;  // the selection within marked
+    AxGeom  geom;
+    i32    *units[AXU_N];   // per unit, the byte where each starts
+    i32     nunits[AXU_N];  // and how many, built on demand
+    i32    *nl;             // lines by newlines alone, when geom is stale
+    i32     nnl;
+};
+
+// An edit queued for ImGui: bytes [lo, hi), which held expect, become
+// text, then the selection is anchor to caret. With lo < 0 only the
+// selection is set.
+struct AxEdit {
+    u32  id;
+    i32  lo, hi;
+    Str  expect;
+    Str  text;
+    i32  anchor, caret;
+    i64  when;
+};
+
+enum : i64 {
+    AXEDIT_TTL = 5000000,  // µs an edit waits for its field
+};
+
+// The arenas, each given whole: nothing else may use them.
+enum : i32 {
+    AXM_TREE0,  // the two trees, in turn
+    AXM_TREE1,
+    AXM_TEXT0,  // the focused field's text and offsets, in turn
+    AXM_TEXT1,
+    AXM_GEOM,   // its geometry, emptied each frame
+    AXM_QUEUE,  // queued edits, emptied once all are taken
+    AXM_N
+};
+
+struct A11y {
+    Arena          mem[AXM_N];
+    byte          *base[AXM_N];
+    i32            cur;     // which tree arena the published tree is in
+    AxTree        *pub;
+    AxBuild        build;
+    b32            building;
+    i32            tcur;    // which text arena the text is in
+    AxText         text;
+    Slice<AxEdit>  queue;
+    iz             qhead;
+};
+
+static A11y *newa11y(Arena *perm, Arena (&mem)[AXM_N])
 {
     A11y *x = alloc<A11y>(perm);
-    x->mem[0]  = m0;
-    x->mem[1]  = m1;
-    x->base[0] = x->mem[0].beg;
-    x->base[1] = x->mem[1].beg;
-    x->pub     = alloc<AxTree>(&x->mem[0]);
+    for (i32 i = 0; i < AXM_N; i++) {
+        x->mem[i]  = mem[i];
+        x->base[i] = x->mem[i].beg;
+    }
+    x->pub        = alloc<AxTree>(&x->mem[AXM_TREE0]);
     x->pub->focus = -1;
+    x->tcur       = AXM_TEXT0;
     return x;
+}
+
+static Arena *axempty(A11y *x, i32 m)
+{
+    x->mem[m].beg = x->base[m];
+    return &x->mem[m];
 }
 
 static u64 axhash(u32 key, i32 exp)
@@ -194,10 +278,8 @@ static i32 axfind(AxTree *t, u32 key)
 // arena the published tree isn't in, emptied first.
 static AxBuild *axbegin(A11y *x)
 {
-    i32 n = !x->cur;
-    x->mem[n].beg = x->base[n];
     AxBuild *b = &x->build;
-    b->a = &x->mem[n];
+    b->a = axempty(x, x->cur==AXM_TREE0 ? AXM_TREE1 : AXM_TREE0);
     b->nodes = {};
     i32 cap  = x->pub->len>128 ? x->pub->len*2 : 256;
     b->nodes.data = alloc<AxNode>(b->a, cap);
@@ -386,7 +468,7 @@ static Slice<AxEvent> axpublish(A11y *x, u32 focuskey)
     }
     axdiff(x->pub, t, b->a);
     x->pub = t;
-    x->cur = !x->cur;
+    x->cur = x->cur==AXM_TREE0 ? AXM_TREE1 : AXM_TREE0;
     return t->events;
 }
 
@@ -608,4 +690,639 @@ static void axdump(Buf *b, AxTree *t, b32 rects)
             }
         }
     }
+}
+
+
+// Text: the focused field, as the OS reads and edits it
+//
+// The field's text is copied when it changes, into the text arena not
+// in use, so the copy in use can build the new. An assistive tool's edit
+// applies here at once, a shadow of what ImGui will do with it in the
+// next frame, so the tool reads back what it wrote, and is queued with
+// the bytes it replaces: ImGui refuses it if those changed, keys typed
+// in between, say, and the frame after takes ImGui's text again. While
+// an edit for the field waits, its text here is ahead of ImGui's, and
+// its geometry is of the text before (stale): lines then come from
+// newlines alone, and x positions are unknown.
+
+struct AxSpan {
+    i32 lo, hi;
+};
+
+static i32 axclamp(i32 v, i32 lo, i32 hi)
+{
+    return v<lo ? lo : v>hi ? hi : v;
+}
+
+static i32 axtextlen(A11y *x)
+{
+    return (i32)x->text.text.len;
+}
+
+static AxSpan axselection(AxText *t)
+{
+    AxSpan s = {};
+    s.lo = t->anchor<t->caret ? t->anchor : t->caret;
+    s.hi = t->anchor<t->caret ? t->caret  : t->anchor;
+    return s;
+}
+
+static void axunits(A11y *x, AxUnit u)
+{
+    AxText *t = &x->text;
+    if (u==AXU_BYTE || t->units[u]) {
+        return;
+    }
+    Str  s = t->text;
+    i32 *r = alloc<i32>(&x->mem[x->tcur], s.len+1);
+    i32  n = 0;
+    for (iz i = 0; i < s.len;) {
+        i32 beg = (i32)i;
+        i32 c   = utf8decode(s, &i);
+        r[n++] = beg;
+        if (u==AXU_UTF16 && c>0xffff) {
+            r[n++] = beg;  // the low surrogate: the same code point
+        }
+    }
+    r[n] = (i32)s.len;
+    t->units[u]  = r;
+    t->nunits[u] = n;
+}
+
+// A byte offset in units: within a code point, the code point's.
+static i32 axtounit(A11y *x, AxUnit u, i32 b)
+{
+    b = axclamp(b, 0, axtextlen(x));
+    if (u == AXU_BYTE) {
+        return b;
+    }
+    axunits(x, u);
+    i32 *r  = x->text.units[u];
+    i32  lo = 0;
+    i32  hi = x->text.nunits[u] + 1;
+    while (lo < hi) {  // the first unit starting past b
+        i32 mid = lo + (hi - lo)/2;
+        if (r[mid] > b) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    i32 k = lo - 1;
+    while (k>0 && r[k-1]==r[k]) {
+        k--;
+    }
+    return k;
+}
+
+// Units as a byte offset: within a code point, its start.
+static i32 axtobyte(A11y *x, AxUnit u, i32 off)
+{
+    if (u == AXU_BYTE) {
+        u   = AXU_CP;
+        off = axtounit(x, AXU_CP, off);
+    }
+    axunits(x, u);
+    return x->text.units[u][axclamp(off, 0, x->text.nunits[u])];
+}
+
+static i32 axunitlen(A11y *x, AxUnit u)
+{
+    return axtounit(x, u, axtextlen(x));
+}
+
+// Units in s up to byte b, and the byte after n units, for marked text.
+static i32 axcount(Str s, AxUnit u, i32 b)
+{
+    i32 n = 0;
+    for (iz i = 0; i < b && i < s.len;) {
+        i32 c = utf8decode(s, &i);
+        n += u==AXU_BYTE ? 0 : u==AXU_UTF16 && c>0xffff ? 2 : 1;
+    }
+    return u==AXU_BYTE ? axclamp(b, 0, (i32)s.len) : n;
+}
+
+static i32 axadvance(Str s, AxUnit u, i32 n)
+{
+    iz i = 0;
+    for (i32 k = 0; i < s.len;) {
+        iz  beg = i;
+        i32 c   = utf8decode(s, &i);
+        k += u==AXU_BYTE ? (i32)(i - beg) : u==AXU_UTF16 && c>0xffff ? 2 : 1;
+        if (k > n) {
+            return (i32)beg;
+        }
+    }
+    return (i32)s.len;
+}
+
+// The text arena not in use, emptied, for the next text.
+static Arena *axspare(A11y *x)
+{
+    return axempty(x, x->tcur==AXM_TEXT0 ? AXM_TEXT1 : AXM_TEXT0);
+}
+
+// Make s, made in the spare arena, the text.
+static void axtake(A11y *x, Str s)
+{
+    AxText *t = &x->text;
+    x->tcur   = x->tcur==AXM_TEXT0 ? AXM_TEXT1 : AXM_TEXT0;
+    t->text   = s;
+    t->marked = clone(&x->mem[x->tcur], t->marked);
+    t->rev++;
+    for (i32 u = 0; u < AXU_N; u++) {
+        t->units[u]  = 0;
+        t->nunits[u] = 0;
+    }
+    t->nl  = 0;
+    t->nnl = 0;
+}
+
+static void axsettext(A11y *x, Str s)
+{
+    axtake(x, clone(axspare(x), s));
+}
+
+
+// The document the OS sees: the text with the marked text, if any, in
+// place of the selection. Offsets in it are in units.
+
+static i32 axdoclen(A11y *x, AxUnit u)
+{
+    AxText *t = &x->text;
+    if (!t->marked.len) {
+        return axunitlen(x, u);
+    }
+    AxSpan s = axselection(t);
+    return axunitlen(x, u) - (axtounit(x, u, s.hi) - axtounit(x, u, s.lo))
+         + axcount(t->marked, u, (i32)t->marked.len);
+}
+
+// A byte offset in the document as units of it.
+static i32 axdocunit(A11y *x, AxUnit u, i32 d)
+{
+    AxText *t = &x->text;
+    if (!t->marked.len) {
+        return axtounit(x, u, d);
+    }
+    AxSpan s  = axselection(t);
+    i32    ml = (i32)t->marked.len;
+    i32    u0 = axtounit(x, u, s.lo);
+    if (d <= s.lo) {
+        return axtounit(x, u, d);
+    } else if (d < s.lo+ml) {
+        return u0 + axcount(t->marked, u, d - s.lo);
+    }
+    return u0 + axcount(t->marked, u, ml)
+         + axtounit(x, u, d - s.lo - ml + s.hi) - axtounit(x, u, s.hi);
+}
+
+// Units of the document as a byte offset in it.
+static i32 axdocbyte(A11y *x, AxUnit u, i32 v)
+{
+    AxText *t = &x->text;
+    if (!t->marked.len) {
+        return axtobyte(x, u, v);
+    }
+    AxSpan s  = axselection(t);
+    i32    ml = (i32)t->marked.len;
+    i32    u0 = axtounit(x, u, s.lo);
+    i32    m  = axcount(t->marked, u, ml);
+    if (v <= u0) {
+        return axtobyte(x, u, v);
+    } else if (v < u0+m) {
+        return s.lo + axadvance(t->marked, u, v - u0);
+    }
+    return s.lo + ml + axtobyte(x, u, v - u0 - m + axtounit(x, u, s.hi)) - s.hi;
+}
+
+// A byte offset in the document as one in the text: within the marked
+// text, where it goes.
+static i32 axdoctext(A11y *x, i32 d)
+{
+    AxText *t = &x->text;
+    if (!t->marked.len) {
+        return axclamp(d, 0, axtextlen(x));
+    }
+    AxSpan s  = axselection(t);
+    i32    ml = (i32)t->marked.len;
+    if (d <= s.lo) {
+        return axclamp(d, 0, s.lo);
+    } else if (d < s.lo+ml) {
+        return s.lo;
+    }
+    return axclamp(d - s.lo - ml + s.hi, s.hi, axtextlen(x));
+}
+
+// The document itself, made on demand.
+static Str axdoc(A11y *x, Arena *a)
+{
+    AxText *t = &x->text;
+    if (!t->marked.len) {
+        return t->text;
+    }
+    AxSpan s = axselection(t);
+    Buf    b(a, t->text.len + t->marked.len);
+    print(&b, takehead(t->text, s.lo));
+    print(&b, t->marked);
+    print(&b, cuthead(t->text, s.hi));
+    return finish(&b);
+}
+
+// Set the text an input method composes, and its selection (bytes of
+// it), in place of the selection; empty when it is done.
+static void axmark(A11y *x, Str marked, i32 lo, i32 hi)
+{
+    AxText *t = &x->text;
+    t->marked = clone(&x->mem[x->tcur], marked);
+    t->mlo    = axclamp(lo, 0, (i32)marked.len);
+    t->mhi    = axclamp(hi, t->mlo, (i32)marked.len);
+}
+
+
+// Lines, words, paragraphs: spans of bytes in the text
+
+static i32 *axlines(A11y *x, i32 *n)
+{
+    AxText *t = &x->text;
+    if (t->geom.lines && t->geom.rev==t->rev) {
+        *n = t->geom.nlines;
+        return t->geom.lines;
+    }
+    if (!t->nl) {
+        i32 count = 1;
+        for (iz i = 0; i < t->text.len; i++) {
+            count += t->text[i] == '\n';
+        }
+        t->nl  = alloc<i32>(&x->mem[x->tcur], count);
+        t->nnl = 0;
+        t->nl[t->nnl++] = 0;
+        for (iz i = 0; i < t->text.len; i++) {
+            if (t->text[i] == '\n') {
+                t->nl[t->nnl++] = (i32)i + 1;
+            }
+        }
+    }
+    *n = t->nnl;
+    return t->nl;
+}
+
+static i32 axlinecount(A11y *x)
+{
+    i32 n;
+    axlines(x, &n);
+    return n;
+}
+
+// The line byte b is on.
+static i32 axlineat(A11y *x, i32 b)
+{
+    i32  n;
+    i32 *lines = axlines(x, &n);
+    i32  lo = 0;
+    i32  hi = n;
+    while (lo < hi) {  // the first line starting past b
+        i32 mid = lo + (hi - lo)/2;
+        if (lines[mid] > b) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    return lo>0 ? lo-1 : 0;
+}
+
+// Line k's bytes, its newline included.
+static AxSpan axlinespan(A11y *x, i32 k)
+{
+    i32  n;
+    i32 *lines = axlines(x, &n);
+    k = axclamp(k, 0, n-1);
+    AxSpan s = {};
+    s.lo = lines[k];
+    s.hi = k+1<n ? lines[k+1] : axtextlen(x);
+    return s;
+}
+
+static i32 axclass(i32 c)
+{
+    if (c==' ' || c=='\t' || c=='\n' || c=='\r' || c==0xa0 || c==0x3000) {
+        return 1;
+    } else if (c>=0x80 || alnum((u8)c) || c=='_') {
+        return 2;
+    }
+    return 3;
+}
+
+// The run of letters and digits, of spaces, or of punctuation that byte
+// b starts or is within; at the end, the run before it.
+static AxSpan axwordat(Str s, i32 b)
+{
+    b = axclamp(b, 0, (i32)s.len);
+    if (b == s.len) {
+        if (!b) {
+            return {};
+        }
+        iz start;
+        utf8prev(s, b, &start);
+        b = (i32)start;
+    }
+    while (b>0 && (s[b]&0xc0)==0x80) {
+        b--;
+    }
+    iz  i   = b;
+    i32 cls = axclass(utf8decode(s, &i));
+    AxSpan r = {b, (i32)i};
+    while (r.hi < s.len) {
+        iz j = r.hi;
+        if (axclass(utf8decode(s, &j)) != cls) {
+            break;
+        }
+        r.hi = (i32)j;
+    }
+    while (r.lo > 0) {
+        iz  start;
+        i32 c = utf8prev(s, r.lo, &start);
+        if (axclass(c) != cls) {
+            break;
+        }
+        r.lo = (i32)start;
+    }
+    return r;
+}
+
+// The paragraph byte b is in, through its newline.
+static AxSpan axparaat(Str s, i32 b)
+{
+    b = axclamp(b, 0, (i32)s.len);
+    AxSpan r = {b, b};
+    while (r.lo>0 && s[r.lo-1]!='\n') {
+        r.lo--;
+    }
+    while (r.hi<s.len && s[r.hi]!='\n') {
+        r.hi++;
+    }
+    r.hi += r.hi < s.len;
+    return r;
+}
+
+
+// Geometry: where the text's bytes are, in the window
+
+// x of byte b, on line k, from the line's start, or -1 when unknown
+static f32 axxof(A11y *x, i32 k, i32 b)
+{
+    AxText *t = &x->text;
+    AxGeom *g = &t->geom;
+    if (g->rev!=t->rev || !g->xs || k<g->vis0 || k>=g->vis1) {
+        return -1;
+    }
+    i32 at = 0;
+    for (i32 j = g->vis0; j < k; j++) {
+        AxSpan s = axlinespan(x, j);
+        at += s.hi - s.lo + 1;
+    }
+    AxSpan s = axlinespan(x, k);
+    i32    i = at + axclamp(b, s.lo, s.hi) - s.lo;
+    return i<g->nxs ? g->xs[i] : -1;
+}
+
+// Where byte b's character is: as wide as it, or none at a line's end.
+static AxRect axcharrect(A11y *x, i32 b)
+{
+    AxGeom *g = &x->text.geom;
+    b = axtobyte(x, AXU_BYTE, b);
+    i32    k = axlineat(x, b);
+    AxSpan s = axlinespan(x, k);
+    iz     e = b;
+    if (b < s.hi) {
+        utf8decode(x->text.text, &e);
+    }
+    f32 x0 = axxof(x, k, b);
+    f32 x1 = axxof(x, k, (i32)e);
+    x0 = x0<0 ? 0  : x0;
+    x1 = x1<0 ? x0 : x1;
+    AxRect r = {};
+    r.x0 = g->x + x0;
+    r.x1 = g->x + x1;
+    r.y0 = g->y + (f32)k*g->lineh;
+    r.y1 = r.y0 + g->lineh;
+    return r;
+}
+
+// The byte offset nearest a point: before the character it is left of
+// the middle of, and never past a line's newline.
+static i32 axoffsetat(A11y *x, f32 px, f32 py)
+{
+    AxGeom *g = &x->text.geom;
+    Str     s = x->text.text;
+    i32     k = 0;
+    if (g->lineh > 0) {
+        k = (i32)__builtin_floorf((py - g->y) / g->lineh);
+    }
+    k = axclamp(k, 0, axlinecount(x)-1);
+    AxSpan line = axlinespan(x, k);
+    i32    end  = line.hi>line.lo && s[line.hi-1]=='\n' ? line.hi-1 : line.hi;
+    if (axxof(x, k, line.lo) < 0) {
+        return line.lo;
+    }
+    for (iz i = line.lo; i < end;) {
+        iz beg = i;
+        utf8decode(s, &i);
+        f32 mid = (axxof(x, k, (i32)beg) + axxof(x, k, (i32)i)) / 2;
+        if (px - g->x < mid) {
+            return (i32)beg;
+        }
+    }
+    return end;
+}
+
+
+// Keeping up with ImGui
+
+static b32 axqueued(A11y *x, u32 id)
+{
+    for (iz i = x->qhead; i < x->queue.len; i++) {
+        if (x->queue[i].id == id) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// The focused field as drawn this frame: its text, selection and where
+// it drew them. With an edit for it queued, its text and selection here
+// are ahead of ImGui's, and stay.
+static void axtextsync(A11y *x, u32 key, u32 id, u32 state, b32 multiline,
+                       Str text, i32 anchor, i32 caret, AxGeom *g)
+{
+    AxText *t     = &x->text;
+    b32     other = !t->live || t->key!=key || t->id!=id;
+    if (other) {
+        t->marked = {};
+        t->mlo = t->mhi = 0;
+    }
+    t->live      = 1;
+    t->key       = key;
+    t->id        = id;
+    t->state     = state;
+    t->multiline = multiline;
+    if (other || !axqueued(x, id)) {
+        if (other || !(t->text == text)) {
+            axsettext(x, text);
+        }
+        t->anchor = axclamp(anchor, 0, axtextlen(x));
+        t->caret  = axclamp(caret,  0, axtextlen(x));
+    }
+
+    Arena *a = axempty(x, AXM_GEOM);
+    t->geom  = *g;
+    t->geom.lines = alloc<i32>(a, g->nlines);
+    for (i32 i = 0; i < g->nlines; i++) {
+        t->geom.lines[i] = g->lines[i];
+    }
+    t->geom.xs = alloc<f32>(a, g->nxs);
+    for (i32 i = 0; i < g->nxs; i++) {
+        t->geom.xs[i] = g->xs[i];
+    }
+    t->geom.rev = t->text==text ? t->rev : -1;
+}
+
+// No field is focused.
+static void axtextnone(A11y *x)
+{
+    AxText *t = &x->text;
+    t->live   = 0;
+    t->marked = {};
+    t->mlo = t->mhi = 0;
+    t->geom   = {};
+    t->geom.rev = -1;
+}
+
+// Text as a field takes it: CRLF and CR as LF, tabs as spaces, other
+// control characters dropped, and newlines too in a field of one line.
+static Str axclean(Arena *a, Str s, b32 multiline)
+{
+    Buf b(a, s.len);
+    for (iz i = 0; i < s.len; i++) {
+        u8 c = s[i];
+        if (c == '\r') {
+            c = '\n';
+            i += i+1<s.len && s[i+1]=='\n';
+        }
+        c = c=='\t' ? ' ' : c;
+        if ((c=='\n' && !multiline) || (c<0x20 && c!='\n') || c==0x7f) {
+            continue;
+        }
+        putbyte(&b, c);
+    }
+    return finish(&b);
+}
+
+enum : i32 {
+    AX_AFTER = -1,  // a selection at the end of the text put in
+};
+
+static b32 axeditable(AxText *t)
+{
+    return t->live && !(t->state & (AXS_READONLY|AXS_PASSWORD));
+}
+
+// Replace bytes [lo, hi) of the focused field's text, then select from
+// anchor to caret, both in the text after, or AX_AFTER. Refused (0) for
+// a field not editable, or a range not in its text.
+static b32 axedit(A11y *x, i32 lo, i32 hi, Str text, i32 anchor, i32 caret, i64 now)
+{
+    AxText *t   = &x->text;
+    i32     len = axtextlen(x);
+    if (!axeditable(t) || lo<0 || hi<lo || hi>len) {
+        return 0;
+    }
+    lo = axtobyte(x, AXU_BYTE, lo);
+    hi = axtobyte(x, AXU_BYTE, hi);
+
+    Arena *q = &x->mem[AXM_QUEUE];
+    AxEdit e = {};
+    e.id     = t->id;
+    e.lo     = lo;
+    e.hi     = hi;
+    e.when   = now;
+    e.expect = clone(q, span(t->text.data+lo, t->text.data+hi));
+    e.text   = axclean(q, text, t->multiline);
+
+    i32  raw   = (i32)text.len;
+    i32  add   = (i32)e.text.len;
+    i32  after = len - (hi - lo) + add;
+    auto fix   = [&](i32 p) {
+        p = p==AX_AFTER ? lo+add : p>lo+raw ? p-raw+add : p>lo+add ? lo+add : p;
+        return axclamp(p, 0, after);
+    };
+    e.anchor = fix(anchor);
+    e.caret  = fix(caret);
+    x->queue = push(q, x->queue, e);
+
+    Buf b(axspare(x), after);
+    print(&b, takehead(t->text, lo));
+    print(&b, e.text);
+    print(&b, cuthead(t->text, hi));
+    axtake(x, finish(&b));
+    t->anchor = e.anchor;
+    t->caret  = e.caret;
+    return 1;
+}
+
+// Select from anchor to caret in the focused field.
+static b32 axselect(A11y *x, i32 anchor, i32 caret, i64 now)
+{
+    AxText *t = &x->text;
+    if (!axeditable(t)) {
+        return 0;
+    }
+    AxEdit e = {};
+    e.id     = t->id;
+    e.lo     = -1;
+    e.when   = now;
+    e.anchor = axtobyte(x, AXU_BYTE, anchor);
+    e.caret  = axtobyte(x, AXU_BYTE, caret);
+    x->queue = push(&x->mem[AXM_QUEUE], x->queue, e);
+    t->anchor = e.anchor;
+    t->caret  = e.caret;
+    return 1;
+}
+
+// The next edit for field id, whose text is now text, for ImGui to
+// apply. An edit whose bytes changed under it is dropped, with those
+// after it for the field, which counted on it; one waiting longer than
+// AXEDIT_TTL for its field is dropped.
+static b32 axnextedit(A11y *x, u32 id, Str text, i64 now, AxEdit *out)
+{
+    b32 r = 0;
+    for (iz i = x->qhead; i < x->queue.len; i++) {
+        AxEdit *e = &x->queue[i];
+        if (e->id && now-e->when>AXEDIT_TTL) {
+            e->id = 0;
+        }
+        if (!e->id || e->id!=id || r) {
+            continue;
+        }
+        e->id = 0;
+        if (e->lo>=0 && (e->hi>text.len ||
+                !(span(text.data+e->lo, text.data+e->hi) == e->expect))) {
+            for (iz j = i+1; j < x->queue.len; j++) {
+                x->queue[j].id = x->queue[j].id==id ? 0 : x->queue[j].id;
+            }
+            break;
+        }
+        *out = *e;
+        r    = 1;
+    }
+    while (x->qhead<x->queue.len && !x->queue[x->qhead].id) {
+        x->qhead++;
+    }
+    if (x->qhead == x->queue.len) {
+        axempty(x, AXM_QUEUE);
+        x->queue = {};
+        x->qhead = 0;
+    }
+    return r;
 }
