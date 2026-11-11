@@ -11539,6 +11539,7 @@ static void setpane(Gui *, i32, b32);
 #include "ui.cpp"
 #include "term.cpp"
 #include "files.cpp"
+#include "a11y_imgui.cpp"
 
 
 // The fake agent
