@@ -889,6 +889,7 @@ int main()
     test_dropload(&t);
     test_a11y(&t);
     test_a11yname(&t);
+    test_a11ytext(&t);
     test_viewexport(&t);
     #endif
 
