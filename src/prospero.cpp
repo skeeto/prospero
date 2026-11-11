@@ -513,8 +513,12 @@ static void    os_wake(Os *);
 // a drag over the window and of its leaving, which answers whether a
 // drop there would be refused, and
 // gui_toasted and gui_toastfail of a desktop notification clicked or
-// refused (os_guitoast).
+// refused (os_guitoast). gui_preedit tells of an input method's
+// composition as it changes (ime.cpp), and gui_composing whether one is
+// under way, so its keys are kept from ImGui.
 struct Gui;
+static void    gui_preedit(Gui *, Str text, i32 start, i32 count);
+static b32     gui_composing(Gui *);
 // Open the main window with ImGui's platform and renderer backends, or
 // open it again after os_guished. Returns 0 on failure.
 static b32     os_guiopen(Os *, Gui *, Str title);
@@ -662,6 +666,9 @@ enum {
                     // GEV_DROP; at x, y if down is set, else over the
                     // title bar. Out, x 1 if the platform was told to
                     // take it, 0 to refuse it, -1 where it says nothing
+    GEV_EDITING,    // an input method's composition is the text, its
+                    // clause code points [x, x+y) (gui_preedit); empty
+                    // ends it; out, x -1 where there is no such path
 };
 enum {
     GKEY_TAB,

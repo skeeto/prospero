@@ -98,6 +98,8 @@ static void prospero_axdraw(ImGuiContext &g, ImGuiInputTextState *state, ImGuiID
     static int             linelen = -1;
     static float           linewrap;
     static ImU64           linehash;
+    static ImFont         *linefont;
+    static float           linesize;
 
     ProsperoAxField f = {};
     f.id      = id;
@@ -113,6 +115,7 @@ static void prospero_axdraw(ImGuiContext &g, ImGuiInputTextState *state, ImGuiID
     f.clip[2] = clip.Max.x;
     f.clip[3] = clip.Max.y;
     f.lineh   = g.FontSize;
+    f.caretline = -1;
 
     // Past a megabyte the active field is too long to describe each
     // frame, and while its lines show, only so many bytes of them.
@@ -124,7 +127,8 @@ static void prospero_axdraw(ImGuiContext &g, ImGuiInputTextState *state, ImGuiID
             h ^= (unsigned char)buf[i];
             h *= 1111111111111111111u;
         }
-        if (id!=lineid || f.len!=linelen || wrap!=linewrap || h!=linehash) {
+        if (id!=lineid || f.len!=linelen || wrap!=linewrap || h!=linehash ||
+                g.Font!=linefont || g.FontSize!=linesize) {
             lines.Offsets.resize(0);
             InputTextLineIndexBuild(flags, &lines, buf, buf+f.len, wrap, INT_MAX, NULL);
             lines.EndOffset = f.len;
@@ -132,6 +136,8 @@ static void prospero_axdraw(ImGuiContext &g, ImGuiInputTextState *state, ImGuiID
             linelen  = f.len;
             linewrap = wrap;
             linehash = h;
+            linefont = g.Font;
+            linesize = g.FontSize;
         }
         f.lines  = lines.Offsets.Data;
         f.nlines = lines.Offsets.Size;
@@ -174,6 +180,60 @@ static void prospero_axdraw(ImGuiContext &g, ImGuiInputTextState *state, ImGuiID
         f.anchor = stb->select_start==stb->select_end ? stb->cursor
                  : stb->cursor==stb->select_end       ? stb->select_start
                  :                                      stb->select_end;
+
+        // As InputTextLineIndexGetPosOffset places it: at a wrap, on the
+        // line before after a move rightward.
+        int        c  = f.caret;
+        int const *l0 = f.lines;
+        int const *l1 = f.lines + f.nlines;
+        int const *it = ImLowerBound((int *)l0, (int *)l1, c);
+        if (it>l0 && (it==l1 || *it!=c || (state->WrapWidth>0.0f &&
+                state->LastMoveDirectionLR==ImGuiDir_Right && c>0 &&
+                buf[c-1]!='\n' && buf[c-1]!=0))) {
+            it--;
+        }
+        f.caretline = it==l0 ? 0 : (int)(it - l0);
     }
     prospero_axfield(&f);
+}
+
+// Draw an input method's composition over the active field (ime.cpp),
+// where it goes: in place of the selection, or at the caret, placed as
+// ImGui places the caret. Then the caret is hidden, and the IME's
+// position is the composition's clause, imepos.
+static bool prospero_axpreedit(ImGuiContext &g, ImGuiInputTextState *state, ImGuiID id,
+                               ImGuiTextIndex *line_index, char const *buf, char const *end,
+                               ImVec2 origin, ImVec2 cursor_offset, ImRect clip, bool hint,
+                               ImVec2 *imepos)
+{
+    if (!state || state->ID!=id || !prospero_preediting()) {
+        return false;
+    }
+    ImStbTexteditState *stb = state->Stb;
+    int    lo  = ImMin(stb->select_start, stb->select_end);
+    ImVec2 off = cursor_offset;
+    if (stb->select_start!=stb->select_end && lo!=stb->cursor) {
+        // Where the selection starts, as ImGui highlights it: the caret's
+        // rule for a wrap (the line before, after a move rightward) isn't
+        // for it.
+        ImS8 dir = state->LastMoveDirectionLR;
+        state->LastMoveDirectionLR = ImGuiDir_Left;
+        off = InputTextLineIndexGetPosOffset(g, state, line_index, buf, end, lo);
+        state->LastMoveDirectionLR = dir;
+    }
+    ImVec2 at = ImTrunc(origin + off);
+    ProsperoPreedit e = {};
+    e.id      = id;
+    e.x       = at.x;
+    e.y       = at.y - g.FontSize;
+    e.clip[0] = clip.Min.x;
+    e.clip[1] = clip.Min.y;
+    e.clip[2] = clip.Max.x;
+    e.clip[3] = clip.Max.y;
+    e.hint    = hint;
+    if (!prospero_preedit(&e)) {
+        return false;
+    }
+    *imepos = ImVec2(e.imex, e.imey);
+    return true;
 }

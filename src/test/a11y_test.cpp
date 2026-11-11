@@ -215,7 +215,7 @@ static void test_a11yname(Test *t)
 }
 
 // Geometry as a monospace field would draw s, every line showing, each
-// code point 10 wide, at 100,50 with lines 20 high.
+// code point 10 wide (CR and LF none), at 100,50 with lines 20 high.
 static AxGeom axtestgeom(Arena *a, Str s)
 {
     AxGeom g = {};
@@ -241,7 +241,7 @@ static AxGeom axtestgeom(Arena *a, Str s)
             for (iz j = beg; j < i; j++) {
                 g.xs[g.nxs++] = px;
             }
-            px += c=='\n' ? 0 : 10;
+            px += c=='\n' || c=='\r' ? 0 : 10;
         }
         g.xs[g.nxs++] = px;
     }
@@ -466,4 +466,51 @@ static void test_a11ytext(Test *t)
     AxGeom g = axtestgeom(&a, "other");
     axtextsync(x, 8, 88, 0, 1, "other", 0, 0, &g);
     expect(t, "a11ytext.markgone", axdoc(x, &a), "other");
+
+    // Marked text's rects are where it was drawn, over the field; the
+    // text's around it are where the text was drawn, under it
+    AxGeom mg = axtestgeom(&a, "ab\ncd");
+    f32    mx[] = {110, 110, 110, 125, 130};
+    f32    my[] = {50, 50, 50, 50, 50};
+    mg.mxs = mx;
+    mg.mys = my;
+    mg.nm  = 5;
+    axtextsync(x, 7, 77, 0, 1, "ab\ncd", 1, 1, &mg);
+    axmark(x, "\xe3\x81\x8bx", 4, 4);  // U+304B
+    expect(t, "a11ytext.markdoc", axdoc(x, &a), "a\xe3\x81\x8bxb\ncd");
+    expect(t, "a11ytext.docrect0", axrectstr(&a, axdocrect(x, 0)), "100,50 110,70");
+    expect(t, "a11ytext.docrectka", axrectstr(&a, axdocrect(x, 2)), "110,50 125,70");
+    expect(t, "a11ytext.docrectx", axrectstr(&a, axdocrect(x, 4)), "125,50 130,70");
+    expect(t, "a11ytext.docrectafter", axrectstr(&a, axdocrect(x, 5)), "110,50 120,70");
+    expect(t, "a11ytext.docrectline", axrectstr(&a, axdocrect(x, 7)), "100,70 110,90");
+    Str was = x->text.marked;
+    axmark(x, "\xe3\x81\x8bx", 4, 4);
+    expect(t, "a11ytext.markagain", istr(&a, was.data==x->text.marked.data), "1");
+    axtestsync(x, &a, 0, 1, "ab\ncd", 1, 1);  // not drawn: where it goes
+    expect(t, "a11ytext.docrectundrawn", axrectstr(&a, axdocrect(x, 2)), "110,50 110,70");
+
+    // The caret at a wrap: on the line ImGui drew it on
+    AxGeom wg = {};
+    i32    wl[] = {0, 3};
+    f32    wx[] = {0, 10, 20, 30, 0, 10, 20, 30};
+    wg.x      = 100;
+    wg.y      = 50;
+    wg.lineh  = 20;
+    wg.lines  = wl;
+    wg.nlines = 2;
+    wg.vis1   = 2;
+    wg.xs     = wx;
+    wg.nxs    = 8;
+    wg.caretline = 1;
+    axtextsync(x, 7, 77, 0, 1, "abcdef", 3, 3, &wg);
+    expect(t, "a11ytext.caretnext", axrectstr(&a, axcaretrect(x)), "100,70 100,90");
+    wg.caretline = 0;
+    axtextsync(x, 7, 77, 0, 1, "abcdef", 3, 3, &wg);
+    expect(t, "a11ytext.caretwrap", axrectstr(&a, axcaretrect(x)), "130,50 130,70");
+    expect(t, "a11ytext.charwrap", axrectstr(&a, axcharrect(x, 3)), "100,70 110,90");
+    expect(t, "a11ytext.hitwrap", istr(&a, axoffsetat(x, 900, 55)), "3");
+
+    // A hit past a line's end stays before its CRLF
+    axtestsync(x, &a, 0, 1, "ab\r\ncd", 0, 0);
+    expect(t, "a11ytext.hitcrlf", istr(&a, axoffsetat(x, 900, 55)), "2");
 }
