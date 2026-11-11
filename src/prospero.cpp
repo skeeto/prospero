@@ -769,6 +769,7 @@ static u32     os_guilimits(Os *);
 #include "mcp.cpp"
 #include "admit.cpp"
 #include "compact.cpp"
+#include "fileref.cpp"  // after guard.cpp and mcp.cpp: normpath, hexval
 #include "help.cpp"   // after config.cpp and mcp.cpp: cfgkinds, hexval
 #include "engine.cpp"
 #include "relay.cpp"

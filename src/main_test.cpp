@@ -83,8 +83,50 @@ static void os_arenafault(Str msg)
 }
 
 // Reservations come from the C heap, with commits only bookkeeping.
+// On Windows, whose heap commits all it gives, they are reserved and
+// committed as os_commit asks instead, as the platform layer does: the
+// suite's reservations, many never released, would otherwise add up
+// past the commit limit.
 static i64 g_reserves;  // os_reserve calls, for tests that count them
 
+#ifdef _WIN32
+extern "C" __declspec(dllimport) void *__stdcall
+    VirtualAlloc(void *, size_t, unsigned long, unsigned long) noexcept;
+extern "C" __declspec(dllimport) int __stdcall
+    VirtualFree(void *, size_t, unsigned long) noexcept;
+
+static Region *os_reserve(Os *, iz cap)
+{
+    g_reserves++;
+    byte *p = (byte *)VirtualAlloc(0, (uz)cap, 0x2000, 1);  // MEM_RESERVE
+    if (!p || !VirtualAlloc(p, 64, 0x1000, 4)) {            // MEM_COMMIT
+        if (p) VirtualFree(p, 0, 0x8000);
+        return 0;
+    }
+    Region *r = (Region *)p;
+    r->base      = p + 64;
+    r->cap       = cap - 64;
+    r->committed = 0;
+    return r;
+}
+
+static b32 os_commit(Region *r, iz upto)
+{
+    if (upto > r->committed) {
+        if (!VirtualAlloc(r->base, (uz)upto, 0x1000, 4)) {
+            return 0;
+        }
+        r->committed = upto;
+    }
+    return 1;
+}
+
+static void os_release(Os *, Region *r)
+{
+    arenaforget(r, r->base+r->cap);
+    VirtualFree(r, 0, 0x8000);  // MEM_RELEASE
+}
+#else
 static Region *os_reserve(Os *, iz cap)
 {
     g_reserves++;
@@ -110,6 +152,7 @@ static void os_release(Os *, Region *r)
     arenaforget(r, r->base+r->cap);
     free(r);
 }
+#endif
 
 static i64 os_ticks(Os *os) { return os->now; }
 static i64 os_time(Os *os) { return os->now / 1000; }
@@ -638,6 +681,7 @@ static Str istr(Arena *a, i64 v)
 #include "test/edit_test.cpp"
 #include "test/tools_test.cpp"
 #include "test/guard_test.cpp"
+#include "test/fileref_test.cpp"
 #include "test/admit_test.cpp"
 #include "test/compact_test.cpp"
 #include "test/search_test.cpp"
@@ -682,6 +726,7 @@ static Str istr(Arena *a, i64 v)
 #  include "sidebar.cpp"
 #  include "dock.cpp"
 #  include "termset.cpp"
+#  include "fileset.cpp"
 #  include "palette.cpp"
 #  include "test/sched_test.cpp"
 #  include "test/highlight_test.cpp"
@@ -699,6 +744,7 @@ static Str istr(Arena *a, i64 v)
 #  include "test/sidebar_test.cpp"
 #  include "test/dock_test.cpp"
 #  include "test/termset_test.cpp"
+#  include "test/fileset_test.cpp"
 #  include "test/palette_test.cpp"
 #endif
 
@@ -729,6 +775,7 @@ int main()
     test_edit(&t);
     test_tools(&t);
     test_guard(&t);
+    test_fileref(&t);
     test_admit(&t);
     test_compact(&t);
     test_search(&t);
@@ -791,6 +838,7 @@ int main()
     test_sidebar(&t);
     test_dock(&t);
     test_termset(&t);
+    test_fileset(&t);
     test_palette(&t);
     test_viewexport(&t);
     #endif

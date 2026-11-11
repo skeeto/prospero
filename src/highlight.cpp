@@ -1756,35 +1756,48 @@ static Str hlalias(Str tag, u8 *buf, iz cap)
 {
     static struct { Str alias, tag; } aliases[] = {
         {"asm",         "nasm"},
+        {"bas",         "qbasic"},
         {"cc",          "cpp"},
         {"cjs",         "javascript"},
+        {"clj",         "clojure"},
+        {"cmd",         "bat"},
         {"console",     "sh"},
         {"cxx",         "cpp"},
+        {"el",          "elisp"},
         {"emacs-lisp",  "elisp"},
+        {"frag",        "glsl"},
         {"gnumake",     "make"},
         {"golang",      "go"},
+        {"gp",          "gnuplot"},
         {"h",           "c"},
         {"h++",         "cpp"},
         {"hh",          "cpp"},
         {"hpp",         "cpp"},
         {"htm",         "html"},
         {"hxx",         "cpp"},
+        {"jl",          "julia"},
         {"jsonc",       "json"},
         {"jsonl",       "json"},
         {"jsx",         "javascript"},
         {"ksh",         "sh"},
+        {"mak",         "make"},
         {"mjs",         "javascript"},
         {"mk",          "make"},
         {"patch",       "diff"},
+        {"pl",          "perl"},
+        {"pm",          "perl"},
         {"py3",         "python"},
         {"python3",     "python"},
         {"rb",          "ruby"},
+        {"scm",         "scheme"},
         {"shell",       "sh"},
         {"shellsession","sh"},
         {"svg",         "xml"},
+        {"toml",        "ini"},
         {"ts",          "javascript"},
         {"tsx",         "javascript"},
         {"typescript",  "javascript"},
+        {"vert",        "glsl"},
         {"xhtml",       "xml"},
         {"yml",         "yaml"},
         {"zsh",         "sh"},
@@ -1802,6 +1815,24 @@ static Str hlalias(Str tag, u8 *buf, iz cap)
         }
     }
     return low;
+}
+
+// The language of a file by its name, a tag hllang knows, else empty:
+// its extension as a fence's tag, or make's own names. A tag in buf
+// (cap bytes) as hlalias puts it.
+static Str hlfile(Str name, u8 *buf, iz cap)
+{
+    Str base = basename(name);
+    if (equalfold(base, "Makefile") || equalfold(base, "GNUmakefile")) {
+        return "make";
+    }
+    iz dot = base.len;
+    for (; dot>0 && base[dot-1]!='.'; dot--) {}
+    if (dot <= 1) {
+        return "";  // no extension, or a dot file's name
+    }
+    Str tag = hlalias(cuthead(base, dot), buf, cap);
+    return hllang(tag).lex ? tag : Str("");
 }
 
 // True if the tokens cover the code exactly, in order.

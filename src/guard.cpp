@@ -211,6 +211,128 @@ static Str msysdrive(Arena *a, Str path)
     return finish(&b);
 }
 
+// A Windows path past its "\\?\" and "\\.\" prefixes, either separator,
+// with *dot set if any was "\\.\".
+static Str winunprefix(Str p, b32 *dot)
+{
+    *dot = 0;
+    while (p.len>=4 && issep(p[0], 1) && issep(p[1], 1) && (p[2]=='?' || p[2]=='.') &&
+           issep(p[3], 1)) {
+        *dot |= p[2] == '.';
+        p = cuthead(p, 4);
+    }
+    return p;
+}
+
+// Whether a name is one Win32 opens as a device in any folder: CON,
+// PRN, AUX, NUL, COM and LPT with a digit (or ¹²³), CONIN$ and CONOUT$,
+// in any case, with any extension, trailing spaces ignored.
+static b32 windevname(Str name)
+{
+    iz n = 0;
+    for (; n<name.len && name[n]!='.'; n++) {}
+    for (; n>0 && name[n-1]==' '; n--) {}
+    Str base = takehead(name, n);
+    if (equalfold(base, "CON") || equalfold(base, "PRN") || equalfold(base, "AUX") ||
+            equalfold(base, "NUL") || equalfold(base, "CONIN$") ||
+            equalfold(base, "CONOUT$")) {
+        return 1;
+    }
+    if (base.len<4 || (!equalfold(takehead(base, 3), "COM") &&
+                       !equalfold(takehead(base, 3), "LPT"))) {
+        return 0;
+    }
+    Str num = cuthead(base, 3);
+    return (num.len==1 && digit(num[0])) || num=="\xc2\xb9" || num=="\xc2\xb2" ||
+           num=="\xc2\xb3";
+}
+
+// Whether opening a path on a Windows host (win) could reach a device
+// rather than a file: the "\\.\" and "\??\" forms, "\\?\" but for a
+// drive or UNC, a reserved name in any folder, or a ':' after the root
+// (an alternate data stream). POSIX devices are left to os_stat, which
+// sees them for what they are without opening them.
+static b32 devicepath(Str path, b32 win)
+{
+    if (!win) {
+        return 0;
+    }
+    if (path.len>=4 && issep(path[0], 1) && path[1]=='?' && path[2]=='?' &&
+            issep(path[3], 1)) {
+        return 1;  // NT's own namespace, which Win32 passes through
+    }
+    b32 dot = 0;
+    Str p   = winunprefix(path, &dot);
+    iz  root;
+    if (dot) {
+        return 1;
+    } else if (p.len < path.len) {
+        if (p.len>=3 && isdrive(p) && issep(p[2], 1)) {
+            root = 3;
+        } else if (p.len>=4 && equalfold(takehead(p, 3), "UNC") && issep(p[3], 1)) {
+            root = 4;  // and past the host and share, "UNC\h\s\"
+            for (i32 parts = 0; parts < 2; parts++) {
+                for (; root<p.len && !issep(p[root], 1); root++) {}
+                root += root < p.len;
+            }
+        } else {
+            return 1;
+        }
+    } else {
+        root = pathroot(p, 1);
+        root = !root && isdrive(p) ? 2 : root;
+    }
+    for (iz i = root; i < p.len;) {
+        iz j = i;
+        for (; j<p.len && !issep(p[j], 1); j++) {}
+        Str name = span(p.data+i, p.data+j);
+        for (iz k = 0; k < name.len; k++) {
+            if (name[k] == ':') {
+                return 1;
+            }
+        }
+        if (windevname(name)) {
+            return 1;
+        }
+        i = j + 1;
+    }
+    return 0;
+}
+
+// Whether a path on a Windows host (win) may reach over the network: a
+// UNC path, "\\h\s" or "\\?\UNC\h\s", but for WSL's own,
+// "\\wsl.localhost\" and "\\wsl$\", and any prefixed path but a
+// drive's, since the device namespace reaches the network too
+// ("\\?\GLOBALROOT\Device\Mup\h\s"). Opening one may send the
+// user's credentials (NTLM) to the host named. POSIX paths never are:
+// network mounts look like any other folder.
+static b32 netpath(Str path, b32 win)
+{
+    if (!win) {
+        return 0;
+    }
+    b32 dot = 0;
+    b32 nt  = path.len>=4 && issep(path[0], 1) && path[1]=='?' && path[2]=='?' &&
+              issep(path[3], 1);
+    Str p   = nt ? cuthead(path, 4) : winunprefix(path, &dot);
+    if (p.len < path.len) {
+        if (isdrive(p) && (p.len==2 || issep(p[2], 1))) {
+            return 0;
+        } else if (p.len<4 || !equalfold(takehead(p, 3), "UNC") || !issep(p[3], 1)) {
+            return 1;
+        }
+        p = cuthead(p, 4);
+    } else if (p.len>=2 && issep(p[0], 1) && issep(p[1], 1)) {
+        p = cuthead(p, 2);
+    } else {
+        return 0;
+    }
+    iz i = 0;
+    for (; i<p.len && !issep(p[i], 1); i++) {}
+    Str host = takehead(p, i);
+    return !equalfold(host, "wsl.localhost") && !equalfold(host, "wsl$");
+}
+
 // The other way: a path in the home directory as "~" or "~/x", else as
 // it is. A home with a drive (C:) is a Windows path, compared without
 // case, its separators either. The path keeps its own separators.

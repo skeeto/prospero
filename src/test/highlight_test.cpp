@@ -520,4 +520,36 @@ static void test_highlight(Test *t)
         Highlight h = highlight(&a, "sh", finish(&code));
         expect(t, "hl.deep", istr(&a, hlroundtrip(h.toks, finish(&code))), "1");
     }
+
+    // Files' languages by name
+    {
+        struct { Str name; Str want; } files[] = {
+            {"main.c", "c"},
+            {"src/ui.CPP", "cpp"},
+            {"a/b.hpp", "cpp"},
+            {"x.ts", "javascript"},
+            {"C:\\w\\run.py", "py"},
+            {"Makefile", "make"},
+            {"src/GNUmakefile", "make"},
+            {"rules.mk", "make"},
+            {"Cargo.toml", "ini"},
+            {"lib.pm", "perl"},
+            {"notes.md", ""},
+            {"main.rs", ""},
+            {"README", ""},
+            {".bashrc", ""},
+            {"dir.c/x", ""},
+            {"x.", ""},
+        };
+        for (iz i = 0; i < countof(files); i++) {
+            u8 buf[16];
+            expect(t, concat(&perm, "hl.file.", files[i].name),
+                   hlfile(files[i].name, buf, countof(buf)), files[i].want);
+        }
+
+        // Fences take the same aliases
+        u8 buf[16];
+        expect(t, "hl.alias.toml", hlalias("TOML", buf, countof(buf)), "ini");
+        expect(t, "hl.alias.pl", hlalias("pl", buf, countof(buf)), "perl");
+    }
 }

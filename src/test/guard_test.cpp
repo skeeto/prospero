@@ -436,4 +436,97 @@ static void test_guard(Test *t)
     // A hint is never in a hidden root
     GuardHint nh = guardhint(os, a, &h, "/q/near/x.c", 1, 0);
     expect(t, "no hint in a hidden root", nh.path.data ? nh.path : Str("(none)"), "(none)");
+
+    // Devices: what opening a path on a Windows host could reach instead
+    // of a file. On POSIX only the stat can tell.
+    struct { Str path; b32 win; b32 want; } devices[] = {
+        {"C:\\w\\x.c",            1, 0},
+        {"C:/w/x.c",              1, 0},
+        {"w/x.c",                 1, 0},
+        {"C:x.c",                 1, 0},
+        {"\\x",                   1, 0},
+        {"//srv/share/x",         1, 0},  // a network path, not a device
+        {"\\\\?\\C:\\x",          1, 0},
+        {"\\\\?\\UNC\\h\\s\\x",   1, 0},
+        {"C:/w/console.c",        1, 0},
+        {"C:/w/com10",            1, 0},
+        {"C:/w/lpt",              1, 0},
+        {"C:/w/nul.d/x",          1, 1},
+        {"CON",                   1, 1},
+        {"con",                   1, 1},
+        {"C:/w/Con.txt",          1, 1},
+        {"C:/w/aux.tar.gz",       1, 1},
+        {"C:/w/NUL ",             1, 1},
+        {"C:/w/nul .txt",         1, 1},
+        {"C:/w/prn.",             1, 1},
+        {"C:/w/COM1",             1, 1},
+        {"C:/w/com9.log",         1, 1},
+        {"C:/w/LPT1",             1, 1},
+        {"C:/w/lpt9",             1, 1},
+        {"C:/w/COM\xc2\xb9",      1, 1},
+        {"C:/w/conin$",           1, 1},
+        {"C:/w/CONOUT$.x",        1, 1},
+        {"\\\\.\\pipe\\p",        1, 1},
+        {"//./C:/x",              1, 1},
+        {"\\\\.\\PhysicalDrive0", 1, 1},
+        {"\\\\?\\GLOBALROOT\\Device\\x", 1, 1},
+        {"\\\\?\\pipe\\p",        1, 1},
+        {"\\??\\C:\\x",           1, 1},
+        {"\\\\?\\C:\\w\\con",     1, 1},
+        {"\\\\?\\UNC\\h\\s\\x:y", 1, 1},
+        {"C:/w/x.c:stream",       1, 1},
+        {"C:x.c:stream",          1, 1},
+        {"//srv/share/x:y",       1, 1},
+        {"w/a:b",                 1, 1},
+        {"/w/CON",                0, 0},
+        {"/w/x:y",                0, 0},
+        {"\\\\.\\pipe\\p",        0, 0},
+        {"/dev/tty",              0, 0},
+    };
+    for (iz i = 0; i < countof(devices); i++) {
+        Str got  = devicepath(devices[i].path, devices[i].win) ? Str("device") : Str("file");
+        Str want = devices[i].want ? Str("device") : Str("file");
+        expect(t, concat(a, devices[i].win ? Str("devicepath win ") : Str("devicepath posix "),
+                         devices[i].path), got, want);
+    }
+
+    // Network paths: UNC, but for WSL's own, and the device namespace
+    // but for a drive
+    struct { Str path; b32 win; b32 want; } nets[] = {
+        {"\\\\srv\\share\\x",              1, 1},
+        {"//srv/share/x",                  1, 1},
+        {"/\\srv\\share",                  1, 1},
+        {"\\\\srv",                        1, 1},
+        {"\\\\",                           1, 1},
+        {"\\\\?\\UNC\\srv\\share\\x",      1, 1},
+        {"//?/unc/srv/share",              1, 1},
+        {"\\\\.\\UNC\\srv\\share",         1, 1},
+        {"\\\\wsl.localhost\\Ubuntu\\x",   1, 0},
+        {"//WSL.LOCALHOST/Ubuntu/x",       1, 0},
+        {"\\\\wsl$\\Ubuntu\\home",         1, 0},
+        {"\\\\?\\UNC\\wsl$\\Ubuntu",       1, 0},
+        {"\\\\wsl.localhost.evil\\x",      1, 1},
+        {"C:\\x",                          1, 0},
+        {"\\x",                            1, 0},
+        {"x\\\\y",                         1, 0},
+        {"\\\\?\\C:\\x",                   1, 0},
+        {"\\\\.\\pipe\\p",                 1, 1},  // the device namespace reaches it
+        {"\\\\?\\GLOBALROOT\\Device\\Mup\\h\\s", 1, 1},
+        {"\\\\.\\Mup\\h\\s\\x",            1, 1},
+        {"\\\\.\\\\UNC\\h\\s",             1, 1},
+        {"\\??\\UNC\\h\\s",                1, 1},
+        {"\\??\\C:\\x",                    1, 0},
+        {"\\\\?\\C:",                      1, 0},
+        {"\\\\.\\C:\\x",                   1, 0},
+        {"\\\\?\\Volume{x}\\a",            1, 1},
+        {"//srv/share/x",                  0, 0},
+        {"\\\\srv\\share",                 0, 0},
+        {"/net/srv/x",                     0, 0},
+    };
+    for (iz i = 0; i < countof(nets); i++) {
+        Str got  = netpath(nets[i].path, nets[i].win) ? Str("net") : Str("local");
+        Str want = nets[i].want ? Str("net") : Str("local");
+        expect(t, concat(a, nets[i].win ? Str("netpath win ") : Str("netpath posix "),
+                         nets[i].path), got, want);
+    }
 }
