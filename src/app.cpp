@@ -77,6 +77,7 @@
 #include "termset.cpp"
 #include "fileset.cpp"
 #include "palette.cpp"
+#include "a11y.cpp"
 
 enum : i64 {
     STREAM_PERIOD = 1000000/30,  // µs between frames showing new deltas
