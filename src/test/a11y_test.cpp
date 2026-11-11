@@ -403,6 +403,24 @@ static void test_a11ytext(Test *t)
     expect(t, "a11ytext.oneline", x->text.text, "name twolines");
     expect(t, "a11ytext.onelineedit", axeditstr(&a, x, 77, "name", 0), "4-4 \" twolines\" 13:13");
 
+    // Edits for a field that turned read-only, lost the focus, or gave
+    // way to another are dropped, and its text is ImGui's again
+    axtestsync(x, &a, 0, 1, "draft", 5, 5);
+    axedit(x, 5, 5, "!", AX_AFTER, AX_AFTER, 0);
+    axtestsync(x, &a, AXS_READONLY, 1, "draft", 5, 5);
+    expect(t, "a11ytext.nowreadonly", istr(&a, axqueued(x, 77)), "0");
+    expect(t, "a11ytext.nowreadonlytext", x->text.text, "draft");
+    axtestsync(x, &a, 0, 1, "draft", 5, 5);
+    axedit(x, 5, 5, "!", AX_AFTER, AX_AFTER, 0);
+    axtextnone(x);
+    expect(t, "a11ytext.blurred", istr(&a, axqueued(x, 77)), "0");
+    axtestsync(x, &a, 0, 1, "draft", 5, 5);
+    axedit(x, 5, 5, "!", AX_AFTER, AX_AFTER, 0);
+    AxGeom og = axtestgeom(&a, "other");
+    axtextsync(x, 7, 78, 0, 1, "other", 0, 0, &og);  // the same key: a new session's
+    expect(t, "a11ytext.switched", istr(&a, axqueued(x, 77)), "0");
+    expect(t, "a11ytext.switchedtext", x->text.text, "other");
+
     // Read-only and password fields refuse edits
     axtestsync(x, &a, AXS_READONLY, 1, "fixed", 0, 0);
     expect(t, "a11ytext.readonly", istr(&a, axedit(x, 0, 0, "x", 0, 0, 0)), "0");

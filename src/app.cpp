@@ -20693,6 +20693,7 @@ static DriveOp a11yops[] = {
     {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
     {OP_NEWSESSION, 0, 0, 0, 0, ""},
     {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_MARKSESS, 0, 0, 0, 0, ""},
     {OP_A11Y, 0, 0, 0, 500, "on"},
     {OP_A11Y, 0, 0, 0, 0, "dump"},
     {OP_A11Y, 0, 0, 0, 0, "has menubar"},
@@ -20704,6 +20705,57 @@ static DriveOp a11yops[] = {
     // What is typed is the field's value, each frame
     {OP_TEXT, 0, 0, 0, 300, "hello there"},
     {OP_A11Y, 0, 0, 0, 0, "value hello there"},
+
+    // A tool's edit: a newline, which doesn't send
+    {OP_A11Y, 0, 0, 0, 300, "edit 11 11 \nsecond"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "hello there\nsecond"},
+    {OP_A11Y, 0, 0, 0, 0, "value hello there\nsecond"},
+    {OP_A11Y, 0, 0, 0, 0, "queued 0"},
+    // Each edit undoes as one
+    {OP_A11Y, 0, 0, 0, 300, "edit 0 5 HELLO"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "HELLO there\nsecond"},
+    RCLICK(500),
+    PICK(T_CMUNDO),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "hello there\nsecond"},
+    RCLICK(500),
+    PICK(T_CMUNDO),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "hello there"},
+    {OP_A11Y, 0, 0, 0, 0, "text hello there"},
+
+    // A key typed before the edit lands changes what it replaces: it is
+    // refused, and the text is ImGui's again
+    SELALL,
+    {OP_TEXT, 0, 0, 0, 300, "abcdef"},
+    {OP_A11Y, 0, 0, 0, 0, "edit 0 6 XYZ"},
+    {OP_A11Y, 0, 0, 0, 0, "text XYZ"},
+    KEY(GKEY_BACKSPACE, 0, 300),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "abcde"},
+    {OP_A11Y, 0, 0, 0, 0, "queued 0"},
+    {OP_A11Y, 0, 0, 0, 0, "text abcde"},
+
+    // Not focused, no edits; focused by the tool, its caret kept, then
+    // edited, and the draft kept
+    CLICK(T_TRANSCRIPT, "", 300),
+    {OP_A11Y, 0, 0, 0, 0, "noedit 0 0 x"},
+    {OP_A11Y, 0, 0, 0, 300, "activate textarea "},
+    {OP_A11Y, 0, 0, 0, 0, "pending 0"},
+    {OP_A11Y, 0, 0, 0, 0, "focus textarea "},
+    {OP_A11Y, 0, 0, 0, 300, "edit 5 5 !"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "abcde!"},
+    {OP_MOVE, T_EMPTY, 0, 0, 1500, ""},
+    {OP_WAIT, W_DRAFTS, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_DRAFTFILE, 0, 0, 0, "abcde!"},
+
+    // Send, pressed by the tool
+    {OP_A11Y, 0, 0, 0, 500, "press button Send"},
+    {OP_A11Y, 0, 0, 0, 0, "pending 0"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
+
+    // Then quiet: nothing pending asks for frames
+    {OP_MARK, 0, 0, 0, 11000, ""},
+    {OP_MARK, 0, 0, 0, 3000, ""},
+    {OP_CHECK, CHK_COMPOSEQUIET, 0, 0, 0, ""},
     {OP_SUMMARY, 0, 0, 0, 0, ""},
     {OP_QUIT, 0, 0, 0, 0, ""},
 };

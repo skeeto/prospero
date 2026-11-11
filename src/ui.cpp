@@ -81,6 +81,15 @@ static void tipv(char const *fmt, __builtin_va_list ap)
 // or not (a11y_imgui.cpp)
 static void axtip(Str);
 static void axtipv(char const *fmt, __builtin_va_list ap);
+static void axkey(Gui *, u32);
+
+// The last item clicked, or pressed by other means: the keyboard's Space
+// on it, or an assistive tool (ImGui's activation)
+static b32 uiclicked()
+{
+    ImGuiID id = ImGui::GetItemID();
+    return ImGui::IsItemClicked(ImGuiMouseButton_Left) || (id && GImGui->NavActivateId==id);
+}
 
 static void itemtip(char const *fmt, ...) IM_FMTARGS(1);
 static void itemtip(char const *fmt, ...)
@@ -6993,6 +7002,7 @@ static void drawprompt(Gui *g)
     b32 edited = ImGui::IsItemEdited();
     g->promptend = g->promptend==2 ? 0 : g->promptend;
     ImGui::PopID();
+    axkey(g, AXKEY_PROMPT);  // the same to a tool in every session
     itemrect(g, RECT_PROMPT);
     ImVec2 r0 = ImGui::GetItemRectMin();
     ImVec2 r1 = ImGui::GetItemRectMax();
@@ -8527,7 +8537,7 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
     pushstr(r->key);
     ImGui::SetNextItemAllowOverlap();
     ImGui::InvisibleButton("##head", v2(w>1 ? w : 1, lineh + 4*sc));
-    b32 click = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+    b32 click = uiclicked();
     itemnamed(g, concat(&a, "head ", r->key));
     if (r->key.len && !r->forced && ImGui::IsItemHovered() &&
             ImGui::GetIO().MousePos.x < dx + 7*sc) {
@@ -8983,7 +8993,7 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other, 
         ImVec2 back = ImGui::GetCursorScreenPos();
         ImGui::SetCursorScreenPos(v2(dx - 7*sc, p.y));
         ImGui::InvisibleButton("##fold", v2(14*sc, lineh + 4*sc));
-        if (ImGui::IsItemClicked(ImGuiMouseButton_Left) && !r->forced) {
+        if (uiclicked() && !r->forced) {
             foldrow(g, r);
         }
         if (ImGui::IsItemHovered() && !r->forced) {

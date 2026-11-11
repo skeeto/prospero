@@ -46,6 +46,7 @@ struct AxItem {
     Str    name;       // from axname
     b32    named;
     Str    help;       // its tooltip's text
+    u32    key;        // from axkey, else its ID
 };
 
 // A text field as drawn this frame, copied from its report
@@ -60,6 +61,20 @@ struct AxFieldDraw {
     AxGeom geom;
 };
 
+// An action an assistive tool asked for, until ImGui activates its item
+enum : i32 {
+    AXACT_PRESS,  // as a click, or the keyboard's Space
+    AXACT_FOCUS,  // a text field, to edit: its caret kept
+};
+
+struct AxAct {
+    u32 key;
+    u32 id;
+    i32 kind;
+    i64 when;
+    b32 done;
+};
+
 struct AxGui {
     Gui                *g;
     A11y               *ax;
@@ -71,6 +86,8 @@ struct AxGui {
     iz                  last;     // the item added last, or -1
     Slice<AxEvent>      events;   // the last publish's
     i64                 publishes;
+    AxAct               acts[16];
+    i32                 nacts;
 };
 
 static AxGui *axgui(ImGuiContext *ctx)
@@ -107,6 +124,9 @@ void ImGuiTestEngineHook_ItemAdd(ImGuiContext *ctx, ImGuiID id, ImRect const &bb
     it.itemflags = item->ItemFlags;
     x->items = push(&x->mem, x->items, it);
     x->last  = x->items.len - 1;
+    if (x->nacts && x->acts[0].id==id && ctx->NavActivateId==id) {
+        x->acts[0].done = 1;  // it landed
+    }
 }
 
 void ImGuiTestEngineHook_ItemInfo(ImGuiContext *ctx, ImGuiID id, char const *label,
@@ -289,6 +309,16 @@ static void axname(Gui *g, Str name)
     }
 }
 
+// The last item's key, for one whose ImGuiID changes when what it is
+// doesn't (AXKEY_*): the prompt, in each session.
+static void axkey(Gui *g, u32 key)
+{
+    AxItem *it = axlastitem(g);
+    if (it) {
+        it->key = key;
+    }
+}
+
 static void axrole(Gui *g, AxRole role)
 {
     AxItem *it = axlastitem(g);
@@ -309,6 +339,17 @@ static AxFieldDraw *axfieldof(AxGui *x, u32 id)
         }
     }
     return 0;
+}
+
+// An item's key, by its ImGuiID
+static u32 axkeyof(AxGui *x, u32 id)
+{
+    for (iz i = x->items.len-1; i >= 0; i--) {
+        if (x->items[i].id == id) {
+            return x->items[i].key ? x->items[i].key : id;
+        }
+    }
+    return id;
 }
 
 static b32 axshown(ImGuiWindow *w)
@@ -383,7 +424,8 @@ static void axbuild(AxGui *x, ImGuiContext *ctx)
             state |= f->flags & ImGuiInputTextFlags_ReadOnly ? AXS_READONLY : 0;
         }
         Str     name = it->named ? it->name : axlabel(&x->mem, it->label);
-        AxNode *n    = axadd(b, parent, it->id, role, name);
+        AxNode *n    = axadd(b, parent, it->key ? it->key : it->id, role, name);
+        n->id      = it->id;
         n->rect    = {it->rect.Min.x, it->rect.Min.y, it->rect.Max.x, it->rect.Max.y};
         n->state   = state;
         n->actions = it->actions;
@@ -412,10 +454,12 @@ static void axbuild(AxGui *x, ImGuiContext *ctx)
         focus = ctx->NavWindow->ID;
     }
 
+    focus = axkeyof(x, focus);
+
     if (active) {
         u32 state = active->password ? AXS_PASSWORD : 0;
         state |= active->flags & ImGuiInputTextFlags_ReadOnly ? AXS_READONLY : 0;
-        axtextsync(x->ax, active->id, active->id, state,
+        axtextsync(x->ax, axkeyof(x, active->id), active->id, state,
                    (active->flags & ImGuiInputTextFlags_Multiline) != 0,
                    active->text, active->anchor, active->caret, &active->geom);
     } else {
@@ -426,12 +470,104 @@ static void axbuild(AxGui *x, ImGuiContext *ctx)
     x->publishes++;
 }
 
+// Whether a modal dialog is open, and the node isn't in it: ImGui's
+// activation ignores modals, as a click on what is under one never does.
+static b32 axblocked(AxGui *x, u32 key)
+{
+    ImGuiWindow *m = ImGui::GetTopMostPopupModal();
+    if (!m) {
+        return 0;
+    }
+    AxTree *t = x->ax->pub;
+    for (i32 i = axfind(t, key); i >= 0; i = t->nodes[i].parent) {
+        if (t->nodes[i].key == m->ID) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+// The first pending action, as ImGui's activation of its item, unless the
+// app asked for one already, for this frame. Until ItemAdd sees it land,
+// it is asked again each frame, for as long as an edit may wait.
+static void axdeliver(AxGui *x, ImGuiContext *ctx)
+{
+    Gui *g = x->g;
+    i32  n = 0;
+    for (i32 i = 0; i < x->nacts; i++) {
+        AxAct *a = x->acts + i;
+        if (!a->done && g->sched.now-a->when<=AXEDIT_TTL) {
+            x->acts[n++] = *a;
+        }
+    }
+    x->nacts = n;
+    if (!n) {
+        return;
+    }
+    AxAct *a = x->acts;
+    if (axblocked(x, a->key)) {
+        a->done = 1;  // refused, as a click would be
+    } else if (!ctx->NavNextActivateId && !ctx->NavMoveSubmitted) {
+        ctx->NavNextActivateId    = a->id;
+        ctx->NavNextActivateFlags = a->kind==AXACT_FOCUS ? ImGuiActivateFlags_TryToPreserveState
+                                                         : ImGuiActivateFlags_None;
+    }
+    scheddirty(&g->sched);  // until it lands
+}
+
+// Ask for an action on the published node with key: 0 if it has no such
+// action, or is disabled.
+static b32 axaction(Gui *g, u32 key, i32 kind)
+{
+    AxGui *x = g->ax && g->ax->on ? g->ax : 0;
+    if (!x) {
+        return 0;
+    }
+    AxTree *t = x->ax->pub;
+    i32     i = axfind(t, key);
+    u32     want = kind==AXACT_FOCUS ? AXA_FOCUS : AXA_PRESS|AXA_TOGGLE|AXA_EXPAND|AXA_SELECT;
+    if (i<0 || !(t->nodes[i].actions & want) || (t->nodes[i].state & AXS_DISABLED) ||
+            x->nacts==countof(x->acts)) {
+        return 0;
+    }
+    AxAct a = {};
+    a.key  = key;
+    a.id   = t->nodes[i].id;
+    a.kind = kind;
+    a.when = g->sched.now;
+    x->acts[x->nacts++] = a;
+    scheddirty(&g->sched);
+    return 1;
+}
+
+// Edit the focused field (axedit), for the next frame to apply.
+static b32 axtextedit(Gui *g, i32 lo, i32 hi, Str text, i32 anchor, i32 caret)
+{
+    AxGui *x = g->ax && g->ax->on ? g->ax : 0;
+    if (!x || !axedit(x->ax, lo, hi, text, anchor, caret, g->sched.now)) {
+        return 0;
+    }
+    scheddirty(&g->sched);
+    return 1;
+}
+
+static b32 axtextselect(Gui *g, i32 anchor, i32 caret)
+{
+    AxGui *x = g->ax && g->ax->on ? g->ax : 0;
+    if (!x || !axselect(x->ax, anchor, caret, g->sched.now)) {
+        return 0;
+    }
+    scheddirty(&g->sched);
+    return 1;
+}
+
 static void axnewframe(ImGuiContext *ctx, ImGuiContextHook *hook)
 {
     AxGui *x = (AxGui *)hook->UserData;
     if (!x->on) {
         return;
     }
+    axdeliver(x, ctx);
     ctx->TestEngineHookItems = true;
     x->mem.beg = x->base;
     x->items   = {};
@@ -500,6 +636,14 @@ static void axstart(Gui *g)
 //   focus ROLE NAME  check that the focus has them
 //   value TEXT       check the focus's value
 //   help ROLE NAME   check that a node has them, and help
+//   edit LO HI TEXT  edit the focused field: check that it's taken
+//   noedit LO HI TEXT  ... or refused
+//   select A C       select in the focused field
+//   text TEXT        check the focused field's text here, ahead of ImGui's
+//   queued N         check the edits waiting for ImGui
+//   press ROLE NAME  press the node: check that it's taken
+//   activate ROLE NAME  focus the field, to edit
+//   pending N        check the actions waiting for ImGui
 //   lint             check that nothing actionable is unnamed, logging
 //                    what is
 
@@ -518,6 +662,28 @@ static void axcheck(Gui *g, Arena *a, b32 ok, Str what)
 static b32 axmatch(AxNode *n, Str role, Str name)
 {
     return axrolenames[n->role] == role && n->name == name;
+}
+
+static i32 axfindnode(AxTree *t, Str role, Str name)
+{
+    for (i32 i = 0; i < t->len; i++) {
+        if (axmatch(t->nodes+i, role, name)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void axcount(Gui *g, Arena *a, Str what, i64 got, Str want)
+{
+    Str msg = concat(a, what, want);
+    if (parseint(want).val != got) {
+        Buf b(a, 32);
+        print(&b, ", not ");
+        print(&b, got);
+        msg = concat(a, msg, finish(&b));
+    }
+    axcheck(g, a, parseint(want).val==got, msg);
 }
 
 static void driveax(Gui *g, Str cmd)
@@ -566,6 +732,34 @@ static void driveax(Gui *g, Str cmd)
             what = concat(&a, what, concat(&a, ", not ", got));
         }
         axcheck(g, &a, got==c.tail, what);
+    } else if (verb=="edit" || verb=="noedit") {
+        Cut hi  = cut(r.tail, ' ');
+        b32 got = axtextedit(g, (i32)parseint(r.head).val, (i32)parseint(hi.head).val,
+                             hi.tail, AX_AFTER, AX_AFTER);
+        axcheck(g, &a, got == (verb=="edit"), concat(&a, "accessible ", cmd));
+    } else if (verb == "select") {
+        b32 got = axtextselect(g, (i32)parseint(r.head).val, (i32)parseint(r.tail).val);
+        axcheck(g, &a, got, concat(&a, "accessible ", cmd));
+    } else if (verb == "text") {
+        Str got  = g->ax->ax->text.text;
+        Str what = concat(&a, "accessible text: ", c.tail);
+        if (!(got == c.tail)) {
+            what = concat(&a, what, concat(&a, ", not ", got));
+        }
+        axcheck(g, &a, got==c.tail, what);
+    } else if (verb == "queued") {
+        A11y *x = g->ax->ax;
+        i64   n = 0;
+        for (iz i = x->qhead; i < x->queue.len; i++) {
+            n += x->queue[i].id != 0;
+        }
+        axcount(g, &a, "accessible edits queued: ", n, c.tail);
+    } else if (verb=="press" || verb=="activate") {
+        i32 i   = axfindnode(t, r.head, r.tail);
+        b32 got = i>=0 && axaction(g, t->nodes[i].key, verb=="press" ? AXACT_PRESS : AXACT_FOCUS);
+        axcheck(g, &a, got, concat(&a, "accessible ", cmd));
+    } else if (verb == "pending") {
+        axcount(g, &a, "accessible actions pending: ", g->ax->nacts, c.tail);
     } else if (verb == "lint") {
         Slice<i32> bad = axlint(&a, t);
         Buf b(&a, 256);

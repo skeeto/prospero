@@ -86,8 +86,10 @@ enum : u32 {
     AXA_NAMED = AXA_PRESS|AXA_TOGGLE|AXA_EXPAND|AXA_EDIT|AXA_SELECT,
 };
 
+// Keys of nodes whose ImGuiID changes when what they are doesn't
 enum : u32 {
-    AXKEY_ROOT = 1,
+    AXKEY_ROOT   = 1,
+    AXKEY_PROMPT = 2,  // the shown session's prompt
 };
 
 struct AxRect {
@@ -101,6 +103,7 @@ static b32 operator==(AxRect a, AxRect b)
 
 struct AxNode {
     u32    key;
+    u32    id;            // the ImGuiID it was drawn as, for actions
     u32    parentkey;     // as built; resolved into parent on publish
     i32    parent;        // index, -1 for the root
     i32    child;         // first child, or -1
@@ -300,6 +303,7 @@ static AxNode *axadd(AxBuild *b, u32 parent, u32 key, AxRole role, Str name)
 {
     AxNode n = {};
     n.key       = key;
+    n.id        = key;
     n.parentkey = parent ? parent : AXKEY_ROOT;
     n.role      = role;
     n.name      = clone(b->a, name);
@@ -1150,17 +1154,35 @@ static b32 axqueued(A11y *x, u32 id)
     return 0;
 }
 
+// Drop the edits queued for field id: it went away, or can't take them.
+static void axdropedits(A11y *x, u32 id)
+{
+    for (iz i = x->qhead; i < x->queue.len; i++) {
+        x->queue[i].id = x->queue[i].id==id ? 0 : x->queue[i].id;
+    }
+    while (x->qhead<x->queue.len && !x->queue[x->qhead].id) {
+        x->qhead++;
+    }
+}
+
 // The focused field as drawn this frame: its text, selection and where
 // it drew them. With an edit for it queued, its text and selection here
-// are ahead of ImGui's, and stay.
+// are ahead of ImGui's, and stay. Edits for a field no longer focused,
+// or now read-only, are dropped: they were meant for it as it was.
 static void axtextsync(A11y *x, u32 key, u32 id, u32 state, b32 multiline,
                        Str text, i32 anchor, i32 caret, AxGeom *g)
 {
     AxText *t     = &x->text;
     b32     other = !t->live || t->key!=key || t->id!=id;
     if (other) {
+        if (t->live) {
+            axdropedits(x, t->id);
+        }
         t->marked = {};
         t->mlo = t->mhi = 0;
+    }
+    if (state & (AXS_READONLY|AXS_PASSWORD)) {
+        axdropedits(x, id);
     }
     t->live      = 1;
     t->key       = key;
@@ -1192,6 +1214,9 @@ static void axtextsync(A11y *x, u32 key, u32 id, u32 state, b32 multiline,
 static void axtextnone(A11y *x)
 {
     AxText *t = &x->text;
+    if (t->live) {
+        axdropedits(x, t->id);
+    }
     t->live   = 0;
     t->marked = {};
     t->mlo = t->mhi = 0;
