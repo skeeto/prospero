@@ -81,6 +81,7 @@ enum : u32 {
     AXA_FOCUS  = 1u << 3,
     AXA_EDIT   = 1u << 4,
     AXA_SELECT = 1u << 5,
+    AXA_MENU   = 1u << 6,   // show its context menu
 
     // What lint expects a name on
     AXA_NAMED = AXA_PRESS|AXA_TOGGLE|AXA_EXPAND|AXA_EDIT|AXA_SELECT,

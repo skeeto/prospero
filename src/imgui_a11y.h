@@ -105,9 +105,10 @@ static void prospero_axdraw(ImGuiContext &g, ImGuiInputTextState *state, ImGuiID
     f.id      = id;
     f.flags   = flags;
     f.active  = g.ActiveId==id && state && state->ID==id;
-    f.hint    = hint && buf==hint ? hint : NULL;
-    f.text    = password ? NULL : f.hint ? "" : buf;
-    f.len     = password || f.hint ? 0 : (int)(end - buf);
+    bool showing = hint && buf==hint;
+    f.hint    = hint;
+    f.text    = password ? NULL : showing ? "" : buf;
+    f.len     = password || showing ? 0 : (int)(end - buf);
     f.x       = origin.x;
     f.y       = origin.y;
     f.clip[0] = clip.Min.x;

@@ -57,7 +57,7 @@ struct ProsperoAxField {
     int          toolong;       // active, but too long to describe: no text
     char const  *text;          // null for a password field
     int          len;
-    char const  *hint;          // the placeholder showing, or null
+    char const  *hint;          // its placeholder, shown when it is empty
     float        x, y;          // the first line's top left, scrolled
     float        clip[4];       // what shows of it: x0, y0, x1, y1
     float        lineh;

@@ -98,6 +98,7 @@ Windows console session): it prints the directories and waits.
 
 import argparse
 import base64
+import fnmatch
 import difflib
 import json
 import os
@@ -945,6 +946,29 @@ def handoffproblems(status, lines, who):
         return [f"{who}: did not say it handed off"]
     return []
 
+
+
+A11Y_ALLOW = os.path.join(os.path.dirname(os.path.abspath(__file__)), "a11y_allow.txt")
+
+
+def a11ylint(lines):
+    """With --a11y-lint: the controls the GUI logged as having no name
+    ("a11y-lint: unnamed ROLE in WINDOW: LABEL") that no pattern in
+    tests/a11y_allow.txt matches, as problems."""
+    allow = []
+    with open(A11Y_ALLOW, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                allow.append(line)
+    seen = []
+    for l in lines:
+        i = l.find("a11y-lint: unnamed ")
+        if i >= 0:
+            what = l[i + len("a11y-lint: unnamed "):].rstrip()
+            if what not in seen and not any(fnmatch.fnmatchcase(what, p) for p in allow):
+                seen.append(what)
+    return ["no accessible name: " + w for w in seen]
 
 def launch(args, host, guiargs, guicwd):
     """--mode launch: the first window, started as "prospero gui --launch
@@ -1820,6 +1844,9 @@ def main():
     ap.add_argument("--keep", action="store_true", help="keep the directories")
     ap.add_argument("--url", help="with --mode e2e: the endpoint (default http://localhost/)")
     ap.add_argument("--shots", help="save the checklist's screenshots here")
+    ap.add_argument("--a11y-lint", action="store_true",
+                    help="accessibility on, failing on visible controls with no "
+                         "name that tests/a11y_allow.txt doesn't allow")
     ap.add_argument("--host", help="run the GUI on this Windows host's console")
     ap.add_argument("--trace", action="store_true", help="log where presses land")
     ap.add_argument("--fake", action="store_true",
@@ -2060,6 +2087,8 @@ def main():
         for d in ("alpha/one", "alpha/two/deep", "alpha/three", "alpine", "beta", ".alhidden"):
             host.mkdir(host.path("work", "pick", *d.split("/")))
         host.write(host.path("work", "pick", "alfile"), "a file\n")
+    if args.a11y_lint:
+        guiargs += ["--a11y-lint"]
     if args.inbox_cap or args.mode not in ("bench", "background"):
         # Small, to lose records, yet over the largest single message:
         # a config.get reply carries the whole schema, near 64 KiB alone
@@ -2173,6 +2202,8 @@ def main():
                 problems.append("checklist: " + s.strip())
         if "STALE" in out:
             problems.append("stale frames reported")
+    if args.a11y_lint:
+        problems += a11ylint(lines)
     if "imgui assertion failed" in out:
         problems.append("an ImGui assertion failed: " +
                         [l for l in lines if "imgui assertion failed" in l][0].strip())

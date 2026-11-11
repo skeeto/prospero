@@ -1813,6 +1813,7 @@ struct Gui {
     u32                notify;     // NOTIFY_*
     b32                nomentions; // [ui] mentions = false: '@' is plain text
     i32                axset;      // [ui] accessibility (AXSET_*)
+    b32                axlint;     // --a11y-lint: log what is unnamed
     AxGui             *ax;         // accessibility (a11y_imgui.cpp), unless off
     Preedit           *ime;        // an input method's composition (ime.cpp)
     i32                toastids;   // the last id given a root
@@ -25918,6 +25919,8 @@ static Str guiusage =
 "                 --cwd that is a git repository\n"
 "  --terminal     the Terminal pane: Ctrl+`, typing, a resize, exit\n"
 "  --a11y         accessibility: the tree a tool sees, its names, focus\n"
+"  --a11y-lint    with any checklist: accessibility on, and each visible\n"
+"                 control with no name logged once (a11y-lint: ...)\n"
 "  --mcp          an MCP server's page in Settings: its state, Sign in\n"
 "                 (a stand-in browser), a call from a session, Sign out\n"
 "  --hosttask     subagents on another host: opened and answered here, a\n"
@@ -26180,6 +26183,8 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
             terminal = probe = 1;
         } else if (a == "--a11y") {
             a11y = probe = 1;
+        } else if (a == "--a11y-lint") {
+            g->axlint = 1;
         } else if (a == "--mcp") {
             mcp = probe = 1;
         } else if (a == "--hosttask") {
@@ -26505,7 +26510,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     io.ConfigErrorRecoveryEnableAssert = 0;
     // Panes close from their tabs alone, not each dock node as well
     ImGui::GetStyle().DockingNodeHasCloseButton = 0;
-    axinit(g, g->axset);
+    axinit(g, g->axlint ? AXSET_ON : g->axset);
     g->ime = alloc<Preedit>(&g->perm);
     g->basestyle = ImGui::GetStyle();
     g->sysdark   = 1;  // until the window opens and the platform says

@@ -65,6 +65,7 @@ struct AxFieldDraw {
 enum : i32 {
     AXACT_PRESS,  // as a click, or the keyboard's Space
     AXACT_FOCUS,  // a text field, to edit: its caret kept
+    AXACT_MENU,   // its context menu, as a right click (uirclicked)
 };
 
 struct AxAct {
@@ -90,7 +91,64 @@ struct AxGui {
     i64                 publishes;
     AxAct               acts[16];
     i32                 nacts;
+    u64                *linted;   // --a11y-lint: what was logged, hashed
+    i32                 nlinted;
+    u32                 menuid;   // an item whose context menu was asked for
+    i64                 menuwhen;
 };
+
+enum { AXLINT_CAP = 1<<12 };
+
+static Str axcstr(char const *);
+
+// --a11y-lint: log a visible control with no name, once, as where it is
+// and its ImGui label (tests/gui.py checks these against
+// tests/a11y_allow.txt).
+static void axlintnote(AxGui *x, AxRole role, ImGuiWindow *w, Str label)
+{
+    Gui  *g = x->g;
+    Arena a = g->frame;
+    Buf   b(&a, 256);
+    print(&b, "a11y-lint: unnamed ");
+    print(&b, axrolenames[role]);
+    print(&b, " in ");
+    // The window's name without the ID suffixes ImGui gives child
+    // windows (Parent/##child_1A2B3C4D), which differ run to run
+    Str name = w ? axcstr(w->Name) : Str("?");
+    for (iz i = 0; i < name.len; i++) {
+        b32 hex = i+9<=name.len && name[i]=='_' && (i+9==name.len || name[i+9]=='/');
+        for (iz k = 1; hex && k < 9; k++) {
+            u8 c = name[i+k];
+            hex = (c>='0' && c<='9') || (c>='A' && c<='F') || (c>='a' && c<='f');
+        }
+        if (hex) {
+            i += 8;
+        } else {
+            putbyte(&b, name[i]);
+        }
+    }
+    print(&b, ": ");
+    print(&b, label.len ? label : Str("(no label)"));
+    Str note = finish(&b);
+    u64 h    = hash(note) | 1;
+    if (!x->linted) {
+        x->linted = alloc<u64>(&g->perm, AXLINT_CAP);
+    }
+    for (u32 i = (u32)h;; i++) {
+        u64 *slot = x->linted + (i & (AXLINT_CAP-1));
+        if (*slot == h) {
+            return;
+        } else if (!*slot) {
+            if (x->nlinted == AXLINT_CAP/2) {
+                return;  // enough to go on
+            }
+            *slot = h;
+            x->nlinted++;
+            guilog(g, note);
+            return;
+        }
+    }
+}
 
 static AxGui *axgui(ImGuiContext *ctx)
 {
@@ -347,6 +405,33 @@ static void axrole(Gui *g, AxRole role)
     }
 }
 
+// The last item has a context menu, which an assistive tool may ask for
+// (uirclicked).
+static void axmenu(Gui *g)
+{
+    AxItem *it = axlastitem(g);
+    if (it) {
+        it->actions |= AXA_MENU;
+    }
+}
+
+// Whether a tool asked for item id's context menu: once.
+// Or the keyboard, its Menu key or Shift+F10 on the item as ImGui's
+// (BeginPopupContextItem's), accessibility on or not.
+static b32 axmenuasked(Gui *g, u32 id)
+{
+    ImGuiContext *ctx = GImGui;
+    if (id && ctx->NavOpenContextMenuItemId==id && ctx->NavId==id) {
+        return 1;
+    }
+    AxGui *x = g->ax && g->ax->on ? g->ax : 0;
+    if (!x || !id || x->menuid!=id) {
+        return 0;
+    }
+    x->menuid = 0;
+    return 1;
+}
+
 
 // The frame's tree
 
@@ -444,7 +529,13 @@ static void axbuild(AxGui *x, ImGuiContext *ctx)
             state |= f->flags & ImGuiInputTextFlags_ReadOnly ? AXS_READONLY : 0;
         }
         Str     name = it->named ? it->name : axlabel(&x->mem, it->label);
+        if (!name.len && f && f->hint.len) {
+            name = f->hint;  // a field with no label says what it is for
+        }
         AxNode *n    = axadd(b, parent, it->key ? it->key : it->id, role, name);
+        if (g->axlint && role!=AX_NONE && (it->actions & AXA_NAMED) && !name.len) {
+            axlintnote(x, role, w, it->label);
+        }
         n->id      = it->id;
         n->rect    = {it->rect.Min.x, it->rect.Min.y, it->rect.Max.x, it->rect.Max.y};
         n->state   = state;
@@ -560,9 +651,18 @@ static b32 axaction(Gui *g, u32 key, i32 kind)
     }
     AxTree *t = x->ax->pub;
     i32     i = axfind(t, key);
-    u32     want = kind==AXACT_FOCUS ? AXA_FOCUS : AXA_PRESS|AXA_TOGGLE|AXA_EXPAND|AXA_SELECT;
+    u32     want = kind==AXACT_FOCUS ? AXA_FOCUS
+                 : kind==AXACT_MENU  ? AXA_MENU
+                 :                     AXA_PRESS|AXA_TOGGLE|AXA_EXPAND|AXA_SELECT;
     if (i<0 || !(t->nodes[i].actions & want) || (t->nodes[i].state & AXS_DISABLED) ||
-            x->nacts==countof(x->acts)) {
+            axblocked(x, key)) {
+        return 0;
+    } else if (kind == AXACT_MENU) {
+        x->menuid   = t->nodes[i].id;  // for the item to see, as it asks
+        x->menuwhen = g->sched.now;
+        scheddirty(&g->sched);
+        return 1;
+    } else if (x->nacts == countof(x->acts)) {
         return 0;
     }
     AxAct a = {};
@@ -603,6 +703,9 @@ static void axnewframe(ImGuiContext *ctx, ImGuiContextHook *hook)
         return;
     }
     axdeliver(x, ctx);
+    if (x->menuid && x->g->sched.now-x->menuwhen>AXEDIT_TTL) {
+        x->menuid = 0;  // its item never asked
+    }
     ctx->TestEngineHookItems = true;
     x->mem.beg = x->base;
     x->items   = {};
@@ -789,9 +892,10 @@ static void driveax(Gui *g, Str cmd)
             n += x->queue[i].id != 0;
         }
         axcount(g, &a, "accessible edits queued: ", n, c.tail);
-    } else if (verb=="press" || verb=="activate") {
-        i32 i   = axfindnode(t, r.head, r.tail);
-        b32 got = i>=0 && axaction(g, t->nodes[i].key, verb=="press" ? AXACT_PRESS : AXACT_FOCUS);
+    } else if (verb=="press" || verb=="activate" || verb=="menu") {
+        i32 i    = axfindnode(t, r.head, r.tail);
+        i32 kind = verb=="press" ? AXACT_PRESS : verb=="menu" ? AXACT_MENU : AXACT_FOCUS;
+        b32 got  = i>=0 && axaction(g, t->nodes[i].key, kind);
         axcheck(g, &a, got, concat(&a, "accessible ", cmd));
     } else if (verb == "pending") {
         axcount(g, &a, "accessible actions pending: ", g->ax->nacts, c.tail);
