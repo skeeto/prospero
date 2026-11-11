@@ -1415,6 +1415,11 @@ struct Gui {
     Changes            changes;    // the Changes pane's
     i32                helppage;   // the Help window's topic (HELP_*)
     DocView           *helpdoc;    // and its page, null until first shown
+    DocView           *diagdoc;    // Settings' diagnostics, null until shown
+    u64                diaghash;   // of the text it shows
+    DocView           *logdoc;     // the Log window's, null until shown
+    i64                logn;       // lines logged so far
+    i64                logshown;   // logn when logdoc was set
     DocView           *greeting;   // the Community Edition's, null until shown
     i32                helpshown;  // the topic in helpdoc, plus one
     b32                helpnarrow; // its topics were a combo, not a list
@@ -1962,6 +1967,7 @@ static void guilog(Gui *g, Str msg)
         g->logs.len--;
     }
     g->logs = push(&g->perm, g->logs, msg);
+    g->logn++;
 }
 
 static void fakecmd(Gui *g, u32 type, Str payload)
@@ -13407,6 +13413,8 @@ enum : i32 {
                       // first titled text if any (dy 1: any row)
     CHK_TERMWAIT,     // the front tab shows Reconnecting (dx 1), or not (0)
     CHK_TERMSIZETIP,  // the terminal's size shows over it (dx 1), or not (0)
+    CHK_DIAGCOPY,     // the clipboard holds the diagnostics as text, the
+                      // Diagnostics page shown
     CHK_COUNT,
 };
 
@@ -13706,6 +13714,7 @@ static Str chknames[] = {
     "the palette lists what it should",
     "the terminal shows Reconnecting, or not, as said",
     "the terminal's size shows over it while it changes, or not, as said",
+    "Copy all copies the diagnostics as text",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -15142,6 +15151,21 @@ static DriveOp m3ops[] = {
     {OP_UP, 0, 0, 0, 800, ""},
     {OP_WAIT, W_CONFIG, 0, 0, 5000, ""},
     {OP_CHECK, CHK_DIAGS, 0, 0, 0, ""},
+    // Diagnostics are a selectable document, and Copy all copies them
+    // as text (issue #36)
+    {OP_SHOWPAGE, 0, 0, 0, 300, "diagnostics"},
+    {OP_MOVE, T_PAGEITEM, 0, 0, 100, "diagnostics"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "diagnostics copy"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_DIAGCOPY, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "4-diagnostics"},
+    {OP_SHOWPAGE, 0, 0, 0, 300, "endpoint fake"},
+    {OP_MOVE, T_PAGEITEM, 0, 0, 100, "endpoint fake"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
     {OP_MOVE, T_SETTING, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 200, ""},
@@ -21591,6 +21615,25 @@ static b32 drivecheck(Gui *g, i32 chk)
         return find(g->cfgstatus, "already exists")>=0 && !g->cfgset;
     case CHK_ROQUIET:
         return g->sess && g->sess->readonly && v->busy && !g->roclock;
+    case CHK_DIAGCOPY: {
+        Arena a = g->frame;
+        Json *d = jsonget(g->cfg, "diags")->child;
+        if (!d || !g->cfgdiag) return 0;
+        Buf b(&a, 256);
+        print(&b, jsonstr(jsonget(d, "file")));
+        putbyte(&b, ':');
+        print(&b, jsonint(jsonget(d, "line"), 0));
+        putbyte(&b, ':');
+        print(&b, jsonint(jsonget(d, "col"), 0));
+        print(&b, ": ");
+        print(&b, jsonstr(jsonget(d, "severity")));
+        print(&b, ": ");
+        print(&b, jsonstr(jsonget(d, "message")));
+        putbyte(&b, '\n');
+        Str want = finish(&b);
+        Str got  = driveclipboard(g, want);
+        return startswith(got, want);
+    }
     case CHK_DIAGS: {
         Json *d = jsonget(g->cfg, "diags")->child;
         return d && jsonstr(jsonget(d, "file")).len && jsonint(jsonget(d, "line"), 0)>0 &&

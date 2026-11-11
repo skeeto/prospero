@@ -21,7 +21,8 @@ and shell lists on the Prompt's status line end with Endpoints and models...
 and Shells..., which show their pages. Its top line says which file it edits.
 [Diagnostics](settings:diagnostics), at the end of its list, shows each
 problem found in the files, with where it is; a bad value falls back to
-its default.
+its default. Select text there to copy it, or Copy all for every one,
+a line each, to paste into a bug report or an editor.
 
 The search field above the pages (Ctrl+F, or Cmd+F on macOS, while
 Settings has the focus) finds a setting by name: keys that match come

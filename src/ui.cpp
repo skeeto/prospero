@@ -12012,6 +12012,7 @@ static void drawcfglist(Gui *g, b32 combo)
                 "with where each is", color, &at)) {
         g->cfgdiag = 1;
     }
+    cfgreveal(g, "diagnostics", g->cfgdiag);
     g->rects[RECT_DIAGPAGE] = at;
 }
 
@@ -12279,15 +12280,69 @@ static void drawcfgtemplate(Gui *g, Str model)
     }
 }
 
+// Text as Markdown shows it as it is: every ASCII punctuation mark
+// escaped, as CommonMark allows any to be.
+static void putmdtext(Buf *b, Str s)
+{
+    for (iz i = 0; i < s.len; i++) {
+        u8 c = s[i];
+        if ((c>='!' && c<='/') || (c>=':' && c<='@') || (c>='[' && c<='`') ||
+                (c>='{' && c<='~')) {
+            putbyte(b, '\\');
+        }
+        putbyte(b, c);
+    }
+}
+
+// Lines as a fenced code block, its fence longer than any run of
+// backticks in them.
+static Str mdcodeblock(Arena *a, Slice<Str> lines)
+{
+    iz longest = 0;
+    iz bytes   = 0;
+    for (iz i = 0; i < lines.len; i++) {
+        bytes += lines[i].len + 1;
+        for (iz k = 0, run = 0; k < lines[i].len; k++) {
+            run     = lines[i][k]=='`' ? run+1 : 0;
+            longest = run>longest ? run : longest;
+        }
+    }
+    iz  n = longest<3 ? 3 : longest+1;
+    Buf b(a, bytes + 2*n + 4);
+    for (iz i = 0; i < n; i++) putbyte(&b, '`');
+    putbyte(&b, '\n');
+    for (iz i = 0; i < lines.len; i++) {
+        print(&b, lines[i]);
+        putbyte(&b, '\n');
+    }
+    for (iz i = 0; i < n; i++) putbyte(&b, '`');
+    putbyte(&b, '\n');
+    return finish(&b);
+}
+
+// "Copy all" on the line with what is to its left: copies text.
+static void copyallbutton(Gui *g, Arena a, Str text, char const *name, char const *tip)
+{
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!text.len);
+    if (ImGui::SmallButton(cstr0(&a, concat(&a, "Copy all##", Str{(u8 *)name, (iz)__builtin_strlen(name)})))) {
+        ImGui::SetClipboardText(cstr0(&a, text));
+    }
+    ImGui::EndDisabled();
+    itemnamed(g, Str{(u8 *)name, (iz)__builtin_strlen(name)});
+    itemtip("%s", tip);
+}
+
+// The configuration's diagnostics, compiler style, as a document whose
+// text is selectable and copied as the Plan's is (issue #36), each led
+// by its severity in bold, and Copy all for every one of them as text,
+// to paste where they are wanted.
 static void drawcfgdiags(Gui *g)
 {
     Arena a     = g->frame;
     Json *diags = jsonget(g->cfg, "diags");
-    ImGui::TextUnformatted("Diagnostics");
-    ImGui::PushTextWrapPos(0);
-    if (!jsonlen(diags)) {
-        ImGui::TextDisabled("None: every line of every file was understood.");
-    }
+    Buf   plain(&a, 1024);
+    Buf   md(&a, 1024);
     for (Json *d = diags->child; d; d = d->next) {
         Str sev = jsonstr(jsonget(d, "severity"));
         Buf b(&a, 256);
@@ -12297,14 +12352,44 @@ static void drawcfgdiags(Gui *g)
         putbyte(&b, ':');
         print(&b, jsonint(jsonget(d, "col"), 0));
         print(&b, ": ");
-        print(&b, sev);
-        print(&b, ": ");
-        print(&b, jsonstr(jsonget(d, "message")));
-        ImGui::PushStyleColor(ImGuiCol_Text, sev=="error" ? g->pal->bad : g->pal->amber);
-        ImGui::TextUnformatted(cstr0(&a, finish(&b)));
-        ImGui::PopStyleColor();
+        Str where = finish(&b);
+        Str msg   = jsonstr(jsonget(d, "message"));
+        print(&plain, where);
+        print(&plain, sev);
+        print(&plain, ": ");
+        print(&plain, msg);
+        putbyte(&plain, '\n');
+        print(&md, "**");
+        print(&md, sev);
+        print(&md, "** ");
+        putmdtext(&md, where);
+        putmdtext(&md, msg);
+        print(&md, "\n\n");
     }
-    ImGui::PopTextWrapPos();
+    Str text = finish(&plain);
+    Str doc  = finish(&md);
+
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("Diagnostics");
+    copyallbutton(g, a, text, "diagnostics copy",
+                  "Copy every diagnostic as text, a line each");
+    if (!jsonlen(diags)) {
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextDisabled("None: every line of every file was understood.");
+        ImGui::PopTextWrapPos();
+        return;
+    }
+    if (!g->diagdoc) {
+        g->diagdoc = newdocview(&g->perm, g->os, g->vcache);
+    }
+    if (hash(doc) != g->diaghash) {
+        docset(g->diagdoc, doc);
+        g->diaghash = hash(doc);
+    }
+    Str link = drawdoc(g, g->diagdoc, "##diags");
+    if (link.len) {
+        followlink(g, link);
+    }
 }
 
 // What a section a web include gives the url of would send there, on its
@@ -13465,13 +13550,30 @@ static void drawmetrics(Gui *g)
     itemtip("Probe every second while idle");
 }
 
+// The GUI's log, its latest lines, as a code block in a document whose
+// text is selectable and copied as the Plan's is, and Copy all.
 static void drawlog(Gui *g)
 {
-    ImGui::BeginChild("##log");
+    Arena a = g->frame;
+    Buf   all(&a, 4096);
     for (iz i = 0; i < g->logs.len; i++) {
-        text(g->logs[i]);
+        print(&all, g->logs[i]);
+        putbyte(&all, '\n');
     }
-    ImGui::EndChild();
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextDisabled("%d lines, the latest", (int)g->logs.len);
+    copyallbutton(g, a, finish(&all), "log copy", "Copy the log's lines as text");
+    if (!g->logs.len) {
+        return;
+    }
+    if (!g->logdoc) {
+        g->logdoc = newdocview(&g->perm, g->os, g->vcache);
+    }
+    if (g->logshown != g->logn) {
+        docset(g->logdoc, mdcodeblock(&a, g->logs));
+        g->logshown = g->logn;
+    }
+    drawdoc(g, g->logdoc, "##log");
 }
 
 // The fonts' licenses, which their files ask to be shown.

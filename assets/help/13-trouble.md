@@ -5,12 +5,13 @@
 - **The menu bar** shows the latest error at its right end, in red
   when the engine itself has a problem.
 - **The Log pane** (View → Log) shows the window's recent messages.
+  Select text there to copy it, or Copy all for all of them.
 - **`gui.log`** in the state directory (`~/.local/state/prospero`, see
   [Configuration](help:config)) keeps the same messages across runs.
   A window launched from a terminal, which goes on detached, writes its
   errors there too; `prospero -f` keeps it in the terminal instead.
 - **Settings → Diagnostics** lists each problem in the configuration
-  files, with where it is.
+  files, with where it is, and copies them with Copy all.
 - **The transcript** notes each retry of a failed request, and the
   error a turn ended with.
 - **Session → Open session records** opens a session's folder in the
