@@ -329,6 +329,39 @@ def bigfiles(host, prefix, n, lines):
                    "".join(f"file {i} line {j}: {fill}\n" for j in range(lines)))
 
 
+def filesfixtures(host):
+    """The Files pane's files, in work/files: numbered lines, with a blank
+    one each 50 (lines 6, 56, ..., 256 among them, at a chunk's end); a
+    400-column line among short ones; two files of one name; Markdown; a
+    BOM and CRLF; a binary file; and more lines than are kept."""
+    d = lambda *p: host.path("work", "files", *p)
+    for sub in ("a", "b"):
+        host.mkdir(d(sub))
+    host.write(d("a", "x.c"), "int a(void) { return 1; }\n")
+    host.write(d("b", "x.c"), "int b(void) { return 2; }\n")
+    host.write(d("notes.md"), "# Notes\n\nSee [the lines](lines.txt).\n\n" +
+               "".join(f"Paragraph {n}.\n\n" for n in range(1, 151)))
+    host.write(d("blob.bin"), "\x7fELF\x00\x01\x02binary\n")
+    if isinstance(host, Remote):
+        host.h.sh(
+            f"awk 'BEGIN {{ for (n = 1; n <= 3000; n++) print n%50==6 ? \"\" : \"line \" n }}'"
+            f" > {d('lines.txt')}\n"
+            f"awk 'BEGIN {{ for (n = 1; n <= 300; n++) {{ s = \"short \" n; if (n == 100) "
+            f"{{ s = \"long\"; for (i = 0; i < 40; i++) s = s \" abcdefghi\" }} print s }} }}'"
+            f" > {d('long.txt')}\n"
+            f"awk 'BEGIN {{ for (n = 1; n <= 100100; n++) print \"huge \" n }}'"
+            f" > {d('huge.txt')}\n"
+            f"printf '\\357\\273\\277first\\r\\nsecond\\r\\nthird\\r\\n' > {d('crlf.txt')}\n")
+        return
+    host.write(d("lines.txt"), "".join("\n" if n%50 == 6 else f"line {n}\n"
+                                       for n in range(1, 3001)))
+    host.write(d("long.txt"), "".join(
+        ("long" + " abcdefghi"*40 if n == 100 else f"short {n}") + "\n" for n in range(1, 301)))
+    host.write(d("huge.txt"), "".join(f"huge {n}\n" for n in range(1, 100101)))
+    with open(d("crlf.txt"), "wb") as f:
+        f.write(b"\xef\xbb\xbffirst\r\nsecond\r\nthird\r\n")
+
+
 def alive(pid):
     return P.alive(pid)
 
@@ -515,8 +548,10 @@ class Local:
         os.makedirs(path, exist_ok=True)
 
     def write(self, path, text):
-        with open(path, "w") as f:
-            f.write(text)
+        # The bytes given, as Remote writes them, without Windows' text
+        # mode, which would make each newline CRLF
+        with open(path, "wb") as f:
+            f.write(text.encode())
 
     def read(self, path):
         try:
@@ -1918,6 +1953,7 @@ def main():
         host.write(host.path("work", "AGENTS.md"), "# Checklist rules\n\nKeep it short.\n")
         bigfiles(host, "small-", 8, 160)
         bigfiles(host, "big-", 10, 512)
+        filesfixtures(host)
     else:
         before = config(curl, model)
     far = None

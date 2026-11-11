@@ -78,13 +78,17 @@ so Ctrl+1 is Standard and Ctrl+4 the first you saved:
 
 - **Standard**: sessions on the left over the todo list, the
   transcript over the prompt in the middle, and the jobs over the
-  plan on the right, with the terminal a tab beside the plan.
-- **Compact**: no right column. The plan is a tab beside the
+  plan on the right, with the terminal and Files tabs beside the plan.
+- **Compact**: no right column. The plan and Files are tabs beside the
   transcript, the jobs a tab beside the todo list, and the terminal
   under the prompt, as tall as it.
 - **Focus**: one session only. The transcript, todo list and plan are
-  tabs over the prompt, and nothing else is open. Ctrl+` brings the
-  terminal back, under the prompt.
+  tabs over the prompt, and nothing else is open. A file opened shows
+  Files as another tab beside the plan, and Ctrl+` brings the terminal
+  back, under the prompt.
+
+Files stays hidden until a file is opened, then shows where the
+layout puts it, beside the plan, whichever layout is picked.
 
 Arrange the panes as you like, by dragging their tabs and the borders
 between them, then View → Layout → Save layout... keeps that

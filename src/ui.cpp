@@ -3764,6 +3764,9 @@ struct TextArea {
     f64    scrolly;
     b32   *dragging; // a selection is being dragged
     f64   *scrollto; // where a drag past an edge scrolls to, -1 if none
+    f32    padx;     // more left margin: a file's line numbers
+    f32    scrollx;  // scrolled right by, unwrapped
+    b32    margin;   // head is a top margin, over the message before's foot
 };
 
 struct TextHit {
@@ -3803,14 +3806,14 @@ static TextHit textmouse(Gui *g, TextArea *ta)
         f32 my = io.MousePos.y;
         my = my<top ? top : my>bot-1 ? bot-1 : my;
         f64 cy = ta->scrolly + (my - wpos.y);
-        i32 i  = viewfind(v, cy);
+        i32 i  = viewfind(v, ta->margin ? cy - ta->head : cy);
         if (i >= 0) {
             ViewMsg   *m  = &v->msgs[i];
             MsgLayout *ml = msglayout(v, i, &g->measure, ta->width, sc);
             f32 ly = (f32)(cy - m->top - ta->head);
             r.at.msg = i;
-            r.at.off = ly<0 || m->collapsed ? 0 :
-                       msghit(&g->measure, msgdoc(v, i), ml, io.MousePos.x - wpos.x - ta->pad, ly);
+            f32 lx = io.MousePos.x - wpos.x - ta->pad - ta->padx + ta->scrollx;
+            r.at.off = ly<0 || m->collapsed ? 0 : msghit(&g->measure, msgdoc(v, i), ml, lx, ly);
             if (ly > m->h) r.at.off = (i32)m->text.len;
             r.hit  = 1;
             r.body = ly>=0 && ly<=m->h && !m->collapsed;
@@ -3838,6 +3841,16 @@ static TextHit textmouse(Gui *g, TextArea *ta)
                 step = step<-60*sc ? -60*sc : step>60*sc ? 60*sc : step;
                 *ta->scrollto = ta->scrolly + step;
                 if (*ta->scrollto < 0) *ta->scrollto = 0;
+            }
+            // And sideways, past the text's left edge or the right
+            f32 mx    = io.MousePos.x;
+            f32 left  = wpos.x + ta->pad + ta->padx;
+            f32 right = wpos.x + ImGui::GetWindowWidth() - st.ScrollbarSize;
+            f32 dx    = mx<left ? mx-left : mx>right ? mx-right : 0;
+            if (dx!=0 && ImGui::GetScrollMaxX()>0) {
+                f32 step = dx * 0.5f;
+                step = step<-60*sc ? -60*sc : step>60*sc ? 60*sc : step;
+                ImGui::SetScrollX(ImGui::GetScrollX() + step);
             }
         }
     }
@@ -4071,15 +4084,311 @@ static Str blocktext(Arena *a, Doc *d, DocBlock *b)
     return finish(&t);
 }
 
+// A file's lines (DocLines; files.cpp) in a child window, as drawdoc's
+// documents, but laid out a screen at a time around what is shown, in
+// the code font: numbered in a gutter on the left, the cited lines
+// banded, scrolled to them once (centered if they fit, else from a
+// third of the way down), or to where the view was, and wrapped at the
+// pane's width or else at FILES_COLS columns, scrolled sideways. Until
+// the pane has settled its size (its first frame, a layout applied, a
+// height that changed) a jump or a restore is made again each frame,
+// and not reported done, nor the place recorded.
+static f32 linesy(View *v, Gui *g, f32 width, f32 pad, i32 line)
+{
+    i32 ci = line / FILES_CHUNK;
+    if (ci >= v->msgs.len) {
+        return 0;
+    }
+    MsgLayout *ml = msglayout(v, ci, &g->measure, width, g->scale);
+    i32        k  = line % FILES_CHUNK;
+    k = k<(i32)ml->blocks.len ? k : (i32)ml->blocks.len-1;
+    return (f32)v->msgs[ci].top + pad + (k>=0 ? ml->blocks[k].y : 0);
+}
+
+static f32 linesh(View *v, Gui *g, f32 width, i32 line)
+{
+    i32 ci = line / FILES_CHUNK;
+    if (ci >= v->msgs.len) {
+        return 0;
+    }
+    MsgLayout *ml = msglayout(v, ci, &g->measure, width, g->scale);
+    i32        k  = line % FILES_CHUNK;
+    return k<ml->blocks.len ? ml->blocks[k].bl->h : 0;
+}
+
+// Lay out the chunks from y0 to y1, then the tops again.
+static f64 lineslay(View *v, Gui *g, f32 width, f32 charw, f32 lineh, f64 y0, f64 y1)
+{
+    i32 i = viewfind(v, y0<0 ? 0 : y0);
+    for (; i>=0 && i<v->msgs.len && v->msgs[i].top<=y1; i++) {
+        msglayout(v, i, &g->measure, width, g->scale);
+    }
+    return viewtops(v, width, charw, lineh);
+}
+
+static Str drawlines(Gui *g, DocView *d, char const *id, DocLines *dl)
+{
+    View       *v     = d->v;
+    f32         sc    = g->scale;
+    ImGuiStyle &st    = ImGui::GetStyle();
+    ImVec2      avail = ImGui::GetContentRegionAvail();
+    f32         pad   = 4*sc;
+    Palette    *pal   = g->pal;
+    FontMetrics fm    = fontmetrics(&g->fonts, STYLE_CODE);
+    f32         adv   = fontadvance(&g->fonts, STYLE_CODE, 'n');
+    v->extra = 0;
+    v->gap   = 0;
+
+    i32 digits = 1;
+    for (i32 n = dl->lines; n >= 10; n /= 10) {
+        digits++;
+    }
+    f32 gutter = (f32)(digits + 2)*adv;
+    f32 width  = 0;
+    if (dl->wrap) {
+        width = (f32)(i32)(avail.x - st.ScrollbarSize - 2*pad - gutter);
+        width = width<50*sc ? 50*sc : width;
+    } else {
+        width = ((f32)FILES_COLS + 0.5f)*adv;  // perline exactly FILES_COLS
+    }
+    f32 winh    = avail.y;
+    b32 pending = ImGui::IsWindowAppearing() || g->layoutpending || g->layoutnow ||
+                  winh!=dl->lasth;
+    dl->lasth    = winh;
+    dl->jumped   = 0;
+    dl->restored = 0;
+    dl->recorded = 0;
+
+    // A new width keeps the line at the top there
+    f64 want  = -1;
+    f32 wantx = -1;
+    f64 cur   = d->win ? d->win->Scroll.y : 0;
+    if (width != v->lastw) {
+        Anchor an = {-1, -1, 0};
+        if (v->lastw>0 && d->win) {
+            an = viewanchor(v, &g->measure, v->lastw, sc, pad, cur);
+        }
+        v->lastw     = width;
+        v->topsdirty = 1;
+        viewtops(v, width, adv, fm.lineh);
+        if (an.msg >= 0) {
+            msglayout(v, an.msg, &g->measure, width, sc);
+            viewtops(v, width, adv, fm.lineh);
+            want = anchory(v, an, &g->measure, width, sc, pad);
+        }
+    }
+    viewtops(v, width, adv, fm.lineh);
+
+    // Unwrapped, as wide as the widest line, as far as drawn, and so a
+    // horizontal scrollbar, which the height shown is less
+    f32 textw = (f32)(dl->cols<FILES_COLS ? dl->cols : FILES_COLS)*adv + adv;
+    textw = dl->seenw>textw ? dl->seenw : textw;
+    f32 contw = dl->wrap ? 0 : gutter + 2*pad + textw;
+    ImGuiWindowFlags wf = ImGuiWindowFlags_AlwaysVerticalScrollbar;
+    if (!dl->wrap && contw>avail.x-st.ScrollbarSize) {
+        wf |= ImGuiWindowFlags_AlwaysHorizontalScrollbar;
+    }
+    f32 vish = winh - (wf&ImGuiWindowFlags_AlwaysHorizontalScrollbar ? st.ScrollbarSize : 0);
+
+    if (dl->jump0>0 && v->msgs.len) {
+        i32 l0 = dl->jump0 - 1;
+        i32 l1 = (dl->jump1>=dl->jump0 ? dl->jump1 : dl->jump0) - 1;
+        f64 y0 = linesy(v, g, width, pad, l0);
+        lineslay(v, g, width, adv, fm.lineh, y0-winh, y0);
+        y0 = linesy(v, g, width, pad, l0);
+        f64 y1 = linesy(v, g, width, pad, l1) + linesh(v, g, width, l1);
+        y0 = linesy(v, g, width, pad, l0);  // tops as laid out
+        want  = y1-y0 <= vish-2*pad ? (y0+y1)/2 - vish/2 : y0 - vish/3;
+        wantx = 0;
+        dl->jumped = !pending;
+    } else if (dl->restore && v->msgs.len) {
+        i32 line = dl->top<0 ? 0 : dl->top>=dl->lines ? dl->lines-1 : dl->top;
+        f64 y    = linesy(v, g, width, pad, line);
+        lineslay(v, g, width, adv, fm.lineh, y-winh, y);
+        want  = linesy(v, g, width, pad, line) + dl->dy;
+        wantx = dl->wrap ? 0 : dl->scrollx;
+        dl->restored = !pending;
+    }
+
+    // What is shown, and a screen each way, laid out, the top kept on
+    // the line it is on as heights above it settle
+    f64 at = want>=0 ? want : cur;
+    at = at<0 ? 0 : at;
+    Anchor an = viewanchor(v, &g->measure, width, sc, pad, at);
+    lineslay(v, g, width, adv, fm.lineh, at-winh, at+2*winh);
+    if (an.msg >= 0) {
+        f64 y = anchory(v, an, &g->measure, width, sc, pad);
+        if (y != at) {
+            want = y;
+        }
+    }
+    f64 total = viewtops(v, width, adv, fm.lineh);
+    f64 most  = total + 2*pad - vish;
+    most = most<0 ? 0 : most;
+    want = want<0 ? -1 : want>most ? most : want;
+    if (pending) {
+        scheddirty(&g->sched);
+    }
+
+    ImGui::SetNextWindowContentSize(v2(contw, (f32)total + 2*pad));
+    if (want>=0 || wantx>=0) {
+        ImGui::SetNextWindowScroll(v2(wantx, want>=0 ? (f32)want : -1));
+    }
+    if (d->scrollto >= 0) {
+        ImGui::SetNextWindowScroll(v2(-1, (f32)d->scrollto));
+        d->scrollto = -1;
+    }
+    ImGui::BeginChild(id, v2(0, 0), 0, wf);
+    d->win = ImGui::GetCurrentWindow();
+    ImVec2 wpos = ImGui::GetWindowPos();
+    f32    wh   = ImGui::GetWindowHeight() - (wf&ImGuiWindowFlags_AlwaysHorizontalScrollbar
+                                              ? st.ScrollbarSize : 0);
+    f32    ww   = ImGui::GetWindowWidth() - st.ScrollbarSize;
+    f32    sx   = dl->wrap ? 0 : ImGui::GetScrollX();
+    TextArea ta = {v, wpos, wh, width, pad, pad, ImGui::GetScrollY(), &d->dragging,
+                   &d->scrollto, gutter, sx, 1};
+    TextHit hit  = textmouse(g, &ta);
+    Str     link = textlink(g, v, hit, &d->press, &d->pressmsg);
+    if (begintextmenu(g, v, -1)) {
+        endtextmenu(g, v);
+    }
+
+    ImDrawList         *dr   = ImGui::GetWindowDrawList();
+    ImDrawListSplitter *sp   = &g->splitter;
+    Range               sel  = selrange(&v->sel);
+    b32                 band = dl->band0>0 && poseq(sel.beg, sel.end);
+    b32                 drew = 0;
+    Marks               mk   = {0, 0, -1};
+    f32                 ox   = wpos.x + pad + gutter - sx;
+    f32                 seen = dl->seenw;
+    Arena               a    = g->frame;
+    ImFont             *font = stylefont(&g->fonts, STYLE_CODE);
+    f32                 size = stylesize(&g->fonts, STYLE_CODE);
+    sp->Split(dr, CH_COUNT);
+    dr->PushClipRect(v2(wpos.x + pad + gutter - adv/2, wpos.y), v2(wpos.x + ww, wpos.y + wh), 1);
+    i32 first = viewfind(v, ta.scrolly - pad);  // the last line above, its foot in view
+    for (i32 i = first; i>=0 && i<v->msgs.len; i++) {
+        ViewMsg *m = &v->msgs[i];
+        f32      y = wpos.y + (f32)(m->top - ta.scrolly) + pad;
+        if (y > wpos.y+wh) {
+            break;
+        }
+        MsgLayout *ml = msglayout(v, i, &g->measure, width, sc);
+        drawmsgtext(g, dr, sp, &ta, i, ml, v2(ox, y), sel, &mk, 1, 0);
+        for (iz k = 0; k < ml->blocks.len; k++) {
+            Placed *pl = &ml->blocks[k];
+            f32     ly = y + pl->y;
+            if (ly > wpos.y+wh) {
+                break;
+            } else if (ly+pl->bl->h < wpos.y) {
+                continue;
+            }
+            for (iz li = 0; li < pl->bl->lines.len; li++) {
+                Line *l = &pl->bl->lines[li];
+                if (l->nrun) {
+                    Run *r = &pl->bl->runs[l->run0 + l->nrun - 1];
+                    seen = r->x+r->w>seen ? r->x+r->w : seen;
+                }
+            }
+            i32 n = m->line0 + (i32)k;
+            if (band && n>=dl->band0 && n<=dl->band1) {
+                sp->SetCurrentChannel(dr, CH_BG);
+                dr->PushClipRect(v2(wpos.x, wpos.y), v2(wpos.x + ww, wpos.y + wh), 0);
+                dr->AddRectFilled(v2(wpos.x, ly), v2(wpos.x + ww, ly + pl->bl->h),
+                                  fade(pal->codetext, 0.08f));
+                dr->PopClipRect();
+                drew = 1;
+            }
+        }
+    }
+    dr->PopClipRect();
+
+    // The line numbers, right-aligned in the gutter, on the band brighter
+    sp->SetCurrentChannel(dr, CH_TEXT);
+    for (i32 i = first; i>=0 && i<v->msgs.len; i++) {
+        ViewMsg *m = &v->msgs[i];
+        f32      y = wpos.y + (f32)(m->top - ta.scrolly) + pad;
+        if (y > wpos.y+wh) {
+            break;
+        }
+        MsgLayout *ml = msglayout(v, i, &g->measure, width, sc);
+        for (iz k = 0; k < ml->blocks.len; k++) {
+            Placed *pl = &ml->blocks[k];
+            f32     ly = y + pl->y;
+            if (ly > wpos.y+wh) {
+                break;
+            } else if (ly+pl->bl->h<wpos.y || !pl->bl->lines.len) {
+                continue;
+            }
+            i32 n  = m->line0 + (i32)k;
+            Buf b(&a, 16);
+            print(&b, (i64)n);
+            Str num = finish(&b);
+            Line *l  = &pl->bl->lines[0];
+            f32   nx = wpos.x + pad + (f32)(digits - num.len)*adv;
+            ImFontBaked *bk = stylebaked(&g->fonts, STYLE_CODE);
+            b32 on = band && n>=dl->band0 && n<=dl->band1;
+            dr->AddText(font, size, v2(nx, ly + l->base - bk->Ascent),
+                        on ? pal->codetext : pal->paneldim, num.cdata, num.cdata+num.len);
+        }
+    }
+    sp->Merge(dr);
+    dl->seenw = seen;
+
+    // Where the view is, by its top line
+    f32 sy = ImGui::GetScrollY();
+    if (!pending && want<0 && v->msgs.len) {
+        f64 y  = sy - pad;
+        i32 ci = viewfind(v, y<0 ? 0 : y);
+        if (ci >= 0) {
+            ViewMsg   *m  = &v->msgs[ci];
+            MsgLayout *ml = msglayout(v, ci, &g->measure, width, sc);
+            f32        ry = (f32)(y - m->top);
+            iz         lo = 0, hi = ml->blocks.len;
+            while (hi-lo > 1) {
+                iz mid = lo + (hi - lo)/2;
+                if (ml->blocks[mid].y <= ry) {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            dl->top      = m->line0 - 1 + (i32)lo;
+            dl->dy       = sy - linesy(v, g, width, pad, dl->top);
+            dl->scrollx  = sx;
+            dl->recorded = 1;
+        }
+    }
+
+    FileShown *fs = &g->fshown;
+    fs->v       = v;
+    fs->wpos    = wpos;
+    fs->winh    = wh;
+    fs->pad     = pad;
+    fs->gutter  = gutter;
+    fs->scrolly = sy;
+    fs->scrollx = sx;
+    fs->width   = width;
+    fs->hbar    = ImGui::GetScrollMaxX() > 0;
+    fs->band    = drew;
+    ImGui::EndChild();
+    textkeys(g, v);
+    return link;
+}
+
 // A document (DocView) in a child window filling the rest of the window
 // at the cursor, or with fit, one fit wide and as tall as the document,
 // unscrolled: laid out at its width whole, as a document is short, its
 // text selectable, with the text's context menu, and its keys while the
 // window has focus, scrolled to its section heading named d->section
 // once laid out. Returns the destination of a link clicked, if any,
-// which is the caller's to follow.
-static Str drawdoc(Gui *g, DocView *d, char const *id, f32 fit = 0)
+// which is the caller's to follow. With dl, it is a file's lines,
+// drawn by drawlines.
+static Str drawdoc(Gui *g, DocView *d, char const *id, f32 fit = 0, DocLines *lines = 0)
 {
+    if (lines) {
+        return drawlines(g, d, id, lines);
+    }
     View       *v     = d->v;
     f32         sc    = g->scale;
     ImGuiStyle &st    = ImGui::GetStyle();
@@ -4130,7 +4439,7 @@ static Str drawdoc(Gui *g, DocView *d, char const *id, f32 fit = 0)
     d->win = ImGui::GetCurrentWindow();
     ImVec2   wpos = ImGui::GetWindowPos();
     TextArea ta   = {v, wpos, ImGui::GetWindowHeight(), width, pad, pad,
-                     ImGui::GetScrollY(), &d->dragging, &d->scrollto};
+                     ImGui::GetScrollY(), &d->dragging, &d->scrollto, 0, 0, 0};
     TextHit hit  = textmouse(g, &ta);
     Str     link = textlink(g, v, hit, &d->press, &d->pressmsg);
     if (begintextmenu(g, v, -1)) {
@@ -4142,7 +4451,7 @@ static Str drawdoc(Gui *g, DocView *d, char const *id, f32 fit = 0)
     Range               sel = selrange(&v->sel);
     Marks               mk  = {0, 0, -1};
     sp->Split(dl, CH_COUNT);
-    for (i32 i = viewfind(v, ta.scrolly); i>=0 && i<v->msgs.len; i++) {
+    for (i32 i = viewfind(v, ta.scrolly - pad); i>=0 && i<v->msgs.len; i++) {
         ViewMsg *m = &v->msgs[i];
         f32      y = wpos.y + (f32)(m->top - ta.scrolly);
         if (y > wpos.y+ta.winh) {
@@ -5016,7 +5325,8 @@ static void drawtranscript(Gui *g)
 
     // Mouse: an invisible button over the visible area, which the
     // headers' toggles and the asks' buttons, made later, overlap.
-    TextArea ta  = {v, wpos, winh, width, pad, head, scrolly, &g->dragging, &g->scrollto};
+    TextArea ta  = {v, wpos, winh, width, pad, head, scrolly, &g->dragging, &g->scrollto,
+                    0, 0, 0};
     TextHit  hit  = textmouse(g, &ta);
     Str      link = textlink(g, v, hit, &g->linkpress, &g->linkmsg);
     itemrect(g, RECT_TRANSCRIPT);
@@ -9205,7 +9515,8 @@ static void drawsessions(Gui *g)
     }
 }
 
-static void drawpathask(Gui *);
+static void drawpathask(Gui *, PathAsk *, char const *, char const *, b32);
+static Str  fileaskok(Gui *, Str);
 
 // The naming dialog (a session's title, a new group for it, a group's
 // new name), the deletion's confirmation, the Markdown export's
@@ -9439,7 +9750,8 @@ static void drawsessdialogs(Gui *g)
         ImGui::EndPopup();
     }
 
-    drawpathask(g);
+    drawpathask(g, &g->pask, "pathask", "pathask", 0);
+    drawpathask(g, &g->fask.p, "openfile", "openfile", 1);
 }
 
 
@@ -10443,26 +10755,34 @@ static void pathafter(Gui *g, PathField *f, char *buf)
     ImGui::End();
 }
 
-// Where the platform has no file dialog to show (pathkeep): the path
-// typed, completed as the new session's folder is, and answered as
-// the dialog would have
-static void drawpathask(Gui *g)
+// A path typed in a modal (popup id ###<pid>, its items "<name> field"
+// and "<name> ok"), completed as the new session's folder is. Where the
+// platform has no file dialog to show (pathkeep, g->pask), it is
+// answered as the dialog would have; for Open file (openfile, g->fask),
+// fileaskok checks and answers it.
+static void drawpathask(Gui *g, PathAsk *pa, char const *pid, char const *name, b32 openfile)
 {
-    Arena    a  = g->frame;
-    f32      sc = g->scale;
-    PathAsk *pa = &g->pask;
+    Arena a  = g->frame;
+    f32   sc = g->scale;
+    Str   id = concat(&a, "###", Str{(u8 *)pid, (iz)__builtin_strlen(pid)});
+    Str   nm = {(u8 *)name, (iz)__builtin_strlen(name)};
     pa->shown = 0;
-    if (pa->open) {
+    // Never over another popup, which opening would close: it waits,
+    // open still, as one opened earlier this frame has no window yet
+    b32 other = ImGui::IsPopupOpen((ImGuiID)0,
+                                   ImGuiPopupFlags_AnyPopupId|ImGuiPopupFlags_AnyPopupLevel);
+    if (pa->open && !other) {
         pa->open = 0;
         pa->err  = {};
-        ImGui::OpenPopup("###pathask");
+        ImGui::OpenPopup(cstr0(&a, id));
     }
-    Str ptitle = concat(&a, pa->title, "###pathask");
+    Str ptitle = concat(&a, pa->title, id);
     if (ImGui::BeginPopupModal(cstr0(&a, ptitle), 0, ImGuiWindowFlags_AlwaysAutoResize)) {
         b32 enter = modalenter();
         b32 save  = pa->kind == ASK_SAVE;
         pa->shown = 1;
-        ImGui::TextUnformatted(save ? "No file dialog can be shown here. Where should it be saved?"
+        ImGui::TextUnformatted(openfile ? "Which file?" :
+                               save ? "No file dialog can be shown here. Where should it be saved?"
                                     : "No file dialog can be shown here. Which file?");
         if (ImGui::IsWindowAppearing()) {
             ImGui::SetKeyboardFocusHere();
@@ -10471,7 +10791,7 @@ static void drawpathask(Gui *g)
         PathField pf = pathbefore(g, g->main, pa->buf, &enter, 0, 1);
         ImGui::InputTextWithHint("##cwd", "A path on this computer", pa->buf, FIELD_MAX,
                                  pf.flags, pathcb, &pf.cb);
-        itemnamed(g, "pathask field");
+        itemnamed(g, concat(&a, nm, " field"));
         pathafter(g, &pf, pa->buf);
         if (pa->err.len) {
             ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
@@ -10480,10 +10800,17 @@ static void drawpathask(Gui *g)
         }
         ImGui::Spacing();
         b32 ok = ImGui::Button(save ? "Save" : "Open", v2(120*sc, 0)) || enter;
-        itemnamed(g, "pathask ok");
+        itemnamed(g, concat(&a, nm, " ok"));
         ImGui::SameLine();
         b32 cancel = ImGui::Button("Cancel", v2(120*sc, 0)) || ImGui::Shortcut(ImGuiKey_Escape);
-        if (ok) {
+        if (ok && openfile) {
+            pa->err = fileaskok(g, trim({(u8 *)pa->buf, (iz)__builtin_strlen(pa->buf)}));
+            if (!pa->err.len) {
+                ImGui::CloseCurrentPopup();
+            }
+        } else if (cancel && openfile) {
+            ImGui::CloseCurrentPopup();
+        } else if (ok) {
             Str      t  = trim({(u8 *)pa->buf, (iz)__builtin_strlen(pa->buf)});
             HomePath hp = tildepath(&a, t, g->main->home, HOST_WINDOWS);
             i32      st = hp.err.len || !t.len ? STAT_MISSING : os_stat(g->os, a, hp.path).type;
@@ -14610,6 +14937,15 @@ static void menukeys(Gui *g)
     if (ImGui::Shortcut(ctrl|ImGuiKey_Comma, glob)) {
         opensettings(g);
     }
+    // Open file, never over another dialog; unavailable, saying why
+    if (ImGui::Shortcut(ctrl|ImGuiKey_O, glob) && !ImGui::GetTopMostPopupModal()) {
+        Str why = fileaskwhy(g);
+        if (why.len && g->sess) {
+            setnote(g, g->sess, why, 0);
+        } else {
+            fileaskopen(g);
+        }
+    }
     // The palette: again to close it, and never over another dialog
     if (ImGui::Shortcut(ctrl|ImGuiKey_K, glob)) {
         if (g->palw.shown) {
@@ -14778,9 +15114,13 @@ static void applylayout(Gui *g, ImGuiID id, ImVec2 pos, ImVec2 size)
         shown |= g->panes[i] ? 1u<<i : 0;
     }
     // A terminal shown gets its home under the prompt; hidden, it floats
-    // until shown (dockwindows), so that its room stays the prompt's
-    g->termhome = !g->panes[PANE_TERMINAL] || !dockaddterm(l);
-    g->termhome = g->termhome && !(dockplaced(l)>>PANE_TERMINAL & 1);
+    // until shown (dockwindows), so that its room stays the prompt's.
+    // Files, which takes no room of its own, is a tab beside Plan's.
+    b32 term  = !g->panes[PANE_TERMINAL] || !dockaddterm(l);
+    b32 files = !dockaddfiles(l);
+    g->homeless  = 0;
+    g->homeless |= term && !(dockplaced(l)>>PANE_TERMINAL & 1) ? 1u<<PANE_TERMINAL : 0;
+    g->homeless |= files && !(dockplaced(l)>>PANE_FILES & 1) ? 1u<<PANE_FILES : 0;
     i32     at     = 0;
     ImGuiID center = id;
     applypart(l, &at, id, shown, &center, g->scale);
@@ -15180,6 +15520,12 @@ static void drawmenubar(Gui *g)
             importstart(g, 0);
         }
         itemtip("A session from its raw log, exported here or elsewhere");
+        if (menutip(g, &a, "Open file...", fileaskwhy(g),
+                    "Show a file on this computer in the Files pane, with :N after "
+                    "its path for a line", cmdkey(g, &a, "O"))) {
+            fileaskopen(g);
+        }
+        itemnamed(g, "menu open file");
         if (menutip(g, &a, "Empty Trash...", emptywhy(g),
                     "Remove every session in the Trash for good now, once you confirm")) {
             askempty(g);
@@ -15509,9 +15855,40 @@ static b32 beginpane(Gui *g, i32 pane)
     return vis;
 }
 
+// A pane shown with no home in the dock space, the Terminal or Files:
+// its first showing, or after a layout left it none (homeless). The
+// layout as it is, with the pane given its home (dockaddterm,
+// dockaddfiles), is applied the next frame.
+static void panehome(Gui *g, i32 pane)
+{
+    char const *name  = panenames[pane];
+    b32         known = saveddock(name) || ImGui::FindWindowByName(name) ||
+                        ImGui::FindWindowSettingsByID(ImHashStr(name));
+    b32         left  = g->homeless>>pane & 1;
+    if ((!left && known) || g->layoutpending || g->layoutnow) {
+        return;
+    }
+    g->homeless &= ~(1u << pane);
+    b32        ok = 0;
+    DockLayout l  = capturelayout(g, &ok);
+    if (left) {
+        // Floating only as its node went with the layout, where a pane
+        // floated by hand would have kept it
+        l.floats &= ~(1u << pane);
+    }
+    b32 added = pane==PANE_TERMINAL ? dockaddterm(&l) : dockaddfiles(&l);
+    if (ok && added) {
+        l.name = g->layout.name;
+        l.keep = ~(u32)0;
+        picklayout(g, &l);
+        g->panefocus = pane + 1;
+    }
+}
+
 static void dockwindows(Gui *g)
 {
     termsweep(g);
+    filesweep(g);
     termhotkeys(g);
     menukeys(g);
     termgrab(g);
@@ -15744,30 +16121,23 @@ static void dockwindows(Gui *g)
     if (show[PANE_TERMINAL]) {
         // Its first showing, or after a layout left it no home: under the
         // prompt, as the layout with it applied the next frame
-        b32 known = saveddock("Terminal") || ImGui::FindWindowByName("Terminal") ||
-                    ImGui::FindWindowSettingsByID(ImHashStr("Terminal"));
-        if ((g->termhome || !known) && !g->layoutpending && !g->layoutnow) {
-            b32 left = g->termhome;
-            g->termhome = 0;
-            b32        ok = 0;
-            DockLayout l  = capturelayout(g, &ok);
-            if (left) {
-                // Floating only as its node went with the layout, where
-                // a terminal floated by hand would have kept it
-                l.floats &= ~(1u << PANE_TERMINAL);
-            }
-            if (ok && dockaddterm(&l)) {
-                l.name = g->layout.name;
-                l.keep = ~(u32)0;
-                picklayout(g, &l);
-                g->panefocus = PANE_TERMINAL + 1;
-            }
-        }
+        panehome(g, PANE_TERMINAL);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, v2(4*g->scale, 4*g->scale));
         b32 vis = beginpane(g, PANE_TERMINAL);
         ImGui::PopStyleVar();
         if (vis) {
             drawterm(g);
+        }
+        ImGui::End();
+    }
+    g->filesdrawn = 0;
+    if (show[PANE_FILES]) {
+        // Its first showing, or after a layout left it no home: beside
+        // Plan, as the layout with it applied the next frame
+        panehome(g, PANE_FILES);
+        g->filesdrawn = beginpane(g, PANE_FILES);
+        if (g->filesdrawn) {
+            drawfiles(g);
         }
         ImGui::End();
     }

@@ -640,6 +640,7 @@ enum {
     GKEY_LEFT,
     GKEY_D,
     GKEY_K,
+    GKEY_O,
 };
 struct GuiEvent {
     i32 kind;

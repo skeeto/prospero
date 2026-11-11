@@ -51,7 +51,11 @@ which the built-in ones lack: those fontconfig, CoreText or Windows' display
 language picks, or the files `[ui] fonts` names. View → Layout, View's first item, arranges the panes as
 Standard, Compact (no right column) or Focus (one session), or as a layout
 saved under a name of its own, kept with the window's layout in the state
-directory; Ctrl+1 to Ctrl+9 (Cmd on macOS) pick them in that order. The
+directory; Ctrl+1 to Ctrl+9 (Cmd on macOS) pick them in that order.
+Session → Open file... (Ctrl+O, Cmd+O) shows a file on this computer in the
+Files pane, hidden until then: in a tab of the session shown, its lines
+numbered and highlighted, wrapped or not, a Markdown file rendered (or as
+text), and `path:N` or `path:A-B` scrolled to those lines and marked. The
 window opens where it was last, fitted to the displays there are; the
 first time, 1700 by 900 at the display's scale, or maximized on a display
 too small for that. The first run shows Help in front, with Settings and

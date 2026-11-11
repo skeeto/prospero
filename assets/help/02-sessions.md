@@ -260,6 +260,23 @@ repository, without taking git's locks or changing its index. It is
 [Configuration](help:config)). A session on another host has its
 host's git run there.
 
+## Files
+
+The Files pane shows files, each in a tab of the session shown (a
+subagent's are its session's), up to eight, the one opened least
+recently closing for a ninth. It stays hidden until a file opens:
+Session → Open file... (Ctrl+O) asks for a path on this computer,
+starting from the session's folder, which Tab completes. After the
+path, `:N` goes to line N and `:A-B` to lines A to B, marked with a
+band until text is selected; opening it again goes there again.
+
+A file shows as text, its lines numbered and highlighted, wrapped at
+the pane's width unless Wrap is off (then scrolled sideways), or a
+Markdown file rendered, the Markdown box switching between the two at
+the same line. Reload (the circular arrow) reads it again, and a tab's
+menu closes tabs or copies the path. A binary file says so, with Show
+as text anyway; past 4 MiB or 100,000 lines only the start shows.
+
 ## The session's menu
 
 Right-click a session in the sidebar, or open the Session menu, for:

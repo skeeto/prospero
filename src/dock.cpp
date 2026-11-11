@@ -14,11 +14,13 @@
 //
 // The presets:
 //   Standard  Sessions over Todo, Transcript over Prompt, and a right
-//             column of Jobs and Log over Plan and Terminal
+//             column of Jobs and Log over Plan and Terminal, with Files
+//             as their tab once a file opens
 //   Compact   Standard without its right column: Jobs behind Todo, Plan
-//             behind Transcript, Log closed, and Terminal under Prompt
-//   Focus     a session alone: Transcript, Todo and Plan as tabs, over
+//             and Files behind Transcript, Log closed, and Terminal under
 //             Prompt
+//   Focus     a session alone: Transcript, Todo and Plan as tabs, over
+//             Prompt, Files among them once a file opens
 // Compact and Focus hide Prompt's tab bar, for room; Standard, the
 // first layout, keeps it, so its menu is found.
 //
@@ -61,6 +63,7 @@ enum : i32 {
     PANE_JOBS,
     PANE_LOG,
     PANE_TERMINAL,
+    PANE_FILES,
     PANE_HOSTS,
     PANE_SETTINGS,
     PANE_HELP,
@@ -71,16 +74,17 @@ static_assert(PANE_COUNT <= 32);  // as bits of a u32
 
 static char const *panenames[] = {
     "Sessions", "Transcript", "Prompt", "Todo", "Plan", "Changes", "Jobs", "Log",
-    "Terminal", "Hosts", "Settings", "Help", "Metrics",
+    "Terminal", "Files", "Hosts", "Settings", "Help", "Metrics",
 };
 static_assert(countof(panenames) == PANE_COUNT);
 
 // The panes hidden until asked for: the metrics; the changes, which a
 // click on the session bar's branch shows (ui.cpp drawbranch); and the
-// terminal, which Ctrl+` shows.
+// terminal, which Ctrl+` shows; and the files, which a file opened shows.
 static b32 panehidden(i32 pane)
 {
-    return pane==PANE_METRICS || pane==PANE_CHANGES || pane==PANE_TERMINAL;
+    return pane==PANE_METRICS || pane==PANE_CHANGES || pane==PANE_TERMINAL ||
+           pane==PANE_FILES;
 }
 
 #ifndef PROSPERO_DEVTOOLS
@@ -482,7 +486,8 @@ static Str docknamewhy(Str name)
 
 // A preset, as if read from the layout file. Help, Settings and Hosts
 // stay shown or hidden in Standard and Compact, whose side columns have
-// little room for them. Standard shows the terminal as a tab beside
+// little room for them, and Files too, hidden until a file opens; Focus
+// hides it, and a file opened shows it in the center. Standard shows the terminal as a tab beside
 // Plan, where a first run finds it; Compact, under the prompt, as tall
 // as it, for a command or two; Focus leaves it out, and Ctrl+` brings it
 // back, its shells having run on, in the home dockaddterm gives it under
@@ -506,8 +511,8 @@ static DockLayout dockpreset(i32 preset)
         dockline(&l, "Tabs", "Prompt");
         docksplit(&l, DOCK_Y, 1 - LAYOUT_PLAN);
         dockline(&l, "Tabs", "*Jobs,Log,Help,Settings,Hosts");
-        dockline(&l, "Tabs", "*Plan,Terminal,Changes");
-        l.keep = extras;
+        dockline(&l, "Tabs", "*Plan,Terminal,Changes,Files");
+        l.keep = extras | 1u<<PANE_FILES;
         break;
     case PRESET_COMPACT:
         dockline(&l, "Shown", "Sessions,Transcript,Prompt,Todo,Plan,Jobs,Terminal");
@@ -517,17 +522,17 @@ static DockLayout dockpreset(i32 preset)
         dockline(&l, "Tabs", "Sessions");
         dockline(&l, "Tabs", "*Todo,Jobs,Log");
         docksplit(&l, DOCK_Y, 1 - 2*LAYOUT_PROMPT);  // the terminal as tall
-        dockline(&l, "Center", "*Transcript,Plan,Changes,Help,Settings,Hosts");
+        dockline(&l, "Center", "*Transcript,Plan,Changes,Files,Help,Settings,Hosts");
         docksplit(&l, DOCK_Y, 0.5f);
         dockline(&l, "Tabs", "Prompt");
         dockline(&l, "TabBar", "Hidden");
         dockline(&l, "Tabs", "Terminal");
-        l.keep = extras;
+        l.keep = extras | 1u<<PANE_FILES;
         break;
     case PRESET_FOCUS:
         dockline(&l, "Shown", "Transcript,Prompt,Todo,Plan");
         docksplit(&l, DOCK_Y, 1 - LAYOUT_PROMPT);
-        dockline(&l, "Center", "*Transcript,Todo,Plan,Changes,Sessions,Jobs,Log,"
+        dockline(&l, "Center", "*Transcript,Todo,Plan,Changes,Files,Sessions,Jobs,Log,"
                                "Help,Settings,Hosts");
         dockline(&l, "Tabs", "Prompt");
         dockline(&l, "TabBar", "Hidden");
@@ -589,5 +594,30 @@ static b32 dockaddterm(DockLayout *l)
     leaf->front = -1;
     docktab(leaf, PANE_TERMINAL);
     l->floats &= ~(1u << PANE_TERMINAL);
+    return 1;
+}
+
+// Give Files a home, if it has none: a tab in the leaf holding Plan,
+// else in the center. Returns whether it changed the layout.
+static b32 dockaddfiles(DockLayout *l)
+{
+    if (dockplaced(l)>>PANE_FILES & 1) {
+        return 0;
+    }
+    i32 at = -1;
+    for (i32 i = 0; i < l->nparts; i++) {
+        DockPart *p = l->parts + i;
+        for (i32 t = 0; t < p->ntabs; t++) {
+            at = p->tabs[t]==PANE_PLAN ? i : at;
+        }
+    }
+    for (i32 i = 0; at<0 && i<l->nparts; i++) {
+        at = l->parts[i].central ? i : at;
+    }
+    if (at < 0) {
+        return 0;
+    }
+    docktab(l->parts + at, PANE_FILES);
+    l->floats &= ~(1u << PANE_FILES);
     return 1;
 }

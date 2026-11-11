@@ -196,6 +196,8 @@ enum : u32 {
                         // + and its result, or ! and why it failed
     TASK_CTRNOTE,       // its progress: NAME, a line, then the note
     TASK_FONTS,         // the system's fonts picked (findfonts): a line each
+    TASK_OPENFILE,      // Open file's path (fileanswerput): LINE0 LINE1 PATH, then
+                        // a line with its section
 };
 
 // Item rectangles the scripted checklist aims at
@@ -679,6 +681,7 @@ struct GuiSession {
     QForm       *qform;     // the answers to the agent's questions, null
                             // until it first asks
     TermSet      terms;     // a root's terminal tabs (term.cpp)
+    FileSet      files;     // and its Files tabs (files.cpp)
 };
 
 // A command awaiting its reply.
@@ -1073,6 +1076,55 @@ struct PathAsk {
     b32   shown;             // and drawn, last frame
     char  buf[FIELD_MAX];    // the field, from where the dialog would start
     Str   err;               // why the path typed was not taken
+};
+
+// Open file's modal (files.cpp): the path typed, with an ask of its own
+// rather than pask, whose single slot an attach's fallback may hold.
+// on the host whose files it opens (uid 0 for this computer).
+struct FileAsk {
+    PathAsk p;
+    u64     host;     // whose path it is, 0 for this computer
+    u8      err[96];  // p.err's bytes, made from filepath's
+};
+
+// A file's text view as drawdoc draws it (DocView of chunk messages, a
+// line a block): what to show, where to go, and where it is. The caller
+// keeps it across frames, filling in the inputs each frame.
+struct DocLines {
+    // In
+    b32 wrap;     // at the pane's width, else at FILES_COLS columns
+    i32 cols;     // the widest line's columns
+    i32 lines;    // the file's, for the gutter's width
+    i32 band0;    // lines banded, 1-based and clamped, else 0
+    i32 band1;
+    i32 jump0;    // lines to scroll to, 1-based and clamped, else 0
+    i32 jump1;
+    b32 restore;  // go to top, dy and scrollx
+    // In with restore, and out
+    i32 top;      // the line at the view's top, 0-based
+    f32 dy;       // how far past its top
+    f32 scrollx;
+    // Out
+    b32 jumped;   // the jump landed
+    b32 restored; // and the restore
+    b32 recorded; // top, dy and scrollx are as drawn
+    // Kept
+    f32 lasth;    // the view's height last frame
+    f32 seenw;    // the widest line drawn, unwrapped, grown as drawn
+};
+
+// Where the Files pane's text was drawn last, for the checklist.
+struct FileShown {
+    View  *v;       // null if no text view was drawn
+    ImVec2 wpos;    // its child window's top left
+    f32    winh;
+    f32    pad;     // text's origin from wpos, unscrolled
+    f32    gutter;
+    f32    scrolly;
+    f32    scrollx;
+    f32    width;   // laid out at
+    b32    hbar;    // a horizontal scrollbar
+    b32    band;    // the band was drawn
 };
 
 struct Export {
@@ -1738,8 +1790,9 @@ struct Gui {
     b32                opendellayout;
     i32                dellayout;  // the layout to delete, +1
     b32                openmodal;
+    u32                homeless;     // panes with no home in the dock space yet
+                                     //   (Terminal, Files), given one as shown
     // The Terminal pane (term.cpp)
-    b32                termhome;     // it has no home in the dock space yet
     TermTab           *termspare;    // closed tabs, to reuse
     GuiSession        *termbarroot;  // whose tabs the bar showed last
     ImRect             termgrid;     // the front tab's grid, as last drawn
@@ -1769,6 +1822,23 @@ struct Gui {
     i32                termforcecols;  // the checklist's grid size, past
     i32                termforcerows;  // its pane's, else 0
     i32                termverts;    // its window's vertices, as last drawn
+    // The Files pane (files.cpp)
+    FileTab           *filespare;    // closed tabs, to reuse
+    GuiSession        *filebarroot;  // whose tabs the bar showed last
+    u32                fileserial;   // the last tab's serial
+    b32                filewrap;     // new tabs wrap: the last choice made
+    FileAsk            fask;         // Open file's modal
+    DocLines           flines;       // the text view's state, as drawn
+    FileShown          fshown;       // and where, for the checklist
+    FileTab           *fshowing;     // the tab drawn last
+    u32                fshowingserial; // its serial then
+    i32                fshowingmode; // and its mode
+    FileBody          *fshowingbody; // and its body
+    u8                 fnotes[256];  // the notes it showed, for the checklist
+    i32                fnoteslen;
+    i32                fmarktop;     // a top line the checklist remembered
+    b32                filesdrawn;   // the pane was drawn this frame
+    i64                fileloads;    // files read, for the checklist
 
     // Files and log
     Str                statedir;
@@ -5874,6 +5944,14 @@ static void ontermenv(Gui *, Arena, Json *, b32);
 static void termopened(Gui *, GuiSession *, i64, Json *, b32, Str);
 static b32  termapply(Gui *, GuiHost *, Arena, EvRec *);
 static void termcloseall(Gui *);
+static void drawfiles(Gui *);
+static void filesweep(Gui *);
+static void filesrelease(Gui *);
+static void filesframe(Gui *);
+static void filesfont(Gui *);
+static void fileaskopen(Gui *);
+static Str  fileaskwhy(Gui *);
+static void fileanswer(Gui *, Str);
 static void termhostlost(Gui *, GuiHost *);
 static void termcloseengine(Gui *);
 static void drawterm(Gui *);
@@ -9653,6 +9731,11 @@ static void ontask(Gui *g, Record r)
     case TASK_TOAST:
         toastbg(g, r.data);
         return;
+    case TASK_OPENFILE:
+        if (r.id == g->fask.p.id) {
+            fileanswer(g, r.data);
+        }
+        return;
     case HTTP_HEAD:
     case HTTP_BODY:
     case HTTP_DONE:
@@ -10873,6 +10956,7 @@ static b32 gobackground(Gui *g)
         // having no window to show them.
         guirelaylostall(g, newarena(g->cmdr), "this computer's window closed");
         termcloseall(g);
+        filesrelease(g);     // the files, read again when shown
         termcloseengine(g);  // and those whose term.open is still in flight
         Arena hp = newarena(os_reserve(g->os, (iz)1<<30));
         g->host  = hp.beg ? newhost(g->os, &hp, g->frame, &hc, &why) : 0;
@@ -11091,6 +11175,7 @@ static void setpane(Gui *, i32, b32);
 
 #include "ui.cpp"
 #include "term.cpp"
+#include "files.cpp"
 
 
 // The fake agent
@@ -11781,6 +11866,7 @@ static void fontsize(Gui *g)
     }
     g->nosession.view->topsdirty = 1;
     cachereset(g->vcache, 1);  // layouts for the old font size
+    filesfont(g);
     schedforce(&g->sched);
 }
 
@@ -12179,7 +12265,11 @@ static void setpane(Gui *g, i32 pane, b32 show)
         scheddirty(&g->sched);
     }
     if (show) {
-        g->panefocus = pane + 1;
+        // Asked for, as a file opened shows Files: a layout's refocus
+        // (layoutrefocus), counted in frames, which may yet be running,
+        // must not hand its focus back to its leaf's front
+        g->panefocus   = pane + 1;
+        g->layoutfocus = 0;
     }
 }
 
@@ -12380,6 +12470,7 @@ static void gui_frame(Gui *g)
         fontsize(g);  // zoomed, [ui] font_size changed, or fonts added
     }
     cachereset(g->vcache, 0);
+    filesframe(g);
     if (g->held && s->now>=g->holduntil) {
         gui_wake(g);  // the hold is over: take what piled up
     }
@@ -12992,6 +13083,8 @@ enum : i32 {
                   // the picker lists a folder; dx 0 lets the walk go on
     OP_MENTIONS,  // dx 0 as [ui] mentions = false would, dx 1 as true
     OP_NODIALOG,  // the next file dialog cannot be shown, as without a portal
+    OP_OPENFILE,  // open text in Files, as a reference (fileref) in --cwd,
+                  // in the session shown
 };
 // OP_TEXTCWD with text types the --cwd directory and text after it, on
 // Windows with backslashes, as a Windows user types a path.
@@ -13105,6 +13198,7 @@ enum : i32 {
     T_SIDELINK,    // a side chat's link back to its original
     T_NEWMODEL,    // the new session dialog's model combo
     T_NEWPICK,     // its first pick other than the default model
+    T_FILETEXT,    // the start of the Files text's line text, 1-based
 };
 
 enum : i32 {
@@ -13475,6 +13569,19 @@ enum : i32 {
     CHK_CFGSAVED,     // the settings' last edit was saved
     CHK_GAUGECOUNT,   // the gauge is a count of tokens alone, no window known
     CHK_ESCHINT,      // the "Esc again stops" toast shows, or not (dx 0)
+    CHK_FILELINE,     // the Files text's line dx (to dy) is in view, with
+                      // text "centered" centered, "away" not in view; or
+                      // "mark" remembers the top line and "kept" compares
+    CHK_FILEBAND,     // the band is drawn (dx 1) or not, over text "A-B"
+    CHK_FILEROWS,     // line dx takes dy rows (0: more than one), "hbar"
+                      // with a horizontal scrollbar, "nohbar" without
+    CHK_FILETABS,     // the shown root's file tab labels, '|' between, '*' front
+    CHK_FILEMODE,     // the front file is drawn in mode dx (FMODE_*)
+    CHK_FILENOTE,     // the pane's notes have text, or none for ""
+    CHK_FILEASKERR,   // Open file is up, saying text
+    CHK_FILESHOWN,    // Files is hidden (dx 0), shown (1), or shown central (2)
+    CHK_FILEBODIES,   // the bodies fit the budget, dx files read at least
+    CHK_FILEQUIET,    // no frames while idle, a file shown
     CHK_COUNT,
 };
 
@@ -13779,6 +13886,11 @@ static Str chknames[] = {
     "the settings edit was saved",
     "with no window known, the gauge is the count of tokens",
     "the Esc again toast shows, or not, as said",
+    "the file's lines are where they should be", "the file's band is as said",
+    "the file's line takes its rows", "the file tabs are as said",
+    "the file is shown in its mode", "the Files pane's notes are as said",
+    "Open file says why not", "the Files pane is where it should be",
+    "the files read fit their budget", "no frames while idle, a file shown",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -13865,6 +13977,7 @@ enum : i32 {
     W_TERM,       // the shown session's terminal shows text
     W_TERMBUSY,   // its front tab runs a program, or not with "idle"
     W_TERMCOUNT,  // dx terminals are open, in every session
+    W_FILEREADY,  // the front file is read and drawn, jumped or restored
 };
 
 static Str waitnames[] = {
@@ -13891,8 +14004,9 @@ static Str waitnames[] = {
     "the changes", "the folder's probe", "the worktree's branch",
     "the thin remote", "a relayed stream", "the container",
     "the terminal's text", "the terminal's program", "the terminals' count",
+    "the file",
 };
-static_assert(countof(waitnames) == W_TERMCOUNT+1);
+static_assert(countof(waitnames) == W_FILEREADY+1);
 
 enum : i32 {
     KEY_CTRL  = 1,
@@ -15586,6 +15700,199 @@ static DriveOp m3ops[] = {
     {OP_MOVE, T_CFGCLEAR, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 500, ""},
+    // The Files pane (gui.py's files in work/files). Open file, with the
+    // pane hidden: Ctrl/Cmd+O, a path Tab completes, a line after it,
+    // and the pane docks, its text jumped to the line, centered
+    {OP_MAIN, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_FILESHOWN, 0, 0, 0, ""},
+    CMDKEY(GKEY_O, 500),
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_TEXTCWD, 0, 0, 0, 300, "/files/line"},
+    {OP_KEYDOWN, 0, GKEY_TAB, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_TAB, 0, 300, ""},
+    {OP_TEXT, 0, 0, 0, 300, ":1200"},
+    {OP_SHOT, 0, 0, 0, 300, "files-open"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Files"},
+    {OP_CHECK, CHK_FILELINE, 1200, 0, 0, "centered"},
+    // Lines cited: centered and banded; scrolled away from and opened
+    // again, jumped to again; a selection hides the band
+    {OP_OPENFILE, 0, 0, 0, 300, "files/lines.txt:1500-1504"},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILELINE, 1500, 1504, 0, "centered"},
+    {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "1500-1504"},
+    {OP_SHOT, 0, 0, 0, 300, "files-band"},
+    {OP_MOVE, T_FILETEXT, 0, 0, 100, "1500"},
+    {OP_WHEEL, 0, 0, -10, 50, ""},
+    {OP_WHEEL, 0, 0, -10, 50, ""},
+    {OP_WHEEL, 0, 0, -10, 800, ""},
+    {OP_CHECK, CHK_FILELINE, 1500, 0, 0, "away"},
+    {OP_OPENFILE, 0, 0, 0, 300, "files/lines.txt:1500-1504"},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILELINE, 1500, 1504, 0, "centered"},
+    {OP_MOVE, T_FILETEXT, 0, 0, 100, "1500"},
+    {OP_DOWN, 0, 0, 0, 100, ""},
+    {OP_MOVE, T_FILETEXT, 20, 0, 100, "1501"},
+    {OP_MOVE, T_FILETEXT, 30, 0, 300, "1502"},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_FILEBAND, 0, 0, 0, ""},
+    // Copied across a blank line and the end of a chunk (256 lines), as
+    // the file has them
+    {OP_OPENFILE, 0, 0, 0, 300, "files/lines.txt:256"},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_MOVE, T_FILETEXT, 0, 0, 100, "255"},
+    {OP_DOWN, 0, 0, 0, 100, ""},
+    {OP_MOVE, T_FILETEXT, 0, 0, 100, "257"},
+    {OP_MOVE, T_FILETEXT, 0, 0, 300, "258"},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "text copy"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_CLIPBOARD, 0, 0, 0, "line 255\n\nline 257\n"},
+    {OP_MOVE, T_FILETEXT, 0, 0, 100, "257"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    // Past the end: a note, and the last line
+    {OP_OPENFILE, 0, 0, 0, 300, "files/lines.txt:5000"},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILENOTE, 0, 0, 0, "The file has only 3000 lines."},
+    {OP_CHECK, CHK_FILELINE, 3000, 0, 0, ""},
+    {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "3000-3000"},
+    // A long line wraps; unwrapped it takes a row, scrolled sideways,
+    // the top line kept
+    {OP_OPENFILE, 0, 0, 0, 300, "files/long.txt:150"},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEROWS, 100, 0, 0, "nohbar"},
+    {OP_CHECK, CHK_FILELINE, 0, 0, 0, "mark"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file wrap"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_CHECK, CHK_FILEROWS, 100, 1, 0, "hbar"},
+    {OP_CHECK, CHK_FILELINE, 0, 0, 0, "kept"},
+    {OP_SHOT, 0, 0, 0, 300, "files-nowrap"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file wrap"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_CHECK, CHK_FILELINE, 0, 0, 0, "kept"},
+    // Unwrapped, the last line jumped to is over the scrollbar
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file wrap"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_OPENFILE, 0, 0, 0, 300, "files/long.txt:300"},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEROWS, 300, 1, 0, "hbar"},
+    {OP_CHECK, CHK_FILELINE, 300, 0, 0, "whole"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file wrap"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    // Two files of one name, told apart by their folders
+    {OP_OPENFILE, 0, 0, 0, 300, "files/a/x.c"},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_OPENFILE, 0, 0, 0, 300, "files/b/x.c"},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILETABS, 0, 0, 0, "lines.txt|long.txt|a/x.c|*b/x.c"},
+    {OP_SHOT, 0, 0, 0, 300, "files-tabs"},
+    // Markdown shows as Markdown; as text, the top line is kept
+    {OP_OPENFILE, 0, 0, 0, 300, "files/notes.md"},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEMODE, FMODE_MARKDOWN, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file text"},
+    {OP_WHEEL, 0, 0, -10, 800, ""},
+    {OP_SHOT, 0, 0, 0, 300, "files-markdown"},
+    {OP_CHECK, CHK_FILELINE, 0, 0, 0, "mark"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file markdown"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEMODE, FMODE_TEXT, 0, 500, ""},
+    {OP_CHECK, CHK_FILELINE, 0, 0, 0, "kept"},
+    // A heading opened is the Markdown's again
+    {OP_OPENFILE, 0, 0, 0, 300, "files/notes.md#notes"},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEMODE, FMODE_MARKDOWN, 0, 500, ""},
+    // CRLF and a byte order mark: neither shown nor copied
+    {OP_OPENFILE, 0, 0, 0, 300, "files/crlf.txt"},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_MOVE, T_FILETEXT, 0, 0, 100, "1"},
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "text select all"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_FILETEXT, 0, 0, 100, "1"},
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "text copy"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_CLIPBOARD, 0, 0, 0, "first\nsecond\nthird\n"},
+    // A binary file says so, and shows as text when asked
+    {OP_OPENFILE, 0, 0, 0, 300, "files/blob.bin"},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILENOTE, 0, 0, 0, "This is a binary file (14 bytes)."},
+    {OP_SHOT, 0, 0, 0, 300, "files-binary"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file astext"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILENOTE, 0, 0, 0, ""},
+    {OP_CHECK, CHK_FILEMODE, FMODE_TEXT, 0, 0, ""},
+    // Past FILES_LINES, cut
+    {OP_OPENFILE, 0, 0, 0, 300, "files/huge.txt"},
+    {OP_WAIT, W_FILEREADY, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_FILENOTE, 0, 0, 0, "Only its first 100000 lines are shown."},
+    // A ninth file closes the tab opened least recently
+    {OP_OPENFILE, 0, 0, 0, 300, "hello.txt"},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILETABS, 0, 0, 0,
+     "long.txt|a/x.c|b/x.c|notes.md|crlf.txt|blob.bin|huge.txt|*hello.txt"},
+    // A missing file: Open file says so
+    CMDKEY(GKEY_O, 500),
+    {OP_TEXTCWD, 0, 0, 0, 300, "/files/nope.txt"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 500, ""},
+    {OP_CHECK, CHK_FILEASKERR, 0, 0, 0, "No such file"},
+    {OP_SHOT, 0, 0, 0, 300, "files-askerr"},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 500, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    // Another session has its own tabs, none
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Fail over."},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_FILETABS, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "files-empty"},
+    {OP_MAIN, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_FILETABS, 0, 0, 0,
+     "long.txt|a/x.c|b/x.c|notes.md|crlf.txt|blob.bin|huge.txt|*hello.txt"},
+    // The second layout, Compact, keeps Files shown; Focus hides it, and
+    // a file opened shows it in the center
+    {OP_MOVE, T_TRANSCRIPT, 0, 0, 100, ""},
+    {OP_KEYDOWN, 0, GKEY_CMD, KEY_CMD, 50, ""},
+    {OP_KEYDOWN, 0, GKEY_2, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_2, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_CMD, 0, 800, ""},
+    {OP_CHECK, CHK_COMPACT, 0, 0, 0, ""},
+    {OP_CHECK, CHK_FILESHOWN, 1, 0, 0, ""},
+    LAYOUT("Focus"),
+    {OP_CHECK, CHK_FILESHOWN, 0, 0, 0, ""},
+    {OP_OPENFILE, 0, 0, 0, 300, "files/a/x.c"},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Files"},
+    {OP_CHECK, CHK_FILESHOWN, 2, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "files-focus"},
+    LAYOUT("Standard"),
+    {OP_CHECK, CHK_FILESHOWN, 1, 0, 0, ""},
+    {OP_CHECK, CHK_FILEBODIES, 9, 0, 0, ""},
+    // Quiet with a file shown, past the tooltips and the layout's save
+    {OP_MOVE, T_EMPTY, 0, 0, 4500, ""},
+    {OP_MARK, 0, 0, 0, 3000, ""},
+    {OP_CHECK, CHK_FILEQUIET, 0, 0, 0, ""},
     // Closing with a turn running asks first; Cancel goes back, and
     // stopping quits
     {OP_PROMPT, 0, 0, 0, 100, "Close me: run a very slow command."},
@@ -19789,6 +20096,10 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_THINKHDR:      return rectcenter(g->rects[RECT_THINKHDR]);
     case T_RAIL:          return rectcenter(g->rects[RECT_RAIL]);
     case T_USERMSG:       return rectcenter(g->rects[RECT_USERMSG]);
+    case T_FILETEXT: {
+        Int n = parseint(g->ops[g->drivepc-1].text);
+        return n.ok ? filelineat(g, (i32)n.val, 2*g->scale) : v2(-1, -1);
+    }
     case T_SIDELINK:      return rectcenter(g->rects[RECT_SIDELINK]);
     case T_CODEBLOCK:     return rectcenter(g->rects[RECT_CODEBLOCK]);
     case T_CODECOPY:      return rectcenter(g->rects[RECT_CODECOPY]);
@@ -20109,6 +20420,7 @@ static b32 docktreecheck(Gui *g)
         {PANE_PLAN,       right->ChildNodes[1]},
         {PANE_TERMINAL,   right->ChildNodes[1]},
         {PANE_CHANGES,    right->ChildNodes[1]},
+        {PANE_FILES,      right->ChildNodes[1]},
         {PANE_HELP,       rtop},
         {PANE_SETTINGS,   rtop},
         {PANE_HOSTS,      rtop},
@@ -20185,6 +20497,7 @@ static b32 compactcheck(Gui *g)
         {PANE_TRANSCRIPT, top},
         {PANE_PLAN,       top},
         {PANE_CHANGES,    top},
+        {PANE_FILES,      top},
         {PANE_HELP,       top},
         {PANE_SETTINGS,   top},
         {PANE_HOSTS,      top},
@@ -20512,6 +20825,181 @@ static i64 drivetermcount(Gui *g)
     return n;
 }
 
+// The Files pane, for the checklist: the front tab read and drawn, at
+// its cited lines if any, else at its place restored.
+static b32 drivefileready(Gui *g)
+{
+    FileTab *ft = filefront(g);
+    if (!ft || !g->filesdrawn || ft->state==FTAB_UNREAD || ft->state==FTAB_READING) {
+        return 0;
+    }
+    return ft->state==FTAB_FAILED || g->fshowing!=ft ||
+           (!g->flines.restore && (!ft->jump || ft->jumped || ft->mode!=FMODE_TEXT));
+}
+
+// The Files pane's checks (CHK_FILE*), logging what was found.
+static b32 drivefilecheck(Gui *g, i32 chk)
+{
+    DriveOp   *op = &g->ops[g->drivepc-1];
+    FileShown *fs = &g->fshown;
+    FileTab   *ft = filefront(g);
+    Arena      a  = g->frame;
+    Buf        b(&a, 1024);
+    b32        ok = 0;
+    switch (chk) {
+    case CHK_FILELINE: {
+        // Line dx, to dy, is in view; or centered there; or the last's
+        // whole row in view ("whole"); or the top line remembered
+        // ("mark"), the same again ("kept"); or out of view
+        i32 n0 = (i32)op->dx;
+        i32 n1 = op->dy>0 ? (i32)op->dy : n0;
+        if (op->text == Str("mark")) {
+            g->fmarktop = ft ? ft->top : -1;
+            print(&b, "drive: the top line is ");
+            print(&b, (i64)g->fmarktop + 1);
+            ok = ft != 0;
+            break;
+        } else if (op->text == Str("kept")) {
+            print(&b, "drive: the top line is ");
+            print(&b, ft ? (i64)ft->top + 1 : 0);
+            print(&b, ", was ");
+            print(&b, (i64)g->fmarktop + 1);
+            ok = ft && ft->top==g->fmarktop;
+            break;
+        }
+        ImVec2 p0 = filelineat(g, n0, 0);
+        ImVec2 p1 = filelineat(g, n1, 0);
+        f32    lh = fontmetrics(&g->fonts, STYLE_CODE).lineh;
+        f32    top = fs->wpos.y, bot = fs->wpos.y + fs->winh;
+        b32    in  = fs->v && p0.y>=top && p1.y<=bot;
+        f32    mid = (p0.y + p1.y)/2;
+        f32    off = mid - (top + bot)/2;
+        print(&b, "drive: lines ");
+        print(&b, (i64)n0);
+        print(&b, "-");
+        print(&b, (i64)n1);
+        print(&b, " at ");
+        print(&b, (i64)(p0.y - top));
+        print(&b, "-");
+        print(&b, (i64)(p1.y - top));
+        print(&b, " in a view ");
+        print(&b, (i64)fs->winh);
+        print(&b, " tall");
+        if (op->text == Str("centered")) {
+            // Centered if the lines fit, wrapped as laid out, else the
+            // first a third of the way down, as the jump puts them
+            i32 rows = filelinerows(g, n1);
+            f32 y0   = p0.y - lh/2;
+            f32 y1   = p1.y - lh/2 + (f32)(rows>0 ? rows : 1)*lh;
+            if (y1-y0 > fs->winh - 2*fs->pad) {
+                f32 third = y0 - (top + fs->winh/3);
+                print(&b, ", too tall to center");
+                ok = fs->v && third<1.5f*lh && third>-1.5f*lh;
+            } else {
+                off = (y0 + y1)/2 - (top + bot)/2;
+                ok  = in && off<1.5f*lh && off>-1.5f*lh;
+            }
+        } else if (op->text == Str("whole")) {
+            ok = in && p1.y+lh/2<=bot;
+        } else if (op->text == Str("away")) {
+            ok = fs->v && !(p0.y>=top && p0.y<=bot);
+        } else {
+            ok = in;
+        }
+    } break;
+    case CHK_FILEBAND: {
+        // Drawn (dx 1) or not, over the lines text says if any
+        print(&b, "drive: the band is ");
+        print(&b, fs->band ? Str("drawn, ") : Str("not drawn, "));
+        print(&b, ft ? (i64)ft->band0 : 0);
+        print(&b, "-");
+        print(&b, ft ? (i64)ft->band1 : 0);
+        Buf want(&a, 32);
+        if (ft) {
+            print(&want, (i64)fileclamp(ft->band0, ft->body ? ft->body->lines : 0));
+            print(&want, "-");
+            print(&want, (i64)fileclamp(ft->band1, ft->body ? ft->body->lines : 0));
+        }
+        ok = ft && fs->v && fs->band==(op->dx!=0) &&
+             (!op->text.len || finish(&want)==op->text);
+    } break;
+    case CHK_FILEROWS: {
+        // Line dx takes dy rows, or more than one with dy 0, and the view
+        // has a horizontal scrollbar ("hbar") or not ("nohbar")
+        i32 rows = filelinerows(g, (i32)op->dx);
+        print(&b, "drive: line ");
+        print(&b, (i64)op->dx);
+        print(&b, " takes ");
+        print(&b, (i64)rows);
+        print(&b, fs->hbar ? Str(" rows, scrolled sideways") : Str(" rows"));
+        ok = fs->v && (op->dy>0 ? rows==(i32)op->dy : rows>1);
+        ok &= op->text!=Str("hbar")   || fs->hbar;
+        ok &= op->text!=Str("nohbar") || !fs->hbar;
+    } break;
+    case CHK_FILETABS: {
+        GuiSession *root = filesroot(g);
+        FileSet    *set  = &root->files;
+        Str        *hosts = alloc<Str>(&a, set->n);
+        Measure     m = {};
+        m.advance = widgetadvance;
+        Str *labels = filelabels(&a, set, hosts, 0, &m);  // uncut: no font here
+        Buf  t(&a, 512);
+        for (i32 i = 0; i < set->n; i++) {
+            print(&t, i ? Str("|") : Str(""));
+            print(&t, i==set->front ? Str("*") : Str(""));
+            print(&t, labels[i]);
+        }
+        Str got = finish(&t);
+        print(&b, "drive: the file tabs are ");
+        print(&b, got);
+        ok = got == op->text;
+    } break;
+    case CHK_FILEMODE:
+        print(&b, "drive: the front file is in mode ");
+        print(&b, ft ? (i64)ft->mode : -1);
+        ok = ft && g->fshowing==ft && ft->mode==(i32)op->dx;
+        break;
+    case CHK_FILENOTE: {
+        Str notes = {g->fnotes, g->fnoteslen};
+        print(&b, "drive: the file's notes: ");
+        print(&b, notes);
+        ok = g->filesdrawn && (op->text.len ? find(notes, op->text)>=0 : !notes.len);
+    } break;
+    case CHK_FILEASKERR:
+        print(&b, "drive: Open file says ");
+        print(&b, g->fask.p.err);
+        ok = g->fask.p.shown && g->fask.p.err==op->text;
+        break;
+    case CHK_FILESHOWN: {
+        // dx 0 hidden, 1 shown, 2 shown in the central node
+        ImGuiWindow   *w = ImGui::FindWindowByName(panenames[PANE_FILES]);
+        ImGuiDockNode *n = w ? w->DockNode : 0;
+        print(&b, "drive: Files is ");
+        print(&b, g->panes[PANE_FILES] ? Str("shown") : Str("hidden"));
+        print(&b, n && n->IsCentralNode() ? Str(", central") : Str(""));
+        ok = op->dx==0 ? !g->panes[PANE_FILES] :
+             op->dx==1 ? g->panes[PANE_FILES] != 0 :
+             g->panes[PANE_FILES] && n && n->IsCentralNode();
+    } break;
+    case CHK_FILEBODIES: {
+        // Within the budget, dx at least read since the start
+        i32 n     = 0;
+        iz  bytes = filebytes(g, &n);
+        print(&b, "drive: file bodies ");
+        print(&b, (i64)n);
+        print(&b, ", ");
+        print(&b, (i64)(bytes>>10));
+        print(&b, " KiB; read ");
+        print(&b, g->fileloads);
+        ok = bytes<=FILES_BUDGET && n>0 && g->fileloads>=(i64)op->dx;
+    } break;
+    case CHK_FILEQUIET:
+        return g->panes[PANE_FILES] && drivequiet(g, "idle with a file shown", 2);
+    }
+    guilog(g, finish(&b));
+    return ok;
+}
+
 static b32 drivewaitdone(Gui *g)
 {
     View *v = g->view;
@@ -20678,6 +21166,8 @@ static b32 drivewaitdone(Gui *g)
     }
     case W_TERMCOUNT:
         return (f32)drivetermcount(g) == g->ops[g->drivepc-1].dx;
+    case W_FILEREADY:
+        return drivefileready(g);
     case W_VIA:
         return g->sess && v->state==LIVE_STREAMING && v->relaylen>0 && v->deltas>0;
     case W_PLAN: {
@@ -22608,6 +23098,17 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_TERMCOUNT:
         return (f32)drivetermcount(g) == g->ops[g->drivepc-1].dx;
+    case CHK_FILELINE:
+    case CHK_FILEBAND:
+    case CHK_FILEROWS:
+    case CHK_FILETABS:
+    case CHK_FILEMODE:
+    case CHK_FILENOTE:
+    case CHK_FILEASKERR:
+    case CHK_FILESHOWN:
+    case CHK_FILEBODIES:
+    case CHK_FILEQUIET:
+        return drivefilecheck(g, chk);
     case CHK_TERMQUIET:
         return g->panes[PANE_TERMINAL] && drivequiet(g, "idle with the terminal shown", 2);
     case CHK_TERMFORCE: {
@@ -24012,6 +24513,18 @@ static void drivestep(Gui *g)
     case OP_NODIALOG:
         g->nodialog = 1;
         break;
+    case OP_OPENFILE: {
+        Arena    a   = g->frame;
+        FileRef  ref = fileref(&a, op->text);
+        FilePath p   = filepath(&a, ref, g->drivecwd, {}, HOST_WINDOWS, 0);
+        if (p.err.len) {
+            guilog(g, concat(&a, "drive: FAIL cannot open the file: ", p.err));
+            g->drivechecks++;
+            g->drivefails++;
+            break;
+        }
+        filesopen(g, g->sess, 0, p.path, ref.line0, ref.line1, ref.section);
+    } break;
     case OP_PLACE:
         if (op->dx != 0) {
             // As if saved on a display right of every display there is
@@ -24877,6 +25390,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
         setcur(g, s);
     }
 
+    g->filewrap = 1;  // new Files tabs wrap until one is unwrapped
     readconfig(g, g->frame);
 
     IMGUI_CHECKVERSION();

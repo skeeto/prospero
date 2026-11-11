@@ -52,7 +52,7 @@ static void test_dock(Test *t)
            "Tabs=Prompt\n"
            "Split=Y,0.5\n"
            "Tabs=*Jobs,Log,Help,Settings,Hosts\n"
-           "Tabs=*Plan,Terminal,Changes\n");
+           "Tabs=*Plan,Terminal,Changes,Files\n");
 
     // Compact keeps the left column's width, with no right column, and
     // the terminal under the prompt, as tall as it
@@ -64,7 +64,7 @@ static void test_dock(Test *t)
            "Tabs=Sessions\n"
            "Tabs=*Todo,Jobs,Log\n"
            "Split=Y,0.44\n"
-           "Center=*Transcript,Plan,Changes,Help,Settings,Hosts\n"
+           "Center=*Transcript,Plan,Changes,Files,Help,Settings,Hosts\n"
            "Split=Y,0.5\n"
            "Tabs=Prompt\n"
            "TabBar=Hidden\n"
@@ -75,7 +75,7 @@ static void test_dock(Test *t)
     expect(t, "dock.focus", dockstr(&a, &focus),
            "Shown=Transcript,Prompt,Todo,Plan\n"
            "Split=Y,0.72\n"
-           "Center=*Transcript,Todo,Plan,Changes,Sessions,Jobs,Log,Help,Settings,Hosts\n"
+           "Center=*Transcript,Todo,Plan,Changes,Files,Sessions,Jobs,Log,Help,Settings,Hosts\n"
            "Tabs=Prompt\n"
            "TabBar=Hidden\n");
 
@@ -102,6 +102,9 @@ static void test_dock(Test *t)
         expect(t, concat(&a, name, ".keep"), istr(&a, l.keep==0),
                i==PRESET_FOCUS ? Str("1") : Str("0"));
         expect(t, concat(&a, name, ".keepterm"), istr(&a, l.keep>>PANE_TERMINAL & 1), "0");
+        expect(t, concat(&a, name, ".keepfiles"), istr(&a, l.keep>>PANE_FILES & 1),
+               focus ? Str("0") : Str("1"));
+        expect(t, concat(&a, name, ".hidefiles"), istr(&a, l.shown>>PANE_FILES & 1), "0");
         b32 done = dockdone(&l);
         expect(t, concat(&a, name, ".done"), istr(&a, done), "1");
         expect(t, concat(&a, name, ".pruned"), dockstr(&a, &l), text);
@@ -151,7 +154,7 @@ static void test_dock(Test *t)
            "Shown=Transcript,Prompt,Todo,Plan\n"
            "Split=Y,0.6\n"
            "Split=Y,0.72\n"
-           "Center=*Transcript,Todo,Plan,Changes,Sessions,Jobs,Log,Help,Settings,Hosts\n"
+           "Center=*Transcript,Todo,Plan,Changes,Files,Sessions,Jobs,Log,Help,Settings,Hosts\n"
            "Tabs=Prompt\n"
            "TabBar=Hidden\n"
            "Tabs=Terminal\n");
@@ -168,6 +171,33 @@ static void test_dock(Test *t)
                "Shown=Terminal\nSplit=X,0.3\nTabs=Todo\nSplit=Y,0.6\n"
                "Center=Transcript\nTabs=Terminal\n");
     }
+
+    // Files' home, in a layout saved without it: a tab with Plan, else
+    // in the center; none if it has one, docked or floating
+    {
+        b32        ok = 0;
+        DockLayout l  = dockread("Shown=Transcript,Plan\nSplit=X,0.7\nCenter=Transcript\n"
+                                 "Tabs=*Plan,Changes\n", &ok);
+        expect(t, "dock.addfiles.read", istr(&a, ok), "1");
+        expect(t, "dock.addfiles", istr(&a, dockaddfiles(&l)), "1");
+        expect(t, "dock.addfiles.again", istr(&a, dockaddfiles(&l)), "0");
+        expect(t, "dock.addfiles.plan", dockstr(&a, &l),
+               "Shown=Transcript,Plan\nSplit=X,0.7\nCenter=Transcript\n"
+               "Tabs=*Plan,Changes,Files\n");
+        l = dockread("Shown=Transcript\nSplit=Y,0.7\nCenter=Transcript,Todo\nTabs=Prompt\n", &ok);
+        expect(t, "dock.addfiles.center", istr(&a, dockaddfiles(&l)), "1");
+        expect(t, "dock.addfiles.centered", dockstr(&a, &l),
+               "Shown=Transcript\nSplit=Y,0.7\nCenter=Transcript,Todo,Files\nTabs=Prompt\n");
+        l = dockread("Shown=Files\nCenter=Transcript\nFloat=Files,0,0,0.5,0.5\n", &ok);
+        expect(t, "dock.addfiles.floated", istr(&a, dockaddfiles(&l)), "0");
+        DockLayout std2 = dockpreset(PRESET_STANDARD);
+        expect(t, "dock.addfiles.placed", istr(&a, dockaddfiles(&std2)), "0");
+    }
+    // Files comes after Terminal in the panes' order, and the layout
+    // file names them all
+    expect(t, "dock.panes", istr(&a, PANE_COUNT), "14");
+    expect(t, "dock.filesname", panestr(PANE_FILES), "Files");
+    expect(t, "dock.filesafter", istr(&a, PANE_FILES == PANE_TERMINAL+1), "1");
 
     // A pane floating at its place, which is kept within the dock space
     Str floats = "Shown=Transcript,Metrics,Help\n"

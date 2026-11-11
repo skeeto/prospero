@@ -239,6 +239,28 @@ static void test_fileset(Test *t)
         expect(t, concat(&a, "filenorm cut ", cuts[i].want), got, cuts[i].want);
     }
 
+    // A head read short of the file's end, up to its last whole line
+    struct { Str raw; iz want; } wholes[] = {
+        {"ab\ncd",                  3},
+        {"ab\r\ncd\r",             4},  // CRLF
+        {"abcd",                    4},  // no LF: all, for filenorm to cut
+        {"",                        0},
+        {"\n",                      1},
+        {"\xff\xfe" "a\0\n\0b\0",  6},  // UTF-16LE
+        {"\xff\xfe" "a\0\n\0\n",   6},  // an odd last byte
+        {"\xff\xfe" "\n\0\x0aN" "a",  4},  // U+4E0A's 0A no LF
+        {"\xff\xfe\x0a\x0a\x0aN",    6},  // nor U+0A0A's, nor U+4E0A's
+        {"\xff\xfe" "abc",           4},  // no LF, whole units
+        {"\xfe\xff\0a\0\n\0b",      6},  // UTF-16BE
+        {"\xfe\xff\0\n\x0a\0",      4},  // U+0A00's 0A no LF
+        {"\xfe\xff\0\r\0\n\0b",     6},  // CRLF, big-endian
+        {"\xfe\xff",                2},
+    };
+    for (iz i = 0; i < countof(wholes); i++) {
+        expect(t, concat(&a, "filewhole ", istr(&a, (i64)i)),
+               istr(&a, filewhole(wholes[i].raw)), istr(&a, wholes[i].want));
+    }
+
     // Decoding that grows past maxbytes, though the file is smaller:
     // windows-1252 at 3 bytes a byte, U+FFFD runs, and UTF-16
     {

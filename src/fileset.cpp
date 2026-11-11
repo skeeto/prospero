@@ -46,6 +46,7 @@ struct FileTab {
     u64       host;       // its host's uid, 0 for this computer
     b32       win;        // a Windows host's: compared without case
     Str       path;       // absolute and normalized
+    iz        pathcap;    // its room, used again by a spare
     i32       state;      // FTAB_*
     i32       mode;       // FMODE_*
     b32       wrap;
@@ -401,6 +402,31 @@ static FileText filenorm(Arena *a, Str raw, b32 astext, iz maxbytes, i32 maxline
     }
     z.r.text = webfinish(&z.b);
     return z.r;
+}
+
+// How much of a file's head, read short of its end, to show: up to its
+// last whole line, an LF a whole code unit in UTF-16 by its mark. With
+// no LF, all of it (in whole units), for filenorm to cut its line.
+static iz filewhole(Str raw)
+{
+    if (startswith(raw, "\xff\xfe") || startswith(raw, "\xfe\xff")) {
+        b32 le  = raw[0] == 0xff;
+        iz  end = 2 + (raw.len - 2)/2*2;
+        for (iz n = end; n > 2; n -= 2) {
+            u8 lo = le ? raw[n-2] : raw[n-1];
+            u8 hi = le ? raw[n-1] : raw[n-2];
+            if (lo=='\n' && !hi) {
+                return n;
+            }
+        }
+        return end;
+    }
+    for (iz n = raw.len; n > 0; n--) {
+        if (raw[n-1] == '\n') {
+            return n;
+        }
+    }
+    return raw.len;
 }
 
 // A cited line as it can be shown: 1 to lines, else 0 for none.
