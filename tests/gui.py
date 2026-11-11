@@ -2111,13 +2111,15 @@ def main():
         if "[ui]\ntheme = light\n" not in after:
             problems.append("the theme was not saved as light under [ui]")
         # The edits, in order: the long value, the theme, notify, the roots, the
-        # deleted endpoint with its comment, the new model, remote and endpoint
+        # deleted endpoint with its comment, the new model, theme, remote and
+        # endpoints
         want = before.replace(f"prompt = {LONG_PROMPT}\n", f"prompt = {LONG_PROMPT}! Left by Tab, then.\n")
         want = want.replace("temp = ask\n", "temp = ask\nroots = ~/a; ~/b\n")
         want = want.replace(SETTINGS_GONE + "\n", "")
         want += ("\n[ui]\ntheme = light\nnotify = allow\n"
                  "\n[theme gruvbox]\npanel = #3c3836\n"
                  "\n[model fresh]\nreasoning = reasoning_content\n"
+                 "\n[theme mine]\nbase = dark\n"
                  "\n[remote box]\nssh = me@box.example\npath = ~/bin/prospero\n"
                  "\n[endpoint gpt]\nkind = anthropic\nurl = http://gpt.example/v1\n"
                  "\n[endpoint oa]\nkind = copilot\n"
@@ -2128,7 +2130,7 @@ def main():
             problems.append("the configuration is not the edits alone:\n" + "\n".join(diff))
         else:
             print("configuration: the long value, the theme and a color of one, notify, "
-                  "the roots, a section deleted and four added, nothing else")
+                  "the roots, a section deleted and five added, nothing else")
         if host.read(host.path("team.ini")) != "# Shared\n[model shared]\ntemperature = 0.1\n":
             problems.append("the included file changed")
         if args.shots and not args.host:

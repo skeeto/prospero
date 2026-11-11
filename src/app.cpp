@@ -260,11 +260,12 @@ enum : i32 {
     RECT_CFGFIND,    // its search field
     RECT_CFGCLEAR,   // and the X that empties it
     RECT_ADDOPEN,    // its Add for each named kind, in order: endpoint,
-    RECT_ADDOPEN1,   // model, role, shell, remote, mcp
+    RECT_ADDOPEN1,   // model, role, shell, theme, remote, mcp
     RECT_ADDOPEN2,
     RECT_ADDOPEN3,
     RECT_ADDOPEN4,
     RECT_ADDOPEN5,
+    RECT_ADDOPEN6,
     RECT_DELETE,     // the page's Delete, and its confirmation's buttons
     RECT_DELOK,
     RECT_DELCANCEL,
@@ -13434,6 +13435,7 @@ enum : i32 {
     CHK_TERMSIZETIP,  // the terminal's size shows over it (dx 1), or not (0)
     CHK_DIAGCOPY,     // the clipboard holds the diagnostics as text, the
                       // Diagnostics page shown
+    CHK_CFGSAVED,     // the settings' last edit was saved
     CHK_COUNT,
 };
 
@@ -13735,6 +13737,7 @@ static Str chknames[] = {
     "the terminal shows Reconnecting, or not, as said",
     "the terminal's size shows over it while it changes, or not, as said",
     "Copy all copies the diagnostics as text",
+    "the settings edit was saved",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -15880,6 +15883,24 @@ static DriveOp settingsops[] = {
     {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
     {OP_CHECK, CHK_PAGE, 0, 0, 0, "model fresh"},
     {OP_CHECK, CHK_NOHSCROLL, 0, 0, 0, ""},
+    // A new theme, written with its base (issue #44: it was given a
+    // role's tools, refused as an unknown key)
+    {OP_SHOWPAGE, 0, 0, 0, 300, "add theme"},
+    {OP_MOVE, T_ADDOPEN, 0, 0, 100, "theme"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_MOVE, T_ADDNAME, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 200, ""},
+    {OP_TEXT, 0, 0, 0, 200, "mine"},
+    {OP_MOVE, T_ADDBTN, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_CONFIGSET, 0, 0, 5000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PAGE, 0, 0, 0, "theme mine"},
+    {OP_CHECK, CHK_CFGVAL, 0, 0, 0, "theme mine base=dark"},
+    {OP_CHECK, CHK_CFGSAVED, 0, 0, 0, ""},
     // A new remote: reached how and where, asked as it is named
     {OP_SNAPCFG, 0, 0, 0, 100, ""},
     {OP_SHOWPAGE, 0, 0, 0, 300, "add remote"},
@@ -19639,7 +19660,7 @@ static ImVec2 targetpos(Gui *g, i32 t)
                 if (!jsonint(jsonget(k, "named"), 0)) {
                     continue;
                 } else if (jsonstr(jsonget(k, "kind")) == text) {
-                    return n<6 ? rectcenter(g->rects[RECT_ADDOPEN+n]) : v2(-1, -1);
+                    return n<7 ? rectcenter(g->rects[RECT_ADDOPEN+n]) : v2(-1, -1);
                 }
                 n++;
             }
@@ -21644,6 +21665,8 @@ static b32 drivecheck(Gui *g, i32 chk)
         return find(g->cfgstatus, "already exists")>=0 && !g->cfgset;
     case CHK_ROQUIET:
         return g->sess && g->sess->readonly && v->busy && !g->roclock;
+    case CHK_CFGSAVED:
+        return startswith(g->cfgstatus, "Saved");
     case CHK_DIAGCOPY: {
         Arena a = g->frame;
         Json *d = jsonget(g->cfg, "diags")->child;

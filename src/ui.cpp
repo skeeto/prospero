@@ -12028,7 +12028,7 @@ static void drawcfglist(Gui *g, b32 combo)
         Str  what = finish(&ab);
         b32  add  = cfgitem(g, a, combo, what, 0, jsonstr(jsonget(k, "desc")),
                             ImGui::GetColorU32(ImGuiCol_TextDisabled), &at);
-        if (group < 6) {
+        if (group < 7) {
             g->rects[RECT_ADDOPEN+group] = at;
         }
         cfgreveal(g, concat(&a, "add ", kind), 0);
@@ -13022,12 +13022,14 @@ static void cfgseed(Str kind, Str name, Str *key, Str *val)
            kind=="model"    ? Str("reasoning") :
            kind=="remote"   ? Str("ssh") :
            kind=="shell"    ? Str("program") :
-           kind=="mcp"      ? Str("url") : Str("tools");
+           kind=="mcp"      ? Str("url") :
+           kind=="theme"    ? Str("base") : Str("tools");
     *val = kind=="endpoint" ? Str("http://localhost/") :
            kind=="model"    ? Str("reasoning_content") :
            kind=="remote"   ? name :
            kind=="shell"    ? name :
            kind=="mcp"      ? Str("https://mcp.example.com/mcp") :
+           kind=="theme"    ? Str("dark") :
                               Str("read write edit shell");
 }
 
