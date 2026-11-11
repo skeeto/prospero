@@ -164,7 +164,9 @@ enum AxUnit : i32 {
 // for all of the text, and xs the x of each byte of the lines that show
 // ([vis0, vis1)), from its start through its end, so one more than its
 // length. Coordinates are the window's, the first line's top left at x,
-// y, scrolled.
+// y, scrolled. The caret is on caretline, which at a wrap may be the
+// line before its byte's. Marked text, drawn over the field, has its
+// own: mxs and mys, the top left of each of its bytes and its end.
 struct AxGeom {
     f32     x, y, lineh;
     AxRect  clip;
@@ -173,7 +175,10 @@ struct AxGeom {
     i32     vis0, vis1;
     f32    *xs;
     i32     nxs;
-    i64     rev;      // the text's revision it was drawn from
+    i32     caretline;  // -1 when unknown
+    f32    *mxs, *mys;
+    i32     nm;         // the marked text's length plus one, or 0
+    i64     rev;        // the text's revision it was drawn from
 };
 
 // The focused text field: its text, selection, and the text an input
@@ -939,6 +944,9 @@ static Str axdoc(A11y *x, Arena *a)
 static void axmark(A11y *x, Str marked, i32 lo, i32 hi)
 {
     AxText *t = &x->text;
+    if (t->marked==marked && t->mlo==lo && t->mhi==hi) {
+        return;  // as each frame says it again
+    }
     t->marked = clone(&x->mem[x->tcur], marked);
     t->mlo    = axclamp(lo, 0, (i32)marked.len);
     t->mhi    = axclamp(hi, t->mlo, (i32)marked.len);
@@ -1115,6 +1123,59 @@ static AxRect axcharrect(A11y *x, i32 b)
     return r;
 }
 
+// Where the caret is: as wide as nothing, on the line ImGui drew it on,
+// which after a move rightward to a wrap is the line before, at its end.
+static AxRect axcaretrect(A11y *x)
+{
+    AxText *t = &x->text;
+    AxGeom *g = &t->geom;
+    i32     b = t->caret;
+    i32     k = axlineat(x, b);
+    if (g->rev==t->rev && g->caretline>=0 && g->caretline==k-1) {
+        k = g->caretline;
+    }
+    f32 cx = axxof(x, k, b);
+    AxRect r = {};
+    r.x0 = r.x1 = g->x + (cx<0 ? 0 : cx);
+    r.y0 = g->y + (f32)k*g->lineh;
+    r.y1 = r.y0 + g->lineh;
+    return r;
+}
+
+// Where byte d of the document is: the text's characters where they
+// were drawn, and the marked text's where it was, over them.
+static AxRect axdocrect(A11y *x, i32 d)
+{
+    AxText *t  = &x->text;
+    AxGeom *g  = &t->geom;
+    i32     ml = (i32)t->marked.len;
+    if (!ml) {
+        return axcharrect(x, d);
+    }
+    AxSpan s = axselection(t);
+    if (d < s.lo) {
+        return axcharrect(x, d);
+    } else if (d >= s.lo+ml) {
+        return axcharrect(x, axdoctext(x, d));
+    }
+    AxRect r = axcharrect(x, s.lo);  // undrawn: where it goes
+    r.x1 = r.x0;
+    if (g->nm != ml+1) {
+        return r;
+    }
+    iz i = d - s.lo;
+    while (i>0 && (t->marked[i]&0xc0)==0x80) {
+        i--;
+    }
+    iz e = i;
+    utf8decode(t->marked, &e);
+    r.x0 = g->mxs[i];
+    r.y0 = g->mys[i];
+    r.x1 = g->mys[e]==r.y0 ? g->mxs[e] : r.x0;  // its line's last: unknown
+    r.y1 = r.y0 + g->lineh;
+    return r;
+}
+
 // The byte offset nearest a point: before the character it is left of
 // the middle of, and never past a line's newline.
 static i32 axoffsetat(A11y *x, f32 px, f32 py)
@@ -1128,6 +1189,7 @@ static i32 axoffsetat(A11y *x, f32 px, f32 py)
     k = axclamp(k, 0, axlinecount(x)-1);
     AxSpan line = axlinespan(x, k);
     i32    end  = line.hi>line.lo && s[line.hi-1]=='\n' ? line.hi-1 : line.hi;
+    end = end>line.lo && s[end-1]=='\r' ? end-1 : end;
     if (axxof(x, k, line.lo) < 0) {
         return line.lo;
     }
@@ -1207,6 +1269,12 @@ static void axtextsync(A11y *x, u32 key, u32 id, u32 state, b32 multiline,
     t->geom.xs = alloc<f32>(a, g->nxs);
     for (i32 i = 0; i < g->nxs; i++) {
         t->geom.xs[i] = g->xs[i];
+    }
+    t->geom.mxs = alloc<f32>(a, g->nm);
+    t->geom.mys = alloc<f32>(a, g->nm);
+    for (i32 i = 0; i < g->nm; i++) {
+        t->geom.mxs[i] = g->mxs[i];
+        t->geom.mys[i] = g->mys[i];
     }
     t->geom.rev = t->text==text ? t->rev : -1;
 }

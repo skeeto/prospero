@@ -2025,8 +2025,8 @@ static void os_guiinject(Os *os, GuiEvent *e)
     a.beg = (byte *)buf;
     a.end = (byte *)buf + countof(buf);
     unsigned short *text = 0;
-    if (e->kind==GEV_FLAGPASTE || e->kind==GEV_CLIPRACE) {
-        e->x = -1;  // macOS only
+    if (e->kind==GEV_FLAGPASTE || e->kind==GEV_CLIPRACE || e->kind==GEV_EDITING) {
+        e->x = -1;  // macOS only; Windows' input methods draw their own
         return;
     } else if (e->text.len) {
         text = (unsigned short *)towide(&a, e->text).data;

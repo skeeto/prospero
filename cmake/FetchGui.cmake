@@ -177,6 +177,20 @@ imgui_splice(imgui_widgets_text
   "    // Render blinking cursor"
   "    if (g.TestEngineHookItems)  // prospero\n        prospero_axdraw(g, state, id, flags, is_password, hint, buf_display, buf_display_end,\n                        draw_pos - draw_scroll, clip_rect, wrap_width);\n\n"
   "the comment before InputTextEx's caret")
+# An input method's composition (src/ime.cpp) is drawn over the active
+# field, its caret hidden meanwhile, and the IME's position moved to it.
+imgui_splice(imgui_widgets_text
+  "    // Render blinking cursor"
+  "    ImVec2 prospero_imepos;  // prospero\n    bool prospero_composing = render_cursor && g.ActiveId == id && !is_readonly && !is_password &&\n        prospero_axpreedit(g, state, id, line_index, buf_display, buf_display_end,\n                           draw_pos - draw_scroll, cursor_offset, clip_rect, is_displaying_hint,\n                           &prospero_imepos);\n\n"
+  "the comment before InputTextEx's caret")
+imgui_splice(imgui_widgets_text
+  "        if (cursor_is_visible && cursor_screen_rect.Overlaps(clip_rect))"
+  "        cursor_is_visible = cursor_is_visible && !prospero_composing;  // prospero\n"
+  "InputTextEx's caret drawing")
+imgui_splice(imgui_widgets_text
+  "    if (is_password && !is_displaying_hint)\n        PopPasswordFont();"
+  "    if (prospero_composing)  // prospero\n        g.PlatformImeData.InputPos = prospero_imepos;\n\n"
+  "InputTextEx's password font pop after the caret")
 set(imgui_widgets_patched ${CMAKE_CURRENT_BINARY_DIR}/imgui-patched/imgui_widgets.cpp)
 file(WRITE ${imgui_widgets_patched}.new "${imgui_widgets_text}")
 file(COPY_FILE ${imgui_widgets_patched}.new ${imgui_widgets_patched} ONLY_IF_DIFFERENT)

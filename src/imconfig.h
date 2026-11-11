@@ -68,5 +68,21 @@ struct ProsperoAxField {
     int          nxs;           // x of each byte from its start through
                                 // its end (one more than its length)
     int          anchor, caret; // the selection, when active
+    int          caretline;     // the line ImGui draws the caret on, which
+                                // at a wrap is either line's, else -1
 };
 extern "C" void prospero_axfield(ProsperoAxField const *);
+
+// An input method's composition (ime.cpp), drawn over the active field
+// where it will go, its line's top left at x, y; the field's caret is
+// hidden meanwhile, and the IME's position is the clause's, imex, imey.
+// The InputTextEx patch asks only while prospero_preediting.
+struct ProsperoPreedit {
+    unsigned id;
+    float    x, y;
+    float    clip[4];
+    int      hint;        // a placeholder shows, to be covered
+    float    imex, imey;  // out
+};
+extern "C" int prospero_preediting(void);
+extern "C" int prospero_preedit(ProsperoPreedit *);

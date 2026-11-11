@@ -250,6 +250,7 @@ extern "C" void prospero_axfield(ProsperoAxField const *f)
     g->x       = f->x;
     g->y       = f->y;
     g->lineh   = f->lineh;
+    g->caretline = -1;
     g->clip    = {f->clip[0], f->clip[1], f->clip[2], f->clip[3]};
     if (f->active) {
         g->nlines = f->nlines;
@@ -259,6 +260,7 @@ extern "C" void prospero_axfield(ProsperoAxField const *f)
         }
         g->vis0 = f->vis0;
         g->vis1 = f->vis1;
+        g->caretline = f->caretline;
         g->nxs  = f->nxs;
         g->xs   = alloc<f32>(&x->mem, f->nxs);
         for (i32 i = 0; i < f->nxs; i++) {
@@ -477,9 +479,18 @@ static void axbuild(AxGui *x, ImGuiContext *ctx)
     if (active) {
         u32 state = active->password ? AXS_PASSWORD : 0;
         state |= active->flags & ImGuiInputTextFlags_ReadOnly ? AXS_READONLY : 0;
+        // An input method's composition, drawn over it this frame
+        Preedit *p  = g->ime;
+        b32      pe = p && p->len && p->drawn && p->owner==active->id;
+        if (pe) {
+            active->geom.mxs = p->xs;
+            active->geom.mys = p->ys;
+            active->geom.nm  = p->len + 1;
+        }
         axtextsync(x->ax, axkeyof(x, active->id), active->id, state,
                    (active->flags & ImGuiInputTextFlags_Multiline) != 0,
                    active->text, active->anchor, active->caret, &active->geom);
+        axmark(x->ax, pe ? imetext(p) : Str{}, pe ? p->sel0 : 0, pe ? p->sel1 : 0);
     } else {
         axtextnone(x->ax);
     }
@@ -784,6 +795,57 @@ static void driveax(Gui *g, Str cmd)
         axcheck(g, &a, got, concat(&a, "accessible ", cmd));
     } else if (verb == "pending") {
         axcount(g, &a, "accessible actions pending: ", g->ax->nacts, c.tail);
+    } else if (verb == "marked") {
+        Str got  = g->ax->ax->text.marked;
+        Str what = concat(&a, "accessible marked text: ", c.tail);
+        if (!(got == c.tail)) {
+            what = concat(&a, what, concat(&a, ", not ", got));
+        }
+        axcheck(g, &a, got==c.tail, what);
+    } else if (verb == "doc") {
+        Str got  = axdoc(g->ax->ax, &a);
+        Str what = concat(&a, "accessible document: ", c.tail);
+        if (!(got == c.tail)) {
+            what = concat(&a, what, concat(&a, ", not ", got));
+        }
+        axcheck(g, &a, got==c.tail, what);
+    } else if (verb=="caret" || verb=="ime") {
+        // Where ImGui told the platform its IME goes (one left of the
+        // caret's top, or of the composition's clause, ime.cpp): where
+        // the text model has them, give or take truncation.
+        A11y   *x = g->ax->ax;
+        AxText *tx = &x->text;
+        AxRect  rc = {};
+        b32     ok = tx->live && tx->geom.rev==tx->rev;
+        if (verb == "caret") {
+            ok = ok && !tx->marked.len;
+            rc = axcaretrect(x);
+        } else {
+            // And it went where the text model has the caret, or the
+            // selection's start, which it replaces
+            AxSpan sp = axselection(tx);
+            AxRect at = sp.lo==sp.hi ? axcaretrect(x) : axcharrect(x, sp.lo);
+            f32    ax = g->ime->at.x - (f32)(i32)at.x0;
+            f32    ay = g->ime->at.y - (f32)(i32)at.y0;
+            ok = ok && tx->marked.len && ax>=-1 && ax<=1 && ay>=-1 && ay<=1;
+            rc = axdocrect(x, sp.lo + tx->mlo);
+        }
+        ImGuiPlatformImeData *d = &ImGui::GetCurrentContext()->PlatformImeData;
+        f32 dx = d->InputPos.x + 1 - (f32)(i32)rc.x0;
+        f32 dy = d->InputPos.y - (f32)(i32)rc.y0;
+        ok = ok && dx>=-1 && dx<=1 && dy>=-1 && dy<=1;
+        Buf b(&a, 128);
+        print(&b, "accessible ");
+        print(&b, verb);
+        print(&b, " at ");
+        print(&b, axround(rc.x0));
+        putbyte(&b, ',');
+        print(&b, axround(rc.y0));
+        print(&b, ", IME at ");
+        print(&b, axround(d->InputPos.x + 1));
+        putbyte(&b, ',');
+        print(&b, axround(d->InputPos.y));
+        axcheck(g, &a, ok, finish(&b));
     } else if (verb == "lint") {
         Slice<i32> bad = axlint(&a, t);
         Buf b(&a, 256);

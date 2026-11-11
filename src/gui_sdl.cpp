@@ -1273,6 +1273,23 @@ static i32 inputkind(SDL_Event *e)
 }
 
 // Closing and quitting are requests the core may decline.
+// An editing key, unmodified, which an input method takes while it
+// composes.
+static b32 composekey(SDL_Event *e)
+{
+    if (e->key.mod & (SDL_KMOD_CTRL|SDL_KMOD_ALT|SDL_KMOD_GUI)) {
+        return 0;
+    }
+    switch (e->key.key) {
+    case SDLK_RETURN: case SDLK_KP_ENTER: case SDLK_BACKSPACE: case SDLK_DELETE:
+    case SDLK_TAB:    case SDLK_ESCAPE:   case SDLK_LEFT:      case SDLK_RIGHT:
+    case SDLK_UP:     case SDLK_DOWN:     case SDLK_HOME:      case SDLK_END:
+    case SDLK_PAGEUP: case SDLK_PAGEDOWN: case SDLK_SPACE:
+        return 1;
+    }
+    return 0;
+}
+
 static void dispatch(Os *os, GuiSdl *p, SDL_Event *e)
 {
     Gui *g = p->gui;
@@ -1349,6 +1366,18 @@ static void dispatch(Os *os, GuiSdl *p, SDL_Event *e)
             e->type==SDL_EVENT_WINDOW_ENTER_FULLSCREEN ||
             e->type==SDL_EVENT_WINDOW_LEAVE_FULLSCREEN) {
         sdlplaced(os, p);
+    }
+    // An input method's composition, which ImGui's backend ignores: the
+    // core draws it (ime.cpp). It ends with typed text, which commits
+    // it, or the window's focus lost, though SDL may not say so.
+    if (e->type == SDL_EVENT_TEXT_EDITING) {
+        gui_preedit(g, inistr(e->edit.text), e->edit.start, e->edit.length);
+        return;
+    } else if (e->type==SDL_EVENT_TEXT_INPUT || e->type==SDL_EVENT_WINDOW_FOCUS_LOST) {
+        gui_preedit(g, {}, 0, 0);
+    } else if (e->type==SDL_EVENT_KEY_DOWN && composekey(e) && gui_composing(g)) {
+        g->woke |= WOKE_OTHER;  // the input method's: Wayland's D-Bus path
+        return;                 // passes them on (Cocoa and X11 don't)
     }
     if (e->type == SDL_EVENT_KEY_DOWN) {
         ImGuiKey k = ImGui_ImplSDL3_KeyEventToImGuiKey(e->key.key, e->key.scancode);
@@ -1643,6 +1672,13 @@ static void os_guiinject(Os *os, GuiEvent *ge)
         e.type          = SDL_EVENT_TEXT_INPUT;
         e.text.windowID = id;
         e.text.text     = ge->text.cdata;  // a literal: outlives dispatch
+        break;
+    case GEV_EDITING:
+        e.type          = SDL_EVENT_TEXT_EDITING;
+        e.edit.windowID = id;
+        e.edit.text     = ge->text.cdata;  // a literal: outlives dispatch
+        e.edit.start    = (i32)ge->x;
+        e.edit.length   = (i32)ge->y;
         break;
     case GEV_RESIZE:
         SDL_SetWindowSize(p->window, (i32)ge->x, (i32)ge->y);

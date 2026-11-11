@@ -1947,6 +1947,12 @@ static void drawterm(Gui *g)
         ime->InputPos        = v2(pos.x + (f32)cur.x*m.cw, pos.y + cy*m.ch);
         ime->InputLineHeight = m.ch;
         ime->ViewportId      = win->Viewport->ID;
+        // An input method's composition, at the cursor until committed
+        ImVec2 imepos;
+        if (imedraw(g, id, dl, stylefont(&g->fonts, STYLE_CODE), m.size, ime->InputPos,
+                    m.ch, bb, 0, bg, termimcolor(ariel_color(tt->t, ARIEL_C_FG)), &imepos)) {
+            ime->InputPos = imepos;
+        }
     }
 }
 

@@ -494,8 +494,12 @@ static void    os_wake(Os *);
 // ImGui's units if the platform knows it, or opened in the application
 // as a whole (macOS: Finder, the Dock, open -a), and
 // gui_toasted and gui_toastfail of a desktop notification clicked or
-// refused (os_guitoast).
+// refused (os_guitoast). gui_preedit tells of an input method's
+// composition as it changes (ime.cpp), and gui_composing whether one is
+// under way, so its keys are kept from ImGui.
 struct Gui;
+static void    gui_preedit(Gui *, Str text, i32 start, i32 count);
+static b32     gui_composing(Gui *);
 // Open the main window with ImGui's platform and renderer backends, or
 // open it again after os_guished. Returns 0 on failure.
 static b32     os_guiopen(Os *, Gui *, Str title);
@@ -627,6 +631,9 @@ enum {
                     // one, as fast as it can; out, x the times it became
                     // key and y the pasteboard's changes seen, or x -1
                     // where there is no such path
+    GEV_EDITING,    // an input method's composition is the text, its
+                    // clause code points [x, x+y) (gui_preedit); empty
+                    // ends it; out, x -1 where there is no such path
 };
 enum {
     GKEY_TAB,

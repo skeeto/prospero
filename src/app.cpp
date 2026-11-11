@@ -1409,6 +1409,7 @@ struct Named {
 
 struct DriveOp;
 struct AxGui;
+struct Preedit;
 
 struct Gui {
     Os                *os;
@@ -1813,6 +1814,7 @@ struct Gui {
     b32                nomentions; // [ui] mentions = false: '@' is plain text
     i32                axset;      // [ui] accessibility (AXSET_*)
     AxGui             *ax;         // accessibility (a11y_imgui.cpp), unless off
+    Preedit           *ime;        // an input method's composition (ime.cpp)
     i32                toastids;   // the last id given a root
     b32                toastprep;  // the platform made ready
     Str                toastwhy;   // the latest refusal, said in the log
@@ -11540,6 +11542,7 @@ static void setzoom(Gui *, f32);
 static void zoomby(Gui *, i32);
 static void setpane(Gui *, i32, b32);
 
+#include "ime.cpp"
 #include "ui.cpp"
 #include "term.cpp"
 #include "files.cpp"
@@ -12887,6 +12890,7 @@ static void gui_frame(Gui *g)
     codelinksflush(g);  // what inline code drawn asks of other hosts
     i64 t2 = os_ticks(g->os);
     ImGui::Render();
+    imeendframe(g);
     i64 t3 = os_ticks(g->os);
     g->benchseg[0]  = t1 - t0;
     g->benchseg[1]  = t2 - t1;
@@ -13379,6 +13383,8 @@ enum : i32 {
     OP_KEYDOWN,   // key in dx, modifiers (KEY_*) in dy
     OP_KEYUP,
     OP_TEXT,
+    OP_EDITING,   // an input method's composition is text, its clause code
+                  // points [dx, dx+dy) (GEV_EDITING); "" ends it. SDL only
     OP_RESIZE,    // to dx by dy, or 0 by 0: the first size (firstgeom)
     OP_CHECK,     // target is a CHK_*
     OP_IDLE,      // log frames since the last OP_MARK
@@ -20694,6 +20700,8 @@ static DriveOp a11yops[] = {
     {OP_NEWSESSION, 0, 0, 0, 0, ""},
     {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
     {OP_MARKSESS, 0, 0, 0, 0, ""},
+    LAYOUT("Standard"),  // first run's Help docked, off the prompt
+    CLICK(T_PROMPT, "", 300),
     {OP_A11Y, 0, 0, 0, 500, "on"},
     {OP_A11Y, 0, 0, 0, 0, "dump"},
     {OP_A11Y, 0, 0, 0, 0, "has menubar"},
@@ -20751,6 +20759,51 @@ static DriveOp a11yops[] = {
     {OP_A11Y, 0, 0, 0, 0, "pending 0"},
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
     {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
+
+    // Where the caret is, in the text model and to the IME
+    {OP_TEXT, 0, 0, 0, 300, "say "},
+    {OP_A11Y, 0, 0, 0, 0, "caret"},
+#ifndef _WIN32  // Windows' input methods draw their own
+    // An input method's composition: over the prompt, not in it, marked
+    // text to a tool, and the IME at its clause; keys that leak through
+    // while it lasts don't send; committed, it is typed text
+    {OP_EDITING, 0, 2, 2, 300, "にほんご"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "say "},
+    {OP_A11Y, 0, 0, 0, 0, "marked にほんご"},
+    {OP_A11Y, 0, 0, 0, 0, "doc say にほんご"},
+    {OP_A11Y, 0, 0, 0, 0, "ime"},
+    {OP_SHOT, 0, 0, 0, 300, "a11y-preedit"},
+    KEY(GKEY_ENTER, 0, 300),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "say "},
+    {OP_EDITING, 0, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 300, "日本語"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "say 日本語"},
+    {OP_A11Y, 0, 0, 0, 0, "marked "},
+    {OP_A11Y, 0, 0, 0, 0, "caret"},
+    // In place of a selection, it goes where the selection starts
+    {OP_A11Y, 0, 0, 0, 300, "select 0 3"},
+    {OP_EDITING, 0, 0, 2, 300, "かな"},
+    {OP_A11Y, 0, 0, 0, 0, "doc かな 日本語"},
+    {OP_A11Y, 0, 0, 0, 0, "ime"},
+    {OP_EDITING, 0, 0, 0, 300, ""},
+    {OP_A11Y, 0, 0, 0, 0, "marked "},
+    // Too long for its line, it wraps, the IME at its clause
+    {OP_EDITING, 0, 90, 2, 300, "あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほまみむめもやゆよらりるれろわをんあいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほまみむめもやゆよらりるれろわをん"},
+    {OP_A11Y, 0, 0, 0, 0, "ime"},
+    {OP_SHOT, 0, 0, 0, 300, "a11y-preedit-wrap"},
+    {OP_EDITING, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "say 日本語"},
+    // One left when the prompt loses the keyboard ends
+    {OP_EDITING, 0, -1, 0, 300, "かな"},
+    {OP_A11Y, 0, 0, 0, 0, "marked かな"},
+    CLICK(T_TRANSCRIPT, "", 300),
+    {OP_A11Y, 0, 0, 0, 300, "activate textarea "},
+    {OP_A11Y, 0, 0, 0, 0, "marked "},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "say 日本語"},
+#endif
+    SELALL,
+    KEY(GKEY_BACKSPACE, 0, 300),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
 
     // Then quiet: nothing pending asks for frames
     {OP_MARK, 0, 0, 0, 11000, ""},
@@ -24992,6 +25045,13 @@ static void drivestep(Gui *g)
         e.text = op->text;
         os_guiinject(g->os, &e);
         break;
+    case OP_EDITING:
+        e.kind = GEV_EDITING;
+        e.text = op->text;
+        e.x    = op->dx;
+        e.y    = op->dy;
+        os_guiinject(g->os, &e);
+        break;
     case OP_TEXTCWD:
         e.kind = GEV_TEXT;
         e.text = g->drivecwd;  // null-terminated, from the command line
@@ -26446,6 +26506,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     // Panes close from their tabs alone, not each dock node as well
     ImGui::GetStyle().DockingNodeHasCloseButton = 0;
     axinit(g, g->axset);
+    g->ime = alloc<Preedit>(&g->perm);
     g->basestyle = ImGui::GetStyle();
     g->sysdark   = 1;  // until the window opens and the platform says
     applytheme(g);
