@@ -538,7 +538,7 @@ static Slice<Str> os_launchenv(Os *, Arena *) { return {}; }
 static iz    os_stdin(Os *, u8 *, iz) { return 0; }
 static Proc *os_spawn(Os *, Spawn *, Arena) { return 0; }
 static Proc *os_spawnio(Os *, Spawn *, Arena) { return 0; }
-static b32 os_launch(Os *, Arena, Slice<Str>, Str, Slice<Str>) { return 0; }
+static b32 os_launch(Os *, Arena, Slice<Str>, Str, Slice<Str>, Str, b32) { return 0; }
 static b32   os_procwrite(Os *, Proc *, Str) { return 0; }
 static void  os_kill(Os *, Proc *, b32) {}
 static void  os_letgo(Os *, Proc *) {}

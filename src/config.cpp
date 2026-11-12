@@ -29,16 +29,17 @@
 // act unasked, and any other setting that chooses a program to run here
 // (cfgruns): [tools] path_prepend and path_append, which say where
 // programs are found, a [tools] shell other than a keyword (auto, sh,
-// powershell, cmd), [tools] shells and git, and [ui] editor and
-// terminal. A [shell] section counts only where the user's own file has
-// its header (cfgownsection), and an included file's settings in an
-// [mcp] or [web] section that the user's own file defines (its url or
-// command, its search or url) are ignored (cfgsealed): it may define
-// those, but not change the user's. The user's file may add to an
-// included one's, a token or key say. What an endpoint or MCP server
-// would send to a url a web include gives (an env:NAME, a secret or
-// header of the user's own, trust = true) holds only for a url the user
-// approved it for (cfgcreds), as the engine keeps them.
+// powershell, cmd), [tools] shells and git, and [ui] editor,
+// editor_line and terminal. A [shell] section counts only where the
+// user's own file has its header (cfgownsection), and an included
+// file's settings in an [mcp] or [web] section that the user's own file
+// defines (its url or command, its search or url) are ignored
+// (cfgsealed): it may define those, but not change the user's. The
+// user's file may add to an included one's, a token or key say. What
+// an endpoint or MCP server would send to a url a web include gives (an
+// env:NAME, a secret or header of the user's own, trust = true) holds
+// only for a url the user approved it for (cfgcreds), as the engine
+// keeps them.
 //
 // Edits (cfgset) go to the user's file only, never into an include,
 // through iniedit: one changed line, with comments, blank lines and
@@ -647,6 +648,15 @@ static CfgKey cfgschema[] = {
      "has no shell environment: no $VISUAL, no $EDITOR, and its PATH may "
      "lack the editor, so name it in full here, or add its directory to "
      "[tools] path_prepend"},
+    {"ui", "editor_line", CFG_STRING, "", {}, {}, "ui",
+     "The command that Files' Open in editor runs, for an editor whose "
+     "arguments for a line are not known: {file} the file's path, quoted "
+     "already: do not put it in quotes, "
+     "{line} its line, {col} its column (1 if none), as in "
+     "myedit --goto {file}:{line}; with no {file}, the path goes last. "
+     "Empty: [ui] editor's command, with the arguments its editor takes "
+     "(code -g, zed, subl, gvim +N, emacs, JetBrains --line and others). "
+     "It must open a window of its own, and it is not waited for"},
     {"ui", "terminal", CFG_STRING, "", {}, {}, "ui",
      "The terminal that a session's Open in external terminal opens in its folder: "
      "on macOS an application's name (Terminal, iTerm, Ghostty), elsewhere "
@@ -1221,7 +1231,8 @@ static b32 cfgruns(CfgKey *k, Str v)
                (k->key=="shell" && !cfghasword("auto sh powershell cmd", v) &&
                 (HOST_WINDOWS || v!="bash"));
     }
-    return (k->kind=="ui" && (k->key=="editor" || k->key=="terminal")) ||
+    return (k->kind=="ui" && (k->key=="editor" || k->key=="editor_line" ||
+                              k->key=="terminal")) ||
            (k->kind=="terminal" && k->key=="shell");
 }
 

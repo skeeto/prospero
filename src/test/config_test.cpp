@@ -126,6 +126,8 @@ static void testcfgschema(Test *t)
         {"tools", "git", " ", CFG_OK, 1},
         {"ui", "editor", "code --wait", CFG_OK, 0},
         {"ui", "editor", "code --wait", CFG_BAD, 1},
+        {"ui", "editor_line", "myedit --goto {file}:{line}", CFG_OK, 0},
+        {"ui", "editor_line", "myedit --goto {file}:{line}", CFG_BAD, 1},
         {"ui", "theme", "dark", CFG_OK, 1},
         {"ui", "notify", "allow, done", CFG_OK, 0},
         {"ui", "notify", "none", CFG_OK, 0},
@@ -1112,6 +1114,7 @@ static void testcfgjson(Test *t)
         "ui//font_size=17*\n"
         "ui//fonts=auto*\n"
         "ui//editor=*\n"
+        "ui//editor_line=*\n"
         "ui//terminal=*\n"
         "ui//mentions=true*\n"
         "ui//notify=allow done*\n"

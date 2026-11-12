@@ -1715,6 +1715,29 @@ static Str wslpath(Arena *a, Str t)
     return finish(&b);
 }
 
+// A WSL distro's absolute path as Windows has it, wslpath's reverse: a
+// drive's "/mnt/c/x" becomes "C:\x", anything else a path in the
+// distro's share, "\\wsl.localhost\DISTRO\x".
+static Str wslwinpath(Arena *a, Str distro, Str p)
+{
+    Buf b(a, 24 + distro.len + p.len);
+    if (p.len>=6 && takehead(p, 5)=="/mnt/" && driveletter(p[5]) && (p.len==6 || p[6]=='/')) {
+        putbyte(&b, (u8)(p[5] & ~0x20));
+        putbyte(&b, ':');
+        p = cuthead(p, 6);
+        if (!p.len) {
+            putbyte(&b, '\\');
+        }
+    } else {
+        print(&b, "\\\\wsl.localhost\\");
+        print(&b, distro);
+    }
+    for (iz i = 0; i < p.len; i++) {
+        putbyte(&b, p[i]=='/' ? '\\' : p[i]);
+    }
+    return finish(&b);
+}
+
 // The head of a Windows path up to its first separator.
 static Str winpart(Str s)
 {

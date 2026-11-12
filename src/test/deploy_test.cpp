@@ -413,6 +413,12 @@ static void test_deploywsl(Test *t)
     expect(t, "wsl.bare", wslpath(&a, "C:"), "/mnt/c");
     expect(t, "wsl.root", wslpath(&a, "C:\\"), "/mnt/c/");
     expect(t, "wsl.relative", wslpath(&a, "C:x"), "C:x");
+    expect(t, "wslwin.drive", wslwinpath(&a, "Deb", "/mnt/c/Users/me/a.c"), "C:\\Users\\me\\a.c");
+    expect(t, "wslwin.root", wslwinpath(&a, "Deb", "/mnt/d"), "D:\\");
+    expect(t, "wslwin.share", wslwinpath(&a, "Deb", "/home/me/a.c"),
+           "\\\\wsl.localhost\\Deb\\home\\me\\a.c");
+    expect(t, "wslwin.mntonly", wslwinpath(&a, "Deb", "/mnt/cd/x"),
+           "\\\\wsl.localhost\\Deb\\mnt\\cd\\x");
     expect(t, "wsl.typing", wslpath(&a, "/mnt/c/Users\\"), "/mnt/c/Users/");
     expect(t, "wsl.mnt", wslpath(&a, "/mnt/c\\x"), "/mnt/c/x");
     expect(t, "wsl.mntonly", wslpath(&a, "/mnt/c"), "/mnt/c");

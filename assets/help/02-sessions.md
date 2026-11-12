@@ -280,7 +280,13 @@ host, as a turn is rewound, as the window or the pane takes the focus
 and as its tab is picked or a link to it clicked, never by polling, at
 most once a second; the text stays at the same line. Reload (the
 circular arrow) reads it again at once, and a tab's menu closes tabs or
-copies the path. A binary file says so, with Show
+copies the path. Reveal (the folder) shows the file in the file
+manager, and Open in editor opens it in your editor (`[ui] editor`,
+or [`[ui] editor_line`](settings:ui#editor_line) for one Prospero
+doesn't know) at the band's first line, else the line at the top,
+without waiting for it. Both work for a file on this computer, in a
+container's folder mounted here, or, on Windows, in a WSL distro;
+for another host's they say why not. A binary file says so, with Show
 as text anyway; past 4 MiB or 100,000 lines only the start shows.
 
 A link to a file in the transcript, in the plan or in a Markdown file
@@ -294,8 +300,8 @@ session worked in when the link was written (a fork into another
 folder keeps its older links pointing where they were), and in a
 Markdown file from the file's own folder, where `#install` alone goes
 to that heading. A line opens the text, even of a Markdown file; a
-click again goes there again. Right-click a link for Open in Files or
-Copy path. The path on a read, write or edit tool row is a link to
+click again goes there again. Right-click a link for Open in Files,
+Open in editor (at its line and column) or Copy path. The path on a read, write or edit tool row is a link to
 its file as well, a read's at the lines it read and an edit's at the
 lines it changed; a click elsewhere on the row's header still folds
 it.

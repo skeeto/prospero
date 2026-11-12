@@ -78,7 +78,7 @@ cannot choose what runs, so these are ignored in one:
 - `[tools] path_prepend`, `path_append`, `shells` and `git`;
 - a `[tools] shell` other than `auto`, `sh`, `bash`, `powershell` or
   `cmd`;
-- `[ui] editor` and `[ui] terminal`.
+- `[ui] editor`, `[ui] editor_line` and `[ui] terminal`.
 
 ## Color themes
 
@@ -287,6 +287,17 @@ fails with a link to sign up for Copilot Free.
   else on macOS the default text editor, which you then quit. Started
   from the Finder or a desktop menu, Prospero has no `$VISUAL` or
   `$EDITOR`: set this, with a full path if need be.
+- **[`[ui] editor_line`](settings:ui#editor_line)**: the command that
+  the Files pane's Open in editor runs, for an editor whose arguments
+  for a line Prospero does not know: `{file}` is the file's path,
+  quoted already (do not put it in quotes), `{line}` its line and `{col}` its column (1 if none), as in
+  `myedit --goto {file}:{line}`; with no `{file}`, the path goes last.
+  Empty, it is the editor's command with the arguments its editor
+  takes: `code -g`, `cursor`, `windsurf`, `zed`, `subl`, `gvim +N`,
+  `emacs`, `gedit`, JetBrains' `--line`, `mate` and `kate`'s `-l`,
+  `notepad++ -n`. Open in editor does not wait, and refuses an editor
+  that runs in a terminal (`vim`, `nano`, `emacs -nw`); one opened by a
+  terminal, as `alacritty -e nvim`, works.
 - **[`[ui] terminal`](settings:ui#terminal)**: the terminal that Open in external terminal opens: on
   macOS an application's name (`iTerm`, `Ghostty`), elsewhere a program
   (`wt.exe`, `konsole`, `kitty`, `wezterm`), whose options for its

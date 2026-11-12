@@ -39,7 +39,8 @@ secrets and `file:` secrets, `[remote]`, `[container]` and `[desktop]`
 settings, an
 `[mcp]` section's `command`, `cwd`, `env.NAME` and `trust = yes`,
 `[web] ask = no`, `[tools] path_prepend` and `path_append`, a
-`[tools] shell` other than a keyword, and `[ui] editor` and `terminal`
+`[tools] shell` other than a keyword, and `[ui] editor`, `editor_line`
+and `terminal`
 are ignored. It may define an MCP server by its url, and `[web]`, but
 cannot change a server your own file gives the `url` or `command` of,
 nor a `[web]` whose `search` or `url` your file sets. Your file may add

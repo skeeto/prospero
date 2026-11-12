@@ -2012,8 +2012,9 @@ static Proc *os_ptyspawn(Os *os, Spawn *sp, PtySize z, iz ring, Arena scratch)
 
 // A grandchild, so nothing waits for it and no reaper sweeps it: the
 // child starts a session, forks it, and exits at once. Between fork and
-// exec only async-signal-safe calls, everything prepared ahead.
-static b32 os_launch(Os *, Arena scratch, Slice<Str> argv, Str cwd, Slice<Str> env)
+// exec only async-signal-safe calls, everything prepared ahead. cmdline
+// and window are Windows' only.
+static b32 os_launch(Os *, Arena scratch, Slice<Str> argv, Str cwd, Slice<Str> env, Str, b32)
 {
     if (!argv.len || hasnul(cwd)) {
         errno = EINVAL;

@@ -343,6 +343,110 @@ static void test_compose(Test *t)
            "code --wait '/tmp/it'\\''s here.md'");
     expect(t, "editor.cmd", editorline(&a, "notepad", "C:\\Temp\\d.md", 1),
            "notepad \"C:\\Temp\\d.md\"");
+    // Open in editor: each preset, quotes and spaces, cmd.exe's refusal
+    // of %, a terminal word before the editor, terminal editors refused,
+    // and [ui] editor_line's templates
+    struct {
+        Str name, cmd, tmpl, path;
+        i32 line, col;
+        b32 win;
+        Str want;  // the command, else "why: " and why
+    } jumps[] = {
+        {"gvim", "gvim -f", {}, "/a/b.c", 12, 0, 0, "gvim -f +12 '/a/b.c'"},
+        {"mvim", "mvim", {}, "/a/b.c", 3, 4, 0, "mvim +3 '/a/b.c'"},
+        {"emacs", "emacs", {}, "/a/b.c", 3, 0, 0, "emacs +3 '/a/b.c'"},
+        {"emacsclient", "emacsclient -c", {}, "/a/b.c", 3, 0, 0, "emacsclient -c +3 '/a/b.c'"},
+        {"gedit", "/usr/bin/gedit", {}, "/a/b.c", 9, 0, 0, "/usr/bin/gedit +9 '/a/b.c'"},
+        {"code", "code --wait", {}, "/a/b.c", 12, 5, 0, "code --wait -g '/a/b.c:12:5'"},
+        {"codenocol", "code", {}, "/a/b.c", 12, 0, 0, "code -g '/a/b.c:12'"},
+        {"insiders", "code-insiders", {}, "/a/b.c", 1, 0, 0, "code-insiders -g '/a/b.c:1'"},
+        {"codium", "codium", {}, "/a/b.c", 2, 0, 0, "codium -g '/a/b.c:2'"},
+        {"cursor", "cursor", {}, "/a/b.c", 2, 0, 0, "cursor -g '/a/b.c:2'"},
+        {"windsurf", "windsurf", {}, "/a/b.c", 2, 0, 0, "windsurf -g '/a/b.c:2'"},
+        {"zed", "zed", {}, "/a/b.c", 7, 2, 0, "zed '/a/b.c:7:2'"},
+        {"zeditor", "zeditor", {}, "/a/b.c", 7, 0, 0, "zeditor '/a/b.c:7'"},
+        {"subl", "subl -w", {}, "/a/b.c", 7, 0, 0, "subl -w '/a/b.c:7'"},
+        {"idea", "idea", {}, "/a/b.c", 8, 0, 0, "idea --line 8 '/a/b.c'"},
+        {"pycharm", "/opt/pycharm/bin/pycharm.sh", {}, "/a/b.c", 8, 0, 0,
+         "/opt/pycharm/bin/pycharm.sh '/a/b.c'"},
+        {"clion", "clion64.exe", {}, "C:\\a\\b.c", 8, 0, 1, "clion64.exe --line 8 \"C:\\a\\b.c\""},
+        {"mate", "mate -w", {}, "/a/b.c", 4, 0, 0, "mate -w -l 4 '/a/b.c'"},
+        {"kate", "kate", {}, "/a/b.c", 4, 0, 0, "kate -l 4 '/a/b.c'"},
+        {"npp", "\"C:\\Program Files\\Notepad++\\notepad++.exe\"", {}, "C:\\x y\\b.c", 6, 0, 1,
+         "\"C:\\Program Files\\Notepad++\\notepad++.exe\" -n6 \"C:\\x y\\b.c\""},
+        {"codecmd", "Code.CMD", {}, "C:\\a\\b.c", 6, 2, 1, "Code.CMD -g \"C:\\a\\b.c:6:2\""},
+        {"unknown", "myedit -x", {}, "/a/b.c", 6, 0, 0, "myedit -x '/a/b.c'"},
+        {"quote", "code", {}, "/it's here/b.c", 6, 0, 0, "code -g '/it'\\''s here/b.c:6'"},
+        {"env", "LANG=C FOO=1 code", {}, "/a/b.c", 6, 0, 0, "LANG=C FOO=1 code -g '/a/b.c:6'"},
+        {"alacritty", "alacritty -e nvim", {}, "/a/b.c", 6, 0, 0, "alacritty -e nvim +6 '/a/b.c'"},
+        {"kitty hx", "kitty hx", {}, "/a/b.c", 6, 3, 0, "kitty hx '/a/b.c:6:3'"},
+        {"open", "open -W -n -t", {}, "/a/b.c", 6, 0, 0, "open -t '/a/b.c'"},
+        {"percent", "code", {}, "C:\\100%\\b.c", 6, 0, 1,
+         "why: Its path holds %, \" or a control character, which cmd.exe cannot pass on"},
+        {"control", "code", {}, "C:\\a\x01\\b.c", 6, 0, 1,
+         "why: Its path holds %, \" or a control character, which cmd.exe cannot pass on"},
+        {"shpercent", "code", {}, "/100%/b.c", 6, 0, 0, "code -g '/100%/b.c:6'"},
+        {"vim", "vim", {}, "/a/b.c", 6, 0, 0,
+         "why: [ui] editor must open a window of its own: vim runs in a terminal"},
+        {"nvim", "/usr/bin/nvim -p", {}, "/a/b.c", 6, 0, 0,
+         "why: [ui] editor must open a window of its own: nvim runs in a terminal"},
+        {"nano", "EDITOR=x nano", {}, "/a/b.c", 6, 0, 0,
+         "why: [ui] editor must open a window of its own: nano runs in a terminal"},
+        {"hx", "hx", {}, "/a/b.c", 6, 0, 0,
+         "why: [ui] editor must open a window of its own: hx runs in a terminal"},
+        {"vimexe", "vim.exe", {}, "C:\\b.c", 6, 0, 1,
+         "why: [ui] editor must open a window of its own: vim.exe runs in a terminal"},
+        {"emacsnw", "emacs -nw", {}, "/a/b.c", 6, 0, 0,
+         "why: [ui] editor must open a window of its own: emacs runs in a terminal"},
+        {"emacsclientt", "emacsclient -t", {}, "/a/b.c", 6, 0, 0,
+         "why: [ui] editor must open a window of its own: emacsclient runs in a terminal"},
+        {"emacstty", "emacsclient --tty", {}, "/a/b.c", 6, 0, 0,
+         "why: [ui] editor must open a window of its own: emacsclient runs in a terminal"},
+        {"none", " ", {}, "/a/b.c", 6, 0, 0,
+         "why: No editor: set [ui] editor in the settings (or $VISUAL or $EDITOR)"},
+        {"tmpl", "vim", "sh /t/e.sh +{line} {file}", "/a b/c.c", 6, 0, 0,
+         "sh /t/e.sh +6 '/a b/c.c'"},
+        {"tmplcol", {}, "ed --at {file}:{line}:{col}", "/a/c.c", 6, 0, 0, "ed --at '/a/c.c':6:1"},
+        {"tmplcol2", "code", " ed {col}x{line} ", "/a/c.c", 6, 9, 0, "ed 9x6 '/a/c.c'"},
+        {"tmplwin", {}, "ed.exe /g {line} {file}", "C:\\a b\\c.c", 6, 0, 1,
+         "ed.exe /g 6 \"C:\\a b\\c.c\""},
+        {"tmplterm", "code", "vim +{line} {file}", "/a/c.c", 6, 0, 0,
+         "why: [ui] editor must open a window of its own: vim runs in a terminal"},
+        {"tmplbrace", {}, "ed {nope} {file}", "/a/c.c", 6, 0, 0, "ed {nope} '/a/c.c'"},
+        {"quotewin", "code", {}, "C:/x\"&calc&\"y.c", 6, 0, 1,
+         "why: Its path holds %, \" or a control character, which cmd.exe cannot pass on"},
+        {"quotesh", "code", {}, "/x\"y.c", 6, 0, 0, "code -g '/x\"y.c:6'"},
+        {"tmpldq", {}, "myedit --goto \"{file}:{line}\"", "/a/c.c", 6, 0, 0,
+         "why: [ui] editor_line must not put {file} in quotes: it is quoted already"},
+        {"tmplsq", {}, "myedit '{file}'", "/a/c.c", 6, 0, 0,
+         "why: [ui] editor_line must not put {file} in quotes: it is quoted already"},
+        {"tmplwindq", {}, "myedit \"{file}\"", "C:\\a.c", 6, 0, 1,
+         "why: [ui] editor_line must not put {file} in quotes: it is quoted already"},
+        {"tmplclosed", {}, "myedit \"--x\" '-y' {file}", "/a/c.c", 6, 0, 0,
+         "myedit \"--x\" '-y' '/a/c.c'"},
+        {"tmplescaped", {}, "myedit \\\" {file}", "/a/c.c", 6, 0, 0,
+         "myedit \\\" '/a/c.c'"},
+        {"tmplwinsq", {}, "myedit '{file}'", "C:\\a.c", 6, 0, 1, "myedit '\"C:\\a.c\"'"},
+        {"opena", "open -a Zed", {}, "/p/f.c", 12, 0, 0, "open -a Zed '/p/f.c'"},
+        {"openwn", "open -W -n -a Cursor", {}, "/p/f.c", 12, 0, 0,
+         "open -W -n -a Cursor '/p/f.c'"},
+        {"openemacs", "open -a Emacs", {}, "/p/f.c", 12, 0, 0, "open -a Emacs '/p/f.c'"},
+        {"emacsnws", "emacs --no-window-system", {}, "/a/b.c", 6, 0, 0,
+         "why: [ui] editor must open a window of its own: emacs runs in a terminal"},
+    };
+    for (iz i = 0; i < countof(jumps); i++) {
+        EditJump j = editorjump(&a, jumps[i].cmd, jumps[i].tmpl, jumps[i].path,
+                                jumps[i].line, jumps[i].col, jumps[i].win);
+        Str got = j.why.len ? concat(&a, "why: ", j.why) : j.line;
+        expect(t, concat(&a, "editor.jump.", jumps[i].name), got, jumps[i].want);
+    }
+    EditJump ej = editorjump(&a, "LANG=C \"/opt/my edit/ed\" -x", {}, "/f", 1, 0, 0);
+    expect(t, "editor.jump.prog", ej.prog, "/opt/my edit/ed");
+    expect(t, "editor.jump.unknown", istr(&a, ej.known), "0");
+    ej = editorjump(&a, "code", {}, "/f", 1, 0, 0);
+    expect(t, "editor.jump.known", istr(&a, ej.known), "1");
+    ej = editorjump(&a, "open -a Zed", {}, "/f", 1, 0, 0);
+    expect(t, "editor.jump.openunknown", istr(&a, ej.known), "0");
     expect(t, "editor.text", editortext("line one\nline two\r\n\n"), "line one\nline two");
     expect(t, "editor.keep", editortext("  indented\n\nend"), "  indented\n\nend");
     // The terminal: its arguments by platform and program, and the

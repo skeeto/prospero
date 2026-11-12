@@ -360,8 +360,11 @@ enum { PTY_MAC = 0, PTY_LINUX = 0 };
 // A program started apart from this one, to outlive it, as a terminal
 // window is: neither waited for nor killed with it, its output nowhere,
 // in its own session (POSIX) or console (Windows). argv[0] is found on
-// env's PATH. Returns 0 on failure, explained by os_lasterr.
-static b32     os_launch(Os *, Arena scratch, Slice<Str> argv, Str cwd, Slice<Str> env);
+// env's PATH. Returns 0 on failure, explained by os_lasterr. On Windows
+// only: cmdline, if not empty, is the command line verbatim, argv[0]
+// its program; window 0 runs it with no console (CREATE_NO_WINDOW).
+static b32     os_launch(Os *, Arena scratch, Slice<Str> argv, Str cwd, Slice<Str> env,
+                         Str cmdline = {}, b32 window = 1);
 
 // (M3) Session locks: an exclusive lock on a file, created if missing,
 // held until os_unlockfile or until the process ends, by any means. The

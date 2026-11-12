@@ -1946,7 +1946,9 @@ def main():
             # without one)
             editor = host.path("config-edit.sh")
             host.write(editor, CONFIG_EDITOR)
-            before += f"\n# Open in editor's editor, a test script\n[ui]\neditor = sh {shword(editor)}\n"
+            before += (f"\n# Open in editor's editor, a test script, and Files' "
+                       f"Open in editor's command\n[ui]\neditor = sh {shword(editor)}\n"
+                       f"editor_line = sh {shword(editor)} +{{line}} {{file}}\n")
         # A directory for the ask allowed always
         host.mkdir(host.path("gui-always"))
         # Instruction files for the info popup, and files to compact over

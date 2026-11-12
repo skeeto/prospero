@@ -1138,6 +1138,7 @@ static void filelinkmark(Gui *g, Str link, LinkFrom *from)
     m->win   = from->win;
     m->line0 = d.here ? 0 : d.file.line0;
     m->line1 = d.here ? 0 : d.file.line1;
+    m->col   = d.here ? 0 : d.file.col;
     copybytes(m->path, f.path.data, f.path.len);
     m->pathlen = (i32)f.path.len;
     Str section = d.here ? d.section : d.file.section;
@@ -1153,8 +1154,81 @@ static void filelinkmark(Gui *g, Str link, LinkFrom *from)
     m->whylen = (i32)n;
 }
 
+// A file of a host (its uid, 0 for this computer) as a path here, for
+// the editor and the file manager, else null and why: a container's in
+// the folder mounted at /work, a WSL distro's through Windows' share.
+static Str filelocal(Gui *g, Arena *a, u64 host, Str path, Str *why)
+{
+    *why = {};
+    if (!host) {
+        return path;
+    }
+    GuiHost *h   = filehost(g, host);
+    b32      run = 0;
+    Ctr     *c   = h ? hostctr(g, h, &run) : 0;
+    if (c) {
+        Str p = ctrhostpath(a, c, path, HOST_WINDOWS);
+        *why = p.len ? Str{} : Str("Its file is only in its container");
+        return p;
+    } else if (HOST_WINDOWS && h && hostwsl(g, h)) {
+        return wslwinpath(a, remoteset(g, h->name, "wsl"), path);
+    }
+    *why = "Its file is on another computer";
+    return {};
+}
+
+// Open in editor for a host's file at a line and column (0 for none):
+// the editor's command, or why not.
+static EditJump filejump(Gui *g, Arena *a, u64 host, Str path, i32 line, i32 col)
+{
+    Str      why  = {};
+    Str      here = filelocal(g, a, host, path, &why);
+    EditJump j    = {};
+    if (why.len) {
+        j.why = why;
+        return j;
+    }
+    return editorjumpfor(g, a, here, line, col);
+}
+
+// Open in editor, launched: the editor on a host's file.
+static void filejumprun(Gui *g, Arena a, u64 host, Str path, i32 line, i32 col)
+{
+    Str why  = {};
+    Str here = filelocal(g, &a, host, path, &why);
+    if (why.len) {
+        g->lasterr = clone(&g->perm, why);
+        return;
+    }
+    editorjumprun(g, a, here, line, col);
+}
+
+// Open in editor's tooltip while it can: what it runs, and for an
+// editor whose arguments for a line aren't known, how to give them.
+static Str filejumptip(Arena *a, EditJump *j)
+{
+    Str tip = concat(a, "Open the file in your editor: ", j->line);
+    if (!j->known) {
+        tip = concat(a, tip, ". Its editor is not one known to take a line: "
+                             "[ui] editor_line can give its arguments");
+    }
+    return tip;
+}
+
+// Reveal's tooltip, by the platform's file manager.
+static Str filerevealtip()
+{
+    #if defined(__APPLE__)
+    return "Reveal: show the file in Finder";
+    #elif defined(_WIN32)
+    return "Reveal: show the file in File Explorer";
+    #else
+    return "Reveal: show the file in the file manager";
+    #endif
+}
+
 // The text's context menu's first items, for a file link right-clicked:
-// Open in Files and Copy path, or why not.
+// Open in Files, Open in editor and Copy path, or why not.
 static void filelinkitems(Gui *g)
 {
     LinkMenu *m = &g->linkmenu;
@@ -1173,6 +1247,17 @@ static void filelinkitems(Gui *g)
         whytip(why);
     } else {
         itemtip("Show the file in the Files pane");
+    }
+    EditJump j = path.len ? filejump(g, &a, m->host, path, m->line0, m->col) : EditJump{};
+    Str jwhy = !path.len ? why : j.why;
+    if (ImGui::MenuItem("Open in editor", 0, false, !jwhy.len)) {
+        filejumprun(g, a, m->host, path, m->line0, m->col);
+    }
+    itemnamed(g, "linkmenu editor");
+    if (jwhy.len) {
+        whytip(jwhy);
+    } else {
+        itemtip("%s", cstr0(&a, filejumptip(&a, &j)));
     }
     if (ImGui::MenuItem("Copy path", 0, false, path.len>0)) {
         ImGui::SetClipboardText(cstr0(&a, path));
@@ -1404,6 +1489,17 @@ struct FileBar {
     i32 reload;  // the tab to read again, else -1
 };
 
+// The line Open in editor opens a tab's file at: its band's first,
+// else the top one in view.
+static i32 filetabline(FileTab *ft)
+{
+    i32 line = ft->band0>0 ? ft->band0 : ft->top+1;
+    if (ft->body && ft->mode==FMODE_TEXT) {
+        line = fileclamp(line, ft->body->lines);
+    }
+    return line>0 ? line : 1;
+}
+
 // The tab bar over the file, modeled on the Terminal's (termtabs): it
 // selects its tab when front changed here (frontset), else front
 // follows the tab picked, which counts as opening it, and the set
@@ -1474,6 +1570,12 @@ static FileBar filetabs(Gui *g, GuiSession *root)
             Str farwhy = ft->host ? filehostwhy(filehost(g, ft->host)) : Str{};
             if (menutip(g, &a, "Reload", farwhy, "Read the file again")) {
                 r.reload = i;
+            }
+            i32      line = filetabline(ft);
+            EditJump j    = filejump(g, &a, ft->host, ft->path, line, 0);
+            Str      tip  = j.why.len ? Str{} : filejumptip(&a, &j);
+            if (menutip(g, &a, "Open in editor", j.why, tip)) {
+                filejumprun(g, a, ft->host, ft->path, line, 0);
             }
             ImGui::EndPopup();
         }
@@ -1699,7 +1801,8 @@ static void drawfiles(Gui *g)
     FileBody *b = ft->body;
     Str       farwhy = ft->host ? filehostwhy(fh) : Str{};
 
-    // The toolbar: Markdown or text, Wrap, Reload, then the path
+    // The toolbar: Markdown or text, Wrap, Reload, Reveal, Open in
+    // editor, then the path
     b32 mdok = b && b->md;
     if (mdok) {
         b32 on  = ft->mode == FMODE_MARKDOWN;
@@ -1737,6 +1840,32 @@ static void drawfiles(Gui *g)
         itemtip("Reload: read the file again");
     }
     ImGui::SameLine();
+    {
+        Str rwhy = {};
+        Str here = filelocal(g, &a, ft->host, ft->path, &rwhy);
+        ImGui::BeginDisabled(rwhy.len > 0);
+        if (iconbutton(ICON_FOLDER "##filereveal")) {
+            guishow(g, here);
+        }
+        ImGui::EndDisabled();
+        itemnamed(g, "file reveal");
+        whytip(rwhy.len ? rwhy : filerevealtip());
+        ImGui::SameLine();
+
+        i32      line = filetabline(ft);
+        EditJump j    = filejump(g, &a, ft->host, ft->path, line, 0);
+        ImGui::BeginDisabled(j.why.len > 0);
+        if (ImGui::Button("Open in editor")) {
+            filejumprun(g, a, ft->host, ft->path, line, 0);
+        }
+        ImGui::EndDisabled();
+        itemnamed(g, "file editor");
+        whytip(j.why.len ? j.why : filejumptip(&a, &j));
+        iz n = j.why.len<(iz)sizeof(g->fjumpwhy) ? j.why.len : (iz)sizeof(g->fjumpwhy);
+        copybytes(g->fjumpwhy, j.why.data, n);
+        g->fjumpwhylen = (i32)n;
+        ImGui::SameLine();
+    }
     {
         Measure m = {};
         m.advance = widgetadvance;

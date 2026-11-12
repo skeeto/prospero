@@ -3759,13 +3759,16 @@ static Detached os_detach(Os *os, Arena scratch, Slice<Str> argv, Str cwd, Str e
 
 // A console of its own, or none for a GUI program (Windows Terminal),
 // out of this process's job where the job allows, inheriting no handles.
-static b32 os_launch(Os *os, Arena scratch, Slice<Str> argv, Str cwd, Slice<Str> env)
+// With cmdline, that verbatim, not argv quoted; without window, no
+// console at all (cmd.exe starting an editor).
+static b32 os_launch(Os *os, Arena scratch, Slice<Str> argv, Str cwd, Slice<Str> env,
+                     Str cmdline, b32 window)
 {
     if (!argv.len || hasnul(cwd)) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return 0;
     }
-    Str found = childpath(os, &scratch, env, argv[0]);
+    Str found = cmdline.len ? Str{} : childpath(os, &scratch, env, argv[0]);
     if (found.len) {
         Slice<Str> copy = {};
         copy = push(&scratch, copy, found);
@@ -3774,14 +3777,16 @@ static b32 os_launch(Os *os, Arena scratch, Slice<Str> argv, Str cwd, Slice<Str>
         }
         argv = copy;
     }
-    c16 *cmd = towide(&scratch, quoteargv(&scratch, argv)).data;
-    c16 *dir = cwd.len ? towide(&scratch, cwd).data : 0;
-    c16 *eb  = envblock(&scratch, env);
+    Str  line = cmdline.len ? cmdline : quoteargv(&scratch, argv);
+    c16 *cmd  = towide(&scratch, line).data;
+    c16 *dir  = cwd.len ? towide(&scratch, cwd).data : 0;
+    c16 *eb   = envblock(&scratch, env);
 
     ProcessInfo pi = {};
     StartupInfo si = {};
     si.cb = sizeof(si);
-    i32 flags = CREATE_NEW_CONSOLE | CREATE_UNICODE_ENVIRONMENT | CREATE_BREAKAWAY_FROM_JOB;
+    i32 flags = (window ? CREATE_NEW_CONSOLE : CREATE_NO_WINDOW) |
+                CREATE_UNICODE_ENVIRONMENT | CREATE_BREAKAWAY_FROM_JOB;
     b32 ok    = CreateProcessW(0, cmd, 0, 0, 0, flags, eb, dir, &si, &pi);
     if (!ok && GetLastError()==ERROR_ACCESS_DENIED) {
         flags &= ~CREATE_BREAKAWAY_FROM_JOB;

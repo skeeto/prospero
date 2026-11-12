@@ -243,7 +243,7 @@ static Str   os_realpath(Os *, Arena *, Str) { return {}; }
 static Str   os_hostids(Os *, Arena *) { return {}; }
 static Proc *os_spawn(Os *, Spawn *, Arena) { return 0; }
 static Proc *os_spawnio(Os *, Spawn *, Arena) { return 0; }
-static b32 os_launch(Os *, Arena, Slice<Str>, Str, Slice<Str>) { return 0; }
+static b32 os_launch(Os *, Arena, Slice<Str>, Str, Slice<Str>, Str, b32) { return 0; }
 static b32   os_procwrite(Os *, Proc *, Str) { return 0; }
 static void  os_kill(Os *, Proc *, b32) {}
 static void  os_letgo(Os *, Proc *) {}

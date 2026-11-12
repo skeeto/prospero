@@ -816,6 +816,7 @@ struct LinkMenu {
     b32         win;
     i32         line0;      // its lines, 1-based, else 0
     i32         line1;
+    i32         col;        // on line0, else 0
     u8          path[1024]; // resolved
     i32         pathlen;    // 0 if it did not resolve
     u8          section[FILES_SECTION];
@@ -1701,6 +1702,14 @@ struct Gui {
     // Compose box: the editor a draft is out in (one at a time), and
     // what the box's popups have open
     Str                editor;     // [ui] editor
+    Str                edjumpfmt;  // [ui] editor_line, Open in editor's template
+    Str                editjump;   // Open in editor's latest command, for the
+    i64                editjumps;  //   checklist, and how many
+    u64                edfoundkey; // editorfound's last answer, by program
+    i64                edfoundat;  //   and PATH, when (µs, os_ticks), and whether it
+    b32                edfound;    //   was found
+    u8                 fjumpwhy[160]; // why the Files toolbar's Open in editor
+    i32                fjumpwhylen;   //   is disabled, as last drawn
     Str                fontsset;   // [ui] fonts, at startup
     Slice<FontFile>    sysfonts;   // found, merged before the next frame
     Str                terminal;   // [ui] terminal
@@ -5003,6 +5012,8 @@ static void loadcfg(Gui *g, Str line)
             setfontbase(g, r.value);
         } else if (r.kind=="ui" && r.key=="editor") {
             setcfgstr(g, &g->editor, r);
+        } else if (r.kind=="ui" && r.key=="editor_line") {
+            setcfgstr(g, &g->edjumpfmt, r);
         } else if (r.kind=="ui" && r.key=="terminal") {
             setcfgstr(g, &g->terminal, r);
         } else if (r.kind=="terminal" && r.key=="scrollback") {
@@ -6936,6 +6947,130 @@ static void guishow(Gui *g, Str path)
     if (!g->drive || g->realreveal) {
         b32 ok = os_guishow(g->os, a, path);
         guilog(g, concat(&a, ok ? Str("revealed ") : Str("cannot reveal "), path));
+    }
+}
+
+// Whether a program the GUI would run is there: at its path if it has
+// a separator (~/ the home directory), else on the GUI's PATH, with
+// PATHEXT's extensions on Windows when it has none. Network paths are
+// never touched (one may stall for seconds): a program there counts as
+// found, and a PATH entry there is passed over.
+static b32 editorfound(Gui *g, Arena a, Str prog)
+{
+    if (cfgtilde(prog)) {
+        prog = concat(&a, userhome(g->os, &a), cuthead(prog, 1));
+    }
+    Slice<Str> exts = {};
+    exts = push(&a, exts, Str{});
+    if (HOST_WINDOWS && find(basename(prog), ".")<0) {
+        Str pe = trim(os_getenv(g->os, &a, "PATHEXT"));
+        for (Str rest = pe.len ? pe : Str(".COM;.EXE;.BAT;.CMD"); rest.len;) {
+            Cut c = cut(rest, ';');
+            rest = c.tail;
+            if (trim(c.head).len) {
+                exts = push(&a, exts, trim(c.head));
+            }
+        }
+    }
+    b32 sep = find(prog, "/")>=0 || (HOST_WINDOWS && (find(prog, "\\")>=0 || find(prog, ":")>=0));
+    if (sep && netpath(prog, HOST_WINDOWS)) {
+        return 1;
+    }
+    Str path = sep ? Str(".") : guipath(g, &a);
+    for (Str rest = path; rest.len;) {
+        Cut c = cut(rest, HOST_WINDOWS ? ';' : ':');
+        Str d = trim(c.head);
+        rest = c.tail;
+        if (d.len>=2 && d[0]=='"' && d[d.len-1]=='"') {
+            d = takehead(cuthead(d, 1), d.len-2);
+        }
+        if (!d.len || (!sep && netpath(d, HOST_WINDOWS))) {
+            continue;
+        }
+        for (iz i = 0; i < exts.len; i++) {
+            Arena t = a;
+            Str   p = concat(&t, sep ? prog : join(&t, d, prog), exts[i]);
+            if (os_stat(g->os, t, p).type == STAT_FILE) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+// Open in editor for path, a file here, at line (1-based) and col (0
+// for none): the command, or why not.
+static EditJump editorjumpfor(Gui *g, Arena *a, Str path, i32 line, i32 col)
+{
+    Str cmd  = editorcmd(g, a);
+    Str tmpl = trim(g->edjumpfmt);
+    if (HOST_WINDOWS) {
+        tmpl = cmdhome(a, tmpl, userhome(g->os, a));
+    }
+    EditJump j = editorjump(a, cmd, tmpl, path, line>0 ? line : 1, col, HOST_WINDOWS);
+    if (!j.why.len) {
+        // Looked for again when the program or PATH changes, else at
+        // most every few seconds: menus and the toolbar ask each frame
+        u64 key = hash(j.prog) ^ (hash(guipath(g, a))*1111111111111111111u);
+        i64 now = os_ticks(g->os);
+        if (!g->edfoundat || key!=g->edfoundkey || now-g->edfoundat>=5000000) {
+            g->edfound    = editorfound(g, *a, j.prog);
+            g->edfoundkey = key;
+            g->edfoundat  = now;
+        }
+    }
+    if (!j.why.len && !g->edfound) {
+        b32 sep = find(j.prog, "/")>=0 || (HOST_WINDOWS && find(j.prog, "\\")>=0);
+        Buf b(a, 64 + j.prog.len);
+        print(&b, "Its editor, ");
+        print(&b, sep ? j.prog : j.name);
+        print(&b, sep ? Str(", is not there") : Str(", is not on PATH"));
+        j.why = finish(&b);
+    }
+    return j;
+}
+
+// Launch the editor on path at a line, left to run on its own: in the
+// checklist only noted (g->editjump), never run.
+static void editorjumprun(Gui *g, Arena a, Str path, i32 line, i32 col)
+{
+    EditJump j = editorjumpfor(g, &a, path, line, col);
+    if (j.why.len) {
+        g->lasterr = clone(&g->perm, j.why);
+        return;
+    }
+    g->editjump = clone(&g->perm, j.line);
+    g->editjumps++;
+    guilog(g, concat(&a, "opening in the editor: ", j.line));
+    if (g->drive) {
+        return;
+    }
+    Str dir = parentdir(path);
+    if (!dir.len || startswith(dir, "\\\\")) {
+        dir = userhome(g->os, &a);  // cmd.exe refuses a UNC folder
+    }
+    Slice<Str> argv = {};
+    Str        cmdline = {};
+    #ifdef _WIN32
+    Str comspec = os_getenv(g->os, &a, "COMSPEC");
+    comspec = comspec.len ? comspec : Str("cmd.exe");
+    Buf c(&a, 64 + comspec.len + j.line.len);
+    putbyte(&c, '"');
+    print(&c, comspec);
+    print(&c, "\" /d /s /c \"");
+    print(&c, j.line);
+    putbyte(&c, '"');
+    argv    = push(&a, argv, comspec);
+    cmdline = finish(&c);
+    #else
+    argv = push(&a, argv, Str("/bin/sh"));
+    argv = push(&a, argv, Str("-c"));
+    argv = push(&a, argv, j.line);
+    #endif
+    Slice<Str> env = guienv(g, &a);
+    if (!os_launch(g->os, a, argv, dir, env, cmdline, 0)) {
+        g->lasterr = clone(&g->perm, concat(&a, "cannot start the editor: ",
+                                            os_lasterr(g->os, &a)));
     }
 }
 
@@ -13698,6 +13833,11 @@ enum : i32 {
     CHK_FILEHOST,     // the front file is on the shown session's host, not
                       // this computer, and dx 1 read there (fs.read); or
                       // dx 2 Open file's path is, checked there (fs.stat)
+    CHK_EDITJUMP,     // Open in editor ran dx times, the latest's command
+                      // with text in it ('/' either way, '"' as '\'')
+    CHK_EDITWHY,      // the Files toolbar's Open in editor is disabled,
+                      // saying text
+    CHK_REVEALED,     // the file shown in the file manager ends with text
     CHK_COUNT,
 };
 
@@ -14012,6 +14152,9 @@ static Str chknames[] = {
     "the tool row whose path was clicked is folded or open as said",
     "the file's text is as said",
     "the file is on the session's host, read there",
+    "Open in editor's command is as said",
+    "Open in editor is disabled, saying why",
+    "the file revealed is the one said",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -16114,6 +16257,17 @@ static DriveOp m3ops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_CLIPEND, 0, 0, 0, "/cite/hello.c"},
+    // Its Open in editor, at its line ([ui] editor_line a test
+    // script's, only noted under the drive)
+    {OP_IFEDITOR, 0, 8, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "link cite/hello.c:12"},
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "linkmenu editor"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_EDITJUMP, 1, 0, 0, " +12 '"},
+    {OP_CHECK, CHK_EDITJUMP, 1, 0, 0, "/cite/hello.c'"},
     {OP_MOVE, T_NAMED, 0, 0, 800, "link mailto:"},
     {OP_CHECK, CHK_TOOLTIP, 0, 0, 0, ""},
     {OP_CHECK, CHK_LINKTIP, 0, 0, 0,
@@ -16187,6 +16341,18 @@ static DriveOp m3ops[] = {
     {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
     {OP_CHECK, CHK_FILETEXT, 0, 0, 0, "line 1\n"},
     {OP_CHECK, CHK_FILELINE, 0, 0, 0, "mark"},
+    // Reveal shows it in the file manager (noted only), and Open in
+    // editor opens it at its band's line
+    {OP_MOVE, T_NAMED, 0, 0, 300, "file reveal"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_REVEALED, 0, 0, 0, "/files/lines.txt"},
+    {OP_IFEDITOR, 0, 5, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "file editor"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_EDITJUMP, 2, 0, 0, " +1200 '"},
+    {OP_CHECK, CHK_EDITJUMP, 2, 0, 0, "/files/lines.txt'"},
     {OP_PROMPT, 0, 0, 0, 1500, "Edit the lines."},
     {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
     {OP_WAIT, W_FILEFRESH, 0, 0, 5000, ""},
@@ -17961,6 +18127,7 @@ static DriveOp remoteops[] = {
     // refused; a link to a file there, and to one not there
     REMOTEFILES(OP_TEXTRCWD, "", "/hello.txt", "/nope.txt"),
     {OP_SHOT, 0, 0, 0, 300, "remote-files"},
+    {OP_CHECK, CHK_EDITWHY, 0, 0, 0, "Its file is on another computer"},
     // A far file a tool changes is checked there (fs.stat) and read
     // again there (fs.read)
     {OP_PROMPT, 0, 0, 0, 100, "Edit the far file."},
@@ -21418,6 +21585,30 @@ static b32 drivefilecheck(Gui *g, i32 chk)
         print(&b, got);
         ok = driveendsep(got, op->text);
     } break;
+    case CHK_EDITJUMP: {
+        // Its separators as '/' and its quotes as sh's, as on Windows
+        // cmd.exe has them '\\' and '"'
+        Str line = clone(&a, g->editjump);
+        for (iz i = 0; i < line.len; i++) {
+            line.data[i] = line[i]=='\\' ? '/' : line[i]=='"' ? '\'' : line[i];
+        }
+        print(&b, "drive: Open in editor ran ");
+        print(&b, g->editjumps);
+        print(&b, ", the latest ");
+        print(&b, g->editjump);
+        ok = g->editjumps==(i64)op->dx && find(line, op->text)>=0;
+    } break;
+    case CHK_EDITWHY: {
+        Str why = {g->fjumpwhy, g->fjumpwhylen};
+        print(&b, "drive: Open in editor's why is ");
+        print(&b, why);
+        ok = ft && why==op->text;
+    } break;
+    case CHK_REVEALED:
+        print(&b, "drive: revealed ");
+        print(&b, g->revealed);
+        ok = g->revealed.len && driveendsep(g->revealed, op->text);
+        break;
     case CHK_FILETOP: {
         // A heading scrolled to may sit a line below the top, past the pad
         i32 top = ft ? ft->top+1 : 0;
@@ -23551,6 +23742,9 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_TOOLPATHFOLD:
     case CHK_FILETEXT:
     case CHK_FILEHOST:
+    case CHK_EDITJUMP:
+    case CHK_EDITWHY:
+    case CHK_REVEALED:
         return drivefilecheck(g, chk);
     case CHK_TERMQUIET:
         return g->panes[PANE_TERMINAL] && drivequiet(g, "idle with the terminal shown", 2);
@@ -25369,6 +25563,7 @@ static void readconfig(Gui *g, Arena scratch)
     setfontbase(g, cfgget(cfg, "ui", "", "font_size", 0));
     g->fontsset   = clone(&g->perm, cfgget(cfg, "ui", "", "fonts", 0));
     g->editor     = clone(&g->perm, cfgget(cfg, "ui", "", "editor", 0));
+    g->edjumpfmt  = clone(&g->perm, cfgget(cfg, "ui", "", "editor_line", 0));
     g->terminal   = clone(&g->perm, cfgget(cfg, "ui", "", "terminal", 0));
     g->notify     = notifyparse(cfgget(cfg, "ui", "", "notify", 0));
     g->nomentions = cfgbool(cfgget(cfg, "ui", "", "mentions", 0)) == 0;
