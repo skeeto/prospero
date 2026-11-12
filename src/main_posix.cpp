@@ -943,6 +943,11 @@ static void os_logclose(Os *, iz log)
     close((i32)log);
 }
 
+static b32 os_logprivate(Os *, iz log)
+{
+    return !fchmod((i32)log, 0600);
+}
+
 
 // More files and the environment
 
@@ -3989,6 +3994,9 @@ static void os_httpfree(Os *, Http *h)
 #if PROSPERO_GUI
 #  include "app.cpp"
 #  include "gui_sdl.cpp"
+#  ifdef __APPLE__
+#    include "a11y_macos.cpp"
+#  endif
 #endif
 
 #if PROSPERO_GUI && defined(__APPLE__)

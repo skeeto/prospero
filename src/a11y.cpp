@@ -1445,3 +1445,110 @@ static b32 axnextedit(A11y *x, u32 id, Str text, i64 now, AxEdit *out)
     }
     return r;  // the queue's arena is kept: out's text is in it
 }
+
+
+// The adapters' calls, with their arguments and what they returned, the
+// latest AXLOG_N lines, for the Metrics pane and a trace: how each OS's
+// speech tools drive a field is learned from these. A string argument
+// is cut after AXLOG_ARG bytes (axlogstr), and a line kept here after
+// AXLOG_LINE, so one long dictation can't push out the calls around it.
+// The lines are slots of a fixed size, allocated once and not zeroed:
+// pages untouched cost nothing.
+enum : i32 {
+    AXLOG_N    = 1024,
+    AXLOG_LINE = 1024,
+    AXLOG_ARG  = 600,
+};
+
+struct AxLog {
+    u8  *buf;    // AXLOG_N slots of AXLOG_LINE bytes
+    i32 *lens;
+    i64  total;  // lines ever logged
+    u64  last;   // the latest line, hashed, for axlogrun
+    i32  run;    // how many times in a row it came, 0 for none
+};
+
+static AxLog *newaxlog(Arena *perm)
+{
+    AxLog *l = alloc<AxLog>(perm);
+    l->buf  = allocbytes(perm, (iz)AXLOG_N*AXLOG_LINE);
+    l->lens = alloc<i32>(perm, AXLOG_N);
+    return l;
+}
+
+// How many bytes of s to keep within max: cut before a character.
+static iz axcutat(Str s, iz max)
+{
+    if (s.len <= max) {
+        return s.len;
+    }
+    iz n = max;
+    while (n>0 && (s[n]&0xc0)==0x80) {
+        n--;
+    }
+    return n;
+}
+
+// Put a line in slot k, cut with an ellipsis to fit. Returns it as kept.
+static Str axlogslot(AxLog *l, i64 k, Str s)
+{
+    Str more = "\xe2\x80\xa6";
+    u8 *dst  = l->buf + (iz)(k % AXLOG_N)*AXLOG_LINE;
+    iz  n    = s.len;
+    if (n > AXLOG_LINE) {
+        n = axcutat(s, AXLOG_LINE - more.len);
+        copybytes(dst+n, more.data, more.len);
+    }
+    copybytes(dst, s.data, n);
+    n += s.len>AXLOG_LINE ? more.len : 0;
+    l->lens[k % AXLOG_N] = (i32)n;
+    return {dst, n};
+}
+
+static Str axlogput(AxLog *l, Str s)
+{
+    return axlogslot(l, l->total++, s);
+}
+
+// Replace the latest line, as a repeat of it is counted there.
+static Str axlogredo(AxLog *l, Str s)
+{
+    return l->total ? axlogslot(l, l->total-1, s) : axlogput(l, s);
+}
+
+// How many times in a row line has now come, 1 if not as the last did.
+// AppKit asks some things over and over on its own, and a run of them
+// as one line keeps the calls around them in the log.
+static i32 axlogrun(AxLog *l, Str line)
+{
+    u64 h = hash(line);
+    if (l->run && h==l->last) {
+        return ++l->run;
+    }
+    l->last = h;
+    return l->run = 1;
+}
+
+static iz axlogkept(AxLog *l)
+{
+    return l->total<AXLOG_N ? (iz)l->total : (iz)AXLOG_N;
+}
+
+// The ith line kept, oldest first.
+static Str axlogline(AxLog *l, iz i)
+{
+    i64 k = (l->total - axlogkept(l) + i) % AXLOG_N;
+    return {l->buf + (iz)k*AXLOG_LINE, l->lens[k]};
+}
+
+// A string argument, quoted as in a dump, cut after AXLOG_ARG bytes on a
+// character, then how many bytes were left out: "abc"…+1234.
+static void axlogstr(Buf *b, Str s)
+{
+    iz n = axcutat(s, AXLOG_ARG);
+    axquote(b, takehead(s, n));
+    if (n < s.len) {
+        print(b, "\xe2\x80\xa6+");
+        print(b, (i64)(s.len - n));
+    }
+}

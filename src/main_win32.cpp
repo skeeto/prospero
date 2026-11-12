@@ -1202,6 +1202,11 @@ static void os_logclose(Os *, iz log)
     CloseHandle((uz)log);
 }
 
+static b32 os_logprivate(Os *, iz)
+{
+    return 1;
+}
+
 
 // More files and the environment
 

@@ -102,6 +102,13 @@ struct AxGui {
     char const         *tablabel;
     u32                 navid;    // the checklist's "nav": the keyboard's item
     u32                 navwin;
+    AxLog              *log;      // the adapter's calls (axnote)
+    Arena               logmem;   // scratch for them, between frames too
+    i64                 logt0;    // when the log began
+    u64                 logmodel; // the text model as last logged, hashed
+    iz                  tracefd;  // PROSPERO_AXTRACE's file, or -1
+    i64                 logmark;  // the checklist's: where "logged" looks from
+    Str                 tracepath;
 };
 
 enum { AXLINT_CAP = 1<<12 };
@@ -813,6 +820,241 @@ static b32 axtextselect(Gui *g, i32 anchor, i32 caret)
     return 1;
 }
 
+// The adapter's log (AxLog): each call an OS adapter answers, a line led
+// by the seconds since the log began, kept for the Metrics pane and, with
+// PROSPERO_AXTRACE=path, appended to that file as it comes, so that a
+// trace can come from a release build, which has no Metrics pane. The
+// adapter builds its lines in logmem, by value, never across a call
+// into AppKit: the calls nest, and come inside frames as well as between.
+
+static void axstamp(AxGui *x, Buf *b)
+{
+    i64 ms = (os_ticks(x->g->os) - x->logt0) / 1000;
+    print(b, ms/1000);
+    putbyte(b, '.');
+    putbyte(b, (u8)('0' + ms/100%10));
+    putbyte(b, (u8)('0' + ms/10%10));
+    putbyte(b, (u8)('0' + ms%10));
+    putbyte(b, ' ');
+}
+
+// Log line, built in scratch's arena; the rest of scratch is free. A
+// line the same as the last is counted on it, with the time of the
+// latest, and the trace has the count once the run ends.
+static void axnote(AxGui *x, Arena scratch, Str line)
+{
+    AxLog *l    = x->log;
+    i32    was  = l->run;
+    i32    run  = axlogrun(l, line);
+    Buf    b(&scratch, line.len+64);
+    if (run==1 && was>1 && x->tracefd>=0) {
+        axstamp(x, &b);
+        print(&b, "(the line before, ");
+        print(&b, (i64)was);
+        print(&b, " times in a row)\n");
+        os_logwrite(x->g->os, x->tracefd, finish(&b));
+        b.len = 0;
+    }
+    axstamp(x, &b);
+    print(&b, line);
+    if (run > 1) {
+        print(&b, " (\xc3\x97");
+        print(&b, (i64)run);
+        putbyte(&b, ')');
+        axlogredo(l, finish(&b));
+        return;
+    }
+    putbyte(&b, '\n');
+    Str s = finish(&b);
+    axlogput(l, takehead(s, s.len-1));
+    if (x->tracefd >= 0) {
+        os_logwrite(x->g->os, x->tracefd, s);
+    }
+}
+
+// The focused field's text model, as a tool is told of it: its length,
+// selection and marked text in UTF-16 units, and its text.
+static void axmodelline(AxGui *x, Buf *b)
+{
+    A11y   *ax = x->ax;
+    AxText *t  = &ax->text;
+    if (!x->on || !t->live) {
+        print(b, x->on ? Str("model: no field") : Str("model: not started"));
+        return;
+    }
+    print(b, "model: field ");
+    print(b, (i64)t->key);
+    print(b, " len ");
+    print(b, (i64)axunitlen(ax, AXU_UTF16));
+    print(b, " sel ");
+    print(b, (i64)axtounit(ax, AXU_UTF16, t->anchor));
+    putbyte(b, ',');
+    print(b, (i64)axtounit(ax, AXU_UTF16, t->caret));
+    if (t->state & AXS_READONLY) {
+        print(b, " readonly");
+    }
+    if (t->state & AXS_PASSWORD) {
+        print(b, " password");  // its text never logged
+        return;
+    }
+    if (t->marked.len) {
+        print(b, " marked ");
+        axlogstr(b, t->marked);
+        putbyte(b, ' ');
+        print(b, (i64)axcount(t->marked, AXU_UTF16, t->mlo));
+        putbyte(b, ',');
+        print(b, (i64)axcount(t->marked, AXU_UTF16, t->mhi));
+    }
+    putbyte(b, ' ');
+    axlogstr(b, t->text);
+}
+
+// Log the text model if it changed since it was last logged: ahead of a
+// call, as its ranges are against it.
+static void axnotemodel(AxGui *x, Arena scratch)
+{
+    Buf b(&scratch, 256);
+    axmodelline(x, &b);
+    Str s = finish(&b);
+    u64 h = hash(s);
+    if (h != x->logmodel) {
+        x->logmodel = h;
+        axnote(x, scratch, s);
+    }
+}
+
+// Lines logged since total since that hold want, for the checklist.
+static i32 axlogged(Gui *g, i64 since, Str want)
+{
+    AxLog *l = g->ax ? g->ax->log : 0;
+    i32    n = 0;
+    for (iz i = 0, kept = l ? axlogkept(l) : 0; i < kept; i++) {
+        n += l->total-kept+i>=since && find(axlogline(l, i), want)>=0;
+    }
+    return n;
+}
+
+static Str const axsetnames[] = {"auto", "on", "off"};
+
+static void axtraceopen(AxGui *x)
+{
+    Gui  *g    = x->g;
+    Arena a    = x->logmem;
+    Str   path = os_getenv(g->os, &a, "PROSPERO_AXTRACE");
+    if (!path.len) {
+        return;
+    }
+    x->tracefd = os_logopen(g->os, a, path);
+    if (x->tracefd>=0 && !os_logprivate(g->os, x->tracefd)) {
+        os_logclose(g->os, x->tracefd);  // typed text mustn't be readable to all
+        x->tracefd = -1;
+    }
+    if (x->tracefd < 0) {
+        guilog(g, concat(&a, "could not open the accessibility trace, ", path));
+        return;
+    }
+    x->tracepath = clone(&g->perm, path);
+    Buf b(&a, 128);
+    print(&b, "trace: prospero " PROSPERO_VERSION ", pid ");
+    print(&b, (i64)os_pid(g->os));
+    print(&b, ", accessibility ");
+    print(&b, axsetnames[g->axset]);
+    axnote(x, a, finish(&b));
+}
+
+// The Metrics pane's Accessibility section (Debug builds): the setting,
+// the focus, the text model, and the adapter's log, to copy.
+static void axmetrics(Gui *g)
+{
+    AxGui *x = g->ax;
+    Arena  a = g->frame;
+    Buf    b(&a, 256);
+    ImGui::SeparatorText("Accessibility");
+    print(&b, "setting ");
+    print(&b, axsetnames[g->axlint ? AXSET_ON : g->axset]);
+    print(&b, !x ? Str("") : x->on ? Str(", started") : Str(", not started"));
+    if (x && x->tracefd>=0) {
+        print(&b, ", tracing to ");
+        print(&b, x->tracepath);
+    }
+    text(finish(&b));
+    if (!x) {
+        return;
+    }
+
+    AxTree *t = x->ax->pub;
+    b.len = 0;
+    print(&b, "focus ");
+    if (t->focus < 0) {
+        print(&b, "none");
+    } else {
+        AxNode *n = t->nodes + t->focus;
+        print(&b, axrolenames[n->role<AX_NROLES ? n->role : 0]);
+        putbyte(&b, ' ');
+        axquote(&b, n->name);
+        print(&b, ", key ");
+        print(&b, (i64)n->key);
+    }
+    print(&b, "  nodes ");
+    print(&b, (i64)t->len);
+    print(&b, "  queued edits ");
+    i64 queued = 0;
+    for (iz i = x->ax->qhead; i < x->ax->queue.len; i++) {
+        queued += x->ax->queue[i].id != 0;
+    }
+    print(&b, queued);
+    print(&b, "  actions ");
+    print(&b, (i64)x->nacts);
+    ImGui::PushTextWrapPos(0);
+    text(finish(&b));
+
+    b.len = 0;
+    Buf mb(&a, 256);
+    axmodelline(x, &mb);
+    Str model = finish(&mb);
+    text(takehead(model, axcutat(model, 400)));
+    ImGui::PopTextWrapPos();
+
+    AxLog *l    = x->log;
+    iz     kept = axlogkept(l);
+    b.len = 0;
+    print(&b, "log ");
+    print(&b, (i64)kept);
+    print(&b, " lines, of ");
+    print(&b, l->total);
+    ImGui::AlignTextToFramePadding();
+    text(finish(&b));
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!kept);
+    if (ImGui::SmallButton("Copy log##axlog")) {
+        Buf all(&a, kept*64);
+        for (iz i = 0; i < kept; i++) {
+            print(&all, axlogline(l, i));
+            putbyte(&all, '\n');
+        }
+        ImGui::SetClipboardText(cstr0(&a, finish(&all)));
+    }
+    ImGui::EndDisabled();
+    itemtip("Copy the accessibility adapter's calls, as text");
+
+    f32 h = ImGui::GetTextLineHeightWithSpacing();
+    if (ImGui::BeginChild("##axlog", v2(0, 12*h), ImGuiChildFlags_Borders,
+                          ImGuiWindowFlags_HorizontalScrollbar)) {
+        ImGuiListClipper clip;
+        clip.Begin((i32)kept);
+        while (clip.Step()) {
+            for (i32 i = clip.DisplayStart; i < clip.DisplayEnd; i++) {
+                Str s = axlogline(l, i);
+                ImGui::TextUnformatted(s.cdata, s.cdata+s.len);
+            }
+        }
+        if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY()) {
+            ImGui::SetScrollHereY(1);  // following the latest
+        }
+    }
+    ImGui::EndChild();
+}
+
 static void axnewframe(ImGuiContext *ctx, ImGuiContextHook *hook)
 {
     AxGui *x = (AxGui *)hook->UserData;
@@ -873,6 +1115,11 @@ static void axinit(Gui *g, i32 set)
     }
     x->ax = newa11y(&g->perm, mem);
     g->ax = x;
+    x->log     = newaxlog(&g->perm);
+    x->logmem  = carve(&g->perm, (iz)1 << 18);
+    x->logt0   = os_ticks(os);
+    x->tracefd = -1;
+    axtraceopen(x);
 
     ImGuiContext    *ctx  = ImGui::GetCurrentContext();
     ImGuiContextHook hook = {};
@@ -884,8 +1131,8 @@ static void axinit(Gui *g, i32 set)
     hook.Callback = axendframe;
     ImGui::AddContextHook(ctx, &hook);
 
-    if (set == AXSET_ON) {
-        x->on = 1;
+    if (set==AXSET_ON || x->tracefd>=0) {
+        x->on = 1;  // a trace wants the text model the calls are against
     }
 }
 
@@ -920,6 +1167,8 @@ static void axstart(Gui *g)
 //   nav ROLE NAME    make the item ImGui's keyboard item, as arrows would
 //   lint             check that nothing actionable is unnamed, logging
 //                    what is
+//   logged TEXT      check that the adapter logged a line holding TEXT
+//                    since the last OP_NSTEXT
 
 // what may be in a, the caller's scratch
 static void axcheck(Gui *g, Arena *a, b32 ok, Str what)
@@ -1144,6 +1393,9 @@ static void driveax(Gui *g, Str cmd)
         putbyte(&b, ',');
         print(&b, axround(d->InputPos.y));
         axcheck(g, &a, ok, finish(&b));
+    } else if (verb == "logged") {
+        axcheck(g, &a, axlogged(g, g->ax->logmark, c.tail) > 0,
+                concat(&a, "accessibility log: ", c.tail));
     } else if (verb == "lint") {
         Slice<i32> bad = axlint(&a, t);
         Buf b(&a, 256);

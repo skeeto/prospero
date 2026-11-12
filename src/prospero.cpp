@@ -177,6 +177,9 @@ static b32     os_logwrite(Os *, iz log, Str record);  // one write per record
 static b32     os_logsync(Os *, iz log);  // flush to stable storage
 static b32     os_logtrunc(Os *, iz log, i64 len);  // drop a torn tail
 static void    os_logclose(Os *, iz log);
+// Make the log readable by its owner only, as for one that holds what
+// the user typed. Windows' per-user ACLs already are: there, nothing.
+static b32     os_logprivate(Os *, iz log);
 
 // (M2) Read up to max bytes of a regular file starting at off. The size
 // is that of the whole file, and data is short only at its end.
@@ -634,6 +637,13 @@ enum {
     GEV_EDITING,    // an input method's composition is the text, its
                     // clause code points [x, x+y) (gui_preedit); empty
                     // ends it; out, x -1 where there is no such path
+    GEV_NSTEXT,     // macOS: the text sent to the window's text input as
+                    // Dictation sends it (NSTextInputClient): x 0 inserted,
+                    // 1 marked, 2 unmarked, 3 each query asked once, 4
+                    // text input as it was before the first, 5 the window
+                    // and its view asked their role (NSAccessibility); out,
+                    // x -1 where there is no such path, -2 if text input
+                    // has no responder (5: no view)
 };
 enum {
     GKEY_TAB,

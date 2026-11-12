@@ -656,6 +656,16 @@ static char const *cstring(void *ns)
     return ns ? objcsend<char const *>(ns, "UTF8String") : 0;
 }
 
+// An NSString of s by its length, which may hold a NUL, or nil if it
+// isn't UTF-8.
+static void *nsstringn(Str s)
+{
+    void *o = objcsend<void *>(objc_getClass("NSString"), "alloc");
+    o = objcsend<void *>(o, "initWithBytes:length:encoding:", (void *)s.data, (uz)s.len,
+                         (uz)4);  // NSUTF8StringEncoding
+    return o ? objcsend<void *>(o, "autorelease") : 0;
+}
+
 // The application menu's Settings... (Cmd+,), where macOS users look
 // for an app's settings. SDL adds it as "Preferences...", with no action
 // and so disabled: here it is renamed as macOS 13 names it, and made to
@@ -713,8 +723,12 @@ enum : uz {
 };
 
 struct NsPoint { double x, y; };
+struct NsRange { uz loc, len; };
+struct NsRect  { double x, y, w, h; };
+enum : uz { NSNOTFOUND = (uz)I64MAX };
 static void (*macsendevent)(void *, void *, void *);
 static b32    macmodsent;  // a key's modifiers were sent, to let go
+static i32    mackeydepth; // key downs being dispatched (a11y_macos.cpp)
 
 static uz sdlmodflags()
 {
@@ -742,7 +756,9 @@ static void macsend(void *self, void *sel, void *ev)
         macsendevent(self, sel, nskeyevent(NSFLAGSCHANGED, mods, win, "", 0));
         macmodsent = 1;
     }
+    mackeydepth += type==NSKEYDOWN;
     macsendevent(self, sel, ev);
+    mackeydepth -= type==NSKEYDOWN;
     if (type==NSKEYUP && macmodsent) {
         macmodsent = 0;
         uz now = objcsend<uz>(objc_getClass("NSEvent"), "modifierFlags");
@@ -752,6 +768,8 @@ static void macsend(void *self, void *sel, void *ev)
 
 extern "C" void *class_getInstanceMethod(void *, void *);
 extern "C" void *method_setImplementation(void *, void *);
+
+static void axmacinit(Gui *);  // a11y_macos.cpp
 
 static void handlemodflags()
 {
@@ -763,6 +781,82 @@ static void handlemodflags()
     if (m && !macsendevent) {
         macsendevent = (void (*)(void *, void *, void *))method_setImplementation(m, (void *)macsend);
     }
+}
+
+// The checklist's Dictation (GEV_NSTEXT): calls to the window's text
+// input as Dictation makes them, through AppKit's NSTextInputClient, so
+// SDL's handling and the accessibility log's wrappers (a11y_macos.cpp)
+// run as they would for it. The checklist's window is never key, so
+// text input is started here, until kind 4, and SDL drops the text.
+// Kind 5 asks NSAccessibility instead, as Voice Control would: of the
+// window and its content view, through the wrappers to AppKit's own.
+static b32 macnststarted;
+
+static void macnstext(SDL_Window *w, GuiEvent *ge)
+{
+    if ((i32)ge->x == 4) {
+        if (macnststarted) {
+            SDL_StopTextInput(w);
+        }
+        macnststarted = 0;
+        return;
+    } else if ((i32)ge->x == 5) {
+        void *pool = objc_autoreleasePoolPush();
+        void *win  = SDL_GetPointerProperty(SDL_GetWindowProperties(w),
+                                            SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, 0);
+        void *view = win ? objcsend<void *>(win, "contentView") : 0;
+        void *role = nsstring("AXRole");
+        if (!view) {
+            ge->x = -2;
+        } else {
+            objcsend<void *>(win, "accessibilityAttributeValue:", role);
+            objcsend<void *>(view, "accessibilityAttributeValue:", role);
+            objcsend<void *>(win, "accessibilityAttributeNames");
+        }
+        objc_autoreleasePoolPop(pool);
+        return;
+    } else if (!SDL_TextInputActive(w)) {
+        macnststarted = SDL_StartTextInput(w);
+    }
+    void *pool = objc_autoreleasePoolPush();
+    void *win  = SDL_GetPointerProperty(SDL_GetWindowProperties(w),
+                                        SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, 0);
+    void *resp = win ? objcsend<void *>(win, "firstResponder") : 0;
+    void *cls  = objc_getClass("SDL3TranslatorResponder");
+    void *s    = nsstringn(ge->text);
+    if (!resp || !cls || !s || !objcsend<ObjcBool>(resp, "isKindOfClass:", cls)) {
+        ge->x = -2;
+        objc_autoreleasePoolPop(pool);
+        return;
+    }
+    NsRange none = {NSNOTFOUND, 0};
+    NsRange got  = {};
+    switch ((i32)ge->x) {
+    case 0:
+        objcsend<void>(resp, "insertText:replacementRange:", s, none);
+        break;
+    case 1:
+        objcsend<void>(resp, "setMarkedText:selectedRange:replacementRange:", s,
+                       NsRange{objcsend<uz>(s, "length"), 0}, none);
+        break;
+    case 2:
+        objcsend<void>(resp, "unmarkText");
+        break;
+    case 3:
+        objcsend<NsRange>(resp, "selectedRange");
+        objcsend<NsRange>(resp, "markedRange");
+        objcsend<ObjcBool>(resp, "hasMarkedText");
+        objcsend<void *>(resp, "attributedSubstringForProposedRange:actualRange:",
+                         NsRange{0, 1}, &got);
+        #if __arm64__  // elsewhere a struct this size comes by objc_msgSend_stret
+        objcsend<NsRect>(resp, "firstRectForCharacterRange:actualRange:", NsRange{0, 0}, &got);
+        #endif
+        objcsend<uz>(resp, "characterIndexForPoint:", NsPoint{});
+        objcsend<void *>(resp, "validAttributesForMarkedText");
+        objcsend<void>(resp, "doCommandBySelector:", sel_registerName("noop:"));
+        break;
+    }
+    objc_autoreleasePoolPop(pool);
 }
 
 // The checklist's paste as dictation apps post it (GEV_FLAGPASTE), sent
@@ -1114,6 +1208,7 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
     handlereopen(p->trayevent);
     handlesettings(p->trayevent);
     handlemodflags();
+    axmacinit(g);
     #endif
     if (!sdlwindow(os, g, p, title)) {
         return 0;
@@ -1586,6 +1681,17 @@ static void os_guiinject(Os *os, GuiEvent *ge)
     } else if (ge->kind == GEV_CLIPRACE) {
         #ifdef __APPLE__
         macliprace(p->window, ge);
+        #else
+        ge->x = -1;
+        #endif
+        return;
+    } else if (ge->kind == GEV_NSTEXT) {
+        #ifdef __APPLE__
+        if (p->window) {
+            macnstext(p->window, ge);
+        } else {
+            ge->x = -2;
+        }
         #else
         ge->x = -1;
         #endif

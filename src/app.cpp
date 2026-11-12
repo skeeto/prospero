@@ -13463,6 +13463,8 @@ enum : i32 {
     OP_OPENFILE,  // open text in Files, as a reference (fileref) in --cwd,
                   // in the session shown
     OP_A11Y,      // an accessibility command, text (driveax)
+    OP_NSTEXT,    // macOS: text to the text input as Dictation sends it
+                  // (GEV_NSTEXT, dx its kind), checked to be logged
 };
 // OP_TEXTCWD with text types the --cwd directory and text after it, on
 // Windows with backslashes, as a Windows user types a path.
@@ -20822,6 +20824,31 @@ static DriveOp a11yops[] = {
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
     {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
 
+#ifdef __APPLE__
+    // Dictation's calls, through AppKit's NSTextInputClient to SDL, each
+    // logged (a11y_macos.cpp), and answered by SDL as before: as its
+    // window isn't key, SDL drops the text, so its own answers show it
+    {OP_NSTEXT, 0, 1, 0, 100, "dictat"},
+    {OP_NSTEXT, 0, 3, 0, 100, ""},
+    {OP_A11Y, 0, 0, 0, 0, "logged hasMarkedText -> YES"},
+    {OP_A11Y, 0, 0, 0, 0, "logged markedRange -> {0,6}"},
+    {OP_A11Y, 0, 0, 0, 0, "logged selectedRange -> {6,0}"},
+    {OP_NSTEXT, 0, 0, 0, 100, "dictated"},
+    {OP_A11Y, 0, 0, 0, 0, "logged hasMarkedText -> YES"},  // SDL's, inside
+    {OP_A11Y, 0, 0, 0, 0, "logged unmarkText"},
+    {OP_NSTEXT, 0, 1, 0, 100, "\xc3\xa9t\xc3\xa9 \xf0\x9f\x8e\x99"},
+    {OP_A11Y, 0, 0, 0, 0, "logged \"\xc3\xa9t\xc3\xa9 \xf0\x9f\x8e\x99\"#6 {6,0}"},
+    {OP_NSTEXT, 0, 2, 0, 100, ""},
+    {OP_NSTEXT, 0, 3, 0, 100, ""},
+    {OP_A11Y, 0, 0, 0, 0, "logged hasMarkedText -> NO"},
+    {OP_NSTEXT, 0, 4, 0, 100, ""},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+
+    // Voice Control's, through NSAccessibility: logged by the methods
+    // added to SDL's classes, and answered by AppKit's as before
+    {OP_NSTEXT, 0, 5, 0, 100, ""},
+#endif
+
     // Where the caret is, in the text model and to the IME
     {OP_TEXT, 0, 0, 0, 300, "say "},
     {OP_A11Y, 0, 0, 0, 0, "caret"},
@@ -25408,6 +25435,62 @@ static void drivestep(Gui *g)
         print(&b, (i64)e.y);
         print(&b, " released");
         guilog(g, finish(&b));
+    } break;
+    case OP_NSTEXT: {
+        static Str const want[][8] = {
+            {"insertText:replacementRange: \""},
+            {"setMarkedText:selectedRange:replacementRange: \""},
+            {"unmarkText"},
+            {"selectedRange -> ", "markedRange -> ", "hasMarkedText -> ",
+             "attributedSubstringForProposedRange:actualRange: {0,1} -> ",
+             "firstRectForCharacterRange:actualRange: {0,0} -> ",
+             "characterIndexForPoint: (0,0) -> ", "validAttributesForMarkedText -> ",
+             "doCommandBySelector: noop:"},
+            {},
+            {"Window accessibilityAttributeValue: AXRole -> AXWindow",
+             "View accessibilityAttributeValue: AXRole -> AX",
+             "Window accessibilityAttributeNames -> ("},
+        };
+        i64 since = g->ax ? g->ax->log->total : 0;
+        if (g->ax) {
+            g->ax->logmark  = since;  // for "logged" (driveax)
+            g->ax->log->run = 0;      // a repeat is a line of its own, after it
+        }
+        e.kind = GEV_NSTEXT;
+        e.x    = op->dx;
+        e.text = op->text;
+        os_guiinject(g->os, &e);
+        if (e.x == -1) {
+            guilog(g, "drive: skip Dictation's calls (macOS only)");
+            break;
+        }
+        Arena a = g->frame;
+        i32   k = (i32)op->dx;
+        b32   ok = e.x!=-2 && k>=0 && k<countof(want);
+        if (ok && !want[k][0].len) {
+            break;  // nothing called, nothing to check
+        }
+        Buf   b(&a, 256);
+        for (i32 i = 0; ok && i<countof(want[k]) && want[k][i].len; i++) {
+            Str w = want[k][i];
+            if (k < 2) {
+                Buf q(&a, 64);
+                print(&q, takehead(w, w.len-1));
+                axlogstr(&q, op->text);
+                w = finish(&q);
+            }
+            if (!axlogged(g, since, w)) {
+                print(&b, b.len ? Str(", ") : Str(", not logged: "));
+                print(&b, w);
+                ok = 0;
+            }
+        }
+        g->drivechecks++;
+        g->drivefails += !ok;
+        Str head = concat(&a, ok ? Str("drive: ok   ") : Str("drive: FAIL "),
+                          concat(&a, "Dictation's calls logged, ", op->text));
+        guilog(g, concat(&a, head, e.x==-2 ? Str(", but no text input responder")
+                                           : finish(&b)));
     } break;
     case OP_CLIPBACK: {
         Arena a = g->frame;

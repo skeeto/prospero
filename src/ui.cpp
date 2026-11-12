@@ -93,6 +93,8 @@ static void axmenu(Gui *);
 static void axfocusable(Gui *);
 static b32  axmenuasked(Gui *, u32);
 static void axexpanded(Gui *, b32 open);
+// The Metrics pane's section for them
+static void axmetrics(Gui *);
 
 // The last item clicked, or pressed by other means: the keyboard's Space
 // on it, or an assistive tool (ImGui's activation)
@@ -14588,6 +14590,7 @@ static void drawmetrics(Gui *g)
     ImGui::SameLine();
     checkbox("Aggressive", &g->sched.aggressive);
     itemtip("Probe every second while idle");
+    axmetrics(g);
 }
 
 // The GUI's log, its latest lines, as a code block in a document whose
