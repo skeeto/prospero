@@ -515,3 +515,74 @@ static void test_a11ytext(Test *t)
     axtestsync(x, &a, 0, 1, "ab\r\ncd", 0, 0);
     expect(t, "a11ytext.hitcrlf", istr(&a, axoffsetat(x, 900, 55)), "2");
 }
+
+// The adapters' log: lines kept oldest first until the ring wraps, a line
+// too long cut on a character with an ellipsis, and a long string
+// argument cut with how much was left out.
+static void test_a11ylog(Test *t)
+{
+    Arena  a = t->perm;
+    AxLog *l = newaxlog(&a);
+    expect(t, "a11ylog.empty", istr(&a, axlogkept(l)), "0");
+
+    axlogput(l, "one");
+    axlogput(l, "two");
+    expect(t, "a11ylog.kept", istr(&a, axlogkept(l)), "2");
+    expect(t, "a11ylog.first", axlogline(l, 0), "one");
+    expect(t, "a11ylog.second", axlogline(l, 1), "two");
+
+    // Wrapped: the oldest go, the rest in order
+    for (i32 i = 0; i < AXLOG_N; i++) {
+        axlogput(l, istr(&a, i));
+    }
+    expect(t, "a11ylog.full", istr(&a, axlogkept(l)), istr(&a, AXLOG_N));
+    expect(t, "a11ylog.total", istr(&a, l->total), istr(&a, AXLOG_N+2));
+    expect(t, "a11ylog.oldest", axlogline(l, 0), "0");
+    expect(t, "a11ylog.latest", axlogline(l, AXLOG_N-1), istr(&a, AXLOG_N-1));
+
+    // Too long for a slot: cut before the character that would split
+    // (é is two bytes), the ellipsis in its place
+    Buf lb(&a, AXLOG_LINE+8);
+    for (i32 i = 0; i < AXLOG_LINE-4; i++) {
+        putbyte(&lb, 'x');
+    }
+    print(&lb, "\xc3\xa9\xc3\xa9\xc3\xa9");
+    Str long1 = finish(&lb);
+    Str kept  = axlogput(l, long1);
+    expect(t, "a11ylog.cutlen", istr(&a, kept.len), istr(&a, AXLOG_LINE-1));
+    expect(t, "a11ylog.cutend", cuthead(kept, kept.len-4), "x\xe2\x80\xa6");
+    expect(t, "a11ylog.cutkept", istr(&a, axlogline(l, AXLOG_N-1).len),
+           istr(&a, AXLOG_LINE-1));
+    expect(t, "a11ylog.exact", istr(&a, axlogput(l, takehead(long1, AXLOG_LINE)).len),
+           istr(&a, AXLOG_LINE));
+
+    // A run of the same line: counted, the latest slot redone in place
+    expect(t, "a11ylog.run1", istr(&a, axlogrun(l, "again")), "1");
+    axlogput(l, "again");
+    i64 before = l->total;
+    expect(t, "a11ylog.run2", istr(&a, axlogrun(l, "again")), "2");
+    axlogredo(l, "again (x2)");
+    expect(t, "a11ylog.redototal", istr(&a, l->total), istr(&a, before));
+    expect(t, "a11ylog.redo", axlogline(l, AXLOG_N-1), "again (x2)");
+    expect(t, "a11ylog.runbreak", istr(&a, axlogrun(l, "other")), "1");
+    expect(t, "a11ylog.runback", istr(&a, axlogrun(l, "again")), "1");
+
+    // Arguments: quoted and escaped, and cut on a character
+    Buf b(&a, 64);
+    axlogstr(&b, "say \"hi\"\n");
+    expect(t, "a11ylog.arg", finish(&b), "\"say \\\"hi\\\"\\n\"");
+    Buf ab(&a, AXLOG_ARG+8);
+    for (i32 i = 0; i < AXLOG_ARG-1; i++) {
+        putbyte(&ab, 'y');
+    }
+    print(&ab, "\xe3\x81\x8bzz");  // U+304B straddles the cut
+    Str arg = finish(&ab);
+    Buf cb(&a, 1024);
+    axlogstr(&cb, arg);
+    Str got = finish(&cb);
+    expect(t, "a11ylog.arglen", istr(&a, got.len), istr(&a, AXLOG_ARG-1 + 2 + 3 + 2));
+    expect(t, "a11ylog.argcut", cuthead(got, got.len-7), "y\"\xe2\x80\xa6+5");
+    Buf sb(&a, 64);
+    axlogstr(&sb, takehead(arg, AXLOG_ARG-1));
+    expect(t, "a11ylog.argwhole", istr(&a, finish(&sb).len), istr(&a, AXLOG_ARG+1));
+}
