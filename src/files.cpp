@@ -229,6 +229,15 @@ static void fileclose(Gui *g, FileSet *set, i32 i)
     scheddirty(&g->sched);
 }
 
+// Close the shown root's front tab, if any (Ctrl+W).
+static void fileclosefront(Gui *g)
+{
+    FileSet *set = &filesroot(g)->files;
+    if (set->n) {
+        fileclose(g, set, set->front);
+    }
+}
+
 // A view of its own over a body's text, made in its arena: no copies,
 // its messages' room taken once, so nothing grows past the cache.
 static DocView *filedocview(Arena *mem, ViewCache *c, iz nmsgs)

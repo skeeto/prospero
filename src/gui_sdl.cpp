@@ -697,6 +697,55 @@ static void handlesettings(u32 trayevent)
     objc_autoreleasePoolPop(pool);
 }
 
+// The Window menu's Close (Cmd+W), as SDL makes it, would close the
+// window before the app saw the key. It keeps the key, its action taken
+// through the application's delegate, as Settings... is: for the app's
+// own window it posts a tray event (TRAY_CLOSEKEY), and the app closes
+// the front file tab while Files has the focus, else the window
+// (menukeys); any other window, such as the About panel, closes as
+// Close closed it.
+static u32 closeevent;
+
+static void closeaction(void *, void *, void *sender)
+{
+    void *app = objcsend<void *>(objc_getClass("NSApplication"), "sharedApplication");
+    void *key = app ? objcsend<void *>(app, "keyWindow") : 0;
+    void *cls = objc_getClass("SDL3Window");
+    if (key && cls && objcsend<bool>(key, "isKindOfClass:", cls)) {
+        SDL_Event e = {};
+        e.type      = closeevent;
+        e.user.code = TRAY_CLOSEKEY;
+        SDL_PushEvent(&e);
+    } else if (key) {
+        objcsend<void>(key, "performClose:", sender);
+    }
+}
+
+static void handleclose(u32 trayevent)
+{
+    void *pool = objc_autoreleasePoolPush();
+    void *app  = objcsend<void *>(objc_getClass("NSApplication"), "sharedApplication");
+    void *bar  = app ? objcsend<void *>(app, "mainMenu") : 0;
+    void *dlg  = app ? objcsend<void *>(app, "delegate") : 0;
+    void *sel  = sel_registerName("performClose:");
+    for (iz t = 0, nt = bar && dlg ? objcsend<iz>(bar, "numberOfItems") : 0; t < nt; t++) {
+        void *top  = objcsend<void *>(bar, "itemAtIndex:", t);
+        void *menu = top ? objcsend<void *>(top, "submenu") : 0;
+        for (iz i = 0, n = menu ? objcsend<iz>(menu, "numberOfItems") : 0; i < n; i++) {
+            void       *it  = objcsend<void *>(menu, "itemAtIndex:", i);
+            char const *key = cstring(objcsend<void *>(it, "keyEquivalent"));
+            if (key && !__builtin_strcmp(key, "w") && objcsend<void *>(it, "action") == sel) {
+                closeevent = trayevent;
+                class_addMethod(object_getClass(dlg), sel_registerName("prosperoClose:"),
+                                (void *)closeaction, "v@:@");
+                objcsend<void>(it, "setTarget:", dlg);
+                objcsend<void>(it, "setAction:", sel_registerName("prosperoClose:"));
+            }
+        }
+    }
+    objc_autoreleasePoolPop(pool);
+}
+
 // Dictation apps (Wispr Flow, superwhisper) put their text on the
 // clipboard and post Cmd+V, as a V whose flags alone hold Cmd, with no
 // Cmd key event before it. SDL learns of modifiers from flagsChanged
@@ -1113,6 +1162,7 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
     #ifdef __APPLE__
     handlereopen(p->trayevent);
     handlesettings(p->trayevent);
+    handleclose(p->trayevent);
     handlemodflags();
     #endif
     if (!sdlwindow(os, g, p, title)) {
@@ -1628,6 +1678,7 @@ static void os_guiinject(Os *os, GuiEvent *ge)
             {SDLK_D,      SDL_SCANCODE_D},
             {SDLK_K,      SDL_SCANCODE_K},
             {SDLK_O,      SDL_SCANCODE_O},
+            {SDLK_W,      SDL_SCANCODE_W},
         };
         e.type         = ge->down ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
         e.key.windowID = id;

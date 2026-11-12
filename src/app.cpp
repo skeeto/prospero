@@ -1993,6 +1993,8 @@ struct Gui {
     i32                fnoteslen;
     i32                fmarktop;     // a top line the checklist remembered
     b32                filesdrawn;   // the pane was drawn this frame
+    ImGuiWindow       *fileswindow;  // its window, as last drawn, else null
+    b32                closekey;     // macOS's Window → Close (Cmd+W), for menukeys
     i64                fileloads;    // files read, for the checklist
     b32                fileswin;     // the window had the focus, as last drawn
     b32                filesfocus;   // and the pane
@@ -6152,6 +6154,7 @@ static void filesrelease(Gui *);
 static void filesframe(Gui *);
 static void filesfont(Gui *);
 static void fileaskopen(Gui *);
+static void fileclosefront(Gui *);
 static Str  fileaskwhy(Gui *);
 static void fileanswer(Gui *, Str);
 static void onfsread(Gui *, Arena, Json *, b32, Str, i64);
@@ -11449,6 +11452,10 @@ static void gui_tray(Gui *g, i32 item)
     case TRAY_SETTINGS:
         opensettings(g);
         break;
+    case TRAY_CLOSEKEY:
+        g->closekey = 1;
+        scheddirty(&g->sched);
+        break;
     case TRAY_STOPALL:
         if (g->host) {
             guilog(g, "stopping every session's work, as the tray asked");
@@ -16331,6 +16338,37 @@ static DriveOp m3ops[] = {
     {OP_CHECK, CHK_FILETABS, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "files-empty"},
     {OP_MAIN, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_FILETABS, 0, 0, 0,
+     "long.txt|a/x.c|b/x.c|notes.md|crlf.txt|blob.bin|huge.txt|*hello.txt"},
+    // Ctrl+W (Cmd+W) closes the front tab while Files has the focus; with
+    // the transcript's, not (on macOS, Cmd+W there closes the window)
+    #if !defined(__APPLE__)
+    {OP_MOVE, T_TRANSCRIPT, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    CMDKEY(GKEY_W, 500),
+    {OP_CHECK, CHK_FILETABS, 0, 0, 0,
+     "long.txt|a/x.c|b/x.c|notes.md|crlf.txt|blob.bin|huge.txt|*hello.txt"},
+    #endif
+    {OP_MOVE, T_FILETEXT, 0, 0, 100, "1"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    CMDKEY(GKEY_W, 500),
+    {OP_CHECK, CHK_FILETABS, 0, 0, 0,
+     "long.txt|a/x.c|b/x.c|notes.md|crlf.txt|blob.bin|*huge.txt"},
+    // and with its text's menu open, a popup of Files
+    {OP_MOVE, T_FILETEXT, 0, 0, 100, "1"},
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    CMDKEY(GKEY_W, 500),
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_CHECK, CHK_FILETABS, 0, 0, 0,
+     "long.txt|a/x.c|b/x.c|notes.md|crlf.txt|*blob.bin"},
+    {OP_OPENFILE, 0, 0, 0, 300, "files/huge.txt"},
+    {OP_WAIT, W_FILEREADY, 0, 0, 10000, ""},
+    {OP_OPENFILE, 0, 0, 0, 300, "hello.txt"},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
     {OP_CHECK, CHK_FILETABS, 0, 0, 0,
      "long.txt|a/x.c|b/x.c|notes.md|crlf.txt|blob.bin|huge.txt|*hello.txt"},
     // The second layout, Compact, keeps Files shown; Focus hides it, and

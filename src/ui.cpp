@@ -15154,6 +15154,33 @@ static void menukeys(Gui *g)
             fileaskopen(g);
         }
     }
+    // Close the front file tab while Files has the focus, its own popups
+    // (a tab's menu) included, and no dialog is up. On macOS, Cmd+W
+    // otherwise closes the window, as the Window menu's Close did: that
+    // item now posts it here (gui_sdl.cpp), and other windows' Close is
+    // its own. Elsewhere a focused terminal keeps Ctrl+W, the shell's
+    #if defined(__APPLE__)
+    ImGuiInputFlags wflags = keep;
+    #else
+    ImGuiInputFlags wflags = glob;
+    #endif
+    b32 closekey = ImGui::Shortcut(ctrl|ImGuiKey_W, wflags) || g->closekey;
+    g->closekey = 0;
+    if (closekey) {
+        ImGuiWindow *nav = c.NavWindow;  // in Files: its children and popups
+        while (g->fileswindow && nav && nav!=g->fileswindow) {
+            nav = nav->ParentWindow;
+        }
+        if (!ImGui::GetTopMostPopupModal() && g->fileswindow && nav) {
+            fileclosefront(g);
+        } else {
+            #if defined(__APPLE__)
+            GuiEvent e = {};
+            e.kind = GEV_CLOSE;
+            os_guiinject(g->os, &e);
+            #endif
+        }
+    }
     // The palette: again to close it, and never over another dialog
     if (ImGui::Shortcut(ctrl|ImGuiKey_K, glob)) {
         if (g->palw.shown) {
@@ -16347,9 +16374,13 @@ static void dockwindows(Gui *g)
         panehome(g, PANE_FILES);
         g->filesdrawn = beginpane(g, PANE_FILES);
         if (g->filesdrawn) {
+            g->fileswindow = ImGui::GetCurrentWindow();
             drawfiles(g);
         }
         ImGui::End();
+    }
+    if (!g->filesdrawn) {
+        g->fileswindow = 0;
     }
     if (!g->filesdrawn) {
         fetchtick(g, 0);  // a far read only for the front tab shown

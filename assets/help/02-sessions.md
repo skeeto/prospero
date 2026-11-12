@@ -283,7 +283,8 @@ host, as a turn is rewound, as the window or the pane takes the focus
 and as its tab is picked or a link to it clicked, never by polling, at
 most once a second; the text stays at the same line. Reload (the
 circular arrow) reads it again at once, and a tab's menu closes tabs or
-copies the path. Reveal (the folder) shows the file in the file
+copies the path. Ctrl+W (Cmd+W) closes the front tab while the pane
+has the focus. Reveal (the folder) shows the file in the file
 manager, and Open in editor opens it in your editor (`[ui] editor`,
 or [`[ui] editor_line`](settings:ui#editor_line) for one Prospero
 doesn't know) at the band's first line, else the line at the top,

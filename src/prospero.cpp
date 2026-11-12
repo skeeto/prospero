@@ -554,6 +554,7 @@ enum {
     TRAY_STOPALL,  // stop every session's work
     TRAY_QUIT,     // stop everything, and exit
     TRAY_SETTINGS, // not the tray's: macOS's application menu's Settings...
+    TRAY_CLOSEKEY, // nor this: macOS's Window menu's Close (Cmd+W)
 };
 static b32     os_trayopen(Os *, Str tip);
 static void    os_trayclose(Os *);
@@ -658,6 +659,7 @@ enum {
     GKEY_D,
     GKEY_K,
     GKEY_O,
+    GKEY_W,
 };
 struct GuiEvent {
     i32 kind;

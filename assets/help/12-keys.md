@@ -16,6 +16,8 @@ except Ctrl+G in the prompt box, which is Ctrl there too.
 - **Ctrl+O**: Open file: a path on the session's host, shown in the Files
   pane. Tab completes it, and `:N` or `:A-B` after it goes to that line
   or those lines, marked.
+- **Ctrl+W**, while the Files pane has the focus: close its front tab.
+  Elsewhere on macOS, Cmd+W closes the window, as before.
 - **Ctrl+Shift+N**: New session, no folder, with the default model:
   no dialog, straight to its prompt box.
 - **Ctrl+F**: find in the transcript. In Help or Settings, while it has
