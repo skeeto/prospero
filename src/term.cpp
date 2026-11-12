@@ -1602,6 +1602,7 @@ static void termselect(Gui *g, TermTab *tt, TermMetrics *m, ImVec2 pos, b32 loca
     i32         y  = (i32)(dy / m->ch);
     i32 block = io.KeyAlt ? ARIEL_SEL_BLOCK : 0;
 
+    // a11y: selection by drag is the mouse's own
     if (local && ImGui::IsMousePosValid() && ImGui::IsMouseClicked(0)) {
         i32 clicks = ImGui::GetMouseClickedCount(0);
         i32 op     = clicks>=3 ? ARIEL_SEL_LINE : clicks==2 ? ARIEL_SEL_WORD : ARIEL_SEL_CHAR;
@@ -1677,6 +1678,7 @@ static void termmouse(Gui *g, TermTab *tt, TermMetrics *m, ImVec2 pos, ImGuiID i
         static i32 const buttons[] = {1, 3, 2};  // ImGui's left, right, middle
         for (i32 b = 0; b < 3; b++) {
             u32 bit = 1u << b;
+            // a11y: the mouse's own, reported to the program
             if (hovered && !io.KeyShift && ImGui::IsMouseClicked(b)) {
                 e.action = ARIEL_PRESS;
                 e.button = buttons[b];
@@ -2117,7 +2119,11 @@ static TermBar termtabs(Gui *g, GuiSession *s)
         print(&nb, (i64)i + 1);
         itemnamed(g, finish(&nb));
         // a11y: an editor's tab's menu names its editor in each tip
-        if (ImGui::BeginPopupContextItem()) {
+        if (uirclicked(g)) {
+            ImGui::OpenPopupEx(ids[i]);  // as BeginPopupContextItem, by the tab's ID
+        }
+        if (ImGui::BeginPopupEx(ids[i], ImGuiWindowFlags_AlwaysAutoResize|ImGuiWindowFlags_NoTitleBar|
+                                ImGuiWindowFlags_NoSavedSettings)) {
             if (tt->edit) {
                 Str name = termeditname(tt);
                 name = name.len ? name : Str("the editor");
@@ -2393,6 +2399,9 @@ static void drawterm(Gui *g)
     if (!ImGui::ItemAdd(bb, id)) {
         return;
     }
+    axname(g, "Terminal");
+    axrole(g, AX_GROUP);  // no field: its text model is to come
+    axfocusable(g);
     // History's scrollbar, over the grid's right edge, taking no column:
     // the grid hovers apart from it
     ariel_View view  = ariel_view(tt->t);
@@ -2406,13 +2415,25 @@ static void drawterm(Gui *g)
     if (hovered) {
         ImGui::SetMouseCursor(ImGuiMouseCursor_TextInput);
     }
-    if (g->termfocus || (hovered && ImGui::IsMouseClicked(0))) {
+    // ImGui's activation, a tool's or Enter or Space on it as the
+    // keyboard's item, focuses it as Ctrl+` does, once that key is up, so
+    // neither it nor its repeats reach the shell. Only this waits: the
+    // rest focus it at once, as before, lest the grid take the active ID
+    // frames later, when a click meant for another item can't hover it
+    g->termnavgo |= c.NavActivateId == id;
+    b32 keyup = !ImGui::IsKeyDown(ImGuiKey_Enter) && !ImGui::IsKeyDown(ImGuiKey_KeypadEnter) &&
+                !ImGui::IsKeyDown(ImGuiKey_Space);
+    // Focused so, or by a click off the scrollbar (a11y: not uiclicked,
+    // which takes that in)
+    if (g->termfocus || (g->termnavgo && keyup) || (hovered && ImGui::IsMouseClicked(0))) {
         g->termfocus = 0;
+        g->termnavgo = 0;
         ImGui::SetActiveID(id, win);
         ImGui::SetFocusID(id, win);
         ImGui::FocusWindow(win);
         ImGui::SetActiveIdUsingAllKeyboardKeys();
     } else if (c.ActiveId==id && ImGui::IsMouseClicked(0) && !hovered) {
+        // a11y: a click elsewhere lets go: no control of its own
         ImGui::ClearActiveID();
     }
     b32 active = c.ActiveId==id && tt->state==TT_LIVE;
