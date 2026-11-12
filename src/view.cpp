@@ -612,6 +612,13 @@ struct View {
     Str             scratch;    // its scratch directory, if any
     Str             forkedfrom; // the session it was forked from, if any
     i64             forkturn;   // and the turn it was cut after
+    Str             movedfrom;  // a fork into another folder: the folder
+                                // its original worked in, else empty
+    i32             movedat;    // and its "moved" notice's message, plus
+                                // one, 0 if none
+    u64             movedsum;   // and that notice's text's hash: the same
+                                // notice again (after a compaction) is
+                                // the same move, still at movedat
     Str             sideof;     // a side chat's original session, else empty
     i32             turn;
     i32             attempt;
@@ -1043,6 +1050,7 @@ static void dropprov(View *v)
             for (iz k = 0; s->active && k < countof(ps); k++) {
                 ps[k]->msg = ps[k]->msg==i ? (i32)n : ps[k]->msg;
             }
+            v->movedat   = v->movedat==i+1 ? (i32)n+1 : v->movedat;
             v->msgs[n++] = v->msgs[i];
         }
         v->msgs.len = n;
@@ -1805,6 +1813,23 @@ static Str showpath(View *v, Str p)
     return p;
 }
 
+// The folder message i's relative paths are from: where the session
+// worked when it was written. A fork into another folder worked, before
+// its "moved" notice, in the folder it moved from (moved_from); lacking
+// the notice, through the turn it was cut after.
+static Str msgcwd(View *v, i32 i)
+{
+    b32 before = 0;
+    if (!v->movedfrom.len || i<0 || i>=v->msgs.len) {
+        before = 0;
+    } else if (v->movedat) {
+        before = i < v->movedat-1;
+    } else {
+        before = v->msgs[i].turn <= v->forkturn;
+    }
+    return before ? v->movedfrom : v->cwd;
+}
+
 // A markdown code span holding s, whatever backticks it has.
 static void codespan(Buf *b, Str s)
 {
@@ -2244,6 +2269,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         v->scratch    = clone(&v->aux, jsonstr(jsonget(j, "scratch")));
         v->forkedfrom = clone(&v->aux, jsonstr(jsonget(j, "forked_from")));
         v->forkturn   = jsonint(jsonget(j, "fork_turn"), 0);
+        v->movedfrom  = clone(&v->aux, jsonstr(jsonget(j, "moved_from")));
         v->sideof     = clone(&v->aux, jsonstr(jsonget(j, "side_of")));
         {
             Buf b(&scratch, 256);
@@ -2836,6 +2862,12 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         m->seq       = r->seq;
         m->fold      = 1;
         m->collapsed = 1;
+        if (kind == "moved") {
+            // A move, unless the same notice again: a compaction's
+            u64 sum = hash(m->text);
+            v->movedat  = sum==v->movedsum ? v->movedat : i+1;
+            v->movedsum = sum;
+        }
         if (kind=="job" && job) {
             Buf b(&v->aux, 48);
             print(&b, "To the agent: job ");

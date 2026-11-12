@@ -277,6 +277,19 @@ the same line. Reload (the circular arrow) reads it again, and a tab's
 menu closes tabs or copies the path. A binary file says so, with Show
 as text anyway; past 4 MiB or 100,000 lines only the start shows.
 
+A link to a file in the transcript, in the plan or in a Markdown file
+shown here opens it too, as the agent writes them:
+`[engine.cpp:42](src/engine.cpp:42)`, a range as `:40-45` or
+`#L40-L45`, a heading as `notes.md#install`, or a `file:///` URL. Its
+tooltip says which file. A relative path is from the folder the
+session worked in when the link was written (a fork into another
+folder keeps its older links pointing where they were), and in a
+Markdown file from the file's own folder, where `#install` alone goes
+to that heading. A line opens the text, even of a Markdown file; a
+click again goes there again. Right-click a link for Open in Files or
+Copy path. Until files on other hosts can be shown, a link in a
+session on another host only says so.
+
 ## The session's menu
 
 Right-click a session in the sidebar, or open the Session menu, for:

@@ -3011,10 +3011,20 @@ GUI_PROMPTS = ("Stream slowly", "Run the tools", "be allowed", "wait for nobody"
                "Describe the images", "Ask on the side", "Run a long command",
                "Stream, then pause", "Call the MCP server", "Remember the hosts",
                "Answer with links", "Ask me questions", "Describe the files",
+               "Cite the files",
                "Run a command to stop", "Read a long prompt",
                "Start a subagent in a container", "Sleep in a container as a subagent")
 
 GUI_TODO = ["Read the greeting", "Change it", "Check the result"]
+
+# The files "Cite the files" writes and links: 300 numbered lines of C,
+# and Markdown linking one of them (from its own folder) and a heading
+# of its own far below
+GUI_CITE_C = "".join(f"int line{i}(void) {{ return {i}; }}\n" for i in range(1, 301))
+GUI_CITE_MD = ("# Notes\n\nSee [hello](hello.c:7), and [Install](#install).\n\n" +
+               "".join(f"Paragraph {i}.\n\n" for i in range(1, 81)) +
+               "## Install\n\nRun make.\n\n" +
+               "".join(f"Afterword {i}.\n\n" for i in range(1, 81)))
 
 # The image of the container subagent, as tests/gui.py --mode containers
 # sets it
@@ -3117,6 +3127,26 @@ def sc_gui(model, n, req):
                           "- [effort](settings:model/nope#effort)\n"
                           "- [a web page](https://example.com/)\n"
                           "- [another to drag from](https://example.org/drag)\n")
+    elif "Cite the files" in prompt:
+        # Two files written, then links to them as models write them: a
+        # line, a range, a #L range, a Markdown file, an absolute file:
+        # URL, past the end, a file not there, and mailto:
+        steps = [("write", {"path": "cite/hello.c", "content": GUI_CITE_C}),
+                 ("write", {"path": "cite/notes.md", "content": GUI_CITE_MD})]
+        if step < len(steps):
+            yield from tool(model, n, *steps[step])
+        else:
+            m = re.search(r"Working directory: ([^\n]+?)(?: \(|\n|$)", system_of(req))
+            cwd = (m.group(1) if m else "").replace("\\", "/")
+            url = "file://" + ("/" if re.match(r"[A-Za-z]:", cwd) else "") + cwd
+            yield from answer(model, "Cited:\n\n"
+                              "- [hello.c:12](cite/hello.c:12), and [:40](cite/hello.c:40-45)\n"
+                              "- [lines 20 to 22](cite/hello.c#L20-L22)\n"
+                              "- [the notes](cite/notes.md)\n"
+                              f"- [hello.c, absolutely](<{url}/cite/hello.c>)\n"
+                              "- [past the end](cite/hello.c:500)\n"
+                              "- [not there](cite/nothere.c:3)\n"
+                              "- [mail](mailto:someone@example.com)\n")
     elif "Ask me questions" in prompt:
         # Decisions for the user (ask_user), then the answers said back
         if step == 0:

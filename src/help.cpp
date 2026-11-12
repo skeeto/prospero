@@ -22,6 +22,10 @@
 //   settings:diagnostics         the problems found in the files
 //   view:PANE                    a pane (viewnames)
 //   http://... and https://...   the browser
+//   a file's path, or file:///...  the Files pane (fileref), at a line
+//                                as path:N, path:A-B or path#L10, at a
+//                                heading as path#section; "#section"
+//                                alone a heading of the document it is in
 //
 // The built-in skill, assets/skills/prospero/SKILL.md, is offered as if
 // it were the user's own (engine.cpp, sessskills), and its {{...}} are
@@ -388,13 +392,15 @@ enum : i32 {
     DEST_SETTINGS,
     DEST_VIEW,
     DEST_WEB,
+    DEST_FILE,
 };
 
 // Where a link goes in the window (helpdest).
 struct Dest {
     i32 kind;
     i32 page;     // DEST_HELP: -1 if no page has the name
-    Str section;  // DEST_HELP: the heading named after #, null for none
+    Str section;  // DEST_HELP, and DEST_FILE here: the heading named after
+                  // #, null for none
     Str cfgkind;  // DEST_SETTINGS: the section's kind, "" the top level
     Str cfgname;  // its name, null for none
     Str cfgkey;   // the setting, null for the page alone
@@ -404,6 +410,9 @@ struct Dest {
     b32 diag;     // the Diagnostics page
     b32 whole;    // the pane as it is, for "settings:" alone
     i32 pane;     // DEST_VIEW: in viewnames, -1 if none
+    FileRef file; // DEST_FILE: the reference, maybe not a usable one
+    b32 here;     // DEST_FILE: "#section", a heading of the document
+                  // the link is in, named by section
 };
 
 static Dest helpdest(Arena *a, Str link)
@@ -450,6 +459,18 @@ static Dest helpdest(Arena *a, Str link)
 
     } else if (helpstarts(link, "http://") || helpstarts(link, "https://")) {
         r.kind = DEST_WEB;
+
+    } else if (link.len && link[0]=='#') {
+        // A heading of the document the link is in; "#" alone, none
+        r.kind    = link.len>1 ? (i32)DEST_FILE : (i32)DEST_NONE;
+        r.here    = link.len > 1;
+        r.section = link.len>1 ? helpunescape(a, cuthead(link, 1)) : Str{};
+
+    } else if (link.len) {
+        // A file, unless another scheme (mailto:, javascript:) or none
+        FileRef f = fileref(a, link);
+        r.kind = f.kind==FREF_SCHEME ? (i32)DEST_NONE : (i32)DEST_FILE;
+        r.file = f;
     }
     return r;
 }

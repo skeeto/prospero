@@ -17,8 +17,39 @@ static b32 helpgoes(Arena a, Str link)
         return d.pane >= 0;
     case DEST_WEB:
         return 1;
+    case DEST_FILE:
+        return 0;  // a Help page has no files of its own
     }
     return 0;
+}
+
+// A link's destination as a line: its kind, then for a file the kind of
+// reference, its path, lines and section, or its heading in the
+// document ("here").
+static Str deststr(Arena *a, Str link)
+{
+    Dest d = helpdest(a, link);
+    Buf  b(a, 128);
+    print(&b, (i64)d.kind);
+    if (d.kind == DEST_FILE && d.here) {
+        print(&b, " here ");
+        print(&b, d.section);
+    } else if (d.kind == DEST_FILE) {
+        FileRef *r = &d.file;
+        putbyte(&b, ' ');
+        print(&b, (i64)r->kind);
+        putbyte(&b, ' ');
+        print(&b, r->path);
+        putbyte(&b, ' ');
+        print(&b, (i64)r->line0);
+        putbyte(&b, '-');
+        print(&b, (i64)r->line1);
+        if (r->section.len) {
+            putbyte(&b, '#');
+            print(&b, r->section);
+        }
+    }
+    return finish(&b);
 }
 
 static void test_help(Test *t)
@@ -55,6 +86,37 @@ static void test_help(Test *t)
         expect(t, "help.goes.nosection", istr(&a, helpgoes(a, "help:config#nope")), "0");
         expect(t, "help.goes.key", istr(&a, helpgoes(a, "settings:ui#nope")), "0");
         expect(t, "help.goes.mailto", istr(&a, helpgoes(a, "mailto:x@example.com")), "0");
+        expect(t, "help.goes.file", istr(&a, helpgoes(a, "src/engine.cpp:42")), "0");
+    }
+
+    // Links to files: the known schemes first, then fileref; another
+    // scheme is still nothing (DEST_NONE), and a reference that names no
+    // file (BAD, NET) is a file's link that opens nothing
+    {
+        struct { Str link, want; } cases[] = {
+            {"src/engine.cpp:42", "5 0 src/engine.cpp 42-42"},
+            {"cite/hello.c:40-45", "5 0 cite/hello.c 40-45"},
+            {"cite/hello.c#L20-L22", "5 0 cite/hello.c 20-22"},
+            {"notes.md#install", "5 0 notes.md 0-0#install"},
+            {"file:///tmp/a.c", "5 0 /tmp/a.c 0-0"},
+            {"File:///tmp/a.c:7", "5 0 /tmp/a.c 7-7"},
+            {"file://host/x.c", "5 1  0-0"},
+            {"README:10", "5 0 README 10-10"},
+            {"C:12", "5 2  0-0"},
+            {"#install", "5 here install"},
+            {"#Getting%20started", "5 here Getting started"},
+            {"#", "0"},
+            {"mailto:x@example.com", "0"},
+            {"javascript:alert(1)", "0"},
+            {"help:config", "1"},
+            {"view:files", "3"},
+            {"https://example.com/a.c", "4"},
+            {"", "0"},
+        };
+        for (iz i = 0; i < countof(cases); i++) {
+            expect(t, concat(&a, "help.dest.", cases[i].link),
+                   deststr(&a, cases[i].link), cases[i].want);
+        }
     }
 
     Buf bad(&a, 256);

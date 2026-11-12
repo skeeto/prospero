@@ -322,6 +322,15 @@ static b32 contentmoves(ImGuiWindow *w)
     return x!=w->ContentSize.x || y!=w->ContentSize.y;
 }
 
+// A focus request waits for the next frame: SetKeyboardFocusHere resolves
+// on the next NewFrame, which activates the field, and ImGui drops the
+// characters that come in the frame a field is activated by nav.
+static b32 uifocusowed()
+{
+    ImGuiContext &c = *GImGui;
+    return c.NavMoveSubmitted || c.NavMoveForwardToNextFrame || c.NavNextActivateId;
+}
+
 // Reasons the frame just rendered needs a successor.
 static u32 uiscan()
 {
@@ -3094,7 +3103,7 @@ static void drawmodelpick(Gui *g, Arena a, GuiSession *s, View *v)
 
 static b32  cfghas(Gui *, Str, Str);
 static void cfgselect(Gui *, Str, Str);
-static void followlink(Gui *, Str);
+static void followlink(Gui *, Str, LinkFrom * = 0);
 
 // A list's last item, label: where its choices are set, in Settings,
 // at the section of kind named, else the kind's first section, else a
@@ -3857,6 +3866,14 @@ static TextHit textmouse(Gui *g, TextArea *ta)
     return r;
 }
 
+// Links to files (files.cpp)
+static LinkFrom filelinkfrom(GuiSession *, Str);
+static Str  termcwd(GuiSession *);
+static Str  filelinktip(Gui *, Arena *, Str, Dest *, LinkFrom *);
+static void filelinkopen(Gui *, Arena *, Dest *, LinkFrom *);
+static void filelinkmark(Gui *, Str, LinkFrom *);
+static void filelinkitems(Gui *);
+
 // The text's context menu, if it opened on the last item: Copy and Copy
 // as Markdown, which the caller may follow with items of its own before
 // endtextmenu. With copyrect not negative, Copy is that RECT_*.
@@ -3865,6 +3882,7 @@ static b32 begintextmenu(Gui *g, View *v, i32 copyrect)
     if (!ImGui::BeginPopupContextItem("##textmenu")) {
         return 0;
     }
+    filelinkitems(g);
     b32 any  = !selempty(&v->sel);
     b32 copy = ImGui::MenuItem("Copy", g->mac ? "Cmd+C" : "Ctrl+C", false, any);
     itemnamed(g, "text copy");
@@ -3958,8 +3976,9 @@ static void drawmsgtext(Gui *g, ImDrawList *dl, ImDrawListSplitter *sp, TextArea
 
 static void helppick(Gui *, i32);
 
-// Where a link goes, in the window's words.
-static Str linktip(Arena *a, Str link)
+// Where a link goes, in the window's words: a file's from where the
+// link is (from, null for nowhere).
+static Str linktip(Gui *g, Arena *a, Str link, LinkFrom *from)
 {
     Dest d = helpdest(a, link);
     switch (d.kind) {
@@ -3996,14 +4015,17 @@ static Str linktip(Arena *a, Str link)
                                      (iz)__builtin_strlen(panenames[d.pane])});
     case DEST_WEB:
         return link;
+    case DEST_FILE:
+        return filelinktip(g, a, link, &d, from);
     }
     return concat(a, link, " (Prospero does not open this link)");
 }
 
 // Go where a link goes. A settings: link waits in cfglink for the
 // configuration (drawsettings), a section of Help for its page's layout
-// (drawdoc). Under the checklist, a web link is only noted.
-static void followlink(Gui *g, Str link)
+// (drawdoc). Under the checklist, a web link is only noted. A file's
+// opens in Files, from where the link is (from, null for nowhere).
+static void followlink(Gui *g, Str link, LinkFrom *from)
 {
     Arena a = g->frame;
     Dest  d = helpdest(&a, link);
@@ -4038,6 +4060,9 @@ static void followlink(Gui *g, Str link)
             os_guiopenurl(g->os, a, link);
         }
         break;
+    case DEST_FILE:
+        filelinkopen(g, &a, &d, from);
+        break;
     }
     scheddirty(&g->sched);
 }
@@ -4045,8 +4070,10 @@ static void followlink(Gui *g, Str link)
 // The link under the mouse in a view's text, right after textmouse made
 // its item: the hand cursor and the link's tooltip over it. Returns a
 // link to follow, let go of in the message and at the link it was
-// pressed on (press, a hash, and pressmsg keep which).
-static Str textlink(Gui *g, View *v, TextHit hit, u64 *press, i32 *pressmsg)
+// pressed on (press, a hash, and pressmsg keep which). A link to a
+// file is from where from says; right-clicked, the text's menu, opened
+// as the button is let go of, is for it (filelinkitems).
+static Str textlink(Gui *g, View *v, TextHit hit, u64 *press, i32 *pressmsg, LinkFrom *from)
 {
     Arena a    = g->frame;
     Str   link = {};
@@ -4056,8 +4083,21 @@ static Str textlink(Gui *g, View *v, TextHit hit, u64 *press, i32 *pressmsg)
     if (link.len) {
         ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
         if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-            tipnow("%s", cstr0(&a, linktip(&a, link)));
+            Str tip = linktip(g, &a, link, from);
+            tipnow("%s", cstr0(&a, tip));
+            if (g->drive) {
+                iz n = tip.len<countof(g->linktipped) ? tip.len : countof(g->linktipped);
+                copybytes(g->linktipped, tip.data, n);
+                g->linktippedlen = (i32)n;
+            }
         }
+    }
+    // The release that opens the text's menu, even over a menu open
+    // already (which the press closed): what it is over is the menu's
+    if (ImGui::IsMouseReleased(ImGuiMouseButton_Right) &&
+            ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByPopup)) {
+        Str at = hit.hit && hit.body ? doclinkat(msgdoc(v, hit.at.msg), hit.at.off) : Str{};
+        filelinkmark(g, at, from);
     }
     if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
         b32 on = link.len && !ImGui::GetIO().KeyShift &&
@@ -4248,7 +4288,7 @@ static Str drawlines(Gui *g, DocView *d, char const *id, DocLines *dl)
     TextArea ta = {v, wpos, wh, width, pad, pad, ImGui::GetScrollY(), &d->dragging,
                    &d->scrollto, gutter, sx, 1};
     TextHit hit  = textmouse(g, &ta);
-    Str     link = textlink(g, v, hit, &d->press, &d->pressmsg);
+    Str     link = textlink(g, v, hit, &d->press, &d->pressmsg, &d->from);
     if (begintextmenu(g, v, -1)) {
         endtextmenu(g, v);
     }
@@ -4441,7 +4481,7 @@ static Str drawdoc(Gui *g, DocView *d, char const *id, f32 fit = 0, DocLines *li
     TextArea ta   = {v, wpos, ImGui::GetWindowHeight(), width, pad, pad,
                      ImGui::GetScrollY(), &d->dragging, &d->scrollto, 0, 0, 0};
     TextHit hit  = textmouse(g, &ta);
-    Str     link = textlink(g, v, hit, &d->press, &d->pressmsg);
+    Str     link = textlink(g, v, hit, &d->press, &d->pressmsg, &d->from);
     if (begintextmenu(g, v, -1)) {
         endtextmenu(g, v);
     }
@@ -5328,10 +5368,11 @@ static void drawtranscript(Gui *g)
     TextArea ta  = {v, wpos, winh, width, pad, head, scrolly, &g->dragging, &g->scrollto,
                     0, 0, 0};
     TextHit  hit  = textmouse(g, &ta);
-    Str      link = textlink(g, v, hit, &g->linkpress, &g->linkmsg);
+    LinkFrom from = filelinkfrom(g->sess, hit.hit ? msgcwd(v, hit.at.msg) : v->cwd);
+    Str      link = textlink(g, v, hit, &g->linkpress, &g->linkmsg, &from);
     itemrect(g, RECT_TRANSCRIPT);
     if (link.len) {
-        followlink(g, link);
+        followlink(g, link, &from);
     }
     if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
         g->menumsg = hit.hit ? hit.at.msg : -1;  // the popup takes the hover from here on
@@ -9895,9 +9936,10 @@ static void drawplan(Gui *g)
     if (!shown) {
         return;  // on its way
     }
+    f->doc->from = filelinkfrom(s, termcwd(s));
     Str link = drawdoc(g, f->doc, "##plan");
     if (link.len) {
-        followlink(g, link);
+        followlink(g, link, &f->doc->from);
     }
     itemnamed(g, "plan text");
     g->planshown = (i32)f->doc->v->msgs[0].text.len;

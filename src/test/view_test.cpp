@@ -624,6 +624,93 @@ static void test_view(Test *t)
         expect(t, "view.fork", concat(&a, v->forkedfrom, concat(&a, " ", istr(&a, v->forkturn))),
                "o 2");
         expect(t, "view.scratch", v->scratch, "/t/prospero-1/s");
+        expect(t, "view.notmoved", concat(&a, msgcwd(v, 0), concat(&a, "|", v->movedfrom)), "/w|");
+    }
+
+    // A fork into another folder: its session record names the folder
+    // it moved from, where the messages before its "moved" notice were
+    // written, and so their links' paths are from (msgcwd)
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        apply(v, a, R"({"sid":"s","seq":1,"ts":0,"ev":"session","forked_from":"o","fork_turn":1,)"
+                    R"("cwd":"/new","moved_from":"/old"})");
+        apply(v, a, R"({"sid":"s","seq":2,"ts":0,"ev":"user","text":"q","via":"prompt"})");
+        apply(v, a, R"({"sid":"s","seq":3,"ts":0,"ev":"turn","n":1})");
+        apply(v, a, R"({"sid":"s","seq":4,"ts":0,"ev":"assistant","turn":1,"attempt":1,)"
+                    R"("blocks":[{"t":"text","text":"See [a](a.c:3)."}]})");
+        apply(v, a, R"({"sid":"s","seq":5,"ts":0,"ev":"turn.end","turn":1,"why":"done"})");
+        expect(t, "view.moved.before", concat(&a, msgcwd(v, 1), concat(&a, "|", v->movedfrom)),
+               "/old|/old");  // by fork_turn, with no notice yet
+        apply(v, a, R"({"sid":"s","seq":6,"ts":0,"ev":"notice","kind":"moved","text":"Moved."})");
+        apply(v, a, R"({"sid":"s","seq":7,"ts":0,"ev":"user","text":"r","via":"prompt"})");
+        apply(v, a, R"({"sid":"s","seq":8,"ts":0,"ev":"turn","n":2})");
+        apply(v, a, R"({"sid":"s","seq":9,"ts":0,"ev":"assistant","turn":2,"attempt":1,)"
+                    R"("blocks":[{"t":"text","text":"See [b](b.c:4)."}]})");
+        Buf b(&a, 64);
+        for (i32 i = 0; i < v->msgs.len; i++) {
+            print(&b, i ? Str(" ") : Str(""));
+            print(&b, msgcwd(v, i));
+        }
+        expect(t, "view.moved.msgcwd", finish(&b), "/old /old /new /new /new");
+        expect(t, "view.moved.range", concat(&a, msgcwd(v, -1), msgcwd(v, 99)), "/new/new");
+
+        // A compaction tells it again, the same notice: still the same
+        // move, the messages since it in the new folder
+        apply(v, a, R"({"sid":"s","seq":10,"ts":0,"ev":"notice","kind":"moved","text":"Moved."})");
+        Buf c(&a, 64);
+        for (i32 i = 0; i < v->msgs.len; i++) {
+            print(&c, i ? Str(" ") : Str(""));
+            print(&c, msgcwd(v, i));
+        }
+        expect(t, "view.moved.again", finish(&c), "/old /old /new /new /new /new");
+
+        // Another move (a moved fork of it) is a notice of its own: what
+        // came before it was written in the folder it moved from now
+        apply(v, a, R"({"sid":"s","seq":11,"ts":0,"ev":"notice","kind":"moved","text":"Moved on."})");
+        expect(t, "view.moved.anew",
+               concat(&a, msgcwd(v, 4), concat(&a, " ", msgcwd(v, 6))), "/old /new");
+    }
+
+    // A notice that comes while a reply streams goes before the
+    // provisional text, and keeps its place once the reply commits and
+    // the provisional messages go (dropprov moves movedat with them)
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        apply(v, a, R"({"sid":"s","seq":1,"ts":0,"ev":"session","forked_from":"o","fork_turn":0,)"
+                    R"("cwd":"/new","moved_from":"/old"})");
+        apply(v, a, R"({"sid":"s","seq":2,"ts":0,"ev":"user","text":"q","via":"prompt"})");
+        apply(v, a, R"({"sid":"s","seq":3,"ts":0,"ev":"turn","n":1})");
+        apply(v, a, R"({"sid":"s","ts":0,"ev":"delta","turn":1,"kind":"text","text":"Hal"})");
+        apply(v, a, R"({"sid":"s","seq":4,"ts":0,"ev":"notice","kind":"moved","text":"Moved."})");
+        i32 at = v->movedat;
+        apply(v, a, R"({"sid":"s","seq":5,"ts":0,"ev":"assistant","turn":1,"attempt":1,)"
+                    R"("blocks":[{"t":"text","text":"Hello"}]})");
+        Buf b(&a, 64);
+        for (i32 i = 0; i < v->msgs.len; i++) {
+            print(&b, i ? Str(" ") : Str(""));
+            print(&b, v->msgs[i].role==VIEW_NOTE ? Str("N") : Str("-"));
+            print(&b, i+1==v->movedat ? Str("*") : Str(""));
+        }
+        expect(t, "view.moved.prov", concat(&a, istr(&a, at), concat(&a, " ", finish(&b))),
+               "2 - N* -");
+    }
+
+    // A plain fork of that fork keeps moved_from, and its own fork_turn,
+    // later than the move: the notice it copied still marks the move
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        apply(v, a, R"({"sid":"s","seq":1,"ts":0,"ev":"session","forked_from":"m","fork_turn":2,)"
+                    R"("cwd":"/new","moved_from":"/old"})");
+        apply(v, a, R"({"sid":"s","seq":2,"ts":0,"ev":"user","text":"q","via":"prompt"})");
+        apply(v, a, R"({"sid":"s","seq":3,"ts":0,"ev":"turn","n":1})");
+        apply(v, a, R"({"sid":"s","seq":4,"ts":0,"ev":"notice","kind":"moved","text":"Moved."})");
+        apply(v, a, R"({"sid":"s","seq":5,"ts":0,"ev":"user","text":"r","via":"prompt"})");
+        apply(v, a, R"({"sid":"s","seq":6,"ts":0,"ev":"turn","n":2})");
+        expect(t, "view.moved.refork",
+               concat(&a, msgcwd(v, 0), concat(&a, " ", msgcwd(v, 2))), "/old /new");
     }
 
     // Plan mode: the mode record sets it, the plan's ask holds the plan

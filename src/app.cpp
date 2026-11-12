@@ -789,6 +789,40 @@ struct PalWin {
     char                first[64];
 };
 
+// Where a link is, for one to a file (help.cpp's DEST_FILE): the
+// session in whose root's Files tabs it opens (null for the window's
+// own), the host its file is on (a uid, 0 for this computer), the
+// folder a relative path is from, and whether paths there are Windows'.
+// Help, the greeting and Diagnostics leave it zero, and a link there to
+// a file opens nothing.
+struct LinkFrom {
+    GuiSession *s;
+    u64         host;
+    Str         base;   // null for none: only absolute paths resolve
+    b32         win;
+    b32         opens;  // file links open: there is a session or a file
+    Str         file;   // the file the text is (Files' Markdown), whose
+                        // "#section" links stay in it, else null
+};
+
+// A file link right-clicked, for the text's context menu (filelinkmenu):
+// what it resolved to as it was clicked, kept in place of the link and
+// its LinkFrom, whose strings may be the frame's.
+struct LinkMenu {
+    b32         on;         // the menu is for a link to a file
+    GuiSession *s;          // as LinkFrom
+    u64         host;
+    b32         win;
+    i32         line0;      // its lines, 1-based, else 0
+    i32         line1;
+    u8          path[1024]; // resolved
+    i32         pathlen;    // 0 if it did not resolve
+    u8          section[FILES_SECTION];
+    i32         sectionlen;
+    u8          why[160];   // why it opens nothing, else empty
+    i32         whylen;
+};
+
 // A Markdown document, read-only, shown as the transcript shows a
 // message, its text selectable and copied likewise (drawdoc): the Plan
 // window's plan, or any other text. Its view holds the document as one
@@ -804,6 +838,7 @@ struct DocView {
     u64          press;     // the link pressed (hash), 0 if none
     i32          pressmsg;  // in this message
     Str          section;   // a heading to scroll to once laid out
+    LinkFrom     from;      // where its links to files are
 };
 
 static DocView *newdocview(Arena *perm, Os *os, ViewCache *c)
@@ -1495,6 +1530,9 @@ struct Gui {
     u64                linkpress;  // the transcript's link pressed (hash), 0 if none
     i32                linkmsg;    // in this message
     Str                linkopened; // a web link followed under the checklist
+    u8                 linktipped[256]; // and the last link's tooltip
+    i32                linktippedlen;
+    LinkMenu           linkmenu;   // the text menu's file link, if any
     Images             img;        // screenshots
     b32                outopen;
     b32                outfocus;   // brought to the front next frame
@@ -9141,6 +9179,9 @@ static void sessgone(Gui *g, GuiSession *s)
     imgdrop(g, s);
     attachclear(g, s);
     mentionidxdrop(g, s);  // its 16 MiB of file list must not outlive it
+    if (g->linkmenu.s == s) {
+        g->linkmenu = {};  // a link of its: nowhere to open it now
+    }
     if (g->out.s == s) {
         g->out.s   = 0;
         g->outopen = 0;
@@ -13582,6 +13623,10 @@ enum : i32 {
     CHK_FILESHOWN,    // Files is hidden (dx 0), shown (1), or shown central (2)
     CHK_FILEBODIES,   // the bodies fit the budget, dx files read at least
     CHK_FILEQUIET,    // no frames while idle, a file shown
+    CHK_LINKTIP,      // the last link's tooltip was text
+    CHK_FILEPATH,     // the front file's path ends with text ('/' either way)
+    CHK_CLIPEND,      // the clipboard ends with text ('/' either way)
+    CHK_FILETOP,      // the front file's top line is dx (1-based), or the next
     CHK_COUNT,
 };
 
@@ -13891,6 +13936,8 @@ static Str chknames[] = {
     "the file is shown in its mode", "the Files pane's notes are as said",
     "Open file says why not", "the Files pane is where it should be",
     "the files read fit their budget", "no frames while idle, a file shown",
+    "the link's tooltip is as said", "the front file is the one said",
+    "the clipboard ends with the path said", "the file's top line is as said",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -15889,6 +15936,102 @@ static DriveOp m3ops[] = {
     LAYOUT("Standard"),
     {OP_CHECK, CHK_FILESHOWN, 1, 0, 0, ""},
     {OP_CHECK, CHK_FILEBODIES, 9, 0, 0, ""},
+    // Links in a reply open files (fake_provider's cite/): a line, in
+    // view and banded, jumped to again when clicked again; a range and a
+    // #L range; past the end; Copy path on the right-click; mailto: and
+    // a file not there open nothing; a Markdown file shows as Markdown,
+    // its link opening from its folder and its #section staying in it;
+    // an absolute file: URL
+    {OP_PROMPT, 0, 0, 0, 1500, "Cite the files."},
+    {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 800, "link cite/hello.c:12"},
+    {OP_CHECK, CHK_TOOLTIP, 0, 0, 0, ""},
+    {OP_CHECK, CHK_LINKTIP, 0, 0, 0, "Files \xe2\x86\x92 cite/hello.c:12"},
+    {OP_SHOT, 0, 0, 0, 300, "files-linktip"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEPATH, 0, 0, 0, "/cite/hello.c"},
+    {OP_CHECK, CHK_FILEMODE, FMODE_TEXT, 0, 0, ""},
+    {OP_CHECK, CHK_FILELINE, 12, 0, 0, ""},
+    {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "12-12"},
+    {OP_MOVE, T_FILETEXT, 0, 0, 100, "12"},
+    {OP_WHEEL, 0, 0, -10, 50, ""},
+    {OP_WHEEL, 0, 0, -10, 50, ""},
+    {OP_WHEEL, 0, 0, -10, 800, ""},
+    {OP_CHECK, CHK_FILELINE, 12, 0, 0, "away"},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "link cite/hello.c:12"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILELINE, 12, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "link cite/hello.c:40-45"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "40-45"},
+    {OP_CHECK, CHK_FILELINE, 40, 45, 0, "centered"},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "link cite/hello.c#L20-L22"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "20-22"},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "link cite/hello.c:500"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILENOTE, 0, 0, 0, "The file has only 300 lines."},
+    {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "300-300"},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "link cite/hello.c:12"},
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_SHOT, 0, 0, 0, 300, "files-linkmenu"},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "link copy path"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_CLIPEND, 0, 0, 0, "/cite/hello.c"},
+    {OP_MOVE, T_NAMED, 0, 0, 800, "link mailto:"},
+    {OP_CHECK, CHK_TOOLTIP, 0, 0, 0, ""},
+    {OP_CHECK, CHK_LINKTIP, 0, 0, 0,
+     "mailto:someone@example.com (Prospero does not open this link)"},
+    {OP_MOVE, T_NAMED, 0, 0, 800, "link cite/nothere.c:3"},
+    {OP_CHECK, CHK_LINKTIP, 0, 0, 0, "Files \xe2\x86\x92 cite/nothere.c:3"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILENOTE, 0, 0, 0, "No such file"},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "link cite/notes.md"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEMODE, FMODE_MARKDOWN, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 800, "link hello.c:7"},
+    {OP_CHECK, CHK_LINKTIP, 0, 0, 0, "Files \xe2\x86\x92 hello.c:7"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEPATH, 0, 0, 0, "/cite/hello.c"},
+    {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "7-7"},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "link cite/notes.md"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEMODE, FMODE_MARKDOWN, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 800, "link #install"},
+    {OP_CHECK, CHK_LINKTIP, 0, 0, 0, "Files \xe2\x86\x92 notes.md \xe2\x80\xba install"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEMODE, FMODE_MARKDOWN, 0, 0, ""},
+    {OP_CHECK, CHK_FILETOP, 165, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "files-linksection"},
+    // An absolute file: URL, from notes.md in front
+    {OP_MOVE, T_NAMED, 0, 0, 800, "link file:"},
+    {OP_CHECK, CHK_LINKTIP, 0, 0, 0, "Files \xe2\x86\x92 cite/hello.c"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEPATH, 0, 0, 0, "/cite/hello.c"},
     // Quiet with a file shown, past the tooltips and the layout's save
     {OP_MOVE, T_EMPTY, 0, 0, 4500, ""},
     {OP_MARK, 0, 0, 0, 3000, ""},
@@ -16937,6 +17080,14 @@ static DriveOp sessionsops[] = {
     {OP_KEYUP, 0, GKEY_ENTER, 0, 1500, ""},
     {OP_CHECK, CHK_SIDE, 0, 0, 0, "G Dropped\n H this\n  S Whole fork\n"},
     {OP_TOASTMARK, 0, 0, 0, 0, ""},  // the turn above was news, rightly
+    // Files cited in it, in work/cite, for the fork below to open
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Whole fork"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_WAIT, W_OPENED, 0, 0, 10000, ""},
+    {OP_PROMPT, 0, 0, 0, 1500, "Cite the files."},
+    {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
+    {OP_TOASTMARK, 0, 0, 0, 0, ""},
     // Into another folder, from the sidebar: the dialog's folder typed
     // over, Enter forks; the fork works there, titled as a fork
     {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Whole fork"},
@@ -16956,6 +17107,16 @@ static DriveOp sessionsops[] = {
     {OP_CHECK, CHK_NOTE, 0, 0, 0, "into"},
     {OP_CHECK, CHK_SESSDIR, 0, 0, 0, "/moved"},
     {OP_CHECK, CHK_TITLE, 0, 0, 0, "Whole fork (fork)"},
+    // A link written before the move is from the folder it moved from
+    {OP_MOVE, T_NAMED, 0, 0, 800, "link cite/hello.c:12"},
+    {OP_CHECK, CHK_LINKTIP, 0, 0, 0, "Files \xe2\x86\x92 cite/hello.c:12"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILENOTE, 0, 0, 0, ""},
+    {OP_CHECK, CHK_FILEPATH, 0, 0, 0, "/work/cite/hello.c"},
+    {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "12-12"},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-movedlink"},
     // A fork before a prompt, from the transcript's menu: the turns
     // before it, none here, the prompt left in the new session's box
     {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Greeting"},
@@ -20837,7 +20998,24 @@ static b32 drivefileready(Gui *g)
            (!g->flines.restore && (!ft->jump || ft->jumped || ft->mode!=FMODE_TEXT));
 }
 
-// The Files pane's checks (CHK_FILE*), logging what was found.
+// Whether s ends with end, a '/' there matching either separator.
+static b32 driveendsep(Str s, Str end)
+{
+    if (s.len < end.len) {
+        return 0;
+    }
+    Str tail = cuthead(s, s.len-end.len);
+    for (iz i = 0; i < end.len; i++) {
+        b32 sep = end[i]=='/' && (tail[i]=='/' || tail[i]=='\\');
+        if (!sep && tail[i]!=end[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+// The Files pane's checks (CHK_FILE*), and links to files', logging
+// what was found.
 static b32 drivefilecheck(Gui *g, i32 chk)
 {
     DriveOp   *op = &g->ops[g->drivepc-1];
@@ -20995,6 +21173,35 @@ static b32 drivefilecheck(Gui *g, i32 chk)
     } break;
     case CHK_FILEQUIET:
         return g->panes[PANE_FILES] && drivequiet(g, "idle with a file shown", 2);
+    case CHK_LINKTIP: {
+        Str tip = {g->linktipped, g->linktippedlen};
+        print(&b, "drive: the link's tooltip was ");
+        print(&b, tip);
+        ok = tip == op->text;
+    } break;
+    case CHK_FILEPATH: {
+        Str path = ft ? ft->path : Str{};
+        print(&b, "drive: the front file is ");
+        print(&b, path);
+        ok = ft && driveendsep(path, op->text);
+    } break;
+    case CHK_CLIPEND: {
+        char const *c   = ImGui::GetClipboardText();
+        Str         got = c ? Str{(u8 *)c, (iz)__builtin_strlen(c)} : Str{};
+        if (!driveendsep(got, op->text) && (os_guilimits(g->os) & GUI_NOSERIAL)) {
+            got = g->driveclip;  // as driveclipboard explains
+        }
+        print(&b, "drive: the clipboard holds ");
+        print(&b, got);
+        ok = driveendsep(got, op->text);
+    } break;
+    case CHK_FILETOP: {
+        // A heading scrolled to may sit a line below the top, past the pad
+        i32 top = ft ? ft->top+1 : 0;
+        print(&b, "drive: the front file's top line is ");
+        print(&b, (i64)top);
+        ok = ft && g->fshowing==ft && (top==(i32)op->dx || top+1==(i32)op->dx);
+    } break;
     }
     guilog(g, finish(&b));
     return ok;
@@ -23108,6 +23315,10 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_FILESHOWN:
     case CHK_FILEBODIES:
     case CHK_FILEQUIET:
+    case CHK_LINKTIP:
+    case CHK_FILEPATH:
+    case CHK_CLIPEND:
+    case CHK_FILETOP:
         return drivefilecheck(g, chk);
     case CHK_TERMQUIET:
         return g->panes[PANE_TERMINAL] && drivequiet(g, "idle with the terminal shown", 2);
@@ -23894,6 +24105,14 @@ static void drivestep(Gui *g)
     }
     if (g->drivepc >= g->nops) {
         g->driveat = I64MAX;  // the script is done
+        return;
+    }
+    i32 next = g->ops[g->drivepc].op;
+    if ((next==OP_TEXT || next==OP_TEXTCWD || next==OP_KEYDOWN) && uifocusowed()) {
+        // A field takes focus next frame, and ImGui drops the text that
+        // comes in the frame it does: type once it has, however long the
+        // frames before took to present
+        g->driveat = g->sched.now + 1;
         return;
     }
     DriveOp *op = &g->ops[g->drivepc++];

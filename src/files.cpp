@@ -16,6 +16,9 @@
 // and fileread, which refuse device and network paths before anything
 // touches them. Files on other hosts come later, through their engines.
 //
+// A file opens from Open file, or from a link to it (filelinkopen) in
+// the transcript, the plan or a Markdown file shown here.
+//
 // This is free and unencumbered software released into the public domain.
 
 enum : i32 {
@@ -448,6 +451,209 @@ static FileTab *filesopen(Gui *g, GuiSession *s, u64 host, Str path, i32 line0, 
 }
 
 
+// Links to files (help.cpp's DEST_FILE), in the transcript, Plan and
+// Markdown files: resolved as asked (filepath, unasked 0) from where
+// the link is (LinkFrom), then shown in the tabs of its session's root.
+// Until engines read files (fs.read), one on another computer only
+// says so.
+
+// Where links in session s's text are, relative paths from base: its
+// root's tabs, on its host. With no session, nowhere.
+static LinkFrom filelinkfrom(GuiSession *s, Str base)
+{
+    LinkFrom r = {};
+    if (s) {
+        r.s     = s;
+        r.host  = s->host->kind==GH_REMOTE ? s->host->uid : 0;
+        r.base  = base;
+        r.win   = hostwin(s->host);
+        r.opens = 1;
+    }
+    return r;
+}
+
+// A path as a link's tooltip names it: below base relative to it, else
+// in its home as "~".
+static Str filelinkshow(Arena *a, Str path, Str base, Str home, b32 win)
+{
+    Str root = base.len ? normpath(a, base, ".", win) : Str{};
+    for (; root.len>1 && issep(root[root.len-1], win); root.len--) {}
+    if (root.len && path.len>root.len+1 && issep(path[root.len], win)) {
+        Str head = takehead(path, root.len);
+        if (win ? equalfold(head, root) : head==root) {
+            return cuthead(path, root.len+1);
+        }
+    }
+    return tildeform(a, path, home);
+}
+
+struct FileLink {
+    Str path;  // absolute and normalized, else null
+    Str show;  // as a tooltip names it
+    Str err;   // why it names no file, else null
+    b32 far;   // on another computer
+};
+
+// The file a link names, from where it is.
+static FileLink filelinkget(Gui *g, Arena *a, Dest *d, LinkFrom *from)
+{
+    FileLink r    = {};
+    GuiHost *h    = filehost(g, from->host);
+    Str      home = h ? h->home : g->main ? g->main->home : Str{};
+    if (d->here) {
+        r.path = from->file;
+        r.err  = r.path.len ? Str{} : Str("its heading is of no file shown here");
+    } else {
+        FilePath p = filepath(a, d->file, from->base, home, from->win, 0);
+        r.path = p.path;
+        r.err  = p.err;
+    }
+    if (r.path.len) {
+        r.show = filelinkshow(a, r.path, from->base, home, from->win);
+        r.far  = from->host != 0;
+    }
+    return r;
+}
+
+// Where a link to a file goes, in a tooltip: "Files → PATH:N", else
+// why it opens nothing.
+static Str filelinktip(Gui *g, Arena *a, Str link, Dest *d, LinkFrom *from)
+{
+    if (!from || !from->opens) {
+        return concat(a, link, " (a link to a file opens nothing here)");
+    }
+    FileLink f = filelinkget(g, a, d, from);
+    Buf      b(a, link.len + f.show.len + f.err.len + d->section.len + 64);
+    print(&b, "Files \xe2\x86\x92 ");
+    if (f.err.len) {
+        print(&b, link);
+        print(&b, ": ");
+        print(&b, f.err);
+        return finish(&b);
+    }
+    print(&b, f.show);
+    FileRef *r = &d->file;
+    if (!d->here && r->line0) {
+        putbyte(&b, ':');
+        print(&b, (i64)r->line0);
+        if (r->line1 > r->line0) {
+            putbyte(&b, '-');
+            print(&b, (i64)r->line1);
+        }
+    }
+    Str section = d->here ? d->section : r->section;
+    if (section.len) {
+        print(&b, " \xe2\x80\xba ");
+        print(&b, section);
+    }
+    if (f.far) {
+        print(&b, ": its file is on another computer");
+    }
+    return finish(&b);
+}
+
+// Show a link's file, as filesopen does; its tab, if open already, may
+// have changed since it was read.
+static void filelinkgo(Gui *g, GuiSession *s, u64 host, Str path, b32 win,
+                       i32 line0, i32 line1, Str section)
+{
+    GuiSession *root = s ? termroot(g, s) : &g->nosession;
+    i32         i    = filesetfind(&root->files, host, path, win);
+    if (i >= 0) {
+        root->files.tabs[i]->stale = 1;
+    }
+    filesopen(g, s, host, path, line0, line1, section);
+}
+
+// A link to a file clicked: shown in Files, at its lines or heading.
+// The arena is the one d was made in, past it.
+static void filelinkopen(Gui *g, Arena *a, Dest *d, LinkFrom *from)
+{
+    if (!from || !from->opens) {
+        return;
+    }
+    FileLink f = filelinkget(g, a, d, from);
+    if (!f.path.len || f.far) {
+        return;
+    }
+    if (d->here) {
+        filelinkgo(g, from->s, from->host, f.path, from->win, 0, 0, d->section);
+    } else {
+        FileRef *r = &d->file;
+        filelinkgo(g, from->s, from->host, f.path, from->win, r->line0, r->line1, r->section);
+    }
+}
+
+// A right-click in text, on link (empty for none): the menu's file
+// link, as it resolves now, kept for as long as the menu is open.
+static void filelinkmark(Gui *g, Str link, LinkFrom *from)
+{
+    LinkMenu *m = &g->linkmenu;
+    *m = {};
+    Arena a = g->frame;
+    Dest  d = helpdest(&a, link);
+    if (!link.len || d.kind!=DEST_FILE || !from || !from->opens) {
+        return;
+    }
+    FileLink f = filelinkget(g, &a, &d, from);
+    if (f.path.len > countof(m->path)) {
+        f = {{}, {}, "its path is too long", 0};
+    }
+    m->on    = 1;
+    m->s     = from->s;
+    m->host  = from->host;
+    m->win   = from->win;
+    m->line0 = d.here ? 0 : d.file.line0;
+    m->line1 = d.here ? 0 : d.file.line1;
+    copybytes(m->path, f.path.data, f.path.len);
+    m->pathlen = (i32)f.path.len;
+    Str section = d.here ? d.section : d.file.section;
+    iz  n = section.len<FILES_SECTION ? section.len : (iz)FILES_SECTION;
+    copybytes(m->section, section.data, n);
+    m->sectionlen = (i32)n;
+    Str why = f.err.len ? f.err : f.far ? Str("its file is on another computer") : Str{};
+    n = why.len<countof(m->why) ? why.len : countof(m->why);
+    copybytes(m->why, why.data, n);
+    if (n) {
+        m->why[0] = (u8)(why[0]>='a' && why[0]<='z' ? why[0]-0x20 : why[0]);
+    }
+    m->whylen = (i32)n;
+}
+
+// The text's context menu's first items, for a file link right-clicked:
+// Open in Files and Copy path, or why not.
+static void filelinkitems(Gui *g)
+{
+    LinkMenu *m = &g->linkmenu;
+    if (!m->on) {
+        return;
+    }
+    Arena a    = g->frame;
+    Str   path = {m->path, m->pathlen};
+    Str   why  = {m->why, m->whylen};
+    if (ImGui::MenuItem("Open in Files", 0, false, !why.len)) {
+        filelinkgo(g, m->s, m->host, path, m->win, m->line0, m->line1,
+                   {m->section, m->sectionlen});
+    }
+    itemnamed(g, "link open");
+    if (why.len) {
+        whytip(why);
+    } else {
+        itemtip("Show the file in the Files pane");
+    }
+    if (ImGui::MenuItem("Copy path", 0, false, path.len>0)) {
+        ImGui::SetClipboardText(cstr0(&a, path));
+    }
+    itemnamed(g, "link copy path");
+    if (!path.len) {
+        whytip(why);
+    } else {
+        itemtip("Put the file's path on the clipboard");
+    }
+    ImGui::Separator();
+}
+
+
 // Open file...: a path typed in a modal of its own (drawpathask), on
 // this computer, its answer TASK_OPENFILE
 
@@ -711,8 +917,9 @@ static void filesempty(Gui *g)
         itemtip("Type a file's path, with :N after it for a line (%s)", cmdkey(g, &a, "O"));
     }
     ImGui::PushTextWrapPos(0);
-    ImGui::TextDisabled("A file opened here shows as text, its lines numbered, or as "
-                        "Markdown, in a tab of the session shown.");
+    ImGui::TextDisabled("A file opened here, or by a click on a link to it in the "
+                        "transcript, the plan or a Markdown file, shows as text, its "
+                        "lines numbered, or as Markdown, in a tab of the session shown.");
     ImGui::PopTextWrapPos();
 }
 
@@ -954,11 +1161,20 @@ static void drawfiles(Gui *g)
         if (pending) {
             scheddirty(&g->sched);
         }
-        // Its child's scroll is the last tab's until it is set
+        // Its child's scroll is the last tab's until it is set. Its links
+        // are from its folder, and "#section" stays in it
         b32 set = d->scrollto>=0 || d->section.len;
+        d->from       = filelinkfrom(g->sess, {});
+        d->from.base  = parentdir(ft->path);
+        d->from.host  = ft->host;
+        d->from.win   = ft->win;
+        d->from.opens = 1;
+        d->from.file  = ft->path;
         Str link = drawdoc(g, d, "##filetext");
-        (void)link;  // links open files from C5 on
         itemnamed(g, "file text");
+        if (link.len) {
+            followlink(g, link, &d->from);
+        }
         if (!pending && !set && !dl->restore) {
             filemdtop(g, b, &ft->top, &ft->dy);
         }

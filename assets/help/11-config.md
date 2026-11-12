@@ -49,7 +49,9 @@ Ask the agent about Prospero, or to change a setting, and it reads
 Prospero's own skill ([Skills](help:instructions#skills)): this Help,
 and every setting with its type, default and meaning. Its answers link
 what they name, a Help topic, a setting or a pane, and a click there
-goes to it.
+goes to it. A link to a file opens it in the Files pane
+([Files](help:sessions#files)); a link in Help, the greeting or
+Diagnostics to a file opens nothing.
 
 It changes the file with its edit and write tools. Each change asks
 you first, with no Always, even where its writes need no asking, but

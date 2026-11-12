@@ -295,5 +295,9 @@ static void test_helpskill(Test *t)
     expect(t, "view files", istr(a, d.kind==DEST_VIEW && d.pane==9), "1");  // PANE_FILES
     expect(t, "view none", istr(a, helpdest(a, "view:nope").pane), "-1");
     expect(t, "web", istr(a, helpdest(a, "HTTPS://example.com/").kind), istr(a, DEST_WEB));
-    expect(t, "other", istr(a, helpdest(a, "file:///etc/passwd").kind), istr(a, DEST_NONE));
+    // A file: URL is a file's link, as Claude Desktop takes them (C5);
+    // another scheme is still nothing Prospero opens
+    d = helpdest(a, "file:///etc/passwd");
+    expect(t, "file url", concat(a, istr(a, d.kind==DEST_FILE), d.file.path), "1/etc/passwd");
+    expect(t, "other", istr(a, helpdest(a, "mailto:x@example.com").kind), istr(a, DEST_NONE));
 }

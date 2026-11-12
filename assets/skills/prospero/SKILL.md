@@ -44,6 +44,10 @@ window's own words, and only one that exists:
   `prompt`, `todo`, `plan`, `changes`, `jobs`, `log`, `terminal`,
   `files`, `hosts`, `settings` or `help`.
 - A web link, `https://...`, opens in the user's browser.
+- A file's path opens the file in the Files pane, relative to your
+  working directory or absolute, with `:N` or `:A-B` after it for lines:
+  `[engine.cpp:42](src/engine.cpp:42)`, `[:88](src/engine.cpp:88)`. Use
+  `/` between folders, and `<...>` around a path with spaces.
 
 ## Changing settings
 
