@@ -14,7 +14,9 @@
 //
 // Files on this computer are read here, by the GUI, through filestat
 // and fileread, which refuse device and network paths before anything
-// touches them. Files on other hosts come later, through their engines.
+// touches them. Files on other hosts (remotes, containers, WSL) come
+// through their engines, fs.read a part at a time (FileFetch), the
+// front tab's only, and Open file checks a path there with fs.stat.
 //
 // A file opens from Open file, or from a link to it (filelinkopen) in
 // the transcript, the plan or a Markdown file shown here.
@@ -44,6 +46,8 @@ struct FileBody {
     i64          mtime;
     u64          sum;      // body's hash
     i32          flags;    // FTEXT_*
+    b32          changed;  // it changed while it was read, twice
+    b32          fetched;  // read on its host (fs.read), for the checklist
     Str          lang;
     i64          drawn;    // total.frames when last drawn
 };
@@ -76,6 +80,16 @@ static Str filehostname(Gui *g, Arena *a, u64 uid)
 {
     GuiHost *h = filehost(g, uid);
     return h ? hostlabel(g, a, h) : Str("this computer");
+}
+
+// A tab failed, saying why. One on another host is tried again only
+// once that host has connected again (drawfiles), or on Retry.
+static void filefail(Gui *g, FileTab *ft, Str why)
+{
+    GuiHost *h = filehost(g, ft->host);
+    ft->state = FTAB_FAILED;
+    ft->err   = why;
+    ft->opens = h ? h->opens : 0;
 }
 
 // The root whose tabs the pane shows: the shown session's, else the
@@ -142,8 +156,13 @@ static void filefree(Gui *g, FileTab *ft)
 }
 
 // A tab closed: its body freed, to the spares.
+static void fetchend(Gui *);
+
 static void filedrop(Gui *g, FileTab *ft)
 {
+    if (g->ffetch.ft == ft) {
+        fetchend(g);  // the tab may be another's next
+    }
     filefree(g, ft);
     ft->next     = g->filespare;
     g->filespare = ft;
@@ -173,40 +192,13 @@ static DocView *filedocview(Arena *mem, ViewCache *c, iz nmsgs)
     return d;
 }
 
-// Read a tab's file, on this computer, into a body of its own, else say
-// why not in the tab.
-static void fileload(Gui *g, FileTab *ft)
+// A tab's file, raw, its first FILES_MAX bytes of size, made into a body
+// of its own, highlighted, in chunks: the scratch sr is released.
+static void filemake(Gui *g, FileTab *ft, Region *sr, Arena s, Str raw, i64 size,
+                     i64 mtime, b32 changed)
 {
-    g->fileloads++;
-    scheddirty(&g->sched);
-    ft->err = {};
-    Region *sr = os_reserve(g->os, FILES_SCRATCH);
-    if (!sr) {
-        ft->state = FTAB_FAILED;
-        ft->err   = "There is no memory to show it";
-        return;
-    }
-    Arena s  = newarena(sr);
-    Stat  st = filestat(g, s, ft->path);
-    Str   why = filestatwhy(st.type);
-    Read  rd  = {};
-    if (!why.len) {
-        rd  = fileread(g, &s, ft->path, FILES_MAX);
-        why = rd.err==READ_OK       ? Str{} :
-              rd.err==READ_NOTFOUND ? Str("No such file") :
-              rd.err==READ_NOTFILE  ? Str("Not a regular file") :
-              Str("It could not be read");
-    }
-    if (why.len) {
-        os_release(g->os, sr);
-        ft->state = FTAB_FAILED;
-        ft->err   = why;
-        return;
-    }
-
     // Past FILES_MAX: up to its last whole line, and so cut
-    Str raw = rd.data;
-    b32 cut = rd.size > raw.len;
+    b32 cut = size > raw.len;
     if (cut) {
         raw = takehead(raw, filewhole(raw));
     }
@@ -230,8 +222,7 @@ static void fileload(Gui *g, FileTab *ft)
             os_release(g->os, r);
         }
         os_release(g->os, sr);
-        ft->state = FTAB_FAILED;
-        ft->err   = "There is no memory to show it";
+        filefail(g, ft, "There is no memory to show it");
         return;
     }
     FileBody *b = alloc<FileBody>(&mem);
@@ -245,10 +236,11 @@ static void fileload(Gui *g, FileTab *ft)
     }
     b->lines = ftx.lines;
     b->cols  = ftx.cols;
-    b->size  = rd.size;
-    b->mtime = st.mtime;
+    b->size  = size;
+    b->mtime = mtime;
     b->sum   = hash(b->body);
     b->flags = ftx.flags;
+    b->changed = changed;
     b->lang  = clone(&mem, lang);
     b->drawn = g->total.frames;
     b->c     = alloc<ViewCache>(&mem);
@@ -290,6 +282,270 @@ static void fileload(Gui *g, FileTab *ft)
     ft->state = FTAB_READ;
     if (ft->mode==FMODE_MARKDOWN && (!b->md || b->body.len>DOC_MAXSIZE)) {
         ft->mode = FMODE_TEXT;  // too big to render, or binary shown as text
+    }
+}
+
+// Read a tab's file, on this computer, into a body of its own, else say
+// why not in the tab.
+static void fileload(Gui *g, FileTab *ft)
+{
+    g->fileloads++;
+    scheddirty(&g->sched);
+    ft->err = {};
+    Region *sr = os_reserve(g->os, FILES_SCRATCH);
+    if (!sr) {
+        filefail(g, ft, "There is no memory to show it");
+        return;
+    }
+    Arena s  = newarena(sr);
+    Stat  st = filestat(g, s, ft->path);
+    Str   why = filestatwhy(st.type);
+    Read  rd  = {};
+    if (!why.len) {
+        rd  = fileread(g, &s, ft->path, FILES_MAX);
+        why = rd.err==READ_OK       ? Str{} :
+              rd.err==READ_NOTFOUND ? Str("No such file") :
+              rd.err==READ_NOTFILE  ? Str("Not a regular file") :
+              Str("It could not be read");
+    }
+    if (why.len) {
+        os_release(g->os, sr);
+        filefail(g, ft, why);
+        return;
+    }
+    filemake(g, ft, sr, s, rd.data, rd.size, st.mtime, 0);
+}
+
+
+// Files on another host, through its engine
+
+// Whether a host is up to show its files, else why not.
+static Str filehostwhy(GuiHost *h)
+{
+    if (!h || !h->r || h->closing || !h->up) {
+        return "Its host is not connected";
+    } else if (!hostcap(h, "fs")) {
+        return "The engine there is too old to show its files: update it";
+    }
+    return {};
+}
+
+// Whether a request still waits for reply id: else REQ_MAX evicted it.
+static b32 reqheld(Gui *g, i64 id)
+{
+    for (i32 i = 0; i < REQ_MAX; i++) {
+        if (g->reqs[i].id == id) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Ask for the fetch's next part.
+static void fsrequest(Gui *g)
+{
+    FileFetch *f = &g->ffetch;
+    GuiHost   *h = filehost(g, f->host);
+    if (!h) {
+        return;
+    }
+    i64   want = FILES_MAX - f->off;
+    Arena a    = newarena(g->cmdr);
+    Buf   b(&a, 256 + 6*f->ft->path.len);
+    EvOut w = cmdopen(g, &b, CMD_FSREAD, 0, h);
+    putkey(&w.json, "path");
+    putstr(&w.json, f->ft->path);
+    putkey(&w.json, "off");
+    putint(&w.json, f->off);
+    putkey(&w.json, "max");
+    putint(&w.json, want<FILES_PART ? want : (i64)FILES_PART);
+    f->id = g->nextid;
+    cmdsend(g, &w, a);
+}
+
+// The fetch let go, its tab as it is.
+static void fetchend(Gui *g)
+{
+    FileFetch *f = &g->ffetch;
+    if (f->r) {
+        os_release(g->os, f->r);
+    }
+    *f = {};
+}
+
+// The fetch abandoned: its tab, still waiting for it, read again later.
+static void fetchdrop(Gui *g)
+{
+    FileFetch *f = &g->ffetch;
+    if (f->ft && f->ft->serial==f->serial && f->ft->state==FTAB_READING) {
+        f->ft->state = FTAB_UNREAD;
+    }
+    fetchend(g);
+}
+
+// The fetch failed, saying why in its tab, which is tried again once
+// its host has connected again.
+static void fetchfail(Gui *g, Str why)
+{
+    filefail(g, g->ffetch.ft, why);
+    fetchend(g);
+    scheddirty(&g->sched);
+}
+
+// Start reading a tab's file on another host, as its tab shows: one
+// fetch at a time, the last given up. With its host down, the tab waits
+// (filesnote says so); with an engine there too old, it fails.
+static void filefetch(Gui *g, FileTab *ft)
+{
+    GuiHost *h   = filehost(g, ft->host);
+    Str      why = filehostwhy(h);
+    if (why.len && h && h->r && !h->closing && h->up) {
+        filefail(g, ft, why);  // too old, until updated
+        return;
+    } else if (why.len) {
+        return;  // until it connects
+    }
+    fetchdrop(g);
+    FileFetch *f = &g->ffetch;
+    f->r = os_reserve(g->os, FILES_SCRATCH);
+    if (!f->r) {
+        filefail(g, ft, "There is no memory to show it");
+        return;
+    }
+    f->mem    = newarena(f->r);
+    f->buf    = allocbytes(&f->mem, FILES_MAX);
+    f->ft     = ft;
+    f->serial = ft->serial;
+    f->host   = ft->host;
+    f->size   = -1;
+    ft->err   = {};
+    ft->state = FTAB_READING;
+    fsrequest(g);
+    scheddirty(&g->sched);
+}
+
+// Each frame the pane is drawn, for the front tab ft: a fetch for
+// another given up, and one whose request slot went (REQ_MAX) asked
+// for again.
+static void fetchtick(Gui *g, FileTab *ft)
+{
+    FileFetch *f = &g->ffetch;
+    if (f->ft && (f->ft!=ft || f->ft->serial!=f->serial || f->ft->state!=FTAB_READING)) {
+        fetchdrop(g);
+    } else if (f->ft && f->id && !reqheld(g, f->id)) {
+        fsrequest(g);
+    }
+}
+
+static void fileaskstat(Gui *);
+
+// Its host connected again: the part in flight asked for again, as its
+// reply may have gone with the link, and Open file's check.
+static void filefetchagain(Gui *g, GuiHost *h)
+{
+    FileFetch *f = &g->ffetch;
+    if (f->ft && f->id && f->host==h->uid) {
+        fsrequest(g);
+    }
+    if (g->fask.statid && g->fask.host==h->uid) {
+        fileaskstat(g);
+    }
+}
+
+// Its host's link ended (Disconnect, quitting): a reply in flight from
+// it is gone, unasked for, so the fetch is dropped, to read again once
+// it is back, and Open file's check, at it, fails.
+static void filehostend(Gui *g, GuiHost *h)
+{
+    if (g->ffetch.ft && g->ffetch.host==h->uid) {
+        fetchdrop(g);
+    }
+    if (g->fask.statid && g->fask.host==h->uid) {
+        g->fask.statid = 0;
+        g->fask.p.err  = filehostwhy(0);
+    }
+}
+
+// An engine's reason, as a tab says it.
+static Str fswhy(Str err)
+{
+    return err=="no such file"       ? Str("No such file") :
+           err=="that is a folder"   ? Str("That is a folder") :
+           err=="not a regular file" ? Str("Not a regular file") :
+                                       Str("It could not be read");
+}
+
+// A part of the fetch's file came: the next asked for, or once all is
+// here (or FILES_MAX), made into a body. A size or mtime changed reads
+// it again from the start once; changed again, what came is kept.
+static void onfsread(Gui *g, Arena scratch, Json *j, b32 ok, Str err)
+{
+    FileFetch *f  = &g->ffetch;
+    FileTab   *ft = f->ft;
+    f->id = 0;
+    if (!ft || ft->serial!=f->serial || ft->state!=FTAB_READING) {
+        fetchend(g);
+        return;
+    }
+    if (!ok && err=="the reply was lost: try again" && f->lost<3) {
+        f->lost++;
+        fsrequest(g);
+        return;
+    } else if (!ok && filehostwhy(filehost(g, f->host)).len) {
+        fetchdrop(g);  // its host went: read when it is back
+        scheddirty(&g->sched);
+        return;
+    } else if (!ok) {
+        fetchfail(g, fswhy(err));
+        return;
+    }
+    Unbase64 u     = unbase64(&scratch, jsonstr(jsonget(j, "data")));
+    i64      size  = jsonint(jsonget(j, "size"), -1);
+    i64      mtime = jsonint(jsonget(j, "mtime"), 0);
+    i64      next  = jsonint(jsonget(j, "off"), -1);
+    b32      more  = jsonint(jsonget(j, "more"), 0) != 0;
+    if (!u.ok || size<0 || u.data.len>FILES_PART) {
+        fetchfail(g, "It could not be read");
+        return;
+    }
+    if (f->size < 0) {
+        f->size  = size;
+        f->mtime = mtime;
+    }
+    b32 changed = size!=f->size || mtime!=f->mtime || next!=f->off+u.data.len;
+    if (changed && !f->again) {
+        f->again = 1;  // from the start, once
+        f->off   = 0;
+        f->size  = -1;
+        fsrequest(g);
+        return;
+    } else if (changed) {
+        f->changed = 1;
+        more       = 0;  // what came is kept
+    } else {
+        iz n = u.data.len<FILES_MAX-f->off ? u.data.len : (iz)(FILES_MAX-f->off);
+        copybytes(f->buf+f->off, u.data.data, n);
+        f->off += n;
+    }
+    if (more && u.data.len && f->off<FILES_MAX) {
+        fsrequest(g);
+        return;
+    }
+
+    // All here: its body, from the scratch past what came
+    Region *r = f->r;
+    Arena   s = f->mem;
+    Str     raw = {f->buf, (iz)f->off};
+    i64     total = f->changed ? f->off : f->size;
+    b32     twice = f->changed;
+    i64     when  = f->mtime;
+    f->r = 0;
+    fetchend(g);
+    g->fileloads++;
+    scheddirty(&g->sched);
+    filemake(g, ft, r, s, raw, total>raw.len ? total : raw.len, when, twice);
+    if (ft->body) {
+        ft->body->fetched = 1;
     }
 }
 
@@ -369,6 +625,7 @@ static void filesweep(Gui *g)
 // kept, to be read again when shown.
 static void filesrelease(Gui *g)
 {
+    fetchdrop(g);  // a read in flight too: read again when shown
     GuiSession *roots[] = {&g->nosession, g->sessions};
     for (i32 k = 0; k < countof(roots); k++) {
         for (GuiSession *s = roots[k]; s; s = k ? s->next : 0) {
@@ -453,9 +710,8 @@ static FileTab *filesopen(Gui *g, GuiSession *s, u64 host, Str path, i32 line0, 
 
 // Links to files (help.cpp's DEST_FILE), in the transcript, Plan and
 // Markdown files: resolved as asked (filepath, unasked 0) from where
-// the link is (LinkFrom), then shown in the tabs of its session's root.
-// Until engines read files (fs.read), one on another computer only
-// says so.
+// the link is (LinkFrom), then shown in the tabs of its session's root,
+// on its host: one on another computer is read there (fs.read).
 
 // Where links in session s's text are, relative paths from base: its
 // root's tabs, on its host. With no session, nowhere.
@@ -491,7 +747,7 @@ struct FileLink {
     Str path;  // absolute and normalized, else null
     Str show;  // as a tooltip names it
     Str err;   // why it names no file, else null
-    b32 far;   // on another computer
+    b32 far;   // on another computer, read through its engine
 };
 
 // The file a link names, from where it is.
@@ -547,7 +803,8 @@ static Str filelinktip(Gui *g, Arena *a, Str link, Dest *d, LinkFrom *from)
         print(&b, section);
     }
     if (f.far) {
-        print(&b, ": its file is on another computer");
+        print(&b, ", on ");
+        print(&b, filehostname(g, a, from->host));
     }
     return finish(&b);
 }
@@ -573,7 +830,7 @@ static void filelinkopen(Gui *g, Arena *a, Dest *d, LinkFrom *from)
         return;
     }
     FileLink f = filelinkget(g, a, d, from);
-    if (!f.path.len || f.far) {
+    if (!f.path.len) {
         return;
     }
     if (d->here) {
@@ -611,7 +868,7 @@ static void filelinkmark(Gui *g, Str link, LinkFrom *from)
     iz  n = section.len<FILES_SECTION ? section.len : (iz)FILES_SECTION;
     copybytes(m->section, section.data, n);
     m->sectionlen = (i32)n;
-    Str why = f.err.len ? f.err : f.far ? Str("its file is on another computer") : Str{};
+    Str why = f.err;
     n = why.len<countof(m->why) ? why.len : countof(m->why);
     copybytes(m->why, why.data, n);
     if (n) {
@@ -655,16 +912,25 @@ static void filelinkitems(Gui *g)
 
 
 // Open file...: a path typed in a modal of its own (drawpathask), on
-// this computer, its answer TASK_OPENFILE
+// the shown session's host, its answer TASK_OPENFILE. On another host
+// the path is checked there (fs.stat) first.
+
+// The host Open file opens files on: the shown session's, else this
+// computer (null).
+static GuiHost *fileaskhost(Gui *g)
+{
+    GuiSession *s = g->sess;
+    return s && s->host->kind==GH_REMOTE ? s->host : 0;
+}
 
 // Why Open file can't be used now, else empty.
 static Str fileaskwhy(Gui *g)
 {
-    GuiSession *s = g->sess;
+    GuiHost *h = fileaskhost(g);
     if (!g->main) {
         return "No engine";
-    } else if (s && s->host->kind==GH_REMOTE) {
-        return "Open file opens files on this computer, and this session is on another";
+    } else if (h) {
+        return filehostwhy(h);
     }
     return {};
 }
@@ -689,7 +955,11 @@ static void fileaskopen(Gui *g)
     p->title = "Open file";
     p->open  = 1;
     fieldput(p->buf, at);
-    g->fask.host = 0;
+    GuiHost *h = fileaskhost(g);
+    g->fask.host   = h ? h->uid : 0;
+    g->fask.statid = 0;
+    g->fask.stated = 0;
+    g->fask.close  = 0;
     scheddirty(&g->sched);
 }
 
@@ -700,10 +970,12 @@ static void fileaskopen(Gui *g)
 static FilePath fileasked(Gui *g, Arena *a, Str text, FileRef *ref)
 {
     GuiSession *s    = g->sess;
-    GuiHost    *h    = g->main;
-    Str         base = s && !sessnofolder(s) ? termcwd(s) : Str{};
+    GuiHost    *far  = filehost(g, g->fask.host);
+    GuiHost    *h    = far ? far : g->main;
+    b32         win  = far ? hostwin(far) : (b32)HOST_WINDOWS;
+    Str         base = s && !sessnofolder(s) && (!far || s->host==far) ? termcwd(s) : Str{};
     *ref = fileref(a, text);
-    FilePath p = text.len ? filepath(a, *ref, base, h ? h->home : Str{}, HOST_WINDOWS, 0)
+    FilePath p = text.len ? filepath(a, *ref, base, h ? h->home : Str{}, win, 0)
                           : FilePath{{}, "type a path"};
     if (p.err.len) {
         iz  n   = p.err.len<countof(g->fask.err) ? p.err.len : countof(g->fask.err);
@@ -711,6 +983,8 @@ static FilePath fileasked(Gui *g, Arena *a, Str text, FileRef *ref)
         g->fask.err[0] = (u8)(p.err[0]>='a' && p.err[0]<='z' ? p.err[0]-0x20 : p.err[0]);
         p.err = {g->fask.err, n};  // kept past the frame, for the modal
         return p;
+    } else if (g->fask.host) {
+        return p;  // checked there (fileaskok)
     }
     Str why = filestatwhy(filestat(g, *a, p.path).type);
     if (why.len) {
@@ -735,7 +1009,33 @@ static Str fileanswerput(Arena *a, FilePath p, FileRef ref)
     return finish(&b);
 }
 
-// Open file's OK: the path typed, its answer posted, else why not.
+// Ask the host whether Open file's path, kept as its answer, is a file.
+static void fileaskstat(Gui *g)
+{
+    FileAsk *f = &g->fask;
+    GuiHost *h = filehost(g, f->host);
+    Str      why = filehostwhy(h);
+    if (why.len) {
+        f->statid = 0;
+        f->p.err  = why;
+        return;
+    }
+    Str   answer = {f->answer, f->answerlen};
+    Cut   pl     = cut(cut(cut(answer, ' ').tail, ' ').tail, '\n');
+    Arena a      = newarena(g->cmdr);
+    Buf   b(&a, 256 + 6*pl.head.len);
+    EvOut w = cmdopen(g, &b, CMD_FSSTAT, 0, h);
+    putkey(&w.json, "paths");
+    putarray(&w.json);
+    putstr(&w.json, pl.head);
+    putend(&w.json);
+    f->statid = g->nextid;
+    cmdsend(g, &w, a);
+}
+
+// Open file's OK: the path typed, its answer posted, else why not. On
+// another host, its answer waits for the check there, the modal open,
+// saying "Checking...".
 static Str fileaskok(Gui *g, Str text)
 {
     Arena    a   = g->frame;
@@ -744,8 +1044,52 @@ static Str fileaskok(Gui *g, Str text)
     if (p.err.len) {
         return p.err;
     }
-    mailpost(g->tasks, TASK_OPENFILE, g->fask.p.id, fileanswerput(&a, p, ref), 1);
-    return {};
+    Str answer = fileanswerput(&a, p, ref);
+    if (!g->fask.host) {
+        mailpost(g->tasks, TASK_OPENFILE, g->fask.p.id, answer, 1);
+        return {};
+    } else if (answer.len > countof(g->fask.answer)) {
+        return "Its path is too long";
+    }
+    copybytes(g->fask.answer, answer.data, answer.len);
+    g->fask.answerlen = answer.len;
+    fileaskstat(g);
+    return g->fask.statid ? Str{} : g->fask.p.err;
+}
+
+// Each frame Open file is up: its check asked again where its request
+// slot went (REQ_MAX).
+static void fileaskcheck(Gui *g)
+{
+    if (g->fask.statid && !reqheld(g, g->fask.statid)) {
+        fileaskstat(g);
+    }
+}
+
+// The host's answer to Open file's check: a file opens, else the modal
+// says why not.
+static void onfsstat(Gui *g, Arena, Json *j, b32 ok, Str err)
+{
+    FileAsk *f = &g->fask;
+    f->statid = 0;
+    f->stated = 1;
+    Str type = jsonstr(jsonget(jsonat(jsonget(j, "stats"), 0), "type"));
+    Str why  = !ok              ? err :
+               type == "file"   ? Str{} :
+               type == "dir"    ? Str("That is a folder") :
+               type == "missing" ? Str("No such file") :
+               type == "bad"    ? Str("It cannot be shown") :
+                                  Str("Not a regular file");
+    if (!why.len) {
+        mailpost(g->tasks, TASK_OPENFILE, f->p.id, {f->answer, f->answerlen}, 1);
+        f->close = 1;
+    } else {
+        iz n = why.len<countof(f->err) ? why.len : countof(f->err);
+        copybytes(f->err, why.data, n);
+        f->err[0] = (u8)(why[0]>='a' && why[0]<='z' ? why[0]-0x20 : why[0]);
+        f->p.err  = {f->err, n};
+    }
+    scheddirty(&g->sched);
 }
 
 static void fileanswer(Gui *g, Str data)
@@ -838,7 +1182,8 @@ static FileBar filetabs(Gui *g, GuiSession *root)
             if (menutip(g, &a, "Copy path", {}, "Put the file's path on the clipboard")) {
                 ImGui::SetClipboardText(cstr0(&a, ft->path));
             }
-            if (menutip(g, &a, "Reload", {}, "Read the file again")) {
+            Str farwhy = ft->host ? filehostwhy(filehost(g, ft->host)) : Str{};
+            if (menutip(g, &a, "Reload", farwhy, "Read the file again")) {
                 r.reload = i;
             }
             ImGui::EndPopup();
@@ -1004,9 +1349,10 @@ static void drawfiles(Gui *g)
         return;
     }
     FileBar bar = filetabs(g, root);
-    if (bar.reload >= 0) {
-        filefree(g, set->tabs[bar.reload]);
-        set->tabs[bar.reload]->state = FTAB_UNREAD;
+    FileTab *rt = bar.reload>=0 ? set->tabs[bar.reload] : 0;
+    if (rt && !(rt->host && filehostwhy(filehost(g, rt->host)).len)) {
+        filefree(g, rt);  // not one whose host can't serve it
+        rt->state = FTAB_UNREAD;
     }
     if (bar.closed>=0 && (bar.others || bar.all)) {
         FileTab *keep = bar.all ? 0 : set->tabs[bar.closed];
@@ -1022,12 +1368,21 @@ static void drawfiles(Gui *g)
     if (!ft) {
         g->fshowing = 0;
         filesempty(g);
+        fetchtick(g, 0);
         return;
     }
-    if (ft->state == FTAB_UNREAD) {
+    fetchtick(g, ft);
+    GuiHost *fh = filehost(g, ft->host);
+    if (ft->state==FTAB_FAILED && ft->host && fh && fh->opens!=ft->opens) {
+        ft->state = FTAB_UNREAD;  // its host connected again: once more
+    }
+    if (ft->state==FTAB_UNREAD && ft->host) {
+        filefetch(g, ft);
+    } else if (ft->state == FTAB_UNREAD) {
         fileload(g, ft);
     }
     FileBody *b = ft->body;
+    Str       farwhy = ft->host ? filehostwhy(fh) : Str{};
 
     // The toolbar: Markdown or text, Wrap, Reload, then the path
     b32 mdok = b && b->md;
@@ -1054,13 +1409,19 @@ static void drawfiles(Gui *g)
         itemtip("Wrap long lines at the pane's width");
         ImGui::SameLine();
     }
+    ImGui::BeginDisabled(farwhy.len > 0);
     if (iconbutton(ICON_REFRESH "##filereload")) {
         filefree(g, ft);
         ft->state = FTAB_UNREAD;
         b = 0;
     }
+    ImGui::EndDisabled();
     itemnamed(g, "file reload");
-    itemtip("Reload: read the file again");
+    if (farwhy.len) {
+        whytip(farwhy);
+    } else {
+        itemtip("Reload: read the file again");
+    }
     ImGui::SameLine();
     {
         Measure m = {};
@@ -1086,10 +1447,26 @@ static void drawfiles(Gui *g)
         g->fshowing = 0;
         return;
     } else if (!b) {
+        // Coming from its host, or waiting for it to connect
+        if (ft->state == FTAB_READING) {
+            filenote(g, "Reading...", 0);
+        } else if (farwhy.len) {
+            filenote(g, farwhy, 1);
+            if (fh && fh->r && !fh->closing && !fh->up) {
+                Buf nb(&a, 64 + fh->name.len);
+                print(&nb, "Reconnecting to ");
+                print(&nb, fh->name);
+                print(&nb, "...");
+                filenote(g, finish(&nb), 0);
+            }
+        }
         g->fshowing = 0;
         return;
     }
     b->drawn = g->total.frames;
+    if (b->changed) {
+        filenote(g, "It changed while it was read.", 0);
+    }
     if (b->flags&FTEXT_BINARY && !ft->astext) {
         Buf nb(&a, 64);
         print(&nb, "This is a binary file (");

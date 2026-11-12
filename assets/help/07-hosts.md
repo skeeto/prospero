@@ -164,6 +164,16 @@ host whose engine is older than this window says so: deploy an engine
 (below) to have terminal tabs there. Closing the window to run in the
 background hangs up this window's terminal tabs.
 
+The Files pane shows a file on another host, a remote, a container or
+a WSL distro, as that host's engine reads it there, a part at a time:
+Open file... (Ctrl+O) with such a session shown asks for a path there,
+completed and checked there, and a link to a file in such a session's
+transcript, or the path in its read, edit or write row, opens the file
+there, its tooltip saying on which host. While the connection is
+broken, a file not yet read there says its host is not connected, and
+is read once it is back. An engine older than this window says it is
+too old to show its files: update it (below).
+
 ## A remote with no models of its own
 
 A remote needs no configuration. One whose configuration has no

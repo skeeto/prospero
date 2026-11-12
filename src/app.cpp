@@ -1121,6 +1121,34 @@ struct FileAsk {
     PathAsk p;
     u64     host;     // whose path it is, 0 for this computer
     u8      err[96];  // p.err's bytes, made from filepath's
+    // On another host, the path is checked there (fs.stat) before the
+    // modal closes, "Checking..." meanwhile
+    i64     statid;   // the fs.stat in flight, else 0
+    b32     close;    // its answer came and was posted: the modal closes
+    u8      answer[FIELD_MAX + 64];  // posted when it says a file
+    iz      answerlen;
+    b32     stated;   // an answer came from there, for the checklist
+};
+
+// A file on another host read into a tab, through its engine (fs.read),
+// a part (FILES_PART) at a time, for the front tab shown only. What came
+// is in r, at most FILES_MAX bytes, the rest of r the scratch that makes
+// it a body. Asked again for after a reconnect, a request slot evicted
+// (REQ_MAX), or a reply lost on the way, up to three times.
+struct FileFetch {
+    FileTab *ft;       // the tab it reads for, else null for none
+    u32      serial;   // and its serial then
+    u64      host;     // its host's uid
+    i64      id;       // the part asked for, else 0
+    Region  *r;
+    Arena    mem;      // r past buf
+    u8      *buf;
+    i64      off;      // bytes in buf
+    i64      size;     // the file's, as the first part said, else -1
+    i64      mtime;
+    i32      again;    // restarts as it changed
+    i32      lost;     // replies lost, asked again
+    b32      changed;  // it changed again: what came is kept
 };
 
 // A file's text view as drawdoc draws it (DocView of chunk messages, a
@@ -1868,6 +1896,7 @@ struct Gui {
     u32                fileserial;   // the last tab's serial
     b32                filewrap;     // new tabs wrap: the last choice made
     FileAsk            fask;         // Open file's modal
+    FileFetch          ffetch;       // a file on another host, coming
     DocLines           flines;       // the text view's state, as drawn
     FileShown          fshown;       // and where, for the checklist
     FileTab           *fshowing;     // the tab drawn last
@@ -3776,6 +3805,8 @@ static void imgrequest(Gui *g)
     putint(&w.json, f->off);
     putkey(&w.json, "encoding");
     putstr(&w.json, "base64");
+    putkey(&w.json, "max");
+    putint(&w.json, FILES_PART);  // under a far host's reserve for replies
     f->id = g->nextid;
     cmdsend(g, &w, a);
 }
@@ -5992,6 +6023,10 @@ static void filesfont(Gui *);
 static void fileaskopen(Gui *);
 static Str  fileaskwhy(Gui *);
 static void fileanswer(Gui *, Str);
+static void onfsread(Gui *, Arena, Json *, b32, Str);
+static void onfsstat(Gui *, Arena, Json *, b32, Str);
+static void filefetchagain(Gui *, GuiHost *);
+static void filehostend(Gui *, GuiHost *);
 static void termhostlost(Gui *, GuiHost *);
 static void termcloseengine(Gui *);
 static void drawterm(Gui *);
@@ -6092,6 +6127,18 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
 
     case CMD_DIR:
         ondir(g, scratch, id, j, ok, err);
+        return;
+
+    case CMD_FSREAD:
+        if (id && id==g->ffetch.id) {
+            onfsread(g, scratch, j, ok, err);
+        }
+        return;
+
+    case CMD_FSSTAT:
+        if (id && id==g->fask.statid) {
+            onfsstat(g, scratch, j, ok, err);
+        }
         return;
 
     case CMD_FILE:
@@ -8747,6 +8794,7 @@ static void onremote(Gui *g, GuiHost *h, Arena a, EvRec *r)
         if (f->s && f->s->host==h && f->id) {
             imgrequest(g);  // its reply may have gone with the link
         }
+        filefetchagain(g, h);  // likewise
     }
     if (msg.len && h->state!=RS_UP) {
         Buf b(&a, 128 + msg.len);
@@ -8795,6 +8843,7 @@ static void onhostend(Gui *g, GuiHost *h)
             imgdrop(g, s);  // closed with its host
         }
     }
+    filehostend(g, h);  // likewise its file being read
     GuiCtr *c = ctrofhost(g, h);
     if (c && c->stopafter) {
         c->stopafter = 0;
@@ -13627,11 +13676,15 @@ enum : i32 {
     CHK_FILESHOWN,    // Files is hidden (dx 0), shown (1), or shown central (2)
     CHK_FILEBODIES,   // the bodies fit the budget, dx files read at least
     CHK_FILEQUIET,    // no frames while idle, a file shown
-    CHK_LINKTIP,      // the last link's tooltip was text
+    CHK_LINKTIP,      // the last link's tooltip was text, or began so (dx 1)
     CHK_FILEPATH,     // the front file's path ends with text ('/' either way)
     CHK_CLIPEND,      // the clipboard ends with text ('/' either way)
     CHK_FILETOP,      // the front file's top line is dx (1-based), or the next
     CHK_TOOLPATHFOLD, // RECT_TOOLPATH's row is folded (dx 1) or open (0)
+    CHK_FILETEXT,     // the front file's text, as read, begins with text
+    CHK_FILEHOST,     // the front file is on the shown session's host, not
+                      // this computer, and dx 1 read there (fs.read); or
+                      // dx 2 Open file's path is, checked there (fs.stat)
     CHK_COUNT,
 };
 
@@ -13944,6 +13997,8 @@ static Str chknames[] = {
     "the link's tooltip is as said", "the front file is the one said",
     "the clipboard ends with the path said", "the file's top line is as said",
     "the tool row whose path was clicked is folded or open as said",
+    "the file's text is as said",
+    "the file is on the session's host, read there",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -14088,6 +14143,55 @@ struct DriveOp {
     {OP_KEYDOWN, 0, key, KEY_CMD, 50, ""}, \
     {OP_KEYUP, 0, key, KEY_CMD, 50, ""}, \
     {OP_KEYUP, 0, GKEY_CMD, 0, ms, ""}
+
+// Files on a session's host, through its engine (fs.read and fs.stat):
+// Open file there, its folder typed by op (OP_TEXTRCWD, or OP_TEXT of
+// dir), then file, read there and shown; then missing, which it says is
+// not there; then a link to hello.txt there, and one to nope.txt. Its
+// text begins "hello" (remote mode's tools edit it). Remote mode's far
+// files are on this computer too, so CHK_FILEHOST shows they came from
+// the host, not read here.
+#define REMOTEFILES(op, dir, file, missing) \
+    CMDKEY(GKEY_O, 800), \
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""}, \
+    {op, 0, 0, 0, 100, dir}, \
+    {OP_TEXT, 0, 0, 0, 300, file}, \
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""}, \
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""}, \
+    {OP_WAIT, W_FILEREADY, 0, 0, 20000, ""}, \
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""}, \
+    {OP_CHECK, CHK_FILEPATH, 0, 0, 0, file}, \
+    {OP_CHECK, CHK_FILETEXT, 0, 0, 0, "hello "}, \
+    {OP_CHECK, CHK_FILEHOST, 1, 0, 0, ""}, \
+    {OP_CHECK, CHK_FILENOTE, 0, 0, 0, ""}, \
+    CMDKEY(GKEY_O, 800), \
+    {op, 0, 0, 0, 100, dir}, \
+    {OP_TEXT, 0, 0, 0, 300, missing}, \
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""}, \
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 2000, ""}, \
+    {OP_CHECK, CHK_FILEASKERR, 0, 0, 0, "No such file"}, \
+    {OP_CHECK, CHK_FILEHOST, 2, 0, 0, ""}, \
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""}, \
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 500, ""}, \
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""}, \
+    {OP_PROMPT, 0, 0, 0, 100, "Link the far file."}, \
+    {OP_WAIT, W_IDLE, 0, 0, 30000, ""}, \
+    {OP_MOVE, T_NAMED, 0, 0, 800, "link nope.txt"}, \
+    {OP_DOWN, 0, 0, 0, 60, ""}, \
+    {OP_UP, 0, 0, 0, 300, ""}, \
+    {OP_WAIT, W_FILEREADY, 0, 0, 20000, ""}, \
+    {OP_CHECK, CHK_FILENOTE, 0, 0, 0, "No such file"}, \
+    {OP_CHECK, CHK_FILEHOST, 0, 0, 0, ""}, \
+    {OP_MOVE, T_NAMED, 0, 0, 800, "link hello.txt:1"}, \
+    {OP_CHECK, CHK_TOOLTIP, 0, 0, 0, ""}, \
+    {OP_CHECK, CHK_LINKTIP, 1, 0, 0, "Files \xe2\x86\x92 hello.txt:1, on "}, \
+    {OP_DOWN, 0, 0, 0, 60, ""}, \
+    {OP_UP, 0, 0, 0, 300, ""}, \
+    {OP_WAIT, W_FILEREADY, 0, 0, 20000, ""}, \
+    {OP_CHECK, CHK_FILEPATH, 0, 0, 0, file}, \
+    {OP_CHECK, CHK_FILETEXT, 0, 0, 0, "hello "}, \
+    {OP_CHECK, CHK_FILEHOST, 1, 0, 0, ""}, \
+    {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "1-1"}
 
 // A layout picked from View, Layout, by its name
 #define LAYOUT(name) \
@@ -17817,6 +17921,11 @@ static DriveOp remoteops[] = {
     {OP_CHECK, CHK_LASTUSER, 0, 0, 0, "@hello.txt"},
     {OP_CHECK, CHK_USERFILES, 0, 0, 0, "Attached: hello.txt"},
     {OP_CHECK, CHK_ATTACHED, 0, 0, 0, ""},
+    // Its files, which its engine reads there (fs.read): Open file on
+    // its host, a path there checked there (fs.stat), a missing one
+    // refused; a link to a file there, and to one not there
+    REMOTEFILES(OP_TEXTRCWD, "", "/hello.txt", "/nope.txt"),
+    {OP_SHOT, 0, 0, 0, 300, "remote-files"},
     // URL includes, fetched again from the settings window
     {OP_MOVE, T_SETTINGSTAB, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -18064,6 +18173,14 @@ static DriveOp ctrops[] = {
     TERMKEY(GKEY_ENTER, 100),
     {OP_WAIT, W_TERM, 0, 0, 5000, "\ninside /work"},
     {OP_SHOT, 0, 0, 0, 300, "containers-terminal"},
+    // Its files, which its engine reads inside it (fs.read), as on a
+    // remote: Open file on its host, the keyboard first taken from the
+    // terminal, whose Ctrl+O is the shell's on Linux
+    {OP_MOVE, T_TRANSCRIPT, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    REMOTEFILES(OP_TEXT, "/work", "/hello.txt", "/nope.txt"),
+    {OP_SHOT, 0, 0, 0, 300, "containers-files"},
     {OP_MOVE, T_SESSTITLE, 0, 0, 100, ""},  // untitled, the only one
     {OP_RDOWN, 0, 0, 0, 60, ""},
     {OP_RUP, 0, 0, 0, 500, ""},
@@ -21213,7 +21330,7 @@ static b32 drivefilecheck(Gui *g, i32 chk)
         Str tip = {g->linktipped, g->linktippedlen};
         print(&b, "drive: the link's tooltip was ");
         print(&b, tip);
-        ok = tip == op->text;
+        ok = op->dx!=0 ? startswith(tip, op->text) : tip==op->text;
     } break;
     case CHK_TOOLPATHFOLD: {
         View *v = g->view;
@@ -21228,6 +21345,26 @@ static b32 drivefilecheck(Gui *g, i32 chk)
         print(&b, "drive: the front file is ");
         print(&b, path);
         ok = ft && driveendsep(path, op->text);
+    } break;
+    case CHK_FILEHOST: {
+        u64 want = g->sess ? g->sess->host->uid : 0;
+        u64 got  = op->dx==2 ? g->fask.host : ft ? ft->host : 0;
+        b32 far  = op->dx==2 ? g->fask.stated :
+                   op->dx==1 ? ft && ft->body && ft->body->fetched : 1;
+        print(&b, "drive: the ");
+        print(&b, op->dx==2 ? Str("asked path's") : Str("front file's"));
+        print(&b, " host is ");
+        print(&b, (i64)got);
+        print(&b, ", the session's ");
+        print(&b, (i64)want);
+        print(&b, far ? Str(", read there") : Str(", not read there"));
+        ok = (op->dx==2 || ft) && got && got==want && far;
+    } break;
+    case CHK_FILETEXT: {
+        Str text = ft && ft->body ? ft->body->body : Str{};
+        print(&b, "drive: the front file's text begins ");
+        print(&b, takehead(text, text.len<64 ? text.len : 64));
+        ok = text.len>=op->text.len && takehead(text, op->text.len)==op->text;
     } break;
     case CHK_CLIPEND: {
         char const *c   = ImGui::GetClipboardText();
@@ -23364,6 +23501,8 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_CLIPEND:
     case CHK_FILETOP:
     case CHK_TOOLPATHFOLD:
+    case CHK_FILETEXT:
+    case CHK_FILEHOST:
         return drivefilecheck(g, chk);
     case CHK_TERMQUIET:
         return g->panes[PANE_TERMINAL] && drivequiet(g, "idle with the terminal shown", 2);

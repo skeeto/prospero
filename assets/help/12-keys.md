@@ -13,7 +13,7 @@ except Ctrl+G in the prompt box, which is Ctrl there too.
   lists the sessions viewed before, so Ctrl+K then Enter goes back to
   the previous one. Up, Down, Page Up and Page Down move the pick, and
   Esc or Ctrl+K again closes it.
-- **Ctrl+O**: Open file: a path on this computer, shown in the Files
+- **Ctrl+O**: Open file: a path on the session's host, shown in the Files
   pane. Tab completes it, and `:N` or `:A-B` after it goes to that line
   or those lines, marked.
 - **Ctrl+Shift+N**: New session, no folder, with the default model:

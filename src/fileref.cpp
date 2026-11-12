@@ -23,7 +23,11 @@ enum : i32 {
 };
 
 enum : iz {
-    FILES_PART = (iz)256 << 10,  // raw bytes of one fs.read part
+    // Raw bytes of one fs.read part, its reply about 350 kB in base64:
+    // under the i686 host's reserve for a client's replies, keepmax/32 =
+    // 512 KiB (host.cpp), which a larger reply could overrun on a busy
+    // link, dropping the client (remote.py fs_busy)
+    FILES_PART = (iz)256 << 10,
 };
 
 struct FileRef {

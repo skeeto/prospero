@@ -7573,18 +7573,20 @@ static b32 remotelisted(Gui *g, GuiHost *h, Str name)
 // Why a session operation cannot be done now, or empty if it can: the
 // host's engine names it in its caps (cap), the host takes commands,
 // the session is its own here, and, where idle matters, nothing runs.
-// Why a session's host can't do what cap names now, else empty.
+// Why a session's host can't do what cap names now, else empty. A
+// remote not connected says so first: it has no caps to judge until
+// its engine says hello.
 static Str hostwhy(Gui *g, GuiSession *s, Str cap)
 {
     if (s->host->ctr && !s->host->r && (cap=="trash" || cap=="delete") &&
             sesstrashed(g, s)) {
         return {};  // a stopped container's Trash is the window's (ctrtrash)
+    } else if (!hostlive(g, s) || (s->host->kind==GH_REMOTE && !s->host->up)) {
+        return "Its host is not connected";
     } else if (cap.len && !hostcap(s->host, cap)) {
-        return s->host->kind==GH_REMOTE && s->host->up
+        return s->host->kind==GH_REMOTE
              ? Str("The engine there is too old for this: update it (Update engine)")
              : Str("This host's engine is too old for this");
-    } else if (!hostlive(g, s)) {
-        return "Its host is not connected";
     }
     return {};
 }
@@ -9615,6 +9617,11 @@ static void drawsessions(Gui *g)
 }
 
 static void drawpathask(Gui *, PathAsk *, char const *, char const *, b32);
+static GuiHost *filehost(Gui *, u64);
+static GuiHost *fileaskhost(Gui *);
+static void fetchtick(Gui *, FileTab *);
+static Str  filehostname(Gui *, Arena *, u64);
+static void fileaskcheck(Gui *);
 static Str  fileaskok(Gui *, Str);
 
 // The naming dialog (a session's title, a new group for it, a group's
@@ -10881,6 +10888,14 @@ static void drawpathask(Gui *g, PathAsk *pa, char const *pid, char const *name, 
         b32 enter = modalenter();
         b32 save  = pa->kind == ASK_SAVE;
         pa->shown = 1;
+        // Open file on another host: its paths, completed and checked there
+        GuiHost *far = openfile ? filehost(g, g->fask.host) : 0;
+        if (openfile && g->fask.close) {
+            g->fask.close = 0;
+            ImGui::CloseCurrentPopup();
+        } else if (openfile) {
+            fileaskcheck(g);
+        }
         ImGui::TextUnformatted(openfile ? "Which file?" :
                                save ? "No file dialog can be shown here. Where should it be saved?"
                                     : "No file dialog can be shown here. Which file?");
@@ -10888,12 +10903,17 @@ static void drawpathask(Gui *g, PathAsk *pa, char const *pid, char const *name, 
             ImGui::SetKeyboardFocusHere();
         }
         ImGui::SetNextItemWidth(560*sc);
-        PathField pf = pathbefore(g, g->main, pa->buf, &enter, 0, 1);
-        ImGui::InputTextWithHint("##cwd", "A path on this computer", pa->buf, FIELD_MAX,
+        PathField pf = pathbefore(g, far ? far : g->main, pa->buf, &enter, 0, 1);
+        Str hint = far ? concat(&a, "A path on ", filehostname(g, &a, far->uid))
+                       : Str("A path on this computer");
+        ImGui::InputTextWithHint("##cwd", cstr0(&a, hint), pa->buf, FIELD_MAX,
                                  pf.flags, pathcb, &pf.cb);
         itemnamed(g, concat(&a, nm, " field"));
         pathafter(g, &pf, pa->buf);
-        if (pa->err.len) {
+        b32 checking = openfile && g->fask.statid;
+        if (checking) {
+            ImGui::TextDisabled("Checking...");
+        } else if (pa->err.len) {
             ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
             ImGui::TextWrapped("%s", cstr0(&a, pa->err));
             ImGui::PopStyleColor();
@@ -10904,11 +10924,14 @@ static void drawpathask(Gui *g, PathAsk *pa, char const *pid, char const *name, 
         ImGui::SameLine();
         b32 cancel = ImGui::Button("Cancel", v2(120*sc, 0)) || ImGui::Shortcut(ImGuiKey_Escape);
         if (ok && openfile) {
-            pa->err = fileaskok(g, trim({(u8 *)pa->buf, (iz)__builtin_strlen(pa->buf)}));
-            if (!pa->err.len) {
-                ImGui::CloseCurrentPopup();
+            if (!checking) {  // else the answer comes first
+                pa->err = fileaskok(g, trim({(u8 *)pa->buf, (iz)__builtin_strlen(pa->buf)}));
+                if (!pa->err.len && !g->fask.statid) {
+                    ImGui::CloseCurrentPopup();
+                }
             }
         } else if (cancel && openfile) {
+            g->fask.statid = 0;  // its answer, if it comes, opens nothing
             ImGui::CloseCurrentPopup();
         } else if (ok) {
             Str      t  = trim({(u8 *)pa->buf, (iz)__builtin_strlen(pa->buf)});
@@ -15620,9 +15643,11 @@ static void drawmenubar(Gui *g)
             importstart(g, 0);
         }
         itemtip("A session from its raw log, exported here or elsewhere");
-        if (menutip(g, &a, "Open file...", fileaskwhy(g),
-                    "Show a file on this computer in the Files pane, with :N after "
-                    "its path for a line", cmdkey(g, &a, "O"))) {
+        GuiHost *fah = fileaskhost(g);
+        Str      fat = concat(&a, concat(&a, "Show a file on ",
+                                         filehostname(g, &a, fah ? fah->uid : 0)),
+                          " in the Files pane, with :N after its path for a line");
+        if (menutip(g, &a, "Open file...", fileaskwhy(g), fat, cmdkey(g, &a, "O"))) {
             fileaskopen(g);
         }
         itemnamed(g, "menu open file");
@@ -16240,6 +16265,9 @@ static void dockwindows(Gui *g)
             drawfiles(g);
         }
         ImGui::End();
+    }
+    if (!g->filesdrawn) {
+        fetchtick(g, 0);  // a far read only for the front tab shown
     }
     g->inpane = 0;
 }

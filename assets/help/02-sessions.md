@@ -265,8 +265,9 @@ host's git run there.
 The Files pane shows files, each in a tab of the session shown (a
 subagent's are its session's), up to eight, the one opened least
 recently closing for a ninth. It stays hidden until a file opens:
-Session → Open file... (Ctrl+O) asks for a path on this computer,
-starting from the session's folder, which Tab completes. After the
+Session → Open file... (Ctrl+O) asks for a path on the session's
+host, this computer or [another](help:hosts), starting from the
+session's folder, which Tab completes. After the
 path, `:N` goes to line N and `:A-B` to lines A to B, marked with a
 band until text is selected; opening it again goes there again.
 

@@ -59,7 +59,8 @@ struct FileTab {
     f32       scrollx;    // unwrapped
     b32       stale;      // it may have changed since it was read
     b32       astext;     // binary, but shown as text anyway
-    Str       err;        // why it failed
+    Str       err;        // why it failed, a literal
+    i64       opens;      // and its host's opens then: tried again once it changes
     u8        section[FILES_SECTION];  // a heading to scroll to
     i32       sectionlen;
     FileBody *body;       // null until read, and once freed

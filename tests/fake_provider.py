@@ -3023,7 +3023,7 @@ GUI_PROMPTS = ("Stream slowly", "Run the tools", "be allowed", "wait for nobody"
                "Describe the images", "Ask on the side", "Run a long command",
                "Stream, then pause", "Call the MCP server", "Remember the hosts",
                "Answer with links", "Ask me questions", "Describe the files",
-               "Cite the files", "Read the cited lines",
+               "Cite the files", "Read the cited lines", "Link the far file",
                "Run a command to stop", "Read a long prompt",
                "Start a subagent in a container", "Sleep in a container as a subagent")
 
@@ -3159,6 +3159,11 @@ def sc_gui(model, n, req):
                               "- [past the end](cite/hello.c:500)\n"
                               "- [not there](cite/nothere.c:3)\n"
                               "- [mail](mailto:someone@example.com)\n")
+    elif "Link the far file" in prompt:
+        # Links to a file in the session's folder on its host, which only
+        # its engine there reads, and to one not there
+        yield from answer(model, "Linked: [hello.txt:1](hello.txt:1), "
+                          "and [not there](nope.txt).\n")
     elif "Read the cited lines" in prompt:
         # Tool rows whose paths open their files (after "Cite the
         # files"): an edit, at the line its result names, then a read of
