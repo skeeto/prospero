@@ -1,6 +1,9 @@
 // The Files pane: files shown in tabs, a root session's (fileset.cpp),
 // each read into a body of its own and drawn as text, highlighted, its
-// lines numbered (drawdoc's DocLines), or as Markdown.
+// lines numbered (drawdoc's DocLines), or as Markdown; an image file
+// (PNG, JPEG, GIF, WebP, BMP) is read whole, up to IMG_FILEMAX, decoded
+// and shown as a texture (drawimage), its bytes counted with the
+// bodies'.
 //
 // A body holds a file as read, in a Region of its own: the text,
 // normalized (filenorm), its tokens, highlighted once over the whole of
@@ -25,6 +28,7 @@
 
 enum : i32 {
     FBODY_TEXT,
+    FBODY_IMAGE,  // a texture, no text or views
 };
 
 enum : iz {
@@ -50,7 +54,57 @@ struct FileBody {
     b32          fetched;  // read on its host (fs.read), for the checklist
     Str          lang;
     i64          drawn;    // total.frames when last drawn
+    GuiTex      *tex;      // an image's, maybe shrunk to fit a texture
+    i32          w;        // and the image's own size in pixels
+    i32          h;
 };
+
+// Whether a file's name says an image, shown as one.
+static b32 fileimgname(Str path)
+{
+    Str exts[] = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"};
+    for (i32 i = 0; i < countof(exts); i++) {
+        if (path.len>exts[i].len && equalfold(cuthead(path, path.len-exts[i].len), exts[i])) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Why an image file is not read: past IMG_FILEMAX, as it says.
+static Str filebigwhy()
+{
+    return IMG_FILEMAX==(iz)32<<20 ? Str("Over 32 MiB, it is too big to show") :
+           IMG_FILEMAX==(iz)8<<20  ? Str("Over 8 MiB, it is too big to show")  :
+                                     Str("It is too big to show");
+}
+
+// A tab's limits as read: an image's whole file, else the text's start;
+// and the scratch it is read into and made a body in.
+static iz filecap(FileTab *ft)
+{
+    return fileimgname(ft->path) ? (iz)IMG_FILEMAX : (iz)FILES_MAX;
+}
+
+static iz filescratch(FileTab *ft)
+{
+    return fileimgname(ft->path) ? (iz)IMG_REGION : (iz)FILES_SCRATCH;
+}
+
+// A body's bytes, as FILES_BUDGET counts them: its Region's, and an
+// image's texture's.
+static iz filebodybytes(FileBody *b)
+{
+    return b->r->committed + (b->tex ? b->tex->r->committed : 0);
+}
+
+// A body's memory let go: its texture, once the renderer lets it go,
+// and its Region.
+static void filebodyfree(Gui *g, FileBody *b)
+{
+    killtex(g, b->tex);
+    os_release(g->os, b->r);
+}
 
 // Whether a file's name says Markdown.
 static b32 filemdname(Str path)
@@ -137,7 +191,7 @@ static void filefree(Gui *g, FileTab *ft)
     if (!b) {
         return;
     }
-    View *views[] = {b->text->v, b->md ? b->md->v : 0};
+    View *views[] = {b->text ? b->text->v : 0, b->md ? b->md->v : 0};
     for (i32 i = 0; i < countof(views); i++) {
         if (views[i] && g->copiedview==views[i]) {
             g->copiedview = 0;
@@ -150,7 +204,7 @@ static void filefree(Gui *g, FileTab *ft)
         g->fshowing     = 0;  // a body read again, maybe here, is new
         g->fshowingbody = 0;
     }
-    os_release(g->os, b->r);
+    filebodyfree(g, b);
     ft->body  = 0;
     ft->state = ft->state==FTAB_READ ? FTAB_UNREAD : ft->state;
 }
@@ -195,9 +249,15 @@ static DocView *filedocview(Arena *mem, ViewCache *c, iz nmsgs)
 // A tab's file, raw, its first FILES_MAX bytes of size, made into a body
 // of its own, highlighted, in chunks, else null, saying why: the scratch
 // sr is released, and the tab left as it is.
+static FileBody *fileimgmake(Gui *, FileTab *, Region *, Arena, Str, i64, i64, b32, Str *);
+
 static FileBody *filemake(Gui *g, FileTab *ft, Region *sr, Arena s, Str raw, i64 size,
                           i64 mtime, b32 changed, Str *why)
 {
+    if (fileimgname(ft->path)) {
+        return fileimgmake(g, ft, sr, s, raw, size, mtime, changed, why);
+    }
+
     // Past FILES_MAX: up to its last whole line, and so cut
     b32 cut = size > raw.len;
     if (cut) {
@@ -281,6 +341,56 @@ static FileBody *filemake(Gui *g, FileTab *ft, Region *sr, Arena s, Str raw, i64
     return b;
 }
 
+// A tab's image file, raw and whole, decoded into a texture, its body
+// else null, saying why: the scratch sr is released, and the tab left as
+// it is but for errbuf, where a decoder's why is said.
+static FileBody *fileimgmake(Gui *g, FileTab *ft, Region *sr, Arena s, Str raw, i64 size,
+                             i64 mtime, b32 changed, Str *why)
+{
+    if (size > raw.len) {
+        // Past the cap, it grew past it after its stat; else it shrank
+        // while it was read
+        os_release(g->os, sr);
+        *why = size>IMG_FILEMAX ? filebigwhy() : Str("It changed while it was read");
+        return 0;
+    }
+    u64   sum = hash(raw);  // before the decode's scratch, past raw, is used
+    Image p   = imgdecode(&s, raw, IMG_MAXPIXELS);
+    if (p.err.data) {
+        Str head = "Not an image it can show: ";
+        iz  room = countof(ft->errbuf) - head.len;
+        iz  n    = p.err.len<room ? p.err.len : room;
+        copybytes(ft->errbuf, head.data, head.len);
+        copybytes(ft->errbuf+head.len, p.err.data, n);
+        *why = {ft->errbuf, head.len+n};
+        os_release(g->os, sr);
+        return 0;
+    }
+    Region *r   = os_reserve(g->os, (iz)64<<10);
+    Arena   mem = newarena(r);
+    GuiTex *tex = r && fits(&mem, sizeof(FileBody)) ? bigtex(g, s, &p) : 0;
+    os_release(g->os, sr);
+    if (!tex) {
+        if (r) {
+            os_release(g->os, r);
+        }
+        *why = "There is no memory to show it";
+        return 0;
+    }
+    FileBody *b = alloc<FileBody>(&mem);
+    b->r       = r;
+    b->kind    = FBODY_IMAGE;
+    b->tex     = tex;
+    b->w       = p.width;
+    b->h       = p.height;
+    b->size    = size;
+    b->mtime   = mtime;
+    b->sum     = sum;
+    b->changed = changed;
+    b->drawn   = g->total.frames;
+    return b;
+}
+
 // A tab's new body shown, else (null) why not, its old one let go. A
 // body of the same text as the old, read again, keeps the old, its place
 // laid out, with the new one's stat. Otherwise a body read again shows
@@ -293,13 +403,14 @@ static b32 fileswap(Gui *g, FileTab *ft, FileBody *nb, Str why)
         filefree(g, ft);
         filefail(g, ft, why);
         return 1;
-    } else if (old && old->sum==nb->sum && old->body==nb->body && old->flags==nb->flags) {
+    } else if (old && old->kind==nb->kind && old->sum==nb->sum && old->body==nb->body &&
+               old->flags==nb->flags && old->w==nb->w && old->h==nb->h) {
         b32 note = old->changed != nb->changed;
         old->size    = nb->size;
         old->mtime   = nb->mtime;
         old->changed = nb->changed;
         old->fetched = nb->fetched;
-        os_release(g->os, nb->r);
+        filebodyfree(g, nb);
         return note;
     }
     filefree(g, ft);
@@ -327,7 +438,7 @@ static iz filebytes(Gui *g, i32 *n)
             for (i32 i = 0; i < s->files.n; i++) {
                 FileBody *b = s->files.tabs[i]->body;
                 if (b) {
-                    total += b->r->committed;
+                    total += filebodybytes(b);
                     (*n)++;
                 }
             }
@@ -361,7 +472,7 @@ static void filesfit(Gui *g, FileTab *keep, iz extra)
         if (!old) {
             break;
         }
-        total -= old->body->r->committed;
+        total -= filebodybytes(old->body);
         filefree(g, old);
     }
 }
@@ -370,7 +481,7 @@ static void filesfit(Gui *g, FileTab *keep, iz extra)
 // saying why, the tab left as it is.
 static FileBody *filebody(Gui *g, FileTab *ft, Str *why)
 {
-    Region *sr = os_reserve(g->os, FILES_SCRATCH);
+    Region *sr = os_reserve(g->os, filescratch(ft));
     if (!sr) {
         *why = "There is no memory to show it";
         return 0;
@@ -379,8 +490,10 @@ static FileBody *filebody(Gui *g, FileTab *ft, Str *why)
     Stat  st = filestat(g, s, ft->path);
     Read  rd = {};
     *why = filestatwhy(st.type);
-    if (!why->len) {
-        rd   = fileread(g, &s, ft->path, FILES_MAX);
+    if (!why->len && fileimgname(ft->path) && st.size>IMG_FILEMAX) {
+        *why = filebigwhy();
+    } else if (!why->len) {
+        rd   = fileread(g, &s, ft->path, filecap(ft));
         *why = rd.err==READ_OK       ? Str{} :
                rd.err==READ_NOTFOUND ? Str("No such file") :
                rd.err==READ_NOTFILE  ? Str("Not a regular file") :
@@ -400,7 +513,7 @@ static void fileload(Gui *g, FileTab *ft)
 {
     g->fileloads++;
     if (ft->body) {
-        filesfit(g, ft, ft->body->r->committed);
+        filesfit(g, ft, filebodybytes(ft->body));
     } else {
         ft->err = {};
     }
@@ -446,7 +559,7 @@ static void fsrequest(Gui *g)
     if (!h) {
         return;
     }
-    i64   want = FILES_MAX - f->off;
+    i64   want = f->max - f->off;
     Arena a    = newarena(g->cmdr);
     Buf   b(&a, 256 + 6*f->ft->path.len);
     EvOut w = cmdopen(g, &b, CMD_FSREAD, 0, h);
@@ -525,14 +638,18 @@ static void filefetch(Gui *g, FileTab *ft, b32 reload)
     }
     fetchdrop(g);
     FileFetch *f = &g->ffetch;
-    f->r = os_reserve(g->os, FILES_SCRATCH);
+    f->r = os_reserve(g->os, filescratch(ft));
     if (!f->r) {
         filefree(g, ft);
         filefail(g, ft, "There is no memory to show it");
         return;
     }
-    f->mem    = newarena(f->r);
-    f->buf    = allocbytes(&f->mem, FILES_MAX);
+    // The buffer is the region's, not f->mem's: f->mem is let go (fetchend)
+    // before the body is made from what came, which must stay readable
+    Arena m = newarena(f->r);
+    f->max    = filecap(ft);
+    f->buf    = allocbytes(&m, f->max);
+    f->mem    = m;
     f->ft     = ft;
     f->serial = ft->serial;
     f->host   = ft->host;
@@ -654,7 +771,8 @@ static Str fswhy(Str err)
 }
 
 // A part of the fetch's file came: the next asked for, or once all is
-// here (or FILES_MAX), made into a body. A size or mtime changed reads
+// here (or its cap, FILES_MAX for text), made into a body; an image too
+// big to read whole fails at once. A size or mtime changed reads
 // it again from the start once; changed again, what came is kept.
 static void onfsread(Gui *g, Arena scratch, Json *j, b32 ok, Str err, i64 ts)
 {
@@ -686,7 +804,10 @@ static void onfsread(Gui *g, Arena scratch, Json *j, b32 ok, Str err, i64 ts)
         fetchfail(g, "It could not be read");
         return;
     }
-    if (f->size < 0) {
+    if (f->size<0 && fileimgname(ft->path) && size>IMG_FILEMAX) {
+        fetchfail(g, filebigwhy());
+        return;
+    } else if (f->size < 0) {
         f->size  = size;
         f->mtime = mtime;
         f->ts    = ts;  // when it was read, on its host's clock
@@ -702,11 +823,11 @@ static void onfsread(Gui *g, Arena scratch, Json *j, b32 ok, Str err, i64 ts)
         f->changed = 1;
         more       = 0;  // what came is kept
     } else {
-        iz n = u.data.len<FILES_MAX-f->off ? u.data.len : (iz)(FILES_MAX-f->off);
+        iz n = u.data.len<f->max-f->off ? u.data.len : (iz)(f->max-f->off);
         copybytes(f->buf+f->off, u.data.data, n);
         f->off += n;
     }
-    if (more && u.data.len && f->off<FILES_MAX) {
+    if (more && u.data.len && f->off<f->max) {
         fsrequest(g);
         return;
     }
@@ -724,7 +845,7 @@ static void onfsread(Gui *g, Arena scratch, Json *j, b32 ok, Str err, i64 ts)
     fetchend(g);
     g->fileloads++;
     if (ft->body) {
-        filesfit(g, ft, ft->body->r->committed);
+        filesfit(g, ft, filebodybytes(ft->body));
     }
     Str       why = {};
     FileBody *nb  = filemake(g, ft, r, s, raw, total>raw.len ? total : raw.len, when, twice,
@@ -854,10 +975,10 @@ static void filesframe(Gui *g)
         for (GuiSession *s = roots[k]; s; s = k ? s->next : 0) {
             for (i32 i = 0; i < s->files.n; i++) {
                 FileBody *b = s->files.tabs[i]->body;
-                if (b) {
+                if (b && b->c) {
                     cachereset(b->c, 0);
-                    total += b->r->committed;
                 }
+                total += b ? filebodybytes(b) : 0;
             }
         }
     }
@@ -874,7 +995,7 @@ static void filesfont(Gui *g)
         for (GuiSession *s = roots[k]; s; s = k ? s->next : 0) {
             for (i32 i = 0; i < s->files.n; i++) {
                 FileBody *b = s->files.tabs[i]->body;
-                if (b) {
+                if (b && b->c) {
                     cachereset(b->c, 1);
                     b->text->v->topsdirty = 1;
                     if (b->md) {
@@ -955,14 +1076,15 @@ static FileTab *filesopen(Gui *g, GuiSession *s, u64 host, Str path, i32 line0, 
         ft->host   = host;
         ft->win    = win;
         ft->wrap   = g->filewrap;
+        ft->fit    = 1;
         ft->mode   = filemdname(path) ? FMODE_MARKDOWN : FMODE_TEXT;
         FileTab *gone = filesetadd(set, ft);
         if (gone) {
             filedrop(g, gone);
         }
     }
-    if (line0) {
-        ft->mode   = FMODE_TEXT;  // a line is the text's
+    if (line0 && !fileimgname(path)) {
+        ft->mode   = FMODE_TEXT;  // a line is the text's; an image has none
         ft->band0  = line0;
         ft->band1  = line1>=line0 ? line1 : line0;
         ft->jump   = line0;
@@ -1066,7 +1188,8 @@ static Str filelinktip(Gui *g, Arena *a, Str link, Dest *d, LinkFrom *from)
     }
     print(&b, f.show);
     FileRef *r = &d->file;
-    if (!d->here && r->line0) {
+    if (!d->here && r->line0 && !fileimgname(f.path)) {
+        // An image opens with no line (filesopen), so none is named
         putbyte(&b, ':');
         print(&b, (i64)r->line0);
         if (r->line1 > r->line0) {
@@ -1977,7 +2100,8 @@ static void filesempty(Gui *g)
     ImGui::PushTextWrapPos(0);
     ImGui::TextDisabled("A file opened here, or by a click on a link to it in the "
                         "transcript, the plan or a Markdown file, shows as text, its "
-                        "lines numbered, or as Markdown, in a tab of the session shown.");
+                        "lines numbered, as Markdown, or as an image, in a tab of the "
+                        "session shown.");
     ImGui::PopTextWrapPos();
 }
 
@@ -2059,6 +2183,7 @@ static void drawfiles(Gui *g)
     g->rects[RECT_FILESPANE] = {wp.x, wp.y, wp.x + ws.x, wp.y + ws.y};
     g->fshown.v   = 0;
     g->fnoteslen  = 0;
+    g->fimgshown  = 0;
     if (!set->n) {
         g->fshowing = 0;
         filesempty(g);
@@ -2126,7 +2251,7 @@ static void drawfiles(Gui *g)
     Str       farwhy = ft->host ? filehostwhy(fh) : Str{};
 
     // The toolbar: Markdown or text, Wrap, Reload, Reveal, Open in
-    // editor, then the path
+    // editor, then the path; an image's Fit is drawimage's, below it
     b32 mdok = b && b->md;
     if (mdok) {
         b32 on  = ft->mode == FMODE_MARKDOWN;
@@ -2143,7 +2268,7 @@ static void drawfiles(Gui *g)
         whytip(why.len ? why : Str("Show it rendered as Markdown, else as text"));
         ImGui::SameLine();
     }
-    if (b && ft->mode==FMODE_TEXT) {
+    if (b && b->kind==FBODY_TEXT && ft->mode==FMODE_TEXT) {
         if (checkbox("Wrap", &ft->wrap)) {
             g->filewrap = ft->wrap;  // new tabs take it
         }
@@ -2233,6 +2358,21 @@ static void drawfiles(Gui *g)
     b->drawn = g->total.frames;
     if (b->changed) {
         filenote(g, "It changed while it was read.", 0);
+    }
+    if (b->kind == FBODY_IMAGE) {
+        // Its size, from g->frame itself: drawimage takes a copy of it
+        Buf nb(&g->frame, 64);
+        print(&nb, (i64)b->w);
+        putbyte(&nb, 'x');
+        print(&nb, (i64)b->h);
+        print(&nb, " pixels");
+        ImgDrawn d = drawimage(g, b->tex, b->w, b->h, &ft->fit, finish(&nb),
+                               "Scale it to fit the pane");
+        g->fimgshown = d.shown;
+        g->fimgsize  = d.size;
+        g->fimgroom  = d.room;
+        g->fshowing  = 0;
+        return;
     }
     if (b->flags&FTEXT_BINARY && !ft->astext) {
         Buf nb(&a, 64);

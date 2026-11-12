@@ -11953,13 +11953,64 @@ static b32 textfit(Arena a, Str s, f32 width, u32 color, Str tip = {})
     return cut;
 }
 
-// The Screenshot window: a screenshot whole, at its own size in the
-// screen's pixels, or fit to the window, larger or smaller. Fit comes
-// first, ahead of a description that shortens to the width, so a narrow
-// window keeps it. The window's own X closes it, as Esc does.
-static void drawshot(Gui *g)
+// Where drawimage drew its image, if it did.
+struct ImgDrawn {
+    b32    shown;
+    ImVec2 size;  // at this size
+    ImVec2 room;  // in a child this big
+};
+
+// An image whole, w by h pixels, its texture tex (null while it has
+// none), at its own size in the screen's pixels, or fit to the room
+// left, larger or smaller. Fit comes first, its tooltip fittip, ahead of
+// a description that
+// shortens to the width, so a narrow window keeps it; then a note, in
+// red if bad, as "Loading..." or why it cannot be shown. The Screenshot
+// window's, and a Files tab's for an image file.
+static ImgDrawn drawimage(Gui *g, GuiTex *tex, i32 w, i32 h, b32 *fit, Str desc,
+                          Str fittip, Str note = {}, b32 bad = 0)
 {
     Arena    a = g->frame;
+    ImgDrawn r = {};
+    checkbox("Fit", fit);
+    itemnamed(g, "Fit");
+    itemtip("%s", cstr0(&a, fittip));
+    ImGui::SameLine();
+    textfit(a, desc, ImGui::GetContentRegionAvail().x,
+            ImGui::GetColorU32(ImGuiCol_TextDisabled));
+    if (note.len && bad) {
+        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
+        ImGui::TextWrapped("%s", cstr0(&a, note));
+        ImGui::PopStyleColor();
+    } else if (note.len) {
+        ImGui::TextDisabled("%s", cstr0(&a, note));
+    }
+    ImGui::BeginChild("##shot", v2(0, 0), ImGuiChildFlags_Borders,
+                      ImGuiWindowFlags_HorizontalScrollbar);
+    if (tex && w>0 && h>0) {
+        f32    fb   = ImGui::GetIO().DisplayFramebufferScale.x;
+        ImVec2 size = v2((f32)w/(fb>0 ? fb : 1), (f32)h/(fb>0 ? fb : 1));
+        ImVec2 room = ImGui::GetContentRegionAvail();
+        if (*fit) {
+            f32 s = room.x/size.x < room.y/size.y ? room.x/size.x : room.y/size.y;
+            s    = s>0 ? s : 1;
+            size = v2(size.x*s, size.y*s);
+        }
+        ImGui::Image(tex->td.GetTexRef(), size);
+        r.shown = 1;
+        r.size  = size;
+        r.room  = room;
+    }
+    ImGui::EndChild();
+    return r;
+}
+
+// The Screenshot window: a screenshot whole (drawimage). The window's
+// own X closes it, as Esc does.
+static void drawshot(Gui *g)
+{
+    // From g->frame itself: drawimage takes a copy of it for scratch
+    Arena   *a = &g->frame;
     ImgView *v = &g->img.view;
     if (!v->s) {
         return;
@@ -11981,49 +12032,29 @@ static void drawshot(Gui *g)
 
     i32 w = v->tex ? v->tex->td.Width  : v->w;
     i32 h = v->tex ? v->tex->td.Height : v->h;
-    checkbox("Fit", &v->fit);
-    itemnamed(g, "Fit");
-    itemtip("Scale it to fit the window");
-    ImGui::SameLine();
-    Buf b(&a, 512);
+    Buf b(a, 512);
     print(&b, imgstr(&v->path));
     print(&b, " of ");
     print(&b, sesstitle(v->s));
     if (v->s->host->kind != GH_ENGINE) {
         print(&b, ", on ");
-        print(&b, hostlabel(g, &a, v->s->host));
+        print(&b, hostlabel(g, a, v->s->host));
     }
     print(&b, ": ");
     print(&b, (i64)w);
     putbyte(&b, 'x');
     print(&b, (i64)h);
     print(&b, " pixels");
-    textfit(a, finish(&b), ImGui::GetContentRegionAvail().x,
-            ImGui::GetColorU32(ImGuiCol_TextDisabled));
-    if (v->state == IMG_FAILED) {
-        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
-        ImGui::TextWrapped("Cannot show the screenshot: %s", cstr0(&a, imgstr(&v->err)));
-        ImGui::PopStyleColor();
-    } else if (v->state != IMG_READY) {
-        ImGui::TextDisabled("Loading...");
-    }
-    ImGui::BeginChild("##shot", v2(0, 0), ImGuiChildFlags_Borders,
-                      ImGuiWindowFlags_HorizontalScrollbar);
-    if (v->state == IMG_READY) {
-        f32    fb   = ImGui::GetIO().DisplayFramebufferScale.x;
-        ImVec2 size = v2((f32)w/(fb>0 ? fb : 1), (f32)h/(fb>0 ? fb : 1));
-        ImVec2 room = ImGui::GetContentRegionAvail();
-        if (v->fit) {
-            f32 s = room.x/size.x < room.y/size.y ? room.x/size.x : room.y/size.y;
-            s    = s>0 ? s : 1;
-            size = v2(size.x*s, size.y*s);
-        }
-        ImGui::Image(v->tex->td.GetTexRef(), size);
+    Str desc = finish(&b);
+    Str note = v->state==IMG_FAILED ? concat(a, "Cannot show the screenshot: ", imgstr(&v->err)) :
+               v->state!=IMG_READY  ? Str("Loading...") : Str{};
+    ImgDrawn d = drawimage(g, v->state==IMG_READY ? v->tex : 0, w, h, &v->fit, desc,
+                           "Scale it to fit the window", note, v->state==IMG_FAILED);
+    if (d.shown) {
         g->shotshown = 1;
-        g->shotsize  = size;
-        g->shotroom  = room;
+        g->shotsize  = d.size;
+        g->shotroom  = d.room;
     }
-    ImGui::EndChild();
     if (close) {
         imgclose(g);
     }

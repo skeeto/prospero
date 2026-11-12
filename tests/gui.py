@@ -97,6 +97,7 @@ Windows console session): it prints the directories and waits.
 """
 
 import argparse
+import base64
 import difflib
 import json
 import os
@@ -105,11 +106,13 @@ import re
 import select
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import zlib
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -329,14 +332,35 @@ def bigfiles(host, prefix, n, lines):
                    "".join(f"file {i} line {j}: {fill}\n" for j in range(lines)))
 
 
+def pngfixture(w, h):
+    """A PNG, w by h, of a gradient: small enough for a Windows command
+    line (Remote.write), and shown as an image in Files."""
+    raw = b"".join(b"\x00" + bytes(v for x in range(w) for v in
+                                   (x*255//(w - 1), y*255//(h - 1), 128))
+                   for y in range(h))
+
+    def chunk(kind, data):
+        return (struct.pack(">I", len(data)) + kind + data +
+                struct.pack(">I", zlib.crc32(kind + data)))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) +
+            chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+
+
+# A PNG that ends in its header, which Files says it cannot show
+BADPNG = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00"
+
+
 def filesfixtures(host):
     """The Files pane's files, in work/files: numbered lines, with a blank
     one each 50 (lines 6, 56, ..., 256 among them, at a chunk's end); a
     400-column line among short ones; two files of one name; Markdown; a
-    BOM and CRLF; a binary file; and more lines than are kept."""
+    BOM and CRLF; a binary file; and more lines than are kept; an image
+    (CHK_FILEIMAGE's 40 by 30) and a PNG cut short."""
     d = lambda *p: host.path("work", "files", *p)
     for sub in ("a", "b"):
         host.mkdir(d(sub))
+    host.write(d("pixels.png"), pngfixture(40, 30))
+    host.write(d("corrupt.png"), BADPNG)
     host.write(d("a", "x.c"), "int a(void) { return 1; }\n")
     host.write(d("b", "x.c"), "int b(void) { return 2; }\n")
     host.write(d("notes.md"), "# Notes\n\nSee [the lines](lines.txt).\n\n" +
@@ -560,7 +584,7 @@ class Local:
         # The bytes given, as Remote writes them, without Windows' text
         # mode, which would make each newline CRLF
         with open(path, "wb") as f:
-            f.write(text.encode())
+            f.write(text.encode() if isinstance(text, str) else text)
 
     def read(self, path):
         try:
@@ -1536,6 +1560,7 @@ class Far:
             host.mkdir(self.state)
             host.write(self.config, cfg)
             host.write(self.work + "/hello.txt", "hello world\n")
+            host.write(self.work + "/pixels.png", pngfixture(40, 30))
             host.mkdir(self.work + "/nested")  # for the directory's completion
             if self.windows:
                 self.ssh = host.path("fakessh.exe")
@@ -1567,8 +1592,10 @@ class Far:
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                     start_new_session=True)
         else:
+            png = base64.b64encode(pngfixture(40, 30)).decode()
             self.sh(f"mkdir -p {self.work}/nested {self.state} && "
-                    f"echo 'hello world' > {self.work}/hello.txt")
+                    f"echo 'hello world' > {self.work}/hello.txt && "
+                    f"echo {png} | base64 -d > {self.work}/pixels.png")
             b = cfg.replace("'", "")
             self.sh(f"cat > {self.config} <<'EOF'\n{b}EOF\n")
 

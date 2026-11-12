@@ -123,7 +123,9 @@ struct FileTab {
     f32       scrollx;    // unwrapped
     FileWatch watch;      // whether it changed since it was read
     b32       astext;    // binary, but shown as text anyway
-    Str       err;        // why it failed, a literal
+    Str       err;        // why it failed, a literal, or in errbuf
+    u8        errbuf[128];
+    b32       fit;        // an image, scaled to fit the pane
     i64       opens;      // and its host's opens then: tried again once it changes
     u8        section[FILES_SECTION];  // a heading to scroll to
     i32       sectionlen;

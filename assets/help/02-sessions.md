@@ -292,6 +292,13 @@ container's folder mounted here, or, on Windows, in a WSL distro;
 for another host's they say why not. A binary file says so, with Show
 as text anyway; past 4 MiB or 100,000 lines only the start shows.
 
+An image file (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp` or `.bmp`)
+shows as the image, up to 32 MiB and 16 million pixels, its size in
+pixels above it. Fit, on in each new tab, scales it to the pane, larger
+or smaller; off, it shows at its own size, scrolled. Reload, Reveal and
+Open in editor work as for text, and a line in a link to it is passed
+over. One that cannot be decoded says why.
+
 A link to a file in the transcript, in the plan or in a Markdown file
 shown here opens it too, as the agent writes them:
 `[engine.cpp:42](src/engine.cpp:42)`, a range as `:40-45` or

@@ -121,7 +121,9 @@ cancels it.
   dropped with it are not attached. While another dialog is up, a
   dropped file is attached.
 - Otherwise a file dropped on the Files pane opens there, in a tab of
-  the session shown, and is not attached.
+  the session shown, and is not attached: an image (PNG, JPEG, GIF,
+  WebP or BMP, by its name's extension) as the image, anything else as
+  text.
 - A file dropped anywhere else on the window is attached to the
   draft, at most ten to a message. An image (PNG, JPEG, GIF, WebP or
   BMP) goes as a picture, to a model that takes images; any other file

@@ -1216,6 +1216,7 @@ struct FileFetch {
     Region  *r;
     Arena    mem;      // r past buf
     u8      *buf;
+    iz       max;      // its room: the bytes read at most
     i64      off;      // bytes in buf
     i64      size;     // the file's, as the first part said, else -1
     i64      mtime;
@@ -1994,6 +1995,9 @@ struct Gui {
     i64                fileloads;    // files read, for the checklist
     b32                fileswin;     // the window had the focus, as last drawn
     b32                filesfocus;   // and the pane
+    b32                fimgshown;    // an image tab drew its image
+    ImVec2             fimgsize;     // at this size
+    ImVec2             fimgroom;     // in a child this big
 
     // Files and log
     Str                statedir;
@@ -3866,6 +3870,26 @@ static void killtex(Gui *g, GuiTex *t)
     }
 }
 
+// A texture of a whole image, shrunk to fit one if it is too big for
+// one, in scratch. Null if there is no memory for it.
+static GuiTex *bigtex(Gui *g, Arena scratch, Image *p)
+{
+    i32  w  = p->width;
+    i32  h  = p->height;
+    u8  *px = p->rgba;
+    if (w>IMG_TEXMAX || h>IMG_TEXMAX) {
+        f32 s  = (f32)IMG_TEXMAX / (f32)(w>h ? w : h);
+        i32 tw = (i32)((f32)w*s);
+        i32 th = (i32)((f32)h*s);
+        tw = tw<1 ? 1 : tw;
+        th = th<1 ? 1 : th;
+        px = shrink(&scratch, px, w, h, tw, th);
+        w  = tw;
+        h  = th;
+    }
+    return newtex(g, px, w, h);
+}
+
 // Between frames: release the textures the renderer has destroyed.
 static void imgreap(Gui *g)
 {
@@ -4001,22 +4025,7 @@ static void imgdone(Gui *g, Image *p, Str err)
             v->state = IMG_FAILED;
             imgset(&v->err, err);
         } else {
-            // Too big for a texture: shrunk to fit one
-            i32   w  = p->width;
-            i32   h  = p->height;
-            u8   *px = p->rgba;
-            if (w>IMG_TEXMAX || h>IMG_TEXMAX) {
-                f32   s = (f32)IMG_TEXMAX / (f32)(w>h ? w : h);
-                i32   tw = (i32)((f32)w*s);
-                i32   th = (i32)((f32)h*s);
-                Arena a  = f->mem;
-                tw = tw<1 ? 1 : tw;
-                th = th<1 ? 1 : th;
-                px = shrink(&a, px, w, h, tw, th);
-                w  = tw;
-                h  = th;
-            }
-            v->tex   = newtex(g, px, w, h);
+            v->tex   = bigtex(g, f->mem, p);
             v->state = v->tex ? IMG_READY : IMG_FAILED;
             imgset(&v->err, v->tex ? Str{} : Str("out of memory"));
         }
@@ -11277,6 +11286,10 @@ static void shed(Gui *g)
         g->trayup = os_trayopen(g->os, "Prospero: sessions running in the background");
     }
     os_guished(g->os);
+    // The renderer is gone, and with it every texture it had (its
+    // Shutdown destroys them): the dying ones' pixels go now, as no
+    // frame runs to reap them until the window is back
+    imgreap(g);
     guilog(g, g->trayup ? Str("the window is gone; the tray icon brings it back")
                         : Str("the window is gone; there is no tray here to bring it back"));
 }
@@ -13954,6 +13967,9 @@ enum : i32 {
                       // names a file and is drawn as a link (dx 1), or
                       // was found to name none and is not (dx 0), or
                       // is not for a link on its way, unfollowed (dx 2)
+    CHK_FILEIMAGE,    // the front file is an image dx by dy pixels, drawn
+                      // with text "fit" fit to its room, else "unfit" at
+                      // its own size
     CHK_COUNT,
 };
 
@@ -14272,6 +14288,7 @@ static Str chknames[] = {
     "Open in editor is disabled, saying why",
     "the file revealed is the one said",
     "inline code is a link once its file is found, and only then",
+    "the image file is shown at its size, fit or not as said",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -16515,6 +16532,27 @@ static DriveOp m3ops[] = {
     {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
     {OP_WAIT, W_FILEFRESH, 0, 0, 5000, ""},
     {OP_CHECK, CHK_FILETEXT, 0, 0, 0, "restored 1\n"},
+    // An image file shows as an image, fit to the pane, or at its own
+    // size; a line to it just opens it; one it cannot decode says why
+    {OP_OPENFILE, 0, 0, 0, 300, "files/pixels.png"},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILENOTE, 0, 0, 0, ""},
+    {OP_CHECK, CHK_FILEIMAGE, 40, 30, 0, "fit"},
+    {OP_SHOT, 0, 0, 0, 300, "files-image"},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "Fit"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_FILEIMAGE, 40, 30, 0, "unfit"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_FILEIMAGE, 40, 30, 0, "fit"},
+    {OP_OPENFILE, 0, 0, 0, 300, "files/pixels.png:5"},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEIMAGE, 40, 30, 0, "fit"},
+    {OP_OPENFILE, 0, 0, 0, 300, "files/corrupt.png"},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILENOTE, 0, 0, 0, "Not an image it can show: "},
+    {OP_SHOT, 0, 0, 0, 300, "files-badimage"},
     // A file dropped on the pane opens in a tab, attached to nothing;
     // dropped while Open file is up, it fills the field, a line typed
     // after it
@@ -18308,6 +18346,18 @@ static DriveOp remoteops[] = {
     {OP_WAIT, W_FILEFRESH, 0, 0, 20000, ""},
     {OP_CHECK, CHK_FILETEXT, 0, 0, 0, "hullo "},
     {OP_CHECK, CHK_FILEHOST, 1, 0, 0, ""},
+    // An image file there, read there whole, in parts
+    CMDKEY(GKEY_O, 800),
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_TEXTRCWD, 0, 0, 0, 100, ""},
+    {OP_TEXT, 0, 0, 0, 300, "/pixels.png"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 20000, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_FILEHOST, 1, 0, 0, ""},
+    {OP_CHECK, CHK_FILEIMAGE, 40, 30, 0, "fit"},
+    {OP_SHOT, 0, 0, 0, 300, "remote-image"},
     // URL includes, fetched again from the settings window
     {OP_MOVE, T_SETTINGSTAB, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -21732,6 +21782,43 @@ static b32 drivefilecheck(Gui *g, i32 chk)
         ok &= op->dx!=2 || linked;  // the fixture's symlinks: POSIX only
         #endif
     } break;
+    case CHK_FILEIMAGE: {
+        // Its size, and fit, as the Screenshot window's (CHK_SHOTFIT), or
+        // at its own size in the screen's pixels
+        FileBody *fb  = ft ? ft->body : 0;
+        b32       img = fb && fb->kind==FBODY_IMAGE && fb->tex;
+        b32       fit = op->text == Str("fit");
+        f32       sc  = ImGui::GetIO().DisplayFramebufferScale.x;
+        ImVec2    z   = g->fimgsize, r = g->fimgroom;
+        sc = sc>0 ? sc : 1;
+        print(&b, "drive: the front file is ");
+        print(&b, img ? Str("an image of ") : Str("no image"));
+        if (img) {
+            print(&b, (i64)fb->w);
+            putbyte(&b, 'x');
+            print(&b, (i64)fb->h);
+            print(&b, ft->fit ? Str(", fit") : Str(", unfit"));
+            print(&b, g->fimgshown ? Str(", drawn at ") : Str(", not drawn"));
+        }
+        if (img && g->fimgshown) {
+            print(&b, (i64)z.x);
+            putbyte(&b, 'x');
+            print(&b, (i64)z.y);
+            print(&b, " in ");
+            print(&b, (i64)r.x);
+            putbyte(&b, 'x');
+            print(&b, (i64)r.y);
+        }
+        ok = img && g->fimgshown && fb->w==(i32)op->dx && fb->h==(i32)op->dy &&
+             ft->fit==fit;
+        if (fit) {
+            f32 dx = z.x - r.x, dy = z.y - r.y;
+            ok &= dx<1 && dy<1 && ((dx>-1 && dx<1) || (dy>-1 && dy<1));
+        } else {
+            f32 dx = z.x - (f32)fb->w/sc, dy = z.y - (f32)fb->h/sc;
+            ok &= dx>-0.5f && dx<0.5f && dy>-0.5f && dy<0.5f;
+        }
+    } break;
     case CHK_LINKTIP: {
         Str tip = {g->linktipped, g->linktippedlen};
         print(&b, "drive: the link's tooltip was ");
@@ -23943,6 +24030,7 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_EDITWHY:
     case CHK_REVEALED:
     case CHK_FILELINK:
+    case CHK_FILEIMAGE:
         return drivefilecheck(g, chk);
     case CHK_TERMQUIET:
         return g->panes[PANE_TERMINAL] && drivequiet(g, "idle with the terminal shown", 2);
