@@ -546,14 +546,16 @@ static Str axiconname(i32 c)
     return {};
 }
 
+// An icon (a private-use code point), or a picker's small down triangle
+// ("Build ▾"), which says only that a list opens
 static b32 axprivate(i32 c)
 {
-    return c>=0xe000 && c<=0xf8ff;
+    return (c>=0xe000 && c<=0xf8ff) || c==0x25be;
 }
 
 // A label as a name: what shows of it, before ImGui's "##", without
-// icons (private-use code points), trimmed. A label that is only icons
-// is named by its icons, joined by spaces.
+// icons (axprivate), trimmed. A label that is only icons is named by
+// its icons, joined by spaces.
 static Str axlabel(Arena *a, Str label)
 {
     iz hide = find(label, "##");

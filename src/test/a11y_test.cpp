@@ -200,6 +200,7 @@ static void test_a11yname(Test *t)
     expect(t, "a11yname.icons", axlabel(&a, ICON_ADD ICON_FOLDER), "Add Folder");
     expect(t, "a11yname.unknown", axlabel(&a, "\xee\x80\x80"), "");  // U+E000
     expect(t, "a11yname.utf8", axlabel(&a, "Caf\xc3\xa9 " ICON_ADD), "Caf\xc3\xa9");
+    expect(t, "a11yname.picker", axlabel(&a, "Build  \xe2\x96\xbe##modepick"), "Build");
 
     // Every icon has a name
     Str used = concat(&a, fonticonsused, ICON_SHELL);

@@ -85,6 +85,7 @@ static void axkey(Gui *, u32);
 // Names and roles that a label and ImGui's flags can't give the last
 // item, and its context menu (a11y_imgui.cpp)
 static void axchecked(Gui *, b32 on);
+static void axselected(Gui *, b32 on);
 static void axname(Gui *, Str);
 static void axrole(Gui *, AxRole);
 static void axmenu(Gui *);
@@ -1160,21 +1161,24 @@ static void pen(Pen *p, Str s, i32 style, u32 col)
 
 // A button whose label is runs of text in styles, drawn as pen draws
 // them: a name in it in the code font, say. Returns whether pressed.
-static b32 penbutton(Gui *g, char const *id, Str *runs, i32 *styles, i32 n)
+static b32 penbutton(Gui *g, Arena a, char const *id, Str *runs, i32 *styles, i32 n)
 {
     ImGuiStyle &st   = ImGui::GetStyle();
     f32         size = ImGui::GetFontSize();
     f32         w    = 0;
+    Buf         name(&a, 256);  // its runs' text, its name to a tool
     for (i32 i = 0; i < n; i++) {
         Str s = runs[i];
         if (!s.len) {
             continue;  // may be null, which ImGui would strlen
         }
+        print(&name, s);
         w += stylefont(&g->fonts, styles[i])->CalcTextSizeA(size, 1e9f, 0, s.cdata,
                                                              s.cdata+s.len).x;
     }
     ImVec2 at   = ImGui::GetCursorScreenPos();
     b32    hit  = ImGui::InvisibleButton(id, v2(w + 2*st.FramePadding.x, ImGui::GetFrameHeight()));
+    axname(g, finish(&name));
     ImRect bb   = {ImGui::GetItemRectMin(), ImGui::GetItemRectMax()};
     i32    col  = ImGui::IsItemActive()  ? ImGuiCol_ButtonActive :
                   ImGui::IsItemHovered() ? ImGuiCol_ButtonHovered : ImGuiCol_Button;
@@ -2692,10 +2696,9 @@ static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
             runs[1] = dir;
             runs[2] = t->access=="write" ? Str(" (write)") : Str(" (read)");
         }
-        if (penbutton(g, "##always", runs, styles, countof(runs))) {
+        if (penbutton(g, a, "##always", runs, styles, countof(runs))) {
             guianswer(g, s, t->req, "always", {});
         }
-        axname(g, concat(&a, runs[0], concat(&a, runs[1], runs[2])));
         if (latest) itemrect(g, RECT_ALWAYS);
         if (desk) {
             itemtip("Allow this action, and every %s action from now on in "
@@ -2737,7 +2740,7 @@ static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
         ImGui::SameLine();
         Str runs[3]   = {"Trust ", t->trust, " in this project"};
         i32 styles[3] = {0, STYLE_CODE, 0};
-        if (penbutton(g, "##trust", runs, styles, countof(runs))) {
+        if (penbutton(g, a, "##trust", runs, styles, countof(runs))) {
             guianswer(g, s, t->req, "trust", {});
         }
         itemtip("Allow this, and every call to a tool of %s from now on, "
@@ -6540,6 +6543,8 @@ static void drawslash(Gui *g, Arena a, Str text, Slice<SkillItem> skills, ImVec2
             SlashInfo c = slashpickinfo(&a, picks[i], skills);
             ImGui::PushID((i32)i);
             ImGui::Selectable(heads[i], i==g->slashsel, 0, v2(w, 0));
+            axselected(g, i==g->slashsel);
+            axname(g, c.args.len ? concat(&a, concat(&a, c.name, " "), c.args) : c.name);
             ImGui::PopID();
             ImGui::SameLine();
             ImGui::TextDisabled("%s", cstr0(&a, utf8head(c.desc, 120)));
@@ -6579,8 +6584,10 @@ static Str mentionelide(Arena *a, Str s, f32 w)
 // popup does not, so the caret keeps blinking and typing goes on. It draws
 // with no rows too, so that the adapter's one line — no files match,
 // indexing, a folder it could not list — is not written to nobody.
-static void drawmention(Gui *g, Arena a, MentionSrc *src, ImVec2 at, f32 maxw)
+// Returns the row an assistive tool pressed, else -1.
+static i32 drawmention(Gui *g, Arena a, MentionSrc *src, ImVec2 at, f32 maxw)
 {
+    i32 hit = -1;
     ImGui::SetNextWindowPos(at, ImGuiCond_Always, v2(0, 1));
     ImGuiWindowFlags f = ImGuiWindowFlags_Tooltip | ImGuiWindowFlags_NoTitleBar |
                          ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
@@ -6629,7 +6636,10 @@ static void drawmention(Gui *g, Arena a, MentionSrc *src, ImVec2 at, f32 maxw)
             char        *name = cstr0(&a, c->name);
             ImGui::PushID(i);
             ImVec2 p = ImGui::GetCursorScreenPos();
-            ImGui::Selectable("##row", s, 0, v2(w, lh));
+            hit = ImGui::Selectable("##row", s, 0, v2(w, lh)) ? i : hit;  // by a tool only
+            axrole(g, AX_LISTITEM);
+            axselected(g, s);
+            axname(g, c->dir.len && !c->sid.len ? concat(&a, c->name, concat(&a, " in ", c->dir)) : c->name);
             ImGui::PopID();
             // Drawn over the row, so each part keeps its own color: the
             // cue, the kind's glyph, the name, and the folder it is in
@@ -6695,6 +6705,7 @@ static void drawmention(Gui *g, Arena a, MentionSrc *src, ImVec2 at, f32 maxw)
         keepset(&g->mentionstatus, src->status);
     }
     ImGui::End();
+    return hit;
 }
 
 
@@ -6770,6 +6781,7 @@ static void drawattached(Gui *g, GuiSession *s)
         ImGui::BeginDisabled(busy);
         b32 go  = ImGui::InvisibleButton("##remove", v2(2*rad, 2*rad));
         b32 hov = ImGui::IsItemHovered();
+        axname(g, concat(&a, "Remove ", m->label.len ? m->label : Str("pasted image")));
         ImGui::EndDisabled();
         if (!busy) {
             itemnamed(g, "attach remove");
@@ -6782,6 +6794,8 @@ static void drawattached(Gui *g, GuiSession *s)
 
         ImGui::SetCursorScreenPos(c0);
         ImGui::InvisibleButton("##att", v2(box, box));
+        axrole(g, m->file ? AX_TEXT : AX_IMAGE);  // nothing to press: its tooltip says what
+        axname(g, m->label.len ? m->label : Str("Pasted image"));
         if (ImGui::IsItemHovered()) {
             Buf b(&a, 128 + m->label.len);
             print(&b, m->label.len ? m->label : Str("Pasted"));
@@ -7064,6 +7078,8 @@ static void drawprompt(Gui *g)
     g->promptend = g->promptend==2 ? 0 : g->promptend;
     ImGui::PopID();
     axkey(g, AXKEY_PROMPT);  // the same to a tool in every session
+    axname(g, "Prompt");
+    axmenu(g);  // its context menu, opened below
     itemrect(g, RECT_PROMPT);
     ImVec2 r0 = ImGui::GetItemRectMin();
     ImVec2 r1 = ImGui::GetItemRectMax();
@@ -7178,8 +7194,18 @@ static void drawprompt(Gui *g)
     if (cb.full) {
         setnote(g, s, "the message is full: delete some text, then pick again", 1);
     }
+    // The popup while a mention is on, even with no row to list: its line
+    // is then all there is to say (no files match, indexing, a folder it
+    // could not list), and the accept below still needs a candidate, so
+    // Enter sends as it does with no pick. A row a tool pressed is the
+    // pick, taken as Tab takes it.
+    i32 hit = -1;
+    if (m1.on && ImGui::GetActiveID()==id) {
+        hit = drawmention(g, a, &msrc, v2(r0.x, r0.y), 0.7f*(r1.x - r0.x));
+    }
+    g->mentionsel = hit>=0 ? hit : g->mentionsel;
     MentionCand *cand = rows && g->mentionsel<rows ? &msrc.cands.data[g->mentionsel] : 0;
-    if (cand && hadkeys && (cb.tab || (send && !io.KeyShift && !io.KeyCtrl))) {
+    if (cand && hadkeys && (hit>=0 || cb.tab || (send && !io.KeyShift && !io.KeyCtrl))) {
         Str t   = mentiontext(&a, cand->path, cand->isdir);
         Str was = span(now.data+m1.beg, now.data+m1.end);  // to check, as it is now
         if (t.len && !mentionqueue(&s->medit, m1.beg, m1.end, was, t)) {
@@ -7201,17 +7227,10 @@ static void drawprompt(Gui *g)
     if (slash && ImGui::GetActiveID()==id) {
         drawslash(g, a, draftstr(s), s->skills, v2(r0.x, r0.y));
     }
-    // The popup while a mention is on, even with no row to list: its line
-    // is then all there is to say (no files match, indexing, a folder it
-    // could not list), and the accept above still needs a candidate, so
-    // Enter sends as it does with no pick
-    if (m1.on && ImGui::GetActiveID()==id) {
-        drawmention(g, a, &msrc, v2(r0.x, r0.y), 0.7f*(r1.x - r0.x));
-    }
 
-    // The context menu
-    if (ImGui::IsMouseReleased(ImGuiMouseButton_Right) && ImGui::IsMouseHoveringRect(r0, r1) &&
-            ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows)) {
+    // The context menu, on the box (a11y: axmenu marks it, above)
+    if ((ImGui::IsMouseReleased(ImGuiMouseButton_Right) && ImGui::IsMouseHoveringRect(r0, r1) &&
+            ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows)) || axmenuasked(g, id)) {
         ImGui::OpenPopup("##composemenu");
     }
     if (ImGui::BeginPopup("##composemenu")) {
@@ -7260,6 +7279,7 @@ static void drawprompt(Gui *g)
     ImGui::BeginDisabled(!can || editing);
     send |= ImGui::Button(v->busy ? ICON_REPLY "##send" : ICON_SEND "##send", v2(bw, 0));
     itemnamed(g, "send");
+    axname(g, v->busy ? Str("Steer") : Str("Send"));
     i32 waits = v->busy ? askwaits(v) : WAITS_NONE;
     itemtip(!v->busy               ? "Send the prompt (Enter; Shift+Enter for a new line)"
             : waits==WAITS_QUESTION ? "Steer: send to the running turn, which the agent reads "
@@ -9767,6 +9787,7 @@ static void drawsessdialogs(Gui *g)
                                      ImGuiInputTextFlags_EnterReturnsTrue |
                                      ImGuiInputTextFlags_AutoSelectAll);
         itemnamed(g, "name field");
+        axname(g, g->nameask==NAME_RENAME ? Str("Session name") : Str("Group name"));
         Str name = trim({(u8 *)g->namebuf, (iz)__builtin_strlen(g->namebuf)});
         ImGui::BeginDisabled(!name.len);
         b32 ok = ImGui::Button("OK", v2(120*sc, 0));
@@ -10935,6 +10956,8 @@ static void pathafter(Gui *g, PathField *f, char *buf)
                 pc->accepts++;
                 scheddirty(&g->sched);
             }
+            axselected(g, i==pc->sel);
+            axname(g, p.name);
             ImGui::PopID();
             if (i == pc->top) {
                 itemnamed(g, "path pick");
@@ -11159,6 +11182,7 @@ static void drawnewmodel(Gui *g, Arena a, GuiHost *host)
             }
         }
         itemnamed(g, "model filter");
+        axname(g, "Filter models");
         Str filter = trim({(u8 *)g->newfilter, (iz)__builtin_strlen(g->newfilter)});
         if (host->listid) {
             ImGui::TextDisabled("Asking the endpoints for their models...");
@@ -12003,6 +12027,7 @@ static void drawoutput(Gui *g)
     if (t.len) {
         ImGui::InputTextMultiline("##out", (char *)t.data, (size_t)t.len + 1, v2(-FLT_MIN, -FLT_MIN),
                                   ImGuiInputTextFlags_ReadOnly);
+        axname(g, "Output");
         g->outshown = 1;
     }
     ImGui::PopFont();
@@ -14945,6 +14970,8 @@ static b32 palrow(Gui *g, Arena a, i32 i, b32 sel, i64 nowms)
     ImVec2 at = ImGui::GetCursorScreenPos();
     f32    w  = ImGui::GetContentRegionAvail().x;
     b32    hit = ImGui::Selectable("##r", sel, 0, v2(0, 2*lineh + 4*sc));
+    axname(g, it->title);
+    axselected(g, sel);
     ImGui::PopID();
     if (sel && p->follow) {
         ImGui::ScrollToItem(ImGuiScrollFlags_KeepVisibleEdgeY);
@@ -15122,6 +15149,7 @@ static void drawpalette(Gui *g)
                              ImGuiInputTextFlags_CallbackHistory |
                              ImGuiInputTextFlags_CallbackEdit, palcb, &cb);
     itemnamed(g, "palette query");
+    axname(g, "Go to");
     if (cb.edited) {
         palbuild(g, 0);
         p->follow = 1;
@@ -15166,7 +15194,8 @@ static void drawpalette(Gui *g)
     }
     ImGui::TextDisabled("Enter to open, Esc to close");
 
-    // A click outside closes it, as Esc and Ctrl/Cmd+K do
+    // A click outside closes it, as Esc and Ctrl/Cmd+K do (a11y: not a
+    // control, and a tool closes it with Esc)
     b32 outside = !appearing && ImGui::IsMouseClicked(0) &&
                   !ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows |
                                           ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);

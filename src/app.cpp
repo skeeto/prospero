@@ -20617,6 +20617,18 @@ static DriveOp composeops[] = {
     {OP_CHECK, CHK_LASTUSER, 0, 0, 0, "@\"Session A\" say hi"},
     {OP_CHECK, CHK_USERFILES, 0, 0, 0, "Mentioned: Session A"},
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    // An assistive tool's press on a row picks it, as Tab does
+    {OP_A11Y, 0, 0, 0, 500, "on"},
+    CLICK(T_PROMPT, "", 300),
+    TYPE1("@"),
+    TYPE1("s"), TYPE1("e"), TYPE1("s"), TYPE1("s"), TYPE1("a"),
+    {OP_CHECK, CHK_MENTION, 2, 0, 0, ""},
+    {OP_A11Y, 0, 0, 0, 600, "press listitem Session A"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "@\"Session A\" "},
+    SELALL,
+    RCLICK(500),
+    PICK(T_CMCUT),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
     // [ui] mentions = false: '@' is plain text, and no picker opens
     {OP_MENTIONS, 0, 0, 0, 300, ""},
     CLICK(T_PROMPT, "", 300),
@@ -20710,7 +20722,7 @@ static DriveOp a11yops[] = {
     {OP_A11Y, 0, 0, 0, 0, "has group Transcript"},
     {OP_A11Y, 0, 0, 0, 0, "has button Send"},
     {OP_A11Y, 0, 0, 0, 0, "help button Send"},
-    {OP_A11Y, 0, 0, 0, 0, "focus textarea "},
+    {OP_A11Y, 0, 0, 0, 0, "focus textarea Prompt"},
     // What is typed is the field's value, each frame
     {OP_TEXT, 0, 0, 0, 300, "hello there"},
     {OP_A11Y, 0, 0, 0, 0, "value hello there"},
@@ -20746,9 +20758,9 @@ static DriveOp a11yops[] = {
     // edited, and the draft kept
     CLICK(T_TRANSCRIPT, "", 300),
     {OP_A11Y, 0, 0, 0, 0, "noedit 0 0 x"},
-    {OP_A11Y, 0, 0, 0, 300, "activate textarea "},
+    {OP_A11Y, 0, 0, 0, 300, "activate textarea Prompt"},
     {OP_A11Y, 0, 0, 0, 0, "pending 0"},
-    {OP_A11Y, 0, 0, 0, 0, "focus textarea "},
+    {OP_A11Y, 0, 0, 0, 0, "focus textarea Prompt"},
     {OP_A11Y, 0, 0, 0, 300, "edit 5 5 !"},
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, "abcde!"},
     {OP_MOVE, T_EMPTY, 0, 0, 1500, ""},
@@ -20798,7 +20810,7 @@ static DriveOp a11yops[] = {
     {OP_EDITING, 0, -1, 0, 300, "かな"},
     {OP_A11Y, 0, 0, 0, 0, "marked かな"},
     CLICK(T_TRANSCRIPT, "", 300),
-    {OP_A11Y, 0, 0, 0, 300, "activate textarea "},
+    {OP_A11Y, 0, 0, 0, 300, "activate textarea Prompt"},
     {OP_A11Y, 0, 0, 0, 0, "marked "},
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, "say 日本語"},
 #endif
@@ -20815,6 +20827,17 @@ static DriveOp a11yops[] = {
     {OP_A11Y, 0, 0, 0, 0, "has menuitem Copy Message"},
     {OP_A11Y, 0, 0, 0, 0, "has menuitem Select All"},
     KEY(GKEY_ESCAPE, 0, 300),
+    // The prompt's, likewise
+    {OP_A11Y, 0, 0, 0, 300, "menu textarea Prompt"},
+    {OP_A11Y, 0, 0, 0, 0, "has menuitem Select all"},
+    KEY(GKEY_ESCAPE, 0, 300),
+
+    // While a turn runs, Send steers it
+    {OP_PROMPT, 0, 0, 0, 100, "Steer me: run a slow command, then answer."},
+    {OP_WAIT, W_TOOL, 0, 0, 10000, ""},
+    {OP_A11Y, 0, 0, 0, 0, "has button Steer"},
+    {OP_WAIT, W_IDLE, 0, 0, 20000, ""},
+    {OP_A11Y, 0, 0, 0, 300, "has button Send"},
 
     // Then quiet: nothing pending asks for frames
     {OP_MARK, 0, 0, 0, 11000, ""},
