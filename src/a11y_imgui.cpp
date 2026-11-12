@@ -109,6 +109,8 @@ struct AxGui {
     iz                  tracefd;  // PROSPERO_AXTRACE's file, or -1
     i64                 logmark;  // the checklist's: where "logged" looks from
     Str                 tracepath;
+    void              (*published)(AxGui *);  // the OS adapter's, after each publish
+    void              (*osdrive)(Gui *, Str); // its checklist verbs ("ns ...")
 };
 
 enum { AXLINT_CAP = 1<<12 };
@@ -1092,6 +1094,9 @@ static void axendframe(ImGuiContext *ctx, ImGuiContextHook *hook)
     AxGui *x = (AxGui *)hook->UserData;
     if (x->on) {
         axbuild(x, ctx);
+        if (x->published) {
+            x->published(x);
+        }
     }
 }
 
@@ -1169,6 +1174,8 @@ static void axstart(Gui *g)
 //                    what is
 //   logged TEXT      check that the adapter logged a line holding TEXT
 //                    since the last OP_NSTEXT
+//   ns ...           the OS adapter's own checks, through the OS's API
+//                    (macOS: a11y_macos.cpp); skipped where there is none
 
 // what may be in a, the caller's scratch
 static void axcheck(Gui *g, Arena *a, b32 ok, Str what)
@@ -1396,6 +1403,12 @@ static void driveax(Gui *g, Str cmd)
     } else if (verb == "logged") {
         axcheck(g, &a, axlogged(g, g->ax->logmark, c.tail) > 0,
                 concat(&a, "accessibility log: ", c.tail));
+    } else if (verb == "ns") {
+        if (g->ax->osdrive) {
+            g->ax->osdrive(g, c.tail);
+        } else {
+            guilog(g, concat(&a, "drive: skipped (no OS adapter here): ", cmd));
+        }
     } else if (verb == "lint") {
         Slice<i32> bad = axlint(&a, t);
         Buf b(&a, 256);

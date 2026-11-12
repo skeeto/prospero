@@ -1,18 +1,21 @@
 // Accessibility: macOS's side
 //
-// For now a trace, which changes nothing: SDL's text input view
-// (SDL3TranslatorResponder, its NSTextInputClient) is what Dictation and
-// the input methods talk to, and NSAccessibility is what Voice Control
-// asks, of the window, its content view (SDL3View) and that text input.
-// Each call they make is logged (axnote, a11y_imgui.cpp) with its
-// arguments and what SDL or AppKit answered, then answered as before,
-// so the adapter to come is built on what they really do. That is only
-// while the tree is built (a tool asked, `[ui] accessibility = on`, or
-// PROSPERO_AXTRACE) and something can read the log (a Debug build's
-// Metrics pane, or the trace). Text is logged only from a field the
-// model knows is not a password, and a key's text, which reaches SDL
-// through these same calls, only as its length: the trace is of speech
-// tools, not typing.
+// The tree (a11y.cpp) to NSAccessibility, which Voice Control and
+// VoiceOver ask: an element for each node, under the window, as the
+// section "The tree" below has it.
+//
+// And a trace: SDL's text input view (SDL3TranslatorResponder, its
+// NSTextInputClient) is what Dictation and the input methods talk to,
+// and NSAccessibility is what Voice Control asks, of the window, its
+// content view (SDL3View) and that text input. Each call they make is
+// logged (axnote, a11y_imgui.cpp) with its arguments and what SDL or
+// AppKit answered, then answered as before, so the text adapter to come
+// is built on what they really do. That is only while the tree is built
+// (a tool asked, `[ui] accessibility = on`, or PROSPERO_AXTRACE) and
+// something can read the log (a Debug build's Metrics pane, or the
+// trace). Text is logged only from a field the model knows is not a
+// password, and a key's text, which reaches SDL through these same
+// calls, only as its length: the trace is of speech tools, not typing.
 //
 // SDL's NSTextInputClient methods are its own, so method_setImplementation
 // wraps them, and the original is called. NSAccessibility's are AppKit's,
@@ -422,6 +425,8 @@ static void *macvalidattrs(void *self, void *sel)
 // answers a remote query with. The classes' own methods call their
 // superclass's, looked up at each call, not at install: AppKit's may be
 // replaced or added to later, as when an assistive tool's bundle loads.
+// What the tree answers itself (the content view's hit test and focus,
+// the text input's focus) it added first, and these leave be.
 
 enum MacAxSig : i32 {
     MAXS_ID,       // id f()
@@ -643,13 +648,1255 @@ static void macwrap(void *cls, char const *name, F wrapper, F *orig)
     }
 }
 
-// Install the wrappers, once: with accessibility off, none.
+
+// The tree, to NSAccessibility: an element for each node of the
+// published tree that a tool has asked about, of a class made at run
+// time from NSAccessibilityElement, which holds only its node's key and
+// looks the node up in the published tree at each call, so it answers
+// for the latest frame and never holds a pointer into a tree. The
+// elements are kept by key until their node leaves the tree, when
+// AppKit is told (UIElementDestroyed) and they are let go, marked dead
+// for any tool still holding one.
+//
+// SDL3View, the window's content view, stays ignored, as AppKit has
+// it, so the window's children are the root's: it gains its children,
+// hit test and focus (class_addMethod, as NSView's are inherited), and
+// the text input view its focus, which AppKit asks as first responder.
+// The first of those calls starts the tree (axstart) with
+// `[ui] accessibility = auto`: it answers a bare root then, and AppKit
+// is told the layout changed once the first tree is published.
+//
+// ImGui coordinates are the content view's points, from its top left;
+// the view isn't flipped, so y is turned over, then converted through
+// the window to the screen, at each call, since the window moves with
+// no frame drawn.
+//
+// Actions are queued through the glue (axaction), which ImGui takes at
+// the next frame; the wake is ours, as the call came between frames,
+// and the GUI may be waiting. Getters are only counted, as a tool reads
+// whole subtrees: their counts are logged once per frame.
+
+extern "C" bool  class_addIvar(void *, char const *, uz, u8, char const *);
+extern "C" void *class_getInstanceVariable(void *, char const *);
+extern "C" iz    ivar_getOffset(void *);
+extern "C" void  NSAccessibilityPostNotification(void *, void *);
+extern "C" void *NSAccessibilityUnignoredAncestor(void *);
+extern "C" void *method_getImplementation(void *);
+#if !__arm64__
+extern "C" void  objc_msgSend_stret();
+#endif
+
+// A message whose answer is an NSRect, which x86-64 returns in memory
+template<typename... A>
+static NsRect objcrect(void *o, char const *sel, A... a)
+{
+    using F = NsRect (*)(void *, void *, A...);
+    #if __arm64__
+    return ((F)(void *)objc_msgSend)(o, sel_registerName(sel), a...);
+    #else
+    return ((F)(void *)objc_msgSend_stret)(o, sel_registerName(sel), a...);
+    #endif
+}
+
+// What the elements are asked, counted for the log
+enum : i32 {
+    MG_ROLE,   // role, subrole
+    MG_NAME,   // label, title, help
+    MG_VALUE,
+    MG_STATE,  // enabled, focused, selected, expanded, allowed selectors
+    MG_TREE,   // parent, children, window
+    MG_FRAME,
+    MG_HIT,
+    MG_FOCUS,  // the focused element
+    MG_N
+};
+
+static char const *const macgetnames[MG_N] = {
+    "role", "name", "value", "state", "tree", "frame", "hit", "focus",
+};
+
+// What AppKit is told, counted for the checklist
+enum : i32 {
+    MN_FOCUS,
+    MN_VALUE,
+    MN_SELTEXT,
+    MN_TITLE,
+    MN_CREATED,
+    MN_DESTROYED,
+    MN_LAYOUT,
+    MN_N
+};
+
+static char const *const macnotes[MN_N] = {
+    "AXFocusedUIElementChanged", "AXValueChanged", "AXSelectedTextChanged",
+    "AXTitleChanged", "AXCreated", "AXUIElementDestroyed", "AXLayoutChanged",
+};
+
+enum : i64 {
+    MACLAYOUT_GAP = 250000,  // µs between layout changes told in a nested loop
+};
+
+struct MacEl {
+    u32   key;   // 0: empty
+    u32   born;  // the publish that made it for a tool, or 0
+    void *el;
+};
+
+static struct {
+    void   *cls;         // ProsperoAxElement
+    iz      keyoff;      // its ivars: the node's key,
+    iz      deadoff;     // and whether that node is gone (MACDEAD_*)
+    Arena   mem;         // the tables, the latest last
+    MacEl  *tab;         // key -> element, open addressing
+    i32     exp;
+    i32     len;
+    b32     rootasked;   // a tool has the root's children
+    b32     started;     // a query started the tree: say so once published
+    b32     layoutowed;  // a layout change waits for its gap
+    i64     layoutat;
+    u32     tkey;        // the text field as last told: which,
+    i64     trev;        // its text,
+    i32     tanchor;     // its selection,
+    i32     tcaret;
+    u64     tmarked;     // and its marked text, hashed
+    u32     pass;        // publishes told, the one telling while inpass
+    b32     inpass;
+    b32     startwason;  // for "ns start": the tree was on already,
+    i32     startposts;  // and layout told for a start since "ns mark"
+    i32     gets[MG_N];
+    i32     posted[MN_N];
+} macax;
+
+enum : u32 {
+    MACDEAD_LIVE,
+    MACDEAD_GONE,
+    MACDEAD_DYING,  // gone, while AppKit is told so: still an element
+};
+
+static u32 *mackeyp(void *el)
+{
+    return (u32 *)((byte *)el + macax.keyoff);
+}
+
+static u32 *macdeadp(void *el)
+{
+    return (u32 *)((byte *)el + macax.deadoff);
+}
+
+static void macgrow()
+{
+    MacEl *old  = macax.tab;
+    i32    oldn = old ? 1<<macax.exp : 0;
+    macax.exp   = old ? macax.exp+1 : 10;
+    macax.tab   = alloc<MacEl>(&macax.mem, (iz)1<<macax.exp);
+    u64 mask = ((u64)1 << macax.exp) - 1;
+    for (i32 i = 0; i < oldn; i++) {
+        if (old[i].key) {
+            u64 h = axhash(old[i].key, macax.exp);
+            while (macax.tab[h].key) {
+                h = (h+1) & mask;
+            }
+            macax.tab[h] = old[i];
+        }
+    }
+}
+
+// The slot holding key, or -1
+static i32 macslot(u32 key)
+{
+    if (!macax.tab || !key) {
+        return -1;
+    }
+    u64 mask = ((u64)1 << macax.exp) - 1;
+    for (u64 h = axhash(key, macax.exp);; h = (h+1) & mask) {
+        if (!macax.tab[h].key) {
+            return -1;
+        } else if (macax.tab[h].key == key) {
+            return (i32)h;
+        }
+    }
+}
+
+// Empty slot h, moving back what probed past it
+static void macunslot(i32 h)
+{
+    u64 mask = ((u64)1 << macax.exp) - 1;
+    u64 hole = (u64)h;
+    macax.tab[hole] = {};
+    for (u64 i = (hole+1) & mask; macax.tab[i].key; i = (i+1) & mask) {
+        u64 home = axhash(macax.tab[i].key, macax.exp);
+        if (((i - home) & mask) >= ((i - hole) & mask)) {
+            macax.tab[hole] = macax.tab[i];
+            macax.tab[i]    = {};
+            hole = i;
+        }
+    }
+    macax.len--;
+}
+
+// The live node an element stands for, or null: its index in at
+static AxNode *macnodeof(void *el, i32 *at = 0)
+{
+    if (!el || !axmac || *macdeadp(el)) {
+        return 0;
+    }
+    AxTree *t = axmac->ax->pub;
+    i32     i = axfind(t, *mackeyp(el));
+    if (i<=0 || t->nodes[i].role==AX_NONE) {
+        return 0;
+    }
+    if (at) {
+        *at = i;
+    }
+    return t->nodes + i;
+}
+
+// The element for node i, made if it has none
+static void *macelof(i32 i)
+{
+    u32 key = axmac->ax->pub->nodes[i].key;
+    i32 s   = macslot(key);
+    if (s >= 0) {
+        return macax.tab[s].el;
+    }
+    if (!macax.tab || (macax.len+1)*2 > 1<<macax.exp) {
+        macgrow();
+    }
+    void *el = objcsend<void *>(objcsend<void *>(macax.cls, "alloc"), "init");
+    if (!el) {
+        return 0;
+    }
+    *mackeyp(el)  = key;
+    *macdeadp(el) = MACDEAD_LIVE;
+    u64 mask = ((u64)1 << macax.exp) - 1;
+    u64 h    = axhash(key, macax.exp);
+    while (macax.tab[h].key) {
+        h = (h+1) & mask;
+    }
+    macax.tab[h] = {key, macax.inpass ? macax.pass : 0, el};
+    macax.len++;
+    return el;
+}
+
+// The element for node i if a tool was given it, or null
+static void *macelif(i32 i)
+{
+    i32 s = macslot(axmac->ax->pub->nodes[i].key);
+    return s<0 ? 0 : macax.tab[s].el;
+}
+
+static void *macwindow()
+{
+    GuiSdl *p = axmac ? (GuiSdl *)axmac->g->os->gui : 0;
+    if (!p || !p->window) {
+        return 0;
+    }
+    return SDL_GetPointerProperty(SDL_GetWindowProperties(p->window),
+                                  SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, 0);
+}
+
+static void *macview()
+{
+    void *win = macwindow();
+    return win ? objcsend<void *>(win, "contentView") : 0;
+}
+
+// Where the root's children say their parent is: the view's first
+// ancestor that isn't ignored, the window
+static void *macroot()
+{
+    void *view = macview();
+    return view ? NSAccessibilityUnignoredAncestor(view) : 0;
+}
+
+static void macwake()
+{
+    os_wake(axmac->g->os);
+}
+
+// Whether the tree is there to answer from; if not, start it, for the
+// next frame, as a tool has asked (`auto`). On isn't enough: until the
+// first publish the published tree is empty, without even a root.
+static b32 macready(char const *why)
+{
+    AxGui *x = axmac;
+    if (x->on && x->ax->pub->len>0) {
+        return 1;
+    } else if (x->on) {
+        macax.started = 1;  // tell AppKit once there is a tree
+        macwake();
+        return 0;
+    }
+    axstart(x->g);
+    macax.started = 1;
+    macwake();
+    if (AxGui *l = maclog()) {
+        Arena a = l->logmem;
+        Buf   b(&a, 128);
+        print(&b, "started by ");
+        print(&b, Str{(u8 *)why, (iz)__builtin_strlen(why)});
+        axnote(l, a, finish(&b));
+    }
+    return 0;
+}
+
+// An NSString of s, its scratch arena past s if s is in it
+static void *macnsstr(Str s, Arena a)
+{
+    void *r = nsstringn(s);
+    if (!r && s.len) {
+        // Not UTF-8: each bad byte as U+FFFD, as ImGui shows it
+        if (fits(&a, s.len*3 + 1)) {
+            r = nsstring(toastclean(&a, s, s.len*3));
+        }
+    }
+    return r ? r : nsstring("");
+}
+
+static void *macnsstr(Str s)
+{
+    return macnsstr(s, axmac->logmem);
+}
+
+// The role as NSAccessibility names it, and its subrole, if any
+static char const *macrole(AxTree *t, i32 i, char const **sub)
+{
+    AxNode *n = t->nodes + i;
+    *sub = 0;
+    switch (n->role) {
+    case AX_NONE:     return "AXUnknown";
+    case AX_APP:      return "AXGroup";
+    case AX_WINDOW:   return "AXGroup";
+    case AX_DIALOG:   return "AXGroup";
+    case AX_POPUP: {
+        // A context menu's popup holds menu items
+        i32 c = n->child;
+        while (c>=0 && t->nodes[c].role==AX_NONE) {
+            c = t->nodes[c].next;
+        }
+        return c>=0 && t->nodes[c].role==AX_MENUITEM ? "AXMenu" : "AXGroup";
+    }
+    case AX_MENUBAR:  return "AXMenuBar";
+    case AX_MENU:     return "AXMenu";
+    case AX_MENUITEM: return "AXMenuItem";
+    case AX_GROUP:    return "AXGroup";
+    case AX_BUTTON:   return "AXButton";
+    case AX_CHECKBOX: return "AXCheckBox";
+    case AX_RADIO:    return "AXRadioButton";
+    case AX_LINK:     return "AXLink";
+    case AX_TABLIST:  return "AXTabGroup";
+    case AX_TAB:      *sub = "AXTabButton";
+                      return "AXRadioButton";
+    // A collapsing header: AXRow wants an AXOutline above it, which no
+    // ImGui window is, so it is the disclosure control it looks like
+    case AX_TREEITEM: return "AXDisclosureTriangle";
+    // A Selectable, a row of a list that is no AXList: pressed to pick
+    case AX_LISTITEM: return "AXButton";
+    case AX_COMBO:    return "AXPopUpButton";
+    case AX_SLIDER:   return "AXSlider";
+    case AX_TEXTFIELD:
+        *sub = n->state & AXS_PASSWORD ? "AXSecureTextField" : 0;
+        return "AXTextField";
+    case AX_TEXTAREA: return "AXTextArea";
+    case AX_TEXT:     return "AXStaticText";
+    case AX_IMAGE:    return "AXImage";
+    case AX_NROLES:   break;
+    }
+    return "AXUnknown";
+}
+
+static b32 macpressable(AxNode *n)
+{
+    return (n->actions & (AXA_PRESS|AXA_TOGGLE|AXA_EXPAND|AXA_SELECT)) != 0;
+}
+
+// Whether its value means something: a state, or text
+static b32 macvalued(AxNode *n)
+{
+    switch (n->role) {
+    case AX_CHECKBOX: case AX_RADIO: case AX_TAB: case AX_TREEITEM:
+    case AX_TEXTFIELD: case AX_TEXTAREA: case AX_TEXT:
+        return 1;
+    default:
+        return n->value.len > 0;
+    }
+}
+
+// Its NSAccessibility frame: the screen's points, from its bottom left
+static NsRect macscreen(AxRect r)
+{
+    void *win  = macwindow();
+    void *view = win ? objcsend<void *>(win, "contentView") : 0;
+    if (!view) {
+        return {};
+    }
+    NsRect b = objcrect(view, "bounds");
+    NsRect v = {r.x0, 0, (f64)r.x1 - r.x0, (f64)r.y1 - r.y0};
+    v.y = objcsend<ObjcBool>(view, "isFlipped") ? b.y + r.y0 : b.y + b.h - r.y1;
+    NsRect w = objcrect(view, "convertRect:toView:", v, (void *)0);
+    return objcrect(win, "convertRectToScreen:", w);
+}
+
+// A screen point in ImGui's coordinates, or 0 with no window
+static b32 macfromscreen(NsPoint p, f32 *x, f32 *y)
+{
+    void *win  = macwindow();
+    void *view = win ? objcsend<void *>(win, "contentView") : 0;
+    if (!view) {
+        return 0;
+    }
+    NsRect  w  = objcrect(win, "convertRectFromScreen:", NsRect{p.x, p.y, 0, 0});
+    NsPoint v  = objcsend<NsPoint>(view, "convertPoint:fromView:", NsPoint{w.x, w.y}, (void *)0);
+    NsRect  b  = objcrect(view, "bounds");
+    *x = (f32)v.x;
+    *y = (f32)(objcsend<ObjcBool>(view, "isFlipped") ? v.y - b.y : b.y + b.h - v.y);
+    return 1;
+}
+
+// Whether node a is in front of node b: of their ancestors where they
+// part, the later sibling, which ImGui drew later, or the deeper
+static b32 macfront(AxTree *t, i32 a, i32 b)
+{
+    enum { DEPTH = 64 };
+    i32 pa[DEPTH], pb[DEPTH];
+    i32 na = 0, nb = 0;
+    for (i32 i = a; i>0 && na<DEPTH; i = t->nodes[i].parent) {
+        pa[na++] = i;
+    }
+    for (i32 i = b; i>0 && nb<DEPTH; i = t->nodes[i].parent) {
+        pb[nb++] = i;
+    }
+    while (na && nb && pa[na-1]==pb[nb-1]) {
+        na--;
+        nb--;
+    }
+    return na && nb ? pa[na-1]>pb[nb-1] : na>0;
+}
+
+// The node at a point, front most and deepest, or the root
+static i32 machit(f32 x, f32 y)
+{
+    AxTree *t    = axmac->ax->pub;
+    i32     best = 0;
+    for (i32 i = 1; i < t->len; i++) {
+        AxNode *n = t->nodes + i;
+        if (n->role!=AX_NONE && x>=n->rect.x0 && x<n->rect.x1 && y>=n->rect.y0 &&
+                y<n->rect.y1 && axfind(t, n->key)==i && macfront(t, i, best)) {
+            best = i;
+        }
+    }
+    return best;
+}
+
+// The visible parent: past those hidden, to the root (0)
+static i32 macparent(AxTree *t, i32 i)
+{
+    i32 p = t->nodes[i].parent;
+    while (p>0 && t->nodes[p].role==AX_NONE) {
+        p = t->nodes[p].parent;
+    }
+    return p<0 ? 0 : p;
+}
+
+// The children of node i as tools see them: those hidden give theirs
+static void mackids(AxTree *t, i32 i, void *arr, i32 depth)
+{
+    for (i32 c = t->nodes[i].child; c >= 0; c = t->nodes[c].next) {
+        if (axfind(t, t->nodes[c].key) != c) {
+            continue;  // a duplicate key: its element is the first's
+        } else if (t->nodes[c].role != AX_NONE) {
+            void *el = macelof(c);
+            if (el) {
+                objcsend<void>(arr, "addObject:", el);
+            }
+        } else if (depth < 64) {
+            mackids(t, c, arr, depth+1);
+        }
+    }
+}
+
+static void *mackidsof(i32 i)
+{
+    void *arr = objcsend<void *>(objc_getClass("NSMutableArray"), "array");
+    if (i < axmac->ax->pub->len) {
+        mackids(axmac->ax->pub, i, arr, 0);
+    }
+    return arr;
+}
+
+static void *macfocused()
+{
+    AxTree *t = axmac->ax->pub;
+    i32     i = t->focus;
+    while (i>0 && t->nodes[i].role==AX_NONE) {
+        i = t->nodes[i].parent;
+    }
+    return i>0 ? macelof(i) : 0;
+}
+
+// The focused field's text model, if it is node n's
+static AxText *mactextof(AxNode *n)
+{
+    AxText *tx = &axmac->ax->text;
+    return tx->live && tx->key==n->key ? tx : 0;
+}
+
+static void macnoteact(char const *what, AxNode *n, b32 ok)
+{
+    if (AxGui *x = maclog()) {
+        Arena a = x->logmem;
+        Buf   b(&a, 256);
+        print(&b, Str{(u8 *)what, (iz)__builtin_strlen(what)});
+        putbyte(&b, ' ');
+        if (n) {
+            print(&b, axrolenames[n->role]);
+            putbyte(&b, ' ');
+            axquote(&b, takehead(n->name, axcutat(n->name, 200)));
+        } else {
+            print(&b, "(gone)");
+        }
+        print(&b, ok ? Str(" -> YES") : Str(" -> NO"));
+        macnote(x, a, &b);
+    }
+}
+
+
+// The element's methods. Each looks its node up again; a node gone
+// answers as nothing at all, never nil where AppKit wants an object.
+
+static void *macelrole(void *self, void *)
+{
+    macax.gets[MG_ROLE]++;
+    i32  i = 0;
+    char const *sub = 0;
+    return macnodeof(self, &i) ? nsstring(macrole(axmac->ax->pub, i, &sub))
+                               : nsstring("AXUnknown");
+}
+
+static void *macelsubrole(void *self, void *)
+{
+    macax.gets[MG_ROLE]++;
+    i32  i = 0;
+    char const *sub = 0;
+    if (macnodeof(self, &i)) {
+        macrole(axmac->ax->pub, i, &sub);
+    }
+    return sub ? nsstring(sub) : 0;
+}
+
+// A menu item's name is its title, as AppKit's are; anything else's,
+// its label (AXDescription), which a static text gives as its value
+static void *macellabel(void *self, void *)
+{
+    macax.gets[MG_NAME]++;
+    AxNode *n = macnodeof(self);
+    if (!n || n->role==AX_MENUITEM || n->role==AX_TEXT || !n->name.len) {
+        return 0;
+    }
+    return macnsstr(n->name);
+}
+
+static void *maceltitle(void *self, void *)
+{
+    macax.gets[MG_NAME]++;
+    AxNode *n = macnodeof(self);
+    return n && n->role==AX_MENUITEM ? macnsstr(n->name) : 0;
+}
+
+static void *macelhelp(void *self, void *)
+{
+    macax.gets[MG_NAME]++;
+    AxNode *n = macnodeof(self);
+    return n && n->help.len ? macnsstr(n->help) : 0;
+}
+
+static void *macnumber(b32 v)
+{
+    return objcsend<void *>(objc_getClass("NSNumber"), "numberWithInt:", (int)(v != 0));
+}
+
+static void *macelvalue(void *self, void *)
+{
+    macax.gets[MG_VALUE]++;
+    AxNode *n = macnodeof(self);
+    if (!n) {
+        return 0;
+    }
+    switch (n->role) {
+    case AX_CHECKBOX:
+    case AX_RADIO:    return macnumber(n->state & AXS_CHECKED);
+    case AX_TAB:      return macnumber(n->state & (AXS_SELECTED|AXS_CHECKED));
+    case AX_TREEITEM: return macnumber(n->state & AXS_EXPANDED);
+    case AX_TEXT:     return macnsstr(n->name);
+    case AX_TEXTFIELD:
+    case AX_TEXTAREA: {
+        if (n->state & AXS_PASSWORD) {
+            return nsstring("");
+        }
+        // The field being edited: its text as the model has it, with a
+        // tool's edits in already, and an input method's marked text
+        AxText *tx = mactextof(n);
+        if (!tx) {
+            return macnsstr(n->value);
+        } else if (!tx->marked.len) {
+            return macnsstr(tx->text);
+        }
+        Arena a = axmac->logmem;
+        if (!fits(&a, tx->text.len + tx->marked.len + 64)) {
+            return macnsstr(tx->text);
+        }
+        Str doc = axdoc(axmac->ax, &a);
+        return macnsstr(doc, a);
+    }
+    default:
+        return n->value.len ? macnsstr(n->value) : 0;
+    }
+}
+
+static ObjcBool macelenabled(void *self, void *)
+{
+    macax.gets[MG_STATE]++;
+    AxNode *n = macnodeof(self);
+    return n && !(n->state & AXS_DISABLED);
+}
+
+static ObjcBool macelfocusedq(void *self, void *)
+{
+    macax.gets[MG_STATE]++;
+    AxNode *n = macnodeof(self);
+    return n && (n->state & AXS_FOCUSED);
+}
+
+static ObjcBool macelselected(void *self, void *)
+{
+    macax.gets[MG_STATE]++;
+    AxNode *n = macnodeof(self);
+    return n && (n->state & AXS_SELECTED);
+}
+
+static ObjcBool macelexpanded(void *self, void *)
+{
+    macax.gets[MG_STATE]++;
+    AxNode *n = macnodeof(self);
+    return n && (n->state & AXS_EXPANDED);
+}
+
+static ObjcBool macelisel(void *self, void *)
+{
+    // A dying element is one still, so AppKit passes on its destruction
+    // rather than ignore it
+    return *macdeadp(self)==MACDEAD_DYING || macnodeof(self);
+}
+
+static void *macelparent(void *self, void *)
+{
+    macax.gets[MG_TREE]++;
+    i32 i = 0;
+    if (!macnodeof(self, &i)) {
+        return 0;
+    }
+    i32 p = macparent(axmac->ax->pub, i);
+    return p ? macelof(p) : macroot();
+}
+
+static void *macelkids(void *self, void *)
+{
+    macax.gets[MG_TREE]++;
+    i32 i = 0;
+    if (!macnodeof(self, &i)) {
+        return objcsend<void *>(objc_getClass("NSArray"), "array");
+    }
+    return mackidsof(i);
+}
+
+static void *macelwindow(void *self, void *)
+{
+    macax.gets[MG_TREE]++;
+    return macnodeof(self) ? macwindow() : 0;
+}
+
+static NsRect macelframe(void *self, void *)
+{
+    macax.gets[MG_FRAME]++;
+    AxNode *n = macnodeof(self);
+    return n ? macscreen(n->rect) : NsRect{};
+}
+
+static void *macelhit(void *self, void *, NsPoint p)
+{
+    macax.gets[MG_HIT]++;
+    i32 i = 0;
+    f32 x = 0, y = 0;
+    if (!macnodeof(self, &i) || !macfromscreen(p, &x, &y)) {
+        return self;
+    }
+    // The deepest at the point, if it is this or under it
+    AxTree *t = axmac->ax->pub;
+    i32     h = machit(x, y);
+    for (i32 k = h; k > 0; k = t->nodes[k].parent) {
+        if (k == i) {
+            return macelof(h);
+        }
+    }
+    return self;
+}
+
+static ObjcBool macelpress(void *self, void *)
+{
+    AxNode *n  = macnodeof(self);
+    b32     ok = n && macpressable(n) && axaction(axmac->g, n->key, AXACT_PRESS);
+    if (ok) {
+        macwake();
+    }
+    macnoteact("AXPress", n, ok);
+    return ok;
+}
+
+static ObjcBool macelmenu(void *self, void *)
+{
+    AxNode *n  = macnodeof(self);
+    b32     ok = n && axaction(axmac->g, n->key, AXACT_MENU);
+    if (ok) {
+        macwake();
+    }
+    macnoteact("AXShowMenu", n, ok);
+    return ok;
+}
+
+// AXFocused = YES: a field takes the keyboard, its caret kept. Focus
+// can't be given away, only taken, as with the mouse.
+static void macelsetfocused(void *self, void *, ObjcBool on)
+{
+    AxNode *n  = macnodeof(self);
+    b32     ok = n && on && axaction(axmac->g, n->key, AXACT_FOCUS);
+    if (ok) {
+        macwake();
+    }
+    macnoteact(on ? "AXFocused=YES" : "AXFocused=NO", n, ok);
+}
+
+static void *macallowedup;  // NSAccessibilityElement's, if it has one
+
+// What each node offers: AppKit lists attributes and actions by this
+static ObjcBool macelallowed(void *self, void *sel, void *what)
+{
+    macax.gets[MG_STATE]++;
+    AxNode *n = macnodeof(self);
+    char const *s = what ? sel_getName(what) : "";
+    if (!n) {
+        // A node gone: nothing to act on
+        return __builtin_strncmp(s, "accessibilityPerform", 20) &&
+               __builtin_strcmp(s, "setAccessibilityFocused:");
+    } else if (!__builtin_strcmp(s, "accessibilityPerformPress")) {
+        return macpressable(n);
+    } else if (!__builtin_strcmp(s, "accessibilityPerformShowMenu")) {
+        return (n->actions & AXA_MENU) != 0;
+    } else if (!__builtin_strcmp(s, "setAccessibilityFocused:")) {
+        return (n->actions & AXA_FOCUS) != 0;
+    } else if (!__builtin_strcmp(s, "accessibilityValue")) {
+        return macvalued(n);
+    } else if (!__builtin_strcmp(s, "isAccessibilityExpanded") ||
+               !__builtin_strcmp(s, "isAccessibilityDisclosed")) {
+        return n->role==AX_TREEITEM || n->role==AX_COMBO;
+    } else if (!__builtin_strcmp(s, "isAccessibilitySelected")) {
+        return n->role==AX_TAB || n->role==AX_LISTITEM || n->role==AX_MENUITEM;
+    }
+    using F = ObjcBool (*)(void *, void *, void *);
+    return macallowedup ? ((F)macallowedup)(self, sel, what) : 1;
+}
+
+
+// SDL3View's and the text input's methods, answering for the root
+
+static void *macviewcls, *macrespcls;
+
+// The superclass's method, past a subclass AppKit may have made of ours
+// at run time (key-value observing), which would call ours again
+static void *macviewsuper(void *self, void *sel)
+{
+    void *c = object_getClass(self);
+    while (c && c!=macviewcls && c!=macrespcls) {
+        c = class_getSuperclass(c);
+    }
+    return class_getMethodImplementation(class_getSuperclass(c), sel);
+}
+
+// Whether self is the window's own view, not the hidden one SDL waits
+// on while the window is shed
+static b32 macours(void *self)
+{
+    void *win = macwindow();
+    return win && objcsend<void *>(self, "window")==win;
+}
+
+static void *macviewkids(void *self, void *sel)
+{
+    if (!macours(self)) {
+        return ((void *(*)(void *, void *))macviewsuper(self, sel))(self, sel);
+    }
+    macax.gets[MG_TREE]++;
+    if (!macready("AXChildren")) {
+        return objcsend<void *>(objc_getClass("NSArray"), "array");  // a bare root, for now
+    }
+    macax.rootasked = 1;
+    return mackidsof(0);
+}
+
+static void *macviewhit(void *self, void *sel, NsPoint p)
+{
+    using F = void *(*)(void *, void *, NsPoint);
+    f32 x = 0, y = 0;
+    if (macours(self) && macready("hit test") && macfromscreen(p, &x, &y)) {
+        macax.gets[MG_HIT]++;
+        i32 i = machit(x, y);
+        if (i > 0) {
+            return macelof(i);
+        }
+    }
+    return ((F)macviewsuper(self, sel))(self, sel, p);
+}
+
+static void *macviewfocus(void *self, void *sel)
+{
+    if (macours(self) && macready("focus")) {
+        macax.gets[MG_FOCUS]++;
+        if (void *el = macfocused()) {
+            return el;
+        }
+    }
+    return ((void *(*)(void *, void *))macviewsuper(self, sel))(self, sel);
+}
+
+
+// After each publish: tell AppKit what changed, of the elements a tool
+// has, and let go of those whose nodes are gone.
+
+static void macpost(void *el, i32 note)
+{
+    if (el) {
+        NSAccessibilityPostNotification(el, nsstring(macnotes[note]));
+        macax.posted[note]++;
+    }
+}
+
+static void macgets(AxGui *l)
+{
+    i32 total = 0;
+    for (i32 k = 0; k < MG_N; k++) {
+        total += macax.gets[k];
+    }
+    if (!total || !l) {
+        return;
+    }
+    Arena a = l->logmem;
+    Buf   b(&a, 256);
+    print(&b, "asked");
+    for (i32 k = 0; k < MG_N; k++) {
+        if (macax.gets[k]) {
+            putbyte(&b, ' ');
+            print(&b, Str{(u8 *)macgetnames[k], (iz)__builtin_strlen(macgetnames[k])});
+            putbyte(&b, ' ');
+            print(&b, (i64)macax.gets[k]);
+        }
+    }
+    print(&b, ", elements ");
+    print(&b, (i64)macax.len);
+    axnote(l, a, finish(&b));
+}
+
+static void macpublished(AxGui *x)
+{
+    AxTree *t    = x->ax->pub;
+    Gui    *g    = x->g;
+    void   *pool = objc_autoreleasePoolPush();
+    void   *win  = macwindow();
+    b32     key  = win && objcsend<ObjcBool>(win, "isKeyWindow");
+    b32     layout = macax.started || macax.layoutowed;
+    macax.pass   = macax.pass+1 ? macax.pass+1 : 1;  // never 0: no publish
+    macax.inpass = 1;
+
+    for (iz e = 0; e < t->events.len; e++) {
+        AxEvent ev = t->events[e];
+        i32     i  = axfind(t, ev.key);
+        switch (ev.kind) {
+        case AXE_DESTROYED: {
+            i32 s = macslot(ev.key);
+            if (s >= 0) {
+                void *el = macax.tab[s].el;
+                macunslot(s);
+                *macdeadp(el) = MACDEAD_DYING;
+                macpost(el, MN_DESTROYED);
+                *macdeadp(el) = MACDEAD_GONE;
+                objcsend<void>(el, "release");
+            }
+        } break;
+        case AXE_CREATED:
+            // Under a parent a tool knew of before this publish, so its
+            // children's change. Not under one made just now: its own
+            // creation tells of what is under it.
+            if (i>0 && t->nodes[i].role!=AX_NONE) {
+                i32 p = macparent(t, i);
+                i32 s = p ? macslot(t->nodes[p].key) : -1;
+                if (p ? s>=0 && macax.tab[s].born!=macax.pass : macax.rootasked) {
+                    macpost(macelof(i), MN_CREATED);
+                }
+            }
+            break;
+        case AXE_NAME:
+            // Where the name is: a static text's value, a menu item's
+            // title, otherwise its label, which has no notice of its own
+            if (void *el = i>0 ? macelif(i) : 0) {
+                switch (t->nodes[i].role) {
+                case AX_TEXT:     macpost(el, MN_VALUE); break;
+                case AX_MENUITEM: macpost(el, MN_TITLE); break;
+                default:          layout = 1;
+                }
+            }
+            break;
+        case AXE_VALUE:
+        case AXE_STATE:
+            macpost(i>0 ? macelif(i) : 0, MN_VALUE);
+            break;
+        case AXE_FOCUS:
+            // Only the window the user is in has the focus to tell of
+            if (key && i>0) {
+                macpost(macfocused(), MN_FOCUS);
+            }
+            break;
+        case AXE_CHILDREN:
+            break;  // as layout
+        case AXE_LAYOUT:
+            layout = 1;
+            break;
+        }
+    }
+
+    // The field's selection, or its marked text, moved
+    AxText *tx = &x->ax->text;
+    if (tx->live) {
+        u64 mh = hash(tx->marked);
+        b32 moved = tx->key==macax.tkey && (tx->rev!=macax.trev ||
+                    tx->anchor!=macax.tanchor || tx->caret!=macax.tcaret || mh!=macax.tmarked);
+        if (moved) {
+            i32 i = axfind(t, tx->key);
+            macpost(i>0 ? macelif(i) : 0, MN_SELTEXT);
+        }
+        macax.tkey    = tx->key;
+        macax.trev    = tx->rev;
+        macax.tanchor = tx->anchor;
+        macax.tcaret  = tx->caret;
+        macax.tmarked = mh;
+    } else {
+        macax.tkey = 0;
+    }
+
+    // In a nested loop (a live resize) frames come fast: tell less often
+    i64 now = g->sched.now;
+    if (layout && win && (!g->inmodal || now-macax.layoutat>=MACLAYOUT_GAP)) {
+        macpost(NSAccessibilityUnignoredAncestor(objcsend<void *>(win, "contentView")),
+                MN_LAYOUT);
+        macax.startposts += macax.started;
+        macax.layoutat   = now;
+        macax.layoutowed = 0;
+        macax.started    = 0;
+    } else if (layout) {
+        macax.layoutowed = 1;
+    }
+
+    macax.inpass = 0;
+    macgets(maclog());
+    for (i32 k = 0; k < MG_N; k++) {
+        macax.gets[k] = 0;
+    }
+    objc_autoreleasePoolPop(pool);
+}
+
+
+// The checklist's "ns" verbs (driveax): the tree through AppKit, as a
+// tool in this process would ask it, from the window down
+//   start              ask the view's children: a bare root, if the
+//                      tree wasn't on, and on from then
+//   started            AppKit told of the tree once a start published it
+//   has AXROLE NAME    an element so named, its parents up to the window
+//   focus AXROLE NAME  the window's focused element, or its first
+//                      responder's while it isn't key
+//   press AXROLE NAME  its AXPress: check that it's taken
+//   can ACTS AXROLE NAME  its actions (AXPress, AXShowMenu) include each,
+//                      a comma between, and not those with a '!'
+//   attr ATTR VALUE AXROLE NAME  an attribute, by its description
+//   hit AXROLE NAME    the window's hit test at its frame's middle
+//   mark               forget what was posted, and told for a start
+//   posted NOTE        AppKit was told NOTE since the mark
+
+static Str macstrof(void *o, char const *sel)
+{
+    if (!o || !objcsend<ObjcBool>(o, "respondsToSelector:", sel_registerName(sel))) {
+        return {};
+    }
+    void *s = objcsend<void *>(o, sel);
+    return maciskind(s, "NSString") ? macutf8(s) : Str{};
+}
+
+static void *macfindel(Arena a, void *win, Str role, Str name)
+{
+    enum { MAXSEEN = 1<<15 };
+    void **stack = alloc<void *>(&a, MAXSEEN);
+    i32    top   = 0;
+    void  *found = 0;
+    stack[top++] = win;
+    void  *sel   = sel_registerName("accessibilityChildren");
+    for (i32 seen = 0; top && seen<MAXSEEN; seen++) {
+        void *o = stack[--top];
+        if (o != win && macstrof(o, "accessibilityRole")==role &&
+                (macstrof(o, "accessibilityLabel")==name ||
+                 macstrof(o, "accessibilityTitle")==name)) {
+            found = found ? found : o;  // the first: the walk goes front first
+        }
+        void *kids = objcsend<ObjcBool>(o, "respondsToSelector:", sel)
+                     ? objcsend<void *>(o, "accessibilityChildren") : 0;
+        uz    n    = kids ? objcsend<uz>(kids, "count") : 0;
+        for (uz k = 0; k<n && top<MAXSEEN; k++) {
+            stack[top++] = objcsend<void *>(kids, "objectAtIndex:", k);  // front on top
+        }
+    }
+    return found;
+}
+
+// Whether el's parents lead to the window
+static b32 macreaches(void *el, void *win)
+{
+    for (i32 i = 0; el && i < 64; i++) {
+        if (el == win) {
+            return 1;
+        }
+        el = objcsend<void *>(el, "accessibilityParent");
+    }
+    return 0;
+}
+
+static void macdrive(Gui *g, Str cmd)
+{
+    Arena a    = g->frame;
+    void *pool = objc_autoreleasePoolPush();
+    Cut   c    = cut(cmd, ' ');
+    Str   verb = c.head;
+    Cut   r    = cut(c.tail, ' ');
+    void *win  = macwindow();
+    void *view = win ? objcsend<void *>(win, "contentView") : 0;
+    Str   what = concat(&a, "ns ", cmd);
+
+    if (!view || !axmac) {
+        axcheck(g, &a, 0, concat(&a, what, ": no window"));
+    } else if (verb == "start") {
+        b32   was  = axmac->on;
+        void *kids = objcsend<void *>(view, "accessibilityChildren");
+        uz    n    = kids ? objcsend<uz>(kids, "count") : 99;
+        Buf b(&a, 128);
+        print(&b, what);
+        print(&b, was ? Str(": on already, ") : Str(": started, "));
+        print(&b, (i64)n);
+        print(&b, " children");
+        axcheck(g, &a, axmac->on && (was || n==0), finish(&b));
+        macax.startwason = was;
+    } else if (verb == "started") {
+        // AppKit told of the tree a start made, unless it was on already
+        Buf b(&a, 128);
+        print(&b, what);
+        print(&b, macax.startwason ? Str(": on already, nothing to tell") : Str(": layout told "));
+        if (!macax.startwason) {
+            print(&b, (i64)macax.startposts);
+        }
+        axcheck(g, &a, macax.startwason || macax.startposts>0, finish(&b));
+    } else if (verb == "mark") {
+        for (i32 k = 0; k < MN_N; k++) {
+            macax.posted[k] = 0;
+        }
+        macax.startposts = 0;
+        guilog(g, concat(&a, "drive: ", what));
+    } else if (verb == "posted") {
+        i32 got = -1;
+        for (i32 k = 0; k < MN_N; k++) {
+            got = c.tail==Str{(u8 *)macnotes[k], (iz)__builtin_strlen(macnotes[k])}
+                  ? macax.posted[k] : got;
+        }
+        Buf b(&a, 128);
+        print(&b, what);
+        print(&b, ": ");
+        print(&b, (i64)got);
+        axcheck(g, &a, got > 0, finish(&b));
+    } else {
+        // VERB [ARGS] AXROLE NAME
+        Cut   av    = cut(c.tail, ' ');  // attr's ATTR, then VALUE
+        Cut   vv    = cut(av.tail, ' ');
+        Str   rest  = verb=="can"  ? r.tail
+                    : verb=="attr" ? vv.tail
+                    :                c.tail;
+        Cut   rn    = cut(rest, ' ');
+        void *el    = macfindel(a, win, rn.head, rn.tail);
+        if (!el) {
+            axcheck(g, &a, 0, concat(&a, what, ": not found"));
+        } else if (verb == "has") {
+            axcheck(g, &a, macreaches(el, win),
+                    concat(&a, what, macreaches(el, win) ? Str("") : Str(": not under the window")));
+        } else if (verb == "focus") {
+            // The window answers for its first responder only while it is
+            // key, which the checklist's mostly isn't: then, as AppKit
+            // would ask once it is, the first responder, a view of ours
+            // (the text input's, or the window's own, with none)
+            b32   key = objcsend<ObjcBool>(win, "isKeyWindow");
+            void *fr  = objcsend<void *>(win, "firstResponder");
+            void *at  = key ? win : maciskind(fr, "NSView") ? fr : view;
+            void *f   = objcsend<void *>(at, "accessibilityFocusedUIElement");
+            Str   by  = key ? Str(": the window's is ") : Str(": its first responder's is ");
+            axcheck(g, &a, f==el, f==el ? what : concat(&a, what, concat(&a, by,
+                    concat(&a, macstrof(f, "accessibilityRole"),
+                           concat(&a, " ", macstrof(f, "accessibilityLabel"))))));
+        } else if (verb == "press") {
+            b32 ok = objcsend<ObjcBool>(el, "accessibilityPerformPress");
+            axcheck(g, &a, ok, concat(&a, what, ok ? Str("") : Str(": refused")));
+        } else if (verb == "can") {
+            // NSAccessibilityElement has no list of actions in process:
+            // AppKit makes one for a tool from the selectors allowed
+            b32 ok = 1;
+            for (Cut w = cut(r.head, ','); w.head.len; w = cut(w.tail, ',')) {
+                b32 no  = w.head[0] == '!';
+                Str act = no ? cuthead(w.head, 1) : w.head;
+                char const *sel = act=="AXPress"    ? "accessibilityPerformPress"
+                                : act=="AXShowMenu" ? "accessibilityPerformShowMenu"
+                                :                     "";
+                b32 has = *sel && objcsend<ObjcBool>(el, "respondsToSelector:",
+                                                     sel_registerName(sel)) &&
+                          objcsend<ObjcBool>(el, "isAccessibilitySelectorAllowed:",
+                                             sel_registerName(sel));
+                ok &= has != no;
+            }
+            axcheck(g, &a, ok, what);
+        } else if (verb == "attr") {
+            // By the getter AppKit answers a tool's attribute with
+            static struct { Str attr; char const *sel; b32 flag; } const getters[] = {
+                {"AXRole",        "accessibilityRole",      0},
+                {"AXSubrole",     "accessibilitySubrole",   0},
+                {"AXDescription", "accessibilityLabel",     0},
+                {"AXTitle",       "accessibilityTitle",     0},
+                {"AXHelp",        "accessibilityHelp",      0},
+                {"AXValue",       "accessibilityValue",     0},
+                {"AXEnabled",     "isAccessibilityEnabled", 1},
+                {"AXFocused",     "isAccessibilityFocused", 1},
+                {"AXSelected",    "isAccessibilitySelected", 1},
+                {"AXExpanded",    "isAccessibilityExpanded", 1},
+            };
+            Buf b(&a, 256);
+            for (i32 k = 0; k < countof(getters); k++) {
+                if (getters[k].attr != av.head) {
+                    continue;
+                } else if (getters[k].flag) {
+                    print(&b, objcsend<ObjcBool>(el, getters[k].sel) ? Str("1") : Str("0"));
+                } else {
+                    macdesc(&b, objcsend<void *>(el, getters[k].sel), 200);
+                }
+            }
+            Str got = finish(&b);
+            axcheck(g, &a, got==vv.head,
+                    got==vv.head ? what : concat(&a, what, concat(&a, ", not ", got)));
+        } else if (verb == "hit") {
+            NsRect  f = objcrect(el, "accessibilityFrame");
+            NsPoint p = {f.x + f.w/2, f.y + f.h/2};
+            void   *h = objcsend<void *>(win, "accessibilityHitTest:", p);
+            Buf b(&a, 256);
+            print(&b, what);
+            if (h != el) {
+                print(&b, ": found ");
+                print(&b, macstrof(h, "accessibilityRole"));
+                putbyte(&b, ' ');
+                print(&b, macstrof(h, "accessibilityLabel"));
+            }
+            axcheck(g, &a, h==el, finish(&b));
+        } else {
+            axcheck(g, &a, 0, concat(&a, what, ": no such command"));
+        }
+    }
+    objc_autoreleasePoolPop(pool);
+}
+
+// The element class and the views' methods, once
+static void macaxtree(Gui *g)
+{
+    void *up  = objc_getClass("NSAccessibilityElement");
+    void *cls = up ? objc_allocateClassPair(up, "ProsperoAxElement", 0) : 0;
+    if (!cls) {
+        return;
+    }
+    void *am = class_getInstanceMethod(up, sel_registerName("isAccessibilitySelectorAllowed:"));
+    macallowedup = am ? method_getImplementation(am) : 0;
+    class_addIvar(cls, "axkey", sizeof(u32), 2, "I");
+    class_addIvar(cls, "axdead", sizeof(u32), 2, "I");
+    static struct { char const *sel; void *imp; char const *types; } const ms[] = {
+        {"accessibilityRole",            (void *)macelrole,       "@@:"},
+        {"accessibilitySubrole",         (void *)macelsubrole,    "@@:"},
+        {"accessibilityLabel",           (void *)macellabel,      "@@:"},
+        {"accessibilityTitle",           (void *)maceltitle,      "@@:"},
+        {"accessibilityHelp",            (void *)macelhelp,       "@@:"},
+        {"accessibilityValue",           (void *)macelvalue,      "@@:"},
+        {"isAccessibilityEnabled",       (void *)macelenabled,    "B@:"},
+        {"isAccessibilityFocused",       (void *)macelfocusedq,   "B@:"},
+        {"isAccessibilitySelected",      (void *)macelselected,   "B@:"},
+        {"isAccessibilityExpanded",      (void *)macelexpanded,   "B@:"},
+        {"isAccessibilityDisclosed",     (void *)macelexpanded,   "B@:"},
+        {"isAccessibilityElement",       (void *)macelisel,       "B@:"},
+        {"accessibilityParent",          (void *)macelparent,     "@@:"},
+        {"accessibilityChildren",        (void *)macelkids,       "@@:"},
+        {"accessibilityWindow",          (void *)macelwindow,     "@@:"},
+        {"accessibilityTopLevelUIElement", (void *)macelwindow,   "@@:"},
+        {"accessibilityFrame",           (void *)macelframe,      "{CGRect={CGPoint=dd}{CGSize=dd}}@:"},
+        {"accessibilityHitTest:",        (void *)macelhit,        "@@:{CGPoint=dd}"},
+        {"accessibilityPerformPress",    (void *)macelpress,      "B@:"},
+        {"accessibilityPerformShowMenu", (void *)macelmenu,       "B@:"},
+        {"setAccessibilityFocused:",     (void *)macelsetfocused, "v@:B"},
+        {"isAccessibilitySelectorAllowed:", (void *)macelallowed, "B@::"},
+    };
+    for (i32 i = 0; i < countof(ms); i++) {
+        void       *sel   = sel_registerName(ms[i].sel);
+        void       *m     = class_getInstanceMethod(up, sel);
+        char const *types = m ? method_getTypeEncoding(m) : ms[i].types;
+        class_addMethod(cls, sel, ms[i].imp, types);
+    }
+    objc_registerClassPair(cls);
+    macax.cls     = cls;
+    macax.keyoff  = ivar_getOffset(class_getInstanceVariable(cls, "axkey"));
+    macax.deadoff = ivar_getOffset(class_getInstanceVariable(cls, "axdead"));
+    macax.mem     = newarena(os_reserve(g->os, (iz)1 << 28));
+
+    // The root's, on the views; before the log's wrappers, which then
+    // leave these selectors to them
+    static struct { char const *cls, *sel; void *imp; } const vs[] = {
+        {"SDL3View",                "accessibilityChildren",         (void *)macviewkids},
+        {"SDL3View",                "accessibilityHitTest:",         (void *)macviewhit},
+        {"SDL3View",                "accessibilityFocusedUIElement", (void *)macviewfocus},
+        {"SDL3TranslatorResponder", "accessibilityFocusedUIElement", (void *)macviewfocus},
+    };
+    macviewcls = objc_getClass("SDL3View");
+    macrespcls = objc_getClass("SDL3TranslatorResponder");
+    for (i32 i = 0; i < countof(vs); i++) {
+        void *c   = objc_getClass(vs[i].cls);
+        void *sel = sel_registerName(vs[i].sel);
+        void *m   = c ? class_getInstanceMethod(c, sel) : 0;
+        if (m && !macownmethod(c, vs[i].sel)) {
+            class_addMethod(c, sel, vs[i].imp, method_getTypeEncoding(m));
+        }
+    }
+    g->ax->published = macpublished;
+    g->ax->osdrive   = macdrive;
+}
+
+// Install the tree and the log's wrappers, once: with accessibility
+// off, none.
 static void axmacinit(Gui *g)
 {
     if (!g->ax || axmac) {
         return;
     }
     axmac = g->ax;
+    macaxtree(g);
 
     void *t = objc_getClass("SDL3TranslatorResponder");
     if (t) {
