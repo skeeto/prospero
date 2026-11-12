@@ -171,7 +171,9 @@ completed and checked there, and a link to a file in such a session's
 transcript, or the path in its read, edit or write row, opens the file
 there, its tooltip saying on which host. While the connection is
 broken, a file not yet read there says its host is not connected, and
-is read once it is back. An engine older than this window says it is
+is read once it is back. One shown is checked there, and read again
+when it changes, as a file on this computer is ([Files](help:sessions#files)).
+An engine older than this window says it is
 too old to show its files: update it (below).
 
 ## A remote with no models of its own

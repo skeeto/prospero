@@ -274,8 +274,13 @@ band until text is selected; opening it again goes there again.
 A file shows as text, its lines numbered and highlighted, wrapped at
 the pane's width unless Wrap is off (then scrolled sideways), or a
 Markdown file rendered, the Markdown box switching between the two at
-the same line. Reload (the circular arrow) reads it again, and a tab's
-menu closes tabs or copies the path. A binary file says so, with Show
+the same line. A file shown is read again when it changes, as far as
+anything here knows: checked as a tool, a job or a turn ends on its
+host, as a turn is rewound, as the window or the pane takes the focus
+and as its tab is picked or a link to it clicked, never by polling, at
+most once a second; the text stays at the same line. Reload (the
+circular arrow) reads it again at once, and a tab's menu closes tabs or
+copies the path. A binary file says so, with Show
 as text anyway; past 4 MiB or 100,000 lines only the start shows.
 
 A link to a file in the transcript, in the plan or in a Markdown file
@@ -293,9 +298,7 @@ click again goes there again. Right-click a link for Open in Files or
 Copy path. The path on a read, write or edit tool row is a link to
 its file as well, a read's at the lines it read and an edit's at the
 lines it changed; a click elsewhere on the row's header still folds
-it. Until files on
-other hosts can be shown, a link in a session on another host only
-says so.
+it.
 
 ## The session's menu
 

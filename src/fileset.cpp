@@ -26,6 +26,70 @@ enum : iz {
     FILES_BUDGET = (iz)64 << 20,  // all bodies, image textures included
 };
 
+enum : i64 {  // epoch ms
+    FILES_GAP    = 1000,       // the least time between a tab's checks
+    FILES_LOST   = 30*1000,    // a check unanswered this long was lost
+    FILES_COARSE = 2000,       // an mtime this near its read may hide a change
+};
+
+enum : i32 {
+    FILES_TRIES = 3,  // checks that failed in a row, kept stale, then left
+};
+
+// Whether a tab's file may have changed since it was read, and the
+// checking of it (filenext). Nothing polls: marks set stale, as tools,
+// jobs and turns end on its host, as a turn is rewound or a cut undone,
+// as the window or the pane takes the focus, and as the tab is picked
+// or a link to it clicked.
+struct FileWatch {
+    b32 stale;   // it may have changed since last checked
+    b32 force;   // Reload: read it again, whatever its stat says
+    i64 id;      // a check in flight: its fs.stat's id, -1 its read; else 0
+    i32 fails;   // checks in a row that failed (FILES_TRIES)
+    i64 sent;    // when the last check began, epoch ms here
+    i64 readat;  // when its body was read, epoch ms on its host's clock
+};
+
+struct FileNext {
+    b32 check;  // check it now
+    i64 wake;   // else when to look again, epoch ms, or 0 for no sooner
+                // than the next mark
+};
+
+// Whether to check a tab's file as of now (epoch ms): only once it may
+// have changed (stale), with its last check answered or lost, once per
+// FILES_GAP at most, but at once for Reload (force). A mark while a
+// check is in flight sets stale again, for another once it is done.
+// Nothing while it is read again (id -1): that read, however slow, ends
+// on its own, and checking meanwhile would restart it.
+static FileNext filenext(FileWatch *w, i64 now)
+{
+    FileNext r = {};
+    if ((!w->stale && !w->force) || w->id<0) {
+        return r;
+    }
+    i64 at = w->force ? 0 : w->sent + FILES_GAP;
+    if (w->id) {
+        at = at>w->sent+FILES_LOST ? at : w->sent+FILES_LOST;
+    }
+    if (now < at) {
+        r.wake = at;
+    } else {
+        r.check = 1;
+    }
+    return r;
+}
+
+// Whether a file read at readat, size and mtime then (its host's
+// clock), is to be read again, its stat now size1 and mtime1: either
+// changed, or its mtime was within FILES_COARSE of the read, when a
+// write since may have left a coarse mtime as it was.
+static b32 filechanged(i64 size, i64 mtime, i64 readat, i64 size1, i64 mtime1)
+{
+    i64 near = readat - mtime;
+    return size!=size1 || mtime!=mtime1 || (near<FILES_COARSE && near>-FILES_COARSE);
+}
+
 enum : i32 {  // FileTab.state
     FTAB_UNREAD,   // not read, or its body freed: read when shown
     FTAB_READING,  // a read in flight
@@ -57,8 +121,8 @@ struct FileTab {
     i32       top;        // the line at the view's top, 0-based
     f32       dy;         // and how far past its top the view is
     f32       scrollx;    // unwrapped
-    b32       stale;      // it may have changed since it was read
-    b32       astext;     // binary, but shown as text anyway
+    FileWatch watch;      // whether it changed since it was read
+    b32       astext;    // binary, but shown as text anyway
     Str       err;        // why it failed, a literal
     i64       opens;      // and its host's opens then: tried again once it changes
     u8        section[FILES_SECTION];  // a heading to scroll to

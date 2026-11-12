@@ -46,6 +46,19 @@ static Str filetextstr(Arena *a, FileText ft)
     return finish(&b);
 }
 
+// filenext's decision: "check" or "none", and "@" its wake.
+static Str filenextstr(Arena *a, FileWatch w, i64 now)
+{
+    FileNext n = filenext(&w, now);
+    Buf      b(a, 32);
+    print(&b, n.check ? Str("check") : Str("none"));
+    if (n.wake) {
+        putbyte(&b, '@');
+        print(&b, n.wake);
+    }
+    return finish(&b);
+}
+
 static void test_fileset(Test *t)
 {
     Arena a = t->perm;
@@ -323,4 +336,53 @@ static void test_fileset(Test *t)
     expect(t, "fileclamp.zero", istr(&a, fileclamp(0, 10)), "0");
     expect(t, "fileclamp.neg", istr(&a, fileclamp(-3, 10)), "0");
     expect(t, "fileclamp.empty", istr(&a, fileclamp(3, 0)), "0");
+
+    // Checks: only once stale, a second apart, at once for Reload, and
+    // after one in flight answers or is lost
+    {
+        i64 t0 = 1793546320000;
+        struct { b32 stale, force; i64 id, sent, now; Str want; } cases[] = {
+            {0, 0, 0, 0, t0, "none"},                        // never marked
+            {1, 0, 0, 0, t0, "check"},                       // never checked
+            {1, 0, 0, t0-400, t0, "none@1793546320600"},     // within the gap
+            {1, 0, 0, t0-1000, t0, "check"},                 // past it
+            {0, 1, 0, t0-100, t0, "check"},                  // Reload: no gap
+            {1, 1, 0, t0-100, t0, "check"},
+            {0, 0, 7, t0-100, t0, "none"},                   // in flight, unmarked
+            {1, 0, 7, t0-5000, t0, "none@1793546345000"},    // marked meanwhile
+            {1, 0, -1, t0-5000, t0, "none"},                 // its read in flight
+            {1, 1, -1, t0-60000, t0, "none"},                // however long
+            {0, 1, 7, t0-100, t0, "none@1793546349900"},     // Reload waits for it
+            {1, 0, 7, t0-30000, t0, "check"},                // lost
+            {1, 0, 0, t0-5000, t0, "check"},                 // answered: once more
+        };
+        for (auto &c : cases) {
+            FileWatch w = {};
+            w.stale = c.stale;
+            w.force = c.force;
+            w.id    = c.id;
+            w.sent  = c.sent;
+            expect(t, "filenext", filenextstr(&a, w, c.now), c.want);
+        }
+    }
+
+    // Read again when its size or mtime changed, or its mtime was within
+    // 2 s of the read either way, which a coarse clock may hide
+    {
+        i64 t0 = 1793546320000;
+        struct { i64 size, mtime, readat, size1, mtime1; b32 want; } cases[] = {
+            {10, t0-60000, t0, 10, t0-60000, 0},  // as it was
+            {10, t0-60000, t0, 11, t0-60000, 1},  // grew
+            {10, t0-60000, t0, 10, t0-59000, 1},  // touched
+            {10, t0-60000, t0, 10, t0-61000, 1},  // older
+            {10, t0-1999, t0, 10, t0-1999, 1},    // near its read
+            {10, t0-2000, t0, 10, t0-2000, 0},
+            {10, t0+1500, t0, 10, t0+1500, 1},    // ahead of this clock
+            {10, t0+2000, t0, 10, t0+2000, 0},
+        };
+        for (auto &c : cases) {
+            b32 got = filechanged(c.size, c.mtime, c.readat, c.size1, c.mtime1);
+            expect(t, "filechanged", istr(&a, got), istr(&a, c.want));
+        }
+    }
 }

@@ -1149,6 +1149,8 @@ struct FileFetch {
     i32      again;    // restarts as it changed
     i32      lost;     // replies lost, asked again
     b32      changed;  // it changed again: what came is kept
+    b32      reload;   // its tab is read already, and shown meanwhile
+    i64      ts;       // when the first part was read, on its host's clock
 };
 
 // A file's text view as drawdoc draws it (DocView of chunk messages, a
@@ -1908,6 +1910,8 @@ struct Gui {
     i32                fmarktop;     // a top line the checklist remembered
     b32                filesdrawn;   // the pane was drawn this frame
     i64                fileloads;    // files read, for the checklist
+    b32                fileswin;     // the window had the focus, as last drawn
+    b32                filesfocus;   // and the pane
 
     // Files and log
     Str                statedir;
@@ -6023,8 +6027,11 @@ static void filesfont(Gui *);
 static void fileaskopen(Gui *);
 static Str  fileaskwhy(Gui *);
 static void fileanswer(Gui *, Str);
-static void onfsread(Gui *, Arena, Json *, b32, Str);
+static void onfsread(Gui *, Arena, Json *, b32, Str, i64);
 static void onfsstat(Gui *, Arena, Json *, b32, Str);
+static void onfswatch(Gui *, i64, Json *, b32, Str);
+static u64  fileuid(GuiHost *);
+static void filesstale(Gui *, u64, i64, b32);
 static void filefetchagain(Gui *, GuiHost *);
 static void filehostend(Gui *, GuiHost *);
 static void termhostlost(Gui *, GuiHost *);
@@ -6131,13 +6138,15 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
 
     case CMD_FSREAD:
         if (id && id==g->ffetch.id) {
-            onfsread(g, scratch, j, ok, err);
+            onfsread(g, scratch, j, ok, err, r->ts);
         }
         return;
 
     case CMD_FSSTAT:
         if (id && id==g->fask.statid) {
             onfsstat(g, scratch, j, ok, err);
+        } else if (id) {
+            onfswatch(g, id, j, ok, err);  // a tab's check, maybe
         }
         return;
 
@@ -7639,6 +7648,10 @@ static b32 guiapply(Gui *g, GuiHost *h, Arena a, EvRec *r, Str line)
     if ((r->ev==EV_TOOLEND || r->ev==EV_JOBEND || r->ev==EV_TURNEND) &&
             g->sess && g->sess->host==h) {
         gitstale(g, g->sess);  // any session's tools may change its files
+    }
+    if (r->ev==EV_TOOLEND || r->ev==EV_JOBEND || r->ev==EV_TURNEND ||
+            r->ev==EV_REWIND || r->ev==EV_CUT || r->ev==EV_UNCUT) {
+        filesstale(g, fileuid(h), r->ts, 0);  // and the files shown from there
     }
     if (r->ev == EV_JOBOUT) {
         // Applied, so that the Jobs window is current once shown, but
@@ -14086,6 +14099,7 @@ enum : i32 {
     W_TERMBUSY,   // its front tab runs a program, or not with "idle"
     W_TERMCOUNT,  // dx terminals are open, in every session
     W_FILEREADY,  // the front file is read and drawn, jumped or restored
+    W_FILEFRESH,  // and checked since its last mark, nothing in flight
 };
 
 static Str waitnames[] = {
@@ -14112,9 +14126,9 @@ static Str waitnames[] = {
     "the changes", "the folder's probe", "the worktree's branch",
     "the thin remote", "a relayed stream", "the container",
     "the terminal's text", "the terminal's program", "the terminals' count",
-    "the file",
+    "the file", "the file checked",
 };
-static_assert(countof(waitnames) == W_FILEREADY+1);
+static_assert(countof(waitnames) == W_FILEFRESH+1);
 
 enum : i32 {
     KEY_CTRL  = 1,
@@ -16167,6 +16181,27 @@ static DriveOp m3ops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_TOOLPATHFOLD, 1, 0, 0, ""},
+    // A file a tool changes is read again as the tool ends, its new text
+    // shown from the same top line, and checked again as the turn ends
+    {OP_OPENFILE, 0, 0, 0, 300, "files/lines.txt:1200"},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILETEXT, 0, 0, 0, "line 1\n"},
+    {OP_CHECK, CHK_FILELINE, 0, 0, 0, "mark"},
+    {OP_PROMPT, 0, 0, 0, 1500, "Edit the lines."},
+    {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
+    {OP_WAIT, W_FILEFRESH, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILETEXT, 0, 0, 0, "edited 1\n"},
+    {OP_CHECK, CHK_FILELINE, 0, 0, 0, "kept"},
+    {OP_SHOT, 0, 0, 0, 300, "files-reloaded"},
+    // Deleted, it says so; put back, a mark reads it again
+    {OP_PROMPT, 0, 0, 0, 1500, "Remove the lines."},
+    {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILENOTE, 0, 0, 0, "No such file"},
+    {OP_PROMPT, 0, 0, 0, 1500, "Restore the lines."},
+    {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
+    {OP_WAIT, W_FILEFRESH, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILETEXT, 0, 0, 0, "restored 1\n"},
     // Quiet with a file shown, past the tooltips and the layout's save
     {OP_MOVE, T_EMPTY, 0, 0, 4500, ""},
     {OP_MARK, 0, 0, 0, 3000, ""},
@@ -17926,6 +17961,13 @@ static DriveOp remoteops[] = {
     // refused; a link to a file there, and to one not there
     REMOTEFILES(OP_TEXTRCWD, "", "/hello.txt", "/nope.txt"),
     {OP_SHOT, 0, 0, 0, 300, "remote-files"},
+    // A far file a tool changes is checked there (fs.stat) and read
+    // again there (fs.read)
+    {OP_PROMPT, 0, 0, 0, 100, "Edit the far file."},
+    {OP_WAIT, W_IDLE, 0, 0, 30000, ""},
+    {OP_WAIT, W_FILEFRESH, 0, 0, 20000, ""},
+    {OP_CHECK, CHK_FILETEXT, 0, 0, 0, "hullo "},
+    {OP_CHECK, CHK_FILEHOST, 1, 0, 0, ""},
     // URL includes, fetched again from the settings window
     {OP_MOVE, T_SETTINGSTAB, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -21556,6 +21598,12 @@ static b32 drivewaitdone(Gui *g)
         return (f32)drivetermcount(g) == g->ops[g->drivepc-1].dx;
     case W_FILEREADY:
         return drivefileready(g);
+    case W_FILEFRESH: {
+        FileTab   *ft = filefront(g);
+        FileWatch *w  = ft ? &ft->watch : 0;
+        return drivefileready(g) && ft->body && !w->stale && !w->force && !w->id &&
+               g->ffetch.ft!=ft;
+    }
     case W_VIA:
         return g->sess && v->state==LIVE_STREAMING && v->relaylen>0 && v->deltas>0;
     case W_PLAN: {

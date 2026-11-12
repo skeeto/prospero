@@ -3024,6 +3024,8 @@ GUI_PROMPTS = ("Stream slowly", "Run the tools", "be allowed", "wait for nobody"
                "Stream, then pause", "Call the MCP server", "Remember the hosts",
                "Answer with links", "Ask me questions", "Describe the files",
                "Cite the files", "Read the cited lines", "Link the far file",
+               "Edit the lines", "Edit the far file", "Remove the lines",
+               "Restore the lines",
                "Run a command to stop", "Read a long prompt",
                "Start a subagent in a container", "Sleep in a container as a subagent")
 
@@ -3164,6 +3166,27 @@ def sc_gui(model, n, req):
         # its engine there reads, and to one not there
         yield from answer(model, "Linked: [hello.txt:1](hello.txt:1), "
                           "and [not there](nope.txt).\n")
+    elif "Edit the lines" in prompt or "Edit the far file" in prompt:
+        # A file shown in the Files pane changed by a tool, which the pane
+        # reads again: files/lines.txt's first line here, or the far
+        # session's hello.txt there
+        far = "Edit the far file" in prompt
+        args = ({"path": "hello.txt", "old_string": "hello", "new_string": "hullo"} if far else
+                {"path": "files/lines.txt", "old_string": "line 1\n",
+                 "new_string": "edited 1\n"})
+        if step == 0:
+            yield from tool(model, n, "edit", args)
+        else:
+            yield from answer(model, "Edited.")
+    elif "Remove the lines" in prompt or "Restore the lines" in prompt:
+        # The file shown (after "Edit the lines") deleted, then written
+        # again: the pane says it's gone, then shows it again
+        args = ({"command": "rm files/lines.txt"} if "Remove" in prompt else
+                {"path": "files/lines.txt", "content": "restored 1\nline 2\n"})
+        if step == 0:
+            yield from tool(model, n, "shell" if "Remove" in prompt else "write", args)
+        else:
+            yield from answer(model, "Done.")
     elif "Read the cited lines" in prompt:
         # Tool rows whose paths open their files (after "Cite the
         # files"): an edit, at the line its result names, then a read of

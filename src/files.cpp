@@ -193,9 +193,10 @@ static DocView *filedocview(Arena *mem, ViewCache *c, iz nmsgs)
 }
 
 // A tab's file, raw, its first FILES_MAX bytes of size, made into a body
-// of its own, highlighted, in chunks: the scratch sr is released.
-static void filemake(Gui *g, FileTab *ft, Region *sr, Arena s, Str raw, i64 size,
-                     i64 mtime, b32 changed)
+// of its own, highlighted, in chunks, else null, saying why: the scratch
+// sr is released, and the tab left as it is.
+static FileBody *filemake(Gui *g, FileTab *ft, Region *sr, Arena s, Str raw, i64 size,
+                          i64 mtime, b32 changed, Str *why)
 {
     // Past FILES_MAX: up to its last whole line, and so cut
     b32 cut = size > raw.len;
@@ -222,8 +223,8 @@ static void filemake(Gui *g, FileTab *ft, Region *sr, Arena s, Str raw, i64 size
             os_release(g->os, r);
         }
         os_release(g->os, sr);
-        filefail(g, ft, "There is no memory to show it");
-        return;
+        *why = "There is no memory to show it";
+        return 0;
     }
     FileBody *b = alloc<FileBody>(&mem);
     b->r     = r;
@@ -277,43 +278,139 @@ static void filemake(Gui *g, FileTab *ft, Region *sr, Arena s, Str raw, i64 size
     b->c->base  = mem.beg;
     b->c->max   = FILES_CACHE;
     os_release(g->os, sr);
+    return b;
+}
 
-    ft->body  = b;
+// A tab's new body shown, else (null) why not, its old one let go. A
+// body of the same text as the old, read again, keeps the old, its place
+// laid out, with the new one's stat. Otherwise a body read again shows
+// from the same top line and with the same band, as far as it has them.
+// Returns whether what shows changed.
+static b32 fileswap(Gui *g, FileTab *ft, FileBody *nb, Str why)
+{
+    FileBody *old = ft->body;
+    if (!nb) {
+        filefree(g, ft);
+        filefail(g, ft, why);
+        return 1;
+    } else if (old && old->sum==nb->sum && old->body==nb->body && old->flags==nb->flags) {
+        b32 note = old->changed != nb->changed;
+        old->size    = nb->size;
+        old->mtime   = nb->mtime;
+        old->changed = nb->changed;
+        old->fetched = nb->fetched;
+        os_release(g->os, nb->r);
+        return note;
+    }
+    filefree(g, ft);
+    ft->body  = nb;
     ft->state = FTAB_READ;
-    if (ft->mode==FMODE_MARKDOWN && (!b->md || b->body.len>DOC_MAXSIZE)) {
+    ft->err   = {};
+    if (ft->mode==FMODE_MARKDOWN && (!nb->md || nb->body.len>DOC_MAXSIZE)) {
         ft->mode = FMODE_TEXT;  // too big to render, or binary shown as text
+    }
+    if (ft->top >= nb->lines) {
+        ft->top = nb->lines>0 ? nb->lines-1 : 0;  // shorter now
+        ft->dy  = 0;
+    }
+    return 1;
+}
+
+// The bodies' committed bytes, and how many there are.
+static iz filebytes(Gui *g, i32 *n)
+{
+    GuiSession *roots[] = {&g->nosession, g->sessions};
+    iz          total   = 0;
+    *n = 0;
+    for (i32 k = 0; k < countof(roots); k++) {
+        for (GuiSession *s = roots[k]; s; s = k ? s->next : 0) {
+            for (i32 i = 0; i < s->files.n; i++) {
+                FileBody *b = s->files.tabs[i]->body;
+                if (b) {
+                    total += b->r->committed;
+                    (*n)++;
+                }
+            }
+        }
+    }
+    return total;
+}
+
+// Bodies let go, least recently drawn first, until all, with extra
+// bytes more, fit in FILES_BUDGET, but never keep's nor the one shown.
+static void filesfit(Gui *g, FileTab *keep, iz extra)
+{
+    GuiSession *roots[] = {&g->nosession, g->sessions};
+    GuiSession *shown   = filesroot(g);
+    FileTab    *front   = filesetfront(&shown->files);
+    i32         n       = 0;
+    iz          total   = filebytes(g, &n) + extra;
+    while (total > FILES_BUDGET) {
+        FileTab *old = 0;
+        for (i32 k = 0; k < countof(roots); k++) {
+            for (GuiSession *s = roots[k]; s; s = k ? s->next : 0) {
+                for (i32 i = 0; i < s->files.n; i++) {
+                    FileTab *ft = s->files.tabs[i];
+                    if (ft->body && ft!=front && ft!=keep &&
+                            (!old || ft->body->drawn<old->body->drawn)) {
+                        old = ft;
+                    }
+                }
+            }
+        }
+        if (!old) {
+            break;
+        }
+        total -= old->body->r->committed;
+        filefree(g, old);
     }
 }
 
-// Read a tab's file, on this computer, into a body of its own, else say
-// why not in the tab.
-static void fileload(Gui *g, FileTab *ft)
+// A tab's file, on this computer, read into a new body, else null,
+// saying why, the tab left as it is.
+static FileBody *filebody(Gui *g, FileTab *ft, Str *why)
 {
-    g->fileloads++;
-    scheddirty(&g->sched);
-    ft->err = {};
     Region *sr = os_reserve(g->os, FILES_SCRATCH);
     if (!sr) {
-        filefail(g, ft, "There is no memory to show it");
-        return;
+        *why = "There is no memory to show it";
+        return 0;
     }
     Arena s  = newarena(sr);
     Stat  st = filestat(g, s, ft->path);
-    Str   why = filestatwhy(st.type);
-    Read  rd  = {};
-    if (!why.len) {
-        rd  = fileread(g, &s, ft->path, FILES_MAX);
-        why = rd.err==READ_OK       ? Str{} :
-              rd.err==READ_NOTFOUND ? Str("No such file") :
-              rd.err==READ_NOTFILE  ? Str("Not a regular file") :
-              Str("It could not be read");
+    Read  rd = {};
+    *why = filestatwhy(st.type);
+    if (!why->len) {
+        rd   = fileread(g, &s, ft->path, FILES_MAX);
+        *why = rd.err==READ_OK       ? Str{} :
+               rd.err==READ_NOTFOUND ? Str("No such file") :
+               rd.err==READ_NOTFILE  ? Str("Not a regular file") :
+               Str("It could not be read");
     }
-    if (why.len) {
+    if (why->len) {
         os_release(g->os, sr);
-        filefail(g, ft, why);
-        return;
+        return 0;
     }
-    filemake(g, ft, sr, s, rd.data, rd.size, st.mtime, 0);
+    return filemake(g, ft, sr, s, rd.data, rd.size, st.mtime, 0, why);
+}
+
+// Read a tab's file, on this computer, into a body of its own, else say
+// why not in the tab. One read already stays shown until the new one is
+// made, room for it made first.
+static void fileload(Gui *g, FileTab *ft)
+{
+    g->fileloads++;
+    if (ft->body) {
+        filesfit(g, ft, ft->body->r->committed);
+    } else {
+        ft->err = {};
+    }
+    ft->watch.stale  = 0;
+    ft->watch.readat = os_time(g->os);
+    Str       why = {};
+    FileBody *nb  = filebody(g, ft, &why);
+    if (fileswap(g, ft, nb, why)) {
+        scheddirty(&g->sched);
+    }
 }
 
 
@@ -363,21 +460,39 @@ static void fsrequest(Gui *g)
     cmdsend(g, &w, a);
 }
 
-// The fetch let go, its tab as it is.
+// The fetch let go, its tab as it is: one read again checked again.
 static void fetchend(Gui *g)
 {
     FileFetch *f = &g->ffetch;
+    if (f->reload && f->ft && f->ft->serial==f->serial) {
+        f->ft->watch.id = 0;
+        if (f->ft->watch.stale || f->ft->watch.force) {
+            scheddirty(&g->sched);  // marked meanwhile: checked now
+        }
+    }
     if (f->r) {
         os_release(g->os, f->r);
     }
     *f = {};
 }
 
-// The fetch abandoned: its tab, still waiting for it, read again later.
+// Whether the fetch's tab still waits for it: unread, or read and
+// shown while it is read again.
+static b32 fetchwanted(FileFetch *f)
+{
+    FileTab *ft = f->ft;
+    return ft && ft->serial==f->serial &&
+           (f->reload ? ft->state==FTAB_READ && ft->body : ft->state==FTAB_READING);
+}
+
+// The fetch abandoned: its tab, still waiting for it, read again later,
+// or, read again, checked again once it shows.
 static void fetchdrop(Gui *g)
 {
     FileFetch *f = &g->ffetch;
-    if (f->ft && f->ft->serial==f->serial && f->ft->state==FTAB_READING) {
+    if (fetchwanted(f) && f->reload) {
+        f->ft->watch.stale = 1;
+    } else if (fetchwanted(f)) {
         f->ft->state = FTAB_UNREAD;
     }
     fetchend(g);
@@ -387,6 +502,7 @@ static void fetchdrop(Gui *g)
 // its host has connected again.
 static void fetchfail(Gui *g, Str why)
 {
+    filefree(g, g->ffetch.ft);  // read again: what it showed is gone
     filefail(g, g->ffetch.ft, why);
     fetchend(g);
     scheddirty(&g->sched);
@@ -394,12 +510,14 @@ static void fetchfail(Gui *g, Str why)
 
 // Start reading a tab's file on another host, as its tab shows: one
 // fetch at a time, the last given up. With its host down, the tab waits
-// (filesnote says so); with an engine there too old, it fails.
-static void filefetch(Gui *g, FileTab *ft)
+// (filesnote says so); with an engine there too old, it fails. A tab
+// read already is read again (reload) into a new body, the old shown
+// until it is made.
+static void filefetch(Gui *g, FileTab *ft, b32 reload)
 {
     GuiHost *h   = filehost(g, ft->host);
     Str      why = filehostwhy(h);
-    if (why.len && h && h->r && !h->closing && h->up) {
+    if (why.len && h && h->r && !h->closing && h->up && !reload) {
         filefail(g, ft, why);  // too old, until updated
         return;
     } else if (why.len) {
@@ -409,6 +527,7 @@ static void filefetch(Gui *g, FileTab *ft)
     FileFetch *f = &g->ffetch;
     f->r = os_reserve(g->os, FILES_SCRATCH);
     if (!f->r) {
+        filefree(g, ft);
         filefail(g, ft, "There is no memory to show it");
         return;
     }
@@ -418,8 +537,14 @@ static void filefetch(Gui *g, FileTab *ft)
     f->serial = ft->serial;
     f->host   = ft->host;
     f->size   = -1;
-    ft->err   = {};
-    ft->state = FTAB_READING;
+    f->reload = reload;
+    if (reload) {
+        ft->watch.id = -1;
+    } else {
+        ft->err         = {};
+        ft->state       = FTAB_READING;
+        ft->watch.stale = 0;
+    }
     fsrequest(g);
     scheddirty(&g->sched);
 }
@@ -430,7 +555,7 @@ static void filefetch(Gui *g, FileTab *ft)
 static void fetchtick(Gui *g, FileTab *ft)
 {
     FileFetch *f = &g->ffetch;
-    if (f->ft && (f->ft!=ft || f->ft->serial!=f->serial || f->ft->state!=FTAB_READING)) {
+    if (f->ft && (f->ft!=ft || !fetchwanted(f))) {
         fetchdrop(g);
     } else if (f->ft && f->id && !reqheld(g, f->id)) {
         fsrequest(g);
@@ -439,8 +564,53 @@ static void fetchtick(Gui *g, FileTab *ft)
 
 static void fileaskstat(Gui *);
 
+// The uid a host's files are known by in tabs: 0, this computer, for
+// every host but a remote, whose own engine reads them.
+static u64 fileuid(GuiHost *h)
+{
+    return h && h->kind==GH_REMOTE ? h->uid : 0;
+}
+
+// Files on the host of uid host may have changed, as of ts, epoch ms on
+// its clock (0: now): each of its tabs read before then is marked, to
+// be checked once shown (filewatch). A replay's older records mark
+// nothing. A check in flight there is let go, with lost, as its reply
+// will never come.
+static void filesstale(Gui *g, u64 host, i64 ts, b32 lost)
+{
+    GuiSession *roots[] = {&g->nosession, g->sessions};
+    FileTab    *front   = filesetfront(&filesroot(g)->files);
+    for (i32 k = 0; k < countof(roots); k++) {
+        for (GuiSession *s = roots[k]; s; s = k ? s->next : 0) {
+            for (i32 i = 0; i < s->files.n; i++) {
+                FileTab   *ft = s->files.tabs[i];
+                FileWatch *w  = &ft->watch;
+                if (ft->host != host) {
+                    continue;
+                } else if (lost && w->id>0) {
+                    w->id = 0;
+                }
+                if (!ts || ts>=w->readat) {
+                    w->stale = 1;
+                    if (ft==front && g->filesdrawn) {
+                        scheddirty(&g->sched);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// One tab may have changed: checked once shown.
+static void filetabstale(Gui *g, FileTab *ft)
+{
+    ft->watch.stale = 1;
+    scheddirty(&g->sched);
+}
+
 // Its host connected again: the part in flight asked for again, as its
-// reply may have gone with the link, and Open file's check.
+// reply may have gone with the link, and Open file's check; its files
+// checked again, changed perhaps meanwhile, checks in flight lost.
 static void filefetchagain(Gui *g, GuiHost *h)
 {
     FileFetch *f = &g->ffetch;
@@ -450,11 +620,15 @@ static void filefetchagain(Gui *g, GuiHost *h)
     if (g->fask.statid && g->fask.host==h->uid) {
         fileaskstat(g);
     }
+    if (h->kind == GH_REMOTE) {
+        filesstale(g, h->uid, 0, 1);
+    }
 }
 
 // Its host's link ended (Disconnect, quitting): a reply in flight from
 // it is gone, unasked for, so the fetch is dropped, to read again once
-// it is back, and Open file's check, at it, fails.
+// it is back, and Open file's check, at it, fails; checks of its files
+// are lost, to be made again once it is back.
 static void filehostend(Gui *g, GuiHost *h)
 {
     if (g->ffetch.ft && g->ffetch.host==h->uid) {
@@ -463,6 +637,9 @@ static void filehostend(Gui *g, GuiHost *h)
     if (g->fask.statid && g->fask.host==h->uid) {
         g->fask.statid = 0;
         g->fask.p.err  = filehostwhy(0);
+    }
+    if (h->kind == GH_REMOTE) {
+        filesstale(g, h->uid, 0, 1);
     }
 }
 
@@ -478,12 +655,12 @@ static Str fswhy(Str err)
 // A part of the fetch's file came: the next asked for, or once all is
 // here (or FILES_MAX), made into a body. A size or mtime changed reads
 // it again from the start once; changed again, what came is kept.
-static void onfsread(Gui *g, Arena scratch, Json *j, b32 ok, Str err)
+static void onfsread(Gui *g, Arena scratch, Json *j, b32 ok, Str err, i64 ts)
 {
     FileFetch *f  = &g->ffetch;
     FileTab   *ft = f->ft;
     f->id = 0;
-    if (!ft || ft->serial!=f->serial || ft->state!=FTAB_READING) {
+    if (!fetchwanted(f)) {
         fetchend(g);
         return;
     }
@@ -511,6 +688,7 @@ static void onfsread(Gui *g, Arena scratch, Json *j, b32 ok, Str err)
     if (f->size < 0) {
         f->size  = size;
         f->mtime = mtime;
+        f->ts    = ts;  // when it was read, on its host's clock
     }
     b32 changed = size!=f->size || mtime!=f->mtime || next!=f->off+u.data.len;
     if (changed && !f->again) {
@@ -532,20 +710,135 @@ static void onfsread(Gui *g, Arena scratch, Json *j, b32 ok, Str err)
         return;
     }
 
-    // All here: its body, from the scratch past what came
+    // All here: its body, from the scratch past what came, room made
+    // first for it beside one read already
     Region *r = f->r;
     Arena   s = f->mem;
     Str     raw = {f->buf, (iz)f->off};
     i64     total = f->changed ? f->off : f->size;
     b32     twice = f->changed;
     i64     when  = f->mtime;
+    ft->watch.readat = f->ts;
     f->r = 0;
     fetchend(g);
     g->fileloads++;
-    scheddirty(&g->sched);
-    filemake(g, ft, r, s, raw, total>raw.len ? total : raw.len, when, twice);
     if (ft->body) {
-        ft->body->fetched = 1;
+        filesfit(g, ft, ft->body->r->committed);
+    }
+    Str       why = {};
+    FileBody *nb  = filemake(g, ft, r, s, raw, total>raw.len ? total : raw.len, when, twice,
+                             &why);
+    if (nb) {
+        nb->fetched = 1;
+    }
+    if (fileswap(g, ft, nb, why)) {
+        scheddirty(&g->sched);
+    }
+}
+
+// Each frame the pane is drawn, for its front tab ft, read: its file
+// checked, as filenext says, once marked as it may have changed (stale),
+// here by its stat, on another host by fs.stat there, and read again
+// into a new body, the old shown meanwhile, when its stat says so
+// (filechanged), or at once for Reload. Nothing while its host is down.
+static void filewatch(Gui *g, FileTab *ft)
+{
+    FileWatch *w = &ft->watch;
+    GuiHost   *h = filehost(g, ft->host);
+    if (ft->state!=FTAB_READ || !ft->body || (ft->host && filehostwhy(h).len)) {
+        return;
+    }
+    if (w->id>0 && !reqheld(g, w->id)) {
+        w->id    = 0;  // its request slot went (REQ_MAX)
+        w->stale = 1;
+    } else if (w->id<0 && !(g->ffetch.ft==ft && fetchwanted(&g->ffetch))) {
+        w->id = 0;  // its read again is gone (fetchend clears it)
+    }
+    i64      now = os_time(g->os);
+    FileNext n   = filenext(w, now);
+    if (n.wake) {
+        schedat(&g->sched, g->sched.now + (n.wake - now)*1000, DUE_APP);
+    }
+    if (!n.check) {
+        return;
+    }
+    b32 force = w->force;
+    w->stale = 0;
+    w->force = 0;
+    w->sent  = now;
+    if (ft->host && force) {
+        filefetch(g, ft, 1);
+    } else if (ft->host) {
+        Arena a = newarena(g->cmdr);
+        Buf   b(&a, 256 + 6*ft->path.len);
+        EvOut o = cmdopen(g, &b, CMD_FSSTAT, 0, h);
+        putkey(&o.json, "paths");
+        putarray(&o.json);
+        putstr(&o.json, ft->path);
+        putend(&o.json);
+        w->id = g->nextid;
+        cmdsend(g, &o, a);
+    } else {
+        FileBody *b  = ft->body;
+        Stat      st = filestat(g, g->frame, ft->path);
+        b32       go = force || st.type!=STAT_FILE ||
+                       filechanged(b->size, b->mtime, w->readat, st.size, st.mtime);
+        if (go) {
+            fileload(g, ft);
+        }
+    }
+}
+
+// A host's answer to a tab's check (filewatch), the reply to id: read
+// again if its stat says so, else as it is. A file gone fails the tab.
+static void onfswatch(Gui *g, i64 id, Json *j, b32 ok, Str err)
+{
+    GuiSession *roots[] = {&g->nosession, g->sessions};
+    FileTab    *ft      = 0;
+    for (i32 k = 0; k<countof(roots) && !ft; k++) {
+        for (GuiSession *s = roots[k]; s && !ft; s = k ? s->next : 0) {
+            for (i32 i = 0; i < s->files.n; i++) {
+                ft = s->files.tabs[i]->watch.id==id ? s->files.tabs[i] : ft;
+            }
+        }
+    }
+    if (!ft) {
+        return;
+    }
+    FileWatch *w = &ft->watch;
+    w->id = 0;
+    if (ft->state!=FTAB_READ || !ft->body) {
+        return;
+    } else if (!ok) {
+        // Not sent, lost, refused, or its host went: the mark kept, so
+        // checked again a few times (else at the next mark), or once
+        // its host is back
+        w->fails++;
+        if (w->fails<=FILES_TRIES || filehostwhy(filehost(g, ft->host)).len) {
+            w->stale = 1;
+            scheddirty(&g->sched);
+        }
+        return;
+    }
+    w->fails = 0;
+    FileBody *b     = ft->body;
+    Json     *st    = jsonat(jsonget(j, "stats"), 0);
+    Str       type  = jsonstr(jsonget(st, "type"));
+    i64       size  = jsonint(jsonget(st, "size"), -1);
+    i64       mtime = jsonint(jsonget(st, "mtime"), 0);
+    if (type != "file") {
+        Str why = type=="dir"     ? Str("That is a folder") :
+                  type=="missing" ? Str("No such file") :
+                  type=="bad"     ? Str("It cannot be shown") :
+                                    Str("Not a regular file");
+        fileswap(g, ft, 0, why);
+        scheddirty(&g->sched);
+    } else if (filechanged(b->size, b->mtime, w->readat, size, mtime)) {
+        if (ft==filesetfront(&filesroot(g)->files) && g->filesdrawn) {
+            filefetch(g, ft, 1);
+        } else {
+            w->stale = 1;  // no longer shown: checked again once it is
+        }
     }
 }
 
@@ -567,25 +860,8 @@ static void filesframe(Gui *g)
             }
         }
     }
-    GuiSession *shown = filesroot(g);
-    FileTab    *front = filesetfront(&shown->files);
-    while (total > FILES_BUDGET) {
-        FileTab *old = 0;
-        for (i32 k = 0; k < countof(roots); k++) {
-            for (GuiSession *s = roots[k]; s; s = k ? s->next : 0) {
-                for (i32 i = 0; i < s->files.n; i++) {
-                    FileTab *ft = s->files.tabs[i];
-                    if (ft->body && ft!=front && (!old || ft->body->drawn<old->body->drawn)) {
-                        old = ft;
-                    }
-                }
-            }
-        }
-        if (!old) {
-            break;
-        }
-        total -= old->body->r->committed;
-        filefree(g, old);
+    if (total > FILES_BUDGET) {
+        filesfit(g, 0, 0);
     }
 }
 
@@ -817,7 +1093,7 @@ static void filelinkgo(Gui *g, GuiSession *s, u64 host, Str path, b32 win,
     GuiSession *root = s ? termroot(g, s) : &g->nosession;
     i32         i    = filesetfind(&root->files, host, path, win);
     if (i >= 0) {
-        root->files.tabs[i]->stale = 1;
+        filetabstale(g, root->files.tabs[i]);
     }
     filesopen(g, s, host, path, line0, line1, section);
 }
@@ -1108,6 +1384,19 @@ static void fileanswer(Gui *g, Str data)
 
 // The pane
 
+// Reload: a tab read again, its body shown until the new one is made
+// (filewatch), else read when shown.
+static void fileforce(Gui *g, FileTab *ft)
+{
+    if (ft->state==FTAB_READ && ft->body) {
+        ft->watch.force = 1;
+    } else {
+        filefree(g, ft);
+        ft->state = FTAB_UNREAD;
+    }
+    scheddirty(&g->sched);
+}
+
 struct FileBar {
     i32 closed;  // the tab to close, else -1
     b32 others;  //   and the others instead
@@ -1233,8 +1522,9 @@ static FileBar filetabs(Gui *g, GuiSession *root)
     } else if (selected && selected!=set->tabs[set->front]) {
         for (i32 i = 0; i < set->n; i++) {
             if (set->tabs[i] == selected) {
-                filesetshow(set, i);  // picked: as opened
+                filesetshow(set, i);  // picked: as opened, and checked
                 set->frontset = 0;
+                filetabstale(g, set->tabs[i]);
             }
         }
         scheddirty(&g->sched);
@@ -1348,11 +1638,21 @@ static void drawfiles(Gui *g)
         filesempty(g);
         return;
     }
+    // The shown tab checked as the window or the pane takes the focus,
+    // or the pane shows
+    b32 win   = guifocused(g);
+    b32 focus = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+    if ((win && !g->fileswin) || (focus && !g->filesfocus) || ImGui::IsWindowAppearing()) {
+        FileTab *front = filesetfront(set);
+        front->watch.stale = 1;
+    }
+    g->fileswin   = win;
+    g->filesfocus = focus;
+
     FileBar bar = filetabs(g, root);
     FileTab *rt = bar.reload>=0 ? set->tabs[bar.reload] : 0;
     if (rt && !(rt->host && filehostwhy(filehost(g, rt->host)).len)) {
-        filefree(g, rt);  // not one whose host can't serve it
-        rt->state = FTAB_UNREAD;
+        fileforce(g, rt);  // not one whose host can't serve it
     }
     if (bar.closed>=0 && (bar.others || bar.all)) {
         FileTab *keep = bar.all ? 0 : set->tabs[bar.closed];
@@ -1375,11 +1675,26 @@ static void drawfiles(Gui *g)
     GuiHost *fh = filehost(g, ft->host);
     if (ft->state==FTAB_FAILED && ft->host && fh && fh->opens!=ft->opens) {
         ft->state = FTAB_UNREAD;  // its host connected again: once more
+    } else if (ft->state==FTAB_FAILED && ft->watch.stale && !(ft->host && filehostwhy(fh).len)) {
+        // Marked since it failed (a tool may have put it back): read once
+        // more, as often as filenext allows
+        i64      now = os_time(g->os);
+        FileNext n   = filenext(&ft->watch, now);
+        if (n.wake) {
+            schedat(&g->sched, g->sched.now + (n.wake - now)*1000, DUE_APP);
+        }
+        if (n.check) {
+            ft->watch.stale = 0;
+            ft->watch.sent  = now;
+            ft->state       = FTAB_UNREAD;
+        }
     }
     if (ft->state==FTAB_UNREAD && ft->host) {
-        filefetch(g, ft);
+        filefetch(g, ft, 0);
     } else if (ft->state == FTAB_UNREAD) {
         fileload(g, ft);
+    } else {
+        filewatch(g, ft);  // changed, maybe, since it was read
     }
     FileBody *b = ft->body;
     Str       farwhy = ft->host ? filehostwhy(fh) : Str{};
@@ -1411,9 +1726,8 @@ static void drawfiles(Gui *g)
     }
     ImGui::BeginDisabled(farwhy.len > 0);
     if (iconbutton(ICON_REFRESH "##filereload")) {
-        filefree(g, ft);
-        ft->state = FTAB_UNREAD;
-        b = 0;
+        fileforce(g, ft);
+        b = ft->body;
     }
     ImGui::EndDisabled();
     itemnamed(g, "file reload");
@@ -1633,22 +1947,3 @@ static i32 filelinerows(Gui *g, i32 n)
     return k<ml->blocks.len ? (i32)ml->blocks[k].bl->lines.len : -1;
 }
 
-// The bodies' committed bytes, and how many there are.
-static iz filebytes(Gui *g, i32 *n)
-{
-    GuiSession *roots[] = {&g->nosession, g->sessions};
-    iz          total   = 0;
-    *n = 0;
-    for (i32 k = 0; k < countof(roots); k++) {
-        for (GuiSession *s = roots[k]; s; s = k ? s->next : 0) {
-            for (i32 i = 0; i < s->files.n; i++) {
-                FileBody *b = s->files.tabs[i]->body;
-                if (b) {
-                    total += b->r->committed;
-                    (*n)++;
-                }
-            }
-        }
-    }
-    return total;
-}
