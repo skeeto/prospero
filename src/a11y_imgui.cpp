@@ -435,6 +435,19 @@ static void axrole(Gui *g, AxRole role)
     }
 }
 
+// The last item folds and opens what is under it, open now or not, as a
+// tree node does: a heading in the sidebar.
+static void axexpanded(Gui *g, b32 open)
+{
+    AxItem *it = axlastitem(g);
+    if (it) {
+        it->role     = AX_TREEITEM;
+        it->info     = 1;
+        it->actions |= AXA_EXPAND;
+        it->state    = open ? it->state|AXS_EXPANDED : it->state&~AXS_EXPANDED;
+    }
+}
+
 // The last item has a context menu, which an assistive tool may ask for
 // (uirclicked).
 static void axmenu(Gui *g)
