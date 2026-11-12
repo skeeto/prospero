@@ -1,0 +1,23 @@
+# Made by hand in the format of PROSPERO_AXTRACE's trace, as a stand-in
+# until a recorded one: a11y mode replays it ("ns replay"), and expects
+# the prompt to hold "a quick brown fox\nleapsjumps".
+0.000 trace: prospero 0.8.3, pid 1, accessibility auto
+0.100 started by firstRect
+0.101 model: not started
+0.102 firstRectForCharacterRange:actualRange: {0,0} -> {0,0 0x0} actual unchanged
+0.300 model: field 2 len 0 sel 0,0 ""
+0.310 selectedRange -> {0,0}
+0.320 setMarkedText:selectedRange:replacementRange: "the quick"#9 attrs[{0,9} { NSUnderline = 1; }] {9,0} {NotFound,0}
+0.330 model: field 2 len 9 sel 0,0 marked "the quick" 9,9 ""
+0.340 markedRange -> {0,9}
+0.400 setMarkedText:selectedRange:replacementRange: "the quick brown"#15 attrs[{0,15} { NSUnderline = 1; }] {15,0} {NotFound,0}
+0.500 insertText:replacementRange: "the quick brown fox"#19 attrs[{0,19} { NSTextAlternatives = "<NSTextAlternatives: {the quick brown fox}>"; }] {NotFound,0}
+0.501 hasMarkedText -> YES
+0.502 unmarkText (SDL's)
+0.600 doCommandBySelector: insertNewline:
+0.700 insertText:replacementRange: "jumps"#5 {NotFound,0}
+0.710 (the line before, 2 times in a row)
+0.800 insertText:replacementRange: "leaps"#5 {20,5}
+0.900 insertText:replacementRange: (typed)#1 {NotFound,0} (SDL's)
+1.000 AXSelectedTextRange= {0,3} -> YES
+1.100 AXSelectedText= "a"#1 -> YES

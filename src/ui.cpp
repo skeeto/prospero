@@ -7384,6 +7384,9 @@ static void drawprompt(Gui *g)
     dragplace(g, DROPTO_ATTACH);
     ImVec2 r0 = ImGui::GetItemRectMin();
     ImVec2 r1 = ImGui::GetItemRectMax();
+    if (cb.recalled) {
+        imedrop(g, s->draftid);
+    }
     if (edited && !cb.recalled) {
         // Typed: the draft, kept once typing pauses, out of history. A note
         // marked fixed is what typing must not take away, as a mention's

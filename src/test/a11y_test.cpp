@@ -342,6 +342,17 @@ static void test_a11ytext(Test *t)
     expect(t, "a11ytext.wordend",   axspanstr(&a, axwordat(w, 26)), "22-26");
     expect(t, "a11ytext.wordnone",  axspanstr(&a, axwordat("", 0)), "0-0");
     expect(t, "a11ytext.wordcjk",   axspanstr(&a, axwordat(s, 6)),  "0-9");
+    expect(t, "a11ytext.back",      istr(&a, axwordback(w, 12)), "7");
+    expect(t, "a11ytext.backin",    istr(&a, axwordback(w, 3)),  "0");
+    expect(t, "a11ytext.backpunct", istr(&a, axwordback(w, 6)),  "5");
+    expect(t, "a11ytext.backspace", istr(&a, axwordback(w, 14)), "7");
+    expect(t, "a11ytext.back0",     istr(&a, axwordback(w, 0)),  "0");
+    expect(t, "a11ytext.backemoji", istr(&a, axwordback(s, 9)),  "0");
+    expect(t, "a11ytext.next",      istr(&a, axwordnext(w, 0)),  "5");
+    expect(t, "a11ytext.nextspace", istr(&a, axwordnext(w, 12)), "21");
+    expect(t, "a11ytext.nextnl",    istr(&a, axwordnext(w, 21)), "26");
+    expect(t, "a11ytext.nextend",   istr(&a, axwordnext(w, 26)), "26");
+    expect(t, "a11ytext.nextmid",   istr(&a, axwordnext(s, 2)),  "9");
     expect(t, "a11ytext.para0",     axspanstr(&a, axparaat(w, 3)),  "0-22");
     expect(t, "a11ytext.para1",     axspanstr(&a, axparaat(w, 23)), "22-26");
 
