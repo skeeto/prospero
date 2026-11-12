@@ -128,8 +128,10 @@ mode, model and shell, each a list to switch it. What you send while it works wa
 the end of the transcript, dimmed and marked "Next step", until the
 agent reads it at its next step (or marked "Queued", for a turn of its
 own, as it is when sent too late for this turn), and its Withdraw
-button takes it back into the box. Stop, or Esc, cancels the turn and
-kills any command it runs.
+button takes it back into the box. Stop cancels the turn and kills
+any command it runs, and so does Esc, once nothing is left for it to
+close: from the prompt box, the first Esc leaves the box, and the
+second stops the turn.
 
 The line above the prompt box says what the session is doing, and
 for how long. While a llama.cpp server reads a long prompt, a bar

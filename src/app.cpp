@@ -654,6 +654,8 @@ struct GuiSession {
     MentionEdit  medit;     // a pick's edit, waiting for the box's next frame
     MentionKeep  mattach;   // a picked file, attached as the next frame begins
     i32          mutebeg;   // the '@' the user dismissed, -1 for none
+    b32          slashmute; // Esc dismissed the slash popup, until its
+                            // word is gone
     i32          draftslen; // the draft's length last frame, to spot a paste
     AttBox      *att;       // images attached to the draft, null until one is
     Str          group;     // its group, from the list (only a root's counts)
@@ -1919,6 +1921,10 @@ struct Gui {
     Str                longval;      // the long setting before its edit
     WinGeom            geommark;     // the window's, as OP_GEOMMARK found it
     b32                slashshown;   // the slash popup drew
+    // Esc, which closes what is open before it stops a turn (escapecancel)
+    GuiSession        *eschint;      // Esc left this session's box mid-turn,
+    i64                eschintat;    // then: "Esc again stops" a while
+    b32                eschintshown; // and that toast drew
     b32                mentionshown; // the '@' popup drew
     i32                mentionrows;  // and how many rows it listed
     i32                mentionkind;  // MENTION_*: where its candidates came
@@ -13026,6 +13032,7 @@ enum : i32 {
     T_CLOSESTOP,   // the close dialog's buttons
     T_CLOSECANCEL,
     T_OTHERSESS,   // the first session in the sidebar not shown
+    T_SHOWNSESS,   // the shown session's row in the sidebar
     T_TOPTEXT,     // near the transcript's top edge
     T_SESSTITLE,   // the sidebar's session whose title starts with text
     T_ADDNAME,     // the new endpoint's name field
@@ -13467,6 +13474,7 @@ enum : i32 {
                       // Diagnostics page shown
     CHK_CFGSAVED,     // the settings' last edit was saved
     CHK_GAUGECOUNT,   // the gauge is a count of tokens alone, no window known
+    CHK_ESCHINT,      // the "Esc again stops" toast shows, or not (dx 0)
     CHK_COUNT,
 };
 
@@ -13770,6 +13778,7 @@ static Str chknames[] = {
     "Copy all copies the diagnostics as text",
     "the settings edit was saved",
     "with no window known, the gauge is the count of tokens",
+    "the Esc again toast shows, or not, as said",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -15205,6 +15214,75 @@ static DriveOp m3ops[] = {
     {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
     {OP_CHECK, CHK_CANCELLED, 0, 0, 0, ""},
     {OP_CHECK, CHK_NOTOAST, 0, 0, 0, ""},  // the user stopped it
+    // From the box, Esc first leaves it, keeping the draft, and the
+    // transcript says that Esc again stops the turn, which it does
+    {OP_PROMPT, 0, 0, 0, 100, "Cancel me: run a very slow command."},
+    {OP_WAIT, W_TOOL, 0, 0, 10000, ""},
+    {OP_MOVE, T_PROMPT, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 200, ""},
+    {OP_TEXT, 0, 0, 0, 200, "kept"},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 500, ""},
+    {OP_CHECK, CHK_STILLBUSY, 0, 0, 0, ""},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "kept"},
+    {OP_CHECK, CHK_ESCHINT, 1, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "15-escagain"},
+    {OP_TEXT, 0, 0, 0, 200, "x"},  // the box has let go of the keyboard
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "kept"},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_CANCELLED, 0, 0, 0, ""},
+    {OP_CHECK, CHK_ESCHINT, 0, 0, 0, ""},
+    {OP_MOVE, T_PROMPT, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 200, ""},
+    {OP_KEYDOWN, 0, GKEY_CMD, KEY_CMD, 50, ""},
+    {OP_KEYDOWN, 0, GKEY_A, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_A, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_CMD, 0, 100, ""},
+    {OP_KEYDOWN, 0, GKEY_BACKSPACE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_BACKSPACE, 0, 200, ""},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    // The toast's Stop does it too; back in the box, the toast goes
+    {OP_PROMPT, 0, 0, 0, 100, "Cancel me: run a very slow command."},
+    {OP_WAIT, W_TOOL, 0, 0, 10000, ""},
+    {OP_MOVE, T_PROMPT, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 200, ""},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 500, ""},
+    {OP_CHECK, CHK_ESCHINT, 1, 0, 0, ""},
+    {OP_MOVE, T_PROMPT, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_ESCHINT, 0, 0, 0, ""},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "esc stop"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_CANCELLED, 0, 0, 0, ""},
+    // From the Sessions pane, Esc leaves the shown session's turn alone
+    {OP_PROMPT, 0, 0, 0, 100, "Cancel me: run a very slow command."},
+    {OP_WAIT, W_TOOL, 0, 0, 10000, ""},
+    {OP_MOVE, T_SHOWNSESS, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 300, ""},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 500, ""},
+    {OP_CHECK, CHK_STILLBUSY, 0, 0, 0, ""},
+    {OP_MOVE, T_TRANSCRIPTTAB, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 300, ""},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_CANCELLED, 0, 0, 0, ""},
     // Records lost to a full inbox (--inbox-cap): held while a fast
     // stream fills it, then resynced from the log; with toasts off
     {OP_NOTIFY, 0, 0, 0, 0, ""},
@@ -15572,6 +15650,10 @@ static DriveOp e2eops[] = {
     {OP_PROMPT, 0, 0, 0, 100,
      "Run exactly this shell command and wait for it: echo $$ > cancel.pid; sleep 120"},
     {OP_WAIT, W_TOOL, 0, 0, 300000, ""},
+    // From the Transcript: from the box, the first Esc only leaves it
+    {OP_MOVE, T_TRANSCRIPTTAB, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
     {OP_MOVE, T_EMPTY, 0, 0, 1500, ""},
     {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
     {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
@@ -18991,6 +19073,20 @@ static DriveOp composeops[] = {
     {OP_CHECK, CHK_SLASHSEL, 0, 0, 0, "/zzcheck"},
     KEY(GKEY_TAB, 0, 300),
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, "/zzcheck "},
+    // Esc closes the popup, and it stays closed while its word is there;
+    // Esc again leaves the box, the draft kept
+    CLICK(T_PROMPT, "", 200),
+    SELALL,
+    {OP_TEXT, 0, 0, 0, 300, "/rena"},
+    {OP_CHECK, CHK_SLASH, 1, 0, 0, ""},
+    KEY(GKEY_ESCAPE, 0, 300),
+    {OP_CHECK, CHK_SLASH, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 300, "m"},
+    {OP_CHECK, CHK_SLASH, 0, 0, 0, ""},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "/renam"},
+    KEY(GKEY_ESCAPE, 0, 300),
+    {OP_TEXT, 0, 0, 0, 300, "e"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "/renam"},
     // Not a command: a path is sent as text
     CLICK(T_PROMPT, "", 200),
     SELALL,
@@ -19635,6 +19731,7 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_CLOSESTOP:   return rectcenter(g->rects[RECT_CLOSESTOP]);
     case T_CLOSECANCEL: return rectcenter(g->rects[RECT_CLOSECANCEL]);
     case T_OTHERSESS:   return rectcenter(g->rects[RECT_OTHERSESS]);
+    case T_SHOWNSESS:   return g->sess ? rectcenter(g->sess->row) : v2(-1, -1);
     case T_THEMECOMBO:  return rectcenter(g->rects[RECT_THEMECOMBO]);
     case T_LONGFIELD:   return rectcenter(g->rects[RECT_LONGFIELD]);
     case T_TASKLINK:    return rectcenter(g->rects[RECT_TASKLINK]);
@@ -21682,6 +21779,8 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_STILLBUSY:
         return v->busy && !g->quitting;
+    case CHK_ESCHINT:
+        return g->eschintshown == (g->ops[g->drivepc-1].dx!=0);
     case CHK_REPLAYED: {
         b32 user = 0, said = 0;
         for (iz i = 0; i < v->msgs.len; i++) {

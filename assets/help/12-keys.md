@@ -43,10 +43,14 @@ except Ctrl+G in the prompt box, which is Ctrl there too.
 
 - **Enter** sends; while the agent works, it steers.
 - **Shift+Enter** starts a new line.
-- **Esc** cancels the running turn (from the Sessions, Transcript and
-  Prompt panes, while no dialog or menu is open). In a field of the
-  agent's questions, Esc first leaves the field, keeping what you
-  typed, and Enter submits the answers once each question has one.
+- **Esc** closes what is open first: a dialog or menu, the `/` or `@`
+  list, the find bar, keyboard navigation's highlight. Then it leaves
+  the prompt box, keeping what you typed; while the agent works, the
+  transcript says so: "Esc again stops the turn". With nothing left to
+  close, in the Transcript or Prompt pane, Esc cancels the running
+  turn. So from the box, it takes two. In a field of the agent's
+  questions, Esc first leaves the field, keeping what you typed, and
+  Enter submits the answers once each question has one.
 - **Ctrl+B** moves what the turn waits for to the background, a
   running command or its subagents, as Run in background does (from
   the same panes); the agent goes on, and you may talk to it. See

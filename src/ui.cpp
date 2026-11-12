@@ -4602,6 +4602,16 @@ static void drawtoast(Gui *g, GuiSession *s, ImVec2 r0, ImVec2 r1)
     if (s->note.len && !s->noteerr && fresh) {
         schedat(&g->sched, s->noteat + TOAST_LIFE, DUE_CLOCK);
     }
+    // Esc left the box mid-turn (drawprompt): while the turn runs, a few
+    // seconds, after an error note, which waits on the user
+    g->eschintshown = 0;
+    b32 hint = g->eschint==s && s->view && s->view->busy &&
+               g->sched.now-g->eschintat<TOAST_LIFE && !(s->note.len && s->noteerr);
+    if (g->eschint==s && !hint) {
+        g->eschint = 0;
+    } else if (hint) {
+        schedat(&g->sched, g->eschintat + TOAST_LIFE, DUE_CLOCK);
+    }
     if (editing) {
         // In the frame itself: toastbtns takes its scratch from there
         Str text = concat(&g->frame, concat(&g->frame, "Editing in ", g->edname), "...");
@@ -4611,6 +4621,14 @@ static void drawtoast(Gui *g, GuiSession *s, ImVec2 r0, ImVec2 r1)
             editcancel(g);
         }
         g->editshown = 1;
+    } else if (hint) {
+        if (toastbox(g, "Esc again stops the turn", g->pal->paneltext, g->pal->rule,
+                     "Stop", "esc stop", "Stop: cancel the turn, killing any command it runs",
+                     -1, r0, r1)) {
+            g->eschint = 0;
+            guicancel(g, s);
+        }
+        g->eschintshown = 1;
     } else if (s->note.len && fresh) {
         if (toastbox(g, s->note, s->noteerr ? g->pal->bad : g->pal->paneldim,
                      s->noteerr ? g->pal->bad : g->pal->rule,
@@ -5249,15 +5267,25 @@ static void drawtranscript(Gui *g)
 
 // Liveness strip and prompt
 
-// Esc cancels the shown session's turn, from inside the windows about
-// the session while one has focus: there it goes ahead of the prompt
-// box, which would otherwise take it to undo the typing, while a field
-// elsewhere (Settings) keeps Esc to abandon its edit, and so does the
-// find bar, where it closes the bar.
+// Esc cancels the shown session's turn, from the Transcript and the
+// Prompt while one has focus, once nothing is left for it to close:
+// a popup or menu, the find bar, a field of the agent's questions, the
+// box's lists, and the box itself, which Esc leaves first (drawprompt),
+// as a field elsewhere (Settings) keeps Esc to abandon its edit. Nor
+// while ImGui's keyboard navigation shows its cursor, or is in a menu
+// bar (Alt): that Esc is ImGui's, to end it. A Shortcut owns its key
+// from the next frame on, ahead of ImGui's own handling, so it is not
+// even asked for then.
 static void escapecancel(Gui *g)
 {
-    if (!ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId) && !g->findactive && !g->findheld &&
-            !g->askactive && ImGui::Shortcut(ImGuiKey_Escape, ImGuiInputFlags_RouteFocused|ImGuiInputFlags_RouteOverActive)) {
+    ImGuiContext &c   = *GImGui;
+    ImGuiID       box = g->sess ? g->sess->draftid : 0;
+    b32 nav = (c.NavCursorVisible && c.NavId && c.NavId!=c.ActiveId && c.NavId!=box) ||
+              c.NavLayer!=ImGuiNavLayer_Main;
+    if (!nav && !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId) && !g->findactive &&
+            !g->findheld && !g->askactive &&
+            ImGui::Shortcut(ImGuiKey_Escape, ImGuiInputFlags_RouteFocused|ImGuiInputFlags_RouteOverActive)) {
+        g->eschint = 0;
         guicancel(g, g->sess);
     }
 }
@@ -6296,6 +6324,7 @@ static void drawprompt(Gui *g)
     char       *buf     = draftbuf(g, s);
     Arena       a       = g->frame;
     b32         wasshown = g->mentionshown;  // last frame's: the Esc test's
+    b32         wasslash = g->slashshown;    // likewise
     i32         wasrows  = g->mentionrows;   // and its rows, for the callback's
     // Views of last frame's pick and query, which nothing changes before
     // they are last read: the query after its compare, the pick in
@@ -6360,8 +6389,19 @@ static void drawprompt(Gui *g)
 
     // The slash popup while its first word is typed: its pick, which
     // Tab completes, as does Enter on a word typed in part (below)
+    // Esc closes it before it reaches the turn, as for the '@' popup
+    // below, and it stays closed while its word is there
     Str        text  = draftstr(s);
     Slice<i32> picks = active && !editing ? slashpicks(&a, text, s->skills) : Slice<i32>{};
+    b32        esctaken = 0;  // this frame's Esc closed something
+    s->slashmute = s->slashmute && picks.len;
+    if (picks.len && !s->slashmute && wasslash && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+        s->slashmute = 1;
+        esctaken     = 1;
+        ImGui::SetKeyOwner(ImGuiKey_Escape, ImGui::GetID("##slashkeys"),
+                           ImGuiInputFlags_LockThisFrame);
+    }
+    picks = s->slashmute ? Slice<i32>{} : picks;
     i32        slash = (i32)picks.len;
     i32        pick  = SLASH_NONE;
     if (slash) {
@@ -6393,14 +6433,31 @@ static void drawprompt(Gui *g)
     // Esc closes the '@' popup before it reaches the turn: the key is
     // taken here, ahead of escapecancel's Shortcut, which honours key
     // ownership, as ##pathkeys does in the path field
-    if (wasshown && m0.on && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+    if (!esctaken && wasshown && m0.on && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
         s->mutebeg = (i32)m0.beg;
+        esctaken   = 1;
         ImGui::SetKeyOwner(ImGuiKey_Escape, ImGui::GetID("##mentionkeys"),
                            ImGuiInputFlags_LockThisFrame);
     }
+    // Esc while recalling empties the box (composecb). Else, with nothing
+    // else to close, it leaves the box, keeping the draft, before the box
+    // runs, where ImGui's own Esc would undo the edit. Mid-turn the
+    // transcript says that Esc again stops it (drawtoast).
+    if (!esctaken && active && !s->hist && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+        ImGui::SetKeyOwner(ImGuiKey_Escape, ImGui::GetID("##promptleave"),
+                           ImGuiInputFlags_LockThisFrame);
+        ImGui::ClearActiveID();
+        active = 0;
+        if (g->sess==s && v && v->busy) {
+            g->eschint   = s;
+            g->eschintat = g->sched.now;
+        }
+    }
+    if (active) {
+        g->eschint = 0;  // back in the box: the hint is done
+    }
 
-    // Esc while recalling empties the box (composecb), else it cancels
-    // the turn
+    // Then, with the box left, Esc cancels the turn
     if (!s->hist) {
         escapecancel(g);
     }
@@ -15518,7 +15575,7 @@ static void dockwindows(Gui *g)
     b32 *show = g->panes;
     if (show[PANE_SESSIONS]) {
         if (beginpane(g, PANE_SESSIONS)) {
-            escapecancel(g);
+            // Not Esc: the shown session's turn is not the rows' business
             backgroundkey(g);
             drawsessions(g);
             drawtrashtoast(g, PANE_SESSIONS, drawhosttoast(g, PANE_SESSIONS));

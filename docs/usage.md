@@ -200,8 +200,11 @@ session's files and folders opens, ranked as you type, a subsequence of
 the path matching and the file's own name counting for more. Up and Down
 move the pick, and Tab or a plain Enter puts `@path` in the message
 without sending it; Shift+Enter and Ctrl+Enter still start a new line,
-and Esc closes the picker and leaves the message alone, a second Esc then
-cancelling the turn as it always did. A path holding a space is quoted,
+and Esc closes the picker and leaves the message alone. Esc closes
+what is open before it stops a turn: the `/` and `@` lists, then the box
+itself, the draft kept, with "Esc again stops the turn" over the
+transcript while one runs; the next Esc stops it. The Sessions pane
+leaves Esc alone. A path holding a space is quoted,
 `@"my file.txt" `, and a folder's pick puts `@src/ui/` in the message
 and keeps the picker open inside it. `@` is already how an instruction
 file imports another, `@docs/a.md`, so the two read alike. `[ui]
