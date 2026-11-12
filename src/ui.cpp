@@ -947,11 +947,14 @@ static void drawmarks(Gui *g, ImDrawList *dl, Marks *mk, Piece *pieces, Run *r,
 }
 
 // Draw one placed block of a message whose content starts at origin.
+// Its inline code that names a file found from where the text is (from,
+// null for nowhere) is drawn as a link.
 static void namedrect(Gui *, Str, ImVec2, ImVec2);
+static b32  codelinkdrawn(Gui *, Arena, LinkFrom *, Str);
 
 static void drawblock(Gui *g, ImDrawList *dl, ImDrawListSplitter *sp,
                       Doc *d, i32 msg, Placed *p, ImVec2 origin, Range sel,
-                      Marks *mk, f32 cliptop, f32 clipbot, f32 alpha)
+                      Marks *mk, f32 cliptop, f32 clipbot, f32 alpha, LinkFrom *from)
 {
     BlockLayout *bl     = p->bl;
     DocBlock    *b      = &d->blocks[p->block];
@@ -997,6 +1000,8 @@ static void drawblock(Gui *g, ImDrawList *dl, ImDrawListSplitter *sp,
     }
 
     b32 selected = !poseq(sel.beg, sel.end) && sel.beg.msg<=msg && msg<=sel.end.msg;
+    i32 candat   = -1;  // the last candidate piece looked up, and whether a link
+    b32 candlink = 0;
     i32 s0 = sel.beg.msg<msg ? 0 : sel.beg.off;
     i32 s1 = sel.end.msg>msg ? 0x7fffffff : sel.end.off;
     for (iz li = 0; li < bl->lines.len; li++) {
@@ -1030,11 +1035,17 @@ static void drawblock(Gui *g, ImDrawList *dl, ImDrawListSplitter *sp,
             if (r->flags & RUN_NODRAW) {
                 continue;
             }
+            if (pc->flags&PIECE_CAND && candat!=r->piece) {
+                DocCand *c = from ? doccand(d, pc) : 0;
+                candat   = r->piece;
+                candlink = c && codelinkdrawn(g, g->frame, from, c->text);
+            }
+            b32          cand = pc->flags&PIECE_CAND && candlink;
             ImFontBaked *bk   = stylebaked(f, pc->style);
             ImVec2       at   = v2(ox + r->x, ly + l->base - bk->Ascent);
             char const  *beg  = pc->text.cdata + r->b0;
             char const  *end  = pc->text.cdata + r->b1;
-            u32          col  = fade(piececolor(pal, pc, code), alpha);
+            u32          col  = fade(cand ? pal->link : piececolor(pal, pc, code), alpha);
             ImFont      *font = stylefont(f, pc->style);
             f32          size = stylesize(f, pc->style);
             sp->SetCurrentChannel(dl, CH_TEXT);
@@ -1052,7 +1063,7 @@ static void drawblock(Gui *g, ImDrawList *dl, ImDrawListSplitter *sp,
             } else {
                 dl->AddText(font, size, at, col, beg, end);
             }
-            if (pc->style & (STYLE_STRIKE|STYLE_LINK)) {
+            if (pc->style&(STYLE_STRIKE|STYLE_LINK) || cand) {
                 f32 y = pc->style&STYLE_STRIKE ? ly + l->base - bk->Ascent*0.35f
                                                : ly + l->base + 1;
                 dl->AddLine(v2(ox+r->x, y), v2(ox+r->x+r->w, y), col, 1);
@@ -1061,6 +1072,11 @@ static void drawblock(Gui *g, ImDrawList *dl, ImDrawListSplitter *sp,
                 // Where the checklist clicks a link: "link " and where to
                 Arena a = g->frame;
                 namedrect(g, concat(&a, "link ", d->links[pc->link]),
+                          v2(ox+r->x, ly), v2(ox+r->x+r->w, ly+l->h));
+            } else if (g->drive && cand) {
+                // Inline code, found a file: "codelink " and its text
+                Arena a = g->frame;
+                namedrect(g, concat(&a, "codelink ", pc->text),
                           v2(ox+r->x, ly), v2(ox+r->x+r->w, ly+l->h));
             }
         }
@@ -3782,6 +3798,8 @@ struct TextArea {
     f32    padx;     // more left margin: a file's line numbers
     f32    scrollx;  // scrolled right by, unwrapped
     b32    margin;   // head is a top margin, over the message before's foot
+    LinkFrom *from;  // where its links to files are, else null: nowhere,
+    b32    permsg;   // or (the transcript) each message's own folder
 };
 
 struct TextHit {
@@ -3878,6 +3896,8 @@ static Str  termcwd(GuiSession *);
 static Str  filelinktip(Gui *, Arena *, Str, Dest *, LinkFrom *);
 static void filelinkopen(Gui *, Arena *, Dest *, LinkFrom *);
 static void filelinkmark(Gui *, Str, LinkFrom *);
+static Str  codelinkat(Gui *, Arena, View *, TextHit, LinkFrom *);
+static void codelinkhostend(Gui *, u64);
 static void filelinkitems(Gui *);
 
 // The text's context menu, if it opened on the last item: Copy and Copy
@@ -3954,12 +3974,23 @@ static void drawmsgtext(Gui *g, ImDrawList *dl, ImDrawListSplitter *sp, TextArea
             hi = mid;
         }
     }
+    LinkFrom  own  = {};
+    LinkFrom *from = 0;
+    if (d->cands.len && !v->msgs[i].prov) {
+        // Inline code that may name a file, once committed
+        if (ta->permsg) {
+            own  = filelinkfrom(g->sess, msgcwd(v, i));
+            from = &own;
+        } else {
+            from = ta->from;
+        }
+    }
     for (iz k = k0; k < ml->blocks.len; k++) {
         Placed *pl = &ml->blocks[k];
         if (origin.y+pl->y > bot) {
             break;
         }
-        drawblock(g, dl, sp, d, i, pl, origin, sel, mk, top, bot, alpha);
+        drawblock(g, dl, sp, d, i, pl, origin, sel, mk, top, bot, alpha, from);
     }
     if (v->msgs[i].lines) {
         return;  // no code blocks, no Copy buttons
@@ -4097,6 +4128,7 @@ static Str textlink(Gui *g, View *v, TextHit hit, u64 *press, i32 *pressmsg, Lin
     Str   link = {};
     if (hit.hit && hit.body && ImGui::IsItemHovered()) {
         link = doclinkat(msgdoc(v, hit.at.msg), hit.at.off);
+        link = link.len ? link : codelinkat(g, a, v, hit, from);
     }
     if (link.len) {
         ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
@@ -4109,6 +4141,7 @@ static Str textlink(Gui *g, View *v, TextHit hit, u64 *press, i32 *pressmsg, Lin
     if (ImGui::IsMouseReleased(ImGuiMouseButton_Right) &&
             ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByPopup)) {
         Str at = hit.hit && hit.body ? doclinkat(msgdoc(v, hit.at.msg), hit.at.off) : Str{};
+        at = at.len ? at : codelinkat(g, a, v, hit, from);
         filelinkmark(g, at, from);
     }
     if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
@@ -4339,7 +4372,7 @@ static Str drawlines(Gui *g, DocView *d, char const *id, DocLines *dl)
     f32    ww   = ImGui::GetWindowWidth() - st.ScrollbarSize;
     f32    sx   = dl->wrap ? 0 : ImGui::GetScrollX();
     TextArea ta = {v, wpos, wh, width, pad, pad, ImGui::GetScrollY(), &d->dragging,
-                   &d->scrollto, gutter, sx, 1};
+                   &d->scrollto, gutter, sx, 1, 0, 0};
     TextHit hit  = textmouse(g, &ta);
     Str     link = textlink(g, v, hit, &d->press, &d->pressmsg, &d->from);
     if (begintextmenu(g, v, -1)) {
@@ -4532,7 +4565,7 @@ static Str drawdoc(Gui *g, DocView *d, char const *id, f32 fit = 0, DocLines *li
     d->win = ImGui::GetCurrentWindow();
     ImVec2   wpos = ImGui::GetWindowPos();
     TextArea ta   = {v, wpos, ImGui::GetWindowHeight(), width, pad, pad,
-                     ImGui::GetScrollY(), &d->dragging, &d->scrollto, 0, 0, 0};
+                     ImGui::GetScrollY(), &d->dragging, &d->scrollto, 0, 0, 0, &d->from, 0};
     TextHit hit  = textmouse(g, &ta);
     Str     link = textlink(g, v, hit, &d->press, &d->pressmsg, &d->from);
     if (begintextmenu(g, v, -1)) {
@@ -5419,7 +5452,7 @@ static void drawtranscript(Gui *g)
     // Mouse: an invisible button over the visible area, which the
     // headers' toggles and the asks' buttons, made later, overlap.
     TextArea ta  = {v, wpos, winh, width, pad, head, scrolly, &g->dragging, &g->scrollto,
-                    0, 0, 0};
+                    0, 0, 0, 0, 1};
     TextHit  hit  = textmouse(g, &ta);
     LinkFrom from = filelinkfrom(g->sess, hit.hit ? msgcwd(v, hit.at.msg) : v->cwd);
     Str      link = textlink(g, v, hit, &g->linkpress, &g->linkmsg, &from);

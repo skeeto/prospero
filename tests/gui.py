@@ -360,6 +360,15 @@ def filesfixtures(host):
     host.write(d("huge.txt"), "".join(f"huge {n}\n" for n in range(1, 100101)))
     with open(d("crlf.txt"), "wb") as f:
         f.write(b"\xef\xbb\xbffirst\r\nsecond\r\nthird\r\n")
+    if os.name != "nt":
+        # Links inside the folder that inline code names, never followed
+        # by its unasked check: out of it to /dev and to a FIFO, and one
+        # staying inside
+        fifo = host.path("outside.fifo")
+        os.mkfifo(fifo)
+        os.symlink("/dev", d("out"))
+        os.symlink(fifo, d("pipe"))
+        os.symlink("a/x.c", d("in.c"))
 
 
 def alive(pid):

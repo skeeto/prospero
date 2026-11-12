@@ -309,6 +309,14 @@ its file as well, a read's at the lines it read and an edit's at the
 lines it changed; a click elsewhere on the row's header still folds
 it.
 
+Inline code that names a file, such as `src/engine.cpp:42`, becomes a
+link too, but only once Prospero finds that file: on its host, within
+the folder its relative links are from, and never by a network path,
+since nobody asked for that file to be looked at. It looks only at
+what is on screen, and a file not found then is looked for again only
+when shown 15 seconds later or more. Code inside a link stays part of
+that link.
+
 ## The session's menu
 
 Right-click a session in the sidebar, or open the Session menu, for:

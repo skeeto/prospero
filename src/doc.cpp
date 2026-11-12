@@ -49,6 +49,7 @@ enum : u8 {
     PIECE_SYNTH = 1<<0,  // display text with no source bytes
     PIECE_HARD  = 1<<1,  // a hard line break
     PIECE_SOFT  = 1<<2,  // a soft line break: a space when wrapped
+    PIECE_CAND  = 1<<3,  // an inline-code span that may name a file
 };
 
 enum : i32 {
@@ -86,12 +87,22 @@ struct DocBlock {
     u64 hash;         // everything layout depends on: the cache key
 };
 
+// An inline-code span outside any link that may name a file (codepath):
+// not a link, and kept out of Doc.links, until its file is found
+// (ui.cpp's codelinks). Its one piece is flagged PIECE_CAND.
+struct DocCand {
+    i32 off;   // its text's source range
+    i32 len;
+    Str text;  // the span's text, a reference as fileref takes it
+};
+
 struct Doc {
     Str          src;
     Slice<DocBlock> blocks;
     Slice<Piece> pieces;
     Slice<Str>   links;
     Slice<i32>   images;  // the links that are images' sources
+    Slice<DocCand> cands; // in source order
     i32          ntables;
     b32          plain;  // parsed as plain text
 };
@@ -121,6 +132,7 @@ struct DocParse {
     u8       task;     // the pending item's task state
     i32      bold, italic, code, strike;  // span nesting counts
     i32      link;     // innermost open link, -1 if none
+    i32      cand;     // an open code span's first piece, -1 if in a link
     i32      table, row, col;
     u8       align;
     b32      header;
@@ -473,7 +485,8 @@ static void closeblock(DocParse *p)
     hashbytes(&h, b->lang.data, b->lang.len);
     for (i32 i = 0; i < b->npiece; i++) {
         Piece *pc = &d->pieces[b->piece0+i];
-        u64 w = (u64)pc->style | (u64)pc->hl<<16 | (u64)pc->flags<<24;
+        u8  fl = (u8)(pc->flags & ~PIECE_CAND);  // drawn, not laid out
+        u64 w  = (u64)pc->style | (u64)pc->hl<<16 | (u64)fl<<24;
         hashword(&h, w);
         hashbytes(&h, pc->text.data, pc->text.len);
     }
@@ -604,7 +617,10 @@ static int mdenterspan(MD_SPANTYPE type, void *detail, void *ud)
     switch (type) {
     case MD_SPAN_EM:     p->italic++; break;
     case MD_SPAN_STRONG: p->bold++;   break;
-    case MD_SPAN_CODE:   p->code++;   break;
+    case MD_SPAN_CODE:
+        p->code++;
+        p->cand = p->link<0 ? (i32)p->doc->pieces.len : -1;
+        break;
     case MD_SPAN_DEL:    p->strike++; break;
     case MD_SPAN_A: {
         MD_SPAN_A_DETAIL *a = (MD_SPAN_A_DETAIL *)detail;
@@ -637,13 +653,53 @@ static int mdenterspan(MD_SPANTYPE type, void *detail, void *ud)
     return 0;
 }
 
+// A code span just closed: a candidate if it is one piece of source
+// text, outside any link, that codepath says may name a file.
+static void codecand(DocParse *p)
+{
+    Doc *d = p->doc;
+    i32  i = p->cand;
+    p->cand = -1;
+    if (i<0 || i!=d->pieces.len-1) {
+        return;
+    }
+    Piece *pc = &d->pieces[i];
+    if (pc->flags&PIECE_SYNTH || pc->len!=pc->text.len || !codepath(pc->text)) {
+        return;
+    }
+    pc->flags |= PIECE_CAND;
+    DocCand c = {pc->off, pc->len, pc->text};
+    d->cands  = push(p->perm, d->cands, c);
+}
+
+// The candidate a PIECE_CAND piece is, else null.
+static DocCand *doccand(Doc *d, Piece *pc)
+{
+    if (!(pc->flags & PIECE_CAND)) {
+        return 0;
+    }
+    iz lo = 0, hi = d->cands.len;
+    while (lo < hi) {
+        iz mid = lo + (hi - lo)/2;
+        if (d->cands[mid].off+d->cands[mid].len <= pc->off) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo<d->cands.len && d->cands[lo].off<=pc->off ? &d->cands[lo] : 0;
+}
+
 static int mdleavespan(MD_SPANTYPE type, void *, void *ud)
 {
     DocParse *p = (DocParse *)ud;
     switch (type) {
     case MD_SPAN_EM:     p->italic--; break;
     case MD_SPAN_STRONG: p->bold--;   break;
-    case MD_SPAN_CODE:   p->code--;   break;
+    case MD_SPAN_CODE:
+        p->code--;
+        codecand(p);
+        break;
     case MD_SPAN_DEL:    p->strike--; break;
     case MD_SPAN_A:      p->link = -1; break;
     case MD_SPAN_IMG:    p->link = -1; p->italic--; break;
@@ -822,6 +878,7 @@ static Doc *parsedoc(Arena *perm, Str src, HlMemo **memo, b32 hardbreaks = 0)
     p.size    = src.len;
     p.cur     = -1;
     p.link    = -1;
+    p.cand    = -1;
     p.indent0 = -1;
     p.hardbreaks = hardbreaks;
     d->src    = src;

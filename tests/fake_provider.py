@@ -3144,7 +3144,9 @@ def sc_gui(model, n, req):
     elif "Cite the files" in prompt:
         # Two files written, then links to them as models write them: a
         # line, a range, a #L range, a Markdown file, an absolute file:
-        # URL, past the end, a file not there, and mailto:
+        # URL, past the end, a file not there, and mailto:; then inline
+        # code naming a file there, and one not there, which links only
+        # once found
         steps = [("write", {"path": "cite/hello.c", "content": GUI_CITE_C}),
                  ("write", {"path": "cite/notes.md", "content": GUI_CITE_MD})]
         if step < len(steps):
@@ -3160,12 +3162,16 @@ def sc_gui(model, n, req):
                               f"- [hello.c, absolutely](<{url}/cite/hello.c>)\n"
                               "- [past the end](cite/hello.c:500)\n"
                               "- [not there](cite/nothere.c:3)\n"
-                              "- [mail](mailto:someone@example.com)\n")
+                              "- [mail](mailto:someone@example.com)\n"
+                              "- in code, `cite/hello.c:7` and `cite/nothere.c:2`\n"
+                              "- through links: `files/out/null`, `files/pipe` "
+                              "and `files/in.c`\n")
     elif "Link the far file" in prompt:
         # Links to a file in the session's folder on its host, which only
-        # its engine there reads, and to one not there
+        # its engine there reads, and to one not there; and the file in
+        # inline code, a link once fs.stat there finds it
         yield from answer(model, "Linked: [hello.txt:1](hello.txt:1), "
-                          "and [not there](nope.txt).\n")
+                          "and [not there](nope.txt). It is `hello.txt`.\n")
     elif "Edit the lines" in prompt or "Edit the far file" in prompt:
         # A file shown in the Files pane changed by a tool, which the pane
         # reads again: files/lines.txt's first line here, or the far

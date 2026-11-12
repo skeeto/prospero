@@ -1354,6 +1354,53 @@ static b32 os_linkfar(Os *, Arena scratch, Str path)
     return 0;
 }
 
+// Each part opened as itself (FILE_FLAG_OPEN_REPARSE_POINT): a reparse
+// point that is a link, or one that can't be told, is a link; others
+// (dedup, cloud placeholders) are not.
+static b32 os_haslink(Os *, Arena scratch, Str path, iz from)
+{
+    if (hasnul(path) || from<0) {
+        return 0;
+    }
+    u8 *buf = (u8 *)alloc<u32>(&scratch, MAXIMUM_REPARSE_DATA_BUFFER_SIZE/4);
+    for (iz end = from; end <= path.len; end++) {
+        b32 sep = end<path.len && (path[end]=='/' || path[end]=='\\');
+        if ((end<path.len && !sep) || end==from ||
+                path[end-1]=='/' || path[end-1]=='\\') {
+            continue;
+        }
+        Arena tmp = scratch;
+        Str16 p   = widepath(&tmp, takehead(path, end));
+        if (!diskpath(p)) {
+            return 1;  // \\?\UNC\, \\.\: off the disks
+        }
+        uz h = CreateFileW(
+            p.data, 0, FILE_SHARE_ALL, 0, OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT, 0
+        );
+        if (h == INVALID_HANDLE_VALUE) {
+            return 0;  // missing or shut: nothing opens past it
+        }
+        FileInfo fi = {};
+        b32      ok = GetFileInformationByHandle(h, &fi);
+        if (!ok || !(fi.attr & FILE_ATTRIBUTE_REPARSE_POINT)) {
+            CloseHandle(h);
+            continue;
+        }
+        i32 got = 0;
+        ok = DeviceIoControl(
+            h, FSCTL_GET_REPARSE_POINT, 0, 0,
+            buf, MAXIMUM_REPARSE_DATA_BUFFER_SIZE, &got, 0
+        );
+        CloseHandle(h);
+        Reparse t = ok ? reparsedata(buf, got) : Reparse{{}, REPARSE_ODDLINK, 0};
+        if (t.kind != REPARSE_NOTLINK) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static Str os_realpath(Os *os, Arena *a, Str path)
 {
     if (hasnul(path)) {

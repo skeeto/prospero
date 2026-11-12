@@ -293,6 +293,12 @@ static Str     os_realpath(Os *, Arena *, Str path);
 // link's target, as os_stat and os_realpath would. Never elsewhere: a
 // stat there does not open what it reaches.
 static b32     os_linkfar(Os *, Arena, Str path);
+// (M3) Is a part of an absolute path from byte from on (each part ending
+// at a separator there or at its end) a symlink, or on Windows a
+// junction or other link? Told part by part without following any link,
+// so nothing a link names is touched; a part missing ends the walk (0).
+// For checks nobody asked for (inline code), which take no link at all.
+static b32     os_haslink(Os *, Arena, Str path, iz from);
 
 // This user's ids as UID:GID on Linux, for a container whose root would
 // be root here (ctruser); null elsewhere.

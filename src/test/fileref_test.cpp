@@ -241,6 +241,12 @@ static void test_fileref(Test *t)
         {"std::vector", 0},
         {"", 0},
         {"a\tb.c", 0},
+        {"cite/hello.c:7", 1},
+        {"hello.txt", 1},
+        {"#L3.c", 1},
+        {"e.g.", 0},
+        {"1.5", 0},
+        {"i.e", 1},
     };
     for (iz i = 0; i < countof(spans); i++) {
         Str got  = codepath(spans[i].span) ? Str("path") : Str("not");

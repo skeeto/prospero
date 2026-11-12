@@ -638,6 +638,7 @@ static void filehostend(Gui *g, GuiHost *h)
         g->fask.statid = 0;
         g->fask.p.err  = filehostwhy(0);
     }
+    codelinkhostend(g, h->uid);
     if (h->kind == GH_REMOTE) {
         filesstale(g, h->uid, 0, 1);
     }
@@ -1269,6 +1270,268 @@ static void filelinkitems(Gui *g)
         itemtip("Put the file's path on the clipboard");
     }
     ImGui::Separator();
+}
+
+
+// Inline code naming a file (doc.cpp's DocCand): a link once its file
+// is found (CodeLinks, app.cpp). Only what is drawn is asked about, and
+// only a committed message's. A span resolves as nobody asked for it
+// (filepath, unasked 1): inside the working directory, with no "~" and
+// no network path, so nothing a model writes makes the window touch
+// another computer. Here no link is followed either: a path through a
+// symlink or junction below the folder (os_haslink, told without
+// following it) is a miss, never stat'ed, wherever the link leads, as
+// a link inside a cloned repository may name a share or an automount.
+// Else filestat answers, at most CODELINK_BATCH paths
+// or CODELINK_US a frame; on another host fs.stat does, in batches of
+// CODELINK_BATCH, one in flight per host. A miss is asked again only
+// when drawn CODELINK_AGAIN later: no timers, no idle frames. A batch
+// whose reply is lost (its host gone, its request slot taken, or
+// FILES_LOST passed) lets its paths be asked again.
+
+// The cache's entry for a span's file from where it is, made if new;
+// null if it names none it may check, or there is no room. It is
+// resolved in scratch, which must hold nothing the caller still uses.
+static CodeLink *codelinkget(Gui *g, Arena scratch, LinkFrom *from, Str span)
+{
+    if (!from || !from->opens || !span.len) {
+        return 0;
+    }
+    Arena a = scratch;
+    Dest  d = helpdest(&a, span);
+    if (d.kind!=DEST_FILE || d.here || d.file.kind!=FREF_PATH) {
+        return 0;
+    }
+    FilePath p = filepath(&a, d.file, from->base, {}, from->win, 1);
+    if (p.err.len || !p.path.len) {
+        return 0;
+    }
+
+    CodeLinks *c = &g->codelinks;
+    if (!c->r) {
+        c->r = os_reserve(g->os, CODELINK_REGION);
+        if (!c->r) {
+            return 0;
+        }
+        c->mem  = newarena(c->r);
+        c->base = c->mem.beg;
+    }
+    Hash64 h = {};
+    hashbytes(&h, &from->host, sizeof(from->host));
+    hashbytes(&h, p.path.data, p.path.len);
+    u64 key = hashfinal(&h);
+
+    CodeLink **m = &c->root;
+    for (u64 k = key; *m; k <<= 2) {
+        CodeLink *e = *m;
+        if (e->key==key && e->host==from->host && e->path==p.path) {
+            return e;
+        }
+        m = &e->child[k>>62];
+    }
+    iz need = (iz)sizeof(CodeLink) + p.path.len + 64;
+    if (c->count>=CODELINK_MAX || !fits(&c->mem, need)) {
+        // Full: all forgotten, batches in flight too (their replies
+        // then match nothing), and asked again as drawn
+        c->mem.beg = c->base;
+        c->root    = 0;
+        c->count   = 0;
+        for (i32 i = 0; i < CODELINK_HOSTS; i++) {
+            c->asks[i] = {};
+        }
+        m = &c->root;
+    }
+    CodeLink *e = alloc<CodeLink>(&c->mem);
+    e->key  = key;
+    e->host = from->host;
+    e->path = clone(&c->mem, p.path);
+    *m = e;
+    c->count++;
+    return e;
+}
+
+// Whether a span drawn is a link: its file found. Asked about if not
+// known, or a miss long enough ago.
+static b32 codelinkdrawn(Gui *g, Arena scratch, LinkFrom *from, Str span)
+{
+    CodeLink *e = codelinkget(g, scratch, from, span);
+    if (!e) {
+        return 0;
+    }
+    CodeLinks *c   = &g->codelinks;
+    i64        now = g->sched.now;
+    switch (e->state) {
+    case CODE_FILE:
+        return 1;
+    case CODE_ASKING:
+        return 0;
+    case CODE_MISS:
+        if (now-e->asked < CODELINK_AGAIN) {
+            return 0;
+        }
+        break;
+    }
+
+    if (!e->host) {
+        if (c->stats>=CODELINK_BATCH || c->spent>=CODELINK_US) {
+            c->more = 1;  // the next frame's
+            return 0;
+        }
+        // Below the folder, by its parts' bytes: its own path, and
+        // what leads to it, are the user's choice
+        Str root = normpath(&scratch, from->base, ".", from->win);
+        for (; root.len && issep(root[root.len-1], from->win); root.len--) {}
+        i64  t0 = os_ticks(g->os);
+        b32  ln = os_haslink(g->os, scratch, e->path, root.len+1);
+        Stat st = ln ? Stat{0, 0, STAT_OTHER} : filestat(g, scratch, e->path);
+        i64  t1 = os_ticks(g->os);
+        e->linked = (u8)ln;
+        c->stats++;
+        c->spent += t1 - t0;
+        e->asked  = t1;
+        e->state  = st.type==STAT_FILE ? CODE_FILE : CODE_MISS;
+        if (e->state == CODE_FILE) {
+            scheddirty(&g->sched);
+        }
+        return e->state == CODE_FILE;
+    }
+
+    GuiHost *h = filehost(g, e->host);
+    if (filehostwhy(h).len) {
+        return 0;  // asked once it can answer, and drawn
+    }
+    CodeAsk *q = 0;
+    for (i32 i = 0; !q && i < CODELINK_HOSTS; i++) {
+        q = c->asks[i].host==e->host ? &c->asks[i] : 0;
+    }
+    for (i32 i = 0; !q && i < CODELINK_HOSTS; i++) {
+        q = !c->asks[i].host ? &c->asks[i] : 0;
+    }
+    if (!q || q->id || q->n==CODELINK_BATCH) {
+        return 0;  // after the batch in flight, whose answer draws again
+    }
+    q->host = e->host;
+    q->paths[q->n++] = e;
+    e->state = CODE_ASKING;
+    return 0;
+}
+
+// The candidate under the mouse in a view's text, if a link: its text.
+static Str codelinkat(Gui *g, Arena scratch, View *v, TextHit hit, LinkFrom *from)
+{
+    if (!hit.hit || !hit.body || v->msgs[hit.at.msg].prov) {
+        return {};
+    }
+    Doc *d = msgdoc(v, hit.at.msg);
+    if (!d->cands.len) {
+        return {};
+    }
+    i32 off = hit.at.off;
+    for (iz i = 0; i < d->cands.len; i++) {
+        DocCand *k = &d->cands[i];
+        if (off>=k->off && off<k->off+k->len) {
+            CodeLink *e = codelinkget(g, scratch, from, k->text);
+            return e && e->state==CODE_FILE ? k->text : Str{};
+        }
+    }
+    return {};
+}
+
+// A batch's paths, its answer lost, to be asked again as drawn.
+static void codeaskdrop(CodeAsk *q)
+{
+    for (i32 i = 0; i < q->n; i++) {
+        if (q->paths[i]->state == CODE_ASKING) {
+            q->paths[i]->state = CODE_NEW;
+        }
+    }
+    *q = {};
+}
+
+// At the end of a frame's drawing: the batches built sent, those lost
+// let go, and another frame if paths drawn here were left unasked.
+static void codelinksflush(Gui *g)
+{
+    CodeLinks *c   = &g->codelinks;
+    i64        now = g->sched.now;
+    for (i32 i = 0; i < CODELINK_HOSTS; i++) {
+        CodeAsk *q = &c->asks[i];
+        if (!q->host) {
+            continue;
+        }
+        GuiHost *h = filehost(g, q->host);
+        if (q->id) {
+            if (filehostwhy(h).len || !reqheld(g, q->id) ||
+                    now-q->sent > (i64)FILES_LOST*1000) {
+                codeaskdrop(q);
+            }
+            continue;
+        } else if (filehostwhy(h).len) {
+            codeaskdrop(q);
+            continue;
+        }
+        iz    len = 0;
+        for (i32 k = 0; k < q->n; k++) {
+            len += q->paths[k]->path.len;
+        }
+        Arena a = newarena(g->cmdr);
+        Buf   b(&a, 256 + 6*len);
+        EvOut o = cmdopen(g, &b, CMD_FSSTAT, 0, h);
+        putkey(&o.json, "paths");
+        putarray(&o.json);
+        for (i32 k = 0; k < q->n; k++) {
+            putstr(&o.json, q->paths[k]->path);
+        }
+        putend(&o.json);
+        q->id   = g->nextid;
+        q->sent = now;
+        cmdsend(g, &o, a);
+    }
+    if (c->more) {
+        scheddirty(&g->sched);
+    }
+    c->stats = 0;
+    c->spent = 0;
+    c->more  = 0;
+}
+
+// A host's answer to a batch, if id is one's: each path a file or a
+// miss. One not answered (refused, not sent) is a miss, asked again
+// later.
+static b32 codelinkreply(Gui *g, i64 id, Json *j, b32 ok)
+{
+    CodeLinks *c = &g->codelinks;
+    CodeAsk   *q = 0;
+    for (i32 i = 0; !q && i < CODELINK_HOSTS; i++) {
+        q = c->asks[i].id==id ? &c->asks[i] : 0;
+    }
+    if (!id || !q) {
+        return 0;
+    }
+    Json *stats = ok ? jsonget(j, "stats") : 0;
+    b32   found = 0;
+    for (i32 i = 0; i < q->n; i++) {
+        CodeLink *e    = q->paths[i];
+        Str       type = jsonstr(jsonget(jsonat(stats, i), "type"));
+        e->state = type=="file" ? CODE_FILE : CODE_MISS;
+        e->asked = g->sched.now;
+        found   |= e->state == CODE_FILE;
+    }
+    *q = {};
+    if (found) {
+        scheddirty(&g->sched);
+    }
+    return 1;
+}
+
+// Its host's link ended: its batch in flight is lost.
+static void codelinkhostend(Gui *g, u64 host)
+{
+    for (i32 i = 0; i < CODELINK_HOSTS; i++) {
+        if (g->codelinks.asks[i].host == host) {
+            codeaskdrop(&g->codelinks.asks[i]);
+        }
+    }
 }
 
 

@@ -401,5 +401,48 @@ static void test_doc(Test *t)
         expect(t, "doc.huge", istr(&a, d->plain), "1");
     }
 
+    // Inline code that may name a file: a candidate, never a link; a
+    // span inside a link is the link's, and the layout is the same
+    {
+        Arena a   = perm;
+        Str   src = "See `src/a.c:3`, [`b.c`](b.c), `foo()`, `x.md`, ![`i.png`](i.png)\n"
+                    "and ``y.c``.\n";
+        Doc  *d   = parsedoc(&a, src, 0);
+        Buf   b(&a, 128);
+        for (iz i = 0; i < d->cands.len; i++) {
+            DocCand *c = &d->cands[i];
+            print(&b, i ? Str(" ") : Str(""));
+            print(&b, c->text);
+            putbyte(&b, '@');
+            print(&b, (i64)c->off);
+            expect(t, "doc.cands.source", takehead(cuthead(src, c->off), c->len), c->text);
+        }
+        expect(t, "doc.cands", finish(&b), "src/a.c:3@5 x.md@41 y.c@72");
+        expect(t, "doc.cands.links", istr(&a, d->links.len), "2");
+        expect(t, "doc.cands.link0", d->links[0], "b.c");
+        expect(t, "doc.cands.notlink", doclinkat(d, 6), "");
+        expect(t, "doc.cands.inlink", doclinkat(d, 19), "b.c");
+        expect(t, "doc.cands.check", doccheck(&a, d), "");
+
+        i32 flagged = 0, found = 0;
+        for (iz i = 0; i < d->pieces.len; i++) {
+            Piece   *pc = &d->pieces[i];
+            DocCand *c  = doccand(d, pc);
+            flagged += (pc->flags & PIECE_CAND) != 0;
+            found   += c && c->off==pc->off && c->text==pc->text;
+            if (pc->link >= 0) {
+                expect(t, "doc.cands.linkpiece", istr(&a, pc->flags & PIECE_CAND), "0");
+            }
+        }
+        expect(t, "doc.cands.flagged", istr(&a, flagged), "3");
+        expect(t, "doc.cands.found", istr(&a, found), "3");
+
+        Doc *e = parsedoc(&a, "`a.c`", 0);
+        expect(t, "doc.cands.one", istr(&a, e->cands.len), "1");
+        expect(t, "doc.cands.show", docshow(&a, e), "P: c:a.c\n");
+        Doc *g = parsedoc(&a, "`a()`", 0);
+        expect(t, "doc.cands.none", istr(&a, g->cands.len), "0");
+    }
+
     test_docsource(t);
 }

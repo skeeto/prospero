@@ -1039,6 +1039,30 @@ static Str os_hostids(Os *, Arena *a)
 
 static b32 os_linkfar(Os *, Arena, Str) { return 0; }
 
+static b32 os_haslink(Os *, Arena scratch, Str path, iz from)
+{
+    if (hasnul(path) || from<0) {
+        return 0;
+    }
+    char *c = cstr(&scratch, path);
+    for (iz end = from; end <= path.len; end++) {
+        if ((end<path.len && path[end]!='/') || end==from || path[end-1]=='/') {
+            continue;
+        }
+        char        save = c[end];
+        struct stat st;
+        c[end] = 0;
+        int r  = lstat(c, &st);
+        c[end] = save;
+        if (r) {
+            return 0;  // missing: nothing past it is reached
+        } else if (S_ISLNK(st.st_mode)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static Str os_realpath(Os *, Arena *a, Str path)
 {
     if (hasnul(path)) {

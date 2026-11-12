@@ -826,6 +826,64 @@ struct LinkMenu {
     i32         whylen;
 };
 
+// Inline code naming a file (doc.cpp's DocCand) is drawn as a link once
+// the file is found: on this computer by filestat, on another host by
+// fs.stat there. Asked only of what is drawn, and remembered by host
+// and resolved path (codelinks, files.cpp). Each path is a CodeLink in
+// a hash trie in the cache's own Region, CODELINK_REGION reserved: the
+// whole cache is forgotten at once when CODELINK_MAX paths are held or
+// the next one would not fit, so it never holds more than that.
+enum : i32 {
+    CODELINK_BATCH = 16,         // stats here a frame, or paths in one fs.stat
+    CODELINK_US    = 2000,       // and at most this long a frame stat'ing here
+    CODELINK_AGAIN = 15000000,   // a miss is asked again once drawn this much later
+    CODELINK_MAX   = 16384,      // paths held, then all forgotten
+    CODELINK_HOSTS = 8,          // hosts asked at once, a batch each
+};
+
+enum : iz {
+    CODELINK_REGION = (iz)4 << 20,
+};
+
+enum : u8 {
+    CODE_NEW,     // not asked yet, or asked and lost: asked when drawn
+    CODE_ASKING,  // in a batch, built or sent
+    CODE_FILE,    // a file: a link
+    CODE_MISS,    // not a file, when asked: asked again later
+};
+
+struct CodeLink {
+    CodeLink *child[4];
+    u64       key;    // hash of host and path
+    u64       host;   // uid, 0 for this computer
+    Str       path;   // resolved
+    i64       asked;  // ticks of the answer, a miss's
+    u8        state;  // CODE_*
+    u8        linked; // a miss for a link on its way, never stat'ed
+};
+
+// One host's fs.stat batch: built as its paths are drawn, sent at the
+// frame's end, one in flight per host.
+struct CodeAsk {
+    u64       host;  // uid, 0 for a free slot
+    i64       id;    // the request in flight, 0 while built
+    i64       sent;  // ticks
+    i32       n;
+    CodeLink *paths[CODELINK_BATCH];
+};
+
+struct CodeLinks {
+    Region   *r;      // null until first needed
+    Arena     mem;
+    byte     *base;   // mem's beginning, to forget everything
+    CodeLink *root;
+    i32       count;
+    i32       stats;  // made here this frame
+    i64       spent;  // ticks they took
+    b32       more;   // drawn and unasked, for the frame's budget
+    CodeAsk   asks[CODELINK_HOSTS];
+};
+
 // A Markdown document, read-only, shown as the transcript shows a
 // message, its text selectable and copied likewise (drawdoc): the Plan
 // window's plan, or any other text. Its view holds the document as one
@@ -1580,6 +1638,7 @@ struct Gui {
     i32                linktippedlen;
     i32                toolpathmsg; // RECT_TOOLPATH's row, under the checklist
     LinkMenu           linkmenu;   // the text menu's file link, if any
+    CodeLinks          codelinks;  // inline code's files, found or not
     Images             img;        // screenshots
     b32                outopen;
     b32                outfocus;   // brought to the front next frame
@@ -6088,6 +6147,7 @@ static void fileanswer(Gui *, Str);
 static void onfsread(Gui *, Arena, Json *, b32, Str, i64);
 static void onfsstat(Gui *, Arena, Json *, b32, Str);
 static void onfswatch(Gui *, i64, Json *, b32, Str);
+static b32  codelinkreply(Gui *, i64, Json *, b32);
 static u64  fileuid(GuiHost *);
 static void filesstale(Gui *, u64, i64, b32);
 static void filefetchagain(Gui *, GuiHost *);
@@ -6203,6 +6263,8 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
     case CMD_FSSTAT:
         if (id && id==g->fask.statid) {
             onfsstat(g, scratch, j, ok, err);
+        } else if (codelinkreply(g, id, j, ok)) {
+            // inline code's files (codelinks)
         } else if (id) {
             onfswatch(g, id, j, ok, err);  // a tab's check, maybe
         }
@@ -12803,6 +12865,7 @@ static void gui_frame(Gui *g)
     droproute(g);  // what was where, as NewFrame knows, before any is drawn
     i64 t1 = os_ticks(g->os);
     dockwindows(g);
+    codelinksflush(g);  // what inline code drawn asks of other hosts
     i64 t2 = os_ticks(g->os);
     ImGui::Render();
     i64 t3 = os_ticks(g->os);
@@ -13887,6 +13950,10 @@ enum : i32 {
     CHK_EDITWHY,      // the Files toolbar's Open in editor is disabled,
                       // saying text
     CHK_REVEALED,     // the file shown in the file manager ends with text
+    CHK_FILELINK,     // inline code text, from the shown session's folder,
+                      // names a file and is drawn as a link (dx 1), or
+                      // was found to name none and is not (dx 0), or
+                      // is not for a link on its way, unfollowed (dx 2)
     CHK_COUNT,
 };
 
@@ -14204,6 +14271,7 @@ static Str chknames[] = {
     "Open in editor's command is as said",
     "Open in editor is disabled, saying why",
     "the file revealed is the one said",
+    "inline code is a link once its file is found, and only then",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -16370,6 +16438,25 @@ static DriveOp m3ops[] = {
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
     {OP_CHECK, CHK_FILEPATH, 0, 0, 0, "/cite/hello.c"},
+    // Inline code naming a file is a link once the file is found, at
+    // its line; one naming no file is no link, and has no rect
+    {OP_CHECK, CHK_FILELINK, 1, 0, 0, "cite/hello.c:7"},
+    {OP_CHECK, CHK_FILELINK, 0, 0, 0, "cite/nothere.c:2"},
+    // ... and through a symlink below the folder, out of it or not,
+    // never followed (gui.py's files/out, pipe and in.c; not on Windows)
+    {OP_CHECK, CHK_FILELINK, 2, 0, 0, "files/out/null"},
+    {OP_CHECK, CHK_FILELINK, 2, 0, 0, "files/pipe"},
+    {OP_CHECK, CHK_FILELINK, 2, 0, 0, "files/in.c"},
+    {OP_MOVE, T_NAMED, 0, 0, 800, "codelink cite/hello.c:7"},
+    {OP_CHECK, CHK_TOOLTIP, 0, 0, 0, ""},
+    {OP_CHECK, CHK_LINKTIP, 0, 0, 0, "Files \xe2\x86\x92 cite/hello.c:7"},
+    {OP_SHOT, 0, 0, 0, 300, "files-codelink"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEPATH, 0, 0, 0, "/cite/hello.c"},
+    {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "7-7"},
+    {OP_CHECK, CHK_FILELINE, 7, 0, 0, ""},
     // A tool row's path opens its file: a read's at the lines it read,
     // while a click elsewhere on its header still folds the row
     {OP_PROMPT, 0, 0, 0, 1500, "Read the cited lines."},
@@ -18209,6 +18296,11 @@ static DriveOp remoteops[] = {
     REMOTEFILES(OP_TEXTRCWD, "", "/hello.txt", "/nope.txt"),
     {OP_SHOT, 0, 0, 0, 300, "remote-files"},
     {OP_CHECK, CHK_EDITWHY, 0, 0, 0, "Its file is on another computer"},
+    // Inline code naming the file there: a link once fs.stat there
+    // found it
+    {OP_CHECK, CHK_FILELINK, 1, 0, 0, "hello.txt"},
+    {OP_MOVE, T_NAMED, 0, 0, 800, "codelink hello.txt"},
+    {OP_CHECK, CHK_LINKTIP, 1, 0, 0, "Files \xe2\x86\x92 hello.txt, on "},
     // A far file a tool changes is checked there (fs.stat) and read
     // again there (fs.read)
     {OP_PROMPT, 0, 0, 0, 100, "Edit the far file."},
@@ -21618,6 +21710,28 @@ static b32 drivefilecheck(Gui *g, i32 chk)
     } break;
     case CHK_FILEQUIET:
         return g->panes[PANE_FILES] && drivequiet(g, "idle with a file shown", 2);
+    case CHK_FILELINK: {
+        LinkFrom  from = filelinkfrom(g->sess, g->view->cwd);
+        Str       name = concat(&a, "codelink ", op->text);
+        CodeLink *e    = codelinkget(g, a, &from, op->text);
+        b32       rect = 0;
+        for (i32 i = 0; i < g->nnamed; i++) {
+            rect |= Str{g->named[i].name, g->named[i].len} == name;
+        }
+        Str states[] = {"not asked about", "being asked about", "a file", "no file"};
+        b32 linked   = e && e->linked;
+        print(&b, "drive: `");
+        print(&b, op->text);
+        print(&b, "` is ");
+        print(&b, e ? states[e->state] : Str("no path it may check"));
+        print(&b, linked ? Str(" (a link on its way, not followed)") : Str(""));
+        print(&b, rect ? Str(", drawn as a link") : Str(", never drawn as a link"));
+        ok = op->dx==1 ? e && e->state==CODE_FILE && rect
+                       : e && e->state==CODE_MISS && !rect;
+        #ifndef _WIN32
+        ok &= op->dx!=2 || linked;  // the fixture's symlinks: POSIX only
+        #endif
+    } break;
     case CHK_LINKTIP: {
         Str tip = {g->linktipped, g->linktippedlen};
         print(&b, "drive: the link's tooltip was ");
@@ -23828,6 +23942,7 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_EDITJUMP:
     case CHK_EDITWHY:
     case CHK_REVEALED:
+    case CHK_FILELINK:
         return drivefilecheck(g, chk);
     case CHK_TERMQUIET:
         return g->panes[PANE_TERMINAL] && drivequiet(g, "idle with the terminal shown", 2);
