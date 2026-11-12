@@ -109,6 +109,8 @@ struct AxGui {
     iz                  tracefd;  // PROSPERO_AXTRACE's file, or -1
     i64                 logmark;  // the checklist's: where "logged" looks from
     Str                 tracepath;
+    void              (*published)(AxGui *);  // the OS adapter's, after each publish
+    void              (*osdrive)(Gui *, Str); // its checklist verbs ("ns ...")
 };
 
 enum { AXLINT_CAP = 1<<12 };
@@ -583,15 +585,70 @@ static b32 axshown(ImGuiWindow *w)
     return w->Active && !w->Hidden && !(w->Flags & ImGuiWindowFlags_Tooltip);
 }
 
-// The node a window's items go under: a multiline field's own child
-// window is its field, so its items go under the field's window.
-static u32 axwindowkey(AxGui *x, ImGuiWindow *w)
+// The window whose node a window's items go under: a multiline field's
+// own child window is its field, so its items go under the field's window.
+static ImGuiWindow *axitemwindow(AxGui *x, ImGuiWindow *w)
 {
     while (w && (w->Flags & ImGuiWindowFlags_ChildWindow) && w->ParentWindow &&
             axfieldof(x, w->ChildId)) {
         w = w->ParentWindow;
     }
-    return w ? w->ID : 0;
+    return w;
+}
+
+// The item that opened menu w, if it is in this frame's tree: a menu
+// bar's item, or a menu's for a submenu. BeginMenu's popup has its
+// item's ID, its window one per depth, which every menu there reuses.
+static AxItem *axopener(AxGui *x, ImGuiWindow *w)
+{
+    if (!w || !(w->Flags & ImGuiWindowFlags_ChildMenu)) {
+        return 0;
+    }
+    for (ImGuiPopupData const &p : GImGui->OpenPopupStack) {
+        if (p.Window != w) {
+            continue;
+        }
+        for (iz i = x->items.len-1; i >= 0; i--) {
+            AxItem *it = &x->items[i];
+            if (it->id==p.PopupId && it->info && !it->offscreen) {
+                return it;
+            }
+        }
+        break;
+    }
+    return 0;
+}
+
+// Whether w is a popup closed this frame, after its Begin: a menu whose
+// item was pressed, drawn once more. It is gone, and its items with it;
+// else, no longer open from its item, it would come back for a frame as
+// another menu.
+static b32 axclosing(ImGuiWindow *w)
+{
+    if (!w || !(w->Flags & ImGuiWindowFlags_Popup)) {
+        return 0;
+    }
+    for (ImGuiPopupData const &p : GImGui->OpenPopupStack) {
+        if (p.Window == w) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+// A window's node: a menu's is its own for the item that opened it, not
+// its window's, so that Help's and View's are two elements, one closed
+// and the other opened, as a tool expects of two menus.
+static u32 axwinkey(AxGui *x, ImGuiWindow *w)
+{
+    AxItem *o = axopener(x, w);
+    return o ? ImHashStr("##axmenu", 0, o->id) : w ? w->ID : 0;
+}
+
+// The node a window's items go under
+static u32 axwindowkey(AxGui *x, ImGuiWindow *w)
+{
+    return axwinkey(x, axitemwindow(x, w));
 }
 
 static void axbuild(AxGui *x, ImGuiContext *ctx)
@@ -600,10 +657,11 @@ static void axbuild(AxGui *x, ImGuiContext *ctx)
     AxBuild *b = axbegin(x->ax);
 
     for (ImGuiWindow *w : ctx->Windows) {
-        if (!axshown(w) || axwindowkey(x, w)!=w->ID) {
+        if (!axshown(w) || axitemwindow(x, w)!=w || axclosing(w)) {
             continue;
         }
         u32    flags  = (u32)w->Flags;
+        u32    key    = w->ID;
         u32    parent = 0;
         AxRole role   = AX_WINDOW;
         u32    state  = 0;
@@ -612,8 +670,13 @@ static void axbuild(AxGui *x, ImGuiContext *ctx)
             role   = AX_GROUP;  // a pane, docked in its host
             parent = w->ParentWindow ? w->ParentWindow->ID : 0;
         } else if (flags & ImGuiWindowFlags_ChildMenu) {
-            role   = AX_MENU;  // a submenu, under the menu it opened from
-            parent = w->ParentWindow ? w->ParentWindow->ID : 0;
+            // A menu, under the item that opened it, as AppKit's hangs
+            // from its menu bar item; else under the window it opened from
+            AxItem *o = axopener(x, w);
+            role   = AX_MENU;
+            key    = axwinkey(x, w);
+            parent = o ? (o->key ? o->key : o->id)
+                       : w->ParentWindow ? axwinkey(x, w->ParentWindow) : 0;
         } else if (flags & ImGuiWindowFlags_ChildWindow) {
             role   = AX_GROUP;
             parent = w->ParentWindow ? w->ParentWindow->ID : 0;
@@ -628,7 +691,7 @@ static void axbuild(AxGui *x, ImGuiContext *ctx)
         } else if (flags & ImGuiWindowFlags_NoTitleBar) {
             role = AX_GROUP;  // a dock space's host: the OS's window is the app
         }
-        AxNode *n = axadd(b, parent, w->ID, role, name);
+        AxNode *n = axadd(b, parent, key, role, name);
         n->rect  = {w->Pos.x, w->Pos.y, w->Pos.x+w->Size.x, w->Pos.y+w->Size.y};
         n->state = state;
     }
@@ -639,6 +702,9 @@ static void axbuild(AxGui *x, ImGuiContext *ctx)
             continue;  // ImGui's own, or clipped away: no label known
         }
         ImGuiWindow *w      = ImGui::FindWindowByID(it->window);
+        if (w && (w->Hidden || axclosing(w) || axclosing(w->RootWindow))) {
+            continue;  // a window's first frame, sizing itself, or a popup's last
+        }
         u32          parent = axwindowkey(x, w);
         AxFieldDraw *f      = it->role==AX_TEXTFIELD ? axfieldof(x, it->id) : 0;
         AxRole       role   = it->role;
@@ -686,7 +752,7 @@ static void axbuild(AxGui *x, ImGuiContext *ctx)
     } else if (ctx->NavId) {
         focus = ctx->NavId;
     } else if (ctx->NavWindow) {
-        focus = ctx->NavWindow->ID;
+        focus = axwinkey(x, ctx->NavWindow);
     }
 
     focus = axkeyof(x, focus);
@@ -1101,6 +1167,9 @@ static void axendframe(ImGuiContext *ctx, ImGuiContextHook *hook)
     AxGui *x = (AxGui *)hook->UserData;
     if (x->on) {
         axbuild(x, ctx);
+        if (x->published) {
+            x->published(x);
+        }
     }
 }
 
@@ -1178,6 +1247,8 @@ static void axstart(Gui *g)
 //                    what is
 //   logged TEXT      check that the adapter logged a line holding TEXT
 //                    since the last OP_NSTEXT
+//   ns ...           the OS adapter's own checks, through the OS's API
+//                    (macOS: a11y_macos.cpp); skipped where there is none
 
 // what may be in a, the caller's scratch
 static void axcheck(Gui *g, Arena *a, b32 ok, Str what)
@@ -1413,6 +1484,12 @@ static void driveax(Gui *g, Str cmd)
     } else if (verb == "logged") {
         axcheck(g, &a, axlogged(g, g->ax->logmark, c.tail) > 0,
                 concat(&a, "accessibility log: ", c.tail));
+    } else if (verb == "ns") {
+        if (g->ax->osdrive) {
+            g->ax->osdrive(g, c.tail);
+        } else {
+            guilog(g, concat(&a, "drive: skipped (no OS adapter here): ", cmd));
+        }
     } else if (verb == "lint") {
         Slice<i32> bad = axlint(&a, t);
         Buf b(&a, 256);

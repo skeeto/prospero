@@ -1233,6 +1233,40 @@ def hungupfile(host, trapfile, pidfile):
     return bool(found) and not alive(found[0])
 
 
+AXAPP_TEXT = "pressed from another process"  # the a11y checklist's
+
+
+def axappwatch(args, host, done, problems):
+    """--mode a11y on macOS: once the checklist is ready (axapp-ready),
+    tests/axapp.py checks the window from another process, as Voice
+    Control would, and presses Send; then axapp-done, which the checklist
+    waits for. Skipped, with the reason said, without Prospero.app or its
+    Accessibility grant; its failures are problems."""
+    ready = host.path("work", "axapp-ready")
+    if not waitfor(lambda: done.is_set() or os.path.exists(ready), args.timeout, 0.2) \
+            or done.is_set():
+        return
+    import axapp
+    pid = guipid(host.prospero, host.path("state"))
+    if not pid:
+        status, msg, p = "fail", "the GUI's pid was not found", None
+    else:
+        status, msg, p = axapp.run(os.path.realpath(args.axapp), pid, AXAPP_TEXT,
+                                   say=lambda m: print("axapp: " + m, flush=True))
+    for ok, what, detail in (p or {}).get("checks", []):
+        print(("axapp: ok    " if ok else "axapp: FAIL  ") + what +
+              ("" if ok else f": {detail!r}"), flush=True)
+    if p and p.get("tree"):
+        print(f"axapp: the tree, {len(p['tree'])} elements; the app's focused element: "
+              f"{p.get('app_focused')}", flush=True)
+        for d, r, sr, n in p["tree"]:
+            print(f"axapp:   {'  ' * d}{r}{'/' + sr if sr else ''} {n!r}", flush=True)
+    print(f"axapp: {status}: {msg}", flush=True)
+    if status == "fail":
+        problems.append(f"axapp: {msg}")
+    host.write(host.path("work", "axapp-done"), status + "\n")
+
+
 def background(args, host, guiargs, guicwd):
     """--mode background: the first window keeps its turn running in the
     background and goes, its process keeping the state directory's
@@ -1980,6 +2014,10 @@ def main():
     ap.add_argument("--a11y-lint", action="store_true",
                     help="accessibility on, failing on visible controls with no "
                          "name that tests/a11y_allow.txt doesn't allow")
+    ap.add_argument("--axapp", default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                    "..", "build-signed", "Prospero.app"),
+                    help="with --mode a11y on macOS: the Prospero.app whose reaper, and "
+                         "Accessibility grant, run tests/axapp.py against the window")
     ap.add_argument("--host", help="run the GUI on this Windows host's console")
     ap.add_argument("--trace", action="store_true", help="log where presses land")
     ap.add_argument("--screen", default="1920x1080",
@@ -2382,7 +2420,18 @@ def main():
         env = far.env() if far else None
         if args.mode == "drive" and args.host and not args.fake:
             env = FSSTALL
-        status, lines = host.run(guiargs, args.timeout, guicwd, env=env)
+        axdone = threading.Event()
+        axthread = None
+        if args.mode == "a11y" and sys.platform == "darwin" and isinstance(host, Local):
+            axthread = threading.Thread(target=axappwatch,
+                                        args=(args, host, axdone, problems))
+            axthread.start()
+        try:
+            status, lines = host.run(guiargs, args.timeout, guicwd, env=env)
+        finally:
+            axdone.set()
+            if axthread:
+                axthread.join()
     dt = time.monotonic() - t0
 
     if status is None:

@@ -1935,6 +1935,7 @@ struct Gui {
     Str                toastwhy;   // the latest refusal, said in the log
     i64                toastclicks;  // for the checklist: clicked
     i32                drivefocus; // checklist: 1 focused, 2 not, 0 as it is
+    b32                drivenskey; // checklist: Dictation's text sent while focused
     b32                realtoast;  // the checklist's show them (PROSPERO_TEST_TOAST)
     i64                toastsshown;  // for the checklist: toasts shown,
     i64                drivetoasts;  //   as at OP_TOASTMARK,
@@ -14424,6 +14425,7 @@ enum : i32 {
     CHK_PLACED,
     CHK_GEOMKEPT,
     CHK_PROMPT,       // the compose box holds text
+    CHK_DICTATED,     // it holds text if SDL took Dictation's, else nothing
     CHK_HIST,         // it recalls history entry text ("N/M"), "" if none
     CHK_DRAFTFILE,    // the marked session's draft sidecar holds text
     CHK_CARET,        // the caret: "0", "end", "first" or "second" line
@@ -14833,6 +14835,7 @@ static Str chknames[] = {
     "a window saved on a display gone since is centered on the primary",
     "the window is where it was",
     "the compose box holds what it should",
+    "the compose box holds what Dictation gave it",
     "history mode as it should be",
     "the engine keeps the draft it should",
     "the caret is where it should be",
@@ -22435,6 +22438,13 @@ static DriveOp a11yops[] = {
     {OP_MARKSESS, 0, 0, 0, 0, ""},
     LAYOUT("Standard"),  // first run's Help docked, off the prompt
     CLICK(T_PROMPT, "", 300),
+#ifdef __APPLE__
+    // A tool's first question starts the tree: a bare root at once (unless
+    // --a11y-lint had it on), the tree from the next frame, AppKit told
+    {OP_A11Y, 0, 0, 0, 0, "ns mark"},
+    {OP_A11Y, 0, 0, 0, 500, "ns start"},
+    {OP_A11Y, 0, 0, 0, 0, "ns started"},
+#endif
     {OP_A11Y, 0, 0, 0, 500, "on"},
     {OP_A11Y, 0, 0, 0, 0, "dump"},
     {OP_A11Y, 0, 0, 0, 0, "has menubar"},
@@ -22529,11 +22539,99 @@ static DriveOp a11yops[] = {
     {OP_NSTEXT, 0, 3, 0, 100, ""},
     {OP_A11Y, 0, 0, 0, 0, "logged hasMarkedText -> NO"},
     {OP_NSTEXT, 0, 4, 0, 100, ""},
+    // SDL takes "dictated" after all if the desktop made the window key,
+    // as it may at launch, and the composition not, as unmarked
+    {OP_CHECK, CHK_DICTATED, 0, 0, 0, "dictated"},
+    SELALL,
+    KEY(GKEY_BACKSPACE, 0, 300),
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
 
     // Voice Control's, through NSAccessibility: logged by the methods
     // added to SDL's classes, and answered by AppKit's as before
     {OP_NSTEXT, 0, 5, 0, 100, ""},
+
+    // The tree as AppKit gives it to a tool in this process: under the
+    // window, named, with roles and actions, at its place on the screen
+    {OP_A11Y, 0, 0, 0, 0, "ns has AXTextArea Prompt"},
+    {OP_A11Y, 0, 0, 0, 0, "ns focus AXTextArea Prompt"},
+    {OP_A11Y, 0, 0, 0, 0, "ns attr AXRole AXTextArea AXTextArea Prompt"},
+    {OP_A11Y, 0, 0, 0, 0, "ns attr AXFocused 1 AXTextArea Prompt"},
+    {OP_A11Y, 0, 0, 0, 0, "ns can AXShowMenu,!AXPress AXTextArea Prompt"},
+    {OP_A11Y, 0, 0, 0, 0, "ns has AXButton Send"},
+    {OP_A11Y, 0, 0, 0, 0, "ns can AXPress,!AXShowMenu AXButton Send"},
+    {OP_A11Y, 0, 0, 0, 0, "ns attr AXEnabled 1 AXButton Send"},
+    {OP_A11Y, 0, 0, 0, 0, "ns hit AXButton Send"},
+    {OP_A11Y, 0, 0, 0, 0, "ns hit AXTextArea Prompt"},
+    {OP_A11Y, 0, 0, 0, 0, "ns has AXGroup Transcript"},
+    {OP_A11Y, 0, 0, 0, 0, "ns has AXMenuBar "},
+    // A menu of the bar, opened by a tool's press, as Voice Control's
+    // "Click Help" in the M1 trial (331.340). AppKit is told it opened:
+    // a tool looks in an AXMenu only then, as AppKit keeps its own menus
+    // in the tree while closed, so Voice Control never asked the trial's
+    // for its items. It hangs from its menu bar item, as AppKit's, its
+    // items show where they are drawn, and its first has the focus,
+    // which the window gives though no field is active (the trial's
+    // answered itself from then on).
+    {OP_A11Y, 0, 0, 0, 0, "ns has AXMenuBarItem Help"},
+    {OP_A11Y, 0, 0, 0, 0, "ns attr AXSelected 0 AXMenuBarItem Help"},
+    {OP_A11Y, 0, 0, 0, 0, "ns mark"},
+    {OP_A11Y, 0, 0, 0, 300, "ns press AXMenuBarItem Help"},
+    {OP_A11Y, 0, 0, 0, 0, "ns posted AXMenuOpened 1"},
+    {OP_A11Y, 0, 0, 0, 0, "ns parent AXMenuBarItem AXMenu Help"},
+    {OP_A11Y, 0, 0, 0, 0, "ns attr AXSelected 1 AXMenuBarItem Help"},
+    {OP_A11Y, 0, 0, 0, 0, "ns parent AXMenu AXMenuItem About Prospero"},
+    {OP_A11Y, 0, 0, 0, 0, "ns can AXPress AXMenuItem About Prospero"},
+    {OP_A11Y, 0, 0, 0, 0, "ns hit AXMenuItem About Prospero"},
+    {OP_A11Y, 0, 0, 0, 0, "ns focus AXMenuItem Help"},
+    {OP_A11Y, 0, 0, 0, 0, "logged Window accessibilityFocusedUIElement -> <ProsperoAxElement"},
+    // Then "Click View", as the trial's next: Help's closes and View's
+    // opens, each its own element, though ImGui draws both in one window
+    {OP_A11Y, 0, 0, 0, 0, "ns mark"},
+    {OP_A11Y, 0, 0, 0, 300, "ns press AXMenuBarItem View"},
+    {OP_A11Y, 0, 0, 0, 0, "ns posted AXMenuClosed 1"},
+    {OP_A11Y, 0, 0, 0, 0, "ns posted AXMenuOpened 1"},
+    {OP_A11Y, 0, 0, 0, 0, "ns posted AXUIElementDestroyed"},
+    {OP_A11Y, 0, 0, 0, 0, "ns parent AXMenuBarItem AXMenu View"},
+    {OP_A11Y, 0, 0, 0, 0, "ns attr AXSelected 0 AXMenuBarItem Help"},
+    {OP_A11Y, 0, 0, 0, 0, "logged told AXMenuOpened \"View\""},
+    // Edit's, and an item of it pressed by name: it does what it says,
+    // and the menu closes
+    {OP_A11Y, 0, 0, 0, 300, "ns press AXMenuBarItem Edit"},
+    {OP_A11Y, 0, 0, 0, 0, "ns mark"},
+    {OP_A11Y, 0, 0, 0, 300, "ns press AXMenuItem Select all"},
+    {OP_CHECK, CHK_SELECTED, 0, 0, 0, ""},
+    {OP_A11Y, 0, 0, 0, 0, "ns posted AXMenuClosed 1"},
+    {OP_A11Y, 0, 0, 0, 0, "ns attr AXSelected 0 AXMenuBarItem Edit"},
+    CLICK(T_TRANSCRIPT, "", 300),
+    {OP_A11Y, 0, 0, 0, 300, "activate textarea Prompt"},
+    {OP_A11Y, 0, 0, 0, 0, "ns focus AXTextArea Prompt"},
+    // What changes is told, of elements a tool has
+    {OP_A11Y, 0, 0, 0, 0, "ns mark"},
+    {OP_TEXT, 0, 0, 0, 300, "AppKit"},
+    {OP_A11Y, 0, 0, 0, 0, "ns attr AXValue AppKit AXTextArea Prompt"},
+    {OP_A11Y, 0, 0, 0, 0, "ns posted AXValueChanged"},
+    {OP_A11Y, 0, 0, 0, 0, "ns posted AXSelectedTextChanged"},
+    // Send, pressed through AppKit: the press reaches the app
+    {OP_A11Y, 0, 0, 0, 500, "ns press AXButton Send"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    {OP_A11Y, 0, 0, 0, 0, "logged AXPress button \"Send\" -> YES"},
+    {OP_A11Y, 0, 0, 0, 0, "logged asked role "},
+    {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
+
+    // From another process, through the Accessibility API, as Voice
+    // Control asks: gui.py runs tests/axapp.py once this is ready, which
+    // finds the prompt focused and presses Send, or says why it can't
+    {OP_TEXT, 0, 0, 0, 300, "pressed from another process"},
+    {OP_TOUCH, 0, 0, 0, 0, "axapp-ready"},
+    {OP_WAIT, W_FILE, 0, 0, 120000, "axapp-done"},
+    {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
+    // Its last press, Edit's Select all, left the transcript selected
+    // and the prompt let go: a click lets go of the one
+    CLICK(T_TRANSCRIPT, "", 300),
+    {OP_A11Y, 0, 0, 0, 300, "activate textarea Prompt"},
+    SELALL,  // what is left if it couldn't
+    KEY(GKEY_BACKSPACE, 0, 300),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
 #endif
 
     // Where the caret is, in the text model and to the IME
@@ -22586,10 +22684,25 @@ static DriveOp a11yops[] = {
     // menu all it offers, made a button though it is
     {OP_A11Y, 0, 0, 0, 0, "can menu group Transcript"},
     {OP_A11Y, 0, 0, 0, 0, "can press button Send"},
+#ifdef __APPLE__
+    {OP_A11Y, 0, 0, 0, 0, "ns mark"},
+#endif
     {OP_A11Y, 0, 0, 0, 300, "menu group Transcript"},
     {OP_A11Y, 0, 0, 0, 0, "has menuitem Copy Message"},
     {OP_A11Y, 0, 0, 0, 0, "has menuitem Select All"},
+#ifdef __APPLE__
+    // Its items to AppKit, told it opened, and that they're gone, and
+    // it closed, once it does: a context menu as a menu bar's
+    {OP_A11Y, 0, 0, 0, 0, "ns posted AXMenuOpened 1"},
+    {OP_A11Y, 0, 0, 0, 0, "ns has AXMenuItem Copy Message"},
+    {OP_A11Y, 0, 0, 0, 0, "ns has AXMenu "},
+    {OP_A11Y, 0, 0, 0, 0, "ns mark"},
+#endif
     KEY(GKEY_ESCAPE, 0, 300),
+#ifdef __APPLE__
+    {OP_A11Y, 0, 0, 0, 0, "ns posted AXUIElementDestroyed"},
+    {OP_A11Y, 0, 0, 0, 0, "ns posted AXMenuClosed 1"},
+#endif
     // Asked for late in the loop's wait, it opens all the same
     {OP_A11Y, 0, 0, 0, 300, "late 6000 menu group Transcript"},
     {OP_A11Y, 0, 0, 0, 0, "has menuitem Copy Message"},
@@ -22620,8 +22733,15 @@ static DriveOp a11yops[] = {
     {OP_A11Y, 0, 0, 0, 0, "is checked checkbox Features: Auth"},
     {OP_A11Y, 0, 0, 0, 0, "is !checked checkbox Features: Other"},
     {OP_A11Y, 0, 0, 0, 0, "can toggle checkbox Features: Export"},
+#ifdef __APPLE__
+    {OP_A11Y, 0, 0, 0, 0, "ns attr AXValue 0 AXRadioButton Database: SQLite"},
+    {OP_A11Y, 0, 0, 0, 0, "ns attr AXValue 1 AXCheckBox Features: Auth"},
+#endif
     {OP_A11Y, 0, 0, 0, 300, "press radio Database: SQLite"},
     {OP_A11Y, 0, 0, 0, 0, "is checked radio Database: SQLite"},
+#ifdef __APPLE__
+    {OP_A11Y, 0, 0, 0, 0, "ns attr AXValue 1 AXRadioButton Database: SQLite"},
+#endif
     {OP_A11Y, 0, 0, 0, 0, "is !checked radio Database: PostgreSQL"},
     {OP_A11Y, 0, 0, 0, 300, "press checkbox Features: Export"},
     {OP_A11Y, 0, 0, 0, 0, "is checked checkbox Features: Export"},
@@ -22636,8 +22756,17 @@ static DriveOp a11yops[] = {
     {OP_A11Y, 0, 0, 0, 300, "has button Send"},
     // A tool row's header folds it, named for the tool and what it ran
     {OP_A11Y, 0, 0, 0, 0, "is expanded treeitem shell: sleep 3"},
+#ifdef __APPLE__
+    // To AppKit, a disclosure triangle, pressed there
+    {OP_A11Y, 0, 0, 0, 0, "ns attr AXValue 1 AXDisclosureTriangle shell: sleep 3"},
+    {OP_A11Y, 0, 0, 0, 300, "ns press AXDisclosureTriangle shell: sleep 3"},
+#else
     {OP_A11Y, 0, 0, 0, 300, "press treeitem shell: sleep 3"},
+#endif
     {OP_A11Y, 0, 0, 0, 0, "is !expanded treeitem shell: sleep 3"},
+#ifdef __APPLE__
+    {OP_A11Y, 0, 0, 0, 0, "ns attr AXExpanded 0 AXDisclosureTriangle shell: sleep 3"},
+#endif
 
     // A combo, Settings' pages while it is narrow: pressed, it opens on
     // its choices, the page shown selected
@@ -24538,6 +24667,15 @@ static b32 composecheck(Gui *g, i32 chk, DriveOp *op)
         got = promptstr(g);
         ok  = got == want;
         break;
+    case CHK_DICTATED:
+        // SDL drops text unless the window has the keyboard, as the
+        // checklist's mostly hasn't, but the desktop may give it
+        guilog(g, g->drivenskey ? Str("drive: Dictation's text sent while focused")
+                                : Str("drive: Dictation's text sent while not focused"));
+        want = g->drivenskey ? want : Str{};
+        got  = promptstr(g);
+        ok   = got == want;
+        break;
     case CHK_HIST: {
         Buf b(&a, 32);
         if (s->hist) {
@@ -25086,6 +25224,7 @@ static b32 drivecheck(Gui *g, i32 chk)
                cx-dx<=4 && dx-cx<=4 && g->geom.box.x==w.box.x && g->geom.box.y==w.box.y;
     }
     case CHK_PROMPT:
+    case CHK_DICTATED:
     case CHK_HIST:
     case CHK_DRAFTFILE:
     case CHK_CARET:
@@ -27566,6 +27705,9 @@ static void drivestep(Gui *g)
         e.kind = GEV_NSTEXT;
         e.x    = op->dx;
         e.text = op->text;
+        if (op->dx == 0) {
+            g->drivenskey = os_guifocused(g->os);  // whether SDL takes it
+        }
         os_guiinject(g->os, &e);
         if (e.x == -1) {
             guilog(g, "drive: skip Dictation's calls (macOS only)");
