@@ -104,6 +104,21 @@ static void gui_preedit(Gui *g, Str text, i32 start, i32 count)
     gui_input(g, INPUT_TEXT);
 }
 
+// Field id's text was put from outside (a send, a draft reloaded, a
+// message recalled): a composition over it, or one no field has drawn
+// yet, no longer belongs, and the input method is told to drop it after
+// the frame. Dictation needs this most: it never says when it is done,
+// and leaves its marked text.
+static void imedrop(Gui *g, u32 id)
+{
+    Preedit *p = g->ime;
+    if (p && p->len && (!p->owner || p->owner==id)) {
+        imeclear(p);
+        p->reset = 1;
+        gui_input(g, INPUT_TEXT);
+    }
+}
+
 // Whether an input method is composing, so keys are its: the platform
 // keeps from ImGui the editing keys that leak through while it does.
 static b32 gui_composing(Gui *g)

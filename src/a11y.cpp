@@ -1082,6 +1082,46 @@ static AxSpan axparaat(Str s, i32 b)
     return r;
 }
 
+// Where a word step from byte b lands, as Cocoa's moveWordLeft: and
+// deleteWordBackward: go: back over spaces, then over the run before
+// them; forward over spaces, then the run after.
+static i32 axwordback(Str s, i32 b)
+{
+    b = axclamp(b, 0, (i32)s.len);
+    iz  start;
+    i32 cls = 1;
+    while (b > 0) {
+        i32 c = axclass(utf8prev(s, b, &start));
+        if (cls==1 && c!=1) {
+            cls = c;  // the spaces are behind: now the run
+        } else if (c != cls) {
+            break;
+        }
+        b = (i32)start;
+    }
+    return b;
+}
+
+static i32 axwordnext(Str s, i32 b)
+{
+    b = axclamp(b, 0, (i32)s.len);
+    while (b>0 && b<s.len && (s[b]&0xc0)==0x80) {
+        b--;
+    }
+    i32 cls = 1;
+    while (b < s.len) {
+        iz  j = b;
+        i32 c = axclass(utf8decode(s, &j));
+        if (cls==1 && c!=1) {
+            cls = c;
+        } else if (c != cls) {
+            break;
+        }
+        b = (i32)j;
+    }
+    return b;
+}
+
 
 // Geometry: where the text's bytes are, in the window
 

@@ -1821,7 +1821,6 @@ struct Gui {
     Str                toastwhy;   // the latest refusal, said in the log
     i64                toastclicks;  // for the checklist: clicked
     i32                drivefocus; // checklist: 1 focused, 2 not, 0 as it is
-    b32                drivenskey; // checklist: Dictation's text sent while focused
     b32                realtoast;  // the checklist's show them (PROSPERO_TEST_TOAST)
     i64                toastsshown;  // for the checklist: toasts shown,
     i64                drivetoasts;  //   as at OP_TOASTMARK,
@@ -5284,6 +5283,7 @@ static void onsessions(Gui *g, GuiHost *h, Json *j)
 static void onfile(Gui *, Json *, b32 ok, Str err);
 static Str  draftstr(GuiSession *);
 static void draftput(Gui *, GuiSession *, Str);
+static void imedrop(Gui *, u32);
 static void setdraft(Gui *, GuiSession *, Str);
 static void setnote(Gui *, GuiSession *, Str, b32, b32);
 static Str  sesstitle(GuiSession *);
@@ -6824,6 +6824,9 @@ static void draftput(Gui *g, GuiSession *s, Str text)
     ImGuiInputTextState *st = ImGui::GetCurrentContext() ? ImGui::GetInputTextState(s->draftid) : 0;
     if (st) {
         st->ReloadUserBufAndMoveToEnd();
+    }
+    if (s == g->sess) {
+        imedrop(g, s->draftid);
     }
     scheddirty(&g->sched);
 }
@@ -13762,7 +13765,6 @@ enum : i32 {
     CHK_PLACED,
     CHK_GEOMKEPT,
     CHK_PROMPT,       // the compose box holds text
-    CHK_DICTATED,     // it holds text if SDL took Dictation's, else nothing
     CHK_HIST,         // it recalls history entry text ("N/M"), "" if none
     CHK_DRAFTFILE,    // the marked session's draft sidecar holds text
     CHK_CARET,        // the caret: "0", "end", "first" or "second" line
@@ -14143,7 +14145,6 @@ static Str chknames[] = {
     "a window saved on a display gone since is centered on the primary",
     "the window is where it was",
     "the compose box holds what it should",
-    "the compose box holds what Dictation gave it",
     "history mode as it should be",
     "the engine keeps the draft it should",
     "the caret is where it should be",
@@ -20835,9 +20836,10 @@ static DriveOp a11yops[] = {
     {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
 
 #ifdef __APPLE__
-    // Dictation's calls, through AppKit's NSTextInputClient to SDL, each
-    // logged (a11y_macos.cpp), and answered by SDL as before: as its
-    // window isn't key, SDL drops the text, so its own answers show it
+    // Dictation's calls, through AppKit's NSTextInputClient, each logged
+    // and answered from the text model (a11y_macos.cpp), not from a key:
+    // the text goes through the edit queue, window key or not
+    {OP_A11Y, 0, 0, 0, 300, "activate textarea Prompt"},
     {OP_NSTEXT, 0, 1, 0, 100, "dictat"},
     {OP_NSTEXT, 0, 3, 0, 100, ""},
     {OP_A11Y, 0, 0, 0, 0, "logged hasMarkedText -> YES"},
@@ -20848,13 +20850,93 @@ static DriveOp a11yops[] = {
     {OP_A11Y, 0, 0, 0, 0, "logged unmarkText"},
     {OP_NSTEXT, 0, 1, 0, 100, "\xc3\xa9t\xc3\xa9 \xf0\x9f\x8e\x99"},
     {OP_A11Y, 0, 0, 0, 0, "logged \"\xc3\xa9t\xc3\xa9 \xf0\x9f\x8e\x99\"#6 {6,0}"},
-    {OP_NSTEXT, 0, 2, 0, 100, ""},
-    {OP_NSTEXT, 0, 3, 0, 100, ""},
+    {OP_NSTEXT, 0, 2, 0, 100, ""},  // unmarkText commits it
+    {OP_NSTEXT, 0, 3, 0, 300, ""},
     {OP_A11Y, 0, 0, 0, 0, "logged hasMarkedText -> NO"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "dictated\xc3\xa9t\xc3\xa9 \xf0\x9f\x8e\x99"},
+    {OP_A11Y, 0, 0, 0, 0, "ns tget AXSelectedTextRange 14,0"},
+
+    // A correction as Dictation sends it: marked text over a replacement
+    // range, which stays until the final text over the marked text's
+    // range replaces it
+    SELALL,
+    KEY(GKEY_BACKSPACE, 0, 300),
+    {OP_A11Y, 0, 0, 0, 300, "ns ti insert none hello wrld"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "hello wrld"},
+    {OP_A11Y, 0, 0, 0, 0, "ns ti mark 3,0 6,4 wor"},
+    {OP_A11Y, 0, 0, 0, 0, "ns ti marked 6,3"},
+    {OP_A11Y, 0, 0, 0, 0, "ns ti sel 9,0"},
+    {OP_A11Y, 0, 0, 0, 0, "ns ti has 1"},
+    {OP_A11Y, 0, 0, 0, 300, "ns ti sub 0,99 0,9 hello wor"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "hello wrld"},
+    {OP_A11Y, 0, 0, 0, 0, "ns ti insert 6,3 world"},
+    {OP_A11Y, 0, 0, 0, 0, "ns ti has 0"},
+    {OP_A11Y, 0, 0, 0, 300, "ns ti marked none"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "hello world"},
+    {OP_A11Y, 0, 0, 0, 0, "ns tget AXSelectedTextRange 11,0"},
+
+    // A newline from no key is one, not a send; so is insertNewline:
+    {OP_A11Y, 0, 0, 0, 300, "ns ti insert none \n"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "hello world\n"},
+    {OP_A11Y, 0, 0, 0, 300, "ns ti cmd insertNewline:"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "hello world\n\n"},
+    {OP_A11Y, 0, 0, 0, 0, "ns ti cmd deleteBackward:"},
+    {OP_A11Y, 0, 0, 0, 300, "ns ti cmd deleteBackward:"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "hello world"},
+    {OP_A11Y, 0, 0, 0, 0, "ns ti cmd moveWordLeft:"},
+    {OP_A11Y, 0, 0, 0, 0, "ns ti sel 6,0"},
+    {OP_A11Y, 0, 0, 0, 300, "ns ti cmd deleteWordBackward:"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "world"},
+    {OP_A11Y, 0, 0, 0, 0, "ns tget AXSelectedTextRange 0,0"},
+
+    // A replacement in the middle, past an emoji: ranges in UTF-16
+    SELALL,
+    KEY(GKEY_BACKSPACE, 0, 300),
+    {OP_A11Y, 0, 0, 0, 300, "ns ti ainsert none \xf0\x9f\x98\x80 one two three"},
+    {OP_A11Y, 0, 0, 0, 300, "ns ti insert 7,3 2"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "\xf0\x9f\x98\x80 one 2 three"},
+    {OP_A11Y, 0, 0, 0, 0, "ns tget AXSelectedTextRange 8,0"},
+    {OP_A11Y, 0, 0, 0, 0, "ns ti sel 8,0"},
+    {OP_A11Y, 0, 0, 0, 0, "ns ti sub 7,1 7,1 2"},
+    {OP_A11Y, 0, 0, 0, 0, "ns ti sub 1,3 0,4 \xf0\x9f\x98\x80 o"},  // half a pair: all of it
+    {OP_A11Y, 0, 0, 0, 0, "ns ti sub 99,1 nil"},
+    {OP_A11Y, 0, 0, 0, 0, "ns ti round 3"},
+    {OP_A11Y, 0, 0, 0, 0, "ns ti round 0"},
+    {OP_A11Y, 0, 0, 0, 300, "ns ti insert 99,1 !"},  // a range not in it: at the caret
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "\xf0\x9f\x98\x80 one 2! three"},
+
+    // A key's calls, as inside its key down's dispatch: its commands are
+    // SDL's (the key itself goes out after), as is its plain text, which
+    // SDL drops here (the window isn't key); a replacement range, or an
+    // edit still queued, puts its text through the queue, in order
+    SELALL,
+    KEY(GKEY_BACKSPACE, 0, 300),
+    {OP_A11Y, 0, 0, 0, 300, "ns ti insert none cafe"},
+    {OP_A11Y, 0, 0, 0, 300, "ns ti key insert 3,1 \xc3\xa9"},  // press-and-hold
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "caf\xc3\xa9"},
+    {OP_A11Y, 0, 0, 0, 300, "ns ti key cmd insertNewline:"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "caf\xc3\xa9"},
+    {OP_A11Y, 0, 0, 0, 300, "ns ti insert none a ; key insert none b"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "caf\xc3\xa9" "ab"},
+    // A key during Dictation's composition commits it ahead of the key
+    {OP_A11Y, 0, 0, 0, 300, "ns ti mark 1,0 none x"},
+    {OP_A11Y, 0, 0, 0, 0, "ns ti has 1"},
+    {OP_A11Y, 0, 0, 0, 300, "ns ti key cmd moveLeft:"},
+    {OP_A11Y, 0, 0, 0, 0, "ns ti has 0"},
+    {OP_A11Y, 0, 0, 0, 0, "logged a key commits Dictation's marked text"},
+    {OP_A11Y, 0, 0, 0, 300, "ns ti insert none c ; mark 1,0 none y ; key insert none d"},
+    {OP_A11Y, 0, 0, 0, 0, "ns ti has 0"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "caf\xc3\xa9" "abcyd"},
+
+    // A trace replayed: tests/a11y_dictation.trace, made by hand in the
+    // format of PROSPERO_AXTRACE's, as a user's will be
+    SELALL,
+    KEY(GKEY_BACKSPACE, 0, 300),
+    {OP_A11Y, 0, 0, 0, 500, "ns replay dictation.trace"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "a quick brown fox\nleapsjumps"},
+
+    // Text input as it was, if Dictation's calls started it
     {OP_NSTEXT, 0, 4, 0, 100, ""},
-    // SDL takes "dictated" after all if the desktop made the window key,
-    // as it may at launch, and the composition not, as unmarked
-    {OP_CHECK, CHK_DICTATED, 0, 0, 0, "dictated"},
     SELALL,
     KEY(GKEY_BACKSPACE, 0, 300),
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
@@ -22818,15 +22900,6 @@ static b32 composecheck(Gui *g, i32 chk, DriveOp *op)
         got = promptstr(g);
         ok  = got == want;
         break;
-    case CHK_DICTATED:
-        // SDL drops text unless the window has the keyboard, as the
-        // checklist's mostly hasn't, but the desktop may give it
-        guilog(g, g->drivenskey ? Str("drive: Dictation's text sent while focused")
-                                : Str("drive: Dictation's text sent while not focused"));
-        want = g->drivenskey ? want : Str{};
-        got  = promptstr(g);
-        ok   = got == want;
-        break;
     case CHK_HIST: {
         Buf b(&a, 32);
         if (s->hist) {
@@ -23288,7 +23361,6 @@ static b32 drivecheck(Gui *g, i32 chk)
                cx-dx<=4 && dx-cx<=4 && g->geom.box.x==w.box.x && g->geom.box.y==w.box.y;
     }
     case CHK_PROMPT:
-    case CHK_DICTATED:
     case CHK_HIST:
     case CHK_DRAFTFILE:
     case CHK_CARET:
@@ -25624,9 +25696,6 @@ static void drivestep(Gui *g)
         e.kind = GEV_NSTEXT;
         e.x    = op->dx;
         e.text = op->text;
-        if (op->dx == 0) {
-            g->drivenskey = os_guifocused(g->os);  // whether SDL takes it
-        }
         os_guiinject(g->os, &e);
         if (e.x == -1) {
             guilog(g, "drive: skip Dictation's calls (macOS only)");

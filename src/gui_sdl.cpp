@@ -729,6 +729,8 @@ enum : uz { NSNOTFOUND = (uz)I64MAX };
 static void (*macsendevent)(void *, void *, void *);
 static b32    macmodsent;  // a key's modifiers were sent, to let go
 static i32    mackeydepth; // key downs being dispatched (a11y_macos.cpp)
+static void  *macdropsoon; // a text input whose input method to tell, after the key
+static void   mackeydone();
 
 static uz sdlmodflags()
 {
@@ -759,6 +761,7 @@ static void macsend(void *self, void *sel, void *ev)
     mackeydepth += type==NSKEYDOWN;
     macsendevent(self, sel, ev);
     mackeydepth -= type==NSKEYDOWN;
+    mackeydone();
     if (type==NSKEYUP && macmodsent) {
         macmodsent = 0;
         uz now = objcsend<uz>(objc_getClass("NSEvent"), "modifierFlags");
@@ -783,11 +786,58 @@ static void handlemodflags()
     }
 }
 
+// Tell the input method serving the window's text input to drop what it
+// composes, before SDL replaces that view (os_guiimereset): Cocoa has no
+// other way to say so, and a view taken away may get the text committed
+// to it instead. Dictation, too, keeps its marked text until told.
+// Meanwhile, and while SDL then takes the view away, a commit from it,
+// an unmarkText or text from no key, commits nothing (a11y_macos.cpp).
+static b32 macdiscarding;
+
+static void macdiscardof(void *resp)
+{
+    void *ctx = objcsend<void *>(resp, "inputContext");
+    if (ctx) {
+        b32 was = macdiscarding;
+        macdiscarding = 1;
+        objcsend<void>(ctx, "discardMarkedText");
+        macdiscarding = was;
+    }
+}
+
+static void macdiscard(SDL_Window *w)
+{
+    void *pool = objc_autoreleasePoolPush();
+    void *win  = SDL_GetPointerProperty(SDL_GetWindowProperties(w),
+                                        SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, 0);
+    void *resp = win ? objcsend<void *>(win, "firstResponder") : 0;
+    void *cls  = objc_getClass("SDL3TranslatorResponder");
+    if (resp && cls && objcsend<ObjcBool>(resp, "isKindOfClass:", cls)) {
+        macdiscardof(resp);
+    }
+    objc_autoreleasePoolPop(pool);
+}
+
+// A key's dispatch is over: an input method whose marked text the key
+// ended (a11y_macos.cpp, Dictation's) is told now, not from inside its
+// own handling of the key.
+static void mackeydone()
+{
+    if (!mackeydepth && macdropsoon) {
+        void *resp = macdropsoon;
+        macdropsoon = 0;
+        void *pool = objc_autoreleasePoolPush();
+        macdiscardof(resp);
+        objc_autoreleasePoolPop(pool);
+    }
+}
+
 // The checklist's Dictation (GEV_NSTEXT): calls to the window's text
 // input as Dictation makes them, through AppKit's NSTextInputClient, so
-// SDL's handling and the accessibility log's wrappers (a11y_macos.cpp)
-// run as they would for it. The checklist's window is never key, so
-// text input is started here, until kind 4, and SDL drops the text.
+// the text input's methods (a11y_macos.cpp, over SDL's) run as they
+// would for it. The checklist's window is never key, so text input is
+// started here, until kind 4: SDL would drop the text, but the text
+// model takes it.
 // Kind 5 asks NSAccessibility instead, as Voice Control would: of the
 // window and its content view, through the wrappers to AppKit's own.
 static b32 macnststarted;
@@ -1613,9 +1663,16 @@ static void os_guiimereset(Os *os)
     if (!p || !p->window || !SDL_TextInputActive(p->window)) {
         return;
     }
+    #ifdef __APPLE__
+    macdiscarding = 1;
+    macdiscard(p->window);
+    #endif
     SDL_ClearComposition(p->window);
     SDL_StopTextInput(p->window);
     SDL_StartTextInput(p->window);
+    #ifdef __APPLE__
+    macdiscarding = 0;
+    #endif
 }
 
 static b32 os_guialtgr(Os *)

@@ -5,30 +5,33 @@
 // section "The tree" below has it, and a text field's as an NSTextView's,
 // which a tool reads and edits by ranges ("A text field's own").
 //
-// And a trace: SDL's text input view (SDL3TranslatorResponder, its
-// NSTextInputClient) is what Dictation and the input methods talk to,
-// and NSAccessibility is what Voice Control asks, of the window, its
-// content view (SDL3View) and that text input. Each call they make is
-// logged (axnote, a11y_imgui.cpp) with its arguments and what SDL or
-// AppKit answered, then answered as before, so the text adapter to come
-// is built on what they really do. That is only while the tree is built
-// (a tool asked, `[ui] accessibility = on`, or PROSPERO_AXTRACE) and
-// something can read the log (a Debug build's Metrics pane, or the
-// trace). Text is logged only from a field the model knows is not a
-// password, and a key's text, which reaches SDL through these same
-// calls, only as its length: the trace is of speech tools, not typing.
+// SDL's text input view (SDL3TranslatorResponder, its NSTextInputClient)
+// is what Dictation and the input methods talk to: while the focused
+// field is in the text model, its methods answer from the model and edit
+// through it, and typing keeps SDL's way ("SDL's NSTextInputClient").
+//
+// And a trace: each call these tools make, to the text input and through
+// NSAccessibility to the window, its content view (SDL3View) and the
+// text input, is logged (axnote, a11y_imgui.cpp) with its arguments and
+// its answer. That is only while the tree is built (a tool asked,
+// `[ui] accessibility = on`, or PROSPERO_AXTRACE) and something can read
+// the log (a Debug build's Metrics pane, or the trace). Text is logged
+// only from a field the model knows is not a password, and a key's
+// text, which reaches SDL through these same calls, only as its length:
+// the trace is of speech tools, not typing.
 //
 // SDL's NSTextInputClient methods are its own, so method_setImplementation
-// wraps them, and the original is called. NSAccessibility's are AppKit's,
-// inherited: changing those would change every view, so the three classes
-// get methods of their own (class_addMethod) that log and call the
-// superclass's. Both are per class: SDL makes a new text input view at
-// each Stop/StartTextInput, which the wrappers serve all the same.
+// replaces them, and the original is called. NSAccessibility's are
+// AppKit's, inherited: changing those would change every view, so the
+// three classes get methods of their own (class_addMethod) that log and
+// call the superclass's. Both are per class: SDL makes a new text input
+// view at each Stop/StartTextInput, which the methods serve all the same.
 //
 // It all runs on the main thread, between frames or inside them (an
 // IME's queries as text input starts), and never touches ImGui. An
 // Objective-C exception can't unwind through C++, so nothing here sends
-// a message that could throw: strings are read, not ranged into.
+// a message that could throw: strings are read, not ranged into, and a
+// range given to SDL is checked first.
 //
 // This is free and unencumbered software released into the public domain.
 
@@ -199,225 +202,6 @@ static void macstrarg(Buf *b, void *o)
         at = r.loc + r.len;
     }
     putbyte(b, ']');
-}
-
-
-// SDL's NSTextInputClient, wrapped
-
-static void (*macinsertimp)(void *, void *, void *, NsRange);
-static void (*macsetmarkedimp)(void *, void *, void *, NsRange, NsRange);
-static void (*macunmarkimp)(void *, void *);
-static NsRange (*macselectedimp)(void *, void *);
-static NsRange (*macmarkedimp)(void *, void *);
-static ObjcBool (*machasmarkedimp)(void *, void *);
-static void *(*macattrsubimp)(void *, void *, NsRange, NsRange *);
-static NsRect (*macfirstrectimp)(void *, void *, NsRange, NsRange *);
-static uz (*macindexatimp)(void *, void *, NsPoint);
-static void (*maccommandimp)(void *, void *, void *);
-static void *(*macvalidattrsimp)(void *, void *);
-
-// A key's text, by its length alone. Nor is the text model logged
-// ahead of it: the next call that isn't a key's logs it.
-static void mactyped(Buf *b, void *o)
-{
-    b32   attr = maciskind(o, "NSAttributedString");
-    void *s    = attr ? objcsend<void *>(o, "string") : o;
-    print(b, "(typed)#");
-    print(b, maciskind(s, "NSString") ? (i64)objcsend<uz>(s, "length") : (i64)-1);
-}
-
-static void macinsert(void *self, void *sel, void *s, NsRange r)
-{
-    if (AxGui *x = maclog()) {
-        Arena a     = x->logmem;
-        b32   keyed = mackeyed();
-        Buf   b(&a, 256);
-        print(&b, "insertText:replacementRange: ");
-        if (keyed) {
-            mactyped(&b, s);
-        } else {
-            macstrarg(&b, s);
-        }
-        putbyte(&b, ' ');
-        macrange(&b, r);
-        if (keyed) {
-            axnote(x, a, finish(&b));
-        } else {
-            macnote(x, a, &b);
-        }
-    }
-    macinsertimp(self, sel, s, r);
-}
-
-static void macsetmarked(void *self, void *sel, void *s, NsRange sr, NsRange rr)
-{
-    if (AxGui *x = maclog()) {
-        Arena a     = x->logmem;
-        b32   keyed = mackeyed();
-        Buf   b(&a, 256);
-        print(&b, "setMarkedText:selectedRange:replacementRange: ");
-        if (keyed) {
-            mactyped(&b, s);
-        } else {
-            macstrarg(&b, s);
-        }
-        putbyte(&b, ' ');
-        macrange(&b, sr);
-        putbyte(&b, ' ');
-        macrange(&b, rr);
-        if (keyed) {
-            axnote(x, a, finish(&b));
-        } else {
-            macnote(x, a, &b);
-        }
-    }
-    macsetmarkedimp(self, sel, s, sr, rr);
-}
-
-static void macunmark(void *self, void *sel)
-{
-    if (AxGui *x = maclog()) {
-        Arena a = x->logmem;
-        Buf   b(&a, 64);
-        print(&b, "unmarkText");
-        macnote(x, a, &b);
-    }
-    macunmarkimp(self, sel);
-}
-
-// The queries are logged after they're answered, with the answer.
-
-static void macnoterange(char const *call, NsRange r)
-{
-    if (AxGui *x = maclog()) {
-        Arena a = x->logmem;
-        Buf   b(&a, 64);
-        print(&b, Str{(u8 *)call, (iz)__builtin_strlen(call)});
-        print(&b, " -> ");
-        macrange(&b, r);
-        macnote(x, a, &b);
-    }
-}
-
-static NsRange macselected(void *self, void *sel)
-{
-    NsRange r = macselectedimp(self, sel);
-    macnoterange("selectedRange", r);
-    return r;
-}
-
-static NsRange macmarked(void *self, void *sel)
-{
-    NsRange r = macmarkedimp(self, sel);
-    macnoterange("markedRange", r);
-    return r;
-}
-
-static ObjcBool machasmarked(void *self, void *sel)
-{
-    ObjcBool r = machasmarkedimp(self, sel);
-    if (AxGui *x = maclog()) {
-        Arena a = x->logmem;
-        Buf   b(&a, 64);
-        print(&b, r ? Str("hasMarkedText -> YES") : Str("hasMarkedText -> NO"));
-        macnote(x, a, &b);
-    }
-    return r;
-}
-
-// What the callee made of an actualRange: SDL's leave it alone, so
-// what's there is the caller's, not an answer.
-static void macactual(Buf *b, NsRange *actual, NsRange was)
-{
-    if (!actual) {
-        return;
-    } else if (actual->loc==was.loc && actual->len==was.len) {
-        print(b, " actual unchanged");
-    } else {
-        print(b, " actual ");
-        macrange(b, *actual);
-    }
-}
-
-static void *macattrsub(void *self, void *sel, NsRange r, NsRange *actual)
-{
-    NsRange was = actual ? *actual : NsRange{};
-    void   *s   = macattrsubimp(self, sel, r, actual);
-    if (AxGui *x = maclog()) {
-        Arena a = x->logmem;
-        Buf   b(&a, 256);
-        print(&b, "attributedSubstringForProposedRange:actualRange: ");
-        macrange(&b, r);
-        print(&b, " -> ");
-        macstrarg(&b, s);
-        macactual(&b, actual, was);
-        macnote(x, a, &b);
-    }
-    return s;
-}
-
-static NsRect macfirstrect(void *self, void *sel, NsRange r, NsRange *actual)
-{
-    NsRange was = actual ? *actual : NsRange{};
-    NsRect  rc  = macfirstrectimp(self, sel, r, actual);
-    if (AxGui *x = maclog()) {
-        Arena a = x->logmem;
-        Buf   b(&a, 128);
-        print(&b, "firstRectForCharacterRange:actualRange: ");
-        macrange(&b, r);
-        print(&b, " -> ");
-        macrect(&b, rc);
-        macactual(&b, actual, was);
-        macnote(x, a, &b);
-    }
-    return rc;
-}
-
-static uz macindexat(void *self, void *sel, NsPoint p)
-{
-    uz i = macindexatimp(self, sel, p);
-    if (AxGui *x = maclog()) {
-        Arena a = x->logmem;
-        Buf   b(&a, 128);
-        print(&b, "characterIndexForPoint: (");
-        print(&b, axround((f32)p.x));
-        putbyte(&b, ',');
-        print(&b, axround((f32)p.y));
-        print(&b, ") -> ");
-        if (i == NSNOTFOUND) {
-            print(&b, "NotFound");
-        } else {
-            print(&b, (i64)i);
-        }
-        macnote(x, a, &b);
-    }
-    return i;
-}
-
-static void maccommand(void *self, void *sel, void *cmd)
-{
-    if (AxGui *x = maclog()) {
-        Arena a = x->logmem;
-        Buf   b(&a, 64);
-        print(&b, "doCommandBySelector: ");
-        char const *name = cmd ? sel_getName(cmd) : "nil";
-        print(&b, Str{(u8 *)name, (iz)__builtin_strlen(name)});
-        macnote(x, a, &b);
-    }
-    maccommandimp(self, sel, cmd);
-}
-
-static void *macvalidattrs(void *self, void *sel)
-{
-    void *r = macvalidattrsimp(self, sel);
-    if (AxGui *x = maclog()) {
-        Arena a = x->logmem;
-        Buf   b(&a, 128);
-        print(&b, "validAttributesForMarkedText -> ");
-        macdesc(&b, r, 300);
-        macnote(x, a, &b);
-    }
-    return r;
 }
 
 
@@ -680,6 +464,7 @@ static void macwrap(void *cls, char const *name, F wrapper, F *orig)
 extern "C" bool  class_addIvar(void *, char const *, uz, u8, char const *);
 extern "C" void *class_getInstanceVariable(void *, char const *);
 extern "C" iz    ivar_getOffset(void *);
+extern "C" char const *ivar_getTypeEncoding(void *);
 extern "C" void  NSAccessibilityPostNotification(void *, void *);
 extern "C" void  NSAccessibilityPostNotificationWithUserInfo(void *, void *, void *);
 extern "C" void *NSAccessibilityUnignoredAncestor(void *);
@@ -1881,6 +1666,771 @@ static ObjcBool macelallowed(void *self, void *sel, void *what)
 }
 
 
+// SDL's NSTextInputClient, backed by the text model
+//
+// Dictation and the input methods talk to SDL's text input view, which
+// knows nothing of the text: its ranges are stale, it reads nothing
+// back, a replacement range becomes one Backspace, and a newline is
+// dropped. While the focused field is in the model (the tree is on),
+// the methods SDL defines answer from the model instead, in UTF-16
+// units of the document (axdoc), and change the text through the edit
+// queue (axtextedit), whose shadow agrees at once for a read-back.
+//
+// Typing keeps SDL's way: a key's text (inside a key down's dispatch,
+// mackeyed) with no replacement range goes to SDL, as do its commands,
+// so Return still sends, and an input method's commit lands as before,
+// in order with the keys around it; unless an edit is still queued for
+// the field, which the key's text then queues after, so as not to land
+// ahead of it. Everything else is queued: Dictation's text, its
+// newlines and corrections, and replacement ranges. SDL's own methods
+// are still called, for their bookkeeping (its marked text, a key's
+// pending press), with what can do no harm: an empty string, a range
+// checked first, as an exception can't unwind through C++. Their calls
+// back into these (SDL's insertText asks hasMarkedText, then calls
+// unmarkText) get SDL's own answers (macinsdl).
+//
+// A composition (setMarkedText) is drawn by the field (gui_preedit) and
+// is the model's marked text at once (axmark); with a replacement range,
+// that range is selected, for the composition to stand in for until it
+// is committed, as one edit. One from no key is Dictation's
+// (macspoken), which never says it is done: a key's text or command
+// commits it ahead of the key (macspokenend), and the input method is
+// told; ime.cpp drops it on a send, a draft put, a recall, or another
+// field.
+//
+// When the tree is off, a call that changes text from no key and looks
+// like Dictation's or Voice Control's starts it (`auto`): setMarkedText,
+// insertText with Dictation's alternatives, a known command. Queries
+// never do, as AppKit, input methods and their windows make them on
+// their own, nor does anything a key does: typing, the emoji picker or
+// a candidate clicked cost nothing. Until the model answers, SDL does,
+// and a replacement range a client worked out from SDL's answers is
+// taken as none (macsdlranges): SDL's ranges count from the marked
+// text, not the document.
+//
+// Each call is logged, after the text model it is against, as M1.0's
+// trace has them ("ns replay" plays one back); one SDL handles is
+// marked "(SDL's)".
+
+static void (*macinsertimp)(void *, void *, void *, NsRange);
+static void (*macsetmarkedimp)(void *, void *, void *, NsRange, NsRange);
+static void (*macunmarkimp)(void *, void *);
+static NsRange (*macselectedimp)(void *, void *);
+static NsRange (*macmarkedimp)(void *, void *);
+static ObjcBool (*machasmarkedimp)(void *, void *);
+static void *(*macattrsubimp)(void *, void *, NsRange, NsRange *);
+static NsRect (*macfirstrectimp)(void *, void *, NsRange, NsRange *);
+static uz (*macindexatimp)(void *, void *, NsPoint);
+static void (*maccommandimp)(void *, void *, void *);
+static void *(*macvalidattrsimp)(void *, void *);
+
+static i32 macinsdl;      // SDL's methods running: their calls back are SDL's
+static b32 macspoken;     // the composition came from no key: Dictation's
+static b32 macsdlranges;  // SDL gave the client its ranges, since the last text
+
+// The model, if the methods answer from it: the focused field's, which
+// SDL's text input serves, when it may be edited
+static A11y *mactext()
+{
+    AxGui *x = axmac;
+    return x && x->on && !macinsdl && axeditable(&x->ax->text) ? x->ax : 0;
+}
+
+// A call from no key that changes text: start the tree, so that the
+// next is the model's
+static void macwant(char const *why)
+{
+    if (axmac && !axmac->on && !macinsdl && !mackeyed()) {
+        macready(why);
+    }
+}
+
+// Whether s carries Dictation's alternatives (NSTextAlternatives), as
+// its final text does: other text from no key (the emoji picker, a
+// candidate clicked) is no reason to start the tree.
+static b32 macdictated(void *s)
+{
+    if (!maciskind(s, "NSAttributedString")) {
+        return 0;
+    }
+    uz   n   = objcsend<uz>(s, "length");
+    void *key = nsstring("NSTextAlternatives");
+    for (uz i = 0, k = 0; i<n && k<64; k++) {
+        NsRange r = {};
+        if (objcsend<void *>(s, "attribute:atIndex:effectiveRange:", key, i, &r)) {
+            return 1;
+        } else if (r.loc+r.len <= i) {
+            break;
+        }
+        i = r.loc + r.len;
+    }
+    return 0;
+}
+
+// A replacement range, unless the client worked it out from SDL's
+// answers, in other units: then none
+static NsRange macreplacing(NsRange r)
+{
+    return macsdlranges ? NsRange{NSNOTFOUND, 0} : r;
+}
+
+// The composition is now s, the input method's selection bytes [lo, hi)
+// of it: drawn by the field, and the model's at once
+static void maccompose(A11y *x, Str s, i32 lo, i32 hi)
+{
+    i32 c0 = axcount(s, AXU_CP, lo);
+    i32 c1 = axcount(s, AXU_CP, hi);
+    gui_preedit(axmac->g, s, c0, c1-c0);
+    axmark(x, s, lo, hi);
+    macwake();
+}
+
+// The composition is over, its text kept or not
+static void macendmark(A11y *x)
+{
+    gui_preedit(axmac->g, {}, 0, 0);
+    axmark(x, {}, 0, 0);
+    macspoken    = 0;
+    macsdlranges = 0;
+    macwake();
+}
+
+// r within n units: past the end, cut to it
+static NsRange macclamp(NsRange r, uz n)
+{
+    uz lo = r.loc>n ? n : r.loc;
+    return {lo, r.len>n-lo ? n-lo : r.len};
+}
+
+// Units r of s (a composition) as its bytes, cut to fit
+static AxSpan macmarkbytes(Str s, NsRange r)
+{
+    NsRange c = macclamp(r, (uz)axcount(s, AXU_UTF16, (i32)s.len));
+    return {axadvance(s, AXU_UTF16, (i32)c.loc), axadvance(s, AXU_UTF16, (i32)(c.loc + c.len))};
+}
+
+// Units r of the document as bytes of the text: within the marked text,
+// the selection it stands in for. 0 if not all in it. One that starts
+// in the marked text ends with it: the field keeps less of a long
+// composition than the client sent (PREEDIT_MAX), and the client's
+// range of all of it would reach into the text after.
+static b32 mactextspan(A11y *x, NsRange r, AxSpan *out)
+{
+    MacDoc d = {x, {}};
+    AxSpan s = {};
+    if (r.loc==NSNOTFOUND || !macbytes(&d, r, &s)) {
+        return 0;
+    }
+    i32 ml = (i32)x->text.marked.len;
+    i32 mlo = axselection(&x->text).lo;
+    if (ml && s.lo>=mlo && s.lo<mlo+ml && s.hi>mlo+ml) {
+        s.hi = mlo + ml;
+    }
+    out->lo = axdoctext(x, s.lo);
+    out->hi = axdoctext(x, s.hi);
+    return 1;
+}
+
+// A text argument's NSString, or an empty one for anything else, as
+// SDL's methods take it unchecked
+static void *macstrobj(void *o)
+{
+    void *s = maciskind(o, "NSAttributedString") ? objcsend<void *>(o, "string") : o;
+    return maciskind(s, "NSString") ? s : nsstring("");
+}
+
+static void macsdlinsert(void *self, void *s)
+{
+    macinsdl++;
+    macinsertimp(self, sel_registerName("insertText:replacementRange:"), s,
+                 NsRange{NSNOTFOUND, 0});
+    macinsdl--;
+}
+
+static void macsdlunmark(void *self)
+{
+    macinsdl++;
+    macunmarkimp(self, sel_registerName("unmarkText"));
+    macinsdl--;
+}
+
+// A key's text, by its length alone. Nor is the text model logged
+// ahead of it: the next call that isn't a key's logs it.
+static void mactyped(Buf *b, void *o)
+{
+    b32   attr = maciskind(o, "NSAttributedString");
+    void *s    = attr ? objcsend<void *>(o, "string") : o;
+    print(b, "(typed)#");
+    print(b, maciskind(s, "NSString") ? (i64)objcsend<uz>(s, "length") : (i64)-1);
+}
+
+// Log a call with a text argument, then its ranges, before it is made
+static void maclogcall(char const *call, b32 keyed, void *s, NsRange *rs, i32 n, b32 sdl)
+{
+    if (AxGui *x = maclog()) {
+        Arena a = x->logmem;
+        Buf   b(&a, 256);
+        print(&b, Str{(u8 *)call, (iz)__builtin_strlen(call)});
+        putbyte(&b, ' ');
+        if (keyed) {
+            mactyped(&b, s);
+        } else {
+            macstrarg(&b, s);
+        }
+        for (i32 i = 0; i < n; i++) {
+            putbyte(&b, ' ');
+            macrange(&b, rs[i]);
+        }
+        if (sdl) {
+            print(&b, " (SDL's)");
+        }
+        if (keyed) {
+            axnote(x, a, finish(&b));
+        } else {
+            macnote(x, a, &b);
+        }
+    }
+}
+
+// The marked text, not from a key, becomes the field's text
+static void maccommit(void *self, A11y *x)
+{
+    AxSpan at = axselection(&x->text);
+    axtextedit(axmac->g, at.lo, at.hi, x->text.marked, AX_AFTER, AX_AFTER);
+    macsdlunmark(self);
+    macendmark(x);
+}
+
+// SDL's key pending in self (SDL3TranslatorResponder's ivar), which its
+// unmarkText clears as consumed by the input method: kept across a
+// commit that isn't the key's, so that the key still goes out after.
+static i32 *macpendingkey(void *self)
+{
+    void *iv = class_getInstanceVariable(object_getClass(self), "_pendingRawCode");
+    char const *t = iv ? ivar_getTypeEncoding(iv) : 0;
+    return t && !__builtin_strcmp(t, "i") ? (i32 *)((u8 *)self + ivar_getOffset(iv)) : 0;
+}
+
+// A key comes while Dictation's composition is up: since macOS 13 one
+// may type while it listens. Its words are kept, ahead of the key, as
+// the key's text or command would be in order: through SDL, as a key's
+// commit, unless an edit is queued for the field, which it then follows.
+// The input method is told after the key (mackeydone), so that it
+// stops counting on marked text that is gone.
+static void macspokenend(void *self, A11y *x)
+{
+    if (!macspoken || !x->text.marked.len) {
+        return;
+    }
+    if (AxGui *l = maclog()) {
+        axnote(l, l->logmem, "a key commits Dictation's marked text");
+    }
+    if (axqueued(x, x->text.id)) {
+        AxSpan at = axselection(&x->text);
+        axtextedit(axmac->g, at.lo, at.hi, x->text.marked, AX_AFTER, AX_AFTER);
+        macsdlunmark(self);
+    } else {
+        // Held back meanwhile: SDL's insertText sends a pending key
+        // ahead of the text when it has no marked text of its own
+        i32 *pk  = macpendingkey(self);
+        i32  key = pk ? *pk : -1;
+        if (pk) {
+            *pk = -1;
+        }
+        macsdlinsert(self, macnsstr(x->text.marked));
+        if (pk) {
+            *pk = key;
+        }
+    }
+    macendmark(x);
+    macdropsoon = self;
+}
+
+static void macinsert(void *self, void *sel, void *s, NsRange r)
+{
+    b32 keyed = mackeyed();
+    if (macdiscarding && !keyed) {
+        // An input method's commit as it was told to drop its text, or
+        // its view was taken away (os_guiimereset): kept from the field
+        A11y *x = mactext();
+        maclogcall("insertText:replacementRange: (discarded)", 0, s, &r, 1, 0);
+        macsdlinsert(self, nsstring(""));
+        if (x) {
+            macendmark(x);
+        }
+        return;
+    }
+    if (!keyed && macdictated(s)) {
+        macwant("insertText");
+    }
+    A11y *x = mactext();
+    if (x && keyed) {
+        macspokenend(self, x);
+    }
+    NsRange rr   = keyed ? r : macreplacing(r);
+    b32     none = rr.loc == NSNOTFOUND;
+    b32     sdl  = !x || (keyed && none && !axqueued(x, x->text.id));
+    maclogcall("insertText:replacementRange:", keyed, s, &r, 1, sdl);
+    if (sdl) {
+        if (x) {
+            axmark(x, {}, 0, 0);  // SDL's text ends it (gui_sdl.cpp's dispatch)
+            macspoken = 0;
+        }
+        macsdlranges = 0;
+        macinsdl++;
+        macinsertimp(self, sel, s, r);
+        macinsdl--;
+        return;
+    }
+
+    b32    ok   = 0;
+    Str    text = mactextarg(s, &ok);
+    AxSpan at   = axselection(&x->text);  // which the marked text stands in for
+    if (!none && !mactextspan(x, rr, &at)) {
+        at = axselection(&x->text);  // not in the text: as though none
+    }
+    macsdlinsert(self, nsstring(""));  // SDL's marked text let go, a key's press sent
+    ok = ok && axtextedit(axmac->g, at.lo, at.hi, text, AX_AFTER, AX_AFTER);
+    macendmark(x);
+    if (!ok) {
+        if (AxGui *l = maclog()) {
+            axnote(l, l->logmem, "insertText refused");
+        }
+    }
+}
+
+static void macsetmarked(void *self, void *sel, void *s, NsRange sr, NsRange rr)
+{
+    b32 keyed = mackeyed();
+    if (!keyed) {
+        macwant("setMarkedText");
+    }
+    A11y   *x     = mactext();
+    if (x && keyed) {
+        macspokenend(self, x);
+    }
+    NsRange rs[2] = {sr, rr};
+    maclogcall("setMarkedText:selectedRange:replacementRange:", keyed, s, rs, 2, !x);
+
+    // SDL's takes the selection unchecked, and a string past its end
+    // raises an exception
+    void   *str = macstrobj(s);
+    NsRange in  = macclamp(sr, objcsend<uz>(str, "length"));
+    if (!x) {
+        macsetmarkedimp(self, sel, s==str || maciskind(s, "NSAttributedString") ? s : str,
+                        in, rr);
+        return;
+    }
+
+    b32 ok   = 0;
+    Str text = mactextarg(str, &ok);
+    text = ok ? text : Str{};
+    AxSpan  at   = {};
+    NsRange rep  = keyed ? rr : macreplacing(rr);
+    if (rep.loc!=NSNOTFOUND && mactextspan(x, rep, &at)) {
+        // What it replaces is selected, for the composition to stand in
+        // for: the commit replaces it, one edit to undo, and a
+        // composition dropped leaves it be
+        axtextselect(axmac->g, at.lo, at.hi);
+    }
+    b32 none = rr.loc == NSNOTFOUND;
+    macinsdl++;
+    macsetmarkedimp(self, sel, str, in, NsRange{NSNOTFOUND, 0});
+    macinsdl--;
+    AxSpan m = macmarkbytes(text, in);
+    if (!text.len) {
+        macendmark(x);
+    } else if (keyed && none) {
+        axmark(x, text, m.lo, m.hi);  // SDL's event draws it, in order with the keys
+        macspoken = 0;
+    } else {
+        maccompose(x, text, m.lo, m.hi);
+        macspoken = !keyed;
+    }
+}
+
+// Marked text becomes text: a key's, through SDL, as a key's commit; else
+// queued
+static void macunmark(void *self, void *sel)
+{
+    b32   keyed = mackeyed();
+    A11y *x     = mactext();
+    b32   has   = x && x->text.marked.len;
+    if (AxGui *l = maclog()) {
+        Arena a = l->logmem;
+        Buf   b(&a, 64);
+        print(&b, has ? Str("unmarkText") : Str("unmarkText (SDL's)"));
+        macnote(l, a, &b);
+    }
+    if (!has) {
+        macunmarkimp(self, sel);
+    } else if (macdiscarding) {
+        macsdlunmark(self);  // told to drop it (macdiscard): nothing is kept
+        macendmark(x);
+    } else if (keyed) {
+        void *s = macnsstr(x->text.marked);
+        axmark(x, {}, 0, 0);
+        macspoken = 0;
+        macsdlinsert(self, s);
+    } else {
+        maccommit(self, x);
+    }
+}
+
+// The queries are logged after they're answered, with the answer.
+
+static void macnoterange(char const *call, NsRange r)
+{
+    if (AxGui *x = maclog()) {
+        Arena a = x->logmem;
+        Buf   b(&a, 64);
+        print(&b, Str{(u8 *)call, (iz)__builtin_strlen(call)});
+        print(&b, " -> ");
+        macrange(&b, r);
+        macnote(x, a, &b);
+    }
+}
+
+// Within marked text, the input method's selection in it
+static NsRange macselected(void *self, void *sel)
+{
+    A11y   *x = mactext();
+    MacDoc  d = {x, {}};
+    NsRange r = x ? macunits(&d, macsel(&d)) : macselectedimp(self, sel);
+    macsdlranges = macinsdl ? macsdlranges : !x;
+    macnoterange("selectedRange", r);
+    return r;
+}
+
+static NsRange macmarked(void *self, void *sel)
+{
+    A11y   *x = mactext();
+    NsRange r = {NSNOTFOUND, 0};
+    if (!x) {
+        r = macmarkedimp(self, sel);
+    } else if (x->text.marked.len) {
+        MacDoc d  = {x, {}};
+        i32    lo = axselection(&x->text).lo;
+        r = macunits(&d, {lo, lo + (i32)x->text.marked.len});
+    }
+    macsdlranges = macinsdl ? macsdlranges : !x;
+    macnoterange("markedRange", r);
+    return r;
+}
+
+static ObjcBool machasmarked(void *self, void *sel)
+{
+    A11y    *x = mactext();
+    ObjcBool r = x ? x->text.marked.len>0 : machasmarkedimp(self, sel);
+    if (AxGui *l = maclog()) {
+        Arena a = l->logmem;
+        Buf   b(&a, 64);
+        print(&b, r ? Str("hasMarkedText -> YES") : Str("hasMarkedText -> NO"));
+        macnote(l, a, &b);
+    }
+    return r;
+}
+
+// What the callee made of an actualRange: SDL's leave it alone, so
+// what's there is the caller's, not an answer.
+static void macactual(Buf *b, NsRange *actual, NsRange was)
+{
+    if (!actual) {
+        return;
+    } else if (actual->loc==was.loc && actual->len==was.len) {
+        print(b, " actual unchanged");
+    } else {
+        print(b, " actual ");
+        macrange(b, *actual);
+    }
+}
+
+// The document's text in range, cut to its end; nil for one starting
+// past it, as the protocol allows
+static void *macattrsub(void *self, void *sel, NsRange r, NsRange *actual)
+{
+    NsRange was = actual ? *actual : NsRange{};
+    A11y   *x   = mactext();
+    void *s = 0;
+    if (!x) {
+        s = macattrsubimp(self, sel, r, actual);
+    } else {
+        MacDoc d = {x, {}};
+        uz     n = (uz)macdoclen(&d);
+        AxSpan b = {};
+        if (r.loc <= n && macbytes(&d, macclamp(r, n), &b)) {
+            void *str = macdocstr(&d, b);
+            s = objcsend<void *>(objc_getClass("NSAttributedString"), "alloc");
+            s = s ? objcsend<void *>(s, "initWithString:", str) : 0;
+            s = s ? objcsend<void *>(s, "autorelease") : 0;
+            if (actual) {
+                *actual = macunits(&d, b);
+            }
+        }
+    }
+    if (AxGui *l = maclog()) {
+        Arena a = l->logmem;
+        Buf   b(&a, 256);
+        print(&b, "attributedSubstringForProposedRange:actualRange: ");
+        macrange(&b, r);
+        print(&b, " -> ");
+        macstrarg(&b, s);
+        macactual(&b, actual, was);
+        macnote(l, a, &b);
+    }
+    return s;
+}
+
+// Where the part of document units r on its first line was drawn, on
+// the screen: 0 if that isn't known, the text or its marked text changed
+// since it was drawn
+static b32 macfirstof(A11y *x, NsRange r, NsRect *out, NsRange *actual)
+{
+    AxText *t  = &x->text;
+    MacDoc  d  = {x, {}};
+    i32     ml = (i32)t->marked.len;
+    AxSpan  s  = {};
+    if (t->geom.rev!=t->rev || (ml && t->geom.nm!=ml+1) ||
+            !macbytes(&d, macclamp(r, (uz)macdoclen(&d)), &s)) {
+        return 0;
+    }
+    if (r.len && macunits(&d, s).len==0) {
+        s.hi = axdocchar(x, s.lo).hi;  // half a surrogate pair: the character
+    }
+    AxRect rc  = axdocrect(x, s.lo);
+    i32    end = s.lo;
+    for (i32 b = s.lo; b < s.hi;) {
+        AxSpan c = axdocchar(x, b);
+        if (c.hi <= c.lo) {
+            break;
+        }
+        AxRect cr = axdocrect(x, c.lo);
+        if (cr.y0 != rc.y0) {
+            break;
+        }
+        rc.x1 = cr.x1>rc.x1 ? cr.x1 : rc.x1;
+        end = b = c.hi;
+    }
+    rc.x1 = end>s.lo ? rc.x1 : rc.x0;  // none: the caret's place
+    *out  = macscreen(rc);
+    if (actual) {
+        *actual = macunits(&d, {s.lo, end});
+    }
+    return 1;
+}
+
+// Where Dictation's and the input method's windows go: until the field
+// draws the text as it is, SDL's answer, the input method's place as the
+// field last gave it
+static NsRect macfirstrect(void *self, void *sel, NsRange r, NsRange *actual)
+{
+    NsRange was = actual ? *actual : NsRange{};
+    A11y   *x   = mactext();
+    NsRect rc = {};
+    if (!x || !macfirstof(x, r, &rc, actual)) {
+        rc = macfirstrectimp(self, sel, r, actual);
+    }
+    if (AxGui *l = maclog()) {
+        Arena a = l->logmem;
+        Buf   b(&a, 128);
+        print(&b, "firstRectForCharacterRange:actualRange: ");
+        macrange(&b, r);
+        print(&b, " -> ");
+        macrect(&b, rc);
+        macactual(&b, actual, was);
+        macnote(l, a, &b);
+    }
+    return rc;
+}
+
+// The insertion point nearest a point of the screen
+static uz macindexat(void *self, void *sel, NsPoint p)
+{
+    A11y *x = mactext();
+    uz    i = NSNOTFOUND;
+    f32   px = 0, py = 0;
+    if (!x) {
+        i = macindexatimp(self, sel, p);
+    } else if (x->text.geom.rev==x->text.rev && macfromscreen(p, &px, &py)) {
+        MacDoc d = {x, {}};
+        i32    b = axtodoc(x, axoffsetat(x, px, py));
+        i = macunits(&d, {b, b}).loc;
+    }
+    if (AxGui *l = maclog()) {
+        Arena a = l->logmem;
+        Buf   b(&a, 128);
+        print(&b, "characterIndexForPoint: (");
+        print(&b, axround((f32)p.x));
+        putbyte(&b, ',');
+        print(&b, axround((f32)p.y));
+        print(&b, ") -> ");
+        if (i == NSNOTFOUND) {
+            print(&b, "NotFound");
+        } else {
+            print(&b, (i64)i);
+        }
+        macnote(l, a, &b);
+    }
+    return i;
+}
+
+// The end of byte b's line, before its newline
+static i32 maclineend(A11y *x, i32 b)
+{
+    Str    s = x->text.text;
+    AxSpan l = axlinespan(x, axlineat(x, b));
+    return l.hi>l.lo && s[l.hi-1]=='\n' ? l.hi-1 : l.hi;
+}
+
+// A command from no key, Dictation's or Voice Control's, done to the
+// model as Cocoa's text views do it: a delete takes the selection if
+// there is one; a move collapses it. 0 for one not known here.
+static Str const maccommands[] = {
+    "insertNewline:", "insertLineBreak:", "insertParagraphSeparator:",
+    "insertNewlineIgnoringFieldEditor:", "deleteBackward:",
+    "deleteBackwardByDecomposingPreviousCharacter:", "deleteForward:",
+    "deleteWordBackward:", "deleteWordForward:", "deleteToBeginningOfLine:",
+    "deleteToEndOfLine:", "deleteToBeginningOfParagraph:", "deleteToEndOfParagraph:",
+    "moveLeft:", "moveBackward:", "moveRight:", "moveForward:", "moveWordLeft:",
+    "moveWordBackward:", "moveWordRight:", "moveWordForward:", "moveToBeginningOfLine:",
+    "moveToLeftEndOfLine:", "moveToEndOfLine:", "moveToRightEndOfLine:",
+    "moveToBeginningOfParagraph:", "moveToEndOfParagraph:",
+    "moveToBeginningOfDocument:", "moveToEndOfDocument:", "selectAll:",
+};
+
+static b32 macknown(Str name)
+{
+    b32 known = 0;
+    for (i32 i = 0; i < countof(maccommands); i++) {
+        known |= maccommands[i] == name;
+    }
+    return known;
+}
+
+static b32 macdocommand(void *self, A11y *x, Str name)
+{
+    if (!macknown(name)) {
+        return 0;
+    } else if (x->text.marked.len) {
+        maccommit(self, x);  // a command ends a composition
+    }
+    Gui    *g   = axmac->g;
+    AxText *t   = &x->text;
+    Str     s   = t->text;
+    i32     n   = (i32)s.len;
+    i32     c   = t->caret;
+    AxSpan  sel = axselection(t);
+    i32     to  = -1;  // a delete's other end, from the caret
+    i32     at  = -1;  // a move's
+    iz      e   = c;
+    iz      p   = c;
+    if (c > 0) {
+        utf8prev(s, c, &p);
+    }
+    if (c < n) {
+        utf8decode(s, &e);
+    }
+
+    if (name=="insertNewline:" || name=="insertLineBreak:" ||
+            name=="insertParagraphSeparator:" || name=="insertNewlineIgnoringFieldEditor:") {
+        axtextedit(g, sel.lo, sel.hi, "\n", AX_AFTER, AX_AFTER);
+        return 1;
+    } else if (name=="deleteBackward:" || name=="deleteBackwardByDecomposingPreviousCharacter:") {
+        to = (i32)p;
+    } else if (name == "deleteForward:") {
+        to = (i32)e;
+    } else if (name == "deleteWordBackward:") {
+        to = axwordback(s, c);
+    } else if (name == "deleteWordForward:") {
+        to = axwordnext(s, c);
+    } else if (name=="deleteToBeginningOfLine:") {
+        to = axlinespan(x, axlineat(x, c)).lo;
+    } else if (name == "deleteToEndOfLine:") {
+        to = maclineend(x, c);
+    } else if (name == "deleteToBeginningOfParagraph:") {
+        to = axparaat(s, c).lo;
+    } else if (name == "deleteToEndOfParagraph:") {
+        AxSpan q = axparaat(s, c);
+        to = q.hi>q.lo && s[q.hi-1]=='\n' ? q.hi-1 : q.hi;
+    } else if (name=="moveLeft:" || name=="moveBackward:") {
+        at = sel.hi>sel.lo ? sel.lo : (i32)p;
+    } else if (name=="moveRight:" || name=="moveForward:") {
+        at = sel.hi>sel.lo ? sel.hi : (i32)e;
+    } else if (name=="moveWordLeft:" || name=="moveWordBackward:") {
+        at = axwordback(s, sel.lo);
+    } else if (name=="moveWordRight:" || name=="moveWordForward:") {
+        at = axwordnext(s, sel.hi);
+    } else if (name=="moveToBeginningOfLine:" || name=="moveToLeftEndOfLine:") {
+        at = axlinespan(x, axlineat(x, c)).lo;
+    } else if (name=="moveToEndOfLine:" || name=="moveToRightEndOfLine:") {
+        at = maclineend(x, c);
+    } else if (name == "moveToBeginningOfParagraph:") {
+        at = axparaat(s, c).lo;
+    } else if (name == "moveToEndOfParagraph:") {
+        AxSpan q = axparaat(s, c);
+        at = q.hi>q.lo && s[q.hi-1]=='\n' ? q.hi-1 : q.hi;
+    } else if (name == "moveToBeginningOfDocument:") {
+        at = 0;
+    } else if (name == "moveToEndOfDocument:") {
+        at = n;
+    } else if (name == "selectAll:") {
+        axtextselect(g, 0, n);
+        return 1;
+    } else {
+        return 0;
+    }
+
+    if (to >= 0) {
+        AxSpan d = sel.hi>sel.lo ? sel : AxSpan{to<c ? to : c, to<c ? c : to};
+        if (d.hi > d.lo) {
+            axtextedit(g, d.lo, d.hi, "", d.lo, d.lo);
+        }
+    } else if (at >= 0) {
+        axtextselect(g, at, at);
+    }
+    return 1;
+}
+
+static void maccommand(void *self, void *sel, void *cmd)
+{
+    b32         keyed = mackeyed();
+    char const *cn    = cmd ? sel_getName(cmd) : "nil";
+    Str         name  = {(u8 *)cn, (iz)__builtin_strlen(cn)};
+    if (!keyed && macknown(name)) {
+        macwant("doCommandBySelector");
+    }
+    A11y *x = mactext();
+    if (AxGui *l = maclog()) {
+        Arena a = l->logmem;
+        Buf   b(&a, 64);
+        print(&b, "doCommandBySelector: ");
+        print(&b, name);
+        macnote(l, a, &b);
+    }
+    if (x && keyed) {
+        macspokenend(self, x);  // the key is the field's, not Dictation's
+    }
+    if (!x || keyed || !macdocommand(self, x, name)) {
+        maccommandimp(self, sel, cmd);  // a key's: SDL sends it as a key
+    } else {
+        macwake();
+    }
+}
+
+static void *macvalidattrs(void *self, void *sel)
+{
+    void *r = macvalidattrsimp(self, sel);
+    if (AxGui *x = maclog()) {
+        Arena a = x->logmem;
+        Buf   b(&a, 128);
+        print(&b, "validAttributesForMarkedText -> ");
+        macdesc(&b, r, 300);
+        macnote(x, a, &b);
+    }
+    return r;
+}
+
+
 // SDL3View's and the text input's methods, answering for the root
 
 static void *macviewcls, *macrespcls;
@@ -2144,6 +2694,8 @@ static void macpublished(AxGui *x)
 //                      frame, and its middle's character is N
 //   tsettable ATTRS    each attribute is settable, a comma between, and
 //                      not those with a '!'
+// and of the window's text input, as Dictation calls it: "ti ..." and
+// "replay FILE" (mactidrive, macreplay).
 
 static Str macstrof(void *o, char const *sel)
 {
@@ -2359,6 +2911,344 @@ static void mactextdrive(Gui *g, Arena *a, void *el, Str verb, Str args, Str wha
     axcheck(g, a, got==want, got==want ? what : concat(a, what, concat(a, ", not ", got)));
 }
 
+// The text input's calls (ti), on the window's first responder, as
+// Dictation makes them, from no key (a range is LOC,LEN in UTF-16 units,
+// or "none" for NSNotFound; text is the rest of the line; " ; " between
+// calls makes them in one step, with no frame between):
+//   ti key CALL        CALL as though inside a key down's dispatch
+//                      (mackeyed), as macsend counts one
+//   ti insert R TEXT   insertText:replacementRange:, an NSString
+//   ti ainsert R TEXT  the same, an NSAttributedString
+//   ti mark S R TEXT   setMarkedText:selectedRange:replacementRange:,
+//                      attributed
+//   ti unmark          unmarkText
+//   ti cmd SELECTOR    doCommandBySelector:
+//   ti sel R           selectedRange is R
+//   ti marked R        markedRange is R
+//   ti has 0|1         hasMarkedText
+//   ti sub R ACTUAL TEXT  attributedSubstringForProposedRange:actualRange:
+//                      gives TEXT, and ACTUAL ("nil" for none)
+//   ti round N         firstRectForCharacterRange: of character N lies in
+//                      the focused element's frame, and
+//                      characterIndexForPoint: at its left edge is N
+static NsRange macparsens(Str s)
+{
+    return s=="none" ? NsRange{NSNOTFOUND, 0} : macparserange(s);
+}
+
+static void *macattrstr(void *s)
+{
+    void *o = objcsend<void *>(objc_getClass("NSAttributedString"), "alloc");
+    o = o ? objcsend<void *>(o, "initWithString:", s) : 0;
+    return o ? objcsend<void *>(o, "autorelease") : 0;
+}
+
+// The window's text input, SDL's, or null
+static void *macresponder(void *win)
+{
+    void *r = win ? objcsend<void *>(win, "firstResponder") : 0;
+    return maciskind(r, "SDL3TranslatorResponder") ? r : 0;
+}
+
+static void mactidrive(Gui *g, Arena *a, void *win, void *view, Str args, Str what)
+{
+    void *resp = macresponder(win);
+    Cut   c    = cut(args, ' ');
+    Str   verb = c.head;
+    Buf   b(a, 256);
+    if (!resp) {
+        axcheck(g, a, 0, concat(a, what, ": no text input"));
+        return;
+    }
+
+    if (verb == "key") {
+        mackeydepth++;
+        mactidrive(g, a, win, view, c.tail, what);
+        mackeydepth--;
+        mackeydone();
+        return;
+    } else if (verb=="insert" || verb=="ainsert") {
+        Cut   r = cut(c.tail, ' ');
+        void *s = macnsstr(r.tail, *a);
+        objcsend<void>(resp, "insertText:replacementRange:",
+                       verb=="ainsert" ? macattrstr(s) : s, macparsens(r.head));
+    } else if (verb == "mark") {
+        Cut sr = cut(c.tail, ' ');
+        Cut rr = cut(sr.tail, ' ');
+        objcsend<void>(resp, "setMarkedText:selectedRange:replacementRange:",
+                       macattrstr(macnsstr(rr.tail, *a)), macparsens(sr.head),
+                       macparsens(rr.head));
+    } else if (verb == "unmark") {
+        objcsend<void>(resp, "unmarkText");
+    } else if (verb == "cmd") {
+        objcsend<void>(resp, "doCommandBySelector:", sel_registerName(cstr0(a, c.tail)));
+    } else if (verb=="sel" || verb=="marked") {
+        NsRange r = objcsend<NsRange>(resp, verb=="sel" ? "selectedRange" : "markedRange");
+        if (r.loc == NSNOTFOUND) {
+            print(&b, "none");
+        } else {
+            macputrange(&b, r);
+        }
+        Str got = finish(&b);
+        axcheck(g, a, got==c.tail, got==c.tail ? what : concat(a, what, concat(a, ", not ", got)));
+        return;
+    } else if (verb == "has") {
+        Str got = objcsend<ObjcBool>(resp, "hasMarkedText") ? Str("1") : Str("0");
+        axcheck(g, a, got==c.tail, got==c.tail ? what : concat(a, what, concat(a, ", not ", got)));
+        return;
+    } else if (verb == "sub") {
+        Cut     rv  = cut(c.tail, ' ');
+        Cut     av  = cut(rv.tail, ' ');
+        NsRange act = {NSNOTFOUND, 0};
+        void   *s   = objcsend<void *>(resp, "attributedSubstringForProposedRange:actualRange:",
+                                       macparsens(rv.head), &act);
+        if (!s) {
+            print(&b, "nil");
+        } else {
+            macputrange(&b, act);
+            putbyte(&b, ' ');
+            macputstr(&b, s);
+        }
+        Str got  = finish(&b);
+        Str want = av.head=="nil" ? av.head : rv.tail;
+        axcheck(g, a, got==want, got==want ? what : concat(a, what, concat(a, ", not ", got)));
+        return;
+    } else if (verb == "round") {
+        iz      i  = (iz)parseint(c.tail).val;
+        void   *el = macfocusof(win, view);
+        NsRect  f  = el ? objcrect(el, "accessibilityFrame") : NsRect{};
+        NsRange ac = {};
+        NsRect  r  = objcrect(resp, "firstRectForCharacterRange:actualRange:",
+                              NsRange{(uz)i, 1}, &ac);
+        uz      at = objcsend<uz>(resp, "characterIndexForPoint:",
+                                  NsPoint{r.x + 1, r.y + r.h/2});
+        b32 in = r.w>0 && r.h>0 && r.x>=f.x-1 && r.y>=f.y-1 &&
+                 r.x+r.w<=f.x+f.w+1 && r.y+r.h<=f.y+f.h+1;
+        b32 ok = in && at==(uz)i && ac.loc==(uz)i && ac.len>=1;
+        print(&b, what);
+        if (!ok) {
+            print(&b, ": ");
+            macrect(&b, r);
+            print(&b, in ? Str(" in ") : Str(" not in "));
+            macrect(&b, f);
+            print(&b, ", actual ");
+            macputrange(&b, ac);
+            print(&b, ", index ");
+            print(&b, at==NSNOTFOUND ? (i64)-1 : (i64)at);
+        }
+        axcheck(g, a, ok, finish(&b));
+        return;
+    } else {
+        axcheck(g, a, 0, concat(a, what, ": no such call"));
+        return;
+    }
+    guilog(g, concat(a, "drive: ", what));
+}
+
+// "ns replay FILE": the calls of a trace (PROSPERO_AXTRACE's file, or the
+// Metrics pane's copied log), FILE in the checklist's --cwd, made again
+// in order, from no key: NSTextInputClient's insertText:, setMarkedText:,
+// unmarkText and doCommandBySelector: on the window's text input, and the
+// AXValue, AXSelectedText and AXSelectedTextRange(s) sets on its focused
+// element. Queries are left out: their answers are this run's. A call
+// whose text the trace withheld (typed, no field, a password) or cut is
+// skipped, and counted. A repeated line (×N, or the trace's "the line
+// before, N times") is made N times.
+
+// A logged string (axquote), from its opening quote; s is left past its
+// closing one. 0 if there is none, or the log cut it (…+N follows).
+static b32 macunquote(Arena *a, Str *s, Str *out)
+{
+    if (!s->len || (*s)[0]!='"') {
+        return 0;
+    }
+    Buf b(a, s->len);
+    iz  i = 1;
+    for (; i<s->len && (*s)[i]!='"'; i++) {
+        u8 c = (*s)[i];
+        if (c=='\\' && i+1<s->len) {
+            u8 e = (*s)[++i];
+            c = e;
+            if (e == 'n') {
+                c = '\n';
+            } else if (e=='x' && i+2<s->len && hexval((*s)[i+1])>=0 && hexval((*s)[i+2])>=0) {
+                c = (u8)(hexval((*s)[i+1])<<4 | hexval((*s)[i+2]));
+                i += 2;
+            }
+        }
+        putbyte(&b, c);
+    }
+    if (i == s->len) {
+        return 0;
+    }
+    *s   = cuthead(*s, i+1);
+    *out = finish(&b);
+    return !startswith(*s, "\xe2\x80\xa6+");
+}
+
+// The last n ranges in s ("{LOC,LEN}", LOC possibly "NotFound"), in order
+static b32 maclastranges(Str s, NsRange *rs, i32 n)
+{
+    i32 got = 0;
+    for (iz i = s.len; i>0 && got<n; i--) {
+        if (s[i-1] != '}') {
+            continue;
+        }
+        iz j = i-1;
+        while (j>0 && s[j-1]!='{') {
+            j--;
+        }
+        if (!j) {
+            break;
+        }
+        Cut c   = cut(span(s.data+j, s.data+i-1), ',');
+        Int lo  = parseint(c.head);
+        Int len = parseint(c.tail);
+        if (!len.ok || (!lo.ok && !(c.head=="NotFound"))) {
+            continue;  // braces of something else: an attribute's
+        }
+        rs[n-1-got++] = {c.head=="NotFound" ? NSNOTFOUND : (uz)lo.val, (uz)len.val};
+        i = j;
+    }
+    return got == n;
+}
+
+// Make the call on line, a line of the trace less its time: 1 made, 0
+// not a call, -1 a call that can't be made again
+static i32 macreplayline(Arena a, void *resp, void *el, Str line)
+{
+    static Str const calls[] = {
+        "insertText:replacementRange: ",
+        "setMarkedText:selectedRange:replacementRange: ",
+        "unmarkText",
+        "doCommandBySelector: ",
+        "AXValue= ",
+        "AXSelectedText= ",
+        "AXSelectedTextRange= ",
+        "AXSelectedTextRanges= ",
+    };
+    i32 k = -1;
+    for (i32 i = 0; k<0 && i<countof(calls); i++) {
+        k = startswith(line, calls[i]) ? i : k;
+    }
+    if (k < 0) {
+        return 0;
+    }
+    Str rest = cuthead(line, calls[k].len);
+    Str text = {};
+    NsRange rs[2] = {};
+    b32 hastext = k==0 || k==1 || k==4 || k==5;
+    if (hastext && !macunquote(&a, &rest, &text)) {
+        return -1;
+    }
+    void *s = hastext ? macnsstr(text, a) : 0;
+    if (hastext && contains(rest, "attrs[")) {
+        s = macattrstr(s);  // as given: Dictation's are attributed
+    }
+    switch (k) {
+    case 0:
+        if (!maclastranges(rest, rs, 1)) {
+            return -1;
+        }
+        objcsend<void>(resp, "insertText:replacementRange:", s, rs[0]);
+        break;
+    case 1:
+        if (!maclastranges(rest, rs, 2)) {
+            return -1;
+        }
+        objcsend<void>(resp, "setMarkedText:selectedRange:replacementRange:", s, rs[0], rs[1]);
+        break;
+    case 2:
+        if (rest.len && !startswith(rest, " (")) {
+            return 0;  // another call that starts the same
+        }
+        objcsend<void>(resp, "unmarkText");
+        break;
+    case 3: {
+        Cut c = cut(rest, ' ');
+        if (!c.head.len || c.head=="nil") {
+            return -1;
+        }
+        objcsend<void>(resp, "doCommandBySelector:", sel_registerName(cstr0(&a, c.head)));
+    } break;
+    case 4:
+    case 5:
+        if (!el) {
+            return -1;
+        }
+        objcsend<void>(el, k==4 ? "setAccessibilityValue:" : "setAccessibilitySelectedText:", s);
+        break;
+    case 6:
+    case 7:
+        if (!el || !maclastranges(cut(rest, ' ').head, rs, 1)) {
+            return -1;
+        } else if (k == 6) {
+            objcsend<void>(el, "setAccessibilitySelectedTextRange:", rs[0]);
+        } else {
+            void *v = objcsend<void *>(objc_getClass("NSValue"), "valueWithRange:", rs[0]);
+            objcsend<void>(el, "setAccessibilitySelectedTextRanges:",
+                           objcsend<void *>(objc_getClass("NSArray"), "arrayWithObject:", v));
+        }
+        break;
+    }
+    return 1;
+}
+
+static void macreplay(Gui *g, Arena *a, void *win, void *view, Str file, Str what)
+{
+    void *resp = macresponder(win);
+    Read  r    = os_read(g->os, a, join(a, g->drivecwd, file), (iz)1<<24);
+    if (r.err != READ_OK) {
+        axcheck(g, a, 0, concat(a, what, ": cannot read it"));
+        return;
+    } else if (!resp) {
+        axcheck(g, a, 0, concat(a, what, ": no text input"));
+        return;
+    }
+    i32 made = 0, skipped = 0;
+    Str last = {};  // the call line before, for a repeat
+    for (Cut c = cut(r.data, '\n'); c.head.len || c.tail.len; c = cut(c.tail, '\n')) {
+        Str line = c.head;
+        if (line.len && line[line.len-1]=='\r') {
+            line = takehead(line, line.len-1);
+        }
+        Cut t = cut(line, ' ');  // its time, seconds.ms
+        if (contains(t.head, ".") && parseint(cut(t.head, '.').head).ok) {
+            line = t.tail;
+        }
+        i32 times = 1;
+        if (startswith(line, "(the line before, ")) {
+            times = (i32)parseint(cut(cuthead(line, 18), ' ').head).val - 1;
+            line  = last;
+        } else if (endswith(line, ")") && contains(line, " (\xc3\x97")) {
+            // The ring's count of a line repeated: " (×N)" at its end
+            iz i = line.len;
+            while (i>0 && line[i-1]!='(') {
+                i--;
+            }
+            times = (i32)parseint(span(line.data+i+2, line.data+line.len-1)).val;
+            line  = takehead(line, i>1 ? i-2 : 0);
+        }
+        for (i32 n = 0; n < times; n++) {
+            void *pool = objc_autoreleasePoolPush();
+            void *el   = macfocusof(win, view);
+            i32   got  = macreplayline(*a, macresponder(win), el, line);
+            objc_autoreleasePoolPop(pool);
+            made    += got > 0;
+            skipped += got < 0;
+            last     = got ? line : last;
+        }
+    }
+    Buf b(a, 128);
+    print(&b, what);
+    print(&b, ": ");
+    print(&b, (i64)made);
+    print(&b, " calls made, ");
+    print(&b, (i64)skipped);
+    print(&b, " skipped");
+    axcheck(g, a, made > 0, finish(&b));
+}
+
 // Whether el's parents lead to the window
 static b32 macreaches(void *el, void *win)
 {
@@ -2432,6 +3322,18 @@ static void macdrive(Gui *g, Str cmd)
     } else if (verb=="tget" || verb=="tset" || verb=="tparam" || verb=="tround" ||
                verb=="tsettable") {
         mactextdrive(g, &a, macfocusof(win, view), verb, c.tail, what);
+    } else if (verb == "ti") {
+        for (Str rest = c.tail; rest.len;) {
+            iz i = 0;
+            while (i+3<=rest.len && !(rest[i]==' ' && rest[i+1]==';' && rest[i+2]==' ')) {
+                i++;
+            }
+            b32 last = i+3 > rest.len;
+            mactidrive(g, &a, win, view, last ? rest : takehead(rest, i), what);
+            rest = last ? Str{} : cuthead(rest, i+3);
+        }
+    } else if (verb == "replay") {
+        macreplay(g, &a, win, view, c.tail, what);
     } else {
         // VERB [ARGS] AXROLE NAME
         Cut   av    = cut(c.tail, ' ');  // attr's ATTR, then VALUE

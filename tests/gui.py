@@ -1927,6 +1927,11 @@ def main():
     host.mkdir(work)
     host.mkdir(state)
     host.write(host.path("work", "hello.txt"), "hello world\n")
+    if args.mode == "a11y":
+        # A Dictation trace for "ns replay": its stand-in, made by hand
+        trace = os.path.join(os.path.dirname(os.path.abspath(__file__)), "a11y_dictation.trace")
+        with open(trace, encoding="utf-8") as f:
+            host.write(host.path("work", "dictation.trace"), f.read())
     if args.mode == "enginestop":
         args.subprocess = True  # the GUI's --enginestop implies it
     curl = host.url if args.host else url
