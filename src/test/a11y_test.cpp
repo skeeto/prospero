@@ -516,6 +516,102 @@ static void test_a11ytext(Test *t)
     expect(t, "a11ytext.hitcrlf", istr(&a, axoffsetat(x, 900, 55)), "2");
 }
 
+static Str axdocrangestr(Arena *a, A11y *x, i64 loc, i64 len)
+{
+    AxSpan s = {};
+    return axdocrange(x, AXU_UTF16, loc, len, &s) ? axspanstr(a, s) : Str("refused");
+}
+
+// The document as the OS's text APIs ask for it: UTF-16 ranges checked
+// and turned to bytes, characters, runs, bounds and hits, the marked
+// text in place of the selection.
+static void test_a11ydoc(Test *t)
+{
+    Arena a = t->perm;
+    A11y *x = newtesta11y(&a);
+
+    // a😀 日本 tail: the emoji two units, each CJK character one
+    Str s = "a\xf0\x9f\x98\x80 \xe6\x97\xa5\xe6\x9c\xac tail";
+    axtestsync(x, &a, 0, 1, s, 17, 17);
+    expect(t, "a11ydoc.emoji",    axdocrangestr(&a, x, 1, 2), "1-5");
+    expect(t, "a11ydoc.cjk",      axdocrangestr(&a, x, 4, 2), "6-12");
+    expect(t, "a11ydoc.after",    axdocrangestr(&a, x, 7, 4), "13-17");
+    expect(t, "a11ydoc.end",      axdocrangestr(&a, x, 11, 0), "17-17");
+    expect(t, "a11ydoc.past",     axdocrangestr(&a, x, 10, 5), "refused");
+    expect(t, "a11ydoc.beyond",   axdocrangestr(&a, x, 12, 0), "refused");
+    expect(t, "a11ydoc.negative", axdocrangestr(&a, x, -1, 1), "refused");
+    expect(t, "a11ydoc.huge",     axdocrangestr(&a, x, 1, I64MAX), "refused");
+    expect(t, "a11ydoc.slice",    axdocslice(x, &a, {6, 12}), "\xe6\x97\xa5\xe6\x9c\xac");
+    expect(t, "a11ydoc.charmid",  axspanstr(&a, axdocchar(x, 3)), "1-5");
+    expect(t, "a11ydoc.charcjk",  axspanstr(&a, axdocchar(x, 6)), "6-9");
+    expect(t, "a11ydoc.charend",  axspanstr(&a, axdocchar(x, 17)), "17-17");
+    expect(t, "a11ydoc.style",    axspanstr(&a, axdocstyle(x, 3)), "0-17");
+    expect(t, "a11ydoc.visible",  axspanstr(&a, axvisible(x)), "0-17");
+    expect(t, "a11ydoc.caretline", istr(&a, axcaretline(x)), "0");
+
+    // Bounds: a character, a run on one line, and nothing at all
+    expect(t, "a11ydoc.boundsemoji", axrectstr(&a, axdocbounds(x, {1, 5})), "110,50 120,70");
+    expect(t, "a11ydoc.boundsall",   axrectstr(&a, axdocbounds(x, {0, 17})), "100,50 200,70");
+    expect(t, "a11ydoc.boundsempty", axrectstr(&a, axdocbounds(x, {6, 6})), "130,50 130,70");
+
+    // Hits: the character under the point, its right half too
+    expect(t, "a11ydoc.hitcjk",   istr(&a, axcharat(x, 135, 55)), "6");
+    expect(t, "a11ydoc.hitright", istr(&a, axcharat(x, 139, 55)), "6");
+    expect(t, "a11ydoc.hitspace", istr(&a, axcharat(x, 125, 55)), "5");
+    expect(t, "a11ydoc.hitleft",  istr(&a, axcharat(x, 0, 55)), "0");
+    expect(t, "a11ydoc.hitpast",  istr(&a, axcharat(x, 900, 55)), "17");
+
+    // Over two lines: each line's width, to the clip
+    AxGeom cg = axtestgeom(&a, "ab\ncd");
+    cg.caretline = -1;
+    axtextsync(x, 7, 77, 0, 1, "ab\ncd", 4, 4, &cg);
+    expect(t, "a11ydoc.caretline2", istr(&a, axcaretline(x)), "1");
+    expect(t, "a11ydoc.boundslines", axrectstr(&a, axdocbounds(x, {1, 4})), "100,50 1000,90");
+    expect(t, "a11ydoc.hitnewline", istr(&a, axcharat(x, 900, 55)), "2");
+    AxGeom vg = axtestgeom(&a, "ab\ncd\nef");
+    vg.vis0 = 1;
+    vg.vis1 = 2;
+    axtextsync(x, 7, 77, 0, 1, "ab\ncd\nef", 0, 0, &vg);
+    expect(t, "a11ydoc.visiblepart", axspanstr(&a, axvisible(x)), "3-6");
+
+    // Marked text in place of the selection
+    axtestsync(x, &a, 0, 1, "hello world", 6, 11);
+    axmark(x, "wor", 3, 3);
+    expect(t, "a11ydoc.todocbefore", istr(&a, axtodoc(x, 3)), "3");
+    expect(t, "a11ydoc.todocin",     istr(&a, axtodoc(x, 8)), "6");
+    expect(t, "a11ydoc.todocafter",  istr(&a, axtodoc(x, 11)), "9");
+    expect(t, "a11ydoc.markslice",   axdocslice(x, &a, {4, 8}), "o wo");
+    expect(t, "a11ydoc.markstyle",   axspanstr(&a, axdocstyle(x, 7)), "6-9");
+    expect(t, "a11ydoc.markbefore",  axspanstr(&a, axdocstyle(x, 2)), "0-6");
+    expect(t, "a11ydoc.markchar",    axspanstr(&a, axdocchar(x, 7)), "7-8");
+    axtestsync(x, &a, 0, 1, "hello world!", 6, 11);
+    axmark(x, "\xf0\x9f\x98\x80x", 2, 2);
+    expect(t, "a11ydoc.markafter",   axspanstr(&a, axdocstyle(x, 11)), "11-12");
+    expect(t, "a11ydoc.markemoji",   axdocrangestr(&a, x, 6, 2), "6-10");
+    expect(t, "a11ydoc.markemojistr", axdocslice(x, &a, {6, 10}), "\xf0\x9f\x98\x80");
+    expect(t, "a11ydoc.markemojichar", axspanstr(&a, axdocchar(x, 8)), "6-10");
+    expect(t, "a11ydoc.marktail",    axdocslice(x, &a, {10, 12}), "x!");
+    expect(t, "a11ydoc.markpast",    axdocrangestr(&a, x, 9, 2), "refused");
+
+    // Hits on marked text: its characters where they were drawn, over
+    // the text's, which shows around them
+    AxGeom mg = axtestgeom(&a, "ab\ncd");
+    f32    mx[] = {110, 110, 110, 125, 130};
+    f32    my[] = {50, 50, 50, 50, 50};
+    mg.mxs = mx;
+    mg.mys = my;
+    mg.nm  = 5;
+    axtextsync(x, 7, 77, 0, 1, "ab\ncd", 1, 1, &mg);
+    axmark(x, "\xe3\x81\x8bx", 4, 4);  // U+304B
+    expect(t, "a11ydoc.hitmarkka",  istr(&a, axdocat(x, 115, 55)), "1");
+    expect(t, "a11ydoc.hitmarkx",   istr(&a, axdocat(x, 127, 55)), "4");
+    expect(t, "a11ydoc.hitmarkpre", istr(&a, axdocat(x, 105, 55)), "0");
+    expect(t, "a11ydoc.hitmarkend", istr(&a, axdocat(x, 900, 55)), "6");
+    expect(t, "a11ydoc.hitmarkln",  istr(&a, axdocat(x, 105, 75)), "7");
+    axtestsync(x, &a, 0, 1, "ab\ncd", 1, 1);  // not drawn: the text's
+    expect(t, "a11ydoc.hitundrawn", istr(&a, axdocat(x, 115, 55)), "1");
+}
+
 // The adapters' log: lines kept oldest first until the ring wraps, a line
 // too long cut on a character with an ellipsis, and a long string
 // argument cut with how much was left out.

@@ -2,7 +2,8 @@
 //
 // The tree (a11y.cpp) to NSAccessibility, which Voice Control and
 // VoiceOver ask: an element for each node, under the window, as the
-// section "The tree" below has it.
+// section "The tree" below has it, and a text field's as an NSTextView's,
+// which a tool reads and edits by ranges ("A text field's own").
 //
 // And a trace: SDL's text input view (SDL3TranslatorResponder, its
 // NSTextInputClient) is what Dictation and the input methods talk to,
@@ -680,6 +681,7 @@ extern "C" bool  class_addIvar(void *, char const *, uz, u8, char const *);
 extern "C" void *class_getInstanceVariable(void *, char const *);
 extern "C" iz    ivar_getOffset(void *);
 extern "C" void  NSAccessibilityPostNotification(void *, void *);
+extern "C" void  NSAccessibilityPostNotificationWithUserInfo(void *, void *, void *);
 extern "C" void *NSAccessibilityUnignoredAncestor(void *);
 extern "C" void *method_getImplementation(void *);
 #if !__arm64__
@@ -708,11 +710,12 @@ enum : i32 {
     MG_FRAME,
     MG_HIT,
     MG_FOCUS,  // the focused element
+    MG_TEXT,   // a text field's selection, length, lines
     MG_N
 };
 
 static char const *const macgetnames[MG_N] = {
-    "role", "name", "value", "state", "tree", "frame", "hit", "focus",
+    "role", "name", "value", "state", "tree", "frame", "hit", "focus", "text",
 };
 
 // What AppKit is told, counted for the checklist
@@ -758,13 +761,15 @@ static struct {
     i64     trev;        // its text,
     i32     tanchor;     // its selection,
     i32     tcaret;
-    u64     tmarked;     // and its marked text, hashed
+    u64     tmarked;     // and its marked text, hashed,
+    i32     tmlo, tmhi;  // with the input method's selection in it
     u32     pass;        // publishes told, the one telling while inpass
     b32     inpass;
     b32     startwason;  // for "ns start": the tree was on already,
     i32     startposts;  // and layout told for a start since "ns mark"
     i32     gets[MG_N];
     i32     posted[MN_N];
+    i32     seltype;     // the last AXSelectedTextChanged's change type, or -1
 } macax;
 
 enum : u32 {
@@ -1375,6 +1380,472 @@ static void macelsetfocused(void *self, void *, ObjcBool on)
     macnoteact(on ? "AXFocused=YES" : "AXFocused=NO", n, ok);
 }
 
+
+// A text field's own, as an NSTextView's. Its document is the text with
+// an input method's marked text in it (axdoc), counted in UTF-16 units:
+// the focused field's from the text model, which a tool's edits are in at
+// once (the shadow), so a read right after a set agrees; another field's,
+// its value, with no selection, lines or geometry of its own. A range a
+// tool gives is checked (axdocrange), as one out of the text would raise
+// in AppKit's own, and an exception can't unwind through C++: refused, it
+// reads as nothing. Sets are queued edits for the focused field alone
+// (axtextedit, axtextselect), each one undo, taken at the next frame.
+// Parameterized attributes and sets are logged with their arguments.
+
+struct MacDoc {
+    A11y *x;  // the text model, if the field is the focused one
+    Str   s;  // else its value
+};
+
+// Whether node n is a text field a tool may read: not a password's
+static b32 mactextrole(AxNode *n)
+{
+    return n && (n->role==AX_TEXTFIELD || n->role==AX_TEXTAREA) &&
+           !(n->state & AXS_PASSWORD);
+}
+
+// ... and may set, which takes the focus to do
+static b32 maceditable(AxNode *n)
+{
+    return mactextrole(n) && !(n->state & (AXS_READONLY|AXS_DISABLED));
+}
+
+static char const *const mactextsels[] = {
+    "accessibilityNumberOfCharacters", "accessibilitySelectedText",
+    "accessibilitySelectedTextRange", "accessibilitySelectedTextRanges",
+    "accessibilityVisibleCharacterRange", "accessibilityInsertionPointLineNumber",
+    "accessibilityLineForIndex:", "accessibilityRangeForLine:",
+    "accessibilityStringForRange:", "accessibilityAttributedStringForRange:",
+    "accessibilityRangeForPosition:", "accessibilityRangeForIndex:",
+    "accessibilityFrameForRange:", "accessibilityStyleRangeForIndex:",
+};
+
+static char const *const macsetsels[] = {
+    "setAccessibilityValue:", "setAccessibilitySelectedText:",
+    "setAccessibilitySelectedTextRange:", "setAccessibilitySelectedTextRanges:",
+};
+
+static b32 macin(char const *s, char const *const *set, i32 n)
+{
+    for (i32 i = 0; i < n; i++) {
+        if (!__builtin_strcmp(s, set[i])) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static b32 mactextsel(char const *s)
+{
+    return macin(s, mactextsels, countof(mactextsels));
+}
+
+static b32 macsetsel(char const *s)
+{
+    return macin(s, macsetsels, countof(macsetsels));
+}
+
+// self's node and document, or null if it is no text field to read
+static AxNode *macdocof(void *self, MacDoc *d)
+{
+    AxNode *n = macnodeof(self);
+    *d = {};
+    if (!mactextrole(n)) {
+        return 0;
+    } else if (mactextof(n)) {
+        d->x = axmac->ax;
+    } else {
+        d->s = n->value;
+    }
+    return n;
+}
+
+static i32 macdoclen(MacDoc *d)
+{
+    return d->x ? axdoclen(d->x, AXU_UTF16) : axcount(d->s, AXU_UTF16, (i32)d->s.len);
+}
+
+// The document's bytes as a tool's units
+static NsRange macunits(MacDoc *d, AxSpan s)
+{
+    i32 lo = d->x ? axdocunit(d->x, AXU_UTF16, s.lo) : axcount(d->s, AXU_UTF16, s.lo);
+    i32 hi = d->x ? axdocunit(d->x, AXU_UTF16, s.hi) : axcount(d->s, AXU_UTF16, s.hi);
+    return {(uz)lo, (uz)(hi>lo ? hi-lo : 0)};
+}
+
+// A tool's units as the document's bytes: 0 if not all in it
+static b32 macbytes(MacDoc *d, NsRange r, AxSpan *out)
+{
+    i64 loc = (i64)r.loc;  // past I64MAX, negative: refused
+    i64 len = (i64)r.len;
+    if (d->x) {
+        return axdocrange(d->x, AXU_UTF16, loc, len, out);
+    }
+    i64 n = macdoclen(d);
+    if (loc<0 || len<0 || loc>n || len>n-loc) {
+        return 0;
+    }
+    out->lo = axadvance(d->s, AXU_UTF16, (i32)loc);
+    out->hi = axadvance(d->s, AXU_UTF16, (i32)(loc + len));
+    return 1;
+}
+
+// The document's byte at unit i, which is put in it first
+static i32 macbyteat(MacDoc *d, iz i)
+{
+    i32    n = macdoclen(d);
+    AxSpan b = {};
+    macbytes(d, {(uz)(i<0 ? 0 : i>n ? n : i), 0}, &b);
+    return b.lo;
+}
+
+// The character at unit i, as units: none past the end
+static NsRange macchar(MacDoc *d, iz i)
+{
+    i32    b = macbyteat(d, i);
+    AxSpan c = {b, b};
+    if (d->x) {
+        c = axdocchar(d->x, b);
+    } else if (b < d->s.len) {
+        iz e = b;
+        utf8decode(d->s, &e);
+        c.hi = (i32)e;
+    }
+    return macunits(d, c);
+}
+
+// The selection, as the document's bytes: within marked text, the input
+// method's own
+static AxSpan macsel(MacDoc *d)
+{
+    if (!d->x) {
+        return {};
+    }
+    AxText *t = &d->x->text;
+    AxSpan  s = axselection(t);
+    return t->marked.len ? AxSpan{s.lo + t->mlo, s.lo + t->mhi} : s;
+}
+
+// The document's bytes as an NSString, made in the adapter's scratch
+static void *macdocstr(MacDoc *d, AxSpan s)
+{
+    Arena a = axmac->logmem;
+    Str   r = {};
+    if (!d->x) {
+        r = span(d->s.data+s.lo, d->s.data+s.hi);
+    } else if (!d->x->text.marked.len || fits(&a, s.hi - s.lo + 64)) {
+        r = axdocslice(d->x, &a, s);
+    }
+    return macnsstr(r, a);
+}
+
+// The log's arguments and answers, of the kinds these take
+enum : i32 {
+    MACA_RANGE,
+    MACA_NUM,
+    MACA_STR,
+    MACA_RECT,
+    MACA_POINT,
+    MACA_OK,
+};
+
+struct MacArg {
+    i32     kind;
+    NsRange r;
+    i64     i;
+    void   *o;
+    NsRect  rc;
+};
+
+static MacArg macarange(NsRange r) { MacArg a = {}; a.kind = MACA_RANGE; a.r = r; return a; }
+static MacArg macanum(i64 i)       { MacArg a = {}; a.kind = MACA_NUM; a.i = i; return a; }
+static MacArg macastr(void *o)     { MacArg a = {}; a.kind = MACA_STR; a.o = o; return a; }
+static MacArg macarect(NsRect r)   { MacArg a = {}; a.kind = MACA_RECT; a.rc = r; return a; }
+static MacArg macaok(b32 ok)       { MacArg a = {}; a.kind = MACA_OK; a.i = ok; return a; }
+
+static MacArg macapoint(NsPoint p)
+{
+    MacArg a = {};
+    a.kind = MACA_POINT;
+    a.rc   = {p.x, p.y, 0, 0};
+    return a;
+}
+
+static void macputarg(Buf *b, MacArg v)
+{
+    switch (v.kind) {
+    case MACA_RANGE: macrange(b, v.r); break;
+    case MACA_NUM:   print(b, v.i); break;
+    case MACA_STR:   macstrarg(b, v.o); break;
+    case MACA_RECT:  macrect(b, v.rc); break;
+    case MACA_OK:    print(b, v.i ? Str("YES") : Str("NO")); break;
+    case MACA_POINT:
+        putbyte(b, '(');
+        print(b, axround((f32)v.rc.x));
+        putbyte(b, ',');
+        print(b, axround((f32)v.rc.y));
+        putbyte(b, ')');
+        break;
+    }
+}
+
+// Log "WHAT ARG -> GOT", after the text model the call is against
+static void maclogtext(char const *what, MacArg arg, MacArg got)
+{
+    if (AxGui *x = maclog()) {
+        Arena a = x->logmem;
+        Buf   b(&a, 256);
+        print(&b, Str{(u8 *)what, (iz)__builtin_strlen(what)});
+        putbyte(&b, ' ');
+        macputarg(&b, arg);
+        print(&b, " -> ");
+        macputarg(&b, got);
+        macnote(x, a, &b);
+    }
+}
+
+static iz macelnchars(void *self, void *)
+{
+    macax.gets[MG_TEXT]++;
+    MacDoc d;
+    return macdocof(self, &d) ? macdoclen(&d) : 0;
+}
+
+static NsRange macelselrange(void *self, void *)
+{
+    macax.gets[MG_TEXT]++;
+    MacDoc d;
+    return macdocof(self, &d) ? macunits(&d, macsel(&d)) : NsRange{};
+}
+
+static void *macelseltext(void *self, void *)
+{
+    macax.gets[MG_TEXT]++;
+    MacDoc d;
+    return macdocof(self, &d) ? macdocstr(&d, macsel(&d)) : 0;
+}
+
+static void *macelselranges(void *self, void *)
+{
+    macax.gets[MG_TEXT]++;
+    MacDoc d;
+    if (!macdocof(self, &d)) {
+        return 0;
+    }
+    void *v = objcsend<void *>(objc_getClass("NSValue"), "valueWithRange:",
+                               macunits(&d, macsel(&d)));
+    return objcsend<void *>(objc_getClass("NSArray"), "arrayWithObject:", v);
+}
+
+// The lines that show; all of another field
+static NsRange macelvisible(void *self, void *)
+{
+    macax.gets[MG_TEXT]++;
+    MacDoc d;
+    if (!macdocof(self, &d)) {
+        return {};
+    } else if (!d.x) {
+        return {0, (uz)macdoclen(&d)};
+    }
+    AxSpan v = axvisible(d.x);
+    return macunits(&d, {axtodoc(d.x, v.lo), axtodoc(d.x, v.hi)});
+}
+
+static iz macelcaretline(void *self, void *)
+{
+    macax.gets[MG_TEXT]++;
+    MacDoc d;
+    return macdocof(self, &d) && d.x ? axcaretline(d.x) : 0;
+}
+
+// Lines are as drawn, wrapped, as an NSTextView's; another field's text
+// is all on one
+static iz macellineof(void *self, void *, iz i)
+{
+    MacDoc d;
+    iz     k = 0;
+    if (macdocof(self, &d) && d.x) {
+        k = axlineat(d.x, axdoctext(d.x, macbyteat(&d, i)));
+    }
+    maclogtext("AXLineForIndex", macanum(i), macanum(k));
+    return k;
+}
+
+static NsRange macelrangeofline(void *self, void *, iz k)
+{
+    MacDoc  d;
+    NsRange r = {};
+    if (!macdocof(self, &d)) {
+        // no text
+    } else if (!d.x) {
+        r = k ? r : NsRange{0, (uz)macdoclen(&d)};
+    } else if (k>=0 && k<axlinecount(d.x)) {
+        AxSpan s = axlinespan(d.x, (i32)k);
+        r = macunits(&d, {axtodoc(d.x, s.lo), axtodoc(d.x, s.hi)});
+    }
+    maclogtext("AXRangeForLine", macanum(k), macarange(r));
+    return r;
+}
+
+// The range's text, or none for a range not in it
+static void *macrangestr(void *self, NsRange r)
+{
+    MacDoc d;
+    AxSpan s = {};
+    if (!macdocof(self, &d)) {
+        return 0;
+    }
+    return macbytes(&d, r, &s) ? macdocstr(&d, s) : nsstring("");
+}
+
+static void *macelstring(void *self, void *, NsRange r)
+{
+    void *s = macrangestr(self, r);
+    maclogtext("AXStringForRange", macarange(r), macastr(s));
+    return s;
+}
+
+// Plain: ImGui draws it all in the one font and color
+static void *macelattrstring(void *self, void *, NsRange r)
+{
+    void *s = macrangestr(self, r);
+    void *o = 0;
+    if (s) {
+        o = objcsend<void *>(objc_getClass("NSAttributedString"), "alloc");
+        o = o ? objcsend<void *>(o, "initWithString:", s) : 0;
+        o = o ? objcsend<void *>(o, "autorelease") : 0;
+    }
+    maclogtext("AXAttributedStringForRange", macarange(r), macastr(o));
+    return o;
+}
+
+// The character under a point of the screen
+static NsRange macelrangeat(void *self, void *, NsPoint p)
+{
+    MacDoc  d;
+    NsRange r = {};
+    f32     x = 0, y = 0;
+    if (macdocof(self, &d) && d.x && macfromscreen(p, &x, &y)) {
+        r = macunits(&d, axdocchar(d.x, axdocat(d.x, x, y)));
+    }
+    maclogtext("AXRangeForPosition", macapoint(p), macarange(r));
+    return r;
+}
+
+// A code point's: two units for one past U+FFFF
+static NsRange macelrangeofindex(void *self, void *, iz i)
+{
+    MacDoc  d;
+    NsRange r = macdocof(self, &d) ? macchar(&d, i) : NsRange{};
+    maclogtext("AXRangeForIndex", macanum(i), macarange(r));
+    return r;
+}
+
+// The marked text, underlined, is a run of its own
+static NsRange macelstyle(void *self, void *, iz i)
+{
+    MacDoc  d;
+    NsRange r = {};
+    if (macdocof(self, &d)) {
+        r = d.x ? macunits(&d, axdocstyle(d.x, macbyteat(&d, i)))
+                : NsRange{0, (uz)macdoclen(&d)};
+    }
+    maclogtext("AXStyleRangeForIndex", macanum(i), macarange(r));
+    return r;
+}
+
+// AXBoundsForRange: where the text was drawn, on the screen; another
+// field's, the field
+static NsRect macelframeof(void *self, void *, NsRange r)
+{
+    MacDoc  d;
+    AxSpan  s = {};
+    NsRect  f = {};
+    AxNode *n = macdocof(self, &d);
+    if (n && macbytes(&d, r, &s)) {
+        f = macscreen(d.x ? axdocbounds(d.x, s) : n->rect);
+    }
+    maclogtext("AXBoundsForRange", macarange(r), macarect(f));
+    return f;
+}
+
+// A tool's text, an NSString or an attributed one, as UTF-8; ok 0 if
+// it is neither, or has no UTF-8 (a lone surrogate)
+static Str mactextarg(void *o, b32 *ok)
+{
+    void *s = maciskind(o, "NSAttributedString") ? objcsend<void *>(o, "string") : o;
+    *ok = maciskind(s, "NSString");
+    Str r = *ok ? macutf8(s) : Str{};
+    *ok = *ok && (r.data || !objcsend<uz>(s, "length"));
+    return r;
+}
+
+// The model, if self is the focused field and a tool may set its text
+static A11y *macsettable(void *self)
+{
+    AxNode *n = macnodeof(self);
+    return maceditable(n) && mactextof(n) ? axmac->ax : 0;
+}
+
+static void macelsetvalue(void *self, void *, void *v)
+{
+    A11y *x  = macsettable(self);
+    b32   ok = 0;
+    Str   s  = x ? mactextarg(v, &ok) : Str{};
+    ok = ok && axtextedit(axmac->g, 0, axtextlen(x), s, AX_AFTER, AX_AFTER);
+    if (ok) {
+        macwake();
+    }
+    maclogtext("AXValue=", macastr(v), macaok(ok));
+}
+
+static void macelsetseltext(void *self, void *, void *v)
+{
+    A11y *x  = macsettable(self);
+    b32   ok = 0;
+    Str   s  = x ? mactextarg(v, &ok) : Str{};
+    if (ok) {
+        AxSpan sel = axselection(&x->text);
+        ok = axtextedit(axmac->g, sel.lo, sel.hi, s, AX_AFTER, AX_AFTER);
+    }
+    if (ok) {
+        macwake();
+    }
+    maclogtext("AXSelectedText=", macastr(v), macaok(ok));
+}
+
+static b32 macselect(void *self, NsRange r)
+{
+    MacDoc d;
+    AxSpan s = {};
+    return macsettable(self) && macdocof(self, &d) && macbytes(&d, r, &s) &&
+           axtextselect(axmac->g, axdoctext(d.x, s.lo), axdoctext(d.x, s.hi));
+}
+
+static void macelsetselrange(void *self, void *, NsRange r)
+{
+    b32 ok = macselect(self, r);
+    if (ok) {
+        macwake();
+    }
+    maclogtext("AXSelectedTextRange=", macarange(r), macaok(ok));
+}
+
+// The first range: ImGui selects only one
+static void macelsetselranges(void *self, void *, void *arr)
+{
+    void       *v    = maciskind(arr, "NSArray") && objcsend<uz>(arr, "count")
+                       ? objcsend<void *>(arr, "objectAtIndex:", (uz)0) : 0;
+    char const *type = maciskind(v, "NSValue") ? objcsend<char const *>(v, "objCType") : 0;
+    b32         is   = type && !__builtin_strncmp(type, "{_NSRange=", 10);
+    NsRange     r    = is ? objcsend<NsRange>(v, "rangeValue") : NsRange{NSNOTFOUND, 0};
+    b32         ok   = is && macselect(self, r);
+    if (ok) {
+        macwake();
+    }
+    maclogtext("AXSelectedTextRanges=", macarange(r), macaok(ok));
+}
+
 static void *macallowedup;  // NSAccessibilityElement's, if it has one
 
 // What each node offers: AppKit lists attributes and actions by this
@@ -1384,9 +1855,13 @@ static ObjcBool macelallowed(void *self, void *sel, void *what)
     AxNode *n = macnodeof(self);
     char const *s = what ? sel_getName(what) : "";
     if (!n) {
-        // A node gone: nothing to act on
+        // A node gone: nothing to act on or set
         return __builtin_strncmp(s, "accessibilityPerform", 20) &&
-               __builtin_strcmp(s, "setAccessibilityFocused:");
+               __builtin_strncmp(s, "setAccessibility", 16);
+    } else if (macsetsel(s)) {
+        return maceditable(n);
+    } else if (mactextsel(s)) {
+        return mactextrole(n);
     } else if (!__builtin_strcmp(s, "accessibilityPerformPress")) {
         return macpressable(n);
     } else if (!__builtin_strcmp(s, "accessibilityPerformShowMenu")) {
@@ -1477,6 +1952,26 @@ static void macpost(void *el, i32 note)
         NSAccessibilityPostNotification(el, nsstring(macnotes[note]));
         macax.posted[note]++;
     }
+}
+
+// The text's selection changed, with how when it only moved: a tool may
+// read the text again after an edit, and only the selection after a move
+static void macposttext(void *el, b32 edited)
+{
+    if (!el) {
+        return;
+    } else if (edited) {
+        macpost(el, MN_SELTEXT);
+        macax.seltype = 0;
+        return;
+    }
+    enum { SELECTIONMOVE = 2 };  // AXTextStateChangeType's
+    void *v    = objcsend<void *>(objc_getClass("NSNumber"), "numberWithInt:", (int)SELECTIONMOVE);
+    void *info = objcsend<void *>(objc_getClass("NSDictionary"), "dictionaryWithObject:forKey:",
+                                  v, nsstring("AXTextStateChangeType"));
+    NSAccessibilityPostNotificationWithUserInfo(el, nsstring(macnotes[MN_SELTEXT]), info);
+    macax.posted[MN_SELTEXT]++;
+    macax.seltype = SELECTIONMOVE;
 }
 
 static void macgets(AxGui *l)
@@ -1574,18 +2069,24 @@ static void macpublished(AxGui *x)
     // The field's selection, or its marked text, moved
     AxText *tx = &x->ax->text;
     if (tx->live) {
-        u64 mh = hash(tx->marked);
-        b32 moved = tx->key==macax.tkey && (tx->rev!=macax.trev ||
-                    tx->anchor!=macax.tanchor || tx->caret!=macax.tcaret || mh!=macax.tmarked);
+        // The document holds the marked text, so its change is an edit,
+        // though the text's revision stays
+        u64 mh     = hash(tx->marked);
+        b32 edited = tx->rev!=macax.trev || mh!=macax.tmarked;
+        b32 moved  = tx->key==macax.tkey && (edited ||
+                     tx->anchor!=macax.tanchor || tx->caret!=macax.tcaret ||
+                     tx->mlo!=macax.tmlo || tx->mhi!=macax.tmhi);
         if (moved) {
             i32 i = axfind(t, tx->key);
-            macpost(i>0 ? macelif(i) : 0, MN_SELTEXT);
+            macposttext(i>0 ? macelif(i) : 0, edited);
         }
         macax.tkey    = tx->key;
         macax.trev    = tx->rev;
         macax.tanchor = tx->anchor;
         macax.tcaret  = tx->caret;
         macax.tmarked = mh;
+        macax.tmlo    = tx->mlo;
+        macax.tmhi    = tx->mhi;
     } else {
         macax.tkey = 0;
     }
@@ -1627,6 +2128,22 @@ static void macpublished(AxGui *x)
 //   hit AXROLE NAME    the window's hit test at its frame's middle
 //   mark               forget what was posted, and told for a start
 //   posted NOTE        AppKit was told NOTE since the mark
+//   seltype N          the last AXSelectedTextChanged since the mark had
+//                      AXTextStateChangeType N, 0 for none
+// and of the focused element's text, as Voice Control asks it (a range
+// is LOC,LEN in UTF-16 units):
+//   tget ATTR WANT     an attribute: AXValue, AXNumberOfCharacters,
+//                      AXSelectedText, AXSelectedTextRange(s),
+//                      AXVisibleCharacterRange, AXInsertionPointLineNumber
+//   tset ATTR VALUE    set AXValue, AXSelectedText, AXSelectedTextRange(s)
+//   tparam ATTR ARG WANT  a parameterized attribute: AXLineForIndex,
+//                      AXRangeForLine, AXStringForRange,
+//                      AXAttributedStringForRange, AXRangeForIndex,
+//                      AXStyleRangeForIndex
+//   tround N           the bounds of character N lie in the element's
+//                      frame, and its middle's character is N
+//   tsettable ATTRS    each attribute is settable, a comma between, and
+//                      not those with a '!'
 
 static Str macstrof(void *o, char const *sel)
 {
@@ -1660,6 +2177,186 @@ static void *macfindel(Arena a, void *win, Str role, Str name)
         }
     }
     return found;
+}
+
+// The focused element, as AppKit answers a tool: the window's while it is
+// key, which the checklist's mostly isn't; then, as AppKit would ask once
+// it is, its first responder's, a view of ours (the text input's, or the
+// window's own, with none)
+static void *macfocusof(void *win, void *view)
+{
+    b32   key = objcsend<ObjcBool>(win, "isKeyWindow");
+    void *fr  = objcsend<void *>(win, "firstResponder");
+    void *at  = key ? win : maciskind(fr, "NSView") ? fr : view;
+    return objcsend<void *>(at, "accessibilityFocusedUIElement");
+}
+
+static NsRange macparserange(Str s)
+{
+    Cut c = cut(s, ',');
+    return {(uz)parseint(c.head).val, (uz)parseint(c.tail).val};
+}
+
+static void macputrange(Buf *b, NsRange r)
+{
+    print(b, (i64)r.loc);
+    putbyte(b, ',');
+    print(b, (i64)r.len);
+}
+
+static void macputstr(Buf *b, void *o)
+{
+    if (maciskind(o, "NSAttributedString")) {
+        o = objcsend<void *>(o, "string");
+    }
+    print(b, maciskind(o, "NSString") ? macutf8(o) : Str("(nil)"));
+}
+
+// The setter for attribute name, or null
+static char const *macsetter(Str attr)
+{
+    static struct { Str attr; char const *sel; } const ss[] = {
+        {"AXValue",              "setAccessibilityValue:"},
+        {"AXSelectedText",       "setAccessibilitySelectedText:"},
+        {"AXSelectedTextRange",  "setAccessibilitySelectedTextRange:"},
+        {"AXSelectedTextRanges", "setAccessibilitySelectedTextRanges:"},
+        {"AXFocused",            "setAccessibilityFocused:"},
+    };
+    for (i32 i = 0; i < countof(ss); i++) {
+        if (ss[i].attr == attr) {
+            return ss[i].sel;
+        }
+    }
+    return 0;
+}
+
+// The text verbs (tget, tset, tparam, tround, tsettable) on el
+static void mactextdrive(Gui *g, Arena *a, void *el, Str verb, Str args, Str what)
+{
+    Cut av   = cut(args, ' ');
+    Str attr = av.head;
+    Str want = av.tail;
+    Buf b(a, 256);
+    b32 known = 1;
+    if (!el) {
+        axcheck(g, a, 0, concat(a, what, ": no focused element"));
+        return;
+    }
+
+    if (verb == "tget") {
+        if (attr=="AXValue" || attr=="AXSelectedText") {
+            macputstr(&b, objcsend<void *>(el, attr=="AXValue" ? "accessibilityValue"
+                                                               : "accessibilitySelectedText"));
+        } else if (attr == "AXNumberOfCharacters") {
+            print(&b, (i64)objcsend<iz>(el, "accessibilityNumberOfCharacters"));
+        } else if (attr == "AXInsertionPointLineNumber") {
+            print(&b, (i64)objcsend<iz>(el, "accessibilityInsertionPointLineNumber"));
+        } else if (attr == "AXSelectedTextRange") {
+            macputrange(&b, objcsend<NsRange>(el, "accessibilitySelectedTextRange"));
+        } else if (attr == "AXVisibleCharacterRange") {
+            macputrange(&b, objcsend<NsRange>(el, "accessibilityVisibleCharacterRange"));
+        } else if (attr == "AXSelectedTextRanges") {
+            void *arr = objcsend<void *>(el, "accessibilitySelectedTextRanges");
+            uz    n   = maciskind(arr, "NSArray") ? objcsend<uz>(arr, "count") : 0;
+            for (uz i = 0; i < n; i++) {
+                if (i) {
+                    putbyte(&b, ' ');
+                }
+                macputrange(&b, objcsend<NsRange>(objcsend<void *>(arr, "objectAtIndex:", i),
+                                                  "rangeValue"));
+            }
+        } else {
+            known = 0;
+        }
+
+    } else if (verb == "tset") {
+        if (attr=="AXValue" || attr=="AXSelectedText") {
+            objcsend<void>(el, attr=="AXValue" ? "setAccessibilityValue:"
+                                               : "setAccessibilitySelectedText:", macnsstr(want));
+        } else if (attr == "AXSelectedTextRange") {
+            objcsend<void>(el, "setAccessibilitySelectedTextRange:", macparserange(want));
+        } else if (attr == "AXSelectedTextRanges") {
+            void *v = objcsend<void *>(objc_getClass("NSValue"), "valueWithRange:",
+                                       macparserange(want));
+            objcsend<void>(el, "setAccessibilitySelectedTextRanges:",
+                           objcsend<void *>(objc_getClass("NSArray"), "arrayWithObject:", v));
+        } else {
+            axcheck(g, a, 0, concat(a, what, ": no such attribute"));
+            return;
+        }
+        guilog(g, concat(a, "drive: ", what));
+        return;
+
+    } else if (verb == "tparam") {
+        Cut pv  = cut(want, ' ');
+        Str arg = pv.head;
+        iz  i   = (iz)parseint(arg).val;
+        want = pv.tail;
+        if (attr == "AXLineForIndex") {
+            print(&b, (i64)objcsend<iz>(el, "accessibilityLineForIndex:", i));
+        } else if (attr == "AXRangeForLine") {
+            macputrange(&b, objcsend<NsRange>(el, "accessibilityRangeForLine:", i));
+        } else if (attr == "AXRangeForIndex") {
+            macputrange(&b, objcsend<NsRange>(el, "accessibilityRangeForIndex:", i));
+        } else if (attr == "AXStyleRangeForIndex") {
+            macputrange(&b, objcsend<NsRange>(el, "accessibilityStyleRangeForIndex:", i));
+        } else if (attr == "AXStringForRange") {
+            macputstr(&b, objcsend<void *>(el, "accessibilityStringForRange:", macparserange(arg)));
+        } else if (attr == "AXAttributedStringForRange") {
+            macputstr(&b, objcsend<void *>(el, "accessibilityAttributedStringForRange:",
+                                           macparserange(arg)));
+        } else {
+            known = 0;
+        }
+
+    } else if (verb == "tround") {
+        // Through the screen and back: character N's bounds, then the
+        // character at their middle
+        iz      i  = (iz)parseint(attr).val;
+        NsRect  f  = objcrect(el, "accessibilityFrame");
+        NsRange c  = objcsend<NsRange>(el, "accessibilityRangeForIndex:", i);
+        NsRect  r  = objcrect(el, "accessibilityFrameForRange:", c);
+        NsRange at = objcsend<NsRange>(el, "accessibilityRangeForPosition:",
+                                       NsPoint{r.x + r.w/2, r.y + r.h/2});
+        b32 in = r.w>0 && r.h>0 && r.x>=f.x-1 && r.y>=f.y-1 &&
+                 r.x+r.w<=f.x+f.w+1 && r.y+r.h<=f.y+f.h+1;
+        b32 ok = in && at.loc==c.loc && at.len==c.len;
+        print(&b, what);
+        if (!ok) {
+            print(&b, ": character ");
+            macputrange(&b, c);
+            print(&b, " at ");
+            macrect(&b, r);
+            print(&b, in ? Str(", in ") : Str(", not in "));
+            macrect(&b, f);
+            print(&b, ", found ");
+            macputrange(&b, at);
+        }
+        axcheck(g, a, ok, finish(&b));
+        return;
+
+    } else if (verb == "tsettable") {
+        // As AppKit lists them for a tool: the setter, if allowed
+        b32 ok = 1;
+        for (Cut w = cut(attr, ','); w.head.len; w = cut(w.tail, ',')) {
+            b32         no  = w.head[0] == '!';
+            char const *sel = macsetter(no ? cuthead(w.head, 1) : w.head);
+            b32         has = sel && objcsend<ObjcBool>(el, "respondsToSelector:",
+                                                        sel_registerName(sel)) &&
+                              objcsend<ObjcBool>(el, "isAccessibilitySelectorAllowed:",
+                                                 sel_registerName(sel));
+            ok &= sel && has!=no;
+        }
+        axcheck(g, a, ok, what);
+        return;
+    }
+
+    if (!known) {
+        axcheck(g, a, 0, concat(a, what, ": no such attribute"));
+        return;
+    }
+    Str got = finish(&b);
+    axcheck(g, a, got==want, got==want ? what : concat(a, what, concat(a, ", not ", got)));
 }
 
 // Whether el's parents lead to the window
@@ -1712,6 +2409,7 @@ static void macdrive(Gui *g, Str cmd)
             macax.posted[k] = 0;
         }
         macax.startposts = 0;
+        macax.seltype    = -1;
         guilog(g, concat(&a, "drive: ", what));
     } else if (verb == "posted") {
         i32 got = -1;
@@ -1724,6 +2422,16 @@ static void macdrive(Gui *g, Str cmd)
         print(&b, ": ");
         print(&b, (i64)got);
         axcheck(g, &a, got > 0, finish(&b));
+    } else if (verb == "seltype") {
+        i32 want = (i32)parseint(c.tail).val;
+        Buf b(&a, 128);
+        print(&b, what);
+        print(&b, ": ");
+        print(&b, (i64)macax.seltype);
+        axcheck(g, &a, macax.seltype==want, finish(&b));
+    } else if (verb=="tget" || verb=="tset" || verb=="tparam" || verb=="tround" ||
+               verb=="tsettable") {
+        mactextdrive(g, &a, macfocusof(win, view), verb, c.tail, what);
     } else {
         // VERB [ARGS] AXROLE NAME
         Cut   av    = cut(c.tail, ' ');  // attr's ATTR, then VALUE
@@ -1739,14 +2447,8 @@ static void macdrive(Gui *g, Str cmd)
             axcheck(g, &a, macreaches(el, win),
                     concat(&a, what, macreaches(el, win) ? Str("") : Str(": not under the window")));
         } else if (verb == "focus") {
-            // The window answers for its first responder only while it is
-            // key, which the checklist's mostly isn't: then, as AppKit
-            // would ask once it is, the first responder, a view of ours
-            // (the text input's, or the window's own, with none)
             b32   key = objcsend<ObjcBool>(win, "isKeyWindow");
-            void *fr  = objcsend<void *>(win, "firstResponder");
-            void *at  = key ? win : maciskind(fr, "NSView") ? fr : view;
-            void *f   = objcsend<void *>(at, "accessibilityFocusedUIElement");
+            void *f   = macfocusof(win, view);
             Str   by  = key ? Str(": the window's is ") : Str(": its first responder's is ");
             axcheck(g, &a, f==el, f==el ? what : concat(&a, what, concat(&a, by,
                     concat(&a, macstrof(f, "accessibilityRole"),
@@ -1853,6 +2555,25 @@ static void macaxtree(Gui *g)
         {"accessibilityPerformShowMenu", (void *)macelmenu,       "B@:"},
         {"setAccessibilityFocused:",     (void *)macelsetfocused, "v@:B"},
         {"isAccessibilitySelectorAllowed:", (void *)macelallowed, "B@::"},
+        {"accessibilityNumberOfCharacters", (void *)macelnchars, "q@:"},
+        {"accessibilitySelectedText",    (void *)macelseltext,    "@@:"},
+        {"accessibilitySelectedTextRange", (void *)macelselrange, "{_NSRange=QQ}@:"},
+        {"accessibilitySelectedTextRanges", (void *)macelselranges, "@@:"},
+        {"accessibilityVisibleCharacterRange", (void *)macelvisible, "{_NSRange=QQ}@:"},
+        {"accessibilityInsertionPointLineNumber", (void *)macelcaretline, "q@:"},
+        {"accessibilityLineForIndex:",   (void *)macellineof,     "q@:q"},
+        {"accessibilityRangeForLine:",   (void *)macelrangeofline, "{_NSRange=QQ}@:q"},
+        {"accessibilityStringForRange:", (void *)macelstring,     "@@:{_NSRange=QQ}"},
+        {"accessibilityAttributedStringForRange:", (void *)macelattrstring, "@@:{_NSRange=QQ}"},
+        {"accessibilityRangeForPosition:", (void *)macelrangeat,  "{_NSRange=QQ}@:{CGPoint=dd}"},
+        {"accessibilityRangeForIndex:",  (void *)macelrangeofindex, "{_NSRange=QQ}@:q"},
+        {"accessibilityFrameForRange:",  (void *)macelframeof,
+            "{CGRect={CGPoint=dd}{CGSize=dd}}@:{_NSRange=QQ}"},
+        {"accessibilityStyleRangeForIndex:", (void *)macelstyle,  "{_NSRange=QQ}@:q"},
+        {"setAccessibilityValue:",       (void *)macelsetvalue,   "v@:@"},
+        {"setAccessibilitySelectedText:", (void *)macelsetseltext, "v@:@"},
+        {"setAccessibilitySelectedTextRange:", (void *)macelsetselrange, "v@:{_NSRange=QQ}"},
+        {"setAccessibilitySelectedTextRanges:", (void *)macelsetselranges, "v@:@"},
     };
     for (i32 i = 0; i < countof(ms); i++) {
         void       *sel   = sel_registerName(ms[i].sel);

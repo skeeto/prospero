@@ -1126,17 +1126,26 @@ static AxRect axcharrect(A11y *x, i32 b)
     return r;
 }
 
-// Where the caret is: as wide as nothing, on the line ImGui drew it on,
-// which after a move rightward to a wrap is the line before, at its end.
+// The line the caret is on: the one ImGui drew it on, which after a move
+// rightward to a wrap is the line before, at its end.
+static i32 axcaretline(A11y *x)
+{
+    AxText *t = &x->text;
+    AxGeom *g = &t->geom;
+    i32     k = axlineat(x, t->caret);
+    if (g->rev==t->rev && g->caretline>=0 && g->caretline==k-1) {
+        k = g->caretline;
+    }
+    return k;
+}
+
+// Where the caret is: as wide as nothing, on its line (axcaretline).
 static AxRect axcaretrect(A11y *x)
 {
     AxText *t = &x->text;
     AxGeom *g = &t->geom;
     i32     b = t->caret;
-    i32     k = axlineat(x, b);
-    if (g->rev==t->rev && g->caretline>=0 && g->caretline==k-1) {
-        k = g->caretline;
-    }
+    i32     k = axcaretline(x);
     f32 cx = axxof(x, k, b);
     AxRect r = {};
     r.x0 = r.x1 = g->x + (cx<0 ? 0 : cx);
@@ -1179,9 +1188,8 @@ static AxRect axdocrect(A11y *x, i32 d)
     return r;
 }
 
-// The byte offset nearest a point: before the character it is left of
-// the middle of, and never past a line's newline.
-static i32 axoffsetat(A11y *x, f32 px, f32 py)
+// The line at y, nearest: its start, and its end before its newline.
+static i32 axlineaty(A11y *x, f32 py, AxSpan *line)
 {
     AxGeom *g = &x->text.geom;
     Str     s = x->text.text;
@@ -1189,10 +1197,22 @@ static i32 axoffsetat(A11y *x, f32 px, f32 py)
     if (g->lineh > 0) {
         k = (i32)__builtin_floorf((py - g->y) / g->lineh);
     }
-    k = axclamp(k, 0, axlinecount(x)-1);
-    AxSpan line = axlinespan(x, k);
-    i32    end  = line.hi>line.lo && s[line.hi-1]=='\n' ? line.hi-1 : line.hi;
-    end = end>line.lo && s[end-1]=='\r' ? end-1 : end;
+    k     = axclamp(k, 0, axlinecount(x)-1);
+    *line = axlinespan(x, k);
+    i32 end = line->hi>line->lo && s[line->hi-1]=='\n' ? line->hi-1 : line->hi;
+    line->hi = end>line->lo && s[end-1]=='\r' ? end-1 : end;
+    return k;
+}
+
+// The byte offset nearest a point: before the character it is left of
+// the middle of, and never past a line's newline.
+static i32 axoffsetat(A11y *x, f32 px, f32 py)
+{
+    AxGeom *g = &x->text.geom;
+    Str     s = x->text.text;
+    AxSpan  line;
+    i32     k   = axlineaty(x, py, &line);
+    i32     end = line.hi;
     if (axxof(x, k, line.lo) < 0) {
         return line.lo;
     }
@@ -1205,6 +1225,183 @@ static i32 axoffsetat(A11y *x, f32 px, f32 py)
         }
     }
     return end;
+}
+
+
+// The character a point is on: on its line, the first whose right edge
+// is past it; left of them all, the first; past them, the line's end.
+static i32 axcharat(A11y *x, f32 px, f32 py)
+{
+    AxGeom *g = &x->text.geom;
+    Str     s = x->text.text;
+    AxSpan  line;
+    i32     k = axlineaty(x, py, &line);
+    if (axxof(x, k, line.lo) < 0) {
+        return line.lo;
+    }
+    for (iz i = line.lo; i < line.hi;) {
+        iz beg = i;
+        utf8decode(s, &i);
+        if (px - g->x < axxof(x, k, (i32)i)) {
+            return (i32)beg;
+        }
+    }
+    return line.hi;
+}
+
+
+// The document's ranges, as the OS's text APIs ask for them: offsets in
+// units of the document (axdoc), from another process, so checked.
+
+// A byte of the text as one of the document: within the selection the
+// marked text stands in for, where the marked text starts.
+static i32 axtodoc(A11y *x, i32 b)
+{
+    AxText *t  = &x->text;
+    i32     ml = (i32)t->marked.len;
+    b = axclamp(b, 0, axtextlen(x));
+    if (!ml) {
+        return b;
+    }
+    AxSpan s = axselection(t);
+    return b<=s.lo ? b : b<s.hi ? s.lo : b - (s.hi - s.lo) + ml;
+}
+
+// The character of the document a point is on: the marked text's where
+// it was drawn, over the text, else the text's under it (axcharat).
+static i32 axdocat(A11y *x, f32 px, f32 py)
+{
+    AxText *t  = &x->text;
+    AxGeom *g  = &t->geom;
+    i32     ml = (i32)t->marked.len;
+    if (ml && g->nm==ml+1) {
+        i32 lo = axselection(t).lo;
+        for (iz i = 0; i < ml;) {
+            iz beg = i;
+            utf8decode(t->marked, &i);
+            f32 y0 = g->mys[beg];
+            f32 x1 = g->mys[i]==y0 ? g->mxs[i] : g->mxs[beg];  // as axdocrect
+            if (py>=y0 && py<y0+g->lineh && px>=g->mxs[beg] && px<x1) {
+                return lo + (i32)beg;
+            }
+        }
+    }
+    return axtodoc(x, axcharat(x, px, py));
+}
+
+// Units [loc, loc+len) of the document, as its bytes: 0 if not all in it.
+static b32 axdocrange(A11y *x, AxUnit u, i64 loc, i64 len, AxSpan *out)
+{
+    i64 n = axdoclen(x, u);
+    if (loc<0 || len<0 || loc>n || len>n-loc) {
+        return 0;
+    }
+    out->lo = axdocbyte(x, u, (i32)loc);
+    out->hi = axdocbyte(x, u, (i32)(loc + len));
+    return 1;
+}
+
+// The character document byte d is within, as its bytes; none at the end.
+static AxSpan axdocchar(A11y *x, i32 d)
+{
+    AxText *t   = &x->text;
+    AxSpan  s   = axselection(t);
+    i32     ml  = (i32)t->marked.len;
+    Str     in  = t->text;  // the part d is in,
+    i32     off = 0;        // and where it starts in the document
+    d = axclamp(d, 0, axdoclen(x, AXU_BYTE));
+    if (ml && d>=s.lo && d<s.lo+ml) {
+        in  = t->marked;
+        off = s.lo;
+    } else if (ml && d>=s.lo+ml) {
+        off = s.lo + ml - s.hi;
+    }
+    iz i = d - off;
+    while (i>0 && i<in.len && (in[i]&0xc0)==0x80) {
+        i--;
+    }
+    iz e = i;
+    if (e < in.len) {
+        utf8decode(in, &e);
+    }
+    return {(i32)i + off, (i32)e + off};
+}
+
+// Bytes [lo, hi) of the document: of the text itself unless they cross
+// marked text, then made in a.
+static Str axdocslice(A11y *x, Arena *a, AxSpan d)
+{
+    AxText *t = &x->text;
+    i32     n = axdoclen(x, AXU_BYTE);
+    d.lo = axclamp(d.lo, 0, n);
+    d.hi = axclamp(d.hi, d.lo, n);
+    if (!t->marked.len) {
+        return span(t->text.data+d.lo, t->text.data+d.hi);
+    }
+    AxSpan s  = axselection(t);
+    i32    ml = (i32)t->marked.len;
+    struct { Str s; i32 at; } parts[] = {
+        {takehead(t->text, s.lo), 0},
+        {t->marked,               s.lo},
+        {cuthead(t->text, s.hi),  s.lo + ml},
+    };
+    Buf b(a, d.hi - d.lo);
+    for (i32 k = 0; k < countof(parts); k++) {
+        i32 lo = axclamp(d.lo - parts[k].at, 0, (i32)parts[k].s.len);
+        i32 hi = axclamp(d.hi - parts[k].at, lo, (i32)parts[k].s.len);
+        print(&b, span(parts[k].s.data+lo, parts[k].s.data+hi));
+    }
+    return finish(&b);
+}
+
+// The run of one style document byte d is in: the marked text, drawn
+// underlined, or the text before or after it.
+static AxSpan axdocstyle(A11y *x, i32 d)
+{
+    AxText *t  = &x->text;
+    i32     n  = axdoclen(x, AXU_BYTE);
+    i32     ml = (i32)t->marked.len;
+    AxSpan  s  = axselection(t);
+    d = axclamp(d, 0, n);
+    if (!ml) {
+        return {0, n};
+    }
+    return d<s.lo ? AxSpan{0, s.lo} : d<s.lo+ml ? AxSpan{s.lo, s.lo+ml} : AxSpan{s.lo+ml, n};
+}
+
+// The text's lines that show, as its bytes: all of it, when unknown.
+static AxSpan axvisible(A11y *x)
+{
+    AxText *t = &x->text;
+    AxGeom *g = &t->geom;
+    if (g->rev!=t->rev || g->vis1<=g->vis0) {
+        return {0, axtextlen(x)};
+    }
+    return {axlinespan(x, g->vis0).lo, axlinespan(x, g->vis1-1).hi};
+}
+
+// Where document bytes [lo, hi) are: empty, the caret's place at lo; on
+// one line, from its first character to its last; over more, every
+// line's width between, as far as the field's clip.
+static AxRect axdocbounds(A11y *x, AxSpan d)
+{
+    AxGeom *g = &x->text.geom;
+    AxRect  r = axdocrect(x, d.lo);
+    if (d.hi <= d.lo) {
+        r.x1 = r.x0;
+        return r;
+    }
+    AxRect e = axdocrect(x, axdocchar(x, d.hi-1).lo);
+    if (e.y0 == r.y0) {
+        r.x1 = e.x1>r.x1 ? e.x1 : r.x1;
+        return r;
+    }
+    f32 right = g->clip.x1>g->x ? g->clip.x1 : g->x;
+    r.x0 = g->x<r.x0 ? g->x : r.x0;
+    r.x1 = right>r.x1 ? right : r.x1;
+    r.x1 = e.x1>r.x1 ? e.x1 : r.x1;
+    r.y1 = e.y1>r.y1 ? e.y1 : r.y1;
+    return r;
 }
 
 

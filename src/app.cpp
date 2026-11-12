@@ -20900,6 +20900,72 @@ static DriveOp a11yops[] = {
     SELALL,  // what is left if it couldn't
     KEY(GKEY_BACKSPACE, 0, 300),
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+
+    // The prompt as a text area, through AppKit as Voice Control asks:
+    // ranges in UTF-16 units, the emoji two, each CJK character one
+    {OP_TEXT, 0, 0, 0, 300, "a\xf0\x9f\x98\x80 \xe6\x97\xa5\xe6\x9c\xac tail"},
+    {OP_A11Y, 0, 0, 0, 0, "ns tget AXNumberOfCharacters 11"},
+    {OP_A11Y, 0, 0, 0, 0, "ns tget AXSelectedTextRange 11,0"},
+    {OP_A11Y, 0, 0, 0, 0, "ns tget AXInsertionPointLineNumber 0"},
+    {OP_A11Y, 0, 0, 0, 0, "ns tget AXVisibleCharacterRange 0,11"},
+    {OP_A11Y, 0, 0, 0, 0, "ns tsettable AXValue,AXSelectedText,AXSelectedTextRange"},
+    {OP_A11Y, 0, 0, 0, 0, "ns tparam AXStringForRange 1,2 \xf0\x9f\x98\x80"},
+    {OP_A11Y, 0, 0, 0, 0, "ns tparam AXStringForRange 4,2 \xe6\x97\xa5\xe6\x9c\xac"},
+    {OP_A11Y, 0, 0, 0, 0, "ns tparam AXAttributedStringForRange 7,4 tail"},
+    {OP_A11Y, 0, 0, 0, 0, "ns tparam AXStringForRange 10,5 "},  // not all in it
+    {OP_A11Y, 0, 0, 0, 0, "ns tparam AXRangeForIndex 2 1,2"},
+    {OP_A11Y, 0, 0, 0, 0, "ns tparam AXRangeForIndex 99 11,0"},
+    {OP_A11Y, 0, 0, 0, 0, "ns tparam AXLineForIndex 9 0"},
+    {OP_A11Y, 0, 0, 0, 0, "ns tparam AXRangeForLine 0 0,11"},
+    {OP_A11Y, 0, 0, 0, 0, "ns tparam AXStyleRangeForIndex 3 0,11"},
+    {OP_A11Y, 0, 0, 0, 0, "ns tround 1"},
+    {OP_A11Y, 0, 0, 0, 0, "ns tround 4"},
+    {OP_A11Y, 0, 0, 0, 0, "ns tround 8"},
+    // Selected, then replaced: read back at once (the shadow), and after
+    // a frame, ImGui's; a range past the text refused
+    {OP_A11Y, 0, 0, 0, 0, "ns mark"},
+    {OP_A11Y, 0, 0, 0, 0, "ns tset AXSelectedTextRange 7,4"},
+    {OP_A11Y, 0, 0, 0, 0, "ns tget AXSelectedText tail"},
+    {OP_A11Y, 0, 0, 0, 0, "ns tset AXSelectedTextRange 9,9"},
+    {OP_A11Y, 0, 0, 0, 0, "ns tget AXSelectedTextRange 7,4"},
+    {OP_A11Y, 0, 0, 0, 0, "ns tset AXSelectedText TAIL!"},
+    {OP_A11Y, 0, 0, 0, 0, "ns tget AXValue a\xf0\x9f\x98\x80 \xe6\x97\xa5\xe6\x9c\xac TAIL!"},
+    {OP_A11Y, 0, 0, 0, 300, "ns tget AXSelectedTextRange 12,0"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "a\xf0\x9f\x98\x80 \xe6\x97\xa5\xe6\x9c\xac TAIL!"},
+    {OP_A11Y, 0, 0, 0, 0, "ns tget AXValue a\xf0\x9f\x98\x80 \xe6\x97\xa5\xe6\x9c\xac TAIL!"},
+    {OP_A11Y, 0, 0, 0, 0, "ns tget AXSelectedTextRange 12,0"},
+    {OP_A11Y, 0, 0, 0, 0, "ns posted AXValueChanged"},
+    {OP_A11Y, 0, 0, 0, 0, "ns posted AXSelectedTextChanged"},
+    {OP_A11Y, 0, 0, 0, 0, "ns seltype 0"},  // an edit: read it again
+    {OP_A11Y, 0, 0, 0, 0, "logged AXSelectedTextRange= {7,4} -> YES"},
+    {OP_A11Y, 0, 0, 0, 0, "logged AXSelectedTextRange= {9,9} -> NO"},
+    {OP_A11Y, 0, 0, 0, 0, "logged AXSelectedText= \"TAIL!\"#5 -> YES"},
+    {OP_A11Y, 0, 0, 0, 0, "logged AXStringForRange {1,2} -> \"\xf0\x9f\x98\x80\"#2"},
+    {OP_A11Y, 0, 0, 0, 0, "logged AXBoundsForRange {4,1} -> {"},
+    // Undone in one
+    CMDKEY(GKEY_Z, 300),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "a\xf0\x9f\x98\x80 \xe6\x97\xa5\xe6\x9c\xac tail"},
+    // The whole value replaced, a newline in it, and the draft kept
+    {OP_A11Y, 0, 0, 0, 0, "ns tset AXValue all of it\nreplaced"},
+    {OP_A11Y, 0, 0, 0, 300, "ns tget AXValue all of it\nreplaced"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "all of it\nreplaced"},
+    {OP_A11Y, 0, 0, 0, 0, "ns tget AXInsertionPointLineNumber 1"},
+    {OP_A11Y, 0, 0, 0, 0, "ns tparam AXLineForIndex 12 1"},
+    {OP_A11Y, 0, 0, 0, 0, "ns tparam AXRangeForLine 1 10,8"},
+    {OP_MOVE, T_EMPTY, 0, 0, 1500, ""},
+    {OP_WAIT, W_DRAFTS, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_DRAFTFILE, 0, 0, 0, "all of it\nreplaced"},
+    CMDKEY(GKEY_Z, 300),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "a\xf0\x9f\x98\x80 \xe6\x97\xa5\xe6\x9c\xac tail"},
+    // A selection moved alone is told as a move
+    {OP_A11Y, 0, 0, 0, 0, "ns mark"},
+    {OP_A11Y, 0, 0, 0, 300, "ns tset AXSelectedTextRanges 1,2"},
+    {OP_A11Y, 0, 0, 0, 0, "ns tget AXSelectedTextRanges 1,2"},
+    {OP_A11Y, 0, 0, 0, 0, "ns tget AXSelectedText \xf0\x9f\x98\x80"},
+    {OP_A11Y, 0, 0, 0, 0, "ns seltype 2"},
+    SELALL,
+    KEY(GKEY_BACKSPACE, 0, 300),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
 #endif
 
     // Where the caret is, in the text model and to the IME
@@ -20909,11 +20975,22 @@ static DriveOp a11yops[] = {
     // An input method's composition: over the prompt, not in it, marked
     // text to a tool, and the IME at its clause; keys that leak through
     // while it lasts don't send; committed, it is typed text
+#ifdef __APPLE__
+    {OP_A11Y, 0, 0, 0, 0, "ns mark"},
+#endif
     {OP_EDITING, 0, 2, 2, 300, "にほんご"},
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, "say "},
     {OP_A11Y, 0, 0, 0, 0, "marked にほんご"},
     {OP_A11Y, 0, 0, 0, 0, "doc say にほんご"},
     {OP_A11Y, 0, 0, 0, 0, "ime"},
+#ifdef __APPLE__
+    // To a tool, the document changed: an edit, though the text didn't;
+    // the IME at another clause of the same text, a move
+    {OP_A11Y, 0, 0, 0, 0, "ns seltype 0"},
+    {OP_EDITING, 0, 0, 2, 300, "にほんご"},
+    {OP_A11Y, 0, 0, 0, 0, "ns seltype 2"},
+    {OP_EDITING, 0, 2, 2, 300, "にほんご"},
+#endif
     {OP_SHOT, 0, 0, 0, 300, "a11y-preedit"},
     KEY(GKEY_ENTER, 0, 300),
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, "say "},
