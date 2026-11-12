@@ -19447,6 +19447,11 @@ static void cmdopen(Engine *e, Arena scratch, i64 id, Json *j)
         }
         Str model = jsonstr(jsonget(j, "model"));
         Str which = jsonstr(jsonget(j, "endpoint"));
+        if (model.len && !which.len) {
+            Target t = targetof(e, model, {});  // ENDPOINT/MODEL, as for new
+            model = t.model;
+            which = t.which;
+        }
         s = parkedat(e, sid)>=0 ? revive(e, scratch, sid, model, which, &first)
                                 : loadsession(e, scratch, sid, model, which, &first, -1);
         if (!s) {

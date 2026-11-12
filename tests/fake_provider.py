@@ -917,6 +917,10 @@ def sc_todo_rename(model, n, req):
         yield from answer(model, "Done.")
 
 
+def sc_resume_qualified(model, n, req):
+    yield from answer(model, "Turn %d." % (n + 1))
+
+
 def sc_todo_job(model, n, req):
     # Waiting for a job with items left: no nudge, since the job's end
     # brings the agent back

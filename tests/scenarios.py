@@ -2407,6 +2407,21 @@ def todo_rename(t):
 
 
 @scenario(bound=10)
+def resume_qualified(t):
+    """run --resume -m ENDPOINT/MODEL takes the endpoint from the name,
+    as a new session does, rather than sending it all as the model."""
+    r1 = t.run()
+    t.check(r1.rc == 0, f"exit {r1.rc}: {r1.stderr}")
+    sid = r1.events[0].get("sid")
+    r2 = t.run("again", resume=sid, extra=["-e", "", "-m", f"fake/{t.model}"])
+    t.check(r2.rc == 0, f"exit {r2.rc}: {r2.stderr}")
+    at = r2.last("attempt")
+    t.check(at.get("model") == t.model and at.get("endpoint") == t.epurl,
+            f"attempt {at}")
+    t.check(r2.last("turn.end").get("why") == "done", f"turn.end {r2.last('turn.end')}")
+
+
+@scenario(bound=10)
 def todo_cap(t):
     """Never finishing the list: three nudges, then the turn ends."""
     r = t.run()
