@@ -1310,9 +1310,13 @@ static void dispatch(Os *os, GuiSdl *p, SDL_Event *e)
         return;
     case SDL_EVENT_DROP_FILE:
         if (e->drop.data) {
-            // No window: opened in the application (macOS's open events)
+            // No window: opened in the application (macOS's open events).
+            // A window's drop is at a point in its coordinates, as the
+            // backend's MousePos is; the checklist's has none (-1, -1)
+            b32 app = !e->drop.windowID;
+            b32 at  = !app && e->drop.x>=0 && e->drop.y>=0;
             gui_drop(g, {(u8 *)e->drop.data, (iz)SDL_strlen(e->drop.data)},
-                     !e->drop.windowID);
+                     app, e->drop.x, e->drop.y, at);
         }
         return;
     case SDL_EVENT_WINDOW_RESIZED:
@@ -1671,8 +1675,8 @@ static void os_guiinject(Os *os, GuiEvent *ge)
     case GEV_DROP:
         e.type          = SDL_EVENT_DROP_FILE;
         e.drop.windowID = id;
-        e.drop.x        = ge->x;
-        e.drop.y        = ge->y;
+        e.drop.x        = ge->down ? ge->x : -1;  // else at no point
+        e.drop.y        = ge->down ? ge->y : -1;
         e.drop.data     = ge->text.cdata;  // outlives dispatch
         break;
     }

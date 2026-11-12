@@ -56,7 +56,8 @@ Session → Open file... (Ctrl+O, Cmd+O) shows a file on the session's host
 (this computer, or another whose engine reads it for the window) in the
 Files pane, hidden until then: in a tab of the session shown, its lines
 numbered and highlighted, wrapped or not, a Markdown file rendered (or as
-text), and `path:N` or `path:A-B` scrolled to those lines and marked. The
+text), and `path:N` or `path:A-B` scrolled to those lines and marked. A
+file dropped on the Files pane opens there too, not attached. The
 window opens where it was last, fitted to the displays there are; the
 first time, 1700 by 900 at the display's scale, or maximized on a display
 too small for that. The first run shows Help in front, with Settings and

@@ -1467,6 +1467,64 @@ static void fileanswer(Gui *g, Str data)
 }
 
 
+// Files dropped at a point (gui_drop's queue), routed each frame after
+// ImGui's NewFrame, which says what windows were where last frame, and
+// before anything is drawn. With Open file up, the first fills its
+// field, a check in flight for the path it replaces let go, or, too
+// long for the field, says so there; the rest go nowhere. With another
+// modal up, each is attached, as a drop always was; else a file dropped
+// on the Files pane, drawn last frame, opens there, a file on this
+// computer, in the shown root's tabs, and one dropped elsewhere is
+// attached.
+static void droproute(Gui *g)
+{
+    DropAt *d = g->drophead;
+    if (!d) {
+        return;
+    }
+    g->drophead = g->droptail = 0;
+    ImGuiWindow *files = ImGui::FindWindowByName(panenames[PANE_FILES]);
+    b32          ask   = g->fask.p.shown;
+    b32          modal = !ask && ImGui::GetTopMostPopupModal();
+    for (; d; d = d->next) {
+        if (ask) {
+            ask = 0;  // the first only, and the rest nowhere
+            if (d->path.len >= FIELD_MAX) {
+                // Never cut, which would name another file
+                g->fask.p.err = "Its path is too long";
+                guilog(g, concat(&g->frame, "dropped on Open file, too long: ", d->path));
+                continue;
+            }
+            fieldput(g->fask.p.buf, d->path);
+            g->fask.p.err   = {};
+            g->fask.statid  = 0;  // a check in flight is of the path replaced,
+            g->fask.close   = 0;  // its answer to open nothing, as on Cancel
+            g->fask.dropped = 1;
+            continue;
+        } else if (g->fask.p.shown) {
+            guilog(g, concat(&g->frame, "dropped on Open file, which takes one: ", d->path));
+            continue;
+        }
+        ImGuiWindow *w = 0, *under = 0;
+        if (!modal && files && g->filesdrawn) {
+            ImGui::FindHoveredWindowEx(v2(d->x, d->y), true, &w, &under);
+        }
+        if (w && w->RootWindow==files) {
+            // From g->frame itself, past what filesopen's copies of it take
+            Str path = d->path;
+            path = pathroot(path, HOST_WINDOWS) ? normpath(&g->frame, {}, path, HOST_WINDOWS)
+                                                : path;
+            filesopen(g, g->sess, 0, path, 0, 0, {});
+        } else {
+            dropattach(g, d->path);
+        }
+    }
+    os_release(g->os, g->dropr);
+    g->dropr = 0;
+    g->dropa = {};
+}
+
+
 // The pane
 
 // Reload: a tab read again, its body shown until the new one is made
@@ -1733,6 +1791,9 @@ static void drawfiles(Gui *g)
     Arena       a    = g->frame;
     GuiSession *root = filesroot(g);
     FileSet    *set  = &root->files;
+    ImVec2      wp   = ImGui::GetWindowPos();
+    ImVec2      ws   = ImGui::GetWindowSize();
+    g->rects[RECT_FILESPANE] = {wp.x, wp.y, wp.x + ws.x, wp.y + ws.y};
     g->fshown.v   = 0;
     g->fnoteslen  = 0;
     if (!set->n) {

@@ -48,7 +48,8 @@ struct W32Hooks {
     void (*systheme)(void *gui, int dark);// the system's theme changed
     void (*tray)(void *gui, int item);    // a pick from the tray's menu
     void (*placed)(void *gui, int const *geom);  // moved, resized: GEOM_*
-    void (*drop)(void *gui, unsigned short const *path);  // a file dropped
+    // A file dropped, at x, y in the client area's pixels if at
+    void (*drop)(void *gui, unsigned short const *path, int x, int y, int at);
     void (*toasted)(void *gui, int id, int refused);      // a toast clicked
     int    drive;                         // scripted: never take focus
 };
@@ -604,12 +605,15 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_DROPFILES: {
-        HDROP    d = (HDROP)wp;
-        UINT     n = DragQueryFileW(d, 0xffffffff, 0, 0);
-        wchar_t *p = (wchar_t *)HeapAlloc(GetProcessHeap(), 0, 32768*sizeof(wchar_t));
+        HDROP    d  = (HDROP)wp;
+        UINT     n  = DragQueryFileW(d, 0xffffffff, 0, 0);
+        // Where, in client coordinates; FALSE outside the client area
+        POINT    pt = {};
+        int      at = DragQueryPoint(d, &pt) != FALSE;
+        wchar_t *p  = (wchar_t *)HeapAlloc(GetProcessHeap(), 0, 32768*sizeof(wchar_t));
         for (UINT i = 0; p && i < n; i++) {
             if (DragQueryFileW(d, i, p, 32768)) {
-                h->drop(h->gui, (unsigned short const *)p);
+                h->drop(h->gui, (unsigned short const *)p, (int)pt.x, (int)pt.y, at);
             }
         }
         if (p) HeapFree(GetProcessHeap(), 0, p);
@@ -1314,7 +1318,8 @@ extern "C" void w32gui_inject(void *p, int kind, float x, float y,
         HANDLE t = CreateThread(0, 0, announcetheme, w->hwnd, 0, 0);
         if (t) CloseHandle(t);
     } break;
-    case 12: {  // a file dropped, as Explorer drops it
+    case 12: {  // a file dropped, as Explorer drops it, at x, y if down,
+                // else outside the client area
         int n = 0;
         for (; text && text[n]; n++) {}
         SIZE_T  size = sizeof(DROPFILES) + (SIZE_T)(n + 2)*sizeof(wchar_t);
@@ -1327,6 +1332,7 @@ extern "C" void w32gui_inject(void *p, int kind, float x, float y,
         df->pFiles = sizeof(DROPFILES);
         df->pt.x   = (LONG)x;
         df->pt.y   = (LONG)y;
+        df->fNC    = down ? FALSE : TRUE;
         df->fWide  = TRUE;
         memcpy(df + 1, text, (size_t)n*sizeof(wchar_t));
         GlobalUnlock(mem);
@@ -1868,12 +1874,14 @@ static void hookplaced(void *g, int const *geom)
     gui_placed((Gui *)g, fromgeom(geom));
 }
 
-static void hookdrop(void *p, unsigned short const *path)
+// Client pixels are ImGui's units here, as the backend's MousePos is.
+static void hookdrop(void *p, unsigned short const *path, int x, int y, int at)
 {
     Gui *g = (Gui *)p;
     iz   n = 0;
     for (; path[n]; n++) {}
-    gui_drop(g, fromwide(&g->frame, (c16 *)path, n), 0);  // until the next frame
+    Str  s = fromwide(&g->frame, (c16 *)path, n);  // until the next frame
+    gui_drop(g, s, 0, (f32)x, (f32)y, at);
 }
 
 static i32 os_guidisplays(Os *, WinBox *out, i32 max)

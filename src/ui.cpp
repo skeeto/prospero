@@ -10904,6 +10904,15 @@ static void drawpathask(Gui *g, PathAsk *pa, char const *pid, char const *name, 
         }
         ImGui::SetNextItemWidth(560*sc);
         PathField pf = pathbefore(g, far ? far : g->main, pa->buf, &enter, 0, 1);
+        if (openfile && g->fask.dropped) {
+            // A file dropped filled the field (droproute): shown as typed,
+            // the caret at its end, for a line after it
+            g->fask.dropped = 0;
+            ImGuiInputTextState *st = ImGui::GetInputTextState(pf.id);
+            if (st && ImGui::GetActiveID()==pf.id) {
+                st->ReloadUserBufAndMoveToEnd();
+            }
+        }
         Str hint = far ? concat(&a, "A path on ", filehostname(g, &a, far->uid))
                        : Str("A path on this computer");
         ImGui::InputTextWithHint("##cwd", cstr0(&a, hint), pa->buf, FIELD_MAX,

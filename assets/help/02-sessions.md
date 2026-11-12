@@ -41,8 +41,8 @@ Session → New session, no folder (Ctrl+Shift+N, Cmd+Shift+N on macOS)
 skips the dialog: a No folder session on this computer, with the
 default model, its prompt box ready. Type `/plan` there for Plan mode.
 
-A folder dropped on the window opens the dialog with that folder
-filled in. `prospero DIR` in a terminal starts a session in DIR at
+A folder dropped on the window, anywhere on it, opens the dialog with
+that folder filled in. `prospero DIR` in a terminal starts a session in DIR at
 once.
 
 ## The sidebar's order
@@ -161,8 +161,9 @@ window, the session keeps it from then on, reopened too, and compacts
 ahead of it. Set the model's `context` in Settings to compact ahead
 from the start.
 
-Attach adds files to the message: drop them on the window, paste them,
-or pick them with the paper clip. Images go to a model that takes
+Attach adds files to the message: drop them on the window (but not on
+the Files pane, which opens them, or while Open file asks for a path,
+which takes the first), paste them, or pick them with the paper clip. Images go to a model that takes
 them, as pictures. Any other file goes as text, as `read` shows it:
 numbered lines, the first 2000 or so, then a note to read on. The
 session keeps a copy in its own folder, so the agent can read the rest
@@ -269,7 +270,9 @@ Session → Open file... (Ctrl+O) asks for a path on the session's
 host, this computer or [another](help:hosts), starting from the
 session's folder, which Tab completes. After the
 path, `:N` goes to line N and `:A-B` to lines A to B, marked with a
-band until text is selected; opening it again goes there again.
+band until text is selected; opening it again goes there again. A file
+dropped on the pane opens in a tab too, rather than being attached,
+and one dropped anywhere while Open file asks fills in its path.
 
 A file shows as text, its lines numbered and highlighted, wrapped at
 the pane's width unless Wrap is off (then scrolled sideways), or a

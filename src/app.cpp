@@ -299,6 +299,7 @@ enum : i32 {
     RECT_QUEUEITEM,  // the transcript's first queued message
     RECT_LASTMSG,    // the transcript's last message, if drawn
     RECT_TOOLPATH,   // the latest tool row's path, a link to its file
+    RECT_FILESPANE,  // the Files pane's window, as last drawn
     RECT_THEME0,     // the theme's choices in its open list
     RECT_PANE0 = RECT_THEME0 + THEME_COUNT,  // View's toggle of each pane
     RECT_COUNT = RECT_PANE0 + PANE_COUNT,
@@ -1097,6 +1098,18 @@ enum : i32 {
     EXP_ASKING,   // the dialog is up
 };
 
+// A file dropped at a point of the window, kept for the next frame,
+// which routes it (droproute): ImGui knows only then what is there.
+struct DropAt {
+    DropAt *next;
+    Str     path;
+    f32     x, y;   // in ImGui's units, as its MousePos
+};
+
+// Bytes reserved for the files dropped before a frame routes them: what
+// doesn't fit is attached at once, as a drop with no point is.
+enum { DROP_QUEUE = 1<<20 };
+
 // A file dialog asked for (askpath), kept in case the platform has none
 // to show, as Linux without a desktop portal or zenity has not: a field
 // of this window asks instead, its answer posted as the dialog's would be.
@@ -1129,6 +1142,7 @@ struct FileAsk {
     u8      answer[FIELD_MAX + 64];  // posted when it says a file
     iz      answerlen;
     b32     stated;   // an answer came from there, for the checklist
+    b32     dropped;  // a file dropped filled the field: its state to reload
 };
 
 // A file on another host read into a tab, through its engine (fs.read),
@@ -2099,6 +2113,10 @@ struct Gui {
     i32                attshown;     // attached images drawn above it
     i32                attready;     // of them with their thumbnail
     i64                drops;        // files dropped on the window
+    Region            *dropr;        // those dropped at a point, until the
+    Arena              dropa;        // next frame routes them (DROP_QUEUE)
+    DropAt            *drophead;
+    DropAt            *droptail;
     u64                attask;       // the attach dialog's latest ask
     GuiSession        *attsess;      // and for which session
     b32                attpend;      // while that dialog is open
@@ -5724,15 +5742,29 @@ static void opendirnew(Gui *g, Str dir, Str why)
     guinew(g, g->main, dir, {}, {});
 }
 
-// A dropped file, attached to the draft shown. A directory has a new
-// session there instead: at once if opened in the application (app:
-// Finder, the Dock, open -a), else through the new session dialog,
-// dropped on the window perhaps only to be attached. The open event
-// macOS makes of prospero DIR's argument is ignored, as the launch has
-// that session already.
-static void gui_drop(Gui *g, Str path, b32 app)
+// A dropped file attached to the draft shown, saying why not.
+static void dropattach(Gui *g, Str path)
 {
-    GuiSession *s = g->sess;
+    GuiSession *s   = g->sess;
+    Str         err = attachfile(g, s, path);
+    if (err.len && s) {
+        setnote(g, s, concat(&g->frame, "not attached: ", err), 1);
+    } else if (err.len) {
+        guilog(g, concat(&g->frame, "not attached: ", err));
+    }
+    scheddirty(&g->sched);
+}
+
+// A dropped file, attached to the draft shown, or, dropped at a point
+// (at, x and y in ImGui's units), queued for the next frame to route
+// (droproute): there it may open in the Files pane, or fill Open file's
+// field. A directory has a new session there instead: at once if opened
+// in the application (app: Finder, the Dock, open -a), else through the
+// new session dialog, dropped on the window perhaps only to be
+// attached. The open event macOS makes of prospero DIR's argument is
+// ignored, as the launch has that session already.
+static void gui_drop(Gui *g, Str path, b32 app, f32 x, f32 y, b32 at)
+{
     g->drops++;
     if (os_stat(g->os, g->frame, path).type == STAT_DIR) {
         Str real = os_realpath(g->os, &g->frame, path);  // until the next frame
@@ -5752,13 +5784,28 @@ static void gui_drop(Gui *g, Str path, b32 app)
         scheddirty(&g->sched);
         return;
     }
-    Str err = attachfile(g, s, path);
-    if (err.len && s) {
-        setnote(g, s, concat(&g->frame, "not attached: ", err), 1);
-    } else if (err.len) {
-        guilog(g, concat(&g->frame, "not attached: ", err));
+    if (at && !app) {
+        // Kept past this frame's scratch, which the next frame resets
+        if (!g->dropr) {
+            g->dropr = os_reserve(g->os, DROP_QUEUE);
+            g->dropa = newarena(g->dropr);
+        }
+        if (g->dropr && fits(&g->dropa, path.len + (iz)sizeof(DropAt) + 64)) {
+            DropAt *d = alloc<DropAt>(&g->dropa);
+            d->path = clone(&g->dropa, path);
+            d->x    = x;
+            d->y    = y;
+            if (g->droptail) {
+                g->droptail->next = d;
+            } else {
+                g->drophead = d;
+            }
+            g->droptail = d;
+            scheddirty(&g->sched);
+            return;
+        }
     }
-    scheddirty(&g->sched);
+    dropattach(g, path);
 }
 
 // Paste: the clipboard's image, or its file, attached, an image or
@@ -12753,6 +12800,7 @@ static void gui_frame(Gui *g)
     }
     uishiftpaste(g);
     ImGui::NewFrame();
+    droproute(g);  // what was where, as NewFrame knows, before any is drawn
     i64 t1 = os_ticks(g->os);
     dockwindows(g);
     i64 t2 = os_ticks(g->os);
@@ -13301,8 +13349,8 @@ enum : i32 {
                   // dx 1: fill the primary display unmaximized (macOS's
                   // Fill), else skip the next op where that is no maximum
     OP_DROP,      // write a dx by dy PNG (or dy lines, .txt; dy pages, .pdf) to
-                  // --cwd as text, drop it
-                  // (a flat gray JPEG if text ends in .jpg)
+                  // --cwd as text, drop it on the target, or at no point
+                  // with T_NONE (a flat gray JPEG if text ends in .jpg)
     OP_CLIPPNG,   // the clipboard's text kept, a dx by dy PNG put there
     OP_CLIPBACK,  // the clipboard's text put back
     OP_CLIPRACE,  // macOS: the window becomes key while another process
@@ -13441,6 +13489,7 @@ enum : i32 {
     T_FILETEXT,    // the start of the Files text's line text, 1-based
     T_TOOLPATH,    // the latest tool row's path drawn, a link to its file
     T_TOOLHEAD,    // and its header, left of the path
+    T_FILESPANE,   // the middle of the Files pane
 };
 
 enum : i32 {
@@ -16368,6 +16417,26 @@ static DriveOp m3ops[] = {
     {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
     {OP_WAIT, W_FILEFRESH, 0, 0, 5000, ""},
     {OP_CHECK, CHK_FILETEXT, 0, 0, 0, "restored 1\n"},
+    // A file dropped on the pane opens in a tab, attached to nothing;
+    // dropped while Open file is up, it fills the field, a line typed
+    // after it
+    {OP_DROP, T_FILESPANE, 0, 3, 800, "files/dropped.txt"},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEPATH, 0, 0, 0, "/files/dropped.txt"},
+    {OP_CHECK, CHK_ATTACHED, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "files-dropped"},
+    CMDKEY(GKEY_O, 500),
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_DROP, T_FILESPANE, 0, 5, 800, "files/dropped2.txt"},
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 300, ":4"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_FILEPATH, 0, 0, 0, "/files/dropped2.txt"},
+    {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "4-4"},
+    {OP_CHECK, CHK_ATTACHED, 0, 0, 0, ""},
     // Quiet with a file shown, past the tooltips and the layout's save
     {OP_MOVE, T_EMPTY, 0, 0, 4500, ""},
     {OP_MARK, 0, 0, 0, 3000, ""},
@@ -20038,15 +20107,16 @@ static DriveOp composeops[] = {
     {OP_CHECK, CHK_LASTUSER, 0, 0, 0, "Late steer"},
     {OP_CHECK, CHK_QUEUESHOWN, 0, 0, 0, ""},
     {OP_CHECK, CHK_QUEUEKEPT, 1, 0, 0, ""},
-    // E: images attached by dropping two files, a PNG and a JPEG, and
-    // pasting a third, the pasted one removed by its x, the others sent
+    // E: images attached by dropping two files, a PNG and a JPEG (the
+    // second on the box, routed as a drop at a point is, not on Files),
+    // and pasting a third, the pasted one removed by its x, the others sent
     // with the prompt and counted by the agent, their thumbnails decoded
     // in the box and in the transcript; a thumbnail there opens whole
     {OP_NEWSESSION, 0, 0, 0, 0, ""},
     {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
     {OP_DROP, 0, 96, 64, 800, "dropped-a.png"},
     {OP_CHECK, CHK_ATTACHED, 1, 0, 0, ""},
-    {OP_DROP, 0, 40, 120, 800, "dropped-b.jpg"},
+    {OP_DROP, T_PROMPT, 40, 120, 800, "dropped-b.jpg"},  // at a point, not Files
     {OP_CHECK, CHK_ATTACHED, 2, 0, 0, ""},
     {OP_CLIPPNG, 0, 80, 80, 200, ""},
     CLICK(T_PROMPT, "", 200),
@@ -20564,6 +20634,7 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_MSGLINK:     return rectcenter(g->rects[RECT_MSGLINK]);
     case T_UNDO:        return rectcenter(g->rects[RECT_UNDO]);
     case T_TOOLPATH:    return rectcenter(g->rects[RECT_TOOLPATH]);
+    case T_FILESPANE:   return rectcenter(g->rects[RECT_FILESPANE]);
     case T_TOOLHEAD: {
         Rect r = g->rects[RECT_TOOLPATH];
         return r.x1>r.x0 ? v2(r.x0 - 24*g->scale, (r.y0+r.y1)/2) : v2(-1, -1);
@@ -24793,6 +24864,13 @@ static void drivestep(Gui *g)
         }
         e.kind = GEV_DROP;
         e.text = {(u8 *)cstr0(&g->perm, path), path.len};
+        if (op->target != T_NONE) {
+            // T_NONE's would be (0, 0): it is at no point instead
+            ImVec2 p = targetpos(g, op->target);
+            e.x    = p.x;
+            e.y    = p.y;
+            e.down = 1;
+        }
         os_guiinject(g->os, &e);
     } break;
     case OP_CLIPRACE: {
@@ -24847,7 +24925,7 @@ static void drivestep(Gui *g)
         if (op->text.len) {
             os_mkdirs(g->os, g->frame, dir);
         }
-        gui_drop(g, dir, 1);
+        gui_drop(g, dir, 1, 0, 0, 0);
     } break;
     case OP_HOLD:
         g->holduntil = g->sched.now + (i64)op->dx*1000;
