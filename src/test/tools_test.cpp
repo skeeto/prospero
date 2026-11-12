@@ -1078,6 +1078,14 @@ static void test_tools(Test *t)
         Str without = systemprompt(a, "/w", &qe);
         expect(t, "ask in the system prompt", istr(a, find(with, "ask with ask_user")>=0 &&
                find(without, "cannot answer questions")>=0 && find(without, "ask_user")<0), "1");
+
+        // File links, only where asked for, as the last guideline
+        Str links  = systemprompt(a, "/w", &qe, 0, 1);
+        Str bullet = "- When you mention files in replies, link them in Markdown";
+        iz  at     = find(links, bullet);
+        expect(t, "file links in the system prompt", istr(a, at>=0 &&
+               find(links, "around a path with spaces.\n\nWorking directory: /w\n")>at &&
+               find(with, bullet)<0 && find(without, bullet)<0), "1");
         expect(t, "ask alias", istr(a, find(unknowntool(a, "AskUserQuestion", TOOL_ASKMASK),
                                             "cannot ask the user")>=0), "1");
         expect(t, "ask in tooljson", istr(a, find(tooljson(a, &qe), "\"ask_user\"")<0), "1");

@@ -281,7 +281,9 @@ A link to a file in the transcript, in the plan or in a Markdown file
 shown here opens it too, as the agent writes them:
 `[engine.cpp:42](src/engine.cpp:42)`, a range as `:40-45` or
 `#L40-L45`, a heading as `notes.md#install`, or a `file:///` URL. Its
-tooltip says which file. A relative path is from the folder the
+tooltip says which file. A session started here asks its agent, in
+its system prompt, to link the files it mentions this way; one started
+by an older version, or by `prospero run`, does not. A relative path is from the folder the
 session worked in when the link was written (a fork into another
 folder keeps its older links pointing where they were), and in a
 Markdown file from the file's own folder, where `#install` alone goes

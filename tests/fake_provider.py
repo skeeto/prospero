@@ -1109,6 +1109,18 @@ def sc_memory_scope_b(model, n, req):
     yield from answer(model, "Report: nothing to see.")
 
 
+def sc_file_links(model, n, req):
+    if last_user(req) == "delegate" and step(req) == 0:
+        yield from tool(model, n, "task", {"description": "Look", "prompt": "Look around.",
+                                           "model": second(model)})
+    else:
+        yield from answer(model, f"Answer number {n}.")
+
+
+def sc_file_links_b(model, n, req):
+    yield from answer(model, "Report: nothing to see.")
+
+
 def sc_memory_plan(model, n, req):
     if step(req) == 0:
         yield from tool(model, n, *memsave("plan-note", "Saved while planning"))

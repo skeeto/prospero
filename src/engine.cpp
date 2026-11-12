@@ -16115,7 +16115,12 @@ static void buildprefix(Session *s, Arena scratch)
         s->te.ctr   = farctrok(e, scratch);
         s->te.ctrimages = s->te.ctr ? farctrimages(e, &s->perm, scratch) : Str{};
     }
-    s->system = systemprompt(&s->perm, s->cwd, &s->te, s->nofolder);
+    // Links to files in replies, where a frontend shows them: a session
+    // opened attended, and its subagents (whose parent is not linked yet
+    // as a new one opens), but not an eval's (projinstr)
+    Session *p     = s->parent ? s->parent : s->psid.len ? findsession(e, s->psid) : 0;
+    b32      links = (s->attended || attending(p)) && !s->projinstr;
+    s->system = systemprompt(&s->perm, s->cwd, &s->te, s->nofolder, links);
     s->system = s->wt.name.len ? concat(&s->perm, s->system, wtpromptline(s, &scratch))
                                : s->system;
     s->tools  = tooljson(&s->perm, &s->te);
@@ -17348,7 +17353,7 @@ static void taskcancel(Session *s, Arena scratch)
 
 static Session *revive(Engine *, Arena, Str sid, Str model, Str which, i64 *firstnew);
 static Session *loadsession(Engine *, Arena, Str sid, Str model, Str which,
-                            i64 *firstnew, iz held);
+                            i64 *firstnew, iz held, b32 attended = 0);
 static void forget(Engine *, Session *);
 
 // The parent of a subagent in the background, to be given its report:
@@ -17545,7 +17550,7 @@ static b32 taskbudget(Session *s, Arena scratch)
 // deliver or a report to make, is not parked.
 
 static Session *loadsession(Engine *, Arena, Str sid, Str model, Str which,
-                            i64 *firstnew, iz held);
+                            i64 *firstnew, iz held, b32 attended);
 
 static i64 parkafter(Engine *e)
 {
@@ -17629,7 +17634,8 @@ static Session *revive(Engine *e, Arena scratch, Str sid, Str model,
     e->parked.len--;
     model = model.len ? model : k.model;
     which = which.len ? which : k.which;
-    Session *s = loadsession(e, scratch, sid, model, which, firstnew, k.lock);
+    Session *s = loadsession(e, scratch, sid, model, which, firstnew, k.lock,
+                             k.attended);
     if (s) {
         s->attended = k.attended;
         s->closed   = k.closed;
@@ -18981,9 +18987,11 @@ static void replayjobs(Session *s, Arena scratch)
 // calls that never started. *firstnew is the seq before any repairs.
 // When another process holds the session's lock, it is only read, and
 // so neither repaired nor written later (readonly). A parked session's
-// lock is held already: held, else -1.
+// lock is held already: held, else -1. Attended is as the frontend
+// opening it asks, known before a prefix the log lacks is built (a fork
+// into another folder's, say), since that prefix is then frozen.
 static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
-                            Str which, i64 *firstnew, iz held)
+                            Str which, i64 *firstnew, iz held, b32 attended)
 {
     Str      dir  = join(&scratch, join(&scratch, e->statedir, "sessions"), sid);
     Str      path = join(&scratch, dir, "events.jsonl");
@@ -18995,6 +19003,7 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
         }
         return 0;
     }
+    s->attended = attended;
     if (held >= 0) {
         s->lock = held;
     } else {
@@ -19452,8 +19461,9 @@ static void cmdopen(Engine *e, Arena scratch, i64 id, Json *j)
             model = t.model;
             which = t.which;
         }
+        b32 att   = jsonflag(jsonget(j, "attended"), 0);  // for its prefix
         s = parkedat(e, sid)>=0 ? revive(e, scratch, sid, model, which, &first)
-                                : loadsession(e, scratch, sid, model, which, &first, -1);
+                                : loadsession(e, scratch, sid, model, which, &first, -1, att);
         if (!s) {
             reply(e, scratch, id, 0, "cannot open the session", sid);
             return;

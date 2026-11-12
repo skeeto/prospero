@@ -2153,6 +2153,59 @@ def memory_scope(t):
     t.check("memory" not in names(kid) and "# Memory" not in system(kid), "no subagent's")
 
 
+@scenario(bound=20)
+def file_links(t):
+    """Only a session whose replies a frontend shows is asked to link the
+    files it mentions: one opened attended, and its subagent, but not one
+    unattended, one with only the project's instructions (as an eval's),
+    nor a run. A fork into another folder, whose prefix is built as it is
+    first opened, has it if that open is attended."""
+    ext = t.host.join(t.base, "ext")
+    t.host.mkdir(ext)
+    h = t.headless()
+    bullet = "- When you mention files in replies, link them in Markdown"
+
+    def logpre(sid):
+        pre = [e["system"] for e in logged(t, sid) if e["ev"] == "prefix"]
+        return pre[0] if len(pre) == 1 else f"{len(pre)} prefixes"
+
+    def prefix(text, **kw):
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", **kw)["sid"]
+        h.send("prompt", sid=sid, text=text)
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        return sid, logpre(sid)
+
+    def moved(sid, **kw):
+        r = h.call("fork", sid=sid, cwd=ext)
+        t.check(r.get("ok") == 1, f"fork: {r}")
+        o = h.call("open", sid=r["sid"], **kw)
+        t.check(o.get("ok") == 1, f"open {o}")
+        return logpre(r["sid"])
+
+    try:
+        sid, shown = prefix("delegate", attended=1)
+        _, alone = prefix("go")
+        _, proj = prefix("go", attended=1, instructions="project")
+        forked = moved(sid, attended=1)
+        unseen = moved(sid)
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+    t.check(bullet in shown and "around a path with spaces.\n\nWorking directory: " in shown,
+            f"attended: {shown[:1200]!r}")
+    kid = fake_provider.system_of(t.requests(t.model2)[0]["body"])
+    t.check(bullet in kid, f"its subagent: {kid[:1200]!r}")
+    t.check(bullet not in alone, "unattended")
+    t.check(bullet not in proj, "the project's instructions only")
+    t.check(bullet in forked, f"a fork into another folder, opened attended: {forked[:1200]!r}")
+    t.check("Guidelines:" in unseen and bullet not in unseen, "the same, opened unattended")
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    pre = r.all("prefix")
+    t.check(len(pre) == 1 and "Guidelines:" in pre[0]["system"] and
+            bullet not in pre[0]["system"], f"a run: {pre[:1]}")
+
+
 @scenario(bound=15)
 def memory_plan(t):
     """A save in plan mode, which changes no project file."""
@@ -6840,6 +6893,7 @@ def eval_formats(t):
     t.check(rc == 0, f"exit {rc}: {err[-2000:]}")
     system = fake_provider.system_of(t.requests(good)[0]["body"])
     t.check("- prospero:" not in system, f"no built-in skill in an eval: {system!r}")
+    t.check("link them in Markdown" not in system, f"no file links in an eval: {system!r}")
     t.check(len(recs) == 48 and not any("error" in r for r in recs),
             f"{len(recs)} records: {[r for r in recs if 'error' in r][:2]}")
     t.check({(r["task"], r["rep"]) for r in recs} ==

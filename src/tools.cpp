@@ -1070,8 +1070,11 @@ static Str tooljson(Arena *a, ToolEnv *te)
 }
 
 // The system prompt's start. A session in a folder of its own (nofolder)
-// is told that its working directory is no project.
-static Str systemprompt(Arena *a, Str cwd, ToolEnv *te, b32 nofolder = 0)
+// is told that its working directory is no project. One whose replies a
+// frontend shows (filelinks) is asked to link the files it mentions,
+// which the GUI opens in its Files pane (fileref).
+static Str systemprompt(Arena *a, Str cwd, ToolEnv *te, b32 nofolder = 0,
+                        b32 filelinks = 0)
 {
     Buf b(a, 2048);
     print(&b,
@@ -1114,8 +1117,19 @@ static Str systemprompt(Arena *a, Str cwd, ToolEnv *te, b32 nofolder = 0)
         "denied path stays denied, by any route.\n"
         "- When a tool returns an error, read it, fix the call, and go on. "
         "Never repeat a call that failed in the same way.\n"
-        "- Do not narrate what you will do next: do it with a tool call.\n\n"
-        "Working directory: ");
+        "- Do not narrate what you will do next: do it with a tool call.\n");
+    if (filelinks) {
+        print(&b,
+            "- When you mention files in replies, link them in Markdown so "
+            "the user can open them: the path relative to the working "
+            "directory as the target, with an optional :line or :start-end "
+            "suffix, as in [engine.cpp:42](src/engine.cpp:42). A later "
+            "mention of the same file can link just its line, as in "
+            "[:88](src/engine.cpp:88). Use an absolute path outside the "
+            "working directory, / between folders, and <...> around a path "
+            "with spaces.\n");
+    }
+    print(&b, "\nWorking directory: ");
     print(&b, cwd);
     if (nofolder) {
         print(&b, " (a private folder for this session; there is no project)");

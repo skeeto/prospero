@@ -156,6 +156,19 @@ static void test_help(Test *t)
     expect(t, "help.at.out", doclinkat(d, 0), "");
     expect(t, "help.at.after", doclinkat(d, 24), "");
 
+    // File links as the system prompt asks for them (systemprompt's
+    // filelinks): any label, <...> around a path with spaces, which
+    // otherwise is no link, and a backslash before punctuation dropped
+    struct { Str name, src, want; } links[] = {
+        {"help.at.label", "[:88](src/engine.cpp:88)", "src/engine.cpp:88"},
+        {"help.at.angle", "[x](<My Files/a.c:3-5>)", "My Files/a.c:3-5"},
+        {"help.at.space", "[x](My Files/a.c:3)", ""},
+        {"help.at.slash", "[x](src\\_a.c)", "src_a.c"},
+    };
+    for (iz i = 0; i < countof(links); i++) {
+        expect(t, links[i].name, doclinkat(parsedoc(&a, links[i].src, &memo), 1), links[i].want);
+    }
+
     // The search: a heading first, its section's line; every word, any
     // case; a page's opening by its title; nothing for nonsense
     {
