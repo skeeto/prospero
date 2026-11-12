@@ -86,6 +86,7 @@ static void axkey(Gui *, u32);
 // item, and its context menu (a11y_imgui.cpp)
 static void axchecked(Gui *, b32 on);
 static void axselected(Gui *, b32 on);
+static void axnextname(Gui *, Str);
 static void axname(Gui *, Str);
 static void axrole(Gui *, AxRole);
 static void axmenu(Gui *);
@@ -3381,6 +3382,7 @@ static void drawmodepick(Gui *g, Arena a, GuiSession *s, View *v)
             if (ImGui::Selectable(cstr0(&a, modes[i].name), on) && !on) {
                 guimode(g, s, modes[i].mode);
             }
+            axselected(g, on);
             if (i == 2) {
                 ImGui::PopStyleColor();
             }
@@ -11658,6 +11660,7 @@ static void drawnewmodel(Gui *g, Arena a, GuiHost *host)
 
     ImVec2 at = ImGui::GetCursorScreenPos();
     f32    w  = ImGui::GetContentRegionAvail().x;
+    axnextname(g, "Model");
     if (ImGui::BeginCombo("##model", cstr0(&a, shown), ImGuiComboFlags_HeightLargest)) {
         g->picksframe = ImGui::GetFrameCount();
         if (ImGui::IsWindowAppearing()) {
@@ -11972,6 +11975,7 @@ static b32 drawnewctr(Gui *g, Arena a, b32 *enter)
                                   ImGuiSelectableFlags_NoAutoClosePopups)) {
                 fieldput(g->newimage, imgs[i]);
             }
+            axselected(g, cur==imgs[i]);
             if (!i) {
                 itemnamed(g, "new image0");
             }
@@ -12092,6 +12096,7 @@ static void drawnew(Gui *g)
         ImVec2 at = ImGui::GetCursorScreenPos();
         Str ctrname = concat(&a, ctrtitle(g->ctrrt.name), ": a new container");
         Str shown   = ctr ? ctrname : hostlabel(g, &a, host);
+        axnextname(g, "Host");
         if (ImGui::BeginCombo("##host", cstr0(&a, shown))) {
             i32 n = 0;
             for (GuiHost *h = g->hosts; h; h = h->next) {
@@ -12101,6 +12106,7 @@ static void drawnew(Gui *g)
                     g->newhost = h;
                     g->newctr  = 0;
                 }
+                axselected(g, h==host && !ctr);
                 if (n < 4) {
                     itemrect(g, RECT_HOST0 + n);
                     g->hostitems[n] = h;
@@ -12114,6 +12120,7 @@ static void drawnew(Gui *g)
                 ctrimglist(g);
             }
             if (ctrok) {
+                axselected(g, ctr);
                 itemnamed(g, "new host ctr");
             }
             ImGui::EndCombo();
@@ -12261,10 +12268,12 @@ static void drawnew(Gui *g)
         ImGui::TextUnformatted("Role");
         ImGui::SetNextItemWidth(-1);
         Str shown = hasrole ? g->newrole : Str("None");
+        axnextname(g, "Role");
         if (ImGui::BeginCombo("##role", cstr0(&a, shown))) {
             if (ImGui::Selectable("None", !hasrole)) {
                 g->newrole = {};
             }
+            axselected(g, !hasrole);
             itemtip("No role: the usual session, with its usual tools");
             for (iz i = 0; i < roles.len; i++) {
                 GuiRole *r = &roles[i];
@@ -12272,6 +12281,7 @@ static void drawnew(Gui *g)
                 if (ImGui::Selectable(cstr0(&a, r->name), r->name==g->newrole)) {
                     g->newrole = clone(&g->perm, r->name);
                 }
+                axselected(g, r->name==g->newrole);
                 Buf tb(&a, 256);
                 print(&tb, r->desc.len ? r->desc : Str("(no description)"));
                 print(&tb, "\nTools: ");
@@ -13107,12 +13117,14 @@ static void drawcfgrow(Gui *g, CfgRow *r, i32 target, b32 wide)
         Str    named = concat(&a, concat(&a, concat(&a, "cfg ", r->kind), " "),
                               concat(&a, concat(&a, r->name, " "), r->key));
         f32    fw    = ImGui::GetContentRegionAvail().x;
+        axnextname(g, r->key);
         if (ImGui::BeginCombo("##v", cstr0(&a, shown))) {
             for (iz i = 0; i < r->choices.len; i++) {
                 Str c = r->choices[i];
                 if (ImGui::Selectable(cstr0(&a, c), c==shown)) {
                     pick = c;
                 }
+                axselected(g, c==shown);
                 if (theme && i<THEME_COUNT) {
                     itemrect(g, RECT_THEME0+(i32)i);
                 }
@@ -13152,6 +13164,7 @@ static void drawcfgrow(Gui *g, CfgRow *r, i32 target, b32 wide)
         n = n<8 ? n : 8;
         f32 h = (f32)n*ImGui::GetTextLineHeight() + 2*ImGui::GetStyle().FramePadding.y;
         ImGui::InputTextMultiline("##v", r->buf, (uz)r->cap, v2(-1, h));
+        axname(g, r->key);
         r->typed |= ImGui::IsItemEdited();
         r->active = ImGui::IsItemActive();
         if (target >= 0) {
@@ -13199,6 +13212,7 @@ static void drawcfgrow(Gui *g, CfgRow *r, i32 target, b32 wide)
         }
         b32 enter = ImGui::InputTextWithHint("##v", hint.len ? cstr0(&a, hint) : "", r->buf, (uz)r->cap,
                                              ImGuiInputTextFlags_EnterReturnsTrue|ImGuiInputTextFlags_AutoSelectAll);
+        axname(g, r->key);
         if (swatch) {
             ImVec2 fmin = ImGui::GetItemRectMin();
             ImVec2 fmax = ImGui::GetItemRectMax();
@@ -13313,6 +13327,7 @@ static b32 cfgitem(Gui *g, Arena a, b32 combo, Str label, b32 selected, Str tip,
         char const *end = label.cdata + label.len;
         b32         cut = ImGui::CalcTextSize(beg, end).x > w;
         click = ImGui::Selectable("##page", selected);
+        axname(g, label);
         f32 h = ImGui::GetTextLineHeight();
         ImGui::RenderTextEllipsis(ImGui::GetWindowDrawList(), p, v2(p.x+w, p.y+h), p.x+w,
                                   beg, end, 0);
@@ -13322,6 +13337,7 @@ static b32 cfgitem(Gui *g, Arena a, b32 combo, Str label, b32 selected, Str tip,
             itemtip("%s", cstr0(&a, t));
         }
     }
+    axselected(g, selected);
     if (color) {
         ImGui::PopStyleColor();
     }
@@ -13653,6 +13669,7 @@ static void drawcfgfind(Gui *g, Arena a, Slice<i32> found, b32 enter)
         if (ImGui::Selectable("##found", cfgfocused(g, r), 0, v2(0, 2*lh + gap/2))) {
             cfggoto(g, r);
         }
+        axname(g, concat(&t, concat(&t, r->key, ", "), page));
         itemtip("%s", cstr0(&t, cfgrowtip(&t, r)));
         ImDrawList *dl = ImGui::GetWindowDrawList();
         ImGui::RenderTextEllipsis(dl, p, v2(p.x+w, p.y+lh), p.x+w,
@@ -14074,6 +14091,7 @@ static void drawmcptools(Gui *g, Arena a, Str name, Json *m)
             b32 hit = ImGui::Checkbox("##on", &box);
             ImGui::EndDisabled();
             itemnamed(g, concat(&tmp, "mcp tool ", tool));
+            axname(g, tool);
             if (bwhy.len) {
                 whytip(bwhy);
             }
@@ -14140,6 +14158,7 @@ static void drawmcptools(Gui *g, Arena a, Str name, Json *m)
             b32 hit = ImGui::Checkbox("##on", &box);
             ImGui::EndDisabled();
             itemnamed(g, concat(&tmp, "mcp tool ", w));
+            axname(g, w);
             if (hit) {
                 Str err = mcptset(g, &tmp, name, w, box);
                 if (err.len) {
@@ -14516,11 +14535,13 @@ static void drawcfgadd(Gui *g)
         ImGui::SetNextItemWidth(-1);
         ImVec2 at = ImGui::GetCursorScreenPos();
         f32    cw = ImGui::GetContentRegionAvail().x;
+        axnextname(g, "Kind");
         if (ImGui::BeginCombo("##addkind", kinds[k])) {
             for (i32 i = 0; i < (i32)countof(kinds); i++) {
                 if (ImGui::Selectable(kinds[i], i==k)) {
                     g->addepkind = i;
                 }
+                axselected(g, i==k);
                 itemnamed(g, concat(&a, "addkind ", epkindname(i)));
             }
             ImGui::EndCombo();
@@ -14539,8 +14560,18 @@ static void drawcfgadd(Gui *g)
         static char const *how[] = {"ssh", "command"};
         i32 hw = g->remexec;
         ImGui::SetNextItemWidth(100*sc);
-        if (ImGui::Combo("##remhow", &hw, how, countof(how))) {
-            g->remexec = hw;
+        axnextname(g, "Reached by");
+        if (ImGui::BeginCombo("##remhow", how[hw])) {
+            for (i32 i = 0; i < (i32)countof(how); i++) {
+                if (ImGui::Selectable(how[i], i==hw)) {
+                    g->remexec = i;
+                }
+                axselected(g, i==hw);
+                if (i == hw) {
+                    ImGui::SetItemDefaultFocus();
+                }
+            }
+            ImGui::EndCombo();
         }
         itemtip("How it is reached: over ssh, or by a command that runs "
                 "another there, docker exec -i NAME, say");
@@ -14892,6 +14923,7 @@ static void drawsettings(Gui *g)
                       g->cfgpname.len ? key : cfgkindlabel(&a, g->cfgpkind, 0);
         ImVec2 at   = ImGui::GetCursorScreenPos();
         ImGui::SetNextItemWidth(-1);
+        axnextname(g, "Page");
         if (ImGui::BeginCombo("##pages", cstr0(&a, show), ImGuiComboFlags_HeightLarge)) {
             g->cfgcombo = 1;
             drawcfglist(g, 1);
@@ -15190,6 +15222,7 @@ static void drawhelp(Gui *g)
                 if (ImGui::Selectable(cstr0(&a, t), i==cur)) {
                     pick = i;
                 }
+                axselected(g, i==cur);
                 itemnamed(g, concat(&a, "help topic ", t));
             }
         }
@@ -15198,6 +15231,7 @@ static void drawhelp(Gui *g)
     } else {
         ImVec2 at = ImGui::GetCursorScreenPos();
         ImGui::SetNextItemWidth(-1);
+        axnextname(g, "Topic");
         if (ImGui::BeginCombo("##topics", cstr0(&a, helptitle(cur)),
                               ImGuiComboFlags_HeightLarge)) {
             for (i32 i = 0; i < HELP_COUNT; i++) {
@@ -15205,6 +15239,7 @@ static void drawhelp(Gui *g)
                 if (ImGui::Selectable(cstr0(&a, t), i==cur)) {
                     pick = i;
                 }
+                axselected(g, i==cur);
                 itemnamed(g, concat(&a, "help topic ", t));
             }
             ImGui::EndCombo();

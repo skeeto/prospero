@@ -2747,7 +2747,11 @@ static FileBar filetabs(Gui *g, GuiSession *root)
         print(&nb, "file tab ");
         print(&nb, (i64)i + 1);
         itemnamed(g, finish(&nb));
-        if (ImGui::BeginPopupContextItem()) {
+        if (uirclicked(g)) {
+            ImGui::OpenPopupEx(ids[i]);  // as BeginPopupContextItem, by the tab's ID
+        }
+        if (ImGui::BeginPopupEx(ids[i], ImGuiWindowFlags_AlwaysAutoResize|ImGuiWindowFlags_NoTitleBar|
+                                ImGuiWindowFlags_NoSavedSettings)) {
             if (menutip(g, &a, "Close", {}, "Close this tab")) {
                 r.closed = i;
             }
