@@ -17868,12 +17868,15 @@ static Str projroot(Engine *e, Arena *a, Map<Str> **seen, Str dir)
             Str main = normpath(a, com, "..", win);
             Str mgit = join(a, main, ".git");
             if (os_stat(e->os, *a, mgit).type == STAT_DIR) {
-                // As its own sessions list it, whatever path .git took
-                Str real = os_realpath(e->os, a, main);
-                root = real.len ? real : main;
+                root = main;
             }
         }
     }
+    // One spelling of a project however its sessions reached it: through
+    // a .git file, from a folder under the root, or with the separators
+    // a Windows cwd was given in, since the Folders view groups by text.
+    Str real = os_realpath(e->os, a, root);
+    root = real.len ? real : root;
     *upsert(seen, dir, a) = root;
     return root;
 }

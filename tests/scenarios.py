@@ -7923,8 +7923,8 @@ def sessions_root(t):
     """The listing's root, the project folder the Sessions pane's Folders
     view groups by: the git root above a session's folder, or for a
     linked worktree its main checkout; a submodule is a project of its
-    own, and a folder in no repository is its own. Sent only when it
-    differs from the cwd."""
+    own, and a folder in no repository is its own. Given as its real
+    path, and sent only when that differs from the cwd."""
     main = os.path.join(t.work, "main")
     os.makedirs(os.path.join(main, ".git", "worktrees", "wt"))
     os.makedirs(os.path.join(main, ".git", "modules", "sub"))
@@ -7944,13 +7944,18 @@ def sessions_root(t):
     h = t.headless()
     try:
         want = {}
-        for cwd, root in ((main, None), (os.path.join(main, "src", "deep"), main),
-                          (os.path.join(wt, "lib"), main), (sub, None), (plain, None)):
+        for cwd, root in ((main, main), (os.path.join(main, "src", "deep"), main),
+                          (os.path.join(wt, "lib"), main), (sub, sub), (plain, plain)):
             sid = h.call("new", cwd=cwd, model=t.model, endpoint="fake")["sid"]
-            want[sid] = (cwd, root and os.path.realpath(root))
+            want[sid] = (cwd, os.path.realpath(root))
+        # The folder each groups under, its root or else its cwd, one
+        # spelling for one project: on Windows a cwd given with mixed
+        # separators is still the folder its subfolders' sessions name.
         for sid, (cwd, root) in want.items():
             en = listentry(h, sid)
-            t.check(en and en.get("root") == root, f"{cwd}: root {en.get('root')}, want {root}")
+            got = en and (en.get("root") or en.get("cwd"))
+            t.check(got == root, f"{cwd}: folder {got}, want {root}")
+            t.check(not en or en.get("root") != en.get("cwd"), f"{cwd}: root sent as its cwd")
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")
