@@ -180,4 +180,67 @@ static void test_wide(Test *t)
         print(&w, (i64)roots[i].root);
         expect(t, hex16(&a, roots[i].path), finish(&b), finish(&w));
     }
+
+    // Reparse data: a symlink, a junction, and what is no link
+    {
+        Str16 name = wide(&a, u"..\\x");
+        u8   *buf  = (u8 *)alloc<u32>(&a, 64);
+        u8    sym[] = {0x0c, 0, 0, 0xa0, 0, 0, 0, 0, 0, 0, 8, 0, 8, 0, 0, 0, 1, 0, 0, 0};
+        copybytes(buf, sym, countof(sym));
+        copybytes(buf+20, name.data, 8);
+        Reparse r = reparsedata(buf, 28);
+        expect(t, "reparse.symlink", r.kind==REPARSE_LINK && r.relative &&
+                                     r.name.len==4 && r.name.data[3]=='x'
+                                     ? Str("ok") : Str("bad"), "ok");
+        expect(t, "reparse.short", r.kind==REPARSE_LINK && reparsedata(buf, 27).kind==REPARSE_ODDLINK
+                                   ? Str("ok") : Str("bad"), "ok");
+        buf[0] = 0x03;  // a junction: names start at 16, no flags
+        r = reparsedata(buf, 28);
+        expect(t, "reparse.junction", r.kind==REPARSE_LINK && !r.relative &&
+                                      r.name.data==(c16 *)(buf+16) ? Str("ok") : Str("bad"), "ok");
+        buf[0] = 0x1b;  buf[3] = 0x80;  // an app execution alias
+        expect(t, "reparse.alias", reparsedata(buf, 28).kind==REPARSE_NOTLINK
+                                   ? Str("ok") : Str("bad"), "ok");
+        buf[0] = 0x1d;  buf[3] = 0xa0;  // a WSL symlink
+        expect(t, "reparse.wsl", reparsedata(buf, 28).kind==REPARSE_ODDLINK
+                                 ? Str("ok") : Str("bad"), "ok");
+    }
+
+    // Following a link to the path to walk on, or null when it leaves
+    // this computer's disks
+    struct { Str16 link, name; b32 relative; Str16 rest, want; } links[] = {
+        {wide(&a, u"\\\\?\\C:\\a\\j"), wide(&a, u"\\??\\D:\\t"), 0,
+         wide(&a, u"\\x"), wide(&a, u"\\\\?\\D:\\t\\x")},
+        {wide(&a, u"\\\\?\\C:\\a\\j"), wide(&a, u"\\??\\D:\\"), 0,
+         wide(&a, u""), wide(&a, u"\\\\?\\D:\\")},
+        {wide(&a, u"\\\\?\\C:\\a\\j"), wide(&a, u"\\??\\Volume{12}\\d"), 0,
+         wide(&a, u""), wide(&a, u"\\\\?\\Volume{12}\\d")},
+        {wide(&a, u"\\\\?\\C:\\a\\l"), wide(&a, u"..\\b"), 1,
+         wide(&a, u"\\c"), wide(&a, u"\\\\?\\C:\\b\\c")},
+        {wide(&a, u"\\\\?\\C:\\a\\l"), wide(&a, u"sub/./x"), 1,
+         wide(&a, u""), wide(&a, u"\\\\?\\C:\\a\\sub\\x")},
+        {wide(&a, u"\\\\?\\C:\\a\\l"), wide(&a, u"..\\..\\..\\x"), 1,
+         wide(&a, u""), wide(&a, u"\\\\?\\C:\\x")},
+        {wide(&a, u"\\\\?\\C:\\a\\l"), wide(&a, u"\\top"), 1,
+         wide(&a, u"\\y"), wide(&a, u"\\\\?\\C:\\top\\y")},
+        {wide(&a, u"\\\\?\\C:\\a\\l"), wide(&a, u"\\??\\UNC\\h\\s\\f"), 0,
+         wide(&a, u""), {}},
+        {wide(&a, u"\\\\?\\C:\\a\\l"), wide(&a, u"\\??\\COM1"), 0,
+         wide(&a, u""), {}},
+        {wide(&a, u"\\\\?\\C:\\a\\l"), wide(&a, u"\\??\\pipe\\x"), 0,
+         wide(&a, u""), {}},
+        {wide(&a, u"\\\\?\\C:\\a\\l"), wide(&a, u"\\Device\\Null"), 0,
+         wide(&a, u""), {}},
+        {wide(&a, u"\\\\?\\C:\\a\\l"), wide(&a, u"\\??\\C:x"), 0,
+         wide(&a, u""), {}},
+        {wide(&a, u"\\\\?\\UNC\\h\\s\\l"), wide(&a, u"x"), 1,
+         wide(&a, u""), {}},
+    };
+    for (iz i = 0; i < countof(links); i++) {
+        Reparse r   = {links[i].name, REPARSE_LINK, links[i].relative};
+        Str16   got = linkpath(&a, links[i].link, r, links[i].rest);
+        Str     g   = got.data ? hex16(&a, got) : Str("null");
+        Str     w   = links[i].want.data ? hex16(&a, links[i].want) : Str("null");
+        expect(t, hex16(&a, links[i].name), g, w);
+    }
 }

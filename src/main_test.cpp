@@ -439,6 +439,8 @@ static void vlink(Os *os, Str from, Str to)
 // covers a leading part of the path. Windows paths in tests use '/'.
 static Str os_hostids(Os *, Arena *a) { return clone(a, Str("1000:1000")); }
 
+static b32 os_linkfar(Os *, Arena, Str) { return 0; }
+
 static Str os_realpath(Os *os, Arena *a, Str path)
 {
     os->realpaths++;

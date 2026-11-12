@@ -287,6 +287,12 @@ static Str     os_lasterr(Os *, Arena *);
 // junctions, where the system can tell; else only made absolute). Null
 // if missing, including a link to something missing.
 static Str     os_realpath(Os *, Arena *, Str path);
+// (M3) Does a link along an absolute path lead off this computer's
+// disks: on Windows to a UNC path, a device or a pipe, through a symlink
+// or junction, or past too many links to tell? Told without opening a
+// link's target, as os_stat and os_realpath would. Never elsewhere: a
+// stat there does not open what it reaches.
+static b32     os_linkfar(Os *, Arena, Str path);
 
 // This user's ids as UID:GID on Linux, for a container whose root would
 // be root here (ctruser); null elsewhere.

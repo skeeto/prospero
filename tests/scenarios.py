@@ -3889,7 +3889,8 @@ def hello_caps(t):
                                                    "approve", "endpoint.auth",
                                                    "endpoint.logout", "term.open",
                                                    "term.input", "term.resize",
-                                                   "term.ack", "term.close"]
+                                                   "term.ack", "term.close",
+                                                   "fs.read", "fs.stat"]
         t.check(cmds == want, f"cmds: {cmds}")
         caps = hello.get("caps", [])
         t.check(isinstance(caps, list) and all(isinstance(c, str) for c in caps) and
@@ -3900,7 +3901,7 @@ def hello_caps(t):
                  "message", "bypass", "nofolder", "dir", "config.create", "side", "background", "models",
                  "mcp", "mcp.auth", "task.remote", "task.host", "memory", "shell",
                  "git", "answer.trust", "trash", "cut", "endpoint.auth",
-                 "endpoint.copilot", "term", "ask.hold"} <= set(caps)
+                 "endpoint.copilot", "term", "ask.hold", "fs"} <= set(caps)
                 and "host" not in caps,
                 f"caps: {caps}")
         want = 0 if isinstance(t.host, XpHost) else 1  # ConPTY, from 10 1809
@@ -9571,6 +9572,245 @@ def dir_listing(t):
         r = h.call("dir", path=big, dirs=1)
         t.check(r.get("ok") == 1 and entries(r) == {"sub": 1} and r.get("more") == 0,
                 f"its one directory: {r}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+def fsread(h, path, **kw):
+    """fs.read's reply, with its data decoded as bytes (b)."""
+    r = h.call("fs.read", path=path, **kw)
+    if r.get("ok") == 1:
+        r["b"] = base64.b64decode(r.get("data", ""))
+    return r
+
+
+def winjunction(link, target):
+    """Make link, a new folder, a junction to target, an NT path such as
+    \\??\\C:\\x or \\??\\UNC\\h\\s, which mklink /J refuses but
+    FSCTL_SET_REPARSE_POINT takes from anyone (Windows)."""
+    import ctypes
+    import struct
+    from ctypes import wintypes
+    os.mkdir(link)
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateFileW.restype = wintypes.HANDLE
+    k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD,
+                                wintypes.HANDLE]
+    k32.DeviceIoControl.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPVOID,
+                                    wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD,
+                                    ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    h = k32.CreateFileW(link, 0x40000000, 0, None, 3,  # GENERIC_WRITE, OPEN_EXISTING
+                        0x02000000 | 0x00200000, None)  # backup, the reparse point
+    if h is None or h == wintypes.HANDLE(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    name = target.encode("utf-16-le")
+    data = struct.pack("<HHHH", 0, len(name), len(name) + 2, 0) + name + b"\0\0\0\0"
+    buf = struct.pack("<IHH", 0xA0000003, len(data), 0) + data  # a mount point
+    got = wintypes.DWORD()
+    ok = k32.DeviceIoControl(h, 0x000900A4, buf, len(buf), None, 0,  # FSCTL_SET_REPARSE_POINT
+                             ctypes.byref(got), None)
+    err = ctypes.get_last_error()
+    k32.CloseHandle(h)
+    if not ok:
+        raise ctypes.WinError(err)
+
+
+def winfarlinks(t, base):
+    """Links under base reaching off this computer's disks, which fs.read
+    and fs.stat refuse without opening what they name (Windows): junctions
+    to a share, a pipe and a device, and, where this user may make one
+    (Developer Mode), a symlink to a share, as (path, name) pairs; and a
+    junction to base itself, which must still work, as its path."""
+    far = []
+    for name, target in [("jshare", "\\??\\UNC\\nohost.invalid\\share"),
+                         ("jpipe", "\\??\\pipe\\prospero-none"),
+                         ("jdev", "\\??\\COM1")]:
+        winjunction(os.path.join(base, name), target)
+        far.append((os.path.join(base, name, "x.txt"), name))
+    try:
+        os.symlink("\\\\nohost.invalid\\share\\x.txt", os.path.join(base, "sshare.txt"))
+        far.append((os.path.join(base, "sshare.txt"), "symlink"))
+    except OSError:
+        t.note("no symlink to a share: this user may not make symlinks")
+    local = os.path.join(base, "jlocal")
+    winjunction(local, "\\??\\" + os.path.abspath(base))
+    return far, local
+
+
+@scenario(bound=30)
+def fs_read(t):
+    """fs.read {path, off?, max?}: any file on the engine's machine, with no
+    session, in parts, always in base64, exactly: off where the next part
+    begins, more, size, mtime, and real, links followed; ~ in the home
+    directory; a relative path, ~user, a folder, a missing file, a FIFO,
+    /dev/null, and on Windows a device's name, a stream (ADS) and a
+    network path refused; a size change between parts shows in size."""
+    env = skillhome(t)
+    home = env["HOME"]
+    base = t.host.join(t.base, "fsread")
+    t.host.mkdir(t.host.join(base, "folder"))
+    # CRLF across a part's end, bytes that are not UTF-8, a NUL
+    blob = b"line one\r\nline two\r\n\xff\xfe\x00caf\xc3\xa9\r\n" * 5
+    path = t.host.join(base, "blob.txt")
+    t.host.write(path, blob)
+    t.host.touch(path, 1700000000)
+    t.host.write(t.host.join(home, "notes.txt"), "in the home\n")
+    h = t.headless(env=env)
+    try:
+        h.call("hello", proto=0, client="scenarios")
+        t.check("fs" in h.all("hello")[0].get("caps", []), "the fs cap")
+
+        r = fsread(h, path)
+        t.check(r.get("ok") == 1 and r.get("b") == blob and r.get("path") == path and
+                r.get("size") == len(blob) and r.get("off") == len(blob) and
+                r.get("more") == 0 and r.get("mtime") == 1700000000 * 1000 and
+                "text" not in r, f"whole: { {k: v for k, v in r.items() if k != 'data'} }")
+        real = r.get("real", "")
+        if isinstance(t.host, LocalHost) and not t.host.windows:
+            t.check(real == os.path.realpath(path), f"real: {real!r}")
+        else:
+            t.check(real.replace("\\", "/").lower().endswith("fsread/blob.txt"),
+                    f"real: {real!r}")
+
+        # In parts of 7 bytes, exactly, each where the last left off
+        got, off, parts = b"", 0, 0
+        while True:
+            p = fsread(h, path, off=off, max=7)
+            n = min(7, len(blob) - off)
+            t.check(p.get("ok") == 1 and len(p.get("b", b"")) == n and
+                    p.get("off") == off + n and p.get("more") == int(off + n < len(blob)) and
+                    p.get("size") == len(blob), f"a part at {off}: {p}")
+            if p.get("ok") != 1:
+                break
+            got, off, parts = got + p["b"], p["off"], parts + 1
+            if not p.get("more"):
+                break
+        t.check(got == blob and parts == (len(blob) + 6) // 7, f"in {parts} parts")
+        p = fsread(h, path, off=len(blob) + 10)
+        t.check(p.get("ok") == 1 and p.get("b") == b"" and p.get("more") == 0,
+                f"past the end: {p}")
+
+        # ~, and its path as given
+        r = fsread(h, "~/notes.txt")
+        t.check(r.get("ok") == 1 and r.get("b") == b"in the home\n" and
+                r.get("path") == "~/notes.txt", f"~: {r}")
+
+        # A size change between parts: the next part's size says so
+        grow = t.host.join(base, "grow.txt")
+        t.host.write(grow, "0123456789")
+        p = fsread(h, grow, max=4)
+        t.check(p.get("ok") == 1 and p.get("size") == 10 and p.get("more") == 1, f"grow: {p}")
+        t.host.write(grow, "0123456789abcdef")
+        p = fsread(h, grow, off=4, max=4)
+        t.check(p.get("ok") == 1 and p.get("b") == b"4567" and p.get("size") == 16,
+                f"grown: {p}")
+
+        # Refused
+        refused = [(t.host.join(base, "nothere"), "no such file"),
+                   (t.host.join(base, "folder"), "that is a folder"),
+                   ("fsread/blob.txt", "the path must be absolute, or begin with ~"),
+                   ("~nobody/x", None),
+                   ("", "path is required")]
+        if not t.host.windows:
+            fifo = t.host.join(base, "fifo")
+            os.mkfifo(fifo)
+            os.symlink(path, t.host.join(base, "link.txt"))
+            os.symlink(t.host.join(base, "gone"), t.host.join(base, "dangling"))
+            refused += [(fifo, "not a regular file"), ("/dev/null", "not a regular file"),
+                        (t.host.join(base, "dangling"), "no such file")]
+            r = fsread(h, t.host.join(base, "link.txt"))
+            t.check(r.get("ok") == 1 and r.get("b") == blob and
+                    r.get("path") == t.host.join(base, "link.txt") and
+                    r.get("real") == os.path.realpath(path), f"a link: {r}")
+        else:
+            # Never opened: a device's name in any folder, with any
+            # extension, a stream, and the network (NTLM)
+            refused += [(t.host.join(base, "COM1"), "not a regular file"),
+                        (t.host.join(base, "nul.txt"), "not a regular file"),
+                        ("C:/x/CONIN$", "not a regular file"),
+                        (path + ":stream", "not a regular file"),
+                        (path + "::$DATA", "not a regular file"),
+                        ("//server/share/x.txt", "not a regular file"),
+                        ("\\\\?\\UNC\\server\\share\\x.txt", "not a regular file"),
+                        ("\\\\.\\COM1", "not a regular file")]
+            if isinstance(t.host, LocalHost):
+                far, local = winfarlinks(t, base)
+                refused += [(p, "not a regular file") for p, _ in far]
+                r = fsread(h, os.path.join(local, "blob.txt"))
+                t.check(r.get("ok") == 1 and r.get("b") == blob,
+                        f"through a junction here: {r}")
+        for bad, err in refused:
+            r = h.call("fs.read", path=bad)
+            ok = r.get("ok") == 0 and (r.get("err") == err if err else
+                                       "~user" in r.get("err", ""))
+            t.check(ok and "data" not in r, f"{bad!r}: {r}")
+        r = h.call("fs.read", path=path, off=-1)
+        t.check(r.get("ok") == 0 and r.get("err") == "off must not be negative",
+                f"off -1: {r}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=30)
+def fs_stat(t):
+    """fs.stat {paths}: each path's type, in order, with no session: file
+    and dir with size and mtime, other (a FIFO, a device), missing, bad
+    (relative, ~user, a device's name or the network on Windows), ~ in
+    the home directory; 64 paths at most, 65 refused."""
+    env = skillhome(t)
+    home = env["HOME"]
+    base = t.host.join(t.base, "fsstat")
+    t.host.mkdir(t.host.join(base, "folder"))
+    f = t.host.join(base, "a.txt")
+    t.host.write(f, "12345")
+    t.host.touch(f, 1700000000)
+    t.host.write(t.host.join(home, "h.txt"), "h")
+    h = t.headless(env=env)
+    try:
+        h.call("hello", proto=0, client="scenarios")
+        paths = [f, t.host.join(base, "folder"), t.host.join(base, "nothere"),
+                 "fsstat/a.txt", "~/h.txt", "~nobody/x", ""]
+        want = [{"type": "file", "size": 5, "mtime": 1700000000 * 1000}, "dir", "missing",
+                "bad", {"type": "file", "size": 1}, "bad", "bad"]
+        if not t.host.windows:
+            fifo = t.host.join(base, "fifo")
+            os.mkfifo(fifo)
+            os.symlink(f, t.host.join(base, "link"))
+            paths += [fifo, "/dev/null", t.host.join(base, "link")]
+            want += ["other", "other", {"type": "file", "size": 5}]
+        else:
+            paths += [t.host.join(base, "COM1"), f + ":s", "//server/share/x"]
+            want += ["bad", "bad", "bad"]
+            if isinstance(t.host, LocalHost):
+                far, local = winfarlinks(t, base)
+                paths += [p for p, _ in far] + [os.path.join(local, "a.txt")]
+                want += ["bad"] * len(far) + [{"type": "file", "size": 5}]
+        r = h.call("fs.stat", paths=paths + [7])
+        want.append("bad")
+        stats = r.get("stats", [])
+        t.check(r.get("ok") == 1 and len(stats) == len(want), f"stats: {r}")
+        for p, s, w in zip(paths + [7], stats, want):
+            w = w if isinstance(w, dict) else {"type": w}
+            ok = all(s.get(k) == v for k, v in w.items())
+            if w["type"] in ("file", "dir"):
+                ok = ok and isinstance(s.get("size"), int) and s.get("mtime", 0) > 0
+            else:
+                ok = ok and "size" not in s and "mtime" not in s
+            t.check(ok, f"{p!r}: {s}, not {w}")
+
+        r = h.call("fs.stat", paths=[f] * 64)
+        t.check(r.get("ok") == 1 and len(r.get("stats", [])) == 64, "64 paths")
+        r = h.call("fs.stat", paths=[f] * 65)
+        t.check(r.get("ok") == 0 and r.get("err") == "at most 64 paths at a time",
+                f"65 paths: {r}")
+        r = h.call("fs.stat")
+        t.check(r.get("ok") == 0 and r.get("err") == "paths is required", f"none: {r}")
+        r = h.call("fs.stat", paths=[])
+        t.check(r.get("ok") == 1 and r.get("stats") == [], f"empty: {r}")
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")

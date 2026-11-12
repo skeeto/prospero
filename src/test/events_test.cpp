@@ -670,7 +670,8 @@ static void test_events(Test *t)
                "\"git\",\"trash\",\"trash.empty\",\"relay.offer\",\"relay.data\","
                "\"relay.more\",\"relay.peer\",\"relay.call\",\"offer\",\"ask.touch\",\"ask.hold\",\"shell.env\",\"call.stop\","
                "\"cut\",\"uncut\",\"approve\",\"endpoint.auth\",\"endpoint.logout\","
-               "\"term.open\",\"term.input\",\"term.resize\",\"term.ack\",\"term.close\"],"
+               "\"term.open\",\"term.input\",\"term.resize\",\"term.ack\",\"term.close\","
+               "\"fs.read\",\"fs.stat\"],"
                "\"caps\":[\"close.forget\",\"config.refresh\",\"file.base64\",\"desktop\","
                "\"subagents\",\"rename\",\"title.by\",\"archive\",\"group\",\"draft\","
                "\"compact\",\"model\",\"gauge\",\"answer.always\",\"scratch\","
@@ -679,7 +680,7 @@ static void test_events(Test *t)
                "\"git\",\"answer.trust\",\"web\",\"question\",\"files\",\"worktree\",\"worktree.side\","
                "\"trash\",\"relay\",\"question.deadline\",\"ask.deadline\",\"ask.hold\",\"shell.env\",\"call.stop\","
                "\"cut\",\"approve\",\"files.path\",\"sessions.mention\",\"fork.cwd\",\"endpoint.auth\",\"endpoint.copilot\","
-               "\"term\",\"term.host\",\"pdf\"]}");
+               "\"term\",\"term.host\",\"pdf\",\"fs\"]}");
         b.len = 0;
         w = {&b};
         putobject(&w);

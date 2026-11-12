@@ -205,3 +205,152 @@ static iz rootlen(Str16 p)
     }
     return i;
 }
+
+// Walking a path without following its links (fs.read, fs.stat), so as
+// to refuse one that reaches off this computer's disks before anything
+// opens it: on Windows opening a link to \\host\share signs in there,
+// and one to a pipe or device connects to it.
+
+enum : i32 {
+    REPARSE_NOTLINK,  // not a name surrogate: dedup, cloud, app alias
+    REPARSE_LINK,     // a symlink or junction, with name
+    REPARSE_ODDLINK,  // another name surrogate, or one that does not parse
+};
+
+struct Reparse {
+    Str16 name;      // the substitute name, as \??\C:\x, or relative
+    i32   kind;      // REPARSE_*
+    b32   relative;  // a symlink's target from the link's folder
+};
+
+// What reparse data (REPARSE_DATA_BUFFER, from FSCTL_GET_REPARSE_POINT)
+// names. The name points into buf, which must be 2-byte aligned.
+static Reparse reparsedata(u8 *buf, iz len)
+{
+    Reparse r = {};
+    if (len < 4) {
+        r.kind = REPARSE_ODDLINK;
+        return r;
+    }
+    u32 tag = (u32)buf[0] | (u32)buf[1]<<8 | (u32)buf[2]<<16 | (u32)buf[3]<<24;
+    if (!(tag & 0x20000000)) {
+        return r;  // not a name surrogate
+    }
+    r.kind = REPARSE_ODDLINK;
+    iz head = tag==0xa000000c ? 20 :  // IO_REPARSE_TAG_SYMLINK
+              tag==0xa0000003 ? 16 :  // IO_REPARSE_TAG_MOUNT_POINT
+              0;
+    if (!head || len<head) {
+        return r;
+    }
+    iz off = buf[8]  | buf[9]<<8;
+    iz n   = buf[10] | buf[11]<<8;
+    if (!n || off&1 || n&1 || head+off+n>len) {
+        return r;
+    }
+    r.kind      = REPARSE_LINK;
+    r.relative  = head==20 && buf[16]&1;  // SYMLINK_FLAG_RELATIVE
+    r.name.data = (c16 *)(buf + head + off);
+    r.name.len  = n / 2;
+    return r;
+}
+
+// Is p an extended-length path on a disk here: \\?\C: or \\?\Volume{?
+static b32 diskpath(Str16 p)
+{
+    c16 *s = p.data;
+    if (p.len<6 || s[0]!='\\' || s[1]!='\\' || s[2]!='?' || s[3]!='\\') {
+        return 0;
+    }
+    c16 d = (c16)(s[4] | 0x20);
+    if (d>='a' && d<='z' && s[5]==':' && (p.len==6 || s[6]=='\\')) {
+        return 1;
+    }
+    c16 vol[] = {'V', 'o', 'l', 'u', 'm', 'e', '{'};
+    if (p.len < 4+countof(vol)) {
+        return 0;
+    }
+    for (iz i = 0; i < countof(vol); i++) {
+        if (s[4+i] != vol[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+// Append path components to out (len units, its root the first root,
+// ending in a backslash), resolving . and .. as the system does.
+static void pushpath16(c16 *out, iz *len, iz root, Str16 s)
+{
+    for (iz i = 0; i < s.len;) {
+        iz j = i;
+        for (; j<s.len && s.data[j]!='\\' && s.data[j]!='/'; j++) {}
+        iz n = j - i;
+        if (!n || (n==1 && s.data[i]=='.')) {
+            // nothing
+        } else if (n==2 && s.data[i]=='.' && s.data[i+1]=='.') {
+            for (; *len>root && out[*len-1]!='\\'; (*len)--) {}
+            *len -= *len > root;
+        } else {
+            if (*len > root) {
+                out[(*len)++] = '\\';
+            }
+            for (iz k = i; k < j; k++) {
+                out[(*len)++] = s.data[k];
+            }
+        }
+        i = j + 1;
+    }
+}
+
+// The path to walk on from a link at link (\\?\C:\a\l, every folder
+// before it no link) with rest after it ("\b", or empty): its target
+// spliced in, in the same form. Null if the target is off this
+// computer's disks (a UNC path, a device, a pipe) or of an unknown form.
+static Str16 linkpath(Arena *a, Str16 link, Reparse t, Str16 rest)
+{
+    Str16 n    = t.name;
+    iz    root = rootlen(link);
+    c16  *out  = alloc<c16>(a, link.len + n.len + rest.len + 16);
+    iz    len  = 0;
+    if (!t.relative) {
+        if (n.len<4 || n.data[0]!='\\' || n.data[1]!='?' || n.data[2]!='?' ||
+                n.data[3]!='\\') {
+            return {};  // \Device\..., or another NT path
+        }
+        // \??\C:\x, or \??\Volume{guid}\x, as \\?\...
+        Str16 s = {n.data+4, n.len-4};
+        iz    i = 0;
+        for (; i<s.len && s.data[i]!='\\'; i++) {}
+        out[len++] = '\\';
+        out[len++] = '\\';
+        out[len++] = '?';
+        out[len++] = '\\';
+        for (iz k = 0; k < i; k++) {
+            out[len++] = s.data[k];
+        }
+        out[len++] = '\\';
+        root = len;
+        if (!diskpath({out, len})) {
+            return {};  // UNC\, a device, a pipe
+        }
+        pushpath16(out, &len, root, {s.data+i, s.len-i});
+    } else {
+        if (!root || !diskpath(link)) {
+            return {};
+        }
+        for (; len < root; len++) {
+            out[len] = link.data[len];
+        }
+        if (!n.len || (n.data[0]!='\\' && n.data[0]!='/')) {
+            // From the link's folder, else from its drive's root
+            c16 up[] = {'.', '.'};
+            pushpath16(out, &len, root, {link.data+root, link.len-root});
+            pushpath16(out, &len, root, {up, 2});
+        }
+        pushpath16(out, &len, root, n);
+    }
+    pushpath16(out, &len, root, rest);
+    out[len] = 0;
+    return {out, len};
+}

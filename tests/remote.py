@@ -93,6 +93,16 @@ def sc_remote_big(model, n, req):
     yield from finish(model)
 
 
+def sc_remote_flood(model, n, req):
+    """An answer of 24 MB in 64 kB pieces, as fast as they go: a stream
+    that fills any client's queue that takes it slowly."""
+    yield S.head()
+    for i in range(384):
+        words = " ".join(hashlib.sha256(f"{i}.{k}".encode()).hexdigest() for k in range(1000))
+        yield S.data(chunk(model, {"content": f"<{i}> {words}\n"}))
+    yield from finish(model)
+
+
 def sc_remote_search(model, n, req):
     """A web search, then what it found."""
     if n == 0:
@@ -106,6 +116,7 @@ fake_provider.SCENARIOS["remote_slow"] = sc_remote_slow
 fake_provider.SCENARIOS["remote_search"] = sc_remote_search
 fake_provider.SCENARIOS["remote_tool"] = sc_remote_tool
 fake_provider.SCENARIOS["remote_big"] = sc_remote_big
+fake_provider.SCENARIOS["remote_flood"] = sc_remote_flood
 fake_provider.SCENARIOS["remote_an"] = fake_provider.sc_an_plain
 
 
@@ -1544,6 +1555,96 @@ def file_cmd(t):
 
 
 @scenario
+def fs_cmd(t):
+    """fs.read and fs.stat through the host, with no session: any file by
+    absolute path, in parts, in base64, exactly; paths' types in order;
+    a relative path refused."""
+    c = Client(t)
+    s = c.attach()
+    hello = c.call("hello")
+    t.check(hello.get("ok") == 1, f"hello: {hello}")
+    caps = [r for r in c.all() if r.get("ev") == "hello"]
+    t.check(caps and "fs" in caps[-1].get("caps", []) and
+            "fs.read" in caps[-1].get("cmds", []), "the fs cap and commands")
+    blob = bytes(range(256)) * 40 + b"a\r\nb\r\n\xe2\x82"
+    path = os.path.join(t.work, "fs.bin")
+    with open(path, "wb") as f:
+        f.write(blob)
+    r = c.call("fs.read", path=path)
+    t.check(r.get("ok") == 1 and base64.b64decode(r.get("data", "")) == blob and
+            r.get("size") == len(blob) and r.get("more") == 0 and r.get("mtime", 0) > 0 and
+            r.get("path") == path and "sid" not in r,
+            f"whole: { {k: v for k, v in r.items() if k != 'data'} }")
+    got, off = b"", 0
+    while True:
+        p = c.call("fs.read", path=path, off=off, max=4000)
+        part = base64.b64decode(p.get("data", ""))
+        t.check(p.get("ok") == 1 and p.get("off") == off + len(part) and
+                len(part) == min(4000, len(blob) - off), f"a part at {off}")
+        got, off = got + part, p["off"]
+        if not p.get("more") or p.get("ok") != 1:
+            break
+    t.check(got == blob, "in parts")
+    st = c.call("fs.stat", paths=[path, t.work, os.path.join(t.work, "none"), "rel"])
+    types = [x.get("type") for x in st.get("stats", [])]
+    t.check(st.get("ok") == 1 and types == ["file", "dir", "missing", "bad"] and
+            st["stats"][0].get("size") == len(blob), f"fs.stat: {st}")
+    x = c.call("fs.read", path="rel/x")
+    t.check(x.get("ok") == 0 and "absolute" in x.get("err", ""), f"relative: {x}")
+    s.disconnect()
+
+
+@scenario
+def fs_busy(t):
+    """A part of a file as the GUI asks for it (FILES_PART, 256 KiB), its
+    reply over 340 kB in base64, to a client whose queue a busy stream
+    has filled, on a host that keeps what the i686 one does (16 MiB, its
+    reserve for replies 512 KiB): the reply comes, and the client is
+    never dropped as too far behind."""
+    keep = 16 << 20
+    env = dict(t.env, PROSPERO_TEST_KEEPMAX=str(keep))
+    blob = os.urandom(1 << 20)
+    path = os.path.join(t.work, "fs.bin")
+    with open(path, "wb") as f:
+        f.write(blob)
+    r = Raw(t, env)
+    try:
+        r.write(r.regular({"cmd": "hello", "id": 1, "proto": 0}))
+        regs = r.wait(2)
+        t.check(len(regs) == 2, f"hello: {regs}")
+        r.write(r.regular({"cmd": "new", "id": 2, "cwd": t.work, "prompt": "go",
+                           "model": t.model("remote_flood"), "attended": 1}))
+        # Until the host holds back live records for it, its queue full
+        # but for the reserve
+        deadline = time.monotonic() + 60
+        full = keep - keep // 32 - (128 << 10)
+        kept = 0
+        while kept < full and time.monotonic() < deadline:
+            r.write(HEAD.pack(KEEPALIVE, 0, 0, 0))  # acknowledging nothing
+            time.sleep(0.2)
+            kept = sum(13 + len(d) for d in r.wait(0, 0))
+        t.check(kept >= full, f"the stream filled its queue: {kept} bytes")
+        time.sleep(0.5)
+        n = len(r.wait(0, 0))
+        r.write(r.regular({"cmd": "fs.read", "id": 3, "path": path, "max": 256 << 10}))
+        deadline = time.monotonic() + 30
+        got = None
+        while got is None and time.monotonic() < deadline:
+            for d in r.wait(n + 1, 1)[n:]:
+                rec = json.loads(d)
+                if rec.get("ev") == "reply" and rec.get("id") == 3:
+                    got = rec
+        t.check(got and got.get("ok") == 1 and
+                base64.b64decode(got.get("data", "")) == blob[:256 << 10] and
+                got.get("more") == 1, f"the part: { {k: v for k, v in (got or {}).items() if k != 'data'} }")
+        with open(os.path.join(t.state, "run", "host.log"), encoding="utf-8") as f:
+            log = f.read()
+        t.check("fell too far behind" not in log, f"dropped: {log[-300:]!r}")
+    finally:
+        r.close()
+
+
+@scenario
 def stop_cmd(t):
     """The stop command, as the tray's "Stop all": the turn ends, and the
     engine runs on."""
@@ -1841,12 +1942,18 @@ sys.exit(p.wait())
 def slow_link(t):
     """A link that carries 40 KB/s, and a reply (the file command's, of
     1 MB) that takes it 26 s to bring, longer than a silent stream is
-    given: its bytes, still arriving, keep the stream, and it comes."""
+    given: its bytes, still arriving, keep the stream, and it comes.
+    Then a part of a file as the GUI fetches one (fs.read of FILES_PART),
+    the link dropped while it comes: once the link is up again, the part
+    asked for again, as the GUI does, comes exactly, as does any reply
+    to the first that came after all."""
     first = Client(t)
     first.attach()
     first.call("hello")
     first.stream.disconnect()
-    prog = program(t, "slowssh", THROTTLE.replace("RATE", "40000"))
+    pidfile = os.path.join(t.root, "ssh.pids")
+    prog = program(t, "slowssh", FAKE + f"record({pidfile!r})\n" +
+                   THROTTLE.replace("RATE", "40000"))
     c = connect(t, ["--ssh", "here", "--ssh-program", prog, "--path", t.prospero,
                     "--remote-state", t.state, "--remote-config", t.config,
                     "--state", os.path.join(t.root, "local")])
@@ -1867,6 +1974,30 @@ def slow_link(t):
     downs = [r.get("msg") for r in c.records if r.get("ev") == "remote"
              and r.get("state") == "down"]
     t.check(not downs, f"never down: {downs}")
+
+    blob = os.urandom(300 << 10)
+    path = os.path.join(t.work, "fetch.bin")
+    with open(path, "wb") as f:
+        f.write(blob)
+    part = 256 << 10
+    lost = c.send("fs.read", path=path, max=part)
+    time.sleep(3)  # about a third of its 350 kB on the way
+    signal_ours(sshpids(pidfile)[-1], P.KILL, lambda p: grandchild(p, c.p.pid), "ssh")
+    c.wait(lambda r: r.get("ev") == "remote" and r.get("state") == "down", what="down")
+    deadline = time.monotonic() + 30
+    while ups(c) < 2:
+        t.check(time.monotonic() < deadline, "up again")
+        time.sleep(0.2)
+    got = c.call("fs.read", path=path, max=part, timeout=60)
+    t.check(got.get("ok") == 1 and base64.b64decode(got.get("data", "")) == blob[:part] and
+            got.get("more") == 1 and got.get("off") == part,
+            f"asked again: { {k: v for k, v in got.items() if k != 'data'} }")
+    rest = c.call("fs.read", path=path, off=part, max=part, timeout=60)
+    t.check(rest.get("ok") == 1 and base64.b64decode(rest.get("data", "")) == blob[part:] and
+            rest.get("more") == 0, "the rest")
+    for r in c.records:
+        if r.get("ev") == "reply" and r.get("id") == lost and r.get("ok") == 1:
+            t.check(base64.b64decode(r.get("data", "")) == blob[:part], "the first, late")
     x = c.call("quit", timeout=60)
     t.check(x.get("ok") == 1, f"quit: {x}")
     t.check(c.close(timeout=60) == 0, "connect exits 0")

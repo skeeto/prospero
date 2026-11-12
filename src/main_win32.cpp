@@ -51,10 +51,13 @@ enum : i32 {
     FILE_ATTRIBUTE_REPARSE_POINT      = 0x400,
     FILE_BEGIN                        = 0,
     FILE_FLAG_BACKUP_SEMANTICS        = 0x02000000,
+    FILE_FLAG_OPEN_REPARSE_POINT      = 0x00200000,
     FILE_SHARE_ALL                    = 7,
     FILE_TYPE_DISK                    = 1,
     FILE_TYPE_CHAR                    = 2,
     FIND_FIRST_EX_LARGE_FETCH         = 2,
+    FSCTL_GET_REPARSE_POINT           = 0x000900a8,
+    MAXIMUM_REPARSE_DATA_BUFFER_SIZE  = 16*1024,
     FindExInfoBasic                   = 1,
     FindExInfoStandard                = 0,
     FindExSearchNameMatch             = 0,
@@ -264,6 +267,8 @@ W32(uz,     CreateFileW(c16 *, i32, i32, uz, i32, i32, uz));
 W32(uz,     CreateThread(uz, iz, u32 (__stdcall *)(void *), void *, i32,
                          i32 *));
 W32(b32,    DeleteFileW(c16 *));
+W32(b32,    DeviceIoControl(uz, i32, void *, i32, void *, i32, i32 *,
+                            Overlapped *));
 W32(void,   EnterCriticalSection(CriticalSection *));
 W32(void,   ExitProcess[[noreturn]](i32));
 W32(b32,    FileTimeToSystemTime(Filetime *, Systemtime *));
@@ -1287,6 +1292,67 @@ static iz os_stdin(Os *os, u8 *buf, iz len)
 // GetFullPathNameW, with its short (8.3) names spelled out. Results drop
 // the \\?\ prefix: "C:\x", "\\h\s\x".
 static Str os_hostids(Os *, Arena *) { return {}; }
+
+// Walk the path a component at a time, opening each as itself, never
+// what it links to, and through each symlink or junction to its target,
+// as the system would, at most LINKFAR_HOPS of them.
+static b32 os_linkfar(Os *, Arena scratch, Str path)
+{
+    enum { LINKFAR_HOPS = 32 };
+    if (hasnul(path)) {
+        return 0;  // names nothing
+    }
+    Str16 p    = widepath(&scratch, path);
+    i32   hops = 0;
+    u8   *buf  = (u8 *)alloc<u32>(&scratch, MAXIMUM_REPARSE_DATA_BUFFER_SIZE/4);
+    for (b32 again = 1; again;) {
+        again = 0;
+        if (!diskpath(p)) {
+            return 1;  // \\?\UNC\, \\.\: off the disks
+        }
+        for (iz i = rootlen(p); i < p.len;) {
+            iz end = i;
+            for (; end<p.len && p.data[end]!='\\'; end++) {}
+            Arena tmp = scratch;
+            c16  *pre = alloc<c16>(&tmp, end+1);
+            copybytes(pre, p.data, end*(iz)sizeof(c16));
+            uz h = CreateFileW(
+                pre, 0, FILE_SHARE_ALL, 0, OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT, 0
+            );
+            if (h == INVALID_HANDLE_VALUE) {
+                return 0;  // missing or shut: nothing opens past it
+            }
+            FileInfo fi = {};
+            b32      ok = GetFileInformationByHandle(h, &fi);
+            if (!ok || !(fi.attr & FILE_ATTRIBUTE_REPARSE_POINT)) {
+                CloseHandle(h);
+                i = end + 1;
+                continue;
+            }
+            i32 got = 0;
+            ok = DeviceIoControl(
+                h, FSCTL_GET_REPARSE_POINT, 0, 0,
+                buf, MAXIMUM_REPARSE_DATA_BUFFER_SIZE, &got, 0
+            );
+            CloseHandle(h);
+            Reparse t = ok ? reparsedata(buf, got) : Reparse{{}, REPARSE_ODDLINK, 0};
+            if (t.kind == REPARSE_NOTLINK) {
+                i = end + 1;
+                continue;
+            } else if (t.kind!=REPARSE_LINK || ++hops>LINKFAR_HOPS) {
+                return 1;
+            }
+            p = linkpath(&scratch, {p.data, end}, t, {p.data+end, p.len-end});
+            if (!p.data) {
+                return 1;
+            }
+            again = 1;
+            break;
+        }
+    }
+    return 0;
+}
 
 static Str os_realpath(Os *os, Arena *a, Str path)
 {

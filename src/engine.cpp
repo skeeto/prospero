@@ -131,6 +131,7 @@ enum : i64 {
     FILECMD_MAX  = 1 << 20,       // bytes of a file a file command gives
     DIRCMD_MAX   = 2000,          // entries a dir command gives
     DIRCMD_BYTES = 256 << 10,     // and bytes of their names
+    FSSTAT_MAX   = 64,            // paths an fs.stat command takes
     PARK_IDLE    = 7*60*SEC,      // idle this long, a session is parked
     TASK_SOFT    = 200,           // a subagent's requests, by default
     HOP_MAX      = 8,             // messages since user input that wake
@@ -20167,6 +20168,46 @@ static Str pathinside(Os *os, Arena *a, Str dir, Str path)
     return real;
 }
 
+// Part of a file for a frontend, read from off, at most max bytes (for
+// none or too many, as many as fit), at most FILECMD_MAX, or less where
+// the frontend's mailbox could not take the reply: in base64 (binary),
+// as is and cut anywhere, else as text, cleaned as tool output is and
+// cut before a character the end may cut short.
+struct FilePart {
+    Str text;  // as the reply carries it
+    i64 next;  // where the next part begins
+    i64 size;  // the file's
+    b32 more;  // anything after it
+    i32 err;   // READ_*
+};
+
+static FilePart filepart(Engine *e, Arena *a, Str real, i64 off, i64 max, b32 binary)
+{
+    // Every byte may be escaped, or base64 takes 4 for 3
+    iz most = mailmax(e->out) / (binary ? 2 : 8);
+    most = most<(iz)FILECMD_MAX ? most : (iz)FILECMD_MAX;
+    max  = max<1 || max>most ? most : max;
+
+    FilePart r  = {};
+    Read     rd = os_readat(e->os, a, real, off, (iz)max);
+    r.err = rd.err;
+    if (rd.err != READ_OK) {
+        return r;
+    }
+    Str data = rd.data;
+    r.more = off+data.len < rd.size;
+    if (r.more && !binary) {
+        // Before any character at the end, which may be cut short
+        iz i = data.len - 1;
+        for (; i>0 && data.len-i<4 && (data[i]&0xc0)==0x80; i--) {}
+        data.len = i>0 && data[i]>=0x80 ? i : data.len;
+    }
+    r.text = binary ? base64(a, data) : cleanoutput(a, data);
+    r.next = off + data.len;
+    r.size = rd.size;
+    return r;
+}
+
 static void cmdfile(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
 {
     Os *os     = e->os;
@@ -20174,41 +20215,177 @@ static void cmdfile(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
     i64 off    = jsonint(jsonget(j, "off"), 0);
     i64 max    = jsonint(jsonget(j, "max"), FILECMD_MAX);
     b32 binary = jsonstr(jsonget(j, "encoding")) == "base64";
-    // Every byte may be escaped, or base64 takes 4 for 3
-    iz  most   = mailmax(e->out) / (binary ? 2 : 8);
-    most = most<(iz)FILECMD_MAX ? most : (iz)FILECMD_MAX;
-    max  = max<1 || max>most ? most : max;
 
     Str real = off<0 ? Str{} : pathinside(os, &scratch, s->dir, path);
     if (!real.data) {
         reply(e, scratch, id, 0, "no such file in the session's directory", s->sid);
         return;
     }
-    Read rd = os_readat(os, &scratch, real, off, (iz)max);
-    if (rd.err != READ_OK) {
-        reply(e, scratch, id, 0, rd.err==READ_NOTFOUND ? Str("no such file")
-                                                       : Str("cannot read the file"), s->sid);
+    FilePart p = filepart(e, &scratch, real, off, max, binary);
+    if (p.err != READ_OK) {
+        reply(e, scratch, id, 0, p.err==READ_NOTFOUND ? Str("no such file")
+                                                      : Str("cannot read the file"), s->sid);
         return;
     }
-    Str data = rd.data;
-    b32 more = off+data.len < rd.size;
-    if (more && !binary) {
-        // Before any character at the end, which may be cut short
-        iz i = data.len - 1;
-        for (; i>0 && data.len-i<4 && (data[i]&0xc0)==0x80; i--) {}
-        data.len = i>0 && data[i]>=0x80 ? i : data.len;
-    }
 
-    Str   text = binary ? base64(&scratch, data) : cleanoutput(&scratch, data);
-    Buf   b(&scratch, 256 + 6*text.len);
+    Buf   b(&scratch, 256 + 6*p.text.len);
     EvOut w = evbegin(&b, s->sid, 0, os_time(os), EV_REPLY);
     putintkey(&w.json, "id", id);
     putintkey(&w.json, "ok", 1);
     putstrkey(&w.json, "path", path);
-    putstrkey(&w.json, binary ? Str("data") : Str("text"), text);
-    putintkey(&w.json, "off", off + data.len);
-    putintkey(&w.json, "size", rd.size);
-    putintkey(&w.json, "more", more);
+    putstrkey(&w.json, binary ? Str("data") : Str("text"), p.text);
+    putintkey(&w.json, "off", p.next);
+    putintkey(&w.json, "size", p.size);
+    putintkey(&w.json, "more", p.more);
+    emit(e, evend(&w));
+}
+
+// A path a frontend gave fs.read or fs.stat, on this machine: a leading
+// ~ the home directory, else absolute, normalized; else err says why.
+// A device's, or one that may reach over the network (Windows), is bad
+// too, before anything opens it: on Windows a stat opens the path, and
+// whatever a link along it names, so os_linkfar walks the links first
+// without opening their targets.
+struct FsPath {
+    Str path;
+    Str err;  // null if none
+    b32 bad;  // a device or the network's
+};
+
+static FsPath fspath(Engine *e, Arena *a, Str path)
+{
+    FsPath   r  = {};
+    HomePath hp = tildepath(a, path, e->home, HOST_WINDOWS);
+    if (!path.len) {
+        r.err = "path is required";
+    } else if (hp.err.len) {
+        r.err = hp.err;
+    } else if (!pathroot(hp.path, HOST_WINDOWS)) {
+        r.err = "the path must be absolute, or begin with ~";
+    } else {
+        r.path = normpath(a, hp.path, ".", HOST_WINDOWS);
+        r.bad  = devicepath(r.path, HOST_WINDOWS) || netpath(r.path, HOST_WINDOWS) ||
+                 os_linkfar(e->os, *a, r.path);
+    }
+    return r;
+}
+
+// fs.read {path, off?, max?}: part of any file on this machine, for a
+// frontend showing files on another computer: from off (0), up to max
+// bytes, or FILECMD_MAX, or less where the frontend's mailbox could not
+// take the reply, always in base64 (data), cut anywhere: text cleaned
+// here would break a CRLF split between parts, and JSON would mangle
+// bytes that are not UTF-8. The reply has the path as given, real, what
+// it resolves to, links followed, the file's size and mtime (epoch ms),
+// off where the next part begins, and more:1 if there is more after it.
+// Only a regular file is read: not a folder, a device, a FIFO, nor a
+// network path (Windows). Like dir, it needs no session: the client may
+// list any folder already, and open a shell (term.open).
+static void cmdfsread(Engine *e, Arena scratch, i64 id, Json *j)
+{
+    Os    *os  = e->os;
+    Str    raw = jsonstr(jsonget(j, "path"));
+    i64    off = jsonint(jsonget(j, "off"), 0);
+    i64    max = jsonint(jsonget(j, "max"), FILECMD_MAX);
+    FsPath p   = fspath(e, &scratch, raw);
+    if (p.err.len) {
+        reply(e, scratch, id, 0, p.err, {});
+        return;
+    } else if (off < 0) {
+        reply(e, scratch, id, 0, "off must not be negative", {});
+        return;
+    } else if (p.bad) {
+        reply(e, scratch, id, 0, "not a regular file", {});
+        return;
+    }
+    Str real = os_realpath(os, &scratch, p.path);
+    if (real.data && (devicepath(real, HOST_WINDOWS) || netpath(real, HOST_WINDOWS))) {
+        reply(e, scratch, id, 0, "not a regular file", {});
+        return;
+    }
+    Stat st = real.data ? os_stat(os, scratch, real) : Stat{};
+    if (st.type != STAT_FILE) {
+        reply(e, scratch, id, 0, st.type==STAT_MISSING ? Str("no such file") :
+                                 st.type==STAT_DIR     ? Str("that is a folder") :
+                                                         Str("not a regular file"), {});
+        return;
+    }
+    FilePart f = filepart(e, &scratch, real, off, max, 1);
+    if (f.err != READ_OK) {
+        reply(e, scratch, id, 0, f.err==READ_NOTFOUND ? Str("no such file") :
+                                 f.err==READ_NOTFILE  ? Str("not a regular file") :
+                                                        Str("cannot read the file"), {});
+        return;
+    }
+
+    Buf   b(&scratch, 256 + 6*(raw.len + real.len) + f.text.len);
+    EvOut w = evbegin(&b, {}, 0, os_time(os), EV_REPLY);
+    putintkey(&w.json, "id", id);
+    putintkey(&w.json, "ok", 1);
+    putstrkey(&w.json, "path", raw);
+    putstrkey(&w.json, "real", real);
+    putintkey(&w.json, "size", f.size);
+    putintkey(&w.json, "mtime", st.mtime);
+    putintkey(&w.json, "off", f.next);
+    putintkey(&w.json, "more", f.more);
+    putstrkey(&w.json, "data", f.text);
+    emit(e, evend(&w));
+}
+
+// fs.stat {paths}: what each of at most FSSTAT_MAX paths on this machine
+// is, in order, as fs.read takes them: stats, each {type} of "file",
+// "dir", "other" (a device, a FIFO), "missing", or "bad" (relative,
+// ~user, a device's name or a network path on Windows), and for a file
+// or folder its size and mtime (epoch ms), links followed.
+static void cmdfsstat(Engine *e, Arena scratch, i64 id, Json *j)
+{
+    Os   *os    = e->os;
+    Json *paths = jsonget(j, "paths");
+    iz    n     = jsonlen(paths);
+    if (paths->type != JSON_ARRAY) {
+        reply(e, scratch, id, 0, "paths is required", {});
+        return;
+    } else if (n > FSSTAT_MAX) {
+        reply(e, scratch, id, 0, "at most 64 paths at a time", {});
+        return;
+    }
+    Buf   b(&scratch, 256 + 64*n);
+    EvOut w = evbegin(&b, {}, 0, os_time(os), EV_REPLY);
+    putintkey(&w.json, "id", id);
+    putintkey(&w.json, "ok", 1);
+    putkey(&w.json, "stats");
+    putarray(&w.json);
+    for (iz i = 0; i < n; i++) {
+        Arena  a    = scratch;
+        Json  *path = jsonat(paths, i);
+        FsPath p    = path->type==JSON_STRING ? fspath(e, &a, jsonstr(path)) : FsPath{};
+        Stat   st   = {};
+        Str    type = "bad";
+        if (p.path.len && !p.bad) {
+            Str real = os_realpath(os, &a, p.path);
+            if (!real.data) {
+                // Missing, or a link to nothing; else unknowable here
+                st.type = os_stat(os, a, p.path).type==STAT_MISSING ? STAT_MISSING
+                                                                     : STAT_OTHER;
+            } else if (devicepath(real, HOST_WINDOWS) || netpath(real, HOST_WINDOWS)) {
+                st.type = -1;
+            } else {
+                st = os_stat(os, a, real);
+            }
+            type = st.type==STAT_FILE    ? Str("file")    :
+                   st.type==STAT_DIR     ? Str("dir")     :
+                   st.type==STAT_MISSING ? Str("missing") :
+                   st.type==STAT_OTHER   ? Str("other")   : Str("bad");
+        }
+        putobject(&w.json);
+        putstrkey(&w.json, "type", type);
+        if (st.type==STAT_FILE || st.type==STAT_DIR) {
+            putintkey(&w.json, "size", st.size);
+            putintkey(&w.json, "mtime", st.mtime);
+        }
+        putend(&w.json);
+    }
+    putend(&w.json);
     emit(e, evend(&w));
 }
 
@@ -23468,6 +23645,12 @@ static void command(Engine *e, Arena scratch, Str line)
         return;
     case CMD_DIR:
         cmddir(e, scratch, id, j);
+        return;
+    case CMD_FSREAD:
+        cmdfsread(e, scratch, id, j);  // inline, as dir: a slow mount stalls
+        return;
+    case CMD_FSSTAT:
+        cmdfsstat(e, scratch, id, j);
         return;
     case CMD_MODELS:
         cmdmodels(e, scratch, id);

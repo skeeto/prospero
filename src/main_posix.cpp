@@ -1037,6 +1037,8 @@ static Str os_hostids(Os *, Arena *a)
 #endif
 }
 
+static b32 os_linkfar(Os *, Arena, Str) { return 0; }
+
 static Str os_realpath(Os *, Arena *a, Str path)
 {
     if (hasnul(path)) {

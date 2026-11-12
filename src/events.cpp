@@ -210,6 +210,8 @@ enum : i32 {
     CMD_TERMRESIZE,  // its new size
     CMD_TERMACK,     // its output taken, up to an offset
     CMD_TERMCLOSE,   // hung up, or killed
+    CMD_FSREAD,      // part of any file on the engine's machine, in base64
+    CMD_FSSTAT,      // the types, sizes and times of paths there
     CMD_COUNT,
 };
 
@@ -224,7 +226,7 @@ static Str cmdnames[] = {
     "trash.empty", "relay.offer", "relay.data", "relay.more", "relay.peer",
     "relay.call", "offer", "ask.touch", "ask.hold", "shell.env", "call.stop", "cut",
     "uncut", "approve", "endpoint.auth", "endpoint.logout", "term.open",
-    "term.input", "term.resize", "term.ack", "term.close",
+    "term.input", "term.resize", "term.ack", "term.close", "fs.read", "fs.stat",
 };
 static_assert(countof(cmdnames) == CMD_COUNT);
 
@@ -371,6 +373,10 @@ static Str capnames[] = {
                        // files/N-NAME.pdf.txt, which the reply names; a
                        // model with vision gets its images too, as the
                        // message's own (img/N, with a label)
+    "fs",              // fs.read {path, off?, max?} and fs.stat {paths}: any
+                       // file on the engine's machine, by absolute path or
+                       // ~, read in parts in base64, and paths' types, for
+                       // a frontend showing files there (no session needed)
 };
 
 static Str evname(i32 ev)
