@@ -90,6 +90,7 @@ static void axname(Gui *, Str);
 static void axrole(Gui *, AxRole);
 static void axmenu(Gui *);
 static b32  axmenuasked(Gui *, u32);
+static void axexpanded(Gui *, b32 open);
 
 // The last item clicked, or pressed by other means: the keyboard's Space
 // on it, or an assistive tool (ImGui's activation)
@@ -1284,13 +1285,18 @@ static Str markwhat(Gui *g, Arena *a, ViewMsg *m)
 }
 
 // What a foldable message's header says first, as drawheader pens it:
-// its toggle's name.
-static Str headername(View *v, ViewMsg *m)
+// its toggle's name. A tool's has its summary too, cut short, else a
+// transcript's many are all "shell".
+static Str headername(Arena *a, View *v, ViewMsg *m)
 {
     b32 live = v->busy && v->stream>=0 && &v->msgs[v->stream]==m &&
                v->streamkind==VIEW_THINK && !m->faded;
     switch (m->role) {
-    case VIEW_TOOL:    return m->tool->name.len ? m->tool->name : Str("call");
+    case VIEW_TOOL: {
+        ViewTool *t    = m->tool;
+        Str       name = t->name.len ? t->name : Str("call");
+        return t->summary.len ? concat(a, concat(a, name, ": "), utf8head(t->summary, 80)) : name;
+    }
     case VIEW_COMPACT: return "Compacted";
     case VIEW_THINK:   return live ? Str("Thinking\xe2\x80\xa6") : Str("Reasoning");
     default:           return m->label.len ? m->label : rolename(m->role);
@@ -5657,7 +5663,9 @@ static void drawtranscript(Gui *g)
             if (ImGui::InvisibleButton("##toggle", v2(width - actw, head))) {
                 togglemsg(v, i);
             }
-            axname(g, headername(v, m));
+            Arena ha = g->frame;
+            axname(g, headername(&ha, v, m));
+            axexpanded(g, !m->collapsed);
             if (m->role == VIEW_COMPACT) {
                 itemrect(g, RECT_COMPACTHDR);
             } else if (m->role == VIEW_THINK) {
@@ -8619,6 +8627,12 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
     ImGui::SetNextItemAllowOverlap();
     ImGui::InvisibleButton("##head", v2(w>1 ? w : 1, lineh + 4*sc));
     b32 click = uiclicked();
+    Str label = r->kind==SROW_GROUP ? r->group : r->kind==SROW_ARCHIVED ? Str("Archived")
+              : r->kind==SROW_TRASH ? Str("Trash") : r->kind==SROW_DONE ? Str("Finished")
+              : r->kind==SROW_FOLDER ? (r->folder.len ? r->label : Str("No folder"))
+              : rt ? ctrtitle(g->ctrrt.name) : h ? hostlabel(g, &a, h) : remote;
+    axname(g, label);
+    axexpanded(g, !r->folded);
     itemnamed(g, concat(&a, "head ", r->key));
     if (r->key.len && !r->forced && ImGui::IsItemHovered() &&
             ImGui::GetIO().MousePos.x < dx + 7*sc) {
@@ -8667,9 +8681,10 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
         }
         break;
     }
-    b32 menu = r->kind!=SROW_ARCHIVED && r->kind!=SROW_DONE && r->kind!=SROW_FOLDER &&
-               ImGui::BeginPopupContextItem("##headmenu");
-    if (menu) {
+    if (r->kind!=SROW_ARCHIVED && r->kind!=SROW_DONE && r->kind!=SROW_FOLDER && uirclicked(g)) {
+        ImGui::OpenPopup("##headmenu");
+    }
+    if (ImGui::BeginPopup("##headmenu")) {
         if (r->kind == SROW_GROUP) {
             groupitems(g, a, r->group);
         } else if (r->kind == SROW_TRASH) {
@@ -8776,6 +8791,7 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
             }
         }
         ImGui::EndDisabled();
+        axname(g, concat(&a, "New session on ", label));  // only with more than one host
         itemnamed(g, concat(&a, "new ", r->key));
         if (hc) {
             itemnamed(g, "new ctrhost");  // the checklist's, its only one
@@ -8793,6 +8809,7 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
             ImGui::BeginDisabled(closing && h->reconnect);
             b32 b = iconbutton(cbtn);
             ImGui::EndDisabled();
+            axname(g, concat(&a, live ? Str("Disconnect from ") : Str("Connect to "), label));
             itemnamed(g, concat(&a, "connect ", r->key));
             itemtip("%s", live ? "Disconnect: leave it, its sessions running "
                                                "on there"
@@ -8811,7 +8828,9 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
         ImGui::SetCursorScreenPos(v2(p.x + w - bw + st.ItemSpacing.x, y));
         b32 ok = h && hostready(g, h);
         ImGui::BeginDisabled(!ok);
-        if (iconbutton(ICON_ADD)) {
+        b32 add = iconbutton(ICON_ADD);
+        axname(g, concat(&a, "New session in ", r->label));
+        if (add) {
             g->newhost = h;
             g->newctr  = 0;
             fieldput(g->newcwd, homeshow(&a, h, r->folder));
@@ -8919,6 +8938,7 @@ static void rowactions(Gui *g, Arena a, SideRow *r, GuiSession *s, ImVec2 r0, Im
             if (rowicon(g, ICON_DISCARD "##restore", why)) {
                 guitrash(g, s, 0);
             }
+            axname(g, "Restore");
             itemnamed(g, concat(&a, "restore ", title));
             whytip(why.len ? why : Str("Restore: back where it was, with its subagents"));
             ImGui::SameLine(0, gap);
@@ -8926,6 +8946,7 @@ static void rowactions(Gui *g, Arena a, SideRow *r, GuiSession *s, ImVec2 r0, Im
             if (rowicon(g, ICON_TRASH "##delete", why)) {
                 askdelete(g, one, {});
             }
+            axname(g, "Delete Permanently");
             itemnamed(g, concat(&a, "delete ", title));
             whytip(why.len ? why : Str("Delete Permanently: remove it and its subagents "
                                        "for good now, once you confirm"));
@@ -8949,6 +8970,7 @@ static void rowactions(Gui *g, Arena a, SideRow *r, GuiSession *s, ImVec2 r0, Im
                     askdelete(g, one, {});
                 }
             }
+            axname(g, on ? Str("Move to Trash") : Str("Delete"));
             itemnamed(g, concat(&a, "trash ", title));
             if (why.len) {
                 whytip(why);
@@ -8968,6 +8990,7 @@ static void rowactions(Gui *g, Arena a, SideRow *r, GuiSession *s, ImVec2 r0, Im
         f32 gx = x1 - gw;
         ImGui::SetCursorScreenPos(v2(gx, r0.y));
         ImGui::InvisibleButton("##grip", v2(gw, r1.y - r0.y));
+        axrole(g, AX_NONE);  // a drag, whose places its menu's items offer
         itemnamed(g, concat(&a, "grip ", sesstitle(s)));
         if (ImGui::IsItemActive()) {
             g->gripsess = s;
@@ -9006,6 +9029,8 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other, 
     if (ImGui::Selectable("##s", s==g->sess, 0, v2(0, 2*lineh + 4*sc)) && !r->trashed) {
         sessgo(g, s);
     }
+    axname(g, sesstitle(s));
+    axselected(g, s==g->sess);
     ImVec2 r0 = ImGui::GetItemRectMin();
     ImVec2 r1 = ImGui::GetItemRectMax();
     s->row = {r0.x, r0.y, r1.x, r1.y};
@@ -9059,7 +9084,10 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other, 
         }
         tipnow("%s", cstr0(&a, finish(&tip)));
     }
-    if (ImGui::BeginPopupContextItem("##sessmenu")) {
+    if (uirclicked(g)) {
+        ImGui::OpenPopup("##sessmenu");
+    }
+    if (ImGui::BeginPopup("##sessmenu")) {
         g->menusess = s;
         sessitems(g, a, s);
         ImGui::EndPopup();
@@ -9081,6 +9109,8 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other, 
             ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
             g->dothot = r->key;  // its rail lights too (drawrails)
         }
+        axname(g, concat(&a, "Subagents of ", sesstitle(s)));
+        axexpanded(g, !r->folded);
         itemnamed(g, concat(&a, "fold ", sesstitle(s)));
         whytip(r->forced ? Str("Open while a subagent works or asks") :
                r->folded ? Str("Show its subagents") : Str("Hide its subagents"));
@@ -9250,6 +9280,7 @@ static void dragrest(Gui *g, Arena a, GuiSession *s, f32 foot)
     f32 rest  = ImGui::GetContentRegionAvail().y;
     ImGui::InvisibleButton("##dropout", v2(ImGui::GetContentRegionAvail().x,
                                            rest>2*lineh ? rest : 2*lineh));
+    axrole(g, AX_NONE);  // a drag's place, as the row menu's Remove from group
     itemnamed(g, "sessions empty");
     droptarget(g, a, s->host, {}, 0, "out of groups");
 
@@ -9303,6 +9334,7 @@ static b32 stripdrop(Gui *g, Arena a, ImVec4 t, f32 x0, f32 x1, char const *icon
     ImDrawList *dl = ImGui::GetWindowDrawList();
     ImGui::SetCursorScreenPos(v2(x0, t.y));
     ImGui::InvisibleButton(cstr0(&a, concat(&a, "##", name)), v2(x1-x0, t.w-t.y));
+    axrole(g, AX_NONE);  // a drag's place, as an item of the row's menu
     itemnamed(g, name);
     b32 over = 0;
     b32 drop = 0;
@@ -9450,6 +9482,7 @@ static void drawrails(Gui *g, Arena a, Slice<SideRow> rows, Slice<RowAt> at, b32
             pushstr(r->key);
             ImGui::SetCursorScreenPos(v2(x - 6*sc, c0));
             go  = ImGui::InvisibleButton("##rail", v2(12*sc, c1 - c0));
+            axrole(g, AX_NONE);  // as its heading or dot folds it
             hov = ImGui::IsItemHovered() || ImGui::IsItemActive() || r->key==g->dothot;
             itemnamed(g, concat(&a, "rail ", r->key));
             ImGui::PopID();
@@ -9515,6 +9548,7 @@ static void drawsessions(Gui *g)
         newsession(g);
     }
     ImGui::EndDisabled();
+    axname(g, "New session");
     itemnamed(g, "new session");
     whytip(cannew(g) ? Str("A new session, on this computer") : Str{});
     if (g->enginekind != ENGINE_FAKE) {
@@ -9554,7 +9588,9 @@ static void drawsessions(Gui *g)
     }
 
     ImGui::SameLine();
-    if (iconbutton(ICON_TREE "##view")) {
+    b32 view = iconbutton(ICON_TREE "##view");
+    axname(g, "View");
+    if (view) {
         ImGui::OpenPopup("##viewmenu");
     }
     itemnamed(g, "sessions view");
@@ -11055,6 +11091,7 @@ static void drawpathask(Gui *g, PathAsk *pa, char const *pid, char const *name, 
                        : Str("A path on this computer");
         ImGui::InputTextWithHint("##cwd", cstr0(&a, hint), pa->buf, FIELD_MAX,
                                  pf.flags, pathcb, &pf.cb);
+        axname(g, "Path");
         itemnamed(g, concat(&a, nm, " field"));
         pathafter(g, &pf, pa->buf);
         b32 checking = openfile && g->fask.statid;
@@ -11226,6 +11263,7 @@ static b32 wtfields(Gui *g, Arena a, GuiHost *host, Str cwd)
     if (ImGui::InputText("##wtname", g->wtname, FIELD_MAX)) {
         g->wtnamed = g->wtname[0] != 0;
     }
+    axname(g, "Worktree name");
     itemnamed(g, "worktree name");
     itemtip("Its folder's name in .prospero/worktrees, and its branch's after "
                           "the prefix: lowercase letters, digits and single hyphens");
@@ -11375,6 +11413,7 @@ static void drawmove(Gui *g)
     }
     PathField pf = pathbefore(g, host, g->newcwd, &enter, why.len>0);
     ImGui::InputText("##cwd", g->newcwd, FIELD_MAX, pf.flags, pathcb, &pf.cb);
+    axname(g, "Folder");
     itemrect(g, RECT_NEWCWD);
     pathafter(g, &pf, g->newcwd);
     ImGui::SameLine();
@@ -11451,6 +11490,7 @@ static b32 drawnewctr(Gui *g, Arena a, b32 *enter)
     }
     *enter |= ImGui::InputText("##image", g->newimage, FIELD_MAX,
                                ImGuiInputTextFlags_EnterReturnsTrue);
+    axname(g, "Image");
     itemnamed(g, "new image");
     itemtip("A Linux image, as the runtime names it: pulled first if "
                           "it is not here");
@@ -11509,6 +11549,7 @@ static b32 drawnewctr(Gui *g, Arena a, b32 *enter)
     PathField pf = pathbefore(g, g->main, g->newcwd, enter, none);
     ImGui::InputTextWithHint("##cwd", "A folder on this computer", g->newcwd, FIELD_MAX,
                              pf.flags, pathcb, &pf.cb);
+    axname(g, "Folder");
     itemrect(g, RECT_NEWCWD);
     pathafter(g, &pf, g->newcwd);
     ImGui::SameLine();
@@ -11663,6 +11704,7 @@ static void drawnew(Gui *g)
         }
         PathField pf = pathbefore(g, host, g->newcwd, &enter, nofolder);
         ImGui::InputText("##cwd", g->newcwd, FIELD_MAX, pf.flags, pathcb, &pf.cb);
+        axname(g, "Working directory");
         itemrect(g, RECT_NEWCWD);
         pathafter(g, &pf, g->newcwd);
         ImGui::SameLine();
@@ -13983,6 +14025,7 @@ static void drawcfgadd(Gui *g)
     ImGui::SetNextItemWidth(-1);
     b32 enter = ImGui::InputTextWithHint("##addname", "NAME", g->addname, FIELD_MAX,
                                          ImGuiInputTextFlags_EnterReturnsTrue);
+    axname(g, "Name");
     itemrect(g, RECT_ADDNAME);
     if (ep) {
         // By kind (EP_*)
@@ -14032,6 +14075,7 @@ static void drawcfgadd(Gui *g)
                                                                   : "ssh destination",
                                           g->remdest, FIELD_MAX,
                                           ImGuiInputTextFlags_EnterReturnsTrue);
+        axname(g, g->remexec ? Str("Command") : Str("SSH destination"));
         itemrect(g, RECT_ADDDEST);
         itemtip(g->remexec ? "A command that runs another inside it, without a "
                              "shell; it needs /bin/sh there"
@@ -14041,6 +14085,7 @@ static void drawcfgadd(Gui *g)
         enter |= ImGui::InputTextWithHint("##rempath", "prospero there (optional)",
                                           g->rempath, FIELD_MAX,
                                           ImGuiInputTextFlags_EnterReturnsTrue);
+        axname(g, "Path to prospero there");
         itemrect(g, RECT_ADDPATH);
     }
     if (g->adderr.len) {
@@ -15733,6 +15778,7 @@ static void drawlayoutdialogs(Gui *g)
         ImGui::SetNextItemWidth(-1);
         b32 enter = ImGui::InputTextWithHint("##layoutname", "Name", g->layoutbuf, FIELD_MAX,
                                              ImGuiInputTextFlags_EnterReturnsTrue);
+        axname(g, "Layout name");
         itemnamed(g, "layout name");
         Str name = trim({(u8 *)g->layoutbuf, (iz)__builtin_strlen(g->layoutbuf)});
         Str why  = docknamewhy(name);

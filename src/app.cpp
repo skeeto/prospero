@@ -20831,6 +20831,12 @@ static DriveOp a11yops[] = {
     {OP_A11Y, 0, 0, 0, 300, "menu textarea Prompt"},
     {OP_A11Y, 0, 0, 0, 0, "has menuitem Select all"},
     KEY(GKEY_ESCAPE, 0, 300),
+    // A session's row in the sidebar, named for its title, and its menu
+    {OP_A11Y, 0, 0, 0, 300, "menu listitem abcde!"},
+    {OP_A11Y, 0, 0, 0, 0, "has menuitem Copy session ID"},
+    KEY(GKEY_ESCAPE, 0, 300),
+    {OP_A11Y, 0, 0, 0, 0, "has treeitem This computer"},
+    {OP_A11Y, 0, 0, 0, 0, "has button New session on This computer"},
 
     // While a turn runs, Send steers it
     {OP_PROMPT, 0, 0, 0, 100, "Steer me: run a slow command, then answer."},
