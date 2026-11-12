@@ -98,6 +98,10 @@ struct AxGui {
     u32                 nextwin;
     u32                 menuid;   // an item whose context menu was asked for
     i64                 menuwhen;
+    u32                 tabid;    // a tab whose info came before its add
+    char const         *tablabel;
+    u32                 navid;    // the checklist's "nav": the keyboard's item
+    u32                 navwin;
 };
 
 enum { AXLINT_CAP = 1<<12 };
@@ -192,6 +196,10 @@ void ImGuiTestEngineHook_ItemAdd(ImGuiContext *ctx, ImGuiID id, ImRect const &bb
     }
     x->items = push(&x->mem, x->items, it);
     x->last  = x->items.len - 1;
+    if (x->tabid == id) {
+        x->tabid = 0;
+        ImGuiTestEngineHook_ItemInfo(ctx, id, x->tablabel, 0);
+    }
     if (x->nacts && x->acts[0].id==id) {
         x->acts[0].seen = 1;
         if (ctx->NavActivateId == id) {
@@ -211,6 +219,12 @@ void ImGuiTestEngineHook_ItemInfo(ImGuiContext *ctx, ImGuiID id, char const *lab
     iz i = x->items.len - 1;
     for (iz stop = i-8; i>=0 && i>stop && x->items[i].id!=id; i--) {}
     if (i<0 || x->items[i].id!=id) {
+        ImGuiTabBar *bar = ctx->CurrentTabBar;
+        if (bar && ImGui::TabBarFindTabByID(bar, id)) {
+            // A tab gives its info first (TabItemEx): kept for its add
+            x->tabid    = id;
+            x->tablabel = cstr0(&x->mem, axcstr(label));
+        }
         return;
     }
     AxItem      *it = &x->items[i];
@@ -506,6 +520,16 @@ static void axmenu(Gui *g)
     }
 }
 
+// The last item takes the keyboard, as a tool may ask (AXACT_FOCUS),
+// which comes as ImGui's activation: one that is no field, the terminal.
+static void axfocusable(Gui *g)
+{
+    AxItem *it = axlastitem(g);
+    if (it) {
+        it->actions |= AXA_FOCUS;
+    }
+}
+
 // Whether a tool asked for item id's context menu: once.
 // Or the keyboard, its Menu key or Shift+F10 on the item as ImGui's
 // (BeginPopupContextItem's), accessibility on or not.
@@ -796,6 +820,19 @@ static void axnewframe(ImGuiContext *ctx, ImGuiContextHook *hook)
         return;
     }
     axdeliver(x, ctx);
+    if (x->navid) {
+        // As though the keyboard moved there, letting go of a field
+        ImGuiWindow *w = ImGui::FindWindowByID(x->navwin);
+        if (w) {
+            ImGui::ClearActiveID();
+            ImGui::FocusWindow(w);
+            ImGui::SetNavID(x->navid, ImGuiNavLayer_Main, w->NavRootFocusScopeId, ImRect());
+            ctx->NavInputSource           = ImGuiInputSource_Keyboard;
+            ctx->NavCursorVisible         = true;
+            ctx->NavHighlightItemUnderNav = true;
+        }
+        x->navid = 0;
+    }
     if (x->menuid && x->g->sched.now-x->menuwhen>AXEDIT_TTL) {
         x->menuid = 0;  // its item never asked
     }
@@ -805,6 +842,7 @@ static void axnewframe(ImGuiContext *ctx, ImGuiContextHook *hook)
     x->fields  = {};
     x->nextname = {};
     x->last    = -1;
+    x->tabid   = 0;
 }
 
 static void axendframe(ImGuiContext *ctx, ImGuiContextHook *hook)
@@ -868,7 +906,9 @@ static void axstart(Gui *g)
 //   focus ROLE NAME  check that the focus has them
 //   value TEXT       check the focus's value
 //   help ROLE NAME   check that a node has them, and help
-//   can ACTS ROLE NAME  check the node's actions: press,menu, or nothing
+//   can ACTS ROLE NAME  check the item's actions: press,menu, or nothing
+//                    (of the item in front, if more than one has the name)
+//   is STATES ROLE NAME  check the item's states: checked,!expanded
 //   edit LO HI TEXT  edit the focused field: check that it's taken
 //   noedit LO HI TEXT  ... or refused
 //   select A C       select in the focused field
@@ -877,6 +917,7 @@ static void axstart(Gui *g)
 //   press ROLE NAME  press the node: check that it's taken
 //   activate ROLE NAME  focus the field, to edit
 //   pending N        check the actions waiting for ImGui
+//   nav ROLE NAME    make the item ImGui's keyboard item, as arrows would
 //   lint             check that nothing actionable is unnamed, logging
 //                    what is
 
@@ -897,14 +938,17 @@ static b32 axmatch(AxNode *n, Str role, Str name)
     return axrolenames[n->role] == role && n->name == name;
 }
 
-static i32 axfindnode(AxTree *t, Str role, Str name)
+// The item so named, not a pane of that name, in the window in front
+// if more than one has it, as a click finds it (the tree goes back to
+// front): t->len if none
+static i32 axitemat(AxTree *t, Str role, Str name)
 {
-    for (i32 i = 0; i < t->len; i++) {
-        if (axmatch(t->nodes+i, role, name)) {
+    for (i32 i = t->len-1; i >= 0; i--) {
+        if (axmatch(t->nodes+i, role, name) && !ImGui::FindWindowByID(t->nodes[i].key)) {
             return i;
         }
     }
-    return -1;
+    return t->len;
 }
 
 static void axcount(Gui *g, Arena *a, Str what, i64 got, Str want)
@@ -950,7 +994,7 @@ static void driveax(Gui *g, Str cmd)
         }
         axcheck(g, &a, found, concat(&a, "accessible help: ", c.tail));
     } else if (verb == "can") {
-        // can ACTIONS ROLE NAME: the first node so named offers just those
+        // can ACTIONS ROLE NAME: the first item so named offers just those
         // actions, a comma between, or "nothing"
         static Str const acts[] = {"press", "toggle", "expand", "focus", "edit", "select", "menu"};
         Cut  rn   = cut(r.tail, ' ');
@@ -960,8 +1004,7 @@ static void driveax(Gui *g, Str cmd)
                 want |= w.head==acts[k] ? 1u<<k : 0;
             }
         }
-        i32 i = 0;
-        for (; i<t->len && !axmatch(t->nodes+i, rn.head, rn.tail); i++) {}
+        i32 i    = axitemat(t, rn.head, rn.tail);
         u32 got  = i<t->len ? t->nodes[i].actions : ~0u;
         Str what = concat(&a, "accessible actions: ", c.tail);
         if (i<t->len && got!=want) {
@@ -976,6 +1019,22 @@ static void driveax(Gui *g, Str cmd)
             what = concat(&a, what, finish(&b));
         }
         axcheck(g, &a, got==want, what);
+    } else if (verb == "is") {
+        // is STATES ROLE NAME: the first item so named has each state, a
+        // comma between, with a '!' before one it hasn't
+        Cut rn = cut(r.tail, ' ');
+        i32 i  = axitemat(t, rn.head, rn.tail);
+        b32 ok = i < t->len;
+        for (Cut w = cut(r.head, ','); ok && w.head.len; w = cut(w.tail, ',')) {
+            b32 no  = w.head[0] == '!';
+            Str s   = no ? cuthead(w.head, 1) : w.head;
+            u32 bit = 0;
+            for (i32 k = 0; k < (i32)AXS_NAMES; k++) {
+                bit |= s==axstatenames[k] ? 1u<<k : 0;
+            }
+            ok = bit && ((t->nodes[i].state & bit) != 0) != no;
+        }
+        axcheck(g, &a, ok, concat(&a, "accessible state: ", c.tail));
     } else if (verb == "focus") {
         b32 ok = t->focus>=0 && axmatch(t->nodes+t->focus, r.head, r.tail);
         Str what = concat(&a, "accessible focus: ", c.tail);
@@ -1015,12 +1074,25 @@ static void driveax(Gui *g, Str cmd)
         }
         axcount(g, &a, "accessible edits queued: ", n, c.tail);
     } else if (verb=="press" || verb=="activate" || verb=="menu") {
-        i32 i    = axfindnode(t, r.head, r.tail);
+        // The one in front that has it (axitemat): a pane and its
+        // contents may share a name, and a picker's row a session's
         i32 kind = verb=="press" ? AXACT_PRESS : verb=="menu" ? AXACT_MENU : AXACT_FOCUS;
-        b32 got  = i>=0 && axaction(g, t->nodes[i].key, kind);
+        b32 got  = 0;
+        for (i32 i = t->len-1; !got && i>=0; i--) {
+            got = axmatch(t->nodes+i, r.head, r.tail) && axaction(g, t->nodes[i].key, kind);
+        }
         axcheck(g, &a, got, concat(&a, "accessible ", cmd));
     } else if (verb == "pending") {
         axcount(g, &a, "accessible actions pending: ", g->ax->nacts, c.tail);
+    } else if (verb == "nav") {
+        i32 i = axitemat(t, r.head, r.tail);
+        i32 p = i<t->len ? t->nodes[i].parent : -1;
+        if (p >= 0) {
+            g->ax->navid  = t->nodes[i].id;
+            g->ax->navwin = t->nodes[p].key;
+            scheddirty(&g->sched);
+        }
+        axcheck(g, &a, p>=0, concat(&a, "accessible ", cmd));
     } else if (verb == "marked") {
         Str got  = g->ax->ax->text.marked;
         Str what = concat(&a, "accessible marked text: ", c.tail);

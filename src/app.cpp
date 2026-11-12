@@ -17897,6 +17897,12 @@ static DriveOp stopops[] = {
     {OP_KEYUP, 0, key, KEY_CTRL|KEY_SHIFT, 50, ""}, \
     {OP_KEYUP, 0, GKEY_SHIFT, KEY_CTRL, 50, ""}, \
     {OP_KEYUP, 0, GKEY_CTRL, 0, ms, ""}
+// Physical Shift and a key
+#define SHIFTKEY(key, ms) \
+    {OP_KEYDOWN, 0, GKEY_SHIFT, KEY_SHIFT, 50, ""}, \
+    {OP_KEYDOWN, 0, key, KEY_SHIFT, 50, ""}, \
+    {OP_KEYUP, 0, key, KEY_SHIFT, 50, ""}, \
+    {OP_KEYUP, 0, GKEY_SHIFT, 0, ms, ""}
 // The terminal's copy and paste chords: Cmd on macOS, Ctrl on Windows
 // (Ctrl+C copying while there is a selection), else Ctrl+Shift
 #if defined(__APPLE__) || defined(_WIN32)
@@ -19257,6 +19263,18 @@ static DriveOp termops[] = {
     {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Terminal"},
     {OP_CHECK, CHK_TERMHOME, 1, 0, 0, ""},
     {OP_CHECK, CHK_NEWTYPED, 0, 0, 0, ""},
+    // To an assistive tool: its tab's menu, and the grid, which it may
+    // give the keyboard as Ctrl+` does
+    {OP_A11Y, 0, 0, 0, 500, "on"},
+    {OP_A11Y, 0, 0, 0, 300, "menu tab " TERMSH},
+    {OP_A11Y, 0, 0, 0, 0, "has menuitem Restart"},
+    TERMKEY(GKEY_ESCAPE, 300),
+    {OP_A11Y, 0, 0, 0, 300, "activate group Terminal"},
+    {OP_A11Y, 0, 0, 0, 0, "pending 0"},
+    {OP_A11Y, 0, 0, 0, 0, "focus group Terminal"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    CTRLKEY(GKEY_GRAVE, 500),
+    {OP_CHECK, CHK_NEWTYPED, 0, 0, 0, ""},
     CTRLKEY(GKEY_GRAVE, 500),
     {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
     // Floating, hidden from the terminal, then back as it was, with the
@@ -19274,6 +19292,35 @@ static DriveOp termops[] = {
     {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Terminal"},
     {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
     {OP_CHECK, CHK_TERMSCREEN, 0, 0, 0, "\nafter"},
+    // The keyboard's ways in: Enter on the grid as ImGui's item gives it
+    // the keyboard, never reaching the shell, which runs the line only
+    // on a key of its own; Shift+F10 on a tab, the transcript's text and
+    // the prompt opens each one's menu
+    {OP_TEXT, 0, 0, 0, 100, "echo nav$((6*7))"},
+    CTRLKEY(GKEY_GRAVE, 500),
+    {OP_A11Y, 0, 0, 0, 300, "nav group Terminal"},
+    TERMKEY(GKEY_ENTER, 300),
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_A11Y, 0, 0, 0, 0, "can focus group Terminal"},
+    {OP_TEXT, 0, 0, 0, 100, "X"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\nnav42X"},
+    {OP_A11Y, 0, 0, 0, 300, "nav tab " TERMSH},
+    SHIFTKEY(GKEY_F10, 300),
+    {OP_A11Y, 0, 0, 0, 0, "has menuitem Restart"},
+    TERMKEY(GKEY_ESCAPE, 300),
+    {OP_A11Y, 0, 0, 0, 300, "nav group Transcript"},
+    SHIFTKEY(GKEY_F10, 300),
+    {OP_A11Y, 0, 0, 0, 0, "has menuitem Copy Message"},
+    TERMKEY(GKEY_ESCAPE, 300),
+    CTRLKEY(GKEY_GRAVE, 500),
+    CTRLKEY(GKEY_GRAVE, 500),
+    {OP_CHECK, CHK_NEWTYPED, 0, 0, 0, ""},
+    SHIFTKEY(GKEY_F10, 300),
+    {OP_A11Y, 0, 0, 0, 0, "has menuitem Select all"},
+    TERMKEY(GKEY_ESCAPE, 300),
+    CTRLKEY(GKEY_GRAVE, 500),
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
     // vim: an edit, resized mid-edit, written and quit
     {OP_TEXT, 0, 0, 0, 100, "vim -u NONE -N notes.txt"},
     TERMKEY(GKEY_ENTER, 100),
@@ -20623,6 +20670,8 @@ static DriveOp composeops[] = {
     TYPE1("@"),
     TYPE1("s"), TYPE1("e"), TYPE1("s"), TYPE1("s"), TYPE1("a"),
     {OP_CHECK, CHK_MENTION, 2, 0, 0, ""},
+    {OP_A11Y, 0, 0, 0, 0, "is selected listitem Session-A.md"},
+    {OP_A11Y, 0, 0, 0, 0, "is !selected listitem Session A"},
     {OP_A11Y, 0, 0, 0, 600, "press listitem Session A"},
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, "@\"Session A\" "},
     SELALL,
@@ -20836,7 +20885,30 @@ static DriveOp a11yops[] = {
     {OP_A11Y, 0, 0, 0, 0, "has menuitem Copy session ID"},
     KEY(GKEY_ESCAPE, 0, 300),
     {OP_A11Y, 0, 0, 0, 0, "has treeitem This computer"},
+    {OP_A11Y, 0, 0, 0, 0, "is selected listitem abcde!"},
     {OP_A11Y, 0, 0, 0, 0, "has button New session on This computer"},
+    // Its renaming dialog's field, named for what it holds
+    {OP_A11Y, 0, 0, 0, 300, "menu listitem abcde!"},
+    {OP_A11Y, 0, 0, 0, 300, "press menuitem Rename..."},
+    {OP_A11Y, 0, 0, 0, 0, "has textfield Session name"},
+    KEY(GKEY_ESCAPE, 0, 300),
+
+    // The agent's questions: radios for one choice, checkboxes for many,
+    // named with each question's header, checked as picked
+    {OP_PROMPT, 0, 0, 0, 100, "Ask me questions."},
+    {OP_WAIT, W_ASK, 0, 0, 10000, ""},
+    {OP_A11Y, 0, 0, 0, 500, "is checked radio Database: PostgreSQL"},
+    {OP_A11Y, 0, 0, 0, 0, "is !checked radio Database: SQLite"},
+    {OP_A11Y, 0, 0, 0, 0, "is checked checkbox Features: Auth"},
+    {OP_A11Y, 0, 0, 0, 0, "is !checked checkbox Features: Other"},
+    {OP_A11Y, 0, 0, 0, 0, "can toggle checkbox Features: Export"},
+    {OP_A11Y, 0, 0, 0, 300, "press radio Database: SQLite"},
+    {OP_A11Y, 0, 0, 0, 0, "is checked radio Database: SQLite"},
+    {OP_A11Y, 0, 0, 0, 0, "is !checked radio Database: PostgreSQL"},
+    {OP_A11Y, 0, 0, 0, 300, "press checkbox Features: Export"},
+    {OP_A11Y, 0, 0, 0, 0, "is checked checkbox Features: Export"},
+    {OP_A11Y, 0, 0, 0, 300, "press button Submit answers"},
+    {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
 
     // While a turn runs, Send steers it
     {OP_PROMPT, 0, 0, 0, 100, "Steer me: run a slow command, then answer."},
@@ -20844,6 +20916,21 @@ static DriveOp a11yops[] = {
     {OP_A11Y, 0, 0, 0, 0, "has button Steer"},
     {OP_WAIT, W_IDLE, 0, 0, 20000, ""},
     {OP_A11Y, 0, 0, 0, 300, "has button Send"},
+    // A tool row's header folds it, named for the tool and what it ran
+    {OP_A11Y, 0, 0, 0, 0, "is expanded treeitem shell: sleep 3"},
+    {OP_A11Y, 0, 0, 0, 300, "press treeitem shell: sleep 3"},
+    {OP_A11Y, 0, 0, 0, 0, "is !expanded treeitem shell: sleep 3"},
+
+    // A combo, Settings' pages while it is narrow: pressed, it opens on
+    // its choices, the page shown selected
+    SHOWPANE("Settings"),
+    {OP_WAIT, W_CONFIG, 0, 0, 5000, ""},
+    {OP_A11Y, 0, 0, 0, 300, "is !expanded combo Page"},
+    {OP_A11Y, 0, 0, 0, 300, "press combo Page"},
+    {OP_A11Y, 0, 0, 0, 0, "is expanded combo Page"},
+    {OP_A11Y, 0, 0, 0, 0, "is selected listitem Defaults"},
+    KEY(GKEY_ESCAPE, 0, 300),
+    {OP_A11Y, 0, 0, 0, 0, "is !expanded combo Page"},
 
     // Then quiet: nothing pending asks for frames
     {OP_MARK, 0, 0, 0, 11000, ""},

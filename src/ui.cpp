@@ -90,6 +90,7 @@ static void axnextname(Gui *, Str);
 static void axname(Gui *, Str);
 static void axrole(Gui *, AxRole);
 static void axmenu(Gui *);
+static void axfocusable(Gui *);
 static b32  axmenuasked(Gui *, u32);
 static void axexpanded(Gui *, b32 open);
 
