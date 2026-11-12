@@ -11851,6 +11851,18 @@ static void drawoutput(Gui *g)
 {
     Arena    a = g->frame;
     OutFile *o = &g->out;
+    // Where the title bar's X is, for the scripted checklist: none
+    // while docked, as a tab's X is elsewhere
+    ImGuiWindow *win = ImGui::GetCurrentWindow();
+    g->rects[RECT_OUTCLOSE] = {};
+    if (!win->DockIsActive && !(win->Flags & ImGuiWindowFlags_NoTitleBar)) {
+        ImGuiStyle &st = ImGui::GetStyle();
+        ImRect      t  = win->TitleBarRect();
+        f32         sz = ImGui::GetFontSize();
+        f32         x  = t.Max.x - st.FramePadding.x - sz;
+        f32         y  = t.Min.y + st.FramePadding.y;
+        g->rects[RECT_OUTCLOSE] = {x, y, x+sz, y+sz};
+    }
     if (!o->s) {
         ImGui::TextDisabled("Nothing to show: a tool row's Output shows its output here.");
         return;

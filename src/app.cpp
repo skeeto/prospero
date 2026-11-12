@@ -300,6 +300,7 @@ enum : i32 {
     RECT_LASTMSG,    // the transcript's last message, if drawn
     RECT_TOOLPATH,   // the latest tool row's path, a link to its file
     RECT_FILESPANE,  // the Files pane's window, as last drawn
+    RECT_OUTCLOSE,   // the Output window's title bar X, floating
     RECT_THEME0,     // the theme's choices in its open list
     RECT_PANE0 = RECT_THEME0 + THEME_COUNT,  // View's toggle of each pane
     RECT_COUNT = RECT_PANE0 + PANE_COUNT,
@@ -13566,6 +13567,7 @@ enum : i32 {
     T_TOOLPATH,    // the latest tool row's path drawn, a link to its file
     T_TOOLHEAD,    // and its header, left of the path
     T_FILESPANE,   // the middle of the Files pane
+    T_OUTCLOSE,    // the Output window's title bar X
 };
 
 enum : i32 {
@@ -13970,6 +13972,7 @@ enum : i32 {
     CHK_FILEIMAGE,    // the front file is an image dx by dy pixels, drawn
                       // with text "fit" fit to its room, else "unfit" at
                       // its own size
+    CHK_OUTCLOSED,    // the Output window is closed
     CHK_COUNT,
 };
 
@@ -14289,6 +14292,7 @@ static Str chknames[] = {
     "the file revealed is the one said",
     "inline code is a link once its file is found, and only then",
     "the image file is shown at its size, fit or not as said",
+    "the Output window is closed",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -18264,6 +18268,11 @@ static DriveOp remoteops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_CHECK, CHK_OUTCOPY, 0, 0, 0, ""},
+    // Closed, as it would float over the transcript's links to come
+    {OP_MOVE, T_OUTCLOSE, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_OUTCLOSED, 0, 0, 0, ""},
     // Its raw log exported, and imported there again from the Session
     // menu, the dialog filled with its directory there: the copy shown
     // with its transcript, though its log skips the numbers of the
@@ -20841,6 +20850,7 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_REFRESHINC:    return rectcenter(g->rects[RECT_REFRESHINC]);
     case T_THUMB:         return rectcenter(g->rects[RECT_THUMB]);
     case T_SHOTCLOSE:     return rectcenter(g->rects[RECT_SHOTCLOSE]);
+    case T_OUTCLOSE:      return rectcenter(g->rects[RECT_OUTCLOSE]);
     case T_THINKHDR:      return rectcenter(g->rects[RECT_THINKHDR]);
     case T_RAIL:          return rectcenter(g->rects[RECT_RAIL]);
     case T_USERMSG:       return rectcenter(g->rects[RECT_USERMSG]);
@@ -22535,6 +22545,10 @@ static b32 drivecheck(Gui *g, i32 chk)
                iv->tex->td.Width==iv->w && iv->tex->td.Height==iv->h &&
                ImGui::FindWindowByName("Screenshot") &&
                ImGui::FindWindowByName("Screenshot")->Active;
+    }
+    case CHK_OUTCLOSED: {
+        ImGuiWindow *w = ImGui::FindWindowByName("Output");
+        return !g->outopen && (!w || !w->Active);
     }
     case CHK_SHOTCLOSED: {
         ImGuiWindow *w = ImGui::FindWindowByName("Screenshot");
