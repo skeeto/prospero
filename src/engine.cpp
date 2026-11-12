@@ -17799,6 +17799,7 @@ struct ListEntry {
     Str       sideof;  // a side chat's original, else empty
     Str       group;   // empty if in none
     Str       scratch; // its scratch directory, if any
+    Str       root;    // its project's folder (projroot), else empty
     i64       mtime;
     i64       lastact; // its latest activity (epoch ms), never before it was made
     b32       locked;  // open in another process
@@ -17825,6 +17826,43 @@ static i64 lastactof(Engine *e, Arena scratch, Str sid, i64 made)
     return v.ok && v.val>floor ? v.val : floor;
 }
 
+// The project a folder is in, as the Sessions pane's Folders view
+// groups by: the git root holding it, or for a linked worktree the
+// main checkout it belongs to (its .git file names a git directory
+// whose commondir leads back to that checkout's .git), else the folder
+// itself. A submodule's .git file names no commondir, so a submodule
+// is a project of its own. Folders already looked at are in seen.
+static Str projroot(Engine *e, Arena *a, Map<Str> **seen, Str dir)
+{
+    Str *got = upsert(seen, dir, (Arena *)0);
+    if (got) {
+        return *got;
+    }
+    b32 win  = HOST_WINDOWS;
+    Str root = instrroot(e->os, a, dir, win);
+    Str git  = join(a, root, ".git");
+    if (os_stat(e->os, *a, git).type == STAT_FILE) {
+        Str line = trim(cut(os_read(e->os, a, git, 4096).data, '\n').head);
+        Str to   = startswith(line, "gitdir:") ? trim(cuthead(line, 7)) : Str{};
+        Str gdir = to.len ? normpath(a, root, to, win) : Str{};
+        Str cdir = gdir.len ? trim(cut(os_read(e->os, a, join(a, gdir, "commondir"),
+                                               4096).data, '\n').head) : Str{};
+        Str com  = cdir.len ? normpath(a, gdir, cdir, win) : Str{};
+        if (com.len && os_stat(e->os, *a, com).type==STAT_DIR &&
+                normpath(a, com, "..", win)!=com) {
+            Str main = normpath(a, com, "..", win);
+            Str mgit = join(a, main, ".git");
+            if (os_stat(e->os, *a, mgit).type == STAT_DIR) {
+                // As its own sessions list it, whatever path .git took
+                Str real = os_realpath(e->os, a, main);
+                root = real.len ? real : main;
+            }
+        }
+    }
+    *upsert(seen, dir, a) = root;
+    return root;
+}
+
 static b32 listbefore(ListEntry *a, ListEntry *b)
 {
     return compare(a->sid, b->sid) < 0;
@@ -17842,8 +17880,9 @@ struct SessScan {
 
 static SessScan scansessions(Engine *e, Arena *a)
 {
-    SessScan r   = {};
-    Str      dir = join(a, e->statedir, "sessions");
+    SessScan  r     = {};
+    Str       dir   = join(a, e->statedir, "sessions");
+    Map<Str> *roots = 0;
     for (Dirent *d = os_list(e->os, a, dir); d; d = d->next) {
         if (!d->isdir) continue;
         Str   sdir = join(a, dir, d->name);
@@ -17873,6 +17912,10 @@ static SessScan scansessions(Engine *e, Arena *a)
         en.nofolder = jsonint(jsonget(rec.root, "nofolder"), 0) == 1;
         en.wt       = wtfrom(a, jsonget(rec.root, "worktree"));
         en.wtgone   = en.wt.name.len && !wtexists(e, *a, &en.wt);
+        if (!en.nofolder) {
+            Str from = en.wt.name.len ? en.wt.main : en.cwd;
+            en.root  = from.len ? projroot(e, a, &roots, from) : Str{};
+        }
         en.mtime    = d->mtime;
         en.lastact  = lastactof(e, *a, d->name, rec.ts);
         en.parked   = !s && parkedat(e, d->name)>=0;  // its lock is ours
@@ -20222,6 +20265,9 @@ static void listput(Engine *e, JsonOut *w, Slice<ListEntry> list, iz i, i32 dept
     putstrkey(w, "sid", en->sid);
     putstrkey(w, "title", en->title);
     putstrkey(w, "cwd", en->cwd);
+    if (en->root.len && en->root!=en->cwd) {
+        putstrkey(w, "root", en->root);  // else the cwd is its project's
+    }
     if (en->nofolder) {
         putintkey(w, "nofolder", 1);
     }

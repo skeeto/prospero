@@ -7923,6 +7923,8 @@ static void droptarget(Gui *g, Arena a, GuiHost *h, Str group, b32 archived, Str
     ImVec4      t = g->trashrect;
     if (!s || (m.x>=t.x && m.x<t.z && m.y>=t.y && m.y<t.w)) {
         return;  // over the drop strip (dragstrip), drawn over this
+    } else if (g->sideview==SIDEVIEW_FOLDERS && !archived) {
+        return;  // no groups shown to drop into, nor out of
     } else if (!dropok(s, h, group, archived)) {
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) &&
                 h && h!=s->host) {
@@ -7988,7 +7990,7 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
     b32         live    = h && h->r && !h->closing;
     char const *cbtn    = live ? ICON_DISCONNECT : ICON_PLUG;  // Disconnect, Connect
     f32         bw      = 0;
-    if (r->kind == SROW_HOST) {
+    if (r->kind==SROW_HOST || (r->kind==SROW_FOLDER && r->folder.len)) {
         bw += iconw() + st.ItemSpacing.x;
         if (remote1) {
             bw += iconw() + st.ItemSpacing.x;
@@ -8024,6 +8026,10 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
         itemtip("Subagents whose tasks are over, kept here out of the way of those "
                 "still at work");
     }
+    if (r->kind==SROW_FOLDER && !r->forced) {
+        itemtip("%s", r->folder.len ? cstr0(&a, homeshow(&a, h, r->folder))
+                                    : "Sessions that each work in a folder of their own");
+    }
     if (r->kind == SROW_TRASH) {
         itemtip("Deleted sessions, each removed for good after the "
                               "days its host keeps them ([sessions] trash_days)");
@@ -8043,7 +8049,7 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
         }
         break;
     }
-    b32 menu = r->kind!=SROW_ARCHIVED && r->kind!=SROW_DONE &&
+    b32 menu = r->kind!=SROW_ARCHIVED && r->kind!=SROW_DONE && r->kind!=SROW_FOLDER &&
                ImGui::BeginPopupContextItem("##headmenu");
     if (menu) {
         if (r->kind == SROW_GROUP) {
@@ -8083,6 +8089,12 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
     case SROW_TRASH:
         folddot(g, dl, dc, g->pal->dim, r->folded);
         pen(&t, "Trash", STYLE_BOLD, g->pal->dim);
+        pen(&t, finish(&c), 0, g->pal->dim);
+        break;
+    case SROW_FOLDER:
+        folddot(g, dl, dc, g->pal->dim, r->folded);
+        pen(&t, r->folder.len ? r->label : Str("No folder"), STYLE_BOLD,
+            r->folder.len ? g->pal->text : g->pal->dim);
         pen(&t, finish(&c), 0, g->pal->dim);
         break;
     case SROW_DONE:
@@ -8173,6 +8185,24 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
                 remoteconnect(g, a, h ? h->name : remote);
             }
         }
+        ImGui::SetCursorScreenPos(v2(p.x, p.y + lineh + 4*sc + st.ItemSpacing.y));
+        ImGui::Dummy(v2(0, 0));
+    } else if (r->kind==SROW_FOLDER && r->folder.len) {
+        // New session in this folder
+        f32 y = p.y + (lineh + 4*sc - ImGui::GetFrameHeight())/2;
+        ImGui::SetCursorScreenPos(v2(p.x + w - bw + st.ItemSpacing.x, y));
+        b32 ok = h && hostready(g, h);
+        ImGui::BeginDisabled(!ok);
+        if (iconbutton(ICON_ADD)) {
+            g->newhost = h;
+            g->newctr  = 0;
+            fieldput(g->newcwd, homeshow(&a, h, r->folder));
+            g->cwdhost = h==g->main ? 0 : h->uid;
+            newsession(g);
+        }
+        ImGui::EndDisabled();
+        itemnamed(g, concat(&a, "new ", r->key));
+        whytip(ok ? Str("A new session in this folder") : Str("Not connected"));
         ImGui::SetCursorScreenPos(v2(p.x, p.y + lineh + 4*sc + st.ItemSpacing.y));
         ImGui::Dummy(v2(0, 0));
     }
@@ -8509,8 +8539,22 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other, 
         print(&q, jobs==1 ? Str(" job") : Str(" jobs"));
         pen(&b, finish(&q), STYLE_BOLD, g->pal->active);
     }
-    pen(&b, "  ", 0, g->pal->dim);
-    pen(&b, sesswhere(&a, s), 0, g->pal->dim);
+    Str where = sesswhere(&a, s);
+    if (g->sideview==SIDEVIEW_FOLDERS && !r->archived && !r->trashed) {
+        // Under its folder's heading: only where in it, if not its top
+        Str folder = sessfolder(s);
+        Str cwd    = s->view && s->view->cwd.len ? s->view->cwd : s->cwd;
+        if (folder.len && cwd==folder) {
+            where = {};
+        } else if (folder.len && cwd.len>folder.len && startswith(cwd, folder) &&
+                   (cwd[folder.len]=='/' || cwd[folder.len]=='\\')) {
+            where = cuthead(cwd, folder.len+1);
+        }
+    }
+    if (where.len) {
+        pen(&b, "  ", 0, g->pal->dim);
+        pen(&b, where, 0, g->pal->dim);
+    }
     // Its context gauge, thin along the row's foot, where a view has it
     if (v && gaugescaled(v) && p.x+w-4*sc-x >= 8) {
         gaugebar(g, dl, v, x, r1.y - 3*sc, p.x + w - 4*sc - x, 2*sc, sc);
@@ -8891,6 +8935,33 @@ static void drawsessions(Gui *g)
         ImGui::EndPopup();
     }
 
+    ImGui::SameLine();
+    if (iconbutton(ICON_TREE "##view")) {
+        ImGui::OpenPopup("##viewmenu");
+    }
+    itemnamed(g, "sessions view");
+    itemtip(g->sideview==SIDEVIEW_FOLDERS ? "View: by folder" : "View: by group");
+    if (ImGui::BeginPopup("##viewmenu")) {
+        i32 was = g->sideview;
+        if (ImGui::MenuItem("Groups", 0, g->sideview==SIDEVIEW_GROUPS)) {
+            g->sideview = SIDEVIEW_GROUPS;
+        }
+        itemnamed(g, "view groups");
+        itemtip("Your groups, then the sessions in none");
+        if (ImGui::MenuItem("Folders", 0, g->sideview==SIDEVIEW_FOLDERS)) {
+            g->sideview = SIDEVIEW_FOLDERS;
+        }
+        itemnamed(g, "view folders");
+        itemtip("A heading for each project folder: the git repository a "
+                "session works in, else its folder");
+        if (g->sideview != was) {
+            resync       = 1;
+            g->sidedirty = 1;
+            scheddirty(&g->sched);
+        }
+        ImGui::EndPopup();
+    }
+
     // Rows hold still while the pointer is over the pane, a session is
     // dragged or a menu is open, so that a turn ending elsewhere never
     // moves a row from under a click; but not as the pane shows again,
@@ -8948,6 +9019,7 @@ static void drawsessions(Gui *g)
     }
     in.heads   = in.hosts.len > 1;
     in.byat    = g->sidesort == SIDESORT_ACTIVITY;
+    in.byfolder = g->sideview == SIDEVIEW_FOLDERS;
     in.groups  = g->groups;
     in.folds   = g->folds;
     in.archive = drag != 0;
@@ -8982,6 +9054,7 @@ static void drawsessions(Gui *g)
                 }
             }
             e.group    = s->group;
+            e.folder   = sessfolder(s);
             e.archived = s->archived;
             e.trashed  = s->trashed != 0;
             e.asks     = v && v->asks && !s->readonly;
@@ -9016,6 +9089,8 @@ static void drawsessions(Gui *g)
             case SROW_ARCHIVED: print(&d, "A"); break;
             case SROW_TRASH:    print(&d, "T"); break;
             case SROW_DONE:     print(&d, "D "); print(&d, (i64)r->count); break;
+            case SROW_FOLDER:   print(&d, "F "); print(&d, r->folder.len ? r->label
+                                                                         : Str("-")); break;
             }
             print(&d, r->away ? Str("@") : Str(""));
             print(&d, r->folded ? Str("+\n") : Str("\n"));
@@ -9040,7 +9115,8 @@ static void drawsessions(Gui *g)
         if (r->kind == SROW_SESSION) {
             drawsessrow(g, a, r, sess[r->sess], &other, nowms);
         } else {
-            HostRef ref = r->kind==SROW_HOST ? refs[r->host] : HostRef{};
+            b32     on  = r->kind==SROW_HOST || r->kind==SROW_FOLDER;
+            HostRef ref = on ? refs[r->host] : HostRef{};
             drawheading(g, a, r, ref.h, ref.remote, nowms, ref.rt);
         }
         at[i].y1 = ImGui::GetCursorScreenPos().y - ImGui::GetStyle().ItemSpacing.y;

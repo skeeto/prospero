@@ -87,6 +87,7 @@ static Str fontemoji()   { return {(u8 *)emojittf, countof(emojittf)}; }
 #define ICON_UP         "\xee\xaa\xa1"  // U+EAA1, arrow-up
 #define ICON_SESSION    "\xee\xab\x87"  // U+EAC7, comment-discussion
 #define ICON_SORT       "\xee\xad\x95"  // U+EB55, sort-precedence
+#define ICON_TREE       "\xee\xae\x86"  // U+EB86, list-tree
 #define ICON_ARCHIVE    "\xee\xaa\x98"  // U+EA98
 #define ICON_UNARCHIVE  "\xee\xb1\xb6"  // U+EC76
 #define ICON_GRIPPER    "\xee\xac\x84"  // U+EB04
@@ -96,7 +97,7 @@ static Str fontemoji()   { return {(u8 *)emojittf, countof(emojittf)}; }
 static Str fonticonsused =
     ICON_ADD ICON_TRASH ICON_HISTORY ICON_CHECK ICON_DISCARD ICON_EXTERNAL ICON_LIGHTBULB ICON_INFO ICON_CLOSE ICON_FILE ICON_REPLY
     ICON_TERMINAL ICON_DISCONNECT ICON_STOP ICON_FOLDER ICON_PLUG
-    ICON_REFRESH ICON_TOOLS ICON_COPY ICON_SEND ICON_ATTACH ICON_UP ICON_SESSION ICON_SORT
+    ICON_REFRESH ICON_TOOLS ICON_COPY ICON_SEND ICON_ATTACH ICON_UP ICON_SESSION ICON_SORT ICON_TREE
     ICON_ARCHIVE ICON_UNARCHIVE ICON_GRIPPER ICON_NEWFOLDER;
 
 // Symbols models commonly write in prose: arrows, check marks and

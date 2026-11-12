@@ -35,6 +35,10 @@ static Str siderows(Arena *a, SideIn *in, Slice<SideRow> rows)
         case SROW_DONE:
             print(&b, "D");
             break;
+        case SROW_FOLDER:
+            print(&b, "F ");
+            print(&b, r->folder.len ? r->label : Str("-"));
+            break;
         }
         if (r->kind != SROW_SESSION) {
             putbyte(&b, ' ');
@@ -434,6 +438,78 @@ static void test_sidebar(Test *t)
         r.byat = 1;
         expect(t, "sidebar.atsections", siderows(&a, &r, sidetree(&a, &r)),
                "G B 2\n S b2\n S g2\nG A 1\n S g1\nS n1\nS n2\nA 2\n S x1\n S x2\n");
+    }
+
+    // By folder: no groups, a heading for each folder in the order of
+    // its newest root, sessions of no folder under their own; subagents
+    // under their parents whatever their folder; Archived as before
+    {
+        SideIn r = {};
+        r.hosts = push(&a, r.hosts, SideHost{"this", 1, 0});
+        r.sess  = push(&a, r.sess, sidesess(0, "p3", {}, "G", 0));
+        r.sess  = push(&a, r.sess, sidesess(0, "k", "p3", {}, 0));
+        r.sess  = push(&a, r.sess, sidesess(0, "q2", {}, {}, 0));
+        r.sess  = push(&a, r.sess, sidesess(0, "n", {}, {}, 0));
+        r.sess  = push(&a, r.sess, sidesess(0, "p1", {}, {}, 0));
+        r.sess  = push(&a, r.sess, sidesess(0, "x", {}, {}, 1));
+        r.sess[0].folder = "/src/p";
+        r.sess[1].folder = "/elsewhere";
+        r.sess[2].folder = "/src/q";
+        r.sess[4].folder = "/src/p";
+        r.sess[5].folder = "/src/z";
+        r.byfolder = 1;
+        expect(t, "sidebar.folders", siderows(&a, &r, sidetree(&a, &r)),
+               "F p 3\n S p3\n  S k\n S p1\nF q 1\n S q2\nF - 1\n S n\nA 1+\n");
+
+        // With byat, a folder ranks by its newest root
+        i64 at[] = {1, 2, 3, 9, 4, 0};
+        for (iz i = 0; i < countof(at); i++) {
+            r.sess[i].at = at[i];
+        }
+        r.byat = 1;
+        expect(t, "sidebar.foldersat", siderows(&a, &r, sidetree(&a, &r)),
+               "F - 1\n S n\nF p 3\n S p1\n S p3\n  S k\nF q 1\n S q2\nA 1+\n");
+
+        // Folded, and open while something under it asks
+        *upsert(&r.folds, "f:this:/src/p", &a) = 1;
+        expect(t, "sidebar.foldersfold", siderows(&a, &r, sidetree(&a, &r)),
+               "F - 1\n S n\nF p 3+\nF q 1\n S q2\nA 1+\n");
+        r.sess[1].asks = 1;
+        expect(t, "sidebar.foldersasks", siderows(&a, &r, sidetree(&a, &r)),
+               "F - 1\n S n\nF p 3!\n S p1\n S p3!\n  S k\nF q 1\n S q2\nA 1+\n");
+    }
+
+    // By folder under host headings: each host's own folders
+    {
+        SideIn r = {};
+        r.hosts = push(&a, r.hosts, SideHost{"this", 1, 0});
+        r.hosts = push(&a, r.hosts, SideHost{"remote:vm", 1, 0});
+        r.sess  = push(&a, r.sess, sidesess(0, "a", {}, {}, 0));
+        r.sess  = push(&a, r.sess, sidesess(1, "b", {}, {}, 0));
+        r.sess[0].folder = "/w/p";
+        r.sess[1].folder = "/w/p";
+        r.heads    = 1;
+        r.byfolder = 1;
+        expect(t, "sidebar.foldershosts", siderows(&a, &r, sidetree(&a, &r)),
+               "H this 1\n F p 1\n  S a\nH remote:vm 1\n F p 1\n  S b\n");
+    }
+
+    // A folder's label: its last segment, with those before it that
+    // tell it apart from the others
+    {
+        Str        f[] = {"/home/u/src/harness", "/old/harness", "/home/u/src/w64",
+                          "C:\\work\\w64", "/x", "/"};
+        Slice<Str> fs  = {f, countof(f)};
+        expect(t, "sidebar.label0", sidelabel(&a, fs, 0), "src/harness");
+        expect(t, "sidebar.label1", sidelabel(&a, fs, 1), "old/harness");
+        expect(t, "sidebar.label2", sidelabel(&a, fs, 2), "src/w64");
+        expect(t, "sidebar.label3", sidelabel(&a, fs, 3), "work\\w64");
+        expect(t, "sidebar.label4", sidelabel(&a, fs, 4), "x");
+        expect(t, "sidebar.label5", sidelabel(&a, fs, 5), "/");
+        Str        g[] = {"/a/b", "/x/a/b"};
+        Slice<Str> gs  = {g, countof(g)};
+        expect(t, "sidebar.label6", sidelabel(&a, gs, 0), "/a/b");
+        expect(t, "sidebar.label7", sidelabel(&a, gs, 1), "x/a/b");
     }
 }
 

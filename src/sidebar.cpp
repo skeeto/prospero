@@ -18,6 +18,15 @@
 // host than its parent's (phost) goes under that parent, in its
 // section and host heading, marked away.
 //
+// With byfolder (the Folders view), the groups are not shown: under
+// each host, or at the top with no host headings, the live roots go
+// under a heading for each project folder (SideSess.folder), those of no
+// folder under one of their own, the headings in the order of their
+// first roots, so that a folder ranks by its newest session as the
+// roots are sorted. Archived and the Trash are as without it. A
+// heading's label is the folder's last segment, with as many before it
+// as tell it apart from the host's other folders (sidelabel).
+//
 // Every heading folds, and so does a session with subagents. The user's
 // choices are kept by key (folds: 1 folded, 0 open); without one, the
 // Archived and Trash headings are folded and everything else open. A session stays
@@ -41,6 +50,7 @@
 //   t|h:HOST          a host's heading under it
 //   s:HOST:SID        a session with subagents
 //   d:HOST:SID        its finished subagents
+//   f:HOST:PATH       a folder (byfolder), PATH empty for no folder
 //
 // This is free and unencumbered software released into the public domain.
 
@@ -51,6 +61,7 @@ enum : i32 {
     SROW_ARCHIVED,  // the Archived heading
     SROW_TRASH,     // the Trash heading
     SROW_DONE,      // a session's finished subagents
+    SROW_FOLDER,    // a project folder (byfolder)
 };
 
 // The sections a root can be in (sidein).
@@ -72,6 +83,8 @@ struct SideSess {
     Str  parent;    // a subagent's, else empty
     i32  phost;     // that parent's host index + 1, if another host's
     Str  group;     // its group, if any: only a root's counts
+    Str  folder;    // its project's folder, empty for none: only a root's
+                    // counts
     b32  archived;  // only a root's counts
     b32  trashed;   // in the Trash: only a root's counts
     b32  active;    // runs a turn
@@ -90,6 +103,7 @@ struct SideHost {
 struct SideIn {
     Slice<SideSess> sess;    // each host's newest first
     b32             byat;    // roots by their subtrees' latest at
+    b32             byfolder;// live roots under folder headings, no groups
     Slice<SideHost> hosts;   // in order
     Slice<Str>      groups;  // in order, empty ones included
     Map<b32>       *folds;   // the user's choices: 1 folded, 0 open
@@ -104,6 +118,8 @@ struct SideRow {
     i32 host;     // SROW_HOST and SROW_SESSION: index into the hosts
     i32 sess;     // SROW_SESSION: index into the sessions, else -1
     Str group;    // SROW_GROUP: its name; else the group it is in, if any
+    Str folder;   // SROW_FOLDER: its path, empty for no folder
+    Str label;    // SROW_FOLDER: its name to show (sidelabel)
     b32 archived; // under the Archived heading, or it
     b32 trashed;  // under the Trash heading, or it
     Str key;      // its fold key, empty if it does not fold
@@ -256,14 +272,62 @@ static void sideemit(SideTree *t, i32 i, i32 depth, Str group, i32 aside, i32 le
 
 // Whether a root belongs to a section: a group's (SIDE_LIVE, group),
 // the ungrouped (SIDE_LIVE, group empty), the archived or the Trash.
-static b32 sidein(SideSess *s, i32 aside, Str group)
+static b32 sidein(SideIn *in, SideSess *s, i32 aside, Str group)
 {
     if (s->trashed) {
         return aside == SIDE_TRASH;
     } else if (s->archived) {
         return aside == SIDE_ARCHIVED;
     }
-    return aside==SIDE_LIVE && s->group==group;
+    return aside==SIDE_LIVE && (in->byfolder || s->group==group);
+}
+
+// The segments of a path, separated by / or \, empty ones left out.
+static Slice<Str> sidesegs(Arena *a, Str path)
+{
+    Slice<Str> r = {};
+    iz         b = 0;
+    for (iz i = 0; i <= path.len; i++) {
+        if (i==path.len || path[i]=='/' || path[i]=='\\') {
+            if (i > b) {
+                r = push(a, r, Str(path.data+b, i-b));
+            }
+            b = i + 1;
+        }
+    }
+    return r;
+}
+
+// The last n segments of a path, joined by its own separators.
+static Str sidetail(Str path, Slice<Str> segs, iz n)
+{
+    if (n > segs.len) {
+        return path;
+    }
+    Str first = segs[segs.len-n];
+    Str last  = segs[segs.len-1];
+    return Str(first.data, last.data+last.len-first.data);
+}
+
+// How folders[i] is shown: its last segment, with as many before it as
+// tell it apart from every other folder's as many, else the whole path.
+static Str sidelabel(Arena *a, Slice<Str> folders, iz i)
+{
+    Slice<Str> mine = sidesegs(a, folders[i]);
+    for (iz n = 1; n <= mine.len; n++) {
+        Str tail = sidetail(folders[i], mine, n);
+        b32 same = 0;
+        for (iz k = 0; !same && k < folders.len; k++) {
+            if (k != i) {
+                Slice<Str> segs = sidesegs(a, folders[k]);
+                same = segs.len>=n && sidetail(folders[k], segs, n)==tail;
+            }
+        }
+        if (!same) {
+            return tail;
+        }
+    }
+    return folders[i];
 }
 
 // A section's roots of one host (host >= 0) or of all, and what they
@@ -279,7 +343,7 @@ static SideSum sidesum(SideTree *t, Slice<i32> roots, i32 host, i32 aside, Str g
     SideSum r = {};
     for (iz n = 0; n < roots.len; n++) {
         SideSess *s = &t->in->sess[roots[n]];
-        if ((host<0 || s->host==host) && sidein(s, aside, group)) {
+        if ((host<0 || s->host==host) && sidein(t->in, s, aside, group)) {
             r.any    = 1;
             r.count += t->size[roots[n]];
             r.asks  |= t->asks[roots[n]];
@@ -305,6 +369,51 @@ static SideSum sidesums(SideTree *t, Slice<i32> roots, i32 h, i32 aside, Str gro
 }
 
 static void sidehost(SideTree *, Slice<i32>, i32, i32, i32, Str, Str, b32);
+
+// A host's live roots under a heading for each folder, in the order of
+// their first roots.
+static void sidefolders(SideTree *t, Slice<i32> roots, i32 h, i32 depth)
+{
+    SideIn    *in      = t->in;
+    Slice<Str> folders = {};
+    for (iz n = 0; n < roots.len; n++) {
+        SideSess *s   = &in->sess[roots[n]];
+        b32       dup = s->host!=h || !sidein(in, s, SIDE_LIVE, {});
+        for (iz k = 0; !dup && k < folders.len; k++) {
+            dup = folders[k] == s->folder;
+        }
+        if (!dup) {
+            folders = push(t->a, folders, s->folder);
+        }
+    }
+    for (iz f = 0; f < folders.len; f++) {
+        SideRow r = {};
+        r.kind   = SROW_FOLDER;
+        r.depth  = depth;
+        r.host   = h;
+        r.sess   = -1;
+        r.folder = folders[f];
+        r.label  = folders[f].len ? sidelabel(t->a, folders, f) : Str{};
+        r.key    = concat(t->a, concat(t->a, concat(t->a, "f:", in->hosts[h].key), ":"),
+                          folders[f]);
+        for (iz n = 0; n < roots.len; n++) {
+            SideSess *s = &in->sess[roots[n]];
+            if (s->host==h && sidein(in, s, SIDE_LIVE, {}) && s->folder==folders[f]) {
+                r.count += t->size[roots[n]];
+                r.asks  |= t->asks[roots[n]];
+            }
+        }
+        r.forced = r.asks;
+        r.folded = sidefolded(in, r.key, 0) && !r.forced;
+        t->rows  = push(t->a, t->rows, r);
+        for (iz n = 0; !r.folded && n < roots.len; n++) {
+            SideSess *s = &in->sess[roots[n]];
+            if (s->host==h && sidein(in, s, SIDE_LIVE, {}) && s->folder==folders[f]) {
+                sideemit(t, roots[n], depth+1, {}, SIDE_LIVE, 0);
+            }
+        }
+    }
+}
 
 // A section's sessions, under host headings when there are any, a host
 // under another (SideHost.under) after that one's sessions, a level in.
@@ -348,10 +457,15 @@ static void sidehost(SideTree *t, Slice<i32> roots, i32 h, i32 depth, i32 aside,
                 return;
             }
         }
-        for (iz n = 0; n < roots.len; n++) {
-            SideSess *s = &in->sess[roots[n]];
-            if (s->host==h && sidein(s, aside, group)) {
-                sideemit(t, roots[n], depth + (in->heads ? 1 : 0), group, aside, 0);
+        i32 inner = depth + (in->heads ? 1 : 0);
+        if (in->byfolder && aside==SIDE_LIVE) {
+            sidefolders(t, roots, h, inner);
+        } else {
+            for (iz n = 0; n < roots.len; n++) {
+                SideSess *s = &in->sess[roots[n]];
+                if (s->host==h && sidein(in, s, aside, group)) {
+                    sideemit(t, roots[n], inner, group, aside, 0);
+                }
             }
         }
         for (i32 k = 0; k < (i32)in->hosts.len; k++) {
@@ -463,7 +577,7 @@ static Slice<SideRow> sidetree(Arena *a, SideIn *in)
             roots[r] = by[r].root;
         }
     }
-    for (iz i = 0; i < groups.len; i++) {
+    for (iz i = 0; !in->byfolder && i < groups.len; i++) {
         SideSum sum = sidesum(&t, roots, -1, SIDE_LIVE, groups[i]);
         SideRow r   = {};
         r.kind   = SROW_GROUP;

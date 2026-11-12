@@ -94,7 +94,11 @@ their own, after those still at work, asking, or in view. Sessions
 come by recent activity, the latest message sent or turn begun or
 ended first, a session's subagents counting as its own; the sort
 button at its top switches to date created, and the window keeps the
-choice. Rows hold still while the pointer is over the sidebar.
+choice. The view button beside it shows the sessions by folder instead
+of by group: a heading for each project, its git repository (a
+worktree's under the repository it came from), ordered by its newest
+session, with a + to start a new session there; the window keeps that
+choice too. Rows hold still while the pointer is over the sidebar.
 Ctrl+K (Cmd+K on macOS), or Go to... in the Session and View menus,
 opens a palette over the window, in any layout: type words from a
 session's title, group, folder or host, and Enter shows it; layouts,

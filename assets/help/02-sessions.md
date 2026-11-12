@@ -74,6 +74,20 @@ says the row drags: drag it, or the row anywhere, as below. The row
 lifts out as a card that follows the pointer and says where it would
 go.
 
+## By folder
+
+The view button, beside the sort button, switches the sidebar from
+your groups to Folders: a heading for each project, the git repository
+a session works in (for a worktree, the repository it was made from),
+else its folder, and one for sessions with no folder. Each host has its
+own. A folder comes where its newest session would, by the sort you
+chose, so the project you work in now is at the top. A session's row
+then shows only where it works within its folder, if not at its top,
+and the + on a folder's heading starts a new session there. Archived
+and the Trash are as before. Your groups are kept, just not shown, and
+a session can't be dragged into or out of one in this view. The window
+remembers the choice.
+
 ## Going to a session
 
 Session → Go to... (Ctrl+K, Cmd+K on macOS) opens a palette over the

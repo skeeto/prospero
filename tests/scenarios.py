@@ -7828,6 +7828,44 @@ def title_rename(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+@scenario()
+def sessions_root(t):
+    """The listing's root, the project folder the Sessions pane's Folders
+    view groups by: the git root above a session's folder, or for a
+    linked worktree its main checkout; a submodule is a project of its
+    own, and a folder in no repository is its own. Sent only when it
+    differs from the cwd."""
+    main = os.path.join(t.work, "main")
+    os.makedirs(os.path.join(main, ".git", "worktrees", "wt"))
+    os.makedirs(os.path.join(main, ".git", "modules", "sub"))
+    os.makedirs(os.path.join(main, "src", "deep"))
+    with open(os.path.join(main, ".git", "worktrees", "wt", "commondir"), "w") as f:
+        f.write("../..\n")
+    wt = os.path.join(t.work, "linked")
+    os.makedirs(os.path.join(wt, "lib"))
+    with open(os.path.join(wt, ".git"), "w") as f:
+        f.write("gitdir: " + os.path.join(main, ".git", "worktrees", "wt") + "\n")
+    sub = os.path.join(main, "sub")
+    os.makedirs(sub)
+    with open(os.path.join(sub, ".git"), "w") as f:
+        f.write("gitdir: ../.git/modules/sub\n")
+    plain = os.path.join(t.work, "plain")
+    os.makedirs(plain)
+    h = t.headless()
+    try:
+        want = {}
+        for cwd, root in ((main, None), (os.path.join(main, "src", "deep"), main),
+                          (os.path.join(wt, "lib"), main), (sub, None), (plain, None)):
+            sid = h.call("new", cwd=cwd, model=t.model, endpoint="fake")["sid"]
+            want[sid] = (cwd, root and os.path.realpath(root))
+        for sid, (cwd, root) in want.items():
+            en = listentry(h, sid)
+            t.check(en and en.get("root") == root, f"{cwd}: root {en.get('root')}, want {root}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 @scenario(bound=20)
 def sessions_lastact(t):
     """The listing's lastact, a session's latest activity: its last

@@ -118,6 +118,13 @@ enum : i32 {
     SIDESORT_CREATED,   // newest made first
 };
 
+// What the sidebar's live sessions are under (the view button), kept
+// with the layout
+enum : i32 {
+    SIDEVIEW_GROUPS,    // the user's groups, the default
+    SIDEVIEW_FOLDERS,   // a heading for each project folder (byfolder)
+};
+
 // Input kinds, recorded for staleness reports
 enum : i32 {
     INPUT_MOVE,
@@ -606,6 +613,7 @@ struct GuiSession {
     Str          title;     // from the list until opened
     Str          cwd;
     b32          nofolder;  // cwd is a folder of its own, from the list
+    Str          root;      // its project's folder, from the list if not cwd
     Str          model;
     Str          parent;    // a subagent's, from the list until opened
     b32          remote;    // and that parent is on another host
@@ -1329,6 +1337,7 @@ struct Gui {
     Slice<Str>         groups;     // the groups' order, empty ones included
     b32                sidedirty;  // folds or groups changed: kept with the layout
     i32                sidesort;   // SIDESORT_*: the sidebar's order, kept with the layout
+    i32                sideview;   // SIDEVIEW_*: and what it is under, likewise
     i64                sideframe;  // the frame the sidebar last drew, to tell
                                    // when it shows again
     GuiSession        *menusess;   // the session the context menu is for
@@ -4961,6 +4970,8 @@ static void onsessions(Gui *g, GuiHost *h, Json *j)
         s->sideof = s->sideof==sideof ? s->sideof : clone(&g->perm, sideof);
         s->cwd    = s->cwd==cwd       ? s->cwd    : clone(&g->perm, cwd);
         s->nofolder = jsonint(jsonget(e, "nofolder"), 0) == 1;
+        Str   root  = jsonstr(jsonget(e, "root"));  // an older engine's: none
+        s->root     = s->root==root ? s->root : clone(&g->perm, root);
         Json *wt    = jsonget(e, "worktree");
         Str   wname = jsonstr(jsonget(wt, "name"));
         Str   wbr   = jsonstr(jsonget(wt, "branch"));
@@ -6358,6 +6369,17 @@ static b32 sessnofolder(GuiSession *s)
 {
     View *v = s->view;
     return v && v->cwd.len ? v->nofolder : s->nofolder;
+}
+
+// The project folder the Folders view puts a session under: as the list
+// has it, else where it works; empty for a folder of its own.
+static Str sessfolder(GuiSession *s)
+{
+    View *v = s->view;
+    if (sessnofolder(s)) {
+        return {};
+    }
+    return s->root.len ? s->root : v && v->cwd.len ? v->cwd : s->cwd;
 }
 
 // Where a session works, as shown: "No folder" for a folder of its own,
@@ -11932,6 +11954,7 @@ static void saveini(Gui *g, b32 last)
 //   Fullscreen=0
 //   [Prospero][Sidebar]
 //   Sort=created
+//   View=folders
 //   Group=Work
 //   Folded=g:Work
 //   Opened=a
@@ -11994,6 +12017,8 @@ static void iniline(ImGuiContext *, ImGuiSettingsHandler *h, void *entry, char c
     } else if (entry == (void *)3) {
         if (kv.head == "Sort") {
             g->sidesort = kv.tail=="created" ? SIDESORT_CREATED : SIDESORT_ACTIVITY;
+        } else if (kv.head == "View") {
+            g->sideview = kv.tail=="folders" ? SIDEVIEW_FOLDERS : SIDEVIEW_GROUPS;
         } else if (kv.head=="Group" && kv.tail.len) {
             addgroup(g, kv.tail);
             g->sidedirty = 0;  // as the file has it
@@ -12058,10 +12083,13 @@ static void iniwrite(ImGuiContext *, ImGuiSettingsHandler *h, ImGuiTextBuffer *o
         out->appendf("Maximized=%d\n", w->max ? 1 : 0);
         out->appendf("Fullscreen=%d\n\n", w->full ? 1 : 0);
     }
-    if (g->groups.len || g->folds || g->sidesort) {
+    if (g->groups.len || g->folds || g->sidesort || g->sideview) {
         out->append("[Prospero][Sidebar]\n");
         if (g->sidesort == SIDESORT_CREATED) {
             out->append("Sort=created\n");
+        }
+        if (g->sideview == SIDEVIEW_FOLDERS) {
+            out->append("View=folders\n");
         }
         for (iz i = 0; i < g->groups.len; i++) {
             Str n = g->groups[i];
@@ -16481,6 +16509,28 @@ static DriveOp sessionsops[] = {
     {OP_UP, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_SIDE, 0, 0, 0, "H this\n S Start more subagents.\n"},
     {OP_CHECK, CHK_NOINI, 0, 0, 0, "Sort="},
+    // By folder: the sessions under their folder's heading, a level in,
+    // kept with the layout; then by group again
+    {OP_MOVE, T_NAMED, 0, 0, 100, "sessions view"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "view folders"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "H this\n F "},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "\n  S Start more subagents.\n"},
+    {OP_CHECK, CHK_SIDEINI, 0, 0, 0, "View=folders\n"},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-folders"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "sessions view"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "view groups"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "H this\n S Start more subagents.\n"},
+    {OP_CHECK, CHK_NOINI, 0, 0, 0, "View="},
     // Dragged by its grip onto New group, at the pane's foot: named, and
     // in it
     {OP_MOVE, T_SESSTITLE, 0, 0, 300, "Whole fork"},
