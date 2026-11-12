@@ -741,14 +741,14 @@ static AttImage *mentionchip(Gui *g, GuiSession *s, Str label, Str src, Str rpat
     AttImage *m = s->att->imgs + s->att->len++;
     *m = {};
     m->r        = r;
-    m->mem      = newarena(r);
-    m->label    = clone(&m->mem, label);
+    m->mem      = attarena(r);
+    m->label    = clone(m->mem, label);
     m->file     = 1;
     m->mention  = 1;
     m->pathonly = !rpath.len;
-    m->src      = clone(&m->mem, src);
-    m->rpath    = clone(&m->mem, rpath);
-    m->why      = clone(&m->mem, why);
+    m->src      = clone(m->mem, src);
+    m->rpath    = clone(m->mem, rpath);
+    m->why      = clone(m->mem, why);
     scheddirty(&g->sched);
     return m;
 }

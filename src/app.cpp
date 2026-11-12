@@ -1346,7 +1346,7 @@ enum : i32 {
 // An attachment: an image, or a text file (file).
 struct AttImage {
     Region *r;      // what follows, until sent or removed
-    Arena   mem;
+    Arena  *mem;    // in r itself (attarena)
     Str     data;   // as attached, empty once withdrawn from the queue
     Str     mime;
     i32     w;
@@ -5319,6 +5319,19 @@ static Str attachwhy(GuiSession *s)
     return {};
 }
 
+// An attachment's arena, kept at the start of its own region, so that an
+// attachment moved to another slot (attachremove) moves a pointer. An
+// Arena assigned from slot to slot is re-pointed, as the arena checker
+// sees it, which drops and, under ASan, poisons what the slot's arena
+// held: the bytes of the attachment that had just moved down.
+static Arena *attarena(Region *r)
+{
+    Arena  a = newarena(r);
+    Arena *m = alloc<Arena>(&a);
+    *m = a;  // handed off: m allocates past itself, and a, given, buries nothing as it ends
+    return m;
+}
+
 // A thumbnail of an image, fit in the box at the display's scale. Null
 // if it cannot be decoded.
 static GuiTex *attthumb(Gui *g, Str data)
@@ -5384,15 +5397,15 @@ static Str attachadd(Gui *g, GuiSession *s, Str data, Str label, Str src = {})
         AttImage *m = s->att->imgs + s->att->len++;
         *m = {};
         m->r     = r;
-        m->mem   = newarena(r);
-        m->data  = clone(&m->mem, data);
-        m->label = clone(&m->mem, label.len ? label : Str("pasted.txt"));
+        m->mem   = attarena(r);
+        m->data  = clone(m->mem, data);
+        m->label = clone(m->mem, label.len ? label : Str("pasted.txt"));
         m->file  = 1;
         m->pdf   = pdf;
         m->bytes = data.len;
         m->lines = pdf ? 0 : countlines(startswith(data, "\xef\xbb\xbf") ? cuthead(data, 3)
                                                                            : data);
-        m->src   = clone(&m->mem, src);
+        m->src   = clone(m->mem, src);
         scheddirty(&g->sched);
         return {};
     } else if (s->view->novision) {
@@ -5413,14 +5426,14 @@ static Str attachadd(Gui *g, GuiSession *s, Str data, Str label, Str src = {})
     AttImage *m = s->att->imgs + s->att->len++;
     *m = {};
     m->r     = r;
-    m->mem   = newarena(r);
-    m->data  = clone(&m->mem, data);
-    m->label = clone(&m->mem, label);
+    m->mem   = attarena(r);
+    m->data  = clone(m->mem, data);
+    m->label = clone(m->mem, label);
     m->mime  = k.mime;
     m->w     = k.w;
     m->h     = k.h;
     m->tex   = attthumb(g, data);
-    m->src   = clone(&m->mem, src);  // set for an '@'-picked image too
+    m->src   = clone(m->mem, src);  // set for an '@'-picked image too
     scheddirty(&g->sched);
     return {};
 }
@@ -5470,8 +5483,8 @@ static void attachnamedfile(Gui *g, GuiSession *s, Json *k)
     AttImage *m = s->att->imgs + s->att->len++;
     *m = {};
     m->r     = r;
-    m->mem   = newarena(r);
-    m->name  = clone(&m->mem, name);
+    m->mem   = attarena(r);
+    m->name  = clone(m->mem, name);
     m->label = cut(cuthead(m->name, 6), '-').tail;
     m->file  = 1;
     m->pdf   = endswith(m->label, ".pdf.txt");  // its text, kept beside it
@@ -5499,8 +5512,8 @@ static void attachnamed(Gui *g, GuiSession *s, Json *k)
     AttImage *m = s->att->imgs + s->att->len++;
     *m = {};
     m->r    = r;
-    m->mem  = newarena(r);
-    m->name = clone(&m->mem, name);
+    m->mem  = attarena(r);
+    m->name = clone(m->mem, name);
     m->mime = mime=="image/png" ? Str("image/png") : Str("image/jpeg");
     m->w    = (i32)jsonint(jsonget(k, "w"), 0);
     m->h    = (i32)jsonint(jsonget(k, "h"), 0);
@@ -5677,13 +5690,13 @@ static void onattach(Gui *g, GuiSession *s, EvRec *r)
         }
         if (why.len) {
             m->pathonly = 1;
-            m->why      = clone(&m->mem, why);
+            m->why      = clone(m->mem, why);
             setnote(g, s, mentionpathnote(&g->frame, m->label, why), 0);
         } else {
-            m->name  = clone(&m->mem, name);
+            m->name  = clone(m->mem, name);
             m->file  = !image;
             m->pdf   = !image && endswith(name, ".pdf.txt");
-            m->mime  = clone(&m->mem, jsonstr(jsonget(j, "mime")));
+            m->mime  = clone(m->mem, jsonstr(jsonget(j, "mime")));
             m->w     = (i32)jsonint(jsonget(j, "w"), 0);
             m->h     = (i32)jsonint(jsonget(j, "h"), 0);
             m->bytes = jsonint(jsonget(j, "bytes"), 0);
@@ -5705,7 +5718,7 @@ static void onattach(Gui *g, GuiSession *s, EvRec *r)
     x->toklen = token.len;
     x->off    = off;
     if (off == m->data.len) {
-        m->name   = clone(&m->mem, name);
+        m->name   = clone(m->mem, name);
         x->off    = 0;
         x->toklen = 0;
     }
@@ -20310,9 +20323,12 @@ static DriveOp composeops[] = {
     {OP_CHECK, CHK_QUEUEKEPT, 1, 0, 0, ""},
     // E: images attached by dropping two files, a PNG and a JPEG (the
     // second on the box, routed as a drop at a point is, not on Files),
-    // and pasting a third, the pasted one removed by its x, the others sent
+    // and pasting a third, the first one removed by its x, the others sent
     // with the prompt and counted by the agent, their thumbnails decoded
-    // in the box and in the transcript; a thumbnail there opens whole
+    // in the box and in the transcript; a thumbnail there opens whole.
+    // The first, so that the two after it move down, their bytes still
+    // theirs: a move once re-pointed each one's arena, and ASan then
+    // found the bytes sent poisoned
     {OP_NEWSESSION, 0, 0, 0, 0, ""},
     {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
     {OP_DROP, 0, 96, 64, 800, "dropped-a.png"},
@@ -20331,7 +20347,7 @@ static DriveOp composeops[] = {
     {OP_CLIPRACE, 0, 0, 0, 300, ""},
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "compose-attached"},
-    CLICK(T_NAMED, "attach remove", 600),
+    CLICK(T_NAMED, "attach first remove", 600),
     {OP_CHECK, CHK_ATTACHED, 2, 0, 0, ""},
     CLICK(T_PROMPT, "", 200),
     {OP_TEXT, 0, 0, 0, 200, "Describe the images."},

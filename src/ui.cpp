@@ -6694,7 +6694,10 @@ static void drawattached(Gui *g, GuiSession *s)
         b32 hov = ImGui::IsItemHovered();
         ImGui::EndDisabled();
         if (!busy) {
-            itemnamed(g, "attach remove");
+            itemnamed(g, "attach remove");  // the last one's, as names go
+            if (i == 0) {
+                itemnamed(g, "attach first remove");
+            }
             itemtip("Remove it");
             f32 d = rad*0.4f;
             dl->AddCircleFilled(k, rad, hov ? g->pal->bad : g->pal->paneldim);
