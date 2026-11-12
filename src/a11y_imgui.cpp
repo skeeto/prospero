@@ -390,6 +390,17 @@ static void axchecked(Gui *g, b32 on)
     }
 }
 
+// The last item is one of a list's, selected now or not: a Selectable,
+// a button to ImGui's flags, made a list's item.
+static void axselected(Gui *g, b32 on)
+{
+    AxItem *it = axlastitem(g);
+    if (it) {
+        it->role  = it->role==AX_BUTTON ? AX_LISTITEM : it->role;
+        it->state = on ? it->state|AXS_SELECTED : it->state&~AXS_SELECTED;
+    }
+}
+
 static void axname(Gui *g, Str name)
 {
     AxItem *it = axlastitem(g);
