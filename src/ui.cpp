@@ -7098,6 +7098,7 @@ static void drawprompt(Gui *g)
     ImVec2 r1 = ImGui::GetItemRectMax();
     if (cb.recalled) {
         imedrop(g, s->draftid);
+        axtextput(g, s->draftid, {(u8 *)buf, (iz)__builtin_strlen(buf)});
     }
     if (edited && !cb.recalled) {
         // Typed: the draft, kept once typing pauses, out of history. A note

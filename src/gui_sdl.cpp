@@ -773,6 +773,7 @@ extern "C" void *class_getInstanceMethod(void *, void *);
 extern "C" void *method_setImplementation(void *, void *);
 
 static void axmacinit(Gui *);  // a11y_macos.cpp
+static void macimedropped();   // a11y_macos.cpp
 
 static void handlemodflags()
 {
@@ -1672,6 +1673,7 @@ static void os_guiimereset(Os *os)
     SDL_StartTextInput(p->window);
     #ifdef __APPLE__
     macdiscarding = 0;
+    macimedropped();
     #endif
 }
 
@@ -1850,8 +1852,13 @@ static void os_guiinject(Os *os, GuiEvent *ge)
         return;
     case GEV_MODALSIZE:
         // What SDL sends from macOS's live-resize loop, 60 times a second
-        // while the user drags: the watch draws from these.
+        // while the user drags: the watch draws from these. Paced, and the
+        // main loop kept waiting, as in the real loop: no frame of its own
+        // comes between them, only after, for the exposes left queued.
         for (i32 i = 0; i < (i32)ge->x; i++) {
+            if (i) {
+                SDL_Delay(16);
+            }
             SDL_Event x = {};
             x.type            = SDL_EVENT_WINDOW_EXPOSED;
             x.window.windowID = id;

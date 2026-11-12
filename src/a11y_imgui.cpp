@@ -822,6 +822,17 @@ static b32 axtextselect(Gui *g, i32 anchor, i32 caret)
     return 1;
 }
 
+// Field id's text was put from outside (a send, a draft reloaded, a
+// recall): edits a tool queued were for the text before, and one that
+// replaces nothing, or as many bytes, could still land in it. Until the
+// next frame, the model answers with the new text (axput).
+static void axtextput(Gui *g, u32 id, Str text)
+{
+    if (g->ax) {
+        axput(g->ax->ax, id, text);
+    }
+}
+
 // The adapter's log (AxLog): each call an OS adapter answers, a line led
 // by the seconds since the log began, kept for the Metrics pane and, with
 // PROSPERO_AXTRACE=path, appended to that file as it comes, so that a
@@ -1176,6 +1187,14 @@ static void axstart(Gui *g)
 //                    since the last OP_NSTEXT
 //   ns ...           the OS adapter's own checks, through the OS's API
 //                    (macOS: a11y_macos.cpp); skipped where there is none
+//   put TEXT         put TEXT in the shown session's box, as a draft
+//                    reloaded from the engine is (draftput)
+//   off              accessibility is off: no tree, and the OS adapter
+//                    installed nothing (axoffcheck)
+
+// The OS adapter's check that it installed nothing, set whether or not
+// it did (macOS: a11y_macos.cpp)
+static void (*axoffcheck)(Gui *, Arena *);
 
 // what may be in a, the caller's scratch
 static void axcheck(Gui *g, Arena *a, b32 ok, Str what)
@@ -1230,6 +1249,18 @@ static void driveax(Gui *g, Str cmd)
     if (verb == "on") {
         axstart(g);
         guilog(g, g->ax ? Str("drive: accessibility on") : Str("drive: accessibility is off"));
+    } else if (verb == "put") {
+        if (g->sess) {
+            draftput(g, g->sess, c.tail);
+        }
+        axcheck(g, &a, g->sess!=0, concat(&a, "accessible put: ", c.tail));
+    } else if (verb == "off") {
+        axcheck(g, &a, !g->ax, Str("accessibility off: no tree"));
+        if (axoffcheck) {
+            axoffcheck(g, &a);
+        } else {
+            guilog(g, "drive: skipped (no OS adapter here): off");
+        }
     } else if (!t) {
         axcheck(g, &a, 0, concat(&a, "accessibility (off): ", cmd));
     } else if (verb == "dump") {

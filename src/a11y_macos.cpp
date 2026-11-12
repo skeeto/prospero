@@ -555,6 +555,13 @@ static struct {
     i32     gets[MG_N];
     i32     posted[MN_N];
     i32     seltype;     // the last AXSelectedTextChanged's change type, or -1
+    i32     alive;       // elements not yet deallocated
+    void   *kept;        // the checklist's element, kept past its node
+    b32     resizing;    // the checklist's: every publish changes layout,
+    i32     modalposts;  // as a live resize's does; told in a nested loop,
+    i32     modalheld;   // or held for the gap,
+    i64     modal0;      // the first and last publish in one
+    i64     modal1;
 } macax;
 
 enum : u32 {
@@ -658,6 +665,7 @@ static void *macelof(i32 i)
     }
     *mackeyp(el)  = key;
     *macdeadp(el) = MACDEAD_LIVE;
+    macax.alive++;
     u64 mask = ((u64)1 << macax.exp) - 1;
     u64 h    = axhash(key, macax.exp);
     while (macax.tab[h].key) {
@@ -2493,6 +2501,39 @@ static void *macviewfocus(void *self, void *sel)
 }
 
 
+// Counted, so the checklist sees that each element made is let go
+static void macedealloc(void *self, void *sel)
+{
+    macax.alive--;
+    void *up = class_getSuperclass(macax.cls);
+    ((void (*)(void *, void *))class_getMethodImplementation(up, sel))(self, sel);
+}
+
+// The input method was told to drop its composition (os_guiimereset,
+// gui_sdl.cpp): a send, a draft put, a recall, another field, or a reset
+// of the terminal's dead keys. If it was Dictation's, that is over, and
+// ranges SDL gave are no one's now. The drawn composition goes too: only
+// imedrop's caller cleared it, and Dictation, which keeps its marked text
+// until told, may never take it back. The model drops it at once, not at
+// the next frame's sync, as a tool may ask before then.
+static void macimedropped()
+{
+    if (!axmac) {
+        return;
+    }
+    A11y *x = axmac->ax;
+    if (AxGui *l = maclog(); l && (macspoken || x->text.marked.len)) {
+        axnote(l, l->logmem, "the composition is dropped");
+    }
+    gui_preedit(axmac->g, {}, 0, 0);
+    macspoken    = 0;
+    macsdlranges = 0;
+    if (x->text.marked.len) {
+        axmark(x, {}, 0, 0);
+    }
+}
+
+
 // After each publish: tell AppKit what changed, of the elements a tool
 // has, and let go of those whose nodes are gone.
 
@@ -2556,7 +2597,7 @@ static void macpublished(AxGui *x)
     void   *pool = objc_autoreleasePoolPush();
     void   *win  = macwindow();
     b32     key  = win && objcsend<ObjcBool>(win, "isKeyWindow");
-    b32     layout = macax.started || macax.layoutowed;
+    b32     layout = macax.started || macax.layoutowed || macax.resizing;
     macax.pass   = macax.pass+1 ? macax.pass+1 : 1;  // never 0: no publish
     macax.inpass = 1;
 
@@ -2641,9 +2682,14 @@ static void macpublished(AxGui *x)
         macax.tkey = 0;
     }
 
-    // In a nested loop (a live resize) frames come fast: tell less often
-    i64 now = g->sched.now;
-    if (layout && win && (!g->inmodal || now-macax.layoutat>=MACLAYOUT_GAP)) {
+    // In a nested loop (a live resize) frames come fast: tell less often.
+    // What is held is owed. SDL's timer draws on while the user holds
+    // still, and leaves an expose queued for the main loop after, so a
+    // frame tells it; the frame asked for once the gap is up is only a
+    // safeguard, for a loop that ends with nothing queued.
+    i64 now  = g->sched.now;
+    b32 tell = layout && win && (!g->inmodal || now-macax.layoutat>=MACLAYOUT_GAP);
+    if (tell) {
         macpost(NSAccessibilityUnignoredAncestor(objcsend<void *>(win, "contentView")),
                 MN_LAYOUT);
         macax.startposts += macax.started;
@@ -2652,6 +2698,15 @@ static void macpublished(AxGui *x)
         macax.started    = 0;
     } else if (layout) {
         macax.layoutowed = 1;
+        if (win) {
+            schedat(&g->sched, macax.layoutat+MACLAYOUT_GAP, DUE_APP);
+        }
+    }
+    if (layout && g->inmodal) {
+        macax.modal0      = macax.modalposts+macax.modalheld ? macax.modal0 : now;
+        macax.modal1      = now;
+        macax.modalposts += tell;
+        macax.modalheld  += !tell;
     }
 
     macax.inpass = 0;
@@ -2677,7 +2732,18 @@ static void macpublished(AxGui *x)
 //   attr ATTR VALUE AXROLE NAME  an attribute, by its description
 //   hit AXROLE NAME    the window's hit test at its frame's middle
 //   mark               forget what was posted, and told for a start
-//   posted NOTE        AppKit was told NOTE since the mark
+//   posted NOTE [N]    AppKit was told NOTE since the mark, N times if given
+//   nofocus            the focused element, asked as AppKit would, is none
+//                      of ours (the window isn't the user's)
+//   alive              every element made and let go was deallocated: those
+//                      left are the table's (and the one kept)
+//   keep AXROLE NAME   keep an element, past its node
+//   kept               the one kept, its node gone, answers as nothing, and
+//                      is let go
+//   resizing 1|0       each publish changes layout, as a live resize's do
+//   throttled          in the nested loop since "resizing 1", layout was
+//                      told no more than the gap allows, and some held
+//   owed N             a layout change is held (1) or not (0)
 //   seltype N          the last AXSelectedTextChanged since the mark had
 //                      AXTextStateChangeType N, 0 for none
 // and of the focused element's text, as Voice Control asks it (a range
@@ -3304,14 +3370,102 @@ static void macdrive(Gui *g, Str cmd)
     } else if (verb == "posted") {
         i32 got = -1;
         for (i32 k = 0; k < MN_N; k++) {
-            got = c.tail==Str{(u8 *)macnotes[k], (iz)__builtin_strlen(macnotes[k])}
+            got = r.head==Str{(u8 *)macnotes[k], (iz)__builtin_strlen(macnotes[k])}
                   ? macax.posted[k] : got;
         }
+        Int n = parseint(r.tail);
         Buf b(&a, 128);
         print(&b, what);
         print(&b, ": ");
         print(&b, (i64)got);
-        axcheck(g, &a, got > 0, finish(&b));
+        axcheck(g, &a, got>=0 && (r.tail.len ? n.ok && got==n.val : got>0), finish(&b));
+    } else if (verb == "nofocus") {
+        void *f  = macfocusof(win, view);
+        b32   ok = !f || !maciskind(f, "ProsperoAxElement");
+        Buf b(&a, 128);
+        print(&b, what);
+        if (!ok) {
+            print(&b, ": ");
+            print(&b, macstrof(f, "accessibilityRole"));
+            putbyte(&b, ' ');
+            print(&b, macstrof(f, "accessibilityLabel"));
+        }
+        axcheck(g, &a, ok, finish(&b));
+    } else if (verb == "alive") {
+        i32 want = macax.len + (macax.kept ? 1 : 0);
+        Buf b(&a, 128);
+        print(&b, what);
+        print(&b, ": ");
+        print(&b, (i64)macax.alive);
+        print(&b, " elements, the table's ");
+        print(&b, (i64)macax.len);
+        axcheck(g, &a, macax.alive==want, finish(&b));
+    } else if (verb == "keep") {
+        void *el = macfindel(a, win, r.head, r.tail);
+        if (el && !macax.kept) {
+            macax.kept = objcsend<void *>(el, "retain");
+        }
+        axcheck(g, &a, el!=0, concat(&a, what, el ? Str("") : Str(": not found")));
+    } else if (verb == "kept") {
+        // Everything a tool may ask, of an element whose node is gone,
+        // ranges in and out of reach: no answer that AppKit would raise
+        // on, no nil where it wants an object
+        void   *el = macax.kept;
+        NsRange r1 = {0, 5};
+        NsRange nf = {NSNOTFOUND, 0};
+        b32 ok = el && *macdeadp(el)==MACDEAD_GONE;
+        ok = ok && !objcsend<ObjcBool>(el, "isAccessibilityElement");
+        ok = ok && macstrof(el, "accessibilityRole")=="AXUnknown";
+        void *kids = el ? objcsend<void *>(el, "accessibilityChildren") : 0;
+        ok = ok && kids && objcsend<uz>(kids, "count")==0;
+        ok = ok && !objcsend<void *>(el, "accessibilityParent");
+        ok = ok && !objcsend<ObjcBool>(el, "accessibilityPerformPress");
+        ok = ok && !objcsend<ObjcBool>(el, "accessibilityPerformShowMenu");
+        ok = ok && !objcsend<ObjcBool>(el, "isAccessibilitySelectorAllowed:",
+                                       sel_registerName("accessibilityPerformPress"));
+        NsRect f = el ? objcrect(el, "accessibilityFrame") : NsRect{};
+        ok = ok && f.w==0 && f.h==0;
+        ok = ok && objcsend<iz>(el, "accessibilityNumberOfCharacters")==0;
+        ok = ok && !objcsend<void *>(el, "accessibilityStringForRange:", r1);
+        ok = ok && !objcsend<void *>(el, "accessibilityAttributedStringForRange:", nf);
+        NsRange s = el ? objcsend<NsRange>(el, "accessibilityRangeForLine:", (iz)-1) : NsRange{};
+        ok = ok && s.loc==0 && s.len==0;
+        NsRect fr = el ? objcrect(el, "accessibilityFrameForRange:", nf) : NsRect{};
+        ok = ok && fr.w==0 && fr.h==0;
+        if (el) {
+            objcsend<void>(el, "accessibilityHitTest:", NsPoint{});
+            objcsend<void>(el, "setAccessibilityFocused:", (ObjcBool)1);
+            objcsend<void>(el, "setAccessibilityValue:", nsstring("x"));
+            objcsend<void>(el, "setAccessibilitySelectedTextRange:", nf);
+            objcsend<void>(el, "release");
+        }
+        macax.kept = 0;
+        axcheck(g, &a, ok, what);
+    } else if (verb == "resizing") {
+        macax.resizing = c.tail == "1";
+        if (macax.resizing) {
+            macax.modalposts = macax.modalheld = 0;
+            macax.modal0 = macax.modal1 = 0;
+        }
+        guilog(g, concat(&a, "drive: ", what));
+    } else if (verb == "throttled") {
+        i64 most = 1 + (macax.modal1 - macax.modal0)/MACLAYOUT_GAP;
+        Buf b(&a, 128);
+        print(&b, what);
+        print(&b, ": told ");
+        print(&b, (i64)macax.modalposts);
+        print(&b, ", held ");
+        print(&b, (i64)macax.modalheld);
+        print(&b, " over ");
+        print(&b, (macax.modal1 - macax.modal0)/1000);
+        print(&b, " ms");
+        axcheck(g, &a, macax.modalheld>0 && macax.modalposts<=most, finish(&b));
+    } else if (verb == "owed") {
+        Buf b(&a, 64);
+        print(&b, what);
+        print(&b, ": ");
+        print(&b, (i64)macax.layoutowed);
+        axcheck(g, &a, macax.layoutowed==(b32)parseint(c.tail).val, finish(&b));
     } else if (verb == "seltype") {
         i32 want = (i32)parseint(c.tail).val;
         Buf b(&a, 128);
@@ -3476,6 +3630,7 @@ static void macaxtree(Gui *g)
         {"setAccessibilitySelectedText:", (void *)macelsetseltext, "v@:@"},
         {"setAccessibilitySelectedTextRange:", (void *)macelsetselrange, "v@:{_NSRange=QQ}"},
         {"setAccessibilitySelectedTextRanges:", (void *)macelsetselranges, "v@:@"},
+        {"dealloc",                      (void *)macedealloc,     "v@:"},
     };
     for (i32 i = 0; i < countof(ms); i++) {
         void       *sel   = sel_registerName(ms[i].sel);
@@ -3511,10 +3666,37 @@ static void macaxtree(Gui *g)
     g->ax->osdrive   = macdrive;
 }
 
+// The checklist's "off": nothing of the above was installed
+static void macoffcheck(Gui *g, Arena *a)
+{
+    // Asked as a tool would, AppKit answers, and nothing starts
+    void *pool = objc_autoreleasePoolPush();
+    void *cv   = 0;
+    if (GuiSdl *p = (GuiSdl *)g->os->gui; p && p->window) {
+        void *win = SDL_GetPointerProperty(SDL_GetWindowProperties(p->window),
+                                           SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, 0);
+        cv = win ? objcsend<void *>(win, "contentView") : 0;
+    }
+    if (cv) {
+        objcsend<void *>(cv, "accessibilityChildren");
+    }
+    objc_autoreleasePoolPop(pool);
+    void *view = objc_getClass("SDL3View");
+    void *resp = objc_getClass("SDL3TranslatorResponder");
+    void *kids = view ? (void *)class_getMethodImplementation(view,
+                        sel_registerName("accessibilityChildren")) : 0;
+    void *ins  = resp ? (void *)class_getMethodImplementation(resp,
+                        sel_registerName("insertText:replacementRange:")) : 0;
+    b32 ok = !objc_getClass("ProsperoAxElement") && !nmacaximps && !macinsertimp &&
+             kids!=(void *)macviewkids && ins!=(void *)macinsert && !axmac;
+    axcheck(g, a, ok, "ns off: nothing installed");
+}
+
 // Install the tree and the log's wrappers, once: with accessibility
 // off, none.
 static void axmacinit(Gui *g)
 {
+    axoffcheck = macoffcheck;
     if (!g->ax || axmac) {
         return;
     }

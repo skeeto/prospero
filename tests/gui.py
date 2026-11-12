@@ -2196,6 +2196,15 @@ def main():
             axdone.set()
             if axthread:
                 axthread.join()
+        if args.mode == "a11y" and status == 0:
+            # Again with [ui] accessibility = off, without the lint, which
+            # turns it on: nothing installed for the OS's tools
+            host.write(ini, before + "\n[ui]\naccessibility = off\n")
+            off = ["--a11y-off" if a == "--a11y" else a for a in guiargs
+                   if a != "--a11y-lint"]
+            st, more = host.run(off, args.timeout, guicwd, tag="off: ")
+            problems += summaryproblems(st, more, "the window with accessibility off")
+            host.write(ini, before)
     dt = time.monotonic() - t0
 
     if status is None:

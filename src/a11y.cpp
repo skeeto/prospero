@@ -1565,6 +1565,23 @@ static Str axclean(Arena *a, Str s, b32 multiline)
     return finish(&b);
 }
 
+// Field id's text was put from outside, the caret at its end, as ImGui
+// shows it from the next frame. Edits queued for it were for the text
+// before, and are dropped. If it is the field the model holds, the model
+// takes the text at once: an edit a tool makes before that frame is made
+// against it, not against what was there.
+static void axput(A11y *x, u32 id, Str text)
+{
+    axdropedits(x, id);
+    AxText *t = &x->text;
+    if (t->live && t->id==id) {
+        t->marked = {};
+        t->mlo = t->mhi = 0;
+        axtake(x, axclean(axspare(x), text, t->multiline));
+        t->anchor = t->caret = axtextlen(x);
+    }
+}
+
 enum : i32 {
     AX_AFTER = -1,  // a selection at the end of the text put in
 };
