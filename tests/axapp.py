@@ -22,10 +22,18 @@ probe then, of the GUI with pid PID:
    and performs it;
 4. requires the prompt to empty within five seconds, as the press sent
    it: so the press reached the app;
-5. works a menu of the window's menu bar as Voice Control does, by
+5. edits the prompt as Voice Control does, in UTF-16 units, past an
+   emoji (two units) and CJK (one each): sets AXValue, then
+   AXSelectedTextRange and AXSelectedText, reading AXValue back at once
+   each time; reads AXStringForRange, AXBoundsForRange and
+   AXRangeForPosition back through the screen; then undoes once, by the
+   prompt's context menu (AXShowMenu, then Undo's AXPress), which must
+   take back the last edit alone; the menu, as AppKit's, is told
+   opened (AXMenuOpened) and closed (AXMenuClosed) to an observer;
+6. works a menu of the window's menu bar as Voice Control does, by
    what it is told: presses the AXMenuBarItem Edit, waits for
    AXMenuOpened, requires that menu to be an AXMenu under Edit, which
-   is AXSelected, then presses Select all by
+   is AXSelected, its items where it is, then presses Select all by
    name, waits for AXMenuClosed, and opens Edit again to find Copy,
    disabled before the press, enabled now, as the press selected the
    transcript; then closes it.
@@ -35,7 +43,8 @@ checklist's window is never key, which that asks for.
 
 Without Prospero.app, or its Accessibility grant, it says so and exits
 2 (skipped); 1 if a check failed, 0 if all passed. It acts on nothing but
-Send and the Edit menu's Select all, and touches no other application.
+the prompt, Send, the prompt's Undo and the Edit menu's Select all, and
+touches no other application.
 
   axapp.py --probe PID TEXT
 
@@ -72,9 +81,18 @@ def lib():
                 ("AXUIElementCopyActionNames", ctypes.c_int32, [p, ctypes.POINTER(p)]),
                 ("AXUIElementPerformAction", ctypes.c_int32, [p, p]),
                 ("AXUIElementSetMessagingTimeout", ctypes.c_int32, [p, ctypes.c_float]),
+                ("AXUIElementSetAttributeValue", ctypes.c_int32, [p, p, p]),
+                ("AXUIElementIsAttributeSettable", ctypes.c_int32,
+                 [p, p, ctypes.POINTER(ctypes.c_bool)]),
+                ("AXUIElementCopyParameterizedAttributeValue", ctypes.c_int32,
+                 [p, p, p, ctypes.POINTER(p)]),
                 ("AXObserverCreate", ctypes.c_int32, [ctypes.c_int, p, ctypes.POINTER(p)]),
                 ("AXObserverAddNotification", ctypes.c_int32, [p, p, p, p]),
-                ("AXObserverGetRunLoopSource", p, [p])):
+                ("AXObserverGetRunLoopSource", p, [p]),
+                ("AXValueCreate", p, [ctypes.c_uint32, p]),
+                ("AXValueGetType", ctypes.c_uint32, [p]),
+                ("AXValueGetTypeID", ctypes.c_ulong, []),
+                ("AXValueGetValue", ctypes.c_bool, [p, ctypes.c_uint32, p])):
             f = getattr(_ax, name)
             f.restype, f.argtypes = res, args
         for name, res, args in (
@@ -111,10 +129,46 @@ def cfname(s):
     return _names[s]
 
 
+class CFRange(ctypes.Structure):
+    _fields_ = [("loc", ctypes.c_long), ("len", ctypes.c_long)]
+
+
+class CGPoint(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+
+
+class CGSize(ctypes.Structure):
+    _fields_ = [("w", ctypes.c_double), ("h", ctypes.c_double)]
+
+
+class CGRect(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double),
+                ("w", ctypes.c_double), ("h", ctypes.c_double)]
+
+
+AXV_POINT, AXV_SIZE, AXV_RECT, AXV_RANGE = 1, 2, 3, 4  # kAXValueType*
+AXV_STRUCTS = {AXV_POINT: CGPoint, AXV_SIZE: CGSize, AXV_RECT: CGRect, AXV_RANGE: CFRange}
+
+
+def axvalue(kind, *fields):
+    """An AXValue of a range (loc, len), point (x, y) or rect."""
+    st = AXV_STRUCTS[kind](*fields)
+    return lib()[0].AXValueCreate(kind, ctypes.byref(st))
+
+
 def cfvalue(v):
-    """A str, bool, int, list of elements, or the element (a pointer)."""
+    """A str, bool, int, list of elements, a tuple of a range, point or
+    rect, or the element (a pointer)."""
     ax, cf = lib()
     t = cf.CFGetTypeID(v)
+    if t == ax.AXValueGetTypeID():
+        kind = ax.AXValueGetType(v)
+        st = AXV_STRUCTS.get(kind)
+        if st is None:
+            return v
+        out = st()
+        ax.AXValueGetValue(v, kind, ctypes.byref(out))
+        return tuple(getattr(out, f) for f, _ in st._fields_)
     if t == cf.CFStringGetTypeID():
         n = cf.CFStringGetMaximumSizeForEncoding(cf.CFStringGetLength(v), UTF8) + 1
         buf = ctypes.create_string_buffer(n)
@@ -139,6 +193,33 @@ def attr(e, name, err=None):
             err.append(rc)
         return None
     return cfvalue(v.value)
+
+
+def param(e, name, arg, err=None):
+    """A parameterized attribute's value, or None."""
+    ax, _ = lib()
+    v = ctypes.c_void_p()
+    rc = ax.AXUIElementCopyParameterizedAttributeValue(e, cfname(name), arg, ctypes.byref(v))
+    if rc or not v.value:
+        if err is not None:
+            err.append(rc)
+        return None
+    return cfvalue(v.value)
+
+
+def setattr_(e, name, value):
+    """Set an attribute: its AXError, 0 if set."""
+    return lib()[0].AXUIElementSetAttributeValue(e, cfname(name), value)
+
+
+def settable(e, name):
+    b = ctypes.c_bool()
+    rc = lib()[0].AXUIElementIsAttributeSettable(e, cfname(name), ctypes.byref(b))
+    return not rc and b.value
+
+
+def cfstr(s):
+    return lib()[1].CFStringCreateWithCString(None, s.encode(), UTF8)
 
 
 def actions(e):
@@ -266,17 +347,108 @@ def probe(pid, text):
             break
         time.sleep(0.1)
     check(value == "", "the prompt emptied: the press reached the app, which sent it", value)
+    if value == "":
+        edit(app, prompt[0], check, obs)
     menus(app, check, obs)
     return r
 
 
+def waitvalue(e, want, secs=5):
+    deadline = time.monotonic() + secs
+    while True:
+        got = attr(e, "AXValue")
+        if got == want or time.monotonic() >= deadline:
+            return got
+        time.sleep(0.1)
+
+
+def edit(app, prompt, check, obs):
+    """Step 5: the prompt's text, set and read as Voice Control does."""
+    text = "a\U0001F600 \u65e5\u672c tail"  # 11 UTF-16 units
+    for a in ("AXValue", "AXSelectedTextRange", "AXSelectedText"):
+        check(settable(prompt, a), f"the prompt's {a} is settable")
+    rc = setattr_(prompt, "AXValue", cfstr(text))
+    check(rc == 0, "AXValue set", f"AXError {rc}")
+    got = attr(prompt, "AXValue")
+    check(got == text, "AXValue reads back at once", got)
+    got = attr(prompt, "AXNumberOfCharacters")
+    check(got == 11, "AXNumberOfCharacters counts UTF-16 units", got)
+    got = waitvalue(prompt, text)  # a frame, to be ImGui's
+    rc = setattr_(prompt, "AXSelectedTextRange", axvalue(AXV_RANGE, 7, 4))
+    check(rc == 0, "AXSelectedTextRange set past the emoji and CJK", f"AXError {rc}")
+    got = attr(prompt, "AXSelectedText")
+    check(got == "tail", "AXSelectedText is what the range covers", got)
+    rc = setattr_(prompt, "AXSelectedText", cfstr("TAIL!"))
+    check(rc == 0, "AXSelectedText set", f"AXError {rc}")
+    after = "a\U0001F600 \u65e5\u672c TAIL!"
+    got = attr(prompt, "AXValue")
+    check(got == after, "AXValue reads back the replacement at once", got)
+    got = attr(prompt, "AXSelectedTextRange")
+    check(got == (12, 0), "the caret is after it", got)
+    for rng, want in (((1, 2), "\U0001F600"), ((4, 2), "\u65e5\u672c")):
+        got = param(prompt, "AXStringForRange", axvalue(AXV_RANGE, *rng))
+        check(got == want, f"AXStringForRange {rng}", got)
+    # Where the text is drawn is known once ImGui has drawn it: until the
+    # next frame, the geometry is of the text before the edit
+    got = waitvalue(prompt, after)
+    check(got == after, "ImGui took the edits", got)
+    time.sleep(0.5)
+    err = []
+    bounds = param(prompt, "AXBoundsForRange", axvalue(AXV_RANGE, 4, 1), err)
+    frame = None
+    pos, size = attr(prompt, "AXPosition"), attr(prompt, "AXSize")
+    if isinstance(pos, tuple) and isinstance(size, tuple):
+        frame = pos + size
+    inside = (isinstance(bounds, tuple) and frame is not None and bounds[2] > 0 and bounds[3] > 0
+              and bounds[0] >= frame[0] - 1 and bounds[0] + bounds[2] <= frame[0] + frame[2] + 1
+              and bounds[1] >= frame[1] - 1 and bounds[1] + bounds[3] <= frame[1] + frame[3] + 1)
+    check(inside, "AXBoundsForRange of a CJK character lies in the prompt",
+          [bounds, frame, err])
+    if isinstance(bounds, tuple):
+        mid = axvalue(AXV_POINT, bounds[0] + bounds[2] / 2, bounds[1] + bounds[3] / 2)
+        got = param(prompt, "AXRangeForPosition", mid)
+        check(got == (4, 1), "AXRangeForPosition at its middle finds it", got)
+
+    # One undo takes back the last edit alone: through the prompt's menu,
+    # as a tool presses it
+    obs.clear()
+    rc = lib()[0].AXUIElementPerformAction(prompt, cfname("AXShowMenu"))
+    check(rc == 0, "AXShowMenu on the prompt", f"AXError {rc}")
+    menu = obs.wait("AXMenuOpened")
+    check(menu and attr(menu, "AXRole") == "AXMenu", "the prompt's menu is told opened, an AXMenu",
+          menu and attr(menu, "AXRole"))
+    undo = []
+    deadline = time.monotonic() + 5
+    while not undo and time.monotonic() < deadline:
+        undo = [e for _, e in walk(app)
+                if attr(e, "AXRole") == "AXMenuItem" and name(e) == "Undo"]
+        if not undo:
+            time.sleep(0.1)
+    if not check(undo, "the prompt's menu has Undo", None):
+        return
+    rc = lib()[0].AXUIElementPerformAction(undo[0], cfname("AXPress"))
+    check(rc == 0, "AXPress on Undo", f"AXError {rc}")
+    check(obs.wait("AXMenuClosed"), "the prompt's menu is told closed")
+    got = waitvalue(prompt, text)
+    check(got == text, "one undo took back the replacement alone", got)
+    setattr_(prompt, "AXValue", cfstr(""))
+
+
 def menuitems(menu):
-    """A menu's items by name: (element, None)."""
+    """A menu's items by name: (element, its frame or None)."""
     items = {}
     for e in attr(menu, "AXChildren") or []:
         if attr(e, "AXRole") == "AXMenuItem":
-            items[name(e)] = (e, None)
+            pos, size = attr(e, "AXPosition"), attr(e, "AXSize")
+            ok = isinstance(pos, tuple) and isinstance(size, tuple)
+            items[name(e)] = (e, pos + size if ok else None)
     return items
+
+
+def within(inner, outer):
+    return (inner is not None and outer is not None and inner[2] > 0 and inner[3] > 0
+            and inner[0] >= outer[0] - 1 and inner[0] + inner[2] <= outer[0] + outer[2] + 1
+            and inner[1] >= outer[1] - 1 and inner[1] + inner[3] <= outer[1] + outer[3] + 1)
 
 
 def menus(app, check, obs):
@@ -309,9 +481,13 @@ def menus(app, check, obs):
           isinstance(up, int) and [attr(up, "AXRole"), name(up)])
     check(attr(edit, "AXSelected") is True, "Edit is selected while its menu is open",
           attr(edit, "AXSelected"))
+    pos, size = attr(menu, "AXPosition"), attr(menu, "AXSize")
+    frame = pos + size if isinstance(pos, tuple) and isinstance(size, tuple) else None
     items = menuitems(menu)
     check("Select all" in items and "Copy" in items, "the menu lists Copy and Select all",
           sorted(items))
+    out = [n for n, (_, f) in items.items() if not within(f, frame)]
+    check(items and not out, "each item lies in the menu's frame", [out, frame])
     if "Select all" not in items:
         return
     sel = items["Select all"][0]

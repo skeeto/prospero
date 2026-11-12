@@ -713,6 +713,7 @@ enum {
     GKEY_W,
     GKEY_F3,
     GKEY_F10,    // Shift+F10: the keyboard's item's context menu
+    GKEY_Z,
 };
 struct GuiEvent {
     i32 kind;
