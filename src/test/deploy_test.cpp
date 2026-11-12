@@ -302,6 +302,44 @@ static void test_deploywsl(Test *t)
     expect(t, "deploy.wsl.good", linkbad(a, wsl), "");
     ssh.ssh = "-oX";
     expect(t, "deploy.ssh.bad", linkbad(a, ssh), "an ssh destination cannot begin with -");
+
+    // A port of the destination's own, host:port, as -p (and scp's -P);
+    // IPv6 only in brackets; anything else as it was
+    struct { Str in, dest, port, scp; } ports[] = {
+        {"pi",                "pi",            "",     "pi:/t"},
+        {"me@pi",             "me@pi",         "",     "me@pi:/t"},
+        {"localhost:2222",    "localhost",     "2222", "localhost:/t"},
+        {"me@box.lan:22022",  "me@box.lan",    "22022","me@box.lan:/t"},
+        {"[::1]:2222",        "::1",           "2222", "[::1]:/t"},
+        {"me@[fe80::1]:22",   "me@fe80::1",    "22",   "me@[fe80::1]:/t"},
+        {"[::1]",             "::1",           "",     "[::1]:/t"},
+        {"::1",               "::1",           "",     "[::1]:/t"},
+        {"fe80::1%en0",       "fe80::1%en0",   "",     "[fe80::1%en0]:/t"},
+        {"host:ssh",          "host:ssh",      "",     ""},
+        {"[::1]x",            "[::1]x",        "",     ""},
+    };
+    for (iz i = 0; i < countof(ports); i++) {
+        SshDest d = sshdest(&a, ports[i].in);
+        expect(t, "deploy.port.dest", d.dest, ports[i].dest);
+        expect(t, "deploy.port.port", d.port, ports[i].port);
+        expect(t, "deploy.port.ok", d.bad ? Str("bad") : Str("ok"), "ok");
+        if (ports[i].scp.len) {
+            expect(t, "deploy.port.scp", scptarget(&a, d, "/t"), ports[i].scp);
+        }
+    }
+    ssh.ssh = "me@pi:2222";
+    s = linkargv(&a, {}, ssh, "uname");
+    expect(t, "deploy.port.argv", joinwords(&a, s),
+           "ssh|-T|-o|BatchMode=yes|-o|ConnectTimeout=15|-o|ServerAliveInterval=15|"
+           "-o|ServerAliveCountMax=3|-o|EscapeChar=none|-p|2222|--|me@pi|uname");
+    expect(t, "deploy.port.key", linkdest(&a, ssh), "me@pi:2222");  // a record per port
+    expect(t, "deploy.port.good", linkbad(a, ssh), "");
+    ssh.ssh = "pi:0";
+    expect(t, "deploy.port.zero", linkbad(a, ssh), "an ssh port must be from 1 to 65535");
+    ssh.ssh = "pi:65536";
+    expect(t, "deploy.port.big", linkbad(a, ssh), "an ssh port must be from 1 to 65535");
+    ssh.ssh = "[::1]:99999999999999999999";
+    expect(t, "deploy.port.huge", linkbad(a, ssh), "an ssh port must be from 1 to 65535");
     expect(t, "deploy.exec.good", linkbad(a, ex), "");
     ex.exec = "  \"-x\" y";
     expect(t, "deploy.exec.bad", linkbad(a, ex), "an exec command cannot begin with -");

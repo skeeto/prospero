@@ -1015,14 +1015,20 @@ static TermRun termargv(Arena *a, i32 os, Str prog, Str dir, Slice<Str> cmd,
 }
 
 // The command that opens a shell in dir on a remote over ssh: a login
-// shell there, or on Windows cmd.exe, in a terminal of its own (-t).
+// shell there, or on Windows cmd.exe, in a terminal of its own (-t). A
+// destination's own port (host:port) goes as -p (sshdest).
 static Slice<Str> termssh(Arena *a, Str ssh, Str dest, Str dir, b32 windows)
 {
     Slice<Str> r = {};
+    SshDest    d = sshdest(a, dest);
     r = push(a, r, ssh);
     r = push(a, r, Str("-t"));
+    if (d.port.len) {
+        r = push(a, r, Str("-p"));
+        r = push(a, r, d.port);
+    }
     r = push(a, r, Str("--"));
-    r = push(a, r, dest);
+    r = push(a, r, d.dest);
     if (windows) {
         r = push(a, r, concat(a, concat(a, "cmd /k cd /d \"", dir), "\""));
     } else {

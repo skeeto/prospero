@@ -1644,7 +1644,7 @@ def record(path):
 def command(args):
     """ssh's command, after its options and destination."""
     while len(args) > 1:
-        if args[0] == "-o":
+        if args[0] in ("-o", "-p"):  # with a value
             args = args[2:]
         elif args[0].startswith("-"):
             args = args[1:]

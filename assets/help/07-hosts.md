@@ -27,7 +27,10 @@ again looks for new ones.
 A remote host is a machine reached over ssh. Add one with Add
 remote... under Remotes in Settings, or in the Hosts pane: a name, an
 ssh destination (`user@host`, or a Host from `~/.ssh/config`), and
-optionally where `prospero` is there. It writes a `[remote NAME]`
+optionally where `prospero` is there. A port other than 22 goes after
+the host, `user@host:2222` (an IPv6 address in brackets,
+`[::1]:2222`), and Prospero passes it to ssh and scp as their own
+option; or set `Port` in `~/.ssh/config`. It writes a `[remote NAME]`
 section to your configuration, whose page in Settings shows how the
 host is, with Connect and Deploy engine, as the Hosts pane does.
 

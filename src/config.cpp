@@ -770,7 +770,8 @@ static CfgKey cfgschema[] = {
      "its records kept for when it comes back"},
 
     {"remote", "ssh", CFG_STRING, "", {}, {}, "remote",
-     "Where ssh reaches the machine: [user@]host, or a Host of ~/.ssh/config"},
+     "Where ssh reaches the machine: [user@]host, with :PORT for another port "
+     "([ADDR]:PORT for IPv6), or a Host of ~/.ssh/config"},
     {"remote", "wsl", CFG_STRING, "", {}, {}, "remote",
      "Instead of ssh, a WSL distro on this Windows machine, by its name as "
      "wsl --list shows it, reached through wsl.exe"},

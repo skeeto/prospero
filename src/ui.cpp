@@ -13378,7 +13378,8 @@ static void drawcfgadd(Gui *g)
         itemrect(g, RECT_ADDDEST);
         itemtip(g->remexec ? "A command that runs another inside it, without a "
                              "shell; it needs /bin/sh there"
-                           : "user@host, or a host from ~/.ssh/config");
+                           : "user@host, user@host:port for another port, or a "
+                             "host from ~/.ssh/config");
         ImGui::SetNextItemWidth(-1);
         enter |= ImGui::InputTextWithHint("##rempath", "prospero there (optional)",
                                           g->rempath, FIELD_MAX,

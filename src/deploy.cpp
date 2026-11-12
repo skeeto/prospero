@@ -519,6 +519,76 @@ static Reach reachof(T *c)
     return l;
 }
 
+// An ssh destination with a port of its own, host:port, which neither
+// ssh nor scp reads that way: ssh would look up "host:port" as a name,
+// and scp would copy to the path "port:..." on host. Split off, the
+// port goes to them as -p and -P. An IPv6 address takes a port only in
+// brackets, [::1]:2222, since bare its colons are its own; the brackets
+// go, as ssh takes an address bare (scptarget puts them back). Anything
+// else, a Host of ~/.ssh/config included, is as it was.
+struct SshDest {
+    Str dest;  // [user@]host, as ssh takes it
+    Str port;  // its digits, or null
+    b32 bad;   // a port out of range, 1 to 65535
+};
+
+static SshDest sshdest(Arena *a, Str s)
+{
+    SshDest r = {};
+    r.dest = s;
+    iz at = -1;
+    for (iz i = 0; i < s.len; i++) {
+        at = s[i]=='@' ? i : at;
+    }
+    Str user = takehead(s, at+1);  // with its '@'
+    Str host = cuthead(s, at+1);
+    Str port = {};
+    if (startswith(host, "[")) {
+        Cut c = cut(cuthead(host, 1), ']');
+        if (!c.ok || (c.tail.len && !startswith(c.tail, ":"))) {
+            return r;  // not one: ssh says what it makes of it
+        }
+        host = c.head;
+        port = c.tail.len ? cuthead(c.tail, 1) : Str{};
+        if (c.tail.len && !port.len) {
+            return r;  // "[addr]:" with no port
+        }
+    } else {
+        Cut c = cut(host, ':');
+        if (!c.ok || cut(c.tail, ':').ok) {
+            return r;  // no colon, or an IPv6 address's
+        }
+        host = c.head;
+        port = c.tail;
+    }
+    for (iz i = 0; i < port.len; i++) {
+        if (!digit(port[i])) {
+            return r;
+        }
+    }
+    Int n = parseint(port);
+    r.bad  = port.len && (!n.ok || n.val<1 || n.val>65535);
+    r.dest = concat(a, user, host);
+    r.port = port;
+    return r;
+}
+
+// scp's target for path there: [user@]host:path, an IPv6 address in
+// brackets, which scp needs to tell its colons from the path's.
+static Str scptarget(Arena *a, SshDest d, Str path)
+{
+    iz at = -1;
+    for (iz i = 0; i < d.dest.len; i++) {
+        at = d.dest[i]=='@' ? i : at;
+    }
+    Str host = cuthead(d.dest, at+1);
+    Str r    = d.dest;
+    if (cut(host, ':').ok) {
+        r = concat(a, concat(a, concat(a, takehead(d.dest, at+1), "["), host), "]");
+    }
+    return concat(a, concat(a, r, ":"), path);
+}
+
 // A remote machine's key for its deploy record and errors: the ssh
 // destination, wsl:DISTRO, or exec:COMMAND, which no ssh destination
 // looks like.
@@ -549,7 +619,10 @@ static Str linkbad(Arena scratch, Reach l)
         return startswith(w.words[0], "-") ? Str("an exec command cannot begin with -")
                                            : Str{};
     }
-    return startswith(l.ssh, "-") ? Str("an ssh destination cannot begin with -") : Str{};
+    if (startswith(l.ssh, "-")) {
+        return "an ssh destination cannot begin with -";
+    }
+    return sshdest(&scratch, l.ssh).bad ? Str("an ssh port must be from 1 to 65535") : Str{};
 }
 
 // The command line that runs a shell command there: ssh, whose login
@@ -594,8 +667,13 @@ static Slice<Str> linkargv(Arena *a, Str program, Reach l, Str command)
     }
     r = push(a, r, Str("-o"));
     r = push(a, r, Str("EscapeChar=none"));
+    SshDest d = sshdest(a, l.ssh);
+    if (d.port.len) {
+        r = push(a, r, Str("-p"));
+        r = push(a, r, d.port);
+    }
     r = push(a, r, Str("--"));  // no options after it
-    r = push(a, r, l.ssh);
+    r = push(a, r, d.dest);
     r = push(a, r, command);
     return r;
 }
@@ -1195,15 +1273,19 @@ static DeployPut deployput(Deploy *d, Arena *perm, Arena scratch, Platform *pf,
             argv  = linkargv(&a, conf->program, reachof(conf), cat);
             input = f->data;
         } else {
+            SshDest sd = sshdest(&a, conf->ssh);
             argv = push(&a, argv, conf->scp.len ? conf->scp : Str("scp"));
             argv = push(&a, argv, Str("-q"));
             for (iz i = 0; i < countof(deployopts); i++) {
                 argv = push(&a, argv, deployopts[i]);
             }
+            if (sd.port.len) {
+                argv = push(&a, argv, Str("-P"));
+                argv = push(&a, argv, sd.port);
+            }
             argv = push(&a, argv, Str("--"));
             argv = push(&a, argv, f->local);
-            Str dest = concat(&a, conf->ssh, ":");
-            argv = push(&a, argv, concat(&a, dest, f->upath));
+            argv = push(&a, argv, scptarget(&a, sd, f->upath));
         }
         i64       limit = DEPLOY_UPTIME + f->data.len/DEPLOY_UPRATE*SEC;
         DeployRun up    = deployrun(d, &a, argv, limit, input);

@@ -106,7 +106,7 @@ if n <= int(os.environ.get("FAKESCP_FAIL", "0")):
     sys.stderr.write("Connection closed by 10.0.0.1 port 22\n")
     sys.exit(255)
 while len(args) > 2:
-    if args[0] == "-o":
+    if args[0] in ("-o", "-P"):  # with a value
         args = args[2:]
     elif args[0].startswith("-"):
         args = args[1:]
@@ -567,6 +567,33 @@ def dash_dest(t):
     t.check(p.returncode == 1, f"exit {p.returncode}: {p.stderr}")
     t.check("an ssh destination cannot begin with -" in p.stderr, f"stderr {p.stderr}")
     t.check(not t.sshlog() and t.scps() == 0, "ssh or scp ran")
+
+
+@scenario
+def port_dest(t):
+    """A destination with a port of its own, user@host:port: ssh gets
+    -p and the destination without it, scp -P and user@host:path; the
+    record is kept by the whole destination. A port out of range is
+    refused before either runs."""
+    src = t.engine()
+    p = t.deploy(target="me@here:2222")
+    t.check(p.returncode == 0, f"exit {p.returncode}: {p.stderr}")
+    t.check(os.path.isfile(t.deployed()) and sha256(t.deployed()) == sha256(src),
+            "the engine is there")
+    ssh = t.sshlog()
+    t.check(ssh and all("-p 2222 -- me@here " in l for l in ssh.splitlines()),
+            f"ssh ran {ssh!r}")
+    with open(os.path.join(t.fakelog, "scp.log")) as f:
+        scp = f.read()
+    t.check("-P 2222 -- " in scp and " me@here:" in scp and "2222:" not in scp,
+            f"scp ran {scp!r}")
+    rec = t.record("me@here_2222")  # deployfile: ":" as "_"
+    t.check(rec.get("host") == "me@here:2222", f"record {rec}")
+    os.remove(os.path.join(t.fakelog, "ssh.log"))
+    q = t.deploy(target="here:70000")
+    t.check(q.returncode == 1, f"exit {q.returncode}: {q.stderr}")
+    t.check("an ssh port must be from 1 to 65535" in q.stderr, f"stderr {q.stderr}")
+    t.check(not t.sshlog(), "ssh ran")
 
 
 @scenario
