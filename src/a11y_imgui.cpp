@@ -108,6 +108,7 @@ struct AxGui {
     u64                 logmodel; // the text model as last logged, hashed
     iz                  tracefd;  // PROSPERO_AXTRACE's file, or -1
     i64                 logmark;  // the checklist's: where "logged" looks from
+    i64                 calledlag;// the checklist's "aged": calls dated this much earlier
     Str                 tracepath;
     void              (*published)(AxGui *);  // the OS adapter's, after each publish
     void              (*osdrive)(Gui *, Str); // its checklist verbs ("ns ...")
@@ -837,7 +838,7 @@ static void axdeliver(AxGui *x, ImGuiContext *ctx)
 // nothing drawn, so the frame after would find the call already stale.
 static i64 axcalled(Gui *g)
 {
-    return os_ticks(g->os);
+    return os_ticks(g->os) - g->ax->calledlag;
 }
 
 // Ask for an action on the published node with key: 0 if it has no such
@@ -893,6 +894,17 @@ static b32 axtextselect(Gui *g, i32 anchor, i32 caret)
     }
     scheddirty(&g->sched);
     return 1;
+}
+
+// Field id's text was put from outside (a send, a draft reloaded, a
+// recall): edits a tool queued were for the text before, and one that
+// replaces nothing, or as many bytes, could still land in it. Until the
+// next frame, the model answers with the new text (axput).
+static void axtextput(Gui *g, u32 id, Str text)
+{
+    if (g->ax) {
+        axput(g->ax->ax, id, text);
+    }
 }
 
 // The adapter's log (AxLog): each call an OS adapter answers, a line led
@@ -1162,11 +1174,47 @@ static void axnewframe(ImGuiContext *ctx, ImGuiContextHook *hook)
     x->tabid   = 0;
 }
 
+// Log the queued edits dropped this frame, and why: each showed in the
+// shadow when made, so without this a tool's edit that never landed (as
+// Voice Control's inserts in the M1 trial) leaves no trace. The tool is
+// told of the text as it is by the publish's notifications.
+static void axnotedrops(AxGui *x)
+{
+    static Str const whys[AXDROP_N] = {
+        "waited too long", "its text changed first",
+        "counted on one dropped before it", "its field lost focus",
+        "its field can't take edits", "text was put over it",
+    };
+    i32 *d = x->ax->dropped;
+    i32  n = 0;
+    for (i32 i = 0; i < AXDROP_N; i++) {
+        n += d[i];
+    }
+    if (n && (PROSPERO_DEVTOOLS || x->tracefd>=0)) {
+        Arena a = x->logmem;
+        Buf   b(&a, 160);
+        print(&b, "queued edits dropped:");
+        for (i32 i = 0, sep = 0; i < AXDROP_N; i++) {
+            if (d[i]) {
+                print(&b, sep++ ? Str(", ") : Str(" "));
+                print(&b, (i64)d[i]);
+                putbyte(&b, ' ');
+                print(&b, whys[i]);
+            }
+        }
+        axnote(x, a, finish(&b));
+    }
+    for (i32 i = 0; i < AXDROP_N; i++) {
+        d[i] = 0;
+    }
+}
+
 static void axendframe(ImGuiContext *ctx, ImGuiContextHook *hook)
 {
     AxGui *x = (AxGui *)hook->UserData;
     if (x->on) {
         axbuild(x, ctx);
+        axnotedrops(x);
         if (x->published) {
             x->published(x);
         }
@@ -1245,10 +1293,19 @@ static void axstart(Gui *g)
 //   nav ROLE NAME    make the item ImGui's keyboard item, as arrows would
 //   lint             check that nothing actionable is unnamed, logging
 //                    what is
+//   aged MS CMD      CMD as a tool's call made MS ago
 //   logged TEXT      check that the adapter logged a line holding TEXT
 //                    since the last OP_NSTEXT
 //   ns ...           the OS adapter's own checks, through the OS's API
 //                    (macOS: a11y_macos.cpp); skipped where there is none
+//   put TEXT         put TEXT in the shown session's box, as a draft
+//                    reloaded from the engine is (draftput)
+//   off              accessibility is off: no tree, and the OS adapter
+//                    installed nothing (axoffcheck)
+
+// The OS adapter's check that it installed nothing, set whether or not
+// it did (macOS: a11y_macos.cpp)
+static void (*axoffcheck)(Gui *, Arena *);
 
 // what may be in a, the caller's scratch
 static void axcheck(Gui *g, Arena *a, b32 ok, Str what)
@@ -1303,6 +1360,18 @@ static void driveax(Gui *g, Str cmd)
     if (verb == "on") {
         axstart(g);
         guilog(g, g->ax ? Str("drive: accessibility on") : Str("drive: accessibility is off"));
+    } else if (verb == "put") {
+        if (g->sess) {
+            draftput(g, g->sess, c.tail);
+        }
+        axcheck(g, &a, g->sess!=0, concat(&a, "accessible put: ", c.tail));
+    } else if (verb == "off") {
+        axcheck(g, &a, !g->ax, Str("accessibility off: no tree"));
+        if (axoffcheck) {
+            axoffcheck(g, &a);
+        } else {
+            guilog(g, "drive: skipped (no OS adapter here): off");
+        }
     } else if (verb == "late") {
         // late MS CMD: CMD as a tool's call that comes while the loop
         // waits, MS after it last read the clock (os_guiwait dispatches
@@ -1311,6 +1380,16 @@ static void driveax(Gui *g, Str cmd)
         g->sched.now -= parseint(r.head).val * 1000;
         driveax(g, r.tail);
         g->sched.now = was;
+    } else if (verb == "aged") {
+        // aged MS CMD: CMD as a tool's call made MS ago, so that what it
+        // queued may go stale before the next frame takes it
+        if (g->ax) {
+            g->ax->calledlag = parseint(r.head).val * 1000;
+        }
+        driveax(g, r.tail);
+        if (g->ax) {
+            g->ax->calledlag = 0;
+        }
     } else if (!t) {
         axcheck(g, &a, 0, concat(&a, "accessibility (off): ", cmd));
     } else if (verb == "dump") {

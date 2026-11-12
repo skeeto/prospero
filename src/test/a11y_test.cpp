@@ -383,12 +383,17 @@ static void test_a11ytext(Test *t)
     // Stale: typed keys changed the bytes, so it and the next go. The
     // queue, all taken, starts over.
     axtestsync(x, &a, 0, 1, "hello world", 0, 0);
+    for (i32 i = 0; i < AXDROP_N; i++) {
+        x->dropped[i] = 0;
+    }
     axedit(x, 0, 5, "HELLO", 0, 5, 1000);
     expect(t, "a11ytext.emptied", istr(&a, x->mem[AXM_QUEUE].beg - x->base[AXM_QUEUE] < 2048), "1");
     axedit(x, 6, 11, "WORLD", AX_AFTER, AX_AFTER, 1000);
     expect(t, "a11ytext.twoedits", x->text.text, "HELLO WORLD");
     expect(t, "a11ytext.changed", axeditstr(&a, x, 77, "jello world", 1000), "none");
     expect(t, "a11ytext.dropped", axeditstr(&a, x, 77, "jello world", 1000), "none");
+    expect(t, "a11ytext.countchanged", istr(&a, x->dropped[AXDROP_CHANGED]), "1");
+    expect(t, "a11ytext.countchangedafter", istr(&a, x->dropped[AXDROP_AFTER]), "1");
     axtestsync(x, &a, 0, 1, "jello world", 1, 1);
     expect(t, "a11ytext.resync", x->text.text, "jello world");
 
@@ -397,6 +402,8 @@ static void test_a11ytext(Test *t)
     axedit(x, 1, 1, "<", AX_AFTER, AX_AFTER, AXEDIT_TTL);
     expect(t, "a11ytext.expired", axeditstr(&a, x, 77, "jello world", AXEDIT_TTL+1), "none");
     expect(t, "a11ytext.expiredgone", istr(&a, axqueued(x, 77)), "0");
+    expect(t, "a11ytext.countstale", istr(&a, x->dropped[AXDROP_STALE]), "1");
+    expect(t, "a11ytext.countstaleafter", istr(&a, x->dropped[AXDROP_AFTER]), "2");
 
     // An insertion, after a key typed first: the length tells
     axtestsync(x, &a, 0, 1, "hello", 0, 0);
@@ -434,11 +441,13 @@ static void test_a11ytext(Test *t)
     axedit(x, 5, 5, "!", AX_AFTER, AX_AFTER, 0);
     axtestsync(x, &a, AXS_READONLY, 1, "draft", 5, 5);
     expect(t, "a11ytext.nowreadonly", istr(&a, axqueued(x, 77)), "0");
+    expect(t, "a11ytext.countfixed", istr(&a, x->dropped[AXDROP_FIXED]), "1");
     expect(t, "a11ytext.nowreadonlytext", x->text.text, "draft");
     axtestsync(x, &a, 0, 1, "draft", 5, 5);
     axedit(x, 5, 5, "!", AX_AFTER, AX_AFTER, 0);
     axtextnone(x);
     expect(t, "a11ytext.blurred", istr(&a, axqueued(x, 77)), "0");
+    expect(t, "a11ytext.countleft", istr(&a, x->dropped[AXDROP_LEFT]), "1");
     axtestsync(x, &a, 0, 1, "draft", 5, 5);
     axedit(x, 5, 5, "!", AX_AFTER, AX_AFTER, 0);
     AxGeom og = axtestgeom(&a, "other");

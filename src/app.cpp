@@ -5502,6 +5502,7 @@ static void onfile(Gui *, Json *, b32 ok, Str err);
 static Str  draftstr(GuiSession *);
 static void draftput(Gui *, GuiSession *, Str);
 static void imedrop(Gui *, u32);
+static void axtextput(Gui *, u32, Str);
 static void setdraft(Gui *, GuiSession *, Str);
 static void setnote(Gui *, GuiSession *, Str, b32, b32);
 static Str  sesstitle(GuiSession *);
@@ -7119,6 +7120,7 @@ static void draftput(Gui *g, GuiSession *s, Str text)
     if (s == g->sess) {
         imedrop(g, s->draftid);
     }
+    axtextput(g, s->draftid, {(u8 *)buf, n});
     scheddirty(&g->sched);
 }
 
@@ -22514,6 +22516,12 @@ static DriveOp a11yops[] = {
     {OP_A11Y, 0, 0, 0, 300, "select 0 6"},
     {OP_A11Y, 0, 0, 0, 300, "late 6000 edit 0 6 Write a hello world program"},
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, "Write a hello world program"},
+    // One that does wait too long for a frame is dropped, as the shadow
+    // is, and the log says so: it showed when made
+    {OP_A11Y, 0, 0, 0, 300, "aged 6000 edit 0 0 Lost"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "Write a hello world program"},
+    {OP_A11Y, 0, 0, 0, 0, "text Write a hello world program"},
+    {OP_A11Y, 0, 0, 0, 0, "logged queued edits dropped: 1 waited too long"},
     {OP_A11Y, 0, 0, 0, 300, "late 6000 press menuitem View"},
     {OP_A11Y, 0, 0, 0, 0, "has menuitem Go to..."},
     KEY(GKEY_ESCAPE, 0, 300),
@@ -22566,6 +22574,11 @@ static DriveOp a11yops[] = {
     {OP_A11Y, 0, 0, 0, 300, "select 6 11"},
     {OP_A11Y, 0, 0, 0, 300, "late 6000 ns ti insert none earth"},
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, "hello earth"},
+    {OP_A11Y, 0, 0, 0, 300, "select 6 11"},
+    {OP_A11Y, 0, 0, 0, 300, "aged 6000 ns ti insert none planet"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "hello earth"},
+    {OP_A11Y, 0, 0, 0, 0, "ns tget AXValue hello earth"},
+    {OP_A11Y, 0, 0, 0, 0, "logged queued edits dropped: 1 waited too long"},
     {OP_A11Y, 0, 0, 0, 300, "ns ti insert 6,5 world"},
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, "hello world"},
     {OP_A11Y, 0, 0, 0, 0, "ns tget AXSelectedTextRange 11,0"},
@@ -22638,6 +22651,83 @@ static DriveOp a11yops[] = {
     {OP_A11Y, 0, 0, 0, 500, "ns replay dictation.trace"},
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, "a quick brown fox\nleapsjumps"},
 
+    // Ranges out of reach, from Dictation and Voice Control alike (an
+    // NSRange's are unsigned: -1 is past I64MAX, NSNotFound is I64MAX):
+    // refused, or cut to the text, never ranged past it
+    SELALL,
+    KEY(GKEY_BACKSPACE, 0, 300),
+    {OP_A11Y, 0, 0, 0, 300, "ns ti insert none hello"},
+    {OP_A11Y, 0, 0, 0, 0, "ns ti sub none nil"},
+    {OP_A11Y, 0, 0, 0, 0, "ns ti sub -1,2 nil"},
+    {OP_A11Y, 0, 0, 0, 0, "ns ti sub 3,-1 3,2 lo"},
+    {OP_A11Y, 0, 0, 0, 300, "ns ti mark 99,99 -1,3 xy"},
+    {OP_A11Y, 0, 0, 0, 0, "ns ti has 1"},
+    {OP_A11Y, 0, 0, 0, 0, "ns ti marked 5,2"},
+    {OP_A11Y, 0, 0, 0, 300, "ns ti unmark"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "helloxy"},
+    {OP_A11Y, 0, 0, 0, 0, "ns ti insert 9223372036854775807,3 !"},
+    {OP_A11Y, 0, 0, 0, 300, "ns ti insert 2,-1 ?"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "helloxy!?"},
+    {OP_A11Y, 0, 0, 0, 0, "ns tparam AXStringForRange -1,2 "},
+    {OP_A11Y, 0, 0, 0, 0, "ns tparam AXStringForRange 2,-1 "},
+    {OP_A11Y, 0, 0, 0, 0, "ns tparam AXStringForRange 9223372036854775807,0 "},
+    {OP_A11Y, 0, 0, 0, 0, "ns tparam AXAttributedStringForRange 9,0 "},
+    {OP_A11Y, 0, 0, 0, 0, "ns tparam AXRangeForLine -1 0,0"},
+    {OP_A11Y, 0, 0, 0, 0, "ns tparam AXLineForIndex -5 0"},
+    {OP_A11Y, 0, 0, 0, 0, "ns tparam AXRangeForIndex -3 0,1"},
+    {OP_A11Y, 0, 0, 0, 0, "ns tparam AXStyleRangeForIndex -1 0,9"},
+    {OP_A11Y, 0, 0, 0, 0, "ns tset AXSelectedTextRange -1,0"},
+    {OP_A11Y, 0, 0, 0, 0, "ns tset AXSelectedTextRanges 9223372036854775807,0"},
+    {OP_A11Y, 0, 0, 0, 300, "ns tset AXSelectedTextRange 4,-1"},
+    {OP_A11Y, 0, 0, 0, 0, "ns tget AXSelectedTextRange 9,0"},
+    {OP_A11Y, 0, 0, 0, 0, "logged AXSelectedTextRange= {-1,0} -> NO"},
+
+    // Text put in the box from outside, a draft reloaded, over Dictation's
+    // composition: that is dropped, and the input method told; over an
+    // edit queued and not yet taken, of as many bytes: that is dropped too
+    {OP_A11Y, 0, 0, 0, 300, "ns ti mark 9,0 none spoken"},
+    {OP_A11Y, 0, 0, 0, 0, "ns ti has 1"},
+    {OP_A11Y, 0, 0, 0, 0, "marked spoken"},
+    {OP_A11Y, 0, 0, 0, 300, "put reloaded"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "reloaded"},
+    {OP_A11Y, 0, 0, 0, 0, "ns ti has 0"},
+    {OP_A11Y, 0, 0, 0, 0, "marked "},
+    {OP_A11Y, 0, 0, 0, 0, "logged the composition is dropped"},
+    {OP_A11Y, 0, 0, 0, 0, "edit 8 8 X"},
+    {OP_A11Y, 0, 0, 0, 300, "put RELOADED"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "RELOADED"},
+    {OP_A11Y, 0, 0, 0, 0, "queued 0"},
+    {OP_A11Y, 0, 0, 0, 0, "text RELOADED"},
+    // An edit before the frame that shows a put is made against the put
+    {OP_A11Y, 0, 0, 0, 0, "put abcd"},
+    {OP_A11Y, 0, 0, 0, 300, "edit 4 4 Q"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "abcdQ"},
+    {OP_A11Y, 0, 0, 0, 0, "text abcdQ"},
+    // Send over a composition: what was typed goes, the composition not
+    {OP_A11Y, 0, 0, 0, 300, "ns ti mark 8,0 none more"},
+    {OP_A11Y, 0, 0, 0, 0, "ns ti has 1"},
+    {OP_A11Y, 0, 0, 0, 500, "press button Send"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    {OP_A11Y, 0, 0, 0, 0, "ns ti has 0"},
+    {OP_A11Y, 0, 0, 0, 0, "marked "},
+    {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
+    // Another session shown over one: the composition stays behind, and
+    // goes; the session it was in keeps its text without it
+    {OP_A11Y, 0, 0, 0, 300, "activate textarea Prompt"},
+    {OP_A11Y, 0, 0, 0, 300, "ns ti insert none kept"},
+    {OP_A11Y, 0, 0, 0, 300, "ns ti mark 4,0 none away"},
+    {OP_A11Y, 0, 0, 0, 0, "ns ti has 1"},
+    {OP_NEWSESSION, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_A11Y, 0, 0, 0, 300, "marked "},
+    {OP_A11Y, 0, 0, 0, 0, "ns ti has 0"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    {OP_A11Y, 0, 0, 0, 600, "press listitem abcde!"},
+    {OP_A11Y, 0, 0, 0, 0, "is selected listitem abcde!"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "kept"},
+    {OP_A11Y, 0, 0, 0, 300, "activate textarea Prompt"},
+    {OP_A11Y, 0, 0, 0, 0, "marked "},
+
     // Text input as it was, if Dictation's calls started it
     {OP_NSTEXT, 0, 4, 0, 100, ""},
     SELALL,
@@ -22703,6 +22793,24 @@ static DriveOp a11yops[] = {
     CLICK(T_TRANSCRIPT, "", 300),
     {OP_A11Y, 0, 0, 0, 300, "activate textarea Prompt"},
     {OP_A11Y, 0, 0, 0, 0, "ns focus AXTextArea Prompt"},
+    // While the window isn't the user's, nothing has the focus
+    {OP_A11Y, 0, 0, 0, 0, "ns mark"},
+    {OP_FOCUS, 0, 2, 0, 300, ""},
+    {OP_A11Y, 0, 0, 0, 0, "ns nofocus"},
+    {OP_A11Y, 0, 0, 0, 0, "ns attr AXFocused 0 AXTextArea Prompt"},
+    {OP_A11Y, 0, 0, 0, 0, "ns posted AXFocusedUIElementChanged 0"},
+    {OP_FOCUS, 0, 1, 0, 300, ""},
+    {OP_A11Y, 0, 0, 0, 0, "ns focus AXTextArea Prompt"},
+    {OP_A11Y, 0, 0, 0, 0, "ns attr AXFocused 1 AXTextArea Prompt"},
+    // A live resize draws from its nested loop, each frame a new layout:
+    // told at most every 250 ms, and what is held told after. Its frames
+    // come paced from one injection, as SDL's timer sends the exposes it
+    // draws from, with no frame of the main loop between them.
+    {OP_A11Y, 0, 0, 0, 0, "ns resizing 1"},
+    {OP_MODALSIZE, 0, 24, 0, 500, ""},  // the next step not inside it
+    {OP_A11Y, 0, 0, 0, 600, "ns resizing 0"},
+    {OP_A11Y, 0, 0, 0, 0, "ns throttled"},
+    {OP_A11Y, 0, 0, 0, 0, "ns owed 0"},
     // What changes is told, of elements a tool has
     {OP_A11Y, 0, 0, 0, 0, "ns mark"},
     {OP_TEXT, 0, 0, 0, 300, "AppKit"},
@@ -22871,12 +22979,16 @@ static DriveOp a11yops[] = {
     {OP_A11Y, 0, 0, 0, 0, "ns posted AXMenuOpened 1"},
     {OP_A11Y, 0, 0, 0, 0, "ns has AXMenuItem Copy Message"},
     {OP_A11Y, 0, 0, 0, 0, "ns has AXMenu "},
+    {OP_A11Y, 0, 0, 0, 0, "ns keep AXMenuItem Copy Message"},
     {OP_A11Y, 0, 0, 0, 0, "ns mark"},
 #endif
     KEY(GKEY_ESCAPE, 0, 300),
 #ifdef __APPLE__
     {OP_A11Y, 0, 0, 0, 0, "ns posted AXUIElementDestroyed"},
     {OP_A11Y, 0, 0, 0, 0, "ns posted AXMenuClosed 1"},
+    // One a tool kept answers as nothing, and every element let go is
+    {OP_A11Y, 0, 0, 0, 0, "ns kept"},
+    {OP_A11Y, 0, 0, 0, 300, "ns alive"},
 #endif
     // Asked for late in the loop's wait, it opens all the same
     {OP_A11Y, 0, 0, 0, 300, "late 6000 menu group Transcript"},
@@ -22958,6 +23070,27 @@ static DriveOp a11yops[] = {
     {OP_MARK, 0, 0, 0, 11000, ""},
     {OP_MARK, 0, 0, 0, 3000, ""},
     {OP_CHECK, CHK_COMPOSEQUIET, 0, 0, 0, ""},
+#ifdef __APPLE__
+    {OP_A11Y, 0, 0, 0, 0, "ns alive"},
+#endif
+    {OP_SUMMARY, 0, 0, 0, 0, ""},
+    {OP_QUIT, 0, 0, 0, 0, ""},
+};
+
+// [ui] accessibility = off (--a11y-off, after --a11y): no tree, nothing
+// installed for the OS's tools, and typing as ever
+static DriveOp a11yoffops[] = {
+    {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
+    {OP_NEWSESSION, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    CLICK(T_PROMPT, "", 300),
+    SELALL,  // keys from the desktop, if the window got them first
+    KEY(GKEY_BACKSPACE, 0, 300),
+    {OP_TEXT, 0, 0, 0, 300, "typed"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "typed"},
+    {OP_A11Y, 0, 0, 0, 300, "off"},
+    {OP_A11Y, 0, 0, 0, 300, "on"},  // as a tool's asking would: still off
+    {OP_A11Y, 0, 0, 0, 0, "off"},
     {OP_SUMMARY, 0, 0, 0, 0, ""},
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
@@ -28598,6 +28731,7 @@ static Str guiusage =
 "                 --cwd that is a git repository\n"
 "  --terminal     the Terminal pane: Ctrl+`, typing, a resize, exit\n"
 "  --a11y         accessibility: the tree a tool sees, its names, focus\n"
+"  --a11y-off     with [ui] accessibility = off: nothing installed for tools\n"
 "  --a11y-lint    with any checklist: accessibility on, and each visible\n"
 "                 control with no name logged once (a11y-lint: ...)\n"
 "  --mcp          an MCP server's page in Settings: its state, Sign in\n"
@@ -28865,6 +28999,9 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
             terminal = probe = 1;
         } else if (a == "--a11y") {
             a11y = probe = 1;
+        } else if (a == "--a11y-off") {
+            a11y  = 2;
+            probe = 1;
         } else if (a == "--a11y-lint") {
             g->axlint = 1;
         } else if (a == "--mcp") {
@@ -28951,7 +29088,10 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
             background || attach || remote || compose || sidebar || plan || launch ||
             first || mcp || hosttask || changes || thin || containers || terminal || a11y) {
         g->drive = 1;
-        if (a11y) {
+        if (a11y == 2) {
+            g->ops  = a11yoffops;
+            g->nops = countof(a11yoffops);
+        } else if (a11y) {
             g->ops  = a11yops;
             g->nops = countof(a11yops);
         } else if (terminal) {

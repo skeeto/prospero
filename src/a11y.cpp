@@ -221,6 +221,18 @@ enum : i64 {
     AXEDIT_TTL = 5000000,  // µs an edit waits for its field
 };
 
+// Why queued edits were dropped, counted for the log: a tool's edit
+// shows in the shadow at once, so one that never lands must say so.
+enum : i32 {
+    AXDROP_STALE,    // waited longer than AXEDIT_TTL
+    AXDROP_CHANGED,  // its field's text changed under it
+    AXDROP_AFTER,    // counted on an edit before it that was dropped
+    AXDROP_LEFT,     // its field lost focus
+    AXDROP_FIXED,    // its field is now read-only or a password's
+    AXDROP_PUT,      // text was put over its field's
+    AXDROP_N
+};
+
 // The arenas, each given whole: nothing else may use them.
 enum : i32 {
     AXM_TREE0,  // the two trees, in turn
@@ -243,6 +255,7 @@ struct A11y {
     AxText         text;
     Slice<AxEdit>  queue;
     iz             qhead;
+    i32            dropped[AXDROP_N];  // since the glue last logged them
 };
 
 static A11y *newa11y(Arena *perm, Arena (&mem)[AXM_N])
@@ -1461,9 +1474,10 @@ static b32 axqueued(A11y *x, u32 id)
 }
 
 // Drop the edits queued for field id: it went away, or can't take them.
-static void axdropedits(A11y *x, u32 id)
+static void axdropedits(A11y *x, u32 id, i32 why)
 {
     for (iz i = x->qhead; i < x->queue.len; i++) {
+        x->dropped[why] += id && x->queue[i].id==id;
         x->queue[i].id = x->queue[i].id==id ? 0 : x->queue[i].id;
     }
     while (x->qhead<x->queue.len && !x->queue[x->qhead].id) {
@@ -1482,13 +1496,13 @@ static void axtextsync(A11y *x, u32 key, u32 id, u32 state, b32 multiline,
     b32     other = !t->live || t->key!=key || t->id!=id;
     if (other) {
         if (t->live) {
-            axdropedits(x, t->id);
+            axdropedits(x, t->id, AXDROP_LEFT);
         }
         t->marked = {};
         t->mlo = t->mhi = 0;
     }
     if (state & (AXS_READONLY|AXS_PASSWORD)) {
-        axdropedits(x, id);
+        axdropedits(x, id, AXDROP_FIXED);
     }
     t->live      = 1;
     t->key       = key;
@@ -1527,7 +1541,7 @@ static void axtextnone(A11y *x)
 {
     AxText *t = &x->text;
     if (t->live) {
-        axdropedits(x, t->id);
+        axdropedits(x, t->id, AXDROP_LEFT);
     }
     t->live   = 0;
     t->marked = {};
@@ -1566,6 +1580,23 @@ static Str axclean(Arena *a, Str s, b32 multiline)
         putbyte(&b, c);
     }
     return finish(&b);
+}
+
+// Field id's text was put from outside, the caret at its end, as ImGui
+// shows it from the next frame. Edits queued for it were for the text
+// before, and are dropped. If it is the field the model holds, the model
+// takes the text at once: an edit a tool makes before that frame is made
+// against it, not against what was there.
+static void axput(A11y *x, u32 id, Str text)
+{
+    axdropedits(x, id, AXDROP_PUT);
+    AxText *t = &x->text;
+    if (t->live && t->id==id) {
+        t->marked = {};
+        t->mlo = t->mhi = 0;
+        axtake(x, axclean(axspare(x), text, t->multiline));
+        t->anchor = t->caret = axtextlen(x);
+    }
 }
 
 enum : i32 {
@@ -1664,6 +1695,7 @@ static b32 axnextedit(A11y *x, u32 id, Str text, i64 now, AxEdit *out)
         AxEdit *e     = &x->queue[i];
         b32     stale = now-e->when > AXEDIT_TTL;
         if (e->id && e->id!=id && stale) {
+            x->dropped[AXDROP_STALE]++;
             e->id = 0;
         }
         if (!e->id || e->id!=id || r) {
@@ -1672,7 +1704,10 @@ static b32 axnextedit(A11y *x, u32 id, Str text, i64 now, AxEdit *out)
         e->id = 0;
         if (stale || text.len!=e->before || (e->lo>=0 && (e->hi>text.len ||
                 !(span(text.data+e->lo, text.data+e->hi) == e->expect)))) {
+            i32 why = stale ? AXDROP_STALE : AXDROP_CHANGED;
+            x->dropped[why]++;
             for (iz j = i+1; j < x->queue.len; j++) {
+                x->dropped[AXDROP_AFTER] += x->queue[j].id==id;
                 x->queue[j].id = x->queue[j].id==id ? 0 : x->queue[j].id;
             }
             break;
