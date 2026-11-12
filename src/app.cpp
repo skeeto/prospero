@@ -298,6 +298,7 @@ enum : i32 {
     RECT_NEWPICK,    // its first pick other than the default model
     RECT_QUEUEITEM,  // the transcript's first queued message
     RECT_LASTMSG,    // the transcript's last message, if drawn
+    RECT_TOOLPATH,   // the latest tool row's path, a link to its file
     RECT_THEME0,     // the theme's choices in its open list
     RECT_PANE0 = RECT_THEME0 + THEME_COUNT,  // View's toggle of each pane
     RECT_COUNT = RECT_PANE0 + PANE_COUNT,
@@ -1532,6 +1533,7 @@ struct Gui {
     Str                linkopened; // a web link followed under the checklist
     u8                 linktipped[256]; // and the last link's tooltip
     i32                linktippedlen;
+    i32                toolpathmsg; // RECT_TOOLPATH's row, under the checklist
     LinkMenu           linkmenu;   // the text menu's file link, if any
     Images             img;        // screenshots
     b32                outopen;
@@ -13240,6 +13242,8 @@ enum : i32 {
     T_NEWMODEL,    // the new session dialog's model combo
     T_NEWPICK,     // its first pick other than the default model
     T_FILETEXT,    // the start of the Files text's line text, 1-based
+    T_TOOLPATH,    // the latest tool row's path drawn, a link to its file
+    T_TOOLHEAD,    // and its header, left of the path
 };
 
 enum : i32 {
@@ -13627,6 +13631,7 @@ enum : i32 {
     CHK_FILEPATH,     // the front file's path ends with text ('/' either way)
     CHK_CLIPEND,      // the clipboard ends with text ('/' either way)
     CHK_FILETOP,      // the front file's top line is dx (1-based), or the next
+    CHK_TOOLPATHFOLD, // RECT_TOOLPATH's row is folded (dx 1) or open (0)
     CHK_COUNT,
 };
 
@@ -13938,6 +13943,7 @@ static Str chknames[] = {
     "the files read fit their budget", "no frames while idle, a file shown",
     "the link's tooltip is as said", "the front file is the one said",
     "the clipboard ends with the path said", "the file's top line is as said",
+    "the tool row whose path was clicked is folded or open as said",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -16032,6 +16038,31 @@ static DriveOp m3ops[] = {
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
     {OP_CHECK, CHK_FILEPATH, 0, 0, 0, "/cite/hello.c"},
+    // A tool row's path opens its file: a read's at the lines it read,
+    // while a click elsewhere on its header still folds the row
+    {OP_PROMPT, 0, 0, 0, 1500, "Read the cited lines."},
+    {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
+    {OP_MOVE, T_TOOLPATH, 0, 0, 800, ""},
+    {OP_CHECK, CHK_TOOLTIP, 0, 0, 0, ""},
+    {OP_CHECK, CHK_LINKTIP, 0, 0, 0, "Files \xe2\x86\x92 cite/hello.c:20-24"},
+    {OP_SHOT, 0, 0, 0, 300, "files-toolpath"},
+    {OP_CHECK, CHK_TOOLPATHFOLD, 1, 0, 0, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEPATH, 0, 0, 0, "/cite/hello.c"},
+    {OP_CHECK, CHK_FILEMODE, FMODE_TEXT, 0, 0, ""},
+    {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "20-24"},
+    {OP_CHECK, CHK_FILELINE, 20, 24, 0, "centered"},
+    {OP_CHECK, CHK_TOOLPATHFOLD, 1, 0, 0, ""},
+    {OP_MOVE, T_TOOLHEAD, 0, 0, 300, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_TOOLPATHFOLD, 0, 0, 0, ""},
+    {OP_MOVE, T_TOOLHEAD, 0, 0, 300, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_TOOLPATHFOLD, 1, 0, 0, ""},
     // Quiet with a file shown, past the tooltips and the layout's save
     {OP_MOVE, T_EMPTY, 0, 0, 4500, ""},
     {OP_MARK, 0, 0, 0, 3000, ""},
@@ -20206,6 +20237,11 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_PARENTLINK:  return rectcenter(g->rects[RECT_PARENTLINK]);
     case T_MSGLINK:     return rectcenter(g->rects[RECT_MSGLINK]);
     case T_UNDO:        return rectcenter(g->rects[RECT_UNDO]);
+    case T_TOOLPATH:    return rectcenter(g->rects[RECT_TOOLPATH]);
+    case T_TOOLHEAD: {
+        Rect r = g->rects[RECT_TOOLPATH];
+        return r.x1>r.x0 ? v2(r.x0 - 24*g->scale, (r.y0+r.y1)/2) : v2(-1, -1);
+    }
     case T_HOLD:        return rectcenter(g->rects[RECT_HOLD]);
     case T_REWINDTURN:  return rectcenter(g->rects[RECT_REWINDTURN]);
     case T_REWINDOK:    return rectcenter(g->rects[RECT_REWINDOK]);
@@ -21178,6 +21214,14 @@ static b32 drivefilecheck(Gui *g, i32 chk)
         print(&b, "drive: the link's tooltip was ");
         print(&b, tip);
         ok = tip == op->text;
+    } break;
+    case CHK_TOOLPATHFOLD: {
+        View *v = g->view;
+        i32   i = g->toolpathmsg;
+        b32   c = i>=0 && i<v->msgs.len && v->msgs[i].collapsed;
+        print(&b, "drive: the tool row's ");
+        print(&b, c ? Str("folded") : Str("open"));
+        ok = i>=0 && i<v->msgs.len && c==(op->dx!=0);
     } break;
     case CHK_FILEPATH: {
         Str path = ft ? ft->path : Str{};
@@ -23319,6 +23363,7 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_FILEPATH:
     case CHK_CLIPEND:
     case CHK_FILETOP:
+    case CHK_TOOLPATHFOLD:
         return drivefilecheck(g, chk);
     case CHK_TERMQUIET:
         return g->panes[PANE_TERMINAL] && drivequiet(g, "idle with the terminal shown", 2);

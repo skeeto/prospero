@@ -160,6 +160,105 @@ static void test_view(Test *t)
                "```diff\n--- f.lua\n+++ f.lua\n@@ -3,1 +3,2 @@\n-\n+\n+T = {}\n```\n");
     }
 
+    // The file a tool row is about, which its path links to (toolfileref),
+    // from the arguments and results the tools take and give
+    {
+        Arena a = perm;
+        struct {
+            Str name;
+            Str args;
+            Str result;
+            Str want;  // "path:line0-line1", or "-" for no file
+        } cases[] = {
+            {"read", R"({"path":"src/a.c"})", "", "src/a.c:0-0"},
+            {"read", R"({"path":"src/a.c","offset":20,"limit":5})", "", "src/a.c:20-24"},
+            {"read", R"({"path":"src/a.c","offset":20})", "", "src/a.c:20-20"},
+            {"read", R"({"path":"src/a.c","limit":5})", "", "src/a.c:0-0"},
+            {"read", R"({"path":"/abs/a.c","offset":"7","limit":"2"})", "", "/abs/a.c:7-8"},
+            {"read", R"({"path":"a.c","offset":0,"limit":3})", "", "a.c:0-0"},
+            {"read", R"({"path":"a.c","offset":99999999})", "", "a.c:0-0"},
+            {"read", R"({"path":"a.c","offset":5,"limit":99999999})", "", "a.c:5-2004"},
+            {"read", R"({"path":"a.c","offset":5,"limit":5000})", "", "a.c:5-2004"},
+            {"read", R"({"path":"a.c","offset":9999999,"limit":5})", "", "a.c:9999999-10000000"},
+            {"read", R"({"path":"a.c","offset":9223372036854775807,"limit":2})", "", "a.c:0-0"},
+            {"read", R"({"path":"a.c","offset":"9223372036854775807","limit":2})", "", "a.c:0-0"},
+            {"read", R"({"path":"src"})", "Directory src (2 entries):\na.c\nb.c\n", "-"},
+            {"read", R"({"path":"src"})", "     1\tDirectory ", "src:0-0"},
+            {"write", R"({"path":"n.txt","content":"a\nb\n"})", "Created n.txt", "n.txt:0-0"},
+            {"edit", R"({"path":"f.lua","old_string":"x\ny","new_string":"a\nb\nc"})",
+             "Edited f.lua: replaced 1 match at line 12.", "f.lua:12-14"},
+            {"edit", R"({"path":"f.lua","old_string":"x","new_string":"a\nb\n"})",
+             "Edited f.lua: replaced 3 matches, the first at line 7.", "f.lua:7-8"},
+            {"edit", R"({"path":"f.lua","old_string":"x","new_string":""})",
+             "Edited f.lua: replaced 1 match at line 4 (matched ignoring indentation).",
+             "f.lua:4-4"},
+            {"edit", R"({"path":"line 9.lua","old_string":"x","new_string":"y"})",
+             "Edited line 9.lua: replaced 1 match at line 2, approximately.", "line 9.lua:2-2"},
+            {"edit", R"({"path":"f.lua","old_string":"x","new_string":"y"})", "", "f.lua:0-0"},
+            {"edit", R"({"path":"a.c","tag":"AB12","edits":[{"op":"replace","line":9,"end":9,)"
+                     R"("text":"q\n"},{"op":"replace","line":2,"end":3,"text":"z\nw\nv\n"}]})",
+             "", "a.c:2-4"},
+            {"edit", R"({"path":"a.c","tag":"AB12","edits":[{"op":"insert","line":0,"text":"t\nu"}]})",
+             "", "a.c:1-2"},
+            {"edit", R"({"path":"a.c","tag":"AB12","edits":[{"op":"delete","line":5,"end":8}]})",
+             "", "a.c:5-5"},
+            {"edit", R"({"path":"a.c","tag":"AB12","edits":"[{\"op\":\"replace\",\"line\":\"6\",)"
+                     R"(\"text\":\"k\"}]"})", "", "a.c:6-6"},
+            {"edit", R"({"path":"a.c","tag":"AB12","edits":{"op":"replace","line":3,"text":"k"}})",
+             "", "a.c:3-3"},
+            {"edit", R"({"patch":"*** Begin Patch\n*** Update File: a.c\n@@ f\n-x\n+y\n)"
+                     R"(*** End Patch"})", "", "a.c:0-0"},
+            {"edit", R"({"patch":"*** Begin Patch\n*** Update File: a.c\n*** Move to: b.c\n)"
+                     R"(@@ f\n-x\n+y\n*** End Patch"})", "", "b.c:0-0"},
+            {"edit", R"({"patch":"*** Begin Patch\n*** Update File: a.c\n@@ f\n-x\n+y\n)"
+                     R"(*** Delete File: b.c\n*** End Patch"})", "", "-"},
+            {"edit", R"({"patch":"not a patch"})", "", "-"},
+            {"edit", R"({"path":"a.c","patch":"*** Begin Patch\n*** Update File: b.c\n@@ f\n)"
+                     R"(-x\n+y\n*** End Patch"})", "", "b.c:0-0"},
+            {"edit", R"({"path":"a.c","patch":"*** Begin Patch\n*** Delete File: old.c\n)"
+                     R"(*** End Patch"})", "", "-"},
+            {"edit", R"({"path":"a.c","tag":"T","edits":[{"op":"insert","line":9223372036854775807,)"
+                     R"("text":"x"},{"op":"replace","line":9223372036854775806,"text":"y\nz"}]})",
+             "", "a.c:0-0"},
+            {"edit", R"({"path":"a.c","tag":"T","edits":[{"op":"insert_after","line":4,"text":"x\n"}]})",
+             "", "a.c:5-5"},
+            {"edit", R"({"path":"a.c","tag":"T","edits":[{"op":" Append","line":0,"text":"x"}]})",
+             "", "a.c:1-1"},
+            {"edit", R"({"path":"a.c","tag":"T","edits":[{"op":"Remove","line":6,"end":9}]})",
+             "", "a.c:6-6"},
+            {"edit", R"({"path":"a.c","tag":"T","edits":[{"op":"insert","line":3,"text":"x"},)"
+                     R"({"op":"replace","line":3,"end":3,"text":"y"}]})", "", "a.c:3-3"},
+            {"edit", R"({"path":"a.c","tag":"T","edits":[{"op":"replace","line":3,"text":"y"},)"
+                     R"({"op":"insert","line":2,"text":"x"}]})", "", "a.c:3-3"},
+            {"edit", R"({"path":"a.c","tag":"T","edits":[{"op":"bogus","line":1,"text":"y"},)"
+                     R"({"op":"delete","line":7}]})", "", "a.c:7-7"},
+            {"write", "{\"path\":\"n.txt\",\"content\":\"a\nb\"}", "", "n.txt:0-0"},
+            {"write", R"("{\"path\":\"n.txt\",\"content\":\"a\"}")", "", "n.txt:0-0"},
+            {"shell", R"({"command":"cat a.c"})", "", "-"},
+            {"grep", R"({"pattern":"x","path":"src"})", "", "-"},
+            {"read", R"({"offset":3})", "", "-"},
+            {"read", "not json", "", "-"},
+        };
+        for (i32 i = 0; i < countof(cases); i++) {
+            Arena   s = a;
+            FileRef r = toolfileref(&s, cases[i].name, cases[i].args, cases[i].result);
+            Buf     b(&s, 128);
+            if (r.kind != FREF_PATH) {
+                print(&b, "-");
+            } else {
+                print(&b, r.path);
+                putbyte(&b, ':');
+                print(&b, (i64)r.line0);
+                putbyte(&b, '-');
+                print(&b, (i64)r.line1);
+            }
+            Buf n(&s, 32);
+            print(&n, "view.toolfileref ");
+            print(&n, (i64)i);
+            expect(t, finish(&n), finish(&b), cases[i].want);
+        }
+    }
+
     // A turn: deltas grow provisional messages, which the committed
     // record replaces, reclaiming their text
     {
@@ -407,6 +506,10 @@ static void test_view(Test *t)
         expect(t, "view.diff", v->msgs[2].text,
                "```diff\n--- a.c\n+++ a.c\n@@ -12,2 +12,1 @@\n-x\n-y\n+z\n```\n");
         expect(t, "view.diffmd", istr(&a, v->msgs[2].md*10 + v->msgs[2].collapsed), "10");
+        FileRef *ef = &v->msgs[2].tool->file;
+        expect(t, "view.editfile", concat(&a, ef->path, concat(&a, ":", istr(&a, ef->line0*100 +
+               ef->line1))), "a.c:1212");
+        expect(t, "view.shellfile", istr(&a, v->msgs[1].tool->file.kind), istr(&a, FREF_BAD));
         apply(v, a, R"({"sid":"s","seq":10,"ts":0,"ev":"turn.end","turn":1,"why":"done"})");
         expect(t, "view.done", istr(&a, v->busy*10 + v->state), "0");
     }

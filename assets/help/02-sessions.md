@@ -287,8 +287,12 @@ folder keeps its older links pointing where they were), and in a
 Markdown file from the file's own folder, where `#install` alone goes
 to that heading. A line opens the text, even of a Markdown file; a
 click again goes there again. Right-click a link for Open in Files or
-Copy path. Until files on other hosts can be shown, a link in a
-session on another host only says so.
+Copy path. The path on a read, write or edit tool row is a link to
+its file as well, a read's at the lines it read and an edit's at the
+lines it changed; a click elsewhere on the row's header still folds
+it. Until files on
+other hosts can be shown, a link in a session on another host only
+says so.
 
 ## The session's menu
 

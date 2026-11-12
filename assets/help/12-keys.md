@@ -94,6 +94,8 @@ copies its code exactly, and shows a check mark for a moment. A click on a tool 
 opens or folds it. So does a click on the bar at its left (a tool
 row's colored bar, reasoning's gray one), from anywhere along it,
 which, folding, scrolls back to its header if that was above the view.
+A click on a tool row's file path, though, opens that file in the
+Files pane.
 
 ## Finding
 

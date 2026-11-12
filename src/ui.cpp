@@ -1227,11 +1227,14 @@ static Str markwhat(Gui *g, Arena *a, ViewMsg *m)
     return m->text;
 }
 
-static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
+// Returns where a tool row's summary went along the line, x0 to x1, to
+// be a link to its file; empty for none.
+static ImVec2 drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
 {
     Arena     a   = g->frame;
     ViewTool *t   = m->tool;
     Palette  *pal = g->pal;
+    ImVec2    sum = {};
     u32 dim = fade(pal->dim, m->faded ? 0.5f : 1);
     switch (m->role) {
     case VIEW_TOOL: {
@@ -1298,7 +1301,9 @@ static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
             }
         }
         pen(p, "  ", 0, dim);
+        sum.x = p->x<p->right ? p->x : p->right;
         pen(p, t->summary, STYLE_CODE, pal->summary);
+        sum.y = p->x<p->right ? p->x : p->right;
     } break;
     case VIEW_COMPACT: {
         ViewCard *c = m->card;
@@ -1528,6 +1533,7 @@ static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
     default:
         pen(p, m->label.len ? m->label : rolename(m->role), STYLE_BOLD, dim);
     }
+    return sum;
 }
 
 // A task's subagent: named by its report, or found by its parent and
@@ -4067,6 +4073,18 @@ static void followlink(Gui *g, Str link, LinkFrom *from)
     scheddirty(&g->sched);
 }
 
+// A link's tooltip, tip, shown now and, under the checklist, kept. The
+// arena is the one tip was made in, past it.
+static void linktipnow(Gui *g, Arena *a, Str tip)
+{
+    tipnow("%s", cstr0(a, tip));
+    if (g->drive) {
+        iz n = tip.len<countof(g->linktipped) ? tip.len : countof(g->linktipped);
+        copybytes(g->linktipped, tip.data, n);
+        g->linktippedlen = (i32)n;
+    }
+}
+
 // The link under the mouse in a view's text, right after textmouse made
 // its item: the hand cursor and the link's tooltip over it. Returns a
 // link to follow, let go of in the message and at the link it was
@@ -4083,13 +4101,7 @@ static Str textlink(Gui *g, View *v, TextHit hit, u64 *press, i32 *pressmsg, Lin
     if (link.len) {
         ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
         if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-            Str tip = linktip(g, &a, link, from);
-            tipnow("%s", cstr0(&a, tip));
-            if (g->drive) {
-                iz n = tip.len<countof(g->linktipped) ? tip.len : countof(g->linktipped);
-                copybytes(g->linktipped, tip.data, n);
-                g->linktippedlen = (i32)n;
-            }
+            linktipnow(g, &a, linktip(g, &a, link, from));
         }
     }
     // The release that opens the text's menu, even over a menu open
@@ -4112,6 +4124,47 @@ static Str textlink(Gui *g, View *v, TextHit hit, u64 *press, i32 *pressmsg, Lin
         *press = 0;
     }
     return r;
+}
+
+// A tool row's file (toolfileref), its summary drawn along the header
+// from x0 to x1 (the header from top, h high; its text at y, size
+// high), made a link as one in the text is, from the folder the
+// session worked in then: the hand and an underline over it, its
+// tooltip, and a click opens it in Files. The rest of the header still
+// folds the row.
+static void toolpathlink(Gui *g, View *v, i32 i, f32 x0, f32 x1, f32 top, f32 h,
+                         f32 y, f32 size)
+{
+    Arena     a = g->frame;
+    ViewTool *t = v->msgs[i].tool;
+    ImGui::SetCursorScreenPos(v2(x0, top));
+    b32 go = ImGui::InvisibleButton("##path", v2(x1 - x0, h));
+    if (g->drive) {
+        Buf b(&a, 32);
+        print(&b, "toolpath ");
+        print(&b, (i64)i);
+        itemnamed(g, finish(&b));
+        itemrect(g, RECT_TOOLPATH);
+        g->toolpathmsg = i;
+    }
+    LinkFrom from = filelinkfrom(g->sess, msgcwd(v, i));
+    Dest     d    = {};
+    d.kind = DEST_FILE;
+    d.file = t->file;
+    if (ImGui::IsItemHovered()) {
+        ImFont *font = stylefont(&g->fonts, STYLE_CODE);
+        f32     base = y + font->GetFontBaked(size)->Ascent + 1;
+        u32     col  = fade(g->pal->summary, v->msgs[i].faded ? 0.5f : 1);
+        ImGui::GetWindowDrawList()->AddLine(v2(x0, base), v2(x1, base), col, 1);
+        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            linktipnow(g, &a, filelinktip(g, &a, t->file.path, &d, &from));
+        }
+    }
+    if (go) {
+        filelinkopen(g, &a, &d, &from);
+        scheddirty(&g->sched);
+    }
 }
 
 // The text of a document's block, as shown.
@@ -5403,7 +5456,7 @@ static void drawtranscript(Gui *g)
     }
     i32 latest[] = {RECT_USERMSG, RECT_TASKLINK, RECT_UNDO, RECT_REWINDTURN, RECT_FORCE,
                     RECT_CUTUNDO, RECT_COMPACTHDR,
-                    RECT_THINKHDR, RECT_ALWAYS, RECT_RAIL};
+                    RECT_THINKHDR, RECT_ALWAYS, RECT_RAIL, RECT_TOOLPATH};
     for (iz i = 0; i < countof(latest); i++) {
         g->rects[latest[i]] = {};  // the latest drawn, or none
     }
@@ -5457,8 +5510,8 @@ static void drawtranscript(Gui *g)
         sp->SetCurrentChannel(dl, CH_TEXT);
         MsgAction act = msgaction(g, g->sess, v, m);
         f32       actw = act.kind ? actwidth(&act) + 8*sc : 0;
-        Pen p = {dl, &g->fonts, x, y + pad/4, x + width - actw, smallsize(&g->fonts)};
-        drawheader(g, &p, v, m, nowms);
+        Pen    p    = {dl, &g->fonts, x, y + pad/4, x + width - actw, smallsize(&g->fonts)};
+        ImVec2 path = drawheader(g, &p, v, m, nowms);
         if ((m->role==VIEW_USER || m->role==VIEW_ASSISTANT) && m->ts &&
                 ImGui::IsWindowHovered() && ImGui::IsMouseHoveringRect(box0, box1)) {
             // When it was sent, or finished, at the header's right,
@@ -5482,6 +5535,11 @@ static void drawtranscript(Gui *g)
         }
 
         ImGui::PushID(i);
+        if (m->role==VIEW_TOOL && m->tool->file.kind==FREF_PATH && m->tool->file.path.len &&
+                path.y > path.x) {
+            // Its file's path, before the header's toggle, which it is over
+            toolpathlink(g, v, i, path.x, path.y, y, head, p.y, p.size);
+        }
         if (m->fold || m->role==VIEW_TOOL || m->role==VIEW_THINK) {
             // The header toggles the body, but for its action
             ImGui::SetCursorScreenPos(v2(x, y));

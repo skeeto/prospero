@@ -278,6 +278,8 @@ struct ViewTool {
     Str  name;      // tool name
     Str  args;      // raw arguments (JSON)
     Str  summary;   // one line: the command, the path
+    FileRef file;   // the file a file tool's call is about (toolfileref),
+                    // relative or not: kind FREF_BAD for none
     Str  cmd;       // a shell call's command, on the first lines of its
                     // row's text, which shows it as a code block
     i32  block;     // provisional: the response block its arguments are
@@ -1613,6 +1615,114 @@ static Str tooldiff(Arena *a, Str name, Str args, Str result)
     return finish(&b);
 }
 
+// An integer argument as tools.cpp's argint takes one, a number or a
+// string of one, else dflt.
+static i64 toolint(Json *v, i64 dflt)
+{
+    if (v->type == JSON_STRING) {
+        Int n = parseint(trim(v->str));
+        return n.ok ? n.val : dflt;
+    }
+    return jsonint(v, dflt);
+}
+
+// Lines line0 through line0+n-1 of a FileRef (one if n is less), if
+// line0 is a line at all. Checked before any sum, since a model may
+// give any number.
+static void toollines(FileRef *r, i64 line0, i64 n)
+{
+    if (line0>=1 && line0<=FREF_MAXLINE) {
+        n = n<1 ? 1 : n>FREF_MAXLINE ? (i64)FREF_MAXLINE : n;
+        i64 line1 = line0 + n - 1;
+        r->line0 = (i32)line0;
+        r->line1 = (i32)(line1>FREF_MAXLINE ? (i64)FREF_MAXLINE : line1);
+    }
+}
+
+// The file a call of a file tool is about, as its arguments name it
+// (relative or not), parsed as the engine repairs them, and the lines
+// it read or changed. Result is what it said (null unless it worked):
+// it gives an edit of old_string its line, and shows a read was of a
+// folder, which names no file. A read is of offset through
+// offset+limit-1, at most READ_LINES as read reads (no line without an
+// offset); a line edit (hashline) is where its topmost edit's new text
+// went, which the others don't move; a write has no line; a patch names
+// its one file, where it ends up, unless that is deleted, and several
+// files name none. Its path and temporaries are in the arena; kind is
+// FREF_BAD for no file.
+static FileRef toolfileref(Arena *a, Str name, Str args, Str result)
+{
+    FileRef r = {};
+    r.kind = FREF_BAD;
+    if (name!="read" && name!="write" && name!="edit") {
+        return r;
+    }
+    Json *j     = repairargs(a, args).root;
+    Json *patch = jsonget(j, "patch");
+    patch = patch->type==JSON_STRING ? patch : jsonget(j, "input");
+    patch = patch->type==JSON_STRING ? patch : jsonget(j, "patchText");
+    Json *edits = jsonget(j, "edits");
+    if (edits->type == JSON_STRING) {
+        edits = jsonparse(a, trim(edits->str)).root;
+    }
+    r.path = jsonstr(jsonget(j, "path"));
+    if (name=="edit" && patch->type==JSON_STRING) {
+        // An apply_patch envelope, which the engine takes over any path,
+        // as the row's summary and diff do
+        Patch p = parsepatch(a, patch->str);
+        if (p.err.data || p.files.len!=1 || p.files[0].op==PATCH_DELETE) {
+            return r;
+        }
+        r.path = p.files[0].to.len ? p.files[0].to : p.files[0].path;
+    } else if (name == "read") {
+        // A folder lists its entries (listdir)
+        if (startswith(result, "Directory ") && find(result, " entries):\n")>=0) {
+            return r;
+        }
+        i64 offset = toolint(jsonget(j, "offset"), 0);
+        i64 limit  = toolint(jsonget(j, "limit"), 0);
+        toollines(&r, offset, limit>READ_LINES ? READ_LINES : limit);
+    } else if (name=="edit" && (edits->type==JSON_ARRAY || edits->type==JSON_OBJECT)) {
+        // Line edits: the topmost, an insert after line L counting as
+        // between L and L+1, as hashop names their ops
+        Json *top  = 0;
+        i64   line = 0;
+        i64   best = 0;
+        i32   op   = -1;
+        for (Json *e = edits->type==JSON_OBJECT ? edits : edits->child; e;
+                 e = edits->type==JSON_OBJECT ? 0 : e->next) {
+            i64 at  = toolint(jsonget(e, "line"), -1);
+            i32 eop = hashop(jsonstr(jsonget(e, "op")));
+            if (eop<0 || at<0 || at>FREF_MAXLINE) {
+                continue;
+            }
+            i64 key = 2*at + (eop==HASH_INSERT);
+            if (!top || key<best) {
+                top  = e;
+                line = at;
+                best = key;
+                op   = eop;
+            }
+        }
+        if (top) {
+            Str text = jsonstr(jsonget(top, "text"));
+            text = text.data ? text : jsonstr(jsonget(top, "content"));
+            toollines(&r, op==HASH_INSERT ? line+1 : line,
+                      op==HASH_DELETE ? 1 : linecount(text));
+        }
+    } else if (name == "edit") {
+        // "replaced 1 match at line N", or "..., the first at line N"
+        iz  at   = find(result, ": replaced ");
+        Int line = at<0 ? Int{} : numafter(cuthead(result, at), "at line ");
+        if (line.ok) {
+            Str news = jsonstr(jsonget(j, "new_string"));
+            toollines(&r, line.val, linecount(news));
+        }
+    }
+    r.kind = r.path.len ? FREF_PATH : FREF_BAD;
+    return r;
+}
+
 // The row of a call, most recent first; -1 if none.
 static i32 findcall(View *v, Str call)
 {
@@ -2009,7 +2119,9 @@ static i32 addcall(View *v, Arena scratch, Str id, Str name, Str args)
     t->name    = clone(&v->aux, name);
     t->args    = clone(&v->aux, args);
     t->summary = toolsummary(&v->aux, scratch, name, args, v->cwd);
+    t->file    = toolfileref(&scratch, name, args, {});
     t->status  = VTOOL_CALLED;
+    t->file.path = clone(&v->aux, t->file.path);
     if (name == "shell") {
         Json *j = jsonparse(&scratch, args).root;
         t->cmd = clone(&v->aux, jsonstr(jsonget(j, "command")));
@@ -2684,6 +2796,16 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         t->imgh    = (i32)jsonint(jsonget(j, "height"), 0);
         m->seq     = r->seq;
         toolbody(v, scratch, m, jsonstr(jsonget(j, "text")));
+        if ((t->name=="edit" || t->name=="read") && t->file.path.len &&
+                t->status==VTOOL_OK) {
+            // An edit's lines, which its result says, or a read that was
+            // of a folder
+            Str     text = jsonstr(jsonget(j, "text"));
+            FileRef f    = toolfileref(&scratch, t->name, t->args, text);
+            t->file.kind  = f.kind;
+            t->file.line0 = f.line0;
+            t->file.line1 = f.line1;
+        }
         if (v->planpath.len && (t->name=="write" || t->name=="edit") &&
                 find(t->args, "plan.md")>=0) {
             v->planver++;  // perhaps the plan file
