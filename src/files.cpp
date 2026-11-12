@@ -1987,6 +1987,7 @@ static FileBar filetabs(Gui *g, GuiSession *root)
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip)) {
             tipnow("%s", cstr0(&a, ft->path));
         }
+        // a11y: the tab's close button and its menu's Close do the same
         if (ImGui::IsItemHovered() && ImGui::IsMouseReleased(ImGuiMouseButton_Middle)) {
             r.closed = i;
         }
@@ -1994,7 +1995,11 @@ static FileBar filetabs(Gui *g, GuiSession *root)
         print(&nb, "file tab ");
         print(&nb, (i64)i + 1);
         itemnamed(g, finish(&nb));
-        if (ImGui::BeginPopupContextItem()) {
+        if (uirclicked(g)) {
+            ImGui::OpenPopupEx(ids[i]);  // as BeginPopupContextItem, by the tab's ID
+        }
+        if (ImGui::BeginPopupEx(ids[i], ImGuiWindowFlags_AlwaysAutoResize|ImGuiWindowFlags_NoTitleBar|
+                                ImGuiWindowFlags_NoSavedSettings)) {
             if (menutip(g, &a, "Close", {}, "Close this tab")) {
                 r.closed = i;
             }

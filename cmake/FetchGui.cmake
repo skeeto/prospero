@@ -191,6 +191,12 @@ imgui_splice(imgui_widgets_text
   "    if (is_password && !is_displaying_hint)\n        PopPasswordFont();"
   "    if (prospero_composing)  // prospero\n        g.PlatformImeData.InputPos = prospero_imepos;\n\n"
   "InputTextEx's password font pop after the caret")
+# A combo box tells its label, value and state, which BeginCombo, unlike
+# other widgets, never gives ImGui's item info.
+imgui_splice(imgui_widgets_text
+  "    // Render shape\n    const ImU32 frame_col = GetColorU32(hovered ? ImGuiCol_FrameBgHovered : ImGuiCol_FrameBg);"
+  "    if (g.TestEngineHookItems)  // prospero\n        prospero_axcombo(id, label, preview_value, popup_open);\n\n"
+  "BeginCombo's shape")
 set(imgui_widgets_patched ${CMAKE_CURRENT_BINARY_DIR}/imgui-patched/imgui_widgets.cpp)
 file(WRITE ${imgui_widgets_patched}.new "${imgui_widgets_text}")
 file(COPY_FILE ${imgui_widgets_patched}.new ${imgui_widgets_patched} ONLY_IF_DIFFERENT)

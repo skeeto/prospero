@@ -47,6 +47,7 @@ struct AxItem {
     b32    named;
     Str    help;       // its tooltip's text
     u32    key;        // from axkey, else its ID
+    Str    value;      // a combo's, as it shows it
 };
 
 // A text field as drawn this frame, copied from its report
@@ -93,6 +94,8 @@ struct AxGui {
     i32                 nacts;
     u64                *linted;   // --a11y-lint: what was logged, hashed
     i32                 nlinted;
+    Str                 nextname; // axnextname's, for the next item in nextwin
+    u32                 nextwin;
     u32                 menuid;   // an item whose context menu was asked for
     i64                 menuwhen;
 };
@@ -182,6 +185,11 @@ void ImGuiTestEngineHook_ItemAdd(ImGuiContext *ctx, ImGuiID id, ImRect const &bb
     it.rect      = item->Rect;
     it.offscreen = !bb.Overlaps(w->ClipRect);
     it.itemflags = item->ItemFlags;
+    if (x->nextname.len) {
+        it.named     = w->ID == x->nextwin;  // else its window skipped it
+        it.name      = it.named ? x->nextname : Str{};
+        x->nextname  = {};
+    }
     x->items = push(&x->mem, x->items, it);
     x->last  = x->items.len - 1;
     if (x->nacts && x->acts[0].id==id) {
@@ -242,7 +250,36 @@ void ImGuiTestEngineHook_ItemInfo(ImGuiContext *ctx, ImGuiID id, char const *lab
         it->role    = AX_BUTTON;
         it->actions = AXA_PRESS;
     }
+    if (bar && (it->label=="##<" || it->label=="##>")) {
+        // ImGui's own arrows on a tab bar too full to show (a dock's)
+        it->role    = AX_BUTTON;
+        it->actions = AXA_PRESS;
+        it->name    = it->label=="##<" ? Str("Scroll tabs left") : Str("Scroll tabs right");
+        it->named   = 1;
+    }
     it->state |= it->itemflags & ImGuiItemFlags_Disabled ? AXS_DISABLED : 0;
+}
+
+// A combo box, as the patched BeginCombo added it (FetchGui.cmake),
+// which gives ImGui no info: its value is what it shows, and a press
+// opens it.
+extern "C" void prospero_axcombo(unsigned id, char const *label, char const *preview, int open)
+{
+    ImGuiContext *ctx = ImGui::GetCurrentContext();
+    AxGui        *x   = axgui(ctx);
+    if (!x) {
+        return;
+    }
+    ImGuiTestEngineHook_ItemInfo(ctx, id, label, ctx->LastItemData.StatusFlags);
+    iz i = x->items.len - 1;
+    if (i<0 || x->items[i].id!=id) {
+        return;
+    }
+    AxItem *it = &x->items[i];
+    it->role    = AX_COMBO;
+    it->actions = AXA_PRESS|AXA_EXPAND;
+    it->state   = open ? it->state|AXS_EXPANDED : it->state&~AXS_EXPANDED;
+    it->value   = clone(&x->mem, axcstr(preview));
 }
 
 void ImGuiTestEngineHook_Log(ImGuiContext *, char const *, ...)
@@ -398,6 +435,17 @@ static void axselected(Gui *g, b32 on)
     if (it) {
         it->role  = it->role==AX_BUTTON ? AX_LISTITEM : it->role;
         it->state = on ? it->state|AXS_SELECTED : it->state&~AXS_SELECTED;
+    }
+}
+
+// The next item's name, ahead of it as ImGui's SetNextItem* go: for a
+// combo, whose popup, while open, comes after it as the last item.
+static void axnextname(Gui *g, Str name)
+{
+    AxGui *x = g->ax && g->ax->on ? g->ax : 0;
+    if (x) {
+        x->nextname = clone(&x->mem, name);
+        x->nextwin  = ImGui::GetCurrentWindow()->ID;
     }
 }
 
@@ -585,6 +633,8 @@ static void axbuild(AxGui *x, ImGuiContext *ctx)
         n->actions = it->actions;
         if (f && !f->password) {
             axsetvalue(b, n, f->text);
+        } else if (it->value.len) {
+            axsetvalue(b, n, it->value);
         }
         if (it->help.len) {
             axsethelp(b, n, it->help);  // read when asked: no event
@@ -753,6 +803,7 @@ static void axnewframe(ImGuiContext *ctx, ImGuiContextHook *hook)
     x->mem.beg = x->base;
     x->items   = {};
     x->fields  = {};
+    x->nextname = {};
     x->last    = -1;
 }
 

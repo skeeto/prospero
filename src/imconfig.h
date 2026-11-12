@@ -73,6 +73,11 @@ struct ProsperoAxField {
 };
 extern "C" void prospero_axfield(ProsperoAxField const *);
 
+// A combo box as BeginCombo added it, which gives no item info of its
+// own: its label, the value it shows (null for none), and whether its
+// popup is open.
+extern "C" void prospero_axcombo(unsigned id, char const *label, char const *preview, int open);
+
 // An input method's composition (ime.cpp), drawn over the active field
 // where it will go, its line's top left at x, y; the field's caret is
 // hidden meanwhile, and the IME's position is the clause's, imex, imey.
