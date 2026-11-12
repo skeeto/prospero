@@ -3720,39 +3720,35 @@ static Str todolist(Arena *a, Slice<TodoItem> items)
     return finish(&b);
 }
 
-// A list after a change: the count done and the items left, but not
-// those done, which the agent knows already, so that the result stays
-// short as the work goes on.
+// A list after a change, in one line: the count done and the item in
+// progress. Not the items themselves: the agent has them from its own
+// calls, and a name that matches none gets the whole list back. Echoing
+// them cost every call input tokens (a 50-item list, ~1,800).
 static Str todoshow(Arena *a, Slice<TodoItem> items)
 {
     if (!items.len) {
         return "The todo list is empty now.";
     }
-    iz done = 0;
+    iz  done   = 0;
+    Str active = {};
     for (iz i = 0; i < items.len; i++) {
         done += items[i].status == TODO_DONE;
+        if (items[i].status==TODO_ACTIVE && !active.data) {
+            active = items[i].content;
+        }
     }
-    Buf b(a, 256);
+    Buf b(a, 64 + active.len);
     print(&b, "Todo list, ");
     print(&b, (i64)done);
     print(&b, " of ");
     print(&b, (i64)items.len);
-    if (done == items.len) {
-        print(&b, " done.\n");
-        return finish(&b);
+    print(&b, " done");
+    if (active.data) {
+        print(&b, "; in progress: ");
+        print(&b, active);
     }
-    print(&b, " done, left:\n");
-    for (iz i = 0; i < items.len; i++) {
-        if (items[i].status == TODO_DONE) {
-            continue;
-        }
-        print(&b, items[i].status==TODO_ACTIVE ? Str("[>] ") : Str("[ ] "));
-        print(&b, items[i].content);
-        if (items[i].status == TODO_ACTIVE) {
-            print(&b, " (in progress)");
-        }
-        putbyte(&b, '\n');
-    }
+    b32 stop = active.len && active[active.len-1]=='.';
+    print(&b, stop ? Str("\n") : Str(".\n"));
     return finish(&b);
 }
 

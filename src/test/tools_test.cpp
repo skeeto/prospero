@@ -1092,9 +1092,16 @@ static void test_tools(Test *t)
         old = push(a, old, x);
         old = push(a, old, y);
         expect(t, "todoshow", todoshow(a, old),
-               "Todo list, 0 of 2 done, left:\n[>] write (in progress)\n[ ] test\n");
+               "Todo list, 0 of 2 done; in progress: write.\n");
         expect(t, "todoleft", todoleft(a, old), "[>] write\n[ ] test\n");
         expect(t, "todoshow empty", todoshow(a, now), "The todo list is empty now.");
+        {
+            Slice<TodoItem> one = {};
+            TodoItem s1 = {"Write the lexer.", TODO_ACTIVE};
+            one = push(a, one, s1);
+            expect(t, "todoshow one period", todoshow(a, one),
+                   "Todo list, 0 of 1 done; in progress: Write the lexer.\n");
+        }
         expect(t, "todo same", istr(a, todoprogress(old, old)), "0");
         x.status = TODO_DONE;
         y.status = TODO_ACTIVE;

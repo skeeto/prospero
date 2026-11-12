@@ -2374,7 +2374,7 @@ def todo_ops(t):
         [("write a", "done"), ("write b", "done")],
     ], f"lists {lists}")
     ends = [(e["status"], e["text"]) for e in r.all("tool.end")]
-    t.check(ends[2] == ("ok", "Todo list, 1 of 2 done, left:\n[>] write b (in progress)\n"),
+    t.check(ends[2] == ("ok", "Todo list, 1 of 2 done; in progress: write b.\n"),
             f"after done {ends[2]!r}")
     t.check(ends[4][0] == "error" and 'no item "write z"' in ends[4][1], f"bad name {ends[4]!r}")
     t.check(ends[-1] == ("ok", "Todo list, 2 of 2 done.\n"), f"the end {ends[-1]!r}")
@@ -2400,8 +2400,8 @@ def todo_rename(t):
         [("write a", "done"), ("write b twice", "done"), ("check both", "done")],
     ], f"lists {lists}")
     ends = [(e["status"], e["text"]) for e in r.all("tool.end")]
-    t.check(ends[2] == ("ok", "Todo list, 1 of 3 done, left:\n[>] write b twice (in progress)\n"
-                              "[ ] check\n"), f"after rename {ends[2]!r}")
+    t.check(ends[2] == ("ok", "Todo list, 1 of 3 done; in progress: write b twice.\n"),
+            f"after rename {ends[2]!r}")
     t.check(ends[4][1].endswith("Next time, reword items with rename instead of sending "
                                 "the whole list again."), f"reworded {ends[4]!r}")
 
