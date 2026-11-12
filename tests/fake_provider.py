@@ -893,6 +893,30 @@ def sc_todo_ops(model, n, req):
         yield from answer(model, "Both written.")
 
 
+def sc_todo_rename(model, n, req):
+    # An item reworded in place by rename, then the whole list sent again
+    # to reword one, which earns the rename hint
+    item = lambda c, st="pending": {"content": c, "status": st}
+    if n == 0:
+        yield from calls(model, n, [
+            ("todo_write", {"todos": [item("write a"), item("write b"), item("check")]}),
+            ("write", {"path": "a.txt", "content": "a\n"})])
+    elif n == 1:
+        yield from calls(model, n, [
+            ("todo_write", {"rename": [{"from": "write b", "to": "write b twice"}],
+                            "done": ["write a"]}),
+            ("write", {"path": "b.txt", "content": "b\nb\n"})])
+    elif n == 2:
+        yield from calls(model, n, [
+            ("todo_write", {"todos": [item("write a", "done"), item("write b twice", "done"),
+                                      item("check both")]}),
+            ("read", {"path": "a.txt"})])
+    elif n == 3:
+        yield from tool(model, n, "todo_write", {"done": "check both"})
+    else:
+        yield from answer(model, "Done.")
+
+
 def sc_todo_job(model, n, req):
     # Waiting for a job with items left: no nudge, since the job's end
     # brings the agent back

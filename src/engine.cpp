@@ -6843,7 +6843,7 @@ static void tooltodo(Session *s, Arena scratch, Args *args)
 {
     Block          *c      = &s->calls[s->callidx];
     Str             err    = {};
-    b32             resent = todoresent(s->todos, args);
+    i32             resent = todoresent(s->todos, args);
     Slice<TodoItem> now    = todoapply(&scratch, s->todos, args, &err);
     if (err.data) {
         toolend(s, scratch, "error", err, 0, 0, {}, 0);
@@ -6878,23 +6878,31 @@ static void tooltodo(Session *s, Arena scratch, Args *args)
     }
     // The slow habits, said here, where the agent reads them, since the
     // description alone didn't stop some models: the whole list sent
-    // again, and a response with nothing but the list, a round trip of
-    // its own. Neither for a list now finished, as there's nothing left
-    // to send with it.
+    // again (to reword an item, too), and a response with nothing but
+    // the list, a round trip of its own. Neither for a list now
+    // finished, as there's nothing left to send with it.
     Str  text  = todoshow(&scratch, items);
     b32  alone = s->calls.len == 1;
     if ((resent || alone) && todoleft(&scratch, items).data) {
-        text = concat(&scratch, text,
-            resent && alone ? Str("Next time, mark items with done and start "
-                                  "instead of sending the whole list, and send "
-                                  "todo_write in the same response as your "
-                                  "other tool calls, not in one of its own.") :
-            resent          ? Str("Next time, mark items with done and start "
-                                  "instead of sending the whole list again.") :
-                              Str("Next time, send todo_write in the same "
-                                  "response as your other tool calls, such as "
-                                  "the first call of the next step, not in a "
-                                  "response of its own."));
+        Str how = resent==TODO_REWORDED ? Str("reword items with rename")
+                                        : Str("mark items with done and start");
+        Buf b(&scratch, 256);
+        print(&b, text);
+        print(&b, "Next time, ");
+        if (resent) {
+            print(&b, how);
+            print(&b, alone ? Str(" instead of sending the whole list, and ")
+                            : Str(" instead of sending the whole list again."));
+        }
+        if (alone) {
+            print(&b, resent ? Str("send todo_write in the same response as "
+                                   "your other tool calls, not in one of its own.")
+                             : Str("send todo_write in the same response as "
+                                   "your other tool calls, such as the first "
+                                   "call of the next step, not in a response "
+                                   "of its own."));
+        }
+        text = finish(&b);
     }
     toolend(s, scratch, "ok", text, 0, 0, {}, 0);
 }
@@ -6931,9 +6939,9 @@ static void todoremind(Session *s, Arena scratch)
     }
     s->mutations = 0;
     nudge(s, scratch, N_REMIND, "You have made 12 changes since your todo "
-          "list last changed. Update it with todo_write (done, start, add or "
-          "remove), in the same response as your next tool call, so that it "
-          "shows what is done and what comes next.");
+          "list last changed. Update it with todo_write (done, start, add, "
+          "remove or rename), in the same response as your next tool call, "
+          "so that it shows what is done and what comes next.");
 }
 
 

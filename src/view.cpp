@@ -1283,20 +1283,26 @@ static Str toolsummary(Arena *perm, Arena scratch, Str name, Str args, Str cwd)
     } else if (name=="shell" && cmd.data) {
         return oneline(perm, cmd);
     } else if (name=="todo_write" && jsonget(j, "todos")->type==JSON_MISSING) {
-        // Changes to the list: "done write it; start test it; add 2"
+        // Changes to the list: "done write it; start test it; add 2",
+        // a rename by its new text
         Buf b(&scratch, 256);
-        static Str const keys[] = {"done", "start", "add", "remove"};
+        static Str const keys[] = {"done", "start", "add", "remove", "rename"};
         for (i32 k = 0; k < countof(keys); k++) {
             Json *v = jsonget(j, keys[k]);
-            if (v->type == JSON_STRING && v->str.len && v->str[0]=='[') {
+            if (v->type==JSON_STRING && v->str.len && (v->str[0]=='[' || v->str[0]=='{')) {
                 v = jsonparse(&scratch, v->str).root;
             }
+            b32 rename = k == countof(keys)-1;
             i64 n = 0;
-            Str one = v->type==JSON_STRING ? v->str : Str{};
+            Str one = v->type==JSON_STRING ? v->str :
+                      v->type==JSON_OBJECT ? jsonstr(jsonget(v, rename ? Str("to") : Str("content"))) :
+                      Str{};
             for (Json *e = v->type==JSON_ARRAY ? v->child : 0; e; e = e->next, n++) {
-                one = e->type==JSON_STRING ? e->str : jsonstr(jsonget(e, "content"));
+                one = e->type==JSON_STRING ? e->str :
+                      e->type==JSON_ARRAY && e->child && e->child->next ? jsonstr(e->child->next) :
+                      jsonstr(jsonget(e, rename ? Str("to") : Str("content")));
             }
-            n = v->type==JSON_STRING ? 1 : n;
+            n = v->type==JSON_STRING || v->type==JSON_OBJECT ? 1 : n;
             if (!n) {
                 continue;
             }

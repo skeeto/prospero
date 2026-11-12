@@ -151,7 +151,13 @@ static void test_tools(Test *t)
                "pattern: must not be empty; ");
         expect(t, "todo missing", argsshow(a, TOOL_TODO, "{}"),
                "todos: give todos, the whole list, or the changes to it: done, start, "
-               "add or remove; ");
+               "add, remove or rename; ");
+        expect(t, "todo bad renames",
+               argsshow(a, TOOL_TODO, "{\"rename\":[{\"from\":\"x\"},{\"from\":\" \",\"to\":\"y\"}]}"),
+               "rename[0]: must be an object with from and to, both text; "
+               "rename[1].from: must name an item by its text; ");
+        expect(t, "todo rename not array", argsshow(a, TOOL_TODO, "{\"rename\":5}"),
+               "rename: must be an array of {from, to} objects; ");
         expect(t, "todo bad names", argsshow(a, TOOL_TODO, "{\"done\":[\"\",3],\"start\":\" \"}"),
                "done[0]: must name an item by its text; done[1]: must name an item by "
                "its text; start: must name an item by its text; ");
@@ -1141,6 +1147,28 @@ static void test_tools(Test *t)
                             "{\"content\":\"b2\",\"status\":\"in_progress\"},"
                             "{\"content\":\"c3\",\"status\":\"in_progress\"}],\"done\":\"b2\"}"),
                "[ ] a1\n[x] b2\n[>] c3 (in progress)\n");
+        expect(t, "todo rename in place",
+               apply(three, "{\"rename\":[{\"from\":\"fix the bug\",\"to\":\"Fix the lexer bug\"}]}"),
+               "[>] Read the parser (in progress)\n[ ] Fix the lexer bug\n[ ] Run tests\n");
+        expect(t, "todo rename then done by old name",
+               apply(three, "{\"rename\":{\"old\":\"Run tests\",\"new\":\"Run all tests\"},"
+                            "\"done\":[\"Read the parser\",\"Run tests\"]}"),
+               "[x] Read the parser\n[>] Fix the bug (in progress)\n[x] Run all tests\n");
+        expect(t, "todo rename start by new name",
+               apply(three, "{\"rename\":[[\"Run tests\",\"Run all tests\"]],\"start\":\"run all tests\"}"),
+               "[ ] Read the parser\n[ ] Fix the bug\n[>] Run all tests (in progress)\n");
+        expect(t, "todo rename pair as string",
+               apply(three, "{\"rename\":\"[\\\"Fix the bug\\\",\\\"Fix it\\\"]\"}"),
+               "[>] Read the parser (in progress)\n[ ] Fix it\n[ ] Run tests\n");
+        expect(t, "todo rename errors",
+               apply(three, "{\"rename\":[{\"from\":\"deploy\",\"to\":\"x\"},"
+                            "{\"from\":\"Run tests\",\"to\":\"fix THE bug\"}]}"),
+               "error: rename: no item \"deploy\"\nrename: another item is already \"fix THE bug\"\n"
+               "The list is unchanged:\n[>] Read the parser (in progress)\n[ ] Fix the bug\n"
+               "[ ] Run tests\nName items by their text, as listed.");
+        expect(t, "todo rename case only",
+               apply(three, "{\"rename\":{\"from\":\"Run tests\",\"to\":\"Run TESTS\"}}"),
+               "[>] Read the parser (in progress)\n[ ] Fix the bug\n[ ] Run TESTS\n");
         {
             // An item quoting a command, its name with backslashes doubled
             Slice<TodoItem> q1 = {};
@@ -1157,6 +1185,14 @@ static void test_tools(Test *t)
             Args d = parseargs(a, TOOL_TODO, "{\"done\":\"Run tests\"}", EDIT_REPLACE);
             expect(t, "todo resent", istr(a, todoresent(three, &w)*100 + todoresent({}, &w)*10 +
                                              todoresent(three, &d)), "100");
+            Args rw = parseargs(a, TOOL_TODO, "{\"todos\":[{\"content\":\"Read the parser\","
+                "\"status\":\"done\"},{\"content\":\"Fix the lexer bug\",\"status\":\"pending\"},"
+                "{\"content\":\"Run tests\",\"status\":\"pending\"}]}", EDIT_REPLACE);
+            Args nw = parseargs(a, TOOL_TODO, "{\"todos\":[{\"content\":\"a\","
+                "\"status\":\"done\"},{\"content\":\"b\",\"status\":\"pending\"},"
+                "{\"content\":\"Run tests\",\"status\":\"pending\"}]}", EDIT_REPLACE);
+            expect(t, "todo reworded", istr(a, todoresent(three, &rw)*10 + todoresent(three, &nw)),
+                   istr(a, TODO_REWORDED*10));
         }
         expect(t, "todo first pending starts",
                apply({}, "{\"todos\":[{\"content\":\"a1\",\"status\":\"pending\"}]}"),

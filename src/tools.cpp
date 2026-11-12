@@ -613,6 +613,11 @@ static Str tooljson(Arena *a, ToolEnv *te)
         "\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"pending\","
         "\"in_progress\",\"done\"]}},\"required\":[\"content\",\"status\"],"
         "\"additionalProperties\":false}";
+    Str todorename =
+        "\"items\":{\"type\":\"object\",\"properties\":{\"from\":{"
+        "\"type\":\"string\",\"description\":\"The item, by its text\"},"
+        "\"to\":{\"type\":\"string\",\"description\":\"Its new text\"}},"
+        "\"required\":[\"from\",\"to\"],\"additionalProperties\":false}";
     Str askitem =
         "\"items\":{\"type\":\"object\",\"properties\":{\"question\":{"
         "\"type\":\"string\",\"description\":\"The whole question, ending "
@@ -713,18 +718,20 @@ static Str tooljson(Arena *a, ToolEnv *te)
             "todo_write",
             "Keep a todo list for a task of three or more steps. Give todos, "
             "the whole list, to begin one or to replace it. After that, change "
-            "it with done, start, add and remove, naming items by their text, "
-            "and don't send the whole list again. One item is in progress at "
-            "a time: when none is, the first pending one starts. Never call "
-            "it on its own: put it in the same response as your other tool "
-            "calls, such as the list with the first call of the task, or an "
-            "item marked done with the first call of the next.",
+            "it with done, start, add, remove and rename, naming items by their "
+            "text, and don't send the whole list again, not even to reword an "
+            "item. One item is in progress at a time: when none is, the first "
+            "pending one starts. Never call it on its own: put it in the same "
+            "response as your other tool calls, such as the list with the "
+            "first call of the task, or an item marked done with the first "
+            "call of the next.",
             {
                 {"todos", "array", "The whole list, replacing any before", 0, todoitem},
                 {"done", "array", "Items now done", 0, "\"items\":{\"type\":\"string\"}"},
                 {"start", "string", "The item now in progress", 0, {}},
                 {"add", "array", "New items, at the end", 0, "\"items\":{\"type\":\"string\"}"},
                 {"remove", "array", "Items that no longer apply", 0, "\"items\":{\"type\":\"string\"}"},
+                {"rename", "array", "Items reworded in place, status kept", 0, todorename},
             },
         },
         {
@@ -1140,6 +1147,12 @@ struct TodoItem {
     i32 status;  // TODO_*
 };
 
+// todo_write's rename: an item named by its text, and its new text
+struct TodoRename {
+    Str from;
+    Str to;
+};
+
 // ask_user's questions: each with its options, of which the agent
 // recommends one (or, with multi, several), and the user's answers, as
 // option indices and words of their own.
@@ -1201,6 +1214,7 @@ struct Args {
     Slice<Str>      tdone;      // todo_write: items to mark done, by text
     Slice<Str>      tadd;       // todo_write: items to append
     Slice<Str>      tremove;    // todo_write: items to remove
+    Slice<TodoRename> trename;  // todo_write: items to reword in place
     Str             tstart;     // todo_write: the item to start, null if none
     Str             tag;        // edit as hashline: the file's tag as read
     Slice<HashEdit> hedits;
@@ -1496,14 +1510,71 @@ static Slice<Str> argtodonames(Arena *a, Args *r, Json *root, Str key)
     return names;
 }
 
+// Items reworded: an array of {from, to}, one such object, or such an
+// array encoded as a string. Also taken: old and new for from and to,
+// and a [from, to] pair for an object.
+static Slice<TodoRename> argtodorenames(Arena *a, Args *r, Json *root)
+{
+    Slice<TodoRename> renames = {};
+    Json *v = jsonget(root, "rename");
+    if (v->type == JSON_STRING) {
+        Str t = trim(v->str);
+        JsonDoc d = t.len && (t[0]=='[' || t[0]=='{') ? jsonparse(a, t) : JsonDoc{};
+        v = d.ok ? d.root : v;
+    }
+    // One object, or one [from, to] pair, stands for an array of it
+    b32 one = v->type==JSON_OBJECT ||
+              (v->type==JSON_ARRAY && v->child && v->child->type==JSON_STRING);
+    if (v->type==JSON_MISSING || v->type==JSON_NULL) {
+        return renames;
+    } else if (!one && v->type!=JSON_ARRAY) {
+        issue(a, r, "rename", "must be an array of {from, to} objects");
+        return renames;
+    }
+    iz n = 0;
+    for (Json *e = one ? v : v->child; e; e = one ? 0 : e->next, n++) {
+        Buf at(a, 32);
+        print(&at, "rename[");
+        print(&at, (i64)n);
+        putbyte(&at, ']');
+        Str where = finish(&at);
+        Json *from = 0, *to = 0;
+        if (e->type == JSON_OBJECT) {
+            from = jsonget(e, "from");
+            from = from->type==JSON_MISSING ? jsonget(e, "old") : from;
+            to   = jsonget(e, "to");
+            to   = to->type==JSON_MISSING ? jsonget(e, "new") : to;
+        } else if (e->type==JSON_ARRAY && e->child && e->child->next &&
+                   !e->child->next->next) {
+            from = e->child;
+            to   = e->child->next;
+        }
+        if (!from || from->type!=JSON_STRING || !to || to->type!=JSON_STRING) {
+            issue(a, r, where, "must be an object with from and to, both text");
+            continue;
+        }
+        Str f = argtodoname(a, r, concat(a, where, ".from"), from);
+        Str t = argtodoname(a, r, concat(a, where, ".to"), to);
+        if (f.data && t.data) {
+            TodoRename x = {f, t};
+            renames = push(a, renames, x);
+        }
+    }
+    if (n > TODO_ITEMS) {
+        issue(a, r, "rename", "too many items: at most 50");
+    }
+    return renames;
+}
+
 // todo_write's arguments: the whole list as todos, an array of {content,
 // status} or such an array encoded as a string, and the changes to it,
-// done, start, add and remove, each naming items by their text.
+// done, start, add, remove and rename, each naming items by their text.
 static void argtodos(Arena *a, Args *r, Json *root)
 {
     r->tdone   = argtodonames(a, r, root, "done");
     r->tadd    = argtodonames(a, r, root, "add");
     r->tremove = argtodonames(a, r, root, "remove");
+    r->trename = argtodorenames(a, r, root);
     Json *sv = jsonget(root, "start");
     if (sv->type!=JSON_MISSING && sv->type!=JSON_NULL) {
         r->tstart = argtodoname(a, r, "start", sv);
@@ -1516,9 +1587,9 @@ static void argtodos(Arena *a, Args *r, Json *root)
     }
     if (v->type==JSON_MISSING || v->type==JSON_NULL) {
         if (!r->tdone.len && !r->tadd.len && !r->tremove.len &&
-            !r->tstart.data && !r->issues.len) {
+            !r->trename.len && !r->tstart.data && !r->issues.len) {
             issue(a, r, "todos", "give todos, the whole list, or the changes "
-                  "to it: done, start, add or remove");
+                  "to it: done, start, add, remove or rename");
         }
         return;
     } else if (v->type != JSON_ARRAY) {
@@ -3746,8 +3817,22 @@ static void todoerr(Buf *e, Str key, Str name, iz at)
     print(e, "\"\n");
 }
 
+// An item named by done or start: by its text now, else by the text a
+// rename in the same call gave a new one, so either names it.
+static iz todofindr(Arena scratch, Slice<TodoItem> items, Str name, Args *r)
+{
+    iz at = todofind(scratch, items, name);
+    for (iz i = 0; at==-1 && i<r->trename.len; i++) {
+        if (todofold(&scratch, r->trename[i].from) == todofold(&scratch, name)) {
+            at = todofind(scratch, items, r->trename[i].to);
+        }
+    }
+    return at;
+}
+
 // The list after a todo_write call: todos if given, else the list as it
-// was, then add, remove, done and start, in that order. One item is in
+// was, then add, remove, rename, done and start, in that order. A rename
+// keeps the item's place and status. One item is in
 // progress at a time: start demotes any other, and when none is, the
 // first pending one starts. On a name that matches no item, or too many
 // items, *err says why and the list is as it was.
@@ -3784,8 +3869,29 @@ static Slice<TodoItem> todoapply(Arena *a, Slice<TodoItem> cur, Args *r, Str *er
         }
         items.len--;
     }
+    for (iz i = 0; i < r->trename.len; i++) {
+        TodoRename x  = r->trename[i];
+        iz         at = todofind(*a, items, x.from);
+        if (at < 0) {
+            todoerr(&e, "rename", x.from, at);
+            continue;
+        }
+        Arena t   = *a;
+        Str   f   = todofold(&t, x.to);
+        b32   dup = 0;
+        for (iz k = 0; k<items.len && !dup; k++) {
+            dup = k!=at && todofold(&t, items[k].content)==f;
+        }
+        if (dup) {
+            print(&e, "rename: another item is already \"");
+            print(&e, x.to);
+            print(&e, "\"\n");
+            continue;
+        }
+        items[at].content = x.to;
+    }
     for (iz i = 0; i < r->tdone.len; i++) {
-        iz at = todofind(*a, items, r->tdone[i]);
+        iz at = todofindr(*a, items, r->tdone[i], r);
         if (at < 0) {
             todoerr(&e, "done", r->tdone[i], at);
         } else {
@@ -3793,7 +3899,7 @@ static Slice<TodoItem> todoapply(Arena *a, Slice<TodoItem> cur, Args *r, Str *er
         }
     }
     if (r->tstart.data) {
-        iz at = todofind(*a, items, r->tstart);
+        iz at = todofindr(*a, items, r->tstart, r);
         if (at < 0) {
             todoerr(&e, "start", r->tstart, at);
         } else {
@@ -3837,19 +3943,25 @@ static Slice<TodoItem> todoapply(Arena *a, Slice<TodoItem> cur, Args *r, Str *er
     return items;
 }
 
-// Whether a call sent the whole list again, the same items in the same
-// order, where done and start would have said the same in a few words.
-static b32 todoresent(Slice<TodoItem> old, Args *r)
+// Whether a call sent the whole list again where a few words would have
+// said the same: TODO_SAME for the same items in the same order (done
+// and start), TODO_REWORDED for the same but a few reworded in place
+// (rename), else 0.
+enum { TODO_SAME = 1, TODO_REWORDED };
+static i32 todoresent(Slice<TodoItem> old, Args *r)
 {
     if (!r->haslist || !old.len || r->todos.len!=old.len) {
         return 0;
     }
+    iz changed = 0;
     for (iz i = 0; i < old.len; i++) {
-        if (r->todos[i].content != old[i].content) {
-            return 0;
-        }
+        changed += r->todos[i].content != old[i].content;
     }
-    return 1;
+    if (!changed) {
+        return TODO_SAME;
+    }
+    // A list mostly new is a new list, not a few items reworded
+    return changed<=3 && changed*2<old.len ? TODO_REWORDED : 0;
 }
 
 // Items not done yet, as todoshow lists them, or null if none.

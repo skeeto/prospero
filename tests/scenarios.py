@@ -2387,6 +2387,26 @@ def todo_ops(t):
 
 
 @scenario(bound=10)
+def todo_rename(t):
+    """rename rewords an item where it is and keeps its status; a whole
+    list sent to reword one is told to use rename next time."""
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    lists = [[(i["content"], i["status"]) for i in x["items"]] for x in r.all("todo")]
+    t.check(lists == [
+        [("write a", "in_progress"), ("write b", "pending"), ("check", "pending")],
+        [("write a", "done"), ("write b twice", "in_progress"), ("check", "pending")],
+        [("write a", "done"), ("write b twice", "done"), ("check both", "in_progress")],
+        [("write a", "done"), ("write b twice", "done"), ("check both", "done")],
+    ], f"lists {lists}")
+    ends = [(e["status"], e["text"]) for e in r.all("tool.end")]
+    t.check(ends[2] == ("ok", "Todo list, 1 of 3 done, left:\n[>] write b twice (in progress)\n"
+                              "[ ] check\n"), f"after rename {ends[2]!r}")
+    t.check(ends[4][1].endswith("Next time, reword items with rename instead of sending "
+                                "the whole list again."), f"reworded {ends[4]!r}")
+
+
+@scenario(bound=10)
 def todo_cap(t):
     """Never finishing the list: three nudges, then the turn ends."""
     r = t.run()
