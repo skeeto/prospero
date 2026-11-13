@@ -1270,13 +1270,20 @@ static void testpty(ProcTest *p, Arena scratch)
 
     // Closing hangs up: SIGHUP to the shell, which a trap sees, while
     // what ignores it (nohup) goes on, and the reaper, let go, ends. The
-    // nap outlasts the waits below (up to 7 s, longer under load) and is
-    // left to finish, as no pid the shell reports is ever signaled.
+    // shell is ready only once nohup's child has started, its SIGHUP
+    // ignored: under load the hang-up could otherwise beat nohup to it.
+    // The nap outlasts the waits below and is left to finish, as no pid
+    // the shell reports is ever signaled.
     Str hup = join(&scratch, p->dir, "hup.log");
-    Buf hc(&scratch, 512);
+    Str noh = join(&scratch, p->dir, "nohup.ready");
+    Buf hc(&scratch, 1024);
     print(&hc, "trap 'echo hup >\"");
     print(&hc, hup);
-    print(&hc, "\"; exit 7' HUP; nohup sleep 30 >/dev/null 2>&1 & "
+    print(&hc, "\"; exit 7' HUP; nohup sh -c ': >\"$0\"; exec sleep 30' \"");
+    print(&hc, noh);
+    print(&hc, "\" >/dev/null 2>&1 & while [ ! -e \"");
+    print(&hc, noh);
+    print(&hc, "\" ]; do sleep 0.01; done; "
                "echo ready $! $PPID; while :; do sleep 0.05; done");
     pr = ptysh(p, scratch, finish(&hc), z, 64*kb);
     if (!check(t, pr!=0, "os_ptyspawn trapping SIGHUP")) return;
