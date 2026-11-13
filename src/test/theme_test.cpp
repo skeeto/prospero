@@ -69,7 +69,7 @@ static void test_theme(Test *t)
         P(text, userbg), P(dim, userbg), P(link, userbg), P(code, userbg),
         P(codetext, codebg), P(text, headerbg), P(seltext, sel),
         P(text, toolbg), P(dim, toolbg), P(summary, toolbg),
-        P(code, toolbg), P(link, toolbg), P(summary, panel),
+        P(code, toolbg), P(tooltext, toolbg), P(link, toolbg), P(summary, panel),
         P(text, askbg), P(dim, askbg), P(summary, askbg),
         P(ok, panel), P(bad, panel), P(amber, panel), P(active, panel),
         P(ok, toolbg), P(bad, toolbg), P(amber, toolbg), P(active, toolbg),
@@ -232,6 +232,17 @@ static void test_theme(Test *t)
         expect(t, "theme.build.fieldhover", istr(&a, f.framehover),
                istr(&a, rgb(0x20+18, 0x30+17, 0x40+5)));
         expect(t, "theme.build.fieldactive", istr(&a, f.frameactive), istr(&a, rgb(1, 2, 3)));
+
+        // A tool's output follows code unless set itself
+        Palette c = themebuild("dark", [](Str key) {
+            return key=="code" ? Str("#102030") : Str{};
+        });
+        expect(t, "theme.build.tooltext.follows", istr(&a, c.tooltext), istr(&a, rgb(0x10, 0x20, 0x30)));
+        Palette o = themebuild("dark", [](Str key) {
+            return key=="code" ? Str("#102030") : key=="tool_output" ? Str("#405060") : Str{};
+        });
+        expect(t, "theme.build.tooltext.own", istr(&a, o.tooltext), istr(&a, rgb(0x40, 0x50, 0x60)));
+        expect(t, "theme.build.tooltext.code", istr(&a, o.code), istr(&a, rgb(0x10, 0x20, 0x30)));
 
         expect(t, "theme.shift.clamp", istr(&a, themeshift(rgb(250, 5, 128), rgb(0, 10, 0), rgb(10, 0, 0))),
                istr(&a, rgb(255, 0, 128)));

@@ -104,17 +104,7 @@ a theme with a swatch, the base's color as the hint, and a change there
 recolors the window at once. `system`, `dark` and `light` name the
 built-in themes and cannot be reused.
 
-A theme is an ordinary section, so it may come from an include. The
-[Gruvbox](https://github.com/skeeto/prospero/blob/master/assets/themes/gruvbox.ini)
-theme, by Arthur Cnops (accnops) after Pavel Pertsev's palette, lists
-every color there is to set:
-
-```ini
-include = themes/gruvbox.ini
-
-[ui]
-theme = gruvbox
-```
+A theme is an ordinary section, so it may come from an include.
 
 ## Session titles
 

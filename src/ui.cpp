@@ -556,6 +556,7 @@ static void themestyle(ImGuiStyle *st, Palette *p)
     c[ImGuiCol_ScrollbarGrab]    = v(p->scroll);
     c[ImGuiCol_ScrollbarGrabHovered] = v(p->scrollhover);
     c[ImGuiCol_ScrollbarGrabActive]  = v(p->scrollpress);
+    c[ImGuiCol_ScrollbarBg]      = v(p->scrolltrack);
     c[ImGuiCol_TextSelectedBg]   = v(p->sel);
     c[ImGuiCol_WindowBg]      = ImGui::ColorConvertU32ToFloat4(p->panel);
     c[ImGuiCol_Text]          = ImGui::ColorConvertU32ToFloat4(p->paneltext);
@@ -797,8 +798,9 @@ static u32 fade(u32 col, f32 alpha)
     return (col & ~IM_COL32_A_MASK) | a<<IM_COL32_A_SHIFT;
 }
 
-// A piece's color, in a code block or elsewhere.
-static u32 piececolor(Palette *pal, Piece *p, b32 codeblock)
+// A piece's color, in a code block or elsewhere. In plain text, as a
+// tool's output is parsed, code is the output's, not a Markdown span's.
+static u32 piececolor(Palette *pal, Piece *p, b32 codeblock, b32 plain)
 {
     if (p->hl) {
         return pal->hl[p->hl];
@@ -809,7 +811,7 @@ static u32 piececolor(Palette *pal, Piece *p, b32 codeblock)
     } else if (p->style & STYLE_DIM) {
         return pal->reasoning;
     } else if (p->style & STYLE_CODE) {
-        return pal->code;
+        return plain ? pal->tooltext : pal->code;
     }
     return pal->text;
 }
@@ -1053,7 +1055,7 @@ static void drawblock(Gui *g, ImDrawList *dl, ImDrawListSplitter *sp,
             ImVec2       at   = v2(ox + r->x, ly + l->base - bk->Ascent);
             char const  *beg  = pc->text.cdata + r->b0;
             char const  *end  = pc->text.cdata + r->b1;
-            u32          col  = fade(cand ? pal->link : piececolor(pal, pc, code), alpha);
+            u32          col  = fade(cand ? pal->link : piececolor(pal, pc, code, d->plain), alpha);
             ImFont      *font = stylefont(f, pc->style);
             f32          size = stylesize(f, pc->style);
             sp->SetCurrentChannel(dl, CH_TEXT);
