@@ -12892,6 +12892,9 @@ static void gui_frame(Gui *g)
 
     imgreap(g);  // before this frame lists the textures
     os_guinewframe(g->os);
+    // A held key that types nothing (Backspace, the arrows) repeats on
+    // ImGui's timer, typed text on the OS's: the same timing for both
+    os_guikeyrepeat(g->os, &io.KeyRepeatDelay, &io.KeyRepeatRate);
     if (g->drive && g->drivemoved) {
         // The backend reads the real mouse when the window has focus and
         // the mouse is elsewhere: the script's mouse is the one

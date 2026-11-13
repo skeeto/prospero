@@ -167,6 +167,11 @@ struct GuiSdl {
     b32           gles;        // gl is OpenGL ES 3.0, not 3.2 core
     i32           keysc[ImGuiKey_NamedKey_COUNT];  // each key's scancode,
                                                    // as last pressed
+    f32           repdelay;    // the OS's key repeat (keyrepeat): seconds
+    f32           repgap;      // to the first repeat, and between repeats
+    i32           repsc;       // Linux: the key last pressed, by scancode,
+    i32           repn;        // its repeats so far, and its latest
+    u64           replast;     // event's timestamp (ns)
     SDL_Tray     *tray;
     TrayItem      items[3];
     u32           wakeevent;
@@ -390,6 +395,7 @@ static bool SDLCALL sdlwatch(void *ud, SDL_Event *e)
 }
 
 static b32 sdlwindow(Os *, Gui *, GuiSdl *, Str title);
+static void keyrepeat(GuiSdl *, SDL_KeyboardEvent *);
 
 // Whether windows are Wayland's, whose compositor places them, so that
 // a window knows neither where it is nor how to move.
@@ -1303,6 +1309,7 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
     }
     p = alloc<GuiSdl>(&g->perm);
     p->gui = g;
+    keyrepeat(p, 0);
     SDL_SetHint(SDL_HINT_POLL_SENTINEL, "0");
     SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");  // sigthread's job
     // A click that activates the window also reaches what it lands on,
@@ -1514,6 +1521,54 @@ static i32 inputkind(SDL_Event *e)
          ? INPUT_WINDOW : INPUT_OTHER;
 }
 
+// The OS's key repeat, which ImGui's own repeat follows (os_guikeyrepeat).
+// macOS says what System Settings has, asked again at each press so a
+// change counts at once. Linux, through SDL, has no way to ask (Wayland
+// sends it to SDL alone, X11 would need Xlib), so it is learned from the
+// repeats SDL delivers, by their timestamps: the first after a press is
+// the delay, each one after it the interval. Until a key has repeated it
+// is GNOME's default.
+static void keyrepeat(GuiSdl *p, SDL_KeyboardEvent *k)
+{
+    if (!k) {
+        p->repdelay = 0.5f;
+        p->repgap   = 0.03f;
+    }
+    #ifdef __APPLE__
+    if (!k || !k->repeat) {
+        void *ev = objc_getClass("NSEvent");
+        f64   d  = objcsend<f64>(ev, "keyRepeatDelay");
+        f64   r  = objcsend<f64>(ev, "keyRepeatInterval");
+        p->repdelay = d>0 ? (f32)d : p->repdelay;
+        p->repgap   = r>0 ? (f32)r : p->repgap;
+    }
+    #else
+    if (!k) {
+        return;
+    }
+    if (!k->repeat || (i32)k->scancode!=p->repsc) {
+        p->repsc   = (i32)k->scancode;
+        p->replast = k->timestamp;
+        p->repn    = 0;
+        return;
+    }
+    f32 dt = (f32)(i64)(k->timestamp - p->replast) / 1e9f;
+    p->replast = k->timestamp;
+    if (!p->repn++) {
+        p->repdelay = dt>=0.05f && dt<=5 ? dt : p->repdelay;
+    } else {
+        p->repgap   = dt>=0.005f && dt<=2 ? dt : p->repgap;
+    }
+    #endif
+}
+
+static void os_guikeyrepeat(Os *os, f32 *delay, f32 *interval)
+{
+    GuiSdl *p = (GuiSdl *)os->gui;
+    *delay    = p->repdelay;
+    *interval = p->repgap;
+}
+
 // Closing and quitting are requests the core may decline.
 static void dispatch(Os *os, GuiSdl *p, SDL_Event *e)
 {
@@ -1597,6 +1652,7 @@ static void dispatch(Os *os, GuiSdl *p, SDL_Event *e)
         if (ImGui::IsNamedKey(k)) {
             p->keysc[k - ImGuiKey_NamedKey_BEGIN] = (i32)e->key.scancode;
         }
+        keyrepeat(p, &e->key);
     }
     if (ImGui_ImplSDL3_ProcessEvent(e)) {
         gui_input(g, inputkind(e));

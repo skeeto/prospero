@@ -510,6 +510,9 @@ static void    os_guinewframe(Os *);
 static void    os_guipresent(Os *, b32 present, u32 clear);
 // The display's refresh period in microseconds.
 static i64     os_guirefresh(Os *);
+// The OS's key repeat, as the user set it: seconds from a key's press to
+// its first repeat, and between repeats.
+static void    os_guikeyrepeat(Os *, f32 *delay, f32 *interval);
 // Bring the window back for the user: restored if minimized, and raised
 // unless scripted (it would take the user's focus).
 static void    os_guiraise(Os *);
