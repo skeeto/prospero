@@ -718,18 +718,28 @@ static void farnamed(Engine *e, Arena scratch, HostLink *l, HostKid *k, Str sid)
     }
 }
 
+// Whether the link's host may have the user's skills (relayofferput,
+// relayserve): not a container with no network, whose subagent runs
+// unasked (Bypass) as it can reach nothing but its own files and /out.
+static b32 farskills(HostLink *l)
+{
+    return !l->ctr || l->ctr->network;
+}
+
 // Offer this engine's models to the host's, for the link's subagents
-// alone, unless this engine is thin itself: relays do not chain.
+// alone, unless this engine is thin itself: relays do not chain. Its
+// skills come only at link-up and as the configuration changes, as the
+// subagents are short-lived.
 static void faroffer(Engine *e, Arena scratch, HostLink *l)
 {
     if (!l->relayok || e->cfg->thin) {
         return;
     }
-    Arena work = carve(&scratch, (iz)1<<20);
+    Arena work = carve(&scratch, (iz)16<<20);  // skills scanned too
     Buf   b(&scratch, 1<<16);
     EvOut w = cmdbegin(&b, CMD_RELAYOFFER, ++l->nextid);
     putkey(&w.json, "offer");
-    relayofferput(e, &w.json, work, l->token);
+    relayofferput(e, &w.json, work, l->token, l);
     farsend(l, evend(&w));
 }
 

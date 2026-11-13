@@ -122,3 +122,9 @@ disabled = frontend-design
 
 A change applies to running sessions from their next request, and the
 agent is told of the skills it lost.
+
+A remote with no models of its own uses your skills here too, copied
+there as they are used: see
+[A remote with no models of its own](help:hosts#a-remote-with-no-models-of-its-own).
+`[skills] share` says which: `yes` (all, the default), `no`, or their
+names, separated by blanks.

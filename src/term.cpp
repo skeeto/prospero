@@ -1461,12 +1461,17 @@ static void termhotkeys(Gui *g)
         g->termfocus = 1;
     } else if (g->panes[PANE_TERMINAL] && g->termfocused) {
         // To the prompt. Docked beside it, the pane stays, since hiding
-        // it would reflow the layout; covering it, as a tab of its node,
-        // or floating, it goes
+        // it would reflow the layout; a tab of the prompt's own node (as
+        // Compact has it) stays too, the prompt's tab brought forward;
+        // covering it otherwise, or floating, it goes
         ImGuiWindow *w     = ImGui::FindWindowByName(panenames[PANE_TERMINAL]);
+        ImGuiWindow *p     = ImGui::FindWindowByName(panenames[PANE_PROMPT]);
         b32          docked = w && w->DockIsActive;
         b32          beside = g->panedrawn[PANE_PROMPT] >= g->total.frames-1;
-        if (!docked || !beside) {
+        b32          paired = docked && p && g->panes[PANE_PROMPT] && p->DockNode==w->DockNode;
+        if (paired) {
+            setpane(g, PANE_PROMPT, 1);  // its tab in front
+        } else if (!docked || !beside) {
             setpane(g, PANE_TERMINAL, 0);
         }
         g->promptfocus = 1;

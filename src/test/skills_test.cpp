@@ -301,3 +301,136 @@ static void test_helpskill(Test *t)
     expect(t, "file url", concat(a, istr(a, d.kind==DEST_FILE), d.file.path), "1/etc/passwd");
     expect(t, "other", istr(a, helpdest(a, "mailto:x@example.com").kind), istr(a, DEST_NONE));
 }
+
+static Str packpaths(Arena *a, Json *pkg)
+{
+    Buf b(a, 256);
+    for (Json *x = jsonget(pkg, "files")->child; x; x = x->next) {
+        print(&b, x==jsonget(pkg, "files")->child ? Str("") : Str(" "));
+        print(&b, jsonstr(jsonget(x, "path")));
+        if (jsonget(x, "data")->type == JSON_STRING) {
+            putbyte(&b, '*');
+        }
+    }
+    return finish(&b);
+}
+
+// Packages: what a computer sends of a skill, and what a thin engine
+// takes of one to copy
+static void test_skillpack(Test *t)
+{
+    Arena *a = &t->perm;
+
+    // The path rule
+    {
+        static Str const good[] = {
+            "SKILL.md", "bin/run.sh", "a/b/c/d/e/f/g/h", "caf\xc3\xa9.txt", "a b", "x.y",
+        };
+        for (iz i = 0; i < countof(good); i++) {
+            expect(t, concat(a, "good path ", good[i]), istr(a, skillpackpath(good[i], 1)), "1");
+        }
+        static Str const bad[] = {
+            "", "/abs", "a//b", "a/", "../x", "a/../b", "./x", ".hidden", "a/.git/x",
+            "a\\b", "c:x", "a/b\x01", "a/b/c/d/e/f/g/h/i", "a\x7f", "a\xff", "a\xed\xa0\x80",
+        };
+        for (iz i = 0; i < countof(bad); i++) {
+            expect(t, concat(a, "bad path ", istr(a, i)), istr(a, skillpackpath(bad[i], 0)), "0");
+        }
+        Buf  b(a, 256);
+        for (i32 i = 0; i < 201; i++) putbyte(&b, 'x');
+        Str  longp = finish(&b);
+        expect(t, "path 200", istr(a, skillpackpath(takehead(longp, 200), 0)), "1");
+        expect(t, "path 201", istr(a, skillpackpath(longp, 0)), "0");
+        expect(t, "win dot",    istr(a, skillpackpath("a./b", 1)*2 + skillpackpath("a./b", 0)), "1");
+        expect(t, "win space",  istr(a, skillpackpath("a /b", 1)*2 + skillpackpath("a /b", 0)), "1");
+        expect(t, "win device", istr(a, skillpackpath("x/con.txt", 1)*2 + skillpackpath("x/con.txt", 0)), "1");
+    }
+
+    // Packing: SKILL.md first, sorted, dot-names and paths a copy may not
+    // have left out, binary files as base64
+    Os *os = newos(a, 8<<20);
+    static Str const dirs[] = {
+        "/s", "/s/notes", "/s/notes/bin", "/s/notes/.git", "/s/notes/deep",
+        "/s/notes/deep/1", "/s/notes/deep/1/2", "/s/notes/deep/1/2/3", "/s/notes/deep/1/2/3/4",
+        "/s/notes/deep/1/2/3/4/5", "/s/notes/deep/1/2/3/4/5/6", "/s/notes/deep/1/2/3/4/5/6/7",
+    };
+    for (iz i = 0; i < countof(dirs); i++) {
+        os_mkdirs(os, *a, dirs[i]);
+    }
+    os_write(os, *a, "/s/notes/SKILL.md", "---\nname: notes\ndescription: Take notes\n---\nUse ref.txt.\n");
+    os_write(os, *a, "/s/notes/ref.txt", "reference\n");
+    os_write(os, *a, "/s/notes/bin/run.sh", "#!/bin/sh\necho hi\n");
+    os_write(os, *a, "/s/notes/img.bin", Str{(u8 *)"PK\0\x01\xff", 5});
+    os_write(os, *a, "/s/notes/.env", "SECRET=1\n");
+    os_write(os, *a, "/s/notes/.git/config", "x\n");
+    os_write(os, *a, "/s/notes/a:b", "x\n");
+    os_write(os, *a, "/s/notes/deep/1/2/3/4/5/6/7/far.txt", "far\n");  // 9 levels
+    os_write(os, *a, "/s/notes/deep/1/2/3/4/5/6/near.txt", "near\n");  // 8 levels
+
+    Skill k = {};
+    k.name = "notes";
+    k.dir  = "/s/notes";
+    k.path = "/s/notes/SKILL.md";
+    Str     pkg = skillpack(os, a, &k, SKILL_PACK);
+    JsonDoc d   = jsonparse(a, pkg);
+    expect(t, "pack name", jsonstr(jsonget(d.root, "name")), "notes");
+    expect(t, "pack paths", packpaths(a, d.root),
+           "SKILL.md bin/run.sh deep/1/2/3/4/5/6/near.txt img.bin* ref.txt");
+    expect(t, "pack whole", istr(a, jsonflag(jsonget(d.root, "cut"), 0)), "0");
+
+    SkillPack p = skillunpack(a, d.root, 1);
+    expect(t, "unpack ok", istr(a, !p.err.data), "1");
+    expect(t, "unpack files", istr(a, p.files.len), "5");
+    expect(t, "unpack binary", p.files[3].data, Str{(u8 *)"PK\0\x01\xff", 5});
+    expect(t, "unpack text", p.files[1].data, "#!/bin/sh\necho hi\n");
+
+    Str h1 = skillhash(a, p.files);
+    expect(t, "hash len", istr(a, h1.len), "16");
+    expect(t, "hash again", skillhash(a, skillunpack(a, jsonparse(a, pkg).root, 0).files), h1);
+    os_write(os, *a, "/s/notes/ref.txt", "reference!\n");
+    Str h2 = skillhash(a, skillunpack(a, jsonparse(a, skillpack(os, a, &k, SKILL_PACK)).root, 0).files);
+    expect(t, "hash changes", istr(a, h1 == h2), "0");
+
+    // Past the size, as encoded: SKILL.md alone, with cut
+    {
+        JsonDoc c = jsonparse(a, skillpack(os, a, &k, 100));
+        expect(t, "cut paths", packpaths(a, c.root), "SKILL.md");
+        expect(t, "cut flag", istr(a, jsonflag(jsonget(c.root, "cut"), 0)), "1");
+        SkillPack q = skillunpack(a, c.root, 0);
+        expect(t, "cut unpack", istr(a, !q.err.data && q.cut), "1");
+    }
+
+    // Unpacking refuses what a copy may not have
+    {
+        static Str const bad[] = {
+            "{\"files\":[{\"path\":\"SKILL.md\",\"text\":\"x\"},{\"path\":\"../x\",\"text\":\"x\"}]}",
+            "{\"files\":[{\"path\":\"SKILL.md\",\"text\":\"x\"},{\"path\":\"/etc/x\",\"text\":\"x\"}]}",
+            "{\"files\":[{\"path\":\"SKILL.md\",\"text\":\"x\"},{\"path\":\"skill.MD\",\"text\":\"x\"}]}",
+            "{\"files\":[{\"path\":\"SKILL.md\",\"text\":\"x\"},{\"path\":\"a\",\"text\":\"x\"},"
+                "{\"path\":\"A/b\",\"text\":\"x\"}]}",
+            "{\"files\":[{\"path\":\"a/b\",\"text\":\"x\"},{\"path\":\"a\",\"text\":\"x\"},"
+                "{\"path\":\"SKILL.md\",\"text\":\"x\"}]}",
+            "{\"files\":[{\"path\":\"ref.txt\",\"text\":\"x\"}]}",
+            "{\"files\":[{\"path\":\"SKILL.md\",\"data\":\"*x*\"}]}",
+            "{\"files\":[{\"path\":\"SKILL.md\",\"text\":\"x\"},{\"path\":\"aux.txt\",\"text\":\"x\"}]}",
+            "{\"files\":[{\"path\":\"SKILL.md\",\"text\":\"x\"},{\"path\":\"x \",\"text\":\"x\"}]}",
+        };
+        for (iz i = 0; i < countof(bad); i++) {
+            SkillPack q = skillunpack(a, jsonparse(a, bad[i]).root, 1);
+            expect(t, concat(a, "refused ", istr(a, i)), istr(a, !!q.err.data), "1");
+        }
+        SkillPack q = skillunpack(a, jsonparse(a, bad[7]).root, 0);
+        expect(t, "device elsewhere", istr(a, !q.err.data), "1");
+
+        Buf b(a, 1<<16);
+        print(&b, "{\"files\":[{\"path\":\"SKILL.md\",\"text\":\"x\"}");
+        for (i32 i = 0; i < SKILL_FILES; i++) {
+            print(&b, ",{\"path\":\"f");
+            print(&b, (i64)i);
+            print(&b, "\",\"text\":\"\"}");
+        }
+        print(&b, "]}");
+        q = skillunpack(a, jsonparse(a, finish(&b)).root, 0);
+        expect(t, "too many", istr(a, !!q.err.data), "1");
+    }
+}

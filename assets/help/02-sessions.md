@@ -116,22 +116,42 @@ Markdown, as it does the agent's: code fences, `inline code`, lists and
 emphasis render, while each line break stays as you typed it and HTML
 tags show as text. The agent gets exactly what you typed. With the
 mouse over a message, its header shows when it was sent, or when the
-agent finished it, in local time, with the date if not today. The buttons
-beside the prompt box are icons,
-named in their tooltips: Send (a paper plane), Attach (a paper clip),
-Open working folder (a folder) and Terminal, which shows the Terminal
-pane with the session's shell in its folder, as Ctrl+` does, on
-whatever host the session runs ([Hosts](help:hosts)). While the agent
-works, Send becomes Steer (a curved arrow), and Stop (a square) shows
-below it. The status line above the box begins with the session's
-mode, model and shell, each a list to switch it. What you send while it works waits at
-the end of the transcript, dimmed and marked "Next step", until the
-agent reads it at its next step (or marked "Queued", for a turn of its
-own, as it is when sent too late for this turn), and its Withdraw
-button takes it back into the box. Stop cancels the turn and kills
-any command it runs, and so does Esc, once nothing is left for it to
-close: from the prompt box, the first Esc leaves the box, and the
-second stops the turn.
+agent finished it, in local time, with the date if not today. The
+buttons beside the prompt box are icons in two columns, named in their
+tooltips: Send (a paper plane), Stop (a square) and Pause (two bars)
+on the left; Attach (a paper clip), Open working folder (a folder) and
+Terminal on the right, which shows the Terminal pane with the
+session's shell in its folder, as Ctrl+` does, on whatever host the
+session runs ([Hosts](help:hosts)). Each is always there, dimmed when
+it can do nothing, so none moves as a turn begins or ends. While the
+agent works, Send becomes Steer (a curved arrow). The status line
+above the box begins with the session's mode, model and shell, each a
+list to switch it. What you send while it works waits at the end of
+the transcript, dimmed and marked "Next step", until the agent reads
+it at its next step (or marked "Queued", for a turn of its own, as it
+is when sent too late for this turn), and its Withdraw button takes it
+back into the box. Stop cancels the turn and kills any command it
+runs, and so does Esc, once nothing is left for it to close: from the
+prompt box, the first Esc leaves the box, and the second stops the
+turn.
+
+Pause holds the agent before its next model request, without ending
+the turn: a response under way stops at once (its text so far is kept,
+its reasoning is not), while a running command, a question waiting for
+you or a subagent's work goes on, and the subagents pause too. The
+status line says "paused", or "pausing" until what runs ends, and Pause
+becomes Resume (a play arrow with a bar), which goes on from there. A
+steer you send meanwhile waits for it. The pause outlasts quitting and
+a restart, though the commands do not: opened again, the session is
+still paused, and Resume goes on in a turn of its own. Stop ends a
+pause along with the turn, and a message you send to a paused session
+that is not working ends the pause too.
+
+After a turn is cut short, by Stop, an error or the harness stopping,
+the transcript offers Continue below the note that says so: the agent
+goes on from where it was, with no message of yours, told only that its
+last response was cut off. It shows there, not beside the prompt box,
+so that a turn ending as you click never turns one button into another.
 
 The line above the prompt box says what the session is doing, and
 for how long. While a llama.cpp server reads a long prompt, a bar
@@ -214,6 +234,8 @@ agent (Tab completes the name):
 - `/plan` and `/plan off` turn Plan mode on and off;
 - `/background` moves the running command or subagents to the
   background, as Ctrl+B does;
+- `/pause` pauses the agent, as Pause does, and `/continue` resumes it,
+  or goes on after a turn cut short, as Continue does;
 - `/NAME [args]` uses the skill NAME (see
   [Instructions and skills](help:instructions)).
 
@@ -284,11 +306,16 @@ and as its tab is picked or a link to it clicked, never by polling, at
 most once a second; the text stays at the same line. Reload (the
 circular arrow) reads it again at once, and a tab's menu closes tabs or
 copies the path. Ctrl+W (Cmd+W) closes the front tab while the pane
-has the focus. Reveal (the folder) shows the file in the file
-manager, and Open in editor opens it in your editor (`[ui] editor`,
-or [`[ui] editor_line`](settings:ui#editor_line) for one Prospero
-doesn't know) at the band's first line, else the line at the top,
-without waiting for it. Both work for a file on this computer, in a
+has the focus, and Ctrl+F (Cmd+F) there finds in the file shown, its
+text or its Markdown as rendered (Edit → Find in file... too). Ctrl+G
+(Ctrl on macOS too) goes to a line (`N`, `N:C` or `A-B`), banded like
+a link's lines (Edit → Go to line... too). Reveal (the folder) shows
+the file in the file manager, and Open in editor opens it in your
+editor (`[ui] editor`, or
+[`[ui] editor_line`](settings:ui#editor_line) for one Prospero doesn't
+know) at the line last gone to (a link's first, Go to line's, or the
+current find match's, with its column), else the band's first line,
+else the line at the top, without waiting for it. Both work for a file on this computer, in a
 container's folder mounted here, or, on Windows, in a WSL distro. For
 another host, Open in editor uses that remote's `viewer` command template
 in this window's `[remote NAME]` section: a local, remote-aware editor,

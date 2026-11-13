@@ -197,6 +197,7 @@ enum : i32 {
     LIVE_COMPACTING,  // a summary request runs
     LIVE_RELAY,       // paused: no connected computer relays its calls
     LIVE_AUTH,        // its endpoint's ChatGPT sign-in is refreshed
+    LIVE_PAUSED,      // the user paused it before its next request
     LIVE_CLOSED,
     LIVE_COUNT,
 };
@@ -204,7 +205,7 @@ enum : i32 {
 static Str livenames[] = {
     "idle", "discover", "waiting", "streaming", "error", "backoff", "tool",
     "ask", "queued", "task", "mcp", "worktree", "compacting", "relay", "auth",
-    "closed",
+    "paused", "closed",
 };
 static_assert(countof(livenames) == LIVE_COUNT);
 
@@ -690,6 +691,9 @@ struct View {
     Str             enderr;
     b32             endresume;   // the next turn began by itself
     b32             endcompact;  // a compaction's turn (compact) ended
+    b32             paused;      // the user paused it (pause records)
+    i32             contmsg;     // 1 + the note of a turn cut short, which
+                                 // offers Continue while idle; 0 if none
     b32             turncompact; // the running turn is one
 
     // Its work (viewwork), the session's and the running turn's
@@ -1053,6 +1057,7 @@ static void dropprov(View *v)
                 ps[k]->msg = ps[k]->msg==i ? (i32)n : ps[k]->msg;
             }
             v->movedat   = v->movedat==i+1 ? (i32)n+1 : v->movedat;
+            v->contmsg   = v->contmsg==i+1 ? (i32)n+1 : v->contmsg;
             v->msgs[n++] = v->msgs[i];
         }
         v->msgs.len = n;
@@ -2567,6 +2572,8 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         v->turnmsg  = v->msgs.len;
         v->pdone   = v->ptotal = 0;
         v->turncompact = jsonstr(jsonget(j, "via")) == "compact";
+        v->topsdirty  |= v->contmsg > 0;  // its Continue goes
+        v->contmsg     = 0;
         // The message that began it: a prompt just before, or, for a
         // turn the session began by itself, a note saying why
         Str via = jsonstr(jsonget(j, "via"));
@@ -2581,6 +2588,12 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
                            "finished, so the agent went on without a prompt.");
             v->msgs[i].seq        = r->seq;
             v->msgs[i].label      = "Resumed by itself";
+            v->msgs[i].startsturn = v->turn;
+        } else if (via == "continue") {
+            i32 i = addmsg(v, VIEW_NOTE, "You asked the agent to go on, "
+                           "without a message.");
+            v->msgs[i].seq        = r->seq;
+            v->msgs[i].label      = "Continued";
             v->msgs[i].startsturn = v->turn;
         } else if (via == "compact") {
             // Asked for by the user (compact), with no message of its
@@ -2959,6 +2972,10 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         v->msgs[i].seq   = r->seq;
         v->msgs[i].label = fb ? Str("Fallback") : Str("Retry");
     } return 1;
+
+    case EV_PAUSE:
+        v->paused = jsonint(jsonget(j, "on"), 0) != 0;
+        return 1;
 
     case EV_NUDGE: {
         fadeprov(v);
@@ -3450,6 +3467,8 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
             Buf   b(&a, 128 + err.len);
             print(&b, why=="cancel"      ? Str("Cancelled.") :
                       why=="interrupted" ? Str("Interrupted: the harness stopped during this turn.") :
+                      why=="paused"      ? Str("Paused when the harness stopped: its "
+                                               "commands ended, but the pause stays.") :
                       why=="budget"      ? Str("Stopped at the step budget.") :
                       why=="side"        ? Str("This side chat began here, while the "
                                                "main session's turn went on there.") :
@@ -3462,6 +3481,9 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
             v->msgs[i].seq   = r->seq;
             v->msgs[i].label = why=="error" ? Str("Error") :
                                why=="side"  ? Str("Side chat") : Str("Turn ended");
+            if (why!="side" && !v->endcompact) {
+                v->contmsg = i + 1;  // Continue, below it
+            }
         }
         clampsel(v);
     } return 1;
@@ -3718,7 +3740,8 @@ static f32 msgfoot(View *v, ViewMsg *m)
     if (th.h > 0) {
         return th.h + v->thumbpad;
     }
-    return (ask || force) && !v->readonly ? v->foot : 0;
+    b32 cont = v->contmsg && m==&v->msgs[v->contmsg-1] && !v->busy;
+    return (ask || force || cont) && !v->readonly ? v->foot : 0;
 }
 
 // Lay out message i at the width, updating its height. A collapsed
@@ -4261,6 +4284,14 @@ struct FindHit {
     i32 len;
 };
 
+// A message's find hits, in order, and which of them is current, -1
+// if none.
+struct Marks {
+    FindHit *h;
+    iz       n;
+    iz       cur;
+};
+
 // A message as a search last saw it.
 struct FindSeen {
     u8 *data;
@@ -4281,6 +4312,8 @@ struct ViewSearch {
     Slice<FindHit>   hits;      // in order
     Slice<FindSeen>  seen;      // the messages searched, in order
     i32              cur;       // the current hit, -1 if none
+    iz               hitmax;    // hits kept at most, 0 for no limit
+    b32              full;      // hitmax kept, and more found
 };
 
 static ViewSearch *newsearch(Arena *perm, Region *hits, Region *seen, iz qmax)
@@ -4309,24 +4342,32 @@ static b32 findnorm(u8 *c, u8 prev)
     return 1;
 }
 
-// Search a view for q from the start, as searchstep goes on to.
-static void searchreset(ViewSearch *s, View *v, Str q)
+// A query as a search compares it, findnorm'd into dst, cut at qmax
+// bytes of q. Returns its length.
+static iz findq(u8 *dst, Str q, iz qmax)
 {
-    q = q.len>s->qmax ? takehead(q, s->qmax) : q;
+    q = q.len>qmax ? takehead(q, qmax) : q;
     iz n = 0;
     for (iz i = 0; i < q.len; i++) {
         u8 c = q[i];
-        if (findnorm(&c, n ? s->q.data[n-1] : 0)) {
-            s->q.data[n++] = c;
+        if (findnorm(&c, n ? dst[n-1] : 0)) {
+            dst[n++] = c;
         }
     }
-    s->q.len      = n;
+    return n;
+}
+
+// Search a view for q from the start, as searchstep goes on to.
+static void searchreset(ViewSearch *s, View *v, Str q)
+{
+    s->q.len      = findq(s->q.data, q, s->qmax);
     s->v          = v;
     s->hitmem.beg = s->hitbase;
     s->seenmem.beg = s->seenbase;
     s->hits       = {};
     s->seen       = {};
     s->cur        = -1;
+    s->full       = 0;
 }
 
 static FindSeen seenof(View *v, ViewMsg *m)
@@ -4411,6 +4452,7 @@ static FindText findtext(Arena *a, Doc *d)
 // A message is searched in what it shows (findtext), from its document,
 // which stays in the cache for the next search, a text typed further,
 // and for showing it; one not made yet costs its parse too.
+// Past hitmax hits (if not 0) it stops, full, until a message changes.
 // Returns whether they are, else it goes on from there next call.
 static b32 searchstep(ViewSearch *s, Arena scratch, iz budget)
 {
@@ -4429,10 +4471,11 @@ static b32 searchstep(ViewSearch *s, Arena scratch, iz budget)
         s->hits.len = k;
         s->seen.len = first;
         s->cur      = s->cur<k ? s->cur : (i32)k-1;
+        s->full     = 0;
     }
 
     Str q = s->q;
-    for (iz i = s->seen.len; i < v->msgs.len; i++) {
+    for (iz i = s->seen.len; i<v->msgs.len && !s->full; i++) {
         if (budget <= 0) {
             return 0;
         }
@@ -4446,13 +4489,15 @@ static b32 searchstep(ViewSearch *s, Arena scratch, iz budget)
         Arena    a = scratch;
         FindText t = findtext(&a, msgdoc(v, (i32)i));
         u8       q0 = q[0];
-        for (iz at = 0; at+q.len <= t.len; at++) {
+        for (iz at = 0; at+q.len<=t.len && !s->full; at++) {
             if (t.text[at] != q0) {
                 continue;
             }
             iz k = 1;
             for (; k<q.len && t.text[at+k]==q[k]; k++) {}
-            if (k == q.len) {
+            if (k==q.len && s->hitmax && s->hits.len==s->hitmax) {
+                s->full = 1;
+            } else if (k == q.len) {
                 i32 beg = t.beg[at];
                 i32 end = t.end[at+q.len-1];
                 FindHit h = {(i32)i, beg, end>beg ? end-beg : 0};
@@ -4464,14 +4509,14 @@ static b32 searchstep(ViewSearch *s, Arena scratch, iz budget)
     return 1;
 }
 
-// The first hit in a message at or after an offset, else the next
-// message's, else hits.len.
-static iz searchfrom(ViewSearch *s, i32 msg, i32 off)
+// The first of hits in a message at or after an offset, or holding it,
+// else the next message's, else hits.len.
+static iz hitfrom(Slice<FindHit> hits, i32 msg, i32 off)
 {
-    iz lo = 0, hi = s->hits.len;
+    iz lo = 0, hi = hits.len;
     while (lo < hi) {
         iz mid = lo + (hi - lo)/2;
-        FindHit *h = &s->hits[mid];
+        FindHit *h = &hits[mid];
         if (h->msg<msg || (h->msg==msg && h->off+h->len<=off)) {
             lo = mid + 1;
         } else {
@@ -4479,6 +4524,26 @@ static iz searchfrom(ViewSearch *s, i32 msg, i32 off)
         }
     }
     return lo;
+}
+
+// A message's hits, and which of them is current, cur being an index
+// into hits, -1 for none.
+static Marks hitmarks(Slice<FindHit> hits, iz cur, i32 msg)
+{
+    iz    lo = hitfrom(hits, msg, 0);
+    iz    hi = hitfrom(hits, msg+1, 0);
+    Marks r  = {};
+    r.h   = hits.data + lo;
+    r.n   = hi - lo;
+    r.cur = cur>=lo && cur<hi ? cur-lo : -1;
+    return r;
+}
+
+// The first hit in a message at or after an offset, else the next
+// message's, else hits.len.
+static iz searchfrom(ViewSearch *s, i32 msg, i32 off)
+{
+    return hitfrom(s->hits, msg, off);
 }
 
 

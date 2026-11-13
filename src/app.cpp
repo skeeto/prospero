@@ -670,6 +670,10 @@ struct GuiSession {
     b32          gone;      // deleted: shown nowhere
     Slice<SkillItem> skills;  // what /name invokes, as its engine lists them
     i64          skillsid;  // that list's skills in flight, 0 if none
+    i64          fetchid;   // skill.fetch in flight, before its prompt
+    Str          fetchskill;  // which, and the prompt that follows it
+    Str          fetchargs;
+    Str          fetchtext;
     GitWatch     git;       // its branch, and asking for it (guigit)
     // Desktop notifications (toastpass): its history, as of its open, its
     // records up to histseq (else written by histts) being no news; the
@@ -901,6 +905,7 @@ struct DocView {
     i32          pressmsg;  // in this message
     Str          section;   // a heading to scroll to once laid out
     LinkFrom     from;      // where its links to files are
+    ViewSearch  *find;      // hits marked, if over v, else null
 };
 
 static DocView *newdocview(Arena *perm, Os *os, ViewCache *c)
@@ -1240,13 +1245,17 @@ struct DocLines {
     i32 band1;
     i32 jump0;    // lines to scroll to, 1-based and clamped, else 0
     i32 jump1;
+    i32 jumpcol;  // a column on jump0's line shown, 1-based, else 0
     b32 restore;  // go to top, dy and scrollx
+    FileFind *find;   // hits marked, else null
+    FindHit reveal;   // a hit brought into view if out of it, len 0 for none
+    f32 covered;  // the height a bar covers at the view's top
     // In with restore, and out
     i32 top;      // the line at the view's top, 0-based
     f32 dy;       // how far past its top
     f32 scrollx;
     // Out
-    b32 jumped;   // the jump landed
+    b32 jumped;   // the jump landed, or the reveal
     b32 restored; // and the restore
     b32 recorded; // top, dy and scrollx are as drawn
     // Kept
@@ -1266,6 +1275,43 @@ struct FileShown {
     f32    width;   // laid out at
     b32    hbar;    // a horizontal scrollbar
     b32    band;    // the band was drawn
+    b32    carried; // a hit was drawn carried over a chunk's start
+    f32    winw;    // the view's width, without its scrollbar
+};
+
+// The Files pane's find bar (files.cpp), one for the pane, over the
+// file shown: its text searched as it is (FileFind), or a Markdown
+// file as rendered (a ViewSearch of its own); or, in line mode, Go to
+// line's field.
+enum : i32 {
+    FBAR_FIND,
+    FBAR_LINE,
+};
+
+struct FileFindBar {
+    FileFind   *text;
+    ViewSearch *md;
+    char       *q;          // the field, FIELD_MAX
+    b32         open;
+    i32         mode;       // FBAR_*
+    b32         focus;      // focus its field next frame
+    b32         held;       // the bar had the focus last frame
+    b32         active;     // its field had the keyboard
+    FileBody   *body;       // what the search is of
+    i32         bmode;      // as FMODE_*
+    u32         serial;     // the front tab it was opened for
+    FindHit     from;       // the first hit at or after this is picked
+    b32         pick;       // pick a hit, cur < 0
+    b32         typed;      // and go to it
+    b32         reveal;     // the current hit, brought into view
+    b32         done;       // searched to the end
+    b32         drawn;      // this frame
+    f32         barh;       // the bar's bottom below the text's top
+    u8          shown[48];  // the count as drawn, for the checklist
+    i32         shownlen;
+    char        line[32];   // Go to line's field
+    b32         back;       // line mode leaves to find mode
+    b32         bad;        // Enter found no line in it
 };
 
 struct Export {
@@ -1985,6 +2031,7 @@ struct Gui {
     FileFetch          ffetch;       // a file on another host, coming
     DocLines           flines;       // the text view's state, as drawn
     FileShown          fshown;       // and where, for the checklist
+    FileFindBar        ffind;        // its find bar
     FileTab           *fshowing;     // the tab drawn last
     u32                fshowingserial; // its serial then
     i32                fshowingmode; // and its mode
@@ -2189,6 +2236,9 @@ struct Gui {
     Str                clipkept;     // the clipboard's text, for the
                                      // checklist's paste to restore
     Str                clippng;      // and the image it put there
+    i32                clipowned;    // copies that reached the checklist's
+    i32                clipshared;   // own pasteboard alone, or with the
+                                     // real one's changing too (clipownafter)
     b32                promptfocus;  // activate the box when next drawn
     i32                promptend;    // 1: with the caret at the draft's end,
                                      // 2: the box is active to put it there
@@ -4306,6 +4356,37 @@ static void guiskill(Gui *g, GuiSession *s, Str skill, Str args, Str text)
     cmdsend(g, &w, a);
 }
 
+static void setnote(Gui *, GuiSession *, Str, b32, b32);
+
+// Invoke a skill (guiskill), one that another computer shares fetched
+// first where the session's engine can (skill.fetch): the prompt goes
+// once its copy is current (onskillfetch). Meanwhile the window vouches
+// for this fetch to that computer as the user's own (guirelayin).
+static void guiskillgo(Gui *g, GuiSession *s, Str skill, Str args, Str text)
+{
+    SkillItem *k = 0;
+    for (iz i = 0; !k && i < s->skills.len; i++) {
+        k = s->skills[i].name==skill ? &s->skills[i] : 0;
+    }
+    if (!k || !k->from.len || !hostcap(s->host, "skill.fetch")) {
+        guiskill(g, s, skill, args, text);
+        return;
+    }
+    Arena a    = newarena(g->cmdr);
+    Str   note = concat(&a, concat(&a, "fetching ", skill), concat(&a, " from ", k->from));
+    Buf   b(&a, 256 + skill.len);
+    EvOut w = cmdopen(g, &b, CMD_SKILLFETCH, s);
+    putkey(&w.json, "name");
+    putstr(&w.json, skill);
+    s->fetchid    = g->nextid;
+    s->fetchskill = clone(&g->perm, skill);
+    s->fetchargs  = clone(&g->perm, args);
+    s->fetchtext  = clone(&g->perm, text);
+    s->stick      = 1;
+    setnote(g, s, note, 0, 0);
+    cmdsend(g, &w, a);
+}
+
 // A skills reply: the list kept anew only when it changed.
 static void onskills(Gui *g, GuiSession *s, Json *j, b32 ok)
 {
@@ -4318,7 +4399,8 @@ static void onskills(Gui *g, GuiSession *s, Json *j, b32 ok)
                t->desc==jsonstr(jsonget(k, "description")) &&
                t->path==jsonstr(jsonget(k, "path")) &&
                t->hidden==(jsonget(k, "hidden")->boolean != 0) &&
-               t->builtin==(jsonget(k, "builtin")->boolean != 0);
+               t->builtin==(jsonget(k, "builtin")->boolean != 0) &&
+               t->from==jsonstr(jsonget(k, "from"));
     }
     if (!ok || same) {
         return;
@@ -4331,6 +4413,7 @@ static void onskills(Gui *g, GuiSession *s, Json *j, b32 ok)
         t.path   = clone(&g->perm, jsonstr(jsonget(k, "path")));
         t.hidden  = jsonget(k, "hidden")->boolean != 0;
         t.builtin = jsonget(k, "builtin")->boolean != 0;
+        t.from    = clone(&g->perm, jsonstr(jsonget(k, "from")));
         s->skills = push(&g->perm, s->skills, t);
     }
     scheddirty(&g->sched);
@@ -4360,6 +4443,53 @@ static void guicancel(Gui *g, GuiSession *s)
     Arena a = newarena(g->cmdr);
     Buf   b(&a, 128);
     EvOut w = cmdopen(g, &b, CMD_CANCEL, s);
+    cmdsend(g, &w, a);
+}
+
+// Why the session cannot be paused (pause) or continued now, else null:
+// Pause while its turn runs and is not paused; continue to end a pause,
+// or after a turn cut short, while idle.
+static Str pausewhy(Gui *g, GuiSession *s, b32 cont)
+{
+    (void)g;
+    View *v = s ? s->view : 0;
+    if (!v) {
+        return "Open the session";
+    } else if (s->readonly) {
+        return "Another process has this session open";
+    } else if (!hostcap(s->host, "pause")) {
+        return "This host's engine is too old to pause; update the engine";
+    } else if (!cont && !v->busy) {
+        return "Nothing runs to pause";
+    } else if (!cont && v->paused) {
+        return "Paused already";
+    } else if (cont && v->busy && !v->paused) {
+        return "The turn runs: it is not paused";
+    } else if (cont && !v->busy && !v->paused && !v->contmsg) {
+        return "Nothing to continue: the last turn was not cut short";
+    }
+    return {};
+}
+
+static void guipause(Gui *g, GuiSession *s)
+{
+    if (pausewhy(g, s, 0).len) {
+        return;
+    }
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 128);
+    EvOut w = cmdopen(g, &b, CMD_PAUSE, s);
+    cmdsend(g, &w, a);
+}
+
+static void guicontinue(Gui *g, GuiSession *s)
+{
+    if (pausewhy(g, s, 1).len) {
+        return;
+    }
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 128);
+    EvOut w = cmdopen(g, &b, CMD_CONTINUE, s);
     cmdsend(g, &w, a);
 }
 
@@ -5926,6 +6056,22 @@ static b32 attachpaste(Gui *g, GuiSession *s)
     return got;
 }
 
+// skill.fetch replied (guiskillgo): the prompt that invokes the skill
+// now, else the failure's note, and the text back in the box if it is
+// still empty.
+static void onskillfetch(Gui *g, GuiSession *s, b32 ok, Str err)
+{
+    s->fetchid = 0;
+    if (!ok) {
+        setnote(g, s, err.len ? err : Str("fetching the skill failed"), 1);
+        if (s->fetchtext.len && !draftstr(s).len) {
+            setdraft(g, s, s->fetchtext);
+        }
+    } else if (s->view && !s->gone) {
+        guiskill(g, s, s->fetchskill, s->fetchargs, s->fetchtext);
+    }
+}
+
 // The reply to a session operation from the box (guicompact and the
 // rest): its note, or its error with the command put back in the box,
 // if it is still empty, to try again; a fork's new session is shown.
@@ -6168,6 +6314,9 @@ static void filesframe(Gui *);
 static void filesfont(Gui *);
 static void fileaskopen(Gui *);
 static void fileclosefront(Gui *);
+static void filefindopen(Gui *);
+static void filelineopen(Gui *);
+static Str  filefindwhy(Gui *);
 static Str  fileaskwhy(Gui *);
 static void fileanswer(Gui *, Str);
 static void onfsread(Gui *, Arena, Json *, b32, Str, i64);
@@ -6248,6 +6397,12 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
         if (q.s && q.s->skillsid==id) {
             q.s->skillsid = 0;
             onskills(g, q.s, j, ok);
+        }
+        return;
+
+    case CMD_SKILLFETCH:
+        if (q.s && q.s->fetchid==id) {
+            onskillfetch(g, q.s, ok, err);
         }
         return;
 
@@ -7659,9 +7814,14 @@ static void guirelaylostall(Gui *g, Arena a, Str why)
 }
 
 // A host went down or away: the main engine stops its calls, and what
-// waited for it goes.
+// waited for it goes, a skill's fetch too, whose reply will not come.
 static void guirelaydrop(Gui *g, Arena a, GuiHost *h)
 {
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        if (s->host==h && s->fetchid) {
+            onskillfetch(g, s, 0, "fetching the skill stopped: the connection broke");
+        }
+    }
     b32 any = 0;
     for (i32 i = 0; i < GUI_RELAYS; i++) {
         any |= g->relays[i].host == h->uid;
@@ -7677,7 +7837,12 @@ static void guirelaydrop(Gui *g, Arena a, GuiHost *h)
     h->offered = 0;
 }
 
-// A thin host's relay record: part of a call, to the main engine.
+static b32 hostskills(GuiHost *);
+
+// A thin host's relay record: part of a call, to the main engine. A
+// skill's fetch (skill/NAME) from a host that may have none is refused;
+// one of the user's alone goes only while the user's own /NAME in that
+// session waits for it, as the window vouches (invoked).
 static void guirelayin(Gui *g, GuiHost *h, Arena a, Json *j)
 {
     i64 rid = jsonint(jsonget(j, "rid"), 0);
@@ -7689,7 +7854,17 @@ static void guirelayin(Gui *g, GuiHost *h, Arena a, Json *j)
         }
         return;
     }
-    i64 part = jsonint(jsonget(j, "part"), -1);
+    i64 part    = jsonint(jsonget(j, "part"), -1);
+    Str path    = jsonstr(jsonget(j, "path"));
+    b32 skill   = part==0 && startswith(path, "skill/");
+    b32 invoked = 0;
+    if (skill && !hostskills(h)) {
+        guirelaylost(g, a, h, rid, "this computer shares no skills with this container");
+        return;
+    } else if (skill) {
+        GuiSession *s = findsess(g, h, jsonstr(jsonget(j, "session")));
+        invoked = s && s->fetchid && s->fetchskill==cuthead(path, 6);
+    }
     if (part == 0) {
         GuiRelay *x = guirelayat(g, h->uid, rid);
         for (i32 i = 0; !x && i < GUI_RELAYS; i++) {
@@ -7703,20 +7878,9 @@ static void guirelayin(Gui *g, GuiHost *h, Arena a, Json *j)
     } else if (!guirelayat(g, h->uid, rid)) {
         return;  // ended already
     }
-    Buf     b(&a, 1024 + jsonstr(jsonget(j, "data")).len);
-    JsonOut w = {&b};
-    putobject(&w);
-    putstrkey(&w, "cmd", "relay.call");
-    putintkey(&w, "cid", rid);
-    putstrkey(&w, "origin", relayorigin(&a, h));
-    for (Json *m = j->child; m; m = m->next) {
-        if (!(m->key=="rid") && !(m->key=="peer") && !(m->key=="ts") && !(m->key=="ev")) {
-            putkey(&w, m->key);
-            putjson(&w, m);
-        }
-    }
-    putend(&w);
-    if (!guimainline(g, a, finish(&b))) {
+    // Only what a call is, never keys of the remote's choosing
+    Str line = relaycallline(&a, j, rid, relayorigin(&a, h), invoked);
+    if (!guimainline(g, a, line)) {
         guirelaylost(g, a, h, rid, "this computer's engine took no call");
     }
 }
@@ -7770,6 +7934,32 @@ static void guiofferask(Gui *g)
     cmdsend(g, &w, a);
 }
 
+// Whether a host may have the user's skills (guioffersend, guirelayin):
+// not the container of a subagent with no network, which runs unasked
+// as it can reach nothing but its own files and /out (hostlink.cpp).
+static b32 hostskills(GuiHost *h)
+{
+    b32 task = h->taskexec.len || startswith(h->name, "ctr:t-");
+    return !task || (h->taskctr && h->taskctr->network);
+}
+
+// An offer without its skills, for a host that may not have them.
+static Str offerunskilled(Arena *a, Str offer)
+{
+    JsonDoc d = jsonparse(a, offer);
+    Buf     b(a, offer.len);
+    JsonOut w = {&b};
+    putobject(&w);
+    for (Json *m = d.root->child; m; m = m->next) {
+        if (!(m->key == "skills")) {
+            putkey(&w, m->key);
+            putjson(&w, m);
+        }
+    }
+    putend(&w);
+    return finish(&b);
+}
+
 // The offer to each thin-capable host up that lacks it as it is now.
 static void guioffersend(Gui *g)
 {
@@ -7781,13 +7971,19 @@ static void guioffersend(Gui *g)
                 !hostcap(h, "relay")) {
             continue;
         }
-        Arena a = newarena(g->cmdr);
-        Buf   b(&a, 256 + g->offer.len);
+        Arena a     = newarena(g->cmdr);
+        Str   offer = hostskills(h) ? g->offer : offerunskilled(&a, g->offer);
+        Buf   b(&a, 256 + offer.len);
         EvOut w = cmdopen(g, &b, CMD_RELAYOFFER, 0, h);
         putkey(&w.json, "offer");
-        putraw(&w.json, g->offer);
+        putraw(&w.json, offer);
         cmdsend(g, &w, a);
         h->offered = 1;
+        for (GuiSession *s = g->sessions; s; s = s->next) {
+            if (s->host==h && s->view && !s->gone) {
+                guiskills(g, s);  // which the offer may change
+            }
+        }
     }
 }
 
@@ -11279,6 +11475,9 @@ static void guigit(Gui *g)
     if (s && ((focused && !g->gitfocused) || (pane && !g->gitpane))) {
         s->git.stale = 1;
     }
+    if (focused && !g->gitfocused) {
+        guiofferask(g);  // the user's skills may have changed meanwhile
+    }
     g->gitfocused = focused;
     g->gitpane    = pane;
     if (!s || s->gone || g->quitting || !hostcap(s->host, "git") || !hostlive(g, s)) {
@@ -12990,6 +13189,9 @@ static void gui_frame(Gui *g)
 
     imgreap(g);  // before this frame lists the textures
     os_guinewframe(g->os);
+    // A held key that types nothing (Backspace, the arrows) repeats on
+    // ImGui's timer, typed text on the OS's: the same timing for both
+    os_guikeyrepeat(g->os, &io.KeyRepeatDelay, &io.KeyRepeatRate);
     if (g->drive && g->drivemoved) {
         // The backend reads the real mouse when the window has focus and
         // the mouse is elsewhere: the script's mouse is the one
@@ -13555,6 +13757,9 @@ enum : i32 {
                   // changes the pasteboard (GEV_CLIPRACE), and lives
     OP_FLAGPASTE, // macOS: Cmd+V as dictation apps post it (GEV_FLAGPASTE),
                   // checked to press Cmd for V and let it go after
+    OP_CLIPOWN,   // macOS, hands off: at least dx copies so far reached the
+                  // checklist's own pasteboard, and none the real one
+                  // (clipownafter); elsewhere a skip line
     OP_OPENDIR,   // an open event (macOS: open -a) for the directory text
                   // in --cwd, or the launch's (prospero DIR) if empty
     OP_CLOSEMAIN, // close the session the checklist made, as Close does
@@ -13571,6 +13776,8 @@ enum : i32 {
     OP_NODIALOG,  // the next file dialog cannot be shown, as without a portal
     OP_OPENFILE,  // open text in Files, as a reference (fileref) in --cwd,
                   // in the session shown
+    OP_MDOWN,     // middle button
+    OP_MUP,
     OP_VIEWERSET, // the shown remote's viewer: empty, invalid, valid, or a
                   // template (a checklist override, not a configuration edit)
 };
@@ -14024,6 +14231,7 @@ enum : i32 {
     CHK_WTFRESH,      // the session shown, from the worktree dialog, is fresh,
                       // nested under its original
     CHK_THIN,         // the remote r is up and thin, the Hosts pane saying so
+    CHK_THINSKILL,    // the shown session's skill gnotes is as text says (thinskill)
     CHK_VIA,          // the session shown streams via this computer
     CHK_CFGSEARCH,    // the settings' search field has the keyboard
     CHK_CTR,          // the first container is as text says (ctrcheck)
@@ -14041,7 +14249,7 @@ enum : i32 {
     CHK_TERMTABS,     // the shown root's tab labels, '|' between, '*' front
     CHK_TERMKID,      // a subagent is shown, with its root's tabs
     CHK_TERMCLOSE,    // the quit dialog counted dx busy terminal tabs
-    CHK_TERMHOME,     // the terminal docked under the prompt, as placed
+    CHK_TERMHOME,     // the terminal in its home: beside Plan, with Prompt, or under it
     CHK_TERMHIST,     // its front tab keeps dx rows of history
     CHK_TERMVIEW,     // scrolled back into history (dx 1), or not (0)
     CHK_TERMSEL,      // the front tab's selection is the text
@@ -14069,7 +14277,8 @@ enum : i32 {
                       // with a horizontal scrollbar, "nohbar" without
     CHK_FILETABS,     // the shown root's file tab labels, '|' between, '*' front
     CHK_FILEMODE,     // the front file is drawn in mode dx (FMODE_*)
-    CHK_FILENOTE,     // the pane's notes have text, or none for ""
+    CHK_FILENOTE,     // the pane's notes have text, or none for ""; or
+                      // with dx 1, they do not have text
     CHK_FILEASKERR,   // Open file is up, saying text
     CHK_FILESHOWN,    // Files is hidden (dx 0), shown (1), or shown central (2)
     CHK_FILEBODIES,   // the bodies fit the budget, dx files read at least
@@ -14096,6 +14305,14 @@ enum : i32 {
                       // with text "fit" fit to its room, else "unfit" at
                       // its own size
     CHK_OUTCLOSED,    // the Output window is closed
+    CHK_FILEFIND,     // the Files find bar is not drawn (dx 0), in find mode
+                      // with its field active (1) or not (2), its count
+                      // ending with text; or Find in file's why is text (4);
+                      // or in line mode (3), its column ending with text
+    CHK_FILESPOT,     // the Files text's line dx, column dy is in view, below
+                      // the bar, with text "hit" the current match's start,
+                      // and "carry" a hit also drawn carried into a chunk
+    CHK_CONTINUED,    // a turn began by Continue, with its note, not paused
     CHK_COUNT,
 };
 
@@ -14323,7 +14540,7 @@ static Str chknames[] = {
     "the window opened at its first size, maximized on a small display",
     "a first run's Help floats centered in front, its tab selected",
     "the layout is as built: its panes' places and shares, Jobs selected",
-    "the Compact layout is as built: two columns, Plan with Transcript, Terminal under Prompt",
+    "the Compact layout is as built: two columns, Plan with Transcript, Terminal a tab behind Prompt",
     "the Focus layout is as built: one session, four panes",
     "the layout saved is back as it was saved",
     "Help shows the topic picked, its page from the top",
@@ -14372,7 +14589,7 @@ static Str chknames[] = {
     "the folder can have a worktree, its changes counted",
     "the session works in its worktree, on its branch",
     "the worktree session starts fresh, under its original",
-    "the remote is thin", "its calls go via this computer",
+    "the remote is thin", "its skill is as expected", "its calls go via this computer",
     "the settings' search field has the keyboard",
     "the container is as expected",
     "the '@' picker listed the rows it should",
@@ -14385,7 +14602,7 @@ static Str chknames[] = {
     "that many terminals are open", "the terminal tabs are as said",
     "a subagent shows its root's terminal tabs",
     "the quit dialog counts the busy terminal tabs",
-    "the terminal is in its home under the prompt",
+    "the terminal is in its home: beside Plan, a tab with the prompt, or under it",
     "the terminal keeps as much history as configured",
     "the terminal's view is scrolled back, or at the bottom, as said",
     "the terminal's selection is as said",
@@ -14416,6 +14633,9 @@ static Str chknames[] = {
     "inline code is a link once its file is found, and only then",
     "the image file is shown at its size, fit or not as said",
     "the Output window is closed",
+    "the Files find bar is as said",
+    "the spot in the file is in view",
+    "a turn began by Continue, and nothing is paused",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -14497,6 +14717,7 @@ enum : i32 {
     W_WORKTREE,   // the session shown is on a branch starting with text
     W_THIN,       // the remote r is up and thin
     W_VIA,        // the session shown streams, relayed
+    W_THINSKILL,  // its skill gnotes is as text says (thinskill)
     W_CTR,        // the container runtime, or the first container, is as
                   // text says (ctrwait)
     W_TERM,       // the shown session's terminal shows text
@@ -14504,6 +14725,9 @@ enum : i32 {
     W_TERMCOUNT,  // dx terminals are open, in every session
     W_FILEREADY,  // the front file is read and drawn, jumped or restored
     W_FILEFRESH,  // and checked since its last mark, nothing in flight
+    W_FILEFOUND,  // the Files find bar drew over the front file, searched
+                  // it, and brought the match it went to into view
+    W_PAUSED,     // the session shown waits, paused, before a request
 };
 
 static Str waitnames[] = {
@@ -14528,11 +14752,11 @@ static Str waitnames[] = {
     "the endpoint's ChatGPT state", "the ChatGPT sign-in",
     "the subagent on far", "the subagent on far shown", "a toast",
     "the changes", "the folder's probe", "the worktree's branch",
-    "the thin remote", "a relayed stream", "the container",
+    "the thin remote", "a relayed stream", "the thin remote's skill", "the container",
     "the terminal's text", "the terminal's program", "the terminals' count",
-    "the file", "the file checked",
+    "the file", "the file checked", "the file's find", "the pause",
 };
-static_assert(countof(waitnames) == W_FILEFRESH+1);
+static_assert(countof(waitnames) == W_PAUSED+1);
 
 enum : i32 {
     KEY_CTRL  = 1,
@@ -14561,6 +14785,28 @@ struct DriveOp {
     {OP_KEYDOWN, 0, key, KEY_CMD, 50, ""}, \
     {OP_KEYUP, 0, key, KEY_CMD, 50, ""}, \
     {OP_KEYUP, 0, GKEY_CMD, 0, ms, ""}
+// And with Shift too
+#define CMDSHIFTKEY(key, ms) \
+    {OP_KEYDOWN, 0, GKEY_CMD, KEY_CMD, 50, ""}, \
+    {OP_KEYDOWN, 0, GKEY_SHIFT, KEY_CMD|KEY_SHIFT, 50, ""}, \
+    {OP_KEYDOWN, 0, key, KEY_CMD|KEY_SHIFT, 50, ""}, \
+    {OP_KEYUP, 0, key, KEY_CMD|KEY_SHIFT, 50, ""}, \
+    {OP_KEYUP, 0, GKEY_SHIFT, KEY_CMD, 50, ""}, \
+    {OP_KEYUP, 0, GKEY_CMD, 0, ms, ""}
+// Physical Ctrl and a key, pressed and let go
+#define CTRLKEY(key, ms) \
+    {OP_KEYDOWN, 0, GKEY_CTRL, KEY_CTRL, 50, ""}, \
+    {OP_KEYDOWN, 0, key, KEY_CTRL, 50, ""}, \
+    {OP_KEYUP, 0, key, KEY_CTRL, 50, ""}, \
+    {OP_KEYUP, 0, GKEY_CTRL, 0, ms, ""}
+// Physical Ctrl+Shift and a key
+#define CTRLSHIFTKEY(key, ms) \
+    {OP_KEYDOWN, 0, GKEY_CTRL, KEY_CTRL, 50, ""}, \
+    {OP_KEYDOWN, 0, GKEY_SHIFT, KEY_CTRL|KEY_SHIFT, 50, ""}, \
+    {OP_KEYDOWN, 0, key, KEY_CTRL|KEY_SHIFT, 50, ""}, \
+    {OP_KEYUP, 0, key, KEY_CTRL|KEY_SHIFT, 50, ""}, \
+    {OP_KEYUP, 0, GKEY_SHIFT, KEY_CTRL, 50, ""}, \
+    {OP_KEYUP, 0, GKEY_CTRL, 0, ms, ""}
 
 // Files on a session's host, through its engine (fs.read and fs.stat):
 // Open file there, its folder typed by op (OP_TEXTRCWD, or OP_TEXT of
@@ -14827,6 +15073,7 @@ static DriveOp driveops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 800, ""},
     {OP_CHECK, CHK_COPIED, 0, 0, 0, ""},
+    {OP_CLIPOWN, 0, 1, 0, 0, ""},
     // Idle: no frames at all once the probe has run
     {OP_MARK, 0, 0, 0, 3000, ""},
     {OP_IDLE, 0, 0, 0, 0, "idle 3 s"},
@@ -15240,14 +15487,16 @@ static DriveOp m3ops[] = {
     {OP_CHECK, CHK_STRIPFIT, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "1-etacramped"},
     {OP_WAIT, W_IDLE, 0, 0, 20000, ""},
-    {OP_MAXIMIZE, 0, 1, 0, 1500, ""},
+    // Maximized, not filling the display: no platform skips a maximize,
+    // while filling is skipped where there is no such thing (Windows,
+    // Wayland), and that skip takes the next op, this prompt, with it
+    {OP_MAXIMIZE, 0, 0, 0, 1500, ""},
     {OP_PROMPT, 0, 0, 0, 100, "Read a long prompt."},
     {OP_WAIT, W_STRIPFULL, 0, 0, 10000, ""},
     {OP_CHECK, CHK_ETASHOWN, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "1-eta"},
     {OP_WAIT, W_IDLE, 0, 0, 20000, ""},
     {OP_CHECK, CHK_WORKED, 0, 0, 0, ""},  // that turn's, a few seconds
-    {OP_MAXIMIZE, 0, 0, 0, 1500, ""},
     // When that message was sent, shown under the mouse
     {OP_MOVE, T_USERMSG, 0, 0, 300, ""},
     {OP_CHECK, CHK_CLOCKSHOWN, 0, 0, 0, ""},
@@ -15427,6 +15676,13 @@ static DriveOp m3ops[] = {
     {OP_CHECK, CHK_FOUNDNEXT, 0, 0, 0, ""},
     {OP_KEYDOWN, 0, GKEY_ENTER, KEY_SHIFT, 50, ""},
     {OP_KEYUP, 0, GKEY_ENTER, KEY_SHIFT, 600, ""},
+    {OP_CHECK, CHK_FOUNDPREV, 0, 0, 0, ""},
+    // and F3 and Shift+F3 too
+    {OP_KEYDOWN, 0, GKEY_F3, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_F3, 0, 600, ""},
+    {OP_CHECK, CHK_FOUNDNEXT, 0, 0, 0, ""},
+    {OP_KEYDOWN, 0, GKEY_F3, KEY_SHIFT, 50, ""},
+    {OP_KEYUP, 0, GKEY_F3, KEY_SHIFT, 600, ""},
     {OP_CHECK, CHK_FOUNDPREV, 0, 0, 0, ""},
     {OP_MOVE, T_EMPTY, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -16343,6 +16599,140 @@ static DriveOp m3ops[] = {
     {OP_MOVE, T_FILETEXT, 0, 0, 100, "257"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
+    // Find in the file (Ctrl/Cmd+F while Files has the focus): whitespace
+    // as one space, across lines and a chunk's end, marked, nothing
+    // scrolled for a match in view; then from the top line down, the
+    // view going to the match
+    CMDKEY(GKEY_F, 300),
+    {OP_CHECK, CHK_FILEFIND, 1, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 300, "line 255  line 257 "},
+    {OP_WAIT, W_FILEFOUND, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEFIND, 1, 0, 0, "1 of 1"},
+    {OP_CHECK, CHK_FILESPOT, 255, 1, 0, "carry"},
+    {OP_SHOT, 0, 0, 0, 300, "files-find"},
+    CMDKEY(GKEY_A, 100),
+    {OP_TEXT, 0, 0, 0, 300, "line 12"},
+    {OP_WAIT, W_FILEFOUND, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEFIND, 1, 0, 0, "12 of 109"},
+    {OP_CHECK, CHK_FILESPOT, 1200, 1, 0, "hit"},
+    // Stepping: Enter and Shift+Enter in the field, its arrows, and
+    // Ctrl/Cmd(+Shift)+G in the bar, F3 and Shift+F3 in Files
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 600, ""},
+    {OP_CHECK, CHK_FILEFIND, 1, 0, 0, "13 of 109"},
+    {OP_CHECK, CHK_FILESPOT, 1201, 1, 0, "hit"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, KEY_SHIFT, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, KEY_SHIFT, 600, ""},
+    {OP_CHECK, CHK_FILEFIND, 1, 0, 0, "12 of 109"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file find previous"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 600, ""},
+    {OP_CHECK, CHK_FILEFIND, 2, 0, 0, "11 of 109"},
+    {OP_CHECK, CHK_FILESPOT, 129, 1, 0, "hit"},
+    CMDKEY(GKEY_G, 600),
+    {OP_CHECK, CHK_FILEFIND, 2, 0, 0, "12 of 109"},
+    CMDSHIFTKEY(GKEY_G, 600),
+    {OP_CHECK, CHK_FILEFIND, 2, 0, 0, "11 of 109"},
+    {OP_KEYDOWN, 0, GKEY_F3, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_F3, 0, 600, ""},
+    {OP_CHECK, CHK_FILEFIND, 2, 0, 0, "12 of 109"},
+    {OP_KEYDOWN, 0, GKEY_F3, KEY_SHIFT, 50, ""},
+    {OP_KEYUP, 0, GKEY_F3, KEY_SHIFT, 600, ""},
+    {OP_CHECK, CHK_FILEFIND, 2, 0, 0, "11 of 109"},
+    // Esc closes it; Edit, Find in file opens it again as it was; and
+    // with no match, Esc from the text closes it
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_CHECK, CHK_FILEFIND, 0, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "menu Edit"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Find in file..."},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 600, ""},
+    {OP_CHECK, CHK_FILEFIND, 1, 0, 0, "11 of 109"},
+    {OP_TEXT, 0, 0, 0, 300, "zzz"},
+    {OP_WAIT, W_FILEFOUND, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEFIND, 1, 0, 0, "No matches"},
+    {OP_MOVE, T_FILETEXT, 0, 0, 100, "129"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_FILEFIND, 2, 0, 0, "No matches"},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_CHECK, CHK_FILEFIND, 0, 0, 0, ""},
+    // Go to line (Ctrl+G while Files has the focus, physical Ctrl on
+    // macOS): lines banded and centered, as a link's are
+    CTRLKEY(GKEY_G, 300),
+    {OP_CHECK, CHK_FILEFIND, 3, 0, 0, "of 3000"},
+    {OP_TEXT, 0, 0, 0, 300, "1500-1504"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEFIND, 0, 0, 0, ""},
+    {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "1500-1504"},
+    {OP_CHECK, CHK_FILELINE, 1500, 1504, 0, "centered"},
+    {OP_SHOT, 0, 0, 0, 300, "files-goto"},
+    // Not a line: it says so, and Esc leaves
+    CTRLKEY(GKEY_G, 300),
+    {OP_TEXT, 0, 0, 0, 300, "abc"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_CHECK, CHK_FILEFIND, 3, 0, 0, "Not a line"},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_CHECK, CHK_FILEFIND, 0, 0, 0, ""},
+    // From the text while finding: a line and column, then back to the
+    // find bar
+    CMDKEY(GKEY_F, 300),
+    {OP_MOVE, T_FILETEXT, 0, 0, 100, "1500"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    CTRLKEY(GKEY_G, 300),
+    {OP_CHECK, CHK_FILEFIND, 3, 0, 0, "of 3000"},
+    {OP_TEXT, 0, 0, 0, 300, "100:3"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEFIND, 2, 0, 0, ""},
+    {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "100-100"},
+    {OP_CHECK, CHK_FILELINE, 100, 0, 0, "centered"},
+    {OP_CHECK, CHK_FILESPOT, 100, 3, 0, ""},
+    #if defined(__APPLE__)
+    // On macOS physical Ctrl+G goes to a line from the find field too,
+    // where Cmd+G is the next match (elsewhere Ctrl+G is, checked above)
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file find field"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_FILEFIND, 1, 0, 0, ""},
+    CTRLKEY(GKEY_G, 300),
+    {OP_CHECK, CHK_FILEFIND, 3, 0, 0, "of 3000"},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_CHECK, CHK_FILEFIND, 2, 0, 0, ""},
+    #endif
+    // Edit, Go to line...; Esc back to the find bar, then closing it
+    {OP_MOVE, T_NAMED, 0, 0, 100, "menu Edit"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Go to line..."},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 600, ""},
+    {OP_CHECK, CHK_FILEFIND, 3, 0, 0, "of 3000"},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_CHECK, CHK_FILEFIND, 2, 0, 0, ""},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_CHECK, CHK_FILEFIND, 0, 0, 0, ""},
+    // Past the end: the last line, with the note
+    CTRLKEY(GKEY_G, 300),
+    {OP_TEXT, 0, 0, 0, 300, "5000"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILENOTE, 0, 0, 0, "The file has only 3000 lines."},
+    {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "3000-3000"},
     // Past the end: a note, and the last line
     {OP_OPENFILE, 0, 0, 0, 300, "files/lines.txt:5000"},
     {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
@@ -16376,6 +16766,57 @@ static DriveOp m3ops[] = {
     {OP_MOVE, T_NAMED, 0, 0, 100, "file wrap"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 800, ""},
+    // Found in a wrapped line, none below the top: from the start, and
+    // wrapping around; unwrapped, scrolled sideways to the match
+    CMDKEY(GKEY_F, 300),
+    CMDKEY(GKEY_A, 100),
+    {OP_TEXT, 0, 0, 0, 300, "abcdefghi"},
+    {OP_WAIT, W_FILEFOUND, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEFIND, 1, 0, 0, "1 of 40"},
+    {OP_CHECK, CHK_FILESPOT, 100, 6, 0, "hit"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, KEY_SHIFT, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, KEY_SHIFT, 600, ""},
+    {OP_CHECK, CHK_FILEFIND, 1, 0, 0, "40 of 40"},
+    {OP_CHECK, CHK_FILESPOT, 100, 396, 0, "hit"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file wrap"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file find field"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 600, ""},
+    {OP_CHECK, CHK_FILESPOT, 100, 6, 0, "hit"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, KEY_SHIFT, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, KEY_SHIFT, 600, ""},
+    {OP_CHECK, CHK_FILESPOT, 100, 396, 0, "hit"},
+    {OP_SHOT, 0, 0, 0, 300, "files-find-x"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file wrap"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_CHECK, CHK_FILEFIND, 0, 0, 0, ""},
+    // Go to a line and column: unwrapped, scrolled sideways to it;
+    // wrapped, its row in view
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file wrap"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    CTRLKEY(GKEY_G, 300),
+    {OP_TEXT, 0, 0, 0, 300, "100:380"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILESPOT, 100, 380, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file wrap"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    CTRLKEY(GKEY_G, 300),
+    {OP_TEXT, 0, 0, 0, 300, "100:380"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILESPOT, 100, 380, 0, ""},
     // Two files of one name, told apart by their folders
     {OP_OPENFILE, 0, 0, 0, 300, "files/a/x.c"},
     {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
@@ -16401,6 +16842,42 @@ static DriveOp m3ops[] = {
     {OP_OPENFILE, 0, 0, 0, 300, "files/notes.md#notes"},
     {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
     {OP_CHECK, CHK_FILEMODE, FMODE_MARKDOWN, 0, 500, ""},
+    // Markdown is searched as it shows, a link's target not, but as text
+    // it is; the bar stays open across the modes
+    CMDKEY(GKEY_F, 300),
+    CMDKEY(GKEY_A, 100),
+    {OP_TEXT, 0, 0, 0, 300, "lines.txt"},
+    {OP_WAIT, W_FILEFOUND, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEFIND, 1, 0, 0, "No matches"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file markdown"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_FILEFOUND, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEFIND, 2, 0, 0, "1 of 1"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file markdown"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_FILEFOUND, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEFIND, 2, 0, 0, "No matches"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file find field"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    CMDKEY(GKEY_A, 100),
+    {OP_TEXT, 0, 0, 0, 300, "the lines"},
+    {OP_WAIT, W_FILEFOUND, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEFIND, 1, 0, 0, "1 of 1"},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_CHECK, CHK_FILEFIND, 0, 0, 0, ""},
+    // Go to line from Markdown shows the text there
+    CTRLKEY(GKEY_G, 300),
+    {OP_CHECK, CHK_FILEFIND, 3, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 300, "5"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEMODE, FMODE_TEXT, 0, 0, ""},
+    {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "5-5"},
     // CRLF and a byte order mark: neither shown nor copied
     {OP_OPENFILE, 0, 0, 0, 300, "files/crlf.txt"},
     {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
@@ -16422,16 +16899,43 @@ static DriveOp m3ops[] = {
     {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
     {OP_CHECK, CHK_FILENOTE, 0, 0, 0, "This is a binary file (14 bytes)."},
     {OP_SHOT, 0, 0, 0, 300, "files-binary"},
+    CMDKEY(GKEY_F, 300),
+    {OP_CHECK, CHK_FILEFIND, 0, 0, 0, ""},
+    {OP_CHECK, CHK_FINDCLOSED, 0, 0, 0, ""},
+    {OP_CHECK, CHK_FILEFIND, 4, 0, 0, "The file shown has no text"},
     {OP_MOVE, T_NAMED, 0, 0, 100, "file astext"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 500, ""},
     {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
     {OP_CHECK, CHK_FILENOTE, 0, 0, 0, ""},
     {OP_CHECK, CHK_FILEMODE, FMODE_TEXT, 0, 0, ""},
-    // Past FILES_LINES, cut
+    CMDKEY(GKEY_F, 300),
+    {OP_CHECK, CHK_FILEFIND, 1, 0, 0, ""},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_CHECK, CHK_FILEFIND, 0, 0, 0, ""},
+    // Past FILES_LINES, cut, and found to its end
     {OP_OPENFILE, 0, 0, 0, 300, "files/huge.txt"},
     {OP_WAIT, W_FILEREADY, 0, 0, 10000, ""},
     {OP_CHECK, CHK_FILENOTE, 0, 0, 0, "Only its first 100000 lines are shown."},
+    CMDKEY(GKEY_F, 300),
+    CMDKEY(GKEY_A, 100),
+    {OP_TEXT, 0, 0, 0, 300, "huge 99999"},
+    {OP_WAIT, W_FILEFOUND, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_FILEFIND, 1, 0, 0, "1 of 1"},
+    {OP_CHECK, CHK_FILESPOT, 99999, 1, 0, "hit"},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_CHECK, CHK_FILEFIND, 0, 0, 0, ""},
+    // Gone to past the lines shown: the last, with only the cut's note
+    CTRLKEY(GKEY_G, 300),
+    {OP_TEXT, 0, 0, 0, 300, "100050"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_FILENOTE, 0, 0, 0, "Only its first 100000 lines are shown."},
+    {OP_CHECK, CHK_FILENOTE, 1, 0, 0, "has only"},
+    {OP_CHECK, CHK_FILELINE, 100000, 0, 0, ""},
     // A ninth file closes the tab opened least recently
     {OP_OPENFILE, 0, 0, 0, 300, "hello.txt"},
     {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
@@ -16487,6 +16991,24 @@ static DriveOp m3ops[] = {
     {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
     {OP_CHECK, CHK_FILETABS, 0, 0, 0,
      "long.txt|a/x.c|b/x.c|notes.md|crlf.txt|blob.bin|huge.txt|*hello.txt"},
+    // So does Ctrl/Cmd+F find in the file, not the transcript
+    {OP_MOVE, T_FILETEXT, 0, 0, 100, "1"},
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    CMDKEY(GKEY_F, 500),
+    {OP_CHECK, CHK_FILEFIND, 1, 0, 0, ""},
+    {OP_CHECK, CHK_FINDCLOSED, 0, 0, 0, ""},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_CHECK, CHK_FILEFIND, 0, 0, 0, ""},
+    // A middle click closes the one tab under the pointer: ImGui closes
+    // it on the press, and the release, over the tab slid into its place,
+    // closes nothing (#51)
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file tab 1"},
+    {OP_MDOWN, 0, 0, 0, 60, ""},
+    {OP_MUP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_FILETABS, 0, 0, 0,
+     "a/x.c|b/x.c|notes.md|crlf.txt|blob.bin|huge.txt|*hello.txt"},
     // The second layout, Compact, keeps Files shown; Focus hides it, and
     // a file opened shows it in the center
     {OP_MOVE, T_TRANSCRIPT, 0, 0, 100, ""},
@@ -16675,21 +17197,52 @@ static DriveOp m3ops[] = {
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_CHECK, CHK_EDITJUMP, 2, 0, 0, " +1200 '"},
     {OP_CHECK, CHK_EDITJUMP, 2, 0, 0, "/files/lines.txt'"},
+    // and at the current match, found
+    CMDKEY(GKEY_F, 300),
+    CMDKEY(GKEY_A, 100),
+    {OP_TEXT, 0, 0, 0, 300, "line 1205"},
+    {OP_WAIT, W_FILEFOUND, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEFIND, 1, 0, 0, "1 of 1"},
+    {OP_IFEDITOR, 0, 4, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "file editor"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_EDITJUMP, 3, 0, 0, " +1205 '"},
+    // The bar left open over what the edit changes: searched again
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file find field"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    CMDKEY(GKEY_A, 100),
+    {OP_TEXT, 0, 0, 0, 300, "edited"},
+    {OP_WAIT, W_FILEFOUND, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEFIND, 1, 0, 0, "No matches"},
+    {OP_MOVE, T_FILETEXT, 0, 0, 100, "1200"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
     {OP_PROMPT, 0, 0, 0, 1500, "Edit the lines."},
     {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
     {OP_WAIT, W_FILEFRESH, 0, 0, 5000, ""},
     {OP_CHECK, CHK_FILETEXT, 0, 0, 0, "edited 1\n"},
     {OP_CHECK, CHK_FILELINE, 0, 0, 0, "kept"},
+    {OP_WAIT, W_FILEFOUND, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEFIND, 2, 0, 0, "1 of 1"},
     {OP_SHOT, 0, 0, 0, 300, "files-reloaded"},
     // Deleted, it says so; put back, a mark reads it again
     {OP_PROMPT, 0, 0, 0, 1500, "Remove the lines."},
     {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
     {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
     {OP_CHECK, CHK_FILENOTE, 0, 0, 0, "No such file"},
+    {OP_CHECK, CHK_FILEFIND, 0, 0, 0, ""},
     {OP_PROMPT, 0, 0, 0, 1500, "Restore the lines."},
     {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
     {OP_WAIT, W_FILEFRESH, 0, 0, 5000, ""},
     {OP_CHECK, CHK_FILETEXT, 0, 0, 0, "restored 1\n"},
+    {OP_WAIT, W_FILEFOUND, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEFIND, 2, 0, 0, "No matches"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file find close"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_FILEFIND, 0, 0, 0, ""},
     // An image file shows as an image, fit to the pane, or at its own
     // size; a line to it just opens it; one it cannot decode says why
     {OP_OPENFILE, 0, 0, 0, 300, "files/pixels.png"},
@@ -16707,6 +17260,12 @@ static DriveOp m3ops[] = {
     {OP_OPENFILE, 0, 0, 0, 300, "files/pixels.png:5"},
     {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
     {OP_CHECK, CHK_FILEIMAGE, 40, 30, 0, "fit"},
+    CMDKEY(GKEY_F, 300),
+    {OP_CHECK, CHK_FILEFIND, 0, 0, 0, ""},
+    {OP_CHECK, CHK_FINDCLOSED, 0, 0, 0, ""},
+    {OP_CHECK, CHK_FILEFIND, 4, 0, 0, "The file shown has no text"},
+    CTRLKEY(GKEY_G, 300),
+    {OP_CHECK, CHK_FILEFIND, 0, 0, 0, ""},
     {OP_OPENFILE, 0, 0, 0, 300, "files/corrupt.png"},
     {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
     {OP_CHECK, CHK_FILENOTE, 0, 0, 0, "Not an image it can show: "},
@@ -16731,7 +17290,19 @@ static DriveOp m3ops[] = {
     {OP_CHECK, CHK_FILEPATH, 0, 0, 0, "/files/dropped2.txt"},
     {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "4-4"},
     {OP_CHECK, CHK_ATTACHED, 0, 0, 0, ""},
-    // Quiet with a file shown, past the tooltips and the layout's save
+    // Quiet with a file shown, its find bar open, its field let go, past
+    // the tooltips and the layout's save
+    {OP_MOVE, T_FILETEXT, 0, 0, 100, "1"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    CMDKEY(GKEY_F, 300),
+    {OP_TEXT, 0, 0, 0, 300, "line"},
+    {OP_WAIT, W_FILEFOUND, 0, 0, 5000, ""},
+    // line 4, since the bar covers the first lines
+    {OP_MOVE, T_FILETEXT, 0, 0, 100, "4"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_FILEFIND, 2, 0, 0, ""},
     {OP_MOVE, T_EMPTY, 0, 0, 4500, ""},
     {OP_MARK, 0, 0, 0, 3000, ""},
     {OP_CHECK, CHK_FILEQUIET, 0, 0, 0, ""},
@@ -16753,6 +17324,7 @@ static DriveOp m3ops[] = {
     {OP_MINCLOSED, 0, 0, 0, 1000, ""},
     {OP_CHECK, CHK_CLOSEMODAL, 0, 0, 0, ""},
     {OP_CHECK, CHK_NOSTALE, 0, 0, 0, ""},
+    {OP_CLIPOWN, 0, 1, 0, 0, ""},
     {OP_SUMMARY, 0, 0, 0, 0, ""},
     {OP_MOVE, T_CLOSESTOP, 0, 0, 200, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -18024,20 +18596,6 @@ static DriveOp stopops[] = {
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
 
-// Physical Ctrl and a key, pressed and let go
-#define CTRLKEY(key, ms) \
-    {OP_KEYDOWN, 0, GKEY_CTRL, KEY_CTRL, 50, ""}, \
-    {OP_KEYDOWN, 0, key, KEY_CTRL, 50, ""}, \
-    {OP_KEYUP, 0, key, KEY_CTRL, 50, ""}, \
-    {OP_KEYUP, 0, GKEY_CTRL, 0, ms, ""}
-// Physical Ctrl+Shift and a key
-#define CTRLSHIFTKEY(key, ms) \
-    {OP_KEYDOWN, 0, GKEY_CTRL, KEY_CTRL, 50, ""}, \
-    {OP_KEYDOWN, 0, GKEY_SHIFT, KEY_CTRL|KEY_SHIFT, 50, ""}, \
-    {OP_KEYDOWN, 0, key, KEY_CTRL|KEY_SHIFT, 50, ""}, \
-    {OP_KEYUP, 0, key, KEY_CTRL|KEY_SHIFT, 50, ""}, \
-    {OP_KEYUP, 0, GKEY_SHIFT, KEY_CTRL, 50, ""}, \
-    {OP_KEYUP, 0, GKEY_CTRL, 0, ms, ""}
 // The terminal's copy and paste chords: Cmd on macOS, Ctrl on Windows
 // (Ctrl+C copying while there is a selection), else Ctrl+Shift
 #if defined(__APPLE__) || defined(_WIN32)
@@ -18613,6 +19171,7 @@ static DriveOp remoteops[] = {
     {OP_SHOT, 0, 0, 0, 300, "remote-5-closed"},
     {OP_CHECK, CHK_NOSTALE, 0, 0, 0, ""},
     {OP_SYSTHEME, 0, -1, 0, 300, ""},
+    {OP_CLIPOWN, 0, 1, 0, 0, ""},
     {OP_SUMMARY, 0, 0, 0, 0, ""},
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
@@ -18908,11 +19467,43 @@ static DriveOp ctrops[] = {
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
 
+static ViewMsg *lastof(View *, i32 role);
+
+// The shown session's skill gnotes, which this window's engine shares
+// with r (tests/gui.py): "listed", from this computer, the user's alone;
+// "used", its fetch done, and the prompt that invoked it shown as typed,
+// the instructions it sent naming r's copy, from this computer.
+static b32 thinskill(Gui *g, Str what)
+{
+    GuiSession *s = g->sess;
+    if (!s || !s->view || s->host->kind!=GH_REMOTE) {
+        return 0;
+    } else if (what == "listed") {
+        for (iz i = 0; i < s->skills.len; i++) {
+            if (s->skills[i].name == "gnotes") {
+                return s->skills[i].from==g->machine && s->skills[i].hidden;
+            }
+        }
+        return 0;
+    }
+    Arena    a    = g->frame;
+    View    *v    = s->view;
+    ViewMsg *u    = lastof(v, VIEW_USER);
+    ViewMsg *n    = lastof(v, VIEW_NOTE);
+    b32      copy = n && (find(n->text, "/skills/gnotes/")>=0 ||
+                          find(n->text, "\\skills\\gnotes\\")>=0);
+    return !s->fetchid && u && u->text=="/gnotes the args" && copy &&
+           n->label=="To the agent: skill gnotes" &&
+           find(n->text, concat(&a, "copy of one from ", g->machine))>=0;
+}
+
 // A thin remote (--thin, tests/gui.py --mode thin): r's configuration
 // has no endpoint, so once up it is offered this window's models, and the
 // Hosts pane says so; a session there streams via this computer, which
-// the session bar names; its stream's link dropped mid-turn, the call is
-// lost and the turn goes on once r is back.
+// the session bar names, and lists the user's skills here, one of which,
+// the user's alone, /gnotes invokes, r fetching a copy first; its
+// stream's link dropped mid-turn, the call is lost and the turn goes on
+// once r is back.
 static DriveOp thinops[] = {
     {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
     {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
@@ -18959,6 +19550,21 @@ static DriveOp thinops[] = {
     {OP_CHECK, CHK_VIA, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "thin-2-via"},
     {OP_WAIT, W_IDLE, 0, 0, 60000, ""},
+    // The user's own skill here, theirs alone: /gnotes, typed and sent,
+    // has r fetch its copy before the prompt that invokes it
+    {OP_WAIT, W_THINSKILL, 0, 0, 30000, "listed"},
+    {OP_CHECK, CHK_THINSKILL, 0, 0, 0, "listed"},
+    {OP_MOVE, T_PROMPT, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 200, ""},
+    {OP_TEXT, 0, 0, 0, 300, "/gnotes the args"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_THINSKILL, 0, 0, 60000, "used"},
+    {OP_WAIT, W_IDLE, 0, 0, 60000, ""},
+    {OP_MARK, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_THINSKILL, 0, 0, 0, "used"},
+    {OP_SHOT, 0, 0, 0, 300, "thin-3-skill"},
     // The link dropped mid-stream: r fails the call as lost, and the
     // turn goes on once r is back
     {OP_PROMPT, 0, 0, 0, 100, "Stream for the link."},
@@ -18969,7 +19575,7 @@ static DriveOp thinops[] = {
     {OP_WAIT, W_REMOTEUP, 0, 0, 60000, ""},
     {OP_WAIT, W_IDLE, 0, 0, 90000, ""},
     {OP_MARK, 0, 0, 0, 1000, ""},
-    {OP_SHOT, 0, 0, 0, 300, "thin-3-after"},
+    {OP_SHOT, 0, 0, 0, 300, "thin-4-after"},
     {OP_SUMMARY, 0, 0, 0, 0, ""},
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
@@ -19371,6 +19977,7 @@ static DriveOp planops[] = {
     {OP_CHECK, CHK_PLANMODE, 0, 0, 0, ""},
     {OP_CHECK, CHK_BYPASS, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "plan-9-build"},
+    {OP_CLIPOWN, 0, 1, 0, 0, ""},
     {OP_SUMMARY, 0, 0, 0, 0, ""},
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
@@ -19556,15 +20163,20 @@ static DriveOp termops[] = {
     {OP_WAIT, W_TERM, 0, 0, 5000, "\nkeyed"},
     {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "onetwo|*" TERMSH},
     // Each layout picked puts the terminal in its place, its tabs as they
-    // were, its size following: Compact under the prompt, as tall as it;
-    // Focus leaves it out, and Ctrl+` brings it back under the prompt;
-    // Standard beside Plan
+    // were, its size following: Compact as a tab behind the prompt, which
+    // Ctrl+` brings forward and goes back from, the tab staying; Focus
+    // leaves it out, and Ctrl+` brings it back under the prompt; Standard
+    // beside Plan
     LAYOUT("Compact"),
-    {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Terminal"},
-    {OP_CHECK, CHK_TERMHOME, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMHOME, 2, 0, 0, "Prompt"},
+    CTRLKEY(GKEY_GRAVE, 500),
+    {OP_CHECK, CHK_TERMHOME, 2, 0, 0, "Terminal"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
     {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "onetwo|*" TERMSH},
     {OP_CHECK, CHK_TERMSIZE, 0, 0, 1500, ""},
     {OP_SHOT, 0, 0, 0, 300, "terminal-compact"},
+    CTRLKEY(GKEY_GRAVE, 500),
+    {OP_CHECK, CHK_TERMHOME, 2, 0, 0, "Prompt"},
     LAYOUT("Focus"),
     {OP_CHECK, CHK_PANECLOSED, 0, 0, 0, "Terminal"},
     CTRLKEY(GKEY_GRAVE, 500),
@@ -19897,6 +20509,7 @@ static DriveOp termops[] = {
     {OP_TEXT, 0, 0, 0, 100, "echo $$ >shell.pid; trap 'echo hup >hup.txt; exit' HUP EXIT"},
     TERMKEY(GKEY_ENTER, 100),
     {OP_WAIT, W_TERM, 0, 0, 5000, "EXIT\ntty$"},  // set, at the next prompt
+    {OP_CLIPOWN, 0, 1, 0, 0, ""},
     {OP_SUMMARY, 0, 0, 0, 0, ""},
     {OP_CLOSE, 0, 0, 0, 0, ""},  // with nothing busy, it quits at once
 };
@@ -20828,6 +21441,24 @@ static DriveOp composeops[] = {
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
     {OP_MOVE, T_EMPTY, 0, 0, 600, ""},
     {OP_MENTIONS, 0, 1, 0, 300, ""},
+    // Pause mid-stream holds the turn, and Resume, in its place, goes
+    // on; after Stop, the Transcript's Continue goes on with no message
+    {OP_NEWSESSION, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_PROMPT, 0, 0, 0, 0, "Stream slowly for a while."},
+    {OP_WAIT, W_STREAMING, 0, 0, 10000, ""},
+    CLICK(T_NAMED, "pause", 300),
+    {OP_WAIT, W_PAUSED, 0, 0, 5000, ""},
+    {OP_SHOT, 0, 0, 0, 300, "compose-paused"},
+    CLICK(T_NAMED, "pause", 300),
+    {OP_WAIT, W_STREAMING, 0, 0, 10000, ""},
+    CLICK(T_NAMED, "stop", 300),
+    {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
+    {OP_WAIT, W_NAMED, 0, 0, 5000, "continue"},
+    {OP_SHOT, 0, 0, 0, 300, "compose-continue"},
+    CLICK(T_NAMED, "continue", 300),
+    {OP_WAIT, W_TURNS, 2, 0, 20000, ""},
+    {OP_CHECK, CHK_CONTINUED, 0, 0, 0, ""},
     // C: enough of a conversation for /compact, with a focus
     {OP_NEWSESSION, 0, 0, 0, 0, ""},
     {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
@@ -20853,6 +21484,7 @@ static DriveOp composeops[] = {
     {OP_CHECK, CHK_MAXIMIZED, 1, 0, 0, ""},
     {OP_MAXIMIZE, 0, 0, 0, 1500, ""},
     {OP_CHECK, CHK_MAXIMIZED, 0, 0, 0, ""},
+    {OP_CLIPOWN, 0, 1, 0, 0, ""},
     {OP_SUMMARY, 0, 0, 0, 0, ""},
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
@@ -21438,23 +22070,23 @@ static b32 layoutbackcheck(Gui *g, Str name)
 }
 
 // The Compact layout, as applied: Standard's left column at its width,
-// over the jobs; the center with Plan and the extras as tabs; no right.
+// over the jobs; the center with Plan and the extras as tabs, over
+// Prompt with Terminal a tab behind it, its tab bar shown; no right.
 static b32 compactcheck(Gui *g)
 {
     ImGuiDockNode *root = ImGui::DockBuilderGetNode(g->dockspace);
     ImGuiDockNode *left = root ? root->ChildNodes[0] : 0;
     ImGuiDockNode *center = root ? root->ChildNodes[1] : 0;
     ImGuiDockNode *top = center ? center->ChildNodes[0] : 0;
-    ImGuiDockNode *foot = center ? center->ChildNodes[1] : 0;  // Prompt over Terminal
-    if (!left || !top || !foot || !foot->ChildNodes[0] || !foot->ChildNodes[1]) {
+    ImGuiDockNode *foot = center ? center->ChildNodes[1] : 0;  // Prompt and Terminal
+    if (!left || !top || !foot || !foot->IsLeafNode()) {
         guilog(g, "drive: the dock space is not split in two columns");
         return 0;
     }
     if (!dockshare(root, ImGuiAxis_X, 0, dockcapped(LAYOUT_LEFT*(1-LAYOUT_RIGHT),
                                                     LAYOUT_LEFTMAX, root->Size.x, g->scale)) ||
         !dockshare(left, ImGuiAxis_Y, 1, LAYOUT_TODO) ||
-        !dockshare(center, ImGuiAxis_Y, 1, 2*LAYOUT_PROMPT) ||
-        !dockshare(foot, ImGuiAxis_Y, 0, 0.5f)) {
+        !dockshare(center, ImGuiAxis_Y, 1, LAYOUT_PROMPT)) {
         guilog(g, "drive: the compact layout's splits are not in their shares");
         return 0;
     }
@@ -21470,14 +22102,14 @@ static b32 compactcheck(Gui *g)
         {PANE_HELP,       top},
         {PANE_SETTINGS,   top},
         {PANE_HOSTS,      top},
-        {PANE_PROMPT,     foot->ChildNodes[0]},
-        {PANE_TERMINAL,   foot->ChildNodes[1]},
+        {PANE_PROMPT,     foot},
+        {PANE_TERMINAL,   foot},
     };
     return dockplacescheck(g, places, countof(places)) &&
            top->IsCentralNode() && tabselected("Todo") &&
            tabselected("Transcript") && g->panes[PANE_JOBS] &&
            g->panes[PANE_PLAN] && !g->panes[PANE_LOG] && g->panes[PANE_TERMINAL] &&
-           foot->ChildNodes[0]->IsHiddenTabBar();
+           tabselected("Prompt") && !foot->IsHiddenTabBar();
 }
 
 // The Focus layout, as applied: Transcript, Todo and Plan as tabs in
@@ -21949,7 +22581,8 @@ static b32 drivefilecheck(Gui *g, i32 chk)
         Str notes = {g->fnotes, g->fnoteslen};
         print(&b, "drive: the file's notes: ");
         print(&b, notes);
-        ok = g->filesdrawn && (op->text.len ? find(notes, op->text)>=0 : !notes.len);
+        ok = g->filesdrawn && (op->dx==1   ? find(notes, op->text)<0  :
+                               op->text.len ? find(notes, op->text)>=0 : !notes.len);
     } break;
     case CHK_FILEASKERR:
         print(&b, "drive: Open file says ");
@@ -22114,6 +22747,71 @@ static b32 drivefilecheck(Gui *g, i32 chk)
         print(&b, g->revealed);
         ok = g->revealed.len && driveendsep(g->revealed, op->text);
         break;
+    case CHK_FILEFIND: {
+        FileFindBar *fb    = &g->ffind;
+        Str          count = {fb->shown, fb->shownlen};
+        i32          dx    = (i32)op->dx;
+        print(&b, "drive: the Files find bar is ");
+        print(&b, !fb->drawn ? Str("not drawn") : fb->active ? Str("active, ")
+                                                             : Str("inactive, "));
+        print(&b, fb->drawn && fb->mode==FBAR_LINE ? Str("in line mode, ") : Str(""));
+        print(&b, fb->drawn ? count : Str(""));
+        if (dx == 4) {
+            Str why = filefindwhy(g);
+            print(&b, "; Find in file's why: ");
+            print(&b, why);
+            ok = why == op->text;
+        } else if (dx == 0) {
+            ok = !fb->drawn;
+        } else if (dx == 3) {
+            ok = fb->drawn && fb->open && fb->mode==FBAR_LINE &&
+                 count.len>=op->text.len && cuthead(count, count.len-op->text.len)==op->text;
+        } else {
+            ok = fb->drawn && fb->open && fb->mode==FBAR_FIND && fb->active==(dx==1) &&
+                 count.len>=op->text.len && cuthead(count, count.len-op->text.len)==op->text;
+        }
+    } break;
+    case CHK_FILESPOT: {
+        // Its row's top below the bar, its foot above the view's, and
+        // unwrapped its x within the text shown
+        i32    line = (i32)op->dx;
+        i32    col  = (i32)op->dy;
+        f32    h    = 0;
+        ImVec2 p    = filespotat(g, line, col, &h);
+        f32    top  = fs->wpos.y + g->ffind.barh;
+        f32    bot  = fs->wpos.y + fs->winh;
+        f32    left = fs->wpos.x + fs->pad + fs->gutter;
+        f32    rgt  = fs->wpos.x + fs->winw;
+        ok = fs->v && p.y>=top && p.y+h<=bot && p.x>=left && p.x<=rgt;
+        print(&b, "drive: line ");
+        print(&b, (i64)line);
+        print(&b, ", column ");
+        print(&b, (i64)col);
+        print(&b, " at ");
+        print(&b, (i64)(p.x - left));
+        print(&b, ", ");
+        print(&b, (i64)(p.y - fs->wpos.y));
+        print(&b, " in a view ");
+        print(&b, (i64)(rgt - left));
+        print(&b, " by ");
+        print(&b, (i64)fs->winh);
+        print(&b, ", the bar ");
+        print(&b, (i64)g->ffind.barh);
+        print(&b, " tall");
+        if (find(op->text, "hit") >= 0) {
+            i32 hl = 0, hc = 0;
+            b32 at = filefindcur(g, ft, &hl, &hc);
+            print(&b, "; the current match at ");
+            print(&b, (i64)hl);
+            putbyte(&b, ':');
+            print(&b, (i64)hc);
+            ok &= at && hl==line && hc==col;
+        }
+        if (find(op->text, "carry") >= 0) {
+            print(&b, fs->carried ? Str("; a hit drawn carried") : Str("; none carried"));
+            ok &= fs->carried;
+        }
+    } break;
     case CHK_FILETOP: {
         // A heading scrolled to may sit a line below the top, past the pad
         i32 top = ft ? ft->top+1 : 0;
@@ -22138,6 +22836,8 @@ static b32 drivewaitdone(Gui *g)
         return g->img.view.state==IMG_READY || g->img.view.state==IMG_FAILED;
     case W_STREAMING:
         return g->sess && v->state==LIVE_STREAMING && v->deltas>0;
+    case W_PAUSED:
+        return g->sess && v->busy && v->paused && v->state==LIVE_PAUSED;
     case W_THINKING:
         return g->sess && thinking(v) && (v->thinking==THINK_HIDE || g->thinkcount>0);
     case W_THINKSTALL:
@@ -22281,6 +22981,8 @@ static b32 drivewaitdone(Gui *g)
     }
     case W_CTR:
         return ctrwait(g, g->ops[g->drivepc-1].text);
+    case W_THINSKILL:
+        return thinskill(g, g->ops[g->drivepc-1].text);
     case W_TERM: {
         Arena a = g->frame;
         return find(termscreen(g, &a), g->ops[g->drivepc-1].text) >= 0;
@@ -22299,6 +23001,12 @@ static b32 drivewaitdone(Gui *g)
         FileWatch *w  = ft ? &ft->watch : 0;
         return drivefileready(g) && ft->body && !w->stale && !w->force && !w->id &&
                g->ffetch.ft!=ft;
+    }
+    case W_FILEFOUND: {
+        FileTab     *ft = filefront(g);
+        FileFindBar *fb = &g->ffind;
+        return ft && fb->drawn && fb->done && fb->body==ft->body && fb->bmode==ft->mode &&
+               !fb->reveal;  // and the match it went to in view
     }
     case W_VIA:
         return g->sess && v->state==LIVE_STREAMING && v->relaylen>0 && v->deltas>0;
@@ -22545,14 +23253,54 @@ static b32 pathendswith(Str path, Str tail)
 static Gui  *clipgui;
 static void (*clipset)(ImGuiContext *, char const *);
 
+// Every copy a checklist makes, bracketed by the change counts of its
+// own pasteboard and the real one (macOS, hands off: GEV_CLIPOWN), which
+// shows that copies stay off the user's clipboard. Only its own moved:
+// counted. Both moved: not counted, as the user may have copied
+// meanwhile. Its own did not move: the copy went elsewhere, a failure.
+// Counts, not contents, which may be left behind, and whose reading
+// may ask the user for paste access. Elsewhere nothing is marked.
+static b32 clipownmark(Gui *g)
+{
+    GuiEvent e = {};
+    e.kind = GEV_CLIPOWN;
+    os_guiinject(g->os, &e);
+    return e.x >= 0;
+}
+
+static void clipownafter(Gui *g, Str what)
+{
+    GuiEvent e = {};
+    e.kind = GEV_CLIPOWN;
+    e.down = 1;
+    os_guiinject(g->os, &e);
+    if (e.x < 0) {
+        return;
+    } else if (e.x == 0) {
+        Arena a = g->frame;
+        guilog(g, concat(&a, concat(&a, "drive: FAIL ", what),
+                         " did not reach the checklist's own pasteboard"));
+        g->drivechecks++;
+        g->drivefails++;
+    } else if (e.y != 0) {
+        g->clipshared++;
+    } else {
+        g->clipowned++;
+    }
+}
+
 static void driveclipset(ImGuiContext *c, char const *text)
 {
     Gui *g = clipgui;
     if (g) {
         g->driveclip = clone(&g->perm, Str{(u8 *)text, (iz)__builtin_strlen(text)});
     }
+    b32 mark = g && clipownmark(g);
     if (clipset) {
         clipset(c, text);
+    }
+    if (mark) {
+        clipownafter(g, "a copied text");
     }
 }
 
@@ -23387,6 +24135,13 @@ static b32 drivecheck(Gui *g, i32 chk)
         return u && u->label.len && u->text=="Use the left door." &&
                a && find(a->text, "Steered")>=0 && find(a->text, "left door")>=0;
     }
+    case CHK_CONTINUED: {
+        b32 noted = 0;
+        for (iz i = 0; i < v->msgs.len; i++) {
+            noted |= v->msgs[i].role==VIEW_NOTE && v->msgs[i].label=="Continued";
+        }
+        return noted && !v->busy && !v->paused && !v->contmsg;
+    }
     case CHK_CANCELLED: {
         ViewMsg  *n = lastmsg(g, VIEW_NOTE);
         ViewTool *s = lasttool(g, "shell");
@@ -24185,16 +24940,22 @@ static b32 drivecheck(Gui *g, i32 chk)
         return (f32)(v.total - tt->rows) == g->ops[g->drivepc-1].dx;
     }
     case CHK_TERMHOME: {
-        // With dx, a tab of Plan's node (Standard); else the lower side of
-        // a vertical split, near its share, whose upper side holds the
-        // prompt (Compact's even split, or dockaddterm's)
+        // With dx 1, a tab of Plan's node (Standard); with dx 2, a tab of
+        // the prompt's (Compact), shown, the tab text names in front if any; else
+        // the lower side of a vertical split, near its share, whose upper
+        // side holds the prompt (dockaddterm's)
         ImGuiWindow   *w = ImGui::FindWindowByName(panenames[PANE_TERMINAL]);
         ImGuiWindow   *p = ImGui::FindWindowByName(panenames[PANE_PROMPT]);
         ImGuiDockNode *n = w ? w->DockNode : 0;
         ImGuiDockNode *s = n ? n->ParentNode : 0;
-        if (g->ops[g->drivepc-1].dx != 0) {
+        if (g->ops[g->drivepc-1].dx == 1) {
             ImGuiWindow *plan = ImGui::FindWindowByName(panenames[PANE_PLAN]);
             return n && plan && plan->DockNode==n;
+        } else if (g->ops[g->drivepc-1].dx == 2) {
+            Arena a     = g->frame;
+            Str   front = g->ops[g->drivepc-1].text;
+            return n && p && p->DockNode==n && g->panes[PANE_TERMINAL] &&
+                   (!front.len || tabselected(cstr0(&a, front)));
         }
         if (!s || !p || !p->DockNode || s->SplitAxis!=ImGuiAxis_Y || s->ChildNodes[1]!=n) {
             return 0;
@@ -24256,6 +25017,8 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_REVEALED:
     case CHK_FILELINK:
     case CHK_FILEIMAGE:
+    case CHK_FILEFIND:
+    case CHK_FILESPOT:
         return drivefilecheck(g, chk);
     case CHK_TERMQUIET:
         return g->panes[PANE_TERMINAL] && drivequiet(g, "idle with the terminal shown", 2);
@@ -24405,6 +25168,8 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_CTR:
         return ctrcheck(g, g->ops[g->drivepc-1].text);
+    case CHK_THINSKILL:
+        return thinskill(g, g->ops[g->drivepc-1].text);
     case CHK_VIA:
         // The view names this computer, as the session bar shows it
         return g->sess && g->sess->host->kind==GH_REMOTE && g->machine.len &&
@@ -25073,11 +25838,14 @@ static void drivestep(Gui *g)
     case OP_UP:
     case OP_RDOWN:
     case OP_RUP:
+    case OP_MDOWN:
+    case OP_MUP:
         e.kind   = GEV_BUTTON;
         e.x      = g->drivex;
         e.y      = g->drivey;
-        e.button = op->op==OP_RDOWN || op->op==OP_RUP;
-        e.down   = op->op==OP_DOWN || op->op==OP_RDOWN;
+        e.button = op->op==OP_RDOWN || op->op==OP_RUP ? 1
+                 : op->op==OP_MDOWN || op->op==OP_MUP ? 2 : 0;
+        e.down   = op->op==OP_DOWN || op->op==OP_RDOWN || op->op==OP_MDOWN;
         os_guiinject(g->os, &e);
         if (e.down && g->tracedrive) {
             // What the press lands on, as of the last frame
@@ -25287,10 +26055,13 @@ static void drivestep(Gui *g)
             char const *t = ImGui::GetClipboardText();
             g->clipkept = t ? clone(&g->perm, Str{(u8 *)t, (iz)__builtin_strlen(t)}) : Str{};
             g->clippng  = clone(&g->perm, png);
+            b32 mark    = clipownmark(g);
             if (!os_guiclipput(g->os, a, png)) {
                 guilog(g, "drive: FAIL could not put an image on the clipboard");
                 g->drivechecks++;
                 g->drivefails++;
+            } else if (mark) {
+                clipownafter(g, "a copied image");
             }
             break;
         }
@@ -25352,6 +26123,26 @@ static void drivestep(Gui *g)
         print(&b, " pressed, ");
         print(&b, (i64)e.y);
         print(&b, " released");
+        guilog(g, finish(&b));
+    } break;
+    case OP_CLIPOWN: {
+        if (!clipownmark(g)) {
+            guilog(g, "drive: skip the checklist's own pasteboard (macOS, hands off, only)");
+            break;
+        }
+        b32 ok = g->clipowned >= (i32)op->dx;
+        g->drivechecks++;
+        g->drivefails += !ok;
+        Arena a = g->frame;
+        Buf   b(&a, 128);
+        print(&b, ok ? Str("drive: ok   ") : Str("drive: FAIL "));
+        print(&b, (i64)g->clipowned);
+        print(&b, " copies reached the checklist's own pasteboard alone");
+        if (g->clipshared) {
+            print(&b, ", and ");
+            print(&b, (i64)g->clipshared);
+            print(&b, " not counted, as the real one changed meanwhile");
+        }
         guilog(g, finish(&b));
     } break;
     case OP_CLIPBACK: {
@@ -26485,6 +27276,10 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->findbuf    = alloc<char>(&g->perm, FIELD_MAX);
     g->search     = newsearch(&g->perm, os_reserve(os, 256*mb), os_reserve(os, 256*mb),
                               FIELD_MAX);
+    g->ffind.text = newfilefind(&g->perm, os_reserve(os, FILES_HITMEM), FIELD_MAX, FILES_HITS);
+    g->ffind.md   = newsearch(&g->perm, os_reserve(os, 16*mb), os_reserve(os, mb), FIELD_MAX);
+    g->ffind.md->hitmax = FILES_HITS;  // 3 MiB of FindHit
+    g->ffind.q    = alloc<char>(&g->perm, FIELD_MAX);
     g->drivecodemsg = -1;
     g->remdest    = alloc<char>(&g->perm, FIELD_MAX);
     g->rempath    = alloc<char>(&g->perm, FIELD_MAX);

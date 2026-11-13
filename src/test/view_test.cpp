@@ -2198,6 +2198,41 @@ static void test_viewtranscript(Test *t)
         expect(t, "find.empty", istr(&a, s->hits.len), "0");
     }
 
+    // Hits by message and offset: the first at or after an offset, or
+    // holding it, else the next message's; a message's hits as marked,
+    // and which is current, if one of them
+    {
+        Arena   a      = perm;
+        FindHit mem[]  = {{0, 2, 3}, {0, 10, 1}, {2, 0, 4}, {2, 8, 2}, {5, 1, 1}};
+        Slice<FindHit> hits = {mem, countof(mem), countof(mem)};
+        expect(t, "find.hitfrom", istr(&a, hitfrom(hits, 0, 0)), "0");
+        expect(t, "find.hitfrom", istr(&a, hitfrom(hits, 0, 4)), "0");  // inside
+        expect(t, "find.hitfrom", istr(&a, hitfrom(hits, 0, 5)), "1");
+        expect(t, "find.hitfrom", istr(&a, hitfrom(hits, 0, 11)), "2");
+        expect(t, "find.hitfrom", istr(&a, hitfrom(hits, 1, 0)), "2");
+        expect(t, "find.hitfrom", istr(&a, hitfrom(hits, 2, 9)), "3");
+        expect(t, "find.hitfrom", istr(&a, hitfrom(hits, 5, 2)), "5");  // past
+        expect(t, "find.hitfrom", istr(&a, hitfrom(hits, 9, 0)), "5");
+        expect(t, "find.hitfrom", istr(&a, hitfrom({}, 0, 0)), "0");
+
+        auto marks = [&](iz cur, i32 msg) {
+            Marks mk = hitmarks(hits, cur, msg);
+            Buf   b(&a, 64);
+            print(&b, (i64)(mk.h - hits.data));
+            putbyte(&b, '+');
+            print(&b, (i64)mk.n);
+            putbyte(&b, '@');
+            print(&b, (i64)mk.cur);
+            return finish(&b);
+        };
+        expect(t, "find.hitmarks", marks(3, 2), "2+2@1");
+        expect(t, "find.hitmarks", marks(0, 2), "2+2@-1");
+        expect(t, "find.hitmarks", marks(1, 0), "0+2@1");
+        expect(t, "find.hitmarks", marks(-1, 5), "4+1@-1");
+        expect(t, "find.hitmarks", marks(4, 1), "2+0@-1");  // none
+        expect(t, "find.hitmarks", marks(4, 7), "5+0@-1");
+    }
+
     // Find: in what messages show, as copied text has it, whatever the
     // markdown, case and spacing; hits are the source they cover
     {
@@ -2227,6 +2262,24 @@ static void test_viewtranscript(Test *t)
         expect(t, "view.findspace", hits("line a line b"), "1:Line A\nline  B;");
         expect(t, "view.findmarkup", hits("**"), "");
         expect(t, "view.findmany", hits("O"), "0:o;0:o;0:o;0:o;0:o;0:o;");
+        expect(t, "find.unfull", istr(&a, s->full), "0");
+
+        // Capped: hitmax kept, then full, done; searched again, it is
+        // not, nor once a message it searched changes
+        s->hitmax = 4;
+        expect(t, "find.capped", hits("o"), "0:o;0:o;0:o;0:o;");
+        expect(t, "find.full", istr(&a, s->full), "1");
+        expect(t, "find.fulldone", istr(&a, searchstep(s, a, 1)), "1");
+        expect(t, "find.capfew", hits("line"), "1:Line;1:line;");
+        expect(t, "find.capfewfull", istr(&a, s->full), "0");
+        hits("o");
+        v->msgs[0].ver++;
+        searchstep(s, a, 0);
+        expect(t, "find.cutunfull", istr(&a, s->full), "0");
+        expect(t, "find.cutkept", istr(&a, s->hits.len), "0");
+        searchstep(s, a, 1<<20);
+        expect(t, "find.refull", istr(&a, s->full), "1");
+        s->hitmax = 0;
     }
 
     // The context gauge: usage, then the engine's own numbers

@@ -510,6 +510,9 @@ static void    os_guinewframe(Os *);
 static void    os_guipresent(Os *, b32 present, u32 clear);
 // The display's refresh period in microseconds.
 static i64     os_guirefresh(Os *);
+// The OS's key repeat, as the user set it: seconds from a key's press to
+// its first repeat, and between repeats.
+static void    os_guikeyrepeat(Os *, f32 *delay, f32 *interval);
 // Bring the window back for the user: restored if minimized, and raised
 // unless scripted (it would take the user's focus).
 static void    os_guiraise(Os *);
@@ -601,7 +604,7 @@ static b32     os_guialtgr(Os *);
 // to x by y.
 enum {
     GEV_MOVE,
-    GEV_BUTTON,  // button 0 left, 1 right
+    GEV_BUTTON,  // button 0 left, 1 right, 2 middle
     GEV_WHEEL,   // y notches, positive up
     GEV_KEY,     // key GKEY_*, with ctrl held if set
     GEV_TEXT,
@@ -628,6 +631,10 @@ enum {
                     // one, as fast as it can; out, x the times it became
                     // key and y the pasteboard's changes seen, or x -1
                     // where there is no such path
+    GEV_CLIPOWN,    // macOS, hands off: down 0 marks the change counts of
+                    // the checklist's own pasteboard and the real one;
+                    // down 1 gives in x and y how far each moved since,
+                    // or x -1 where there is no own pasteboard
 };
 enum {
     GKEY_TAB,
@@ -660,6 +667,7 @@ enum {
     GKEY_K,
     GKEY_O,
     GKEY_W,
+    GKEY_F3,
 };
 struct GuiEvent {
     i32 kind;

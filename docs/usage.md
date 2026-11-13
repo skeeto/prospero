@@ -49,14 +49,14 @@ wheel with the key held); `[ui] font_size` (17 pixels by default) sets its
 size for good. Chinese, Japanese and Korean come from the system's fonts,
 which the built-in ones lack: those fontconfig, CoreText or Windows' display
 language picks, or the files `[ui] fonts` names. View → Layout, View's first item, arranges the panes as
-Standard, Compact (no right column) or Focus (one session), or as a layout
+Standard, Compact (no right column, Terminal a tab beside Prompt) or Focus (one session), or as a layout
 saved under a name of its own, kept with the window's layout in the state
 directory; Ctrl+1 to Ctrl+9 (Cmd on macOS) pick them in that order.
 Session → Open file... (Ctrl+O, Cmd+O) shows a file on the session's host
 (this computer, or another whose engine reads it for the window) in the
 Files pane, hidden until then: in a tab of the session shown, its lines
 numbered and highlighted, wrapped or not, a Markdown file rendered (or as
-text), and `path:N` or `path:A-B` scrolled to those lines and marked. Ctrl+W (Cmd+W) closes its front tab while it has the focus. A
+text), and `path:N` or `path:A-B` scrolled to those lines and marked. Ctrl+W (Cmd+W) closes its front tab, Ctrl+F (Cmd+F) finds in its file, and Ctrl+G goes to a line, while it has the focus. A
 file dropped on the Files pane opens there too, not attached. The
 window opens where it was last, fitted to the displays there are; the
 first time, 1700 by 900 at the display's scale, or maximized on a display

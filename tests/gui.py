@@ -2074,8 +2074,15 @@ def main():
         far = Far(args, host, curl, model, nonce, extra=termcfg)
         before += far.hostsection().replace("[remote far]", "[remote r]")
     elif args.mode == "thin":
-        # r has no endpoint: it runs on this window's models
+        # r has no endpoint: it runs on this window's models, and has the
+        # user's skills here, one of them theirs alone
         far = Far(args, host, curl, model, nonce, thin=True)
+        skills = host.path("skills")
+        host.mkdir(skills + "/gnotes")
+        host.write(skills + "/gnotes/SKILL.md",
+                   "---\nname: gnotes\ndescription: Take notes, for the user alone\n"
+                   "disable-model-invocation: true\n---\nTake notes in notes.md.\n")
+        before += f"\n# The user's own skills, which r may use\n[skills]\npaths = {skills}\n"
         before += far.hostsection().replace("[remote far]", "[remote r]")
     elif args.mode == "containers":
         # The image first in New session's list; its container copies work
@@ -2170,7 +2177,8 @@ def main():
             problems.append("the editor's files are left: " + ", ".join(left))
         if args.shots:
             for name in ("history", "menu", "editing", "editfailed", "slash", "models",
-                         "drafts", "attached", "images", "compacted", "restored"):
+                         "drafts", "attached", "images", "compacted", "paused", "continue",
+                         "restored"):
                 if not os.path.exists(os.path.join(args.shots, f"compose-{name}.png")):
                     problems.append(f"no compose-{name}.png")
     else:
@@ -2335,7 +2343,14 @@ def main():
             problems.append("a tab's Close ended a child ignoring SIGHUP")
         else:
             print("terminal: a child ignoring SIGHUP outlived a tab's Close")
+            # Its loop's sleep, orphaned by this, ends within its second:
+            # waited for, unsignaled, so that nothing of the run is left
+            kids = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True,
+                                  text=True).stdout.split()
             P.signal_ours(pid, P.KILL, lambda q: ours(q, host.root), "stray")
+            deadline = time.monotonic() + 3
+            while any(alive(int(k)) for k in kids) and time.monotonic() < deadline:
+                time.sleep(0.1)
         problems += far.close(args.keep)
     if args.mode == "terminal" and args.shots and os.name != "nt":  # SDL's alone
         for name in ("terminal", "terminal-small", "terminal-vim", "terminal-big",

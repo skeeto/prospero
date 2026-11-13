@@ -38,15 +38,21 @@ enum : i64 {
     SKILL_NAME  = 64,         // bytes of a name
     SKILL_DEPTH = 4,          // levels a skill may sit below its skills directory
     SKILL_DIRS  = 1000,       // directories listed in one skills directory
+    SKILL_PACK  = 2 << 20,    // a package's JSON (skillpack), at most
+    SKILL_FILES = 500,        // files in a package
+    SKILL_PACKDEPTH = 8,      // levels of a path in a package
+    SKILL_PATHLEN   = 200,    // bytes of a path in a package
 };
 
 struct Skill {
     Str name;
     Str desc;     // one line, at most SKILL_DESC bytes
-    Str dir;      // its directory, normalized; null if built in
-    Str path;     // its SKILL.md; null if built in
+    Str dir;      // its directory, normalized; null if built in or relayed
+    Str path;     // its SKILL.md; null if built in or relayed
     b32 hidden;   // disable-model-invocation: the user's alone
     b32 builtin;  // Prospero's own (help.cpp), with no files
+    i64 peer;     // relayed: the computer that offers it (relay.cpp), else 0
+    Str from;     // and that computer's name
 };
 
 // The built-in skill's name, which only the user's own skills may take.
@@ -493,4 +499,235 @@ static SkillCall skillcalled(Str text)
     r.args = trim(rest);
     r.ok   = 1;
     return r;
+}
+
+
+// Packages: a skill as a computer sends it to a thin engine, which
+// relays its calls there, to copy for a session (relay.cpp, engine.cpp)
+//
+// JSON {"name", "files":[{"path", "text"|"data"}], "cut"?}: the files
+// under the skill's directory, but not symlinks nor special files
+// (os_list), nor dot-names, nor paths a copy may not have; sorted, with
+// SKILL.md first; each as text if it is valid UTF-8 with no NUL, else
+// as base64 data. Past its size, as encoded, SKILL.md alone, with cut.
+
+static Str cfgsha256(Arena *, Str);
+
+struct SkillFile {
+    Str path;  // relative, '/'-separated
+    Str data;
+};
+
+struct SkillPack {
+    Slice<SkillFile> files;
+    b32              cut;  // SKILL.md alone, the rest too large
+    Str              err;  // why it is unsound, else null
+};
+
+// Whether a package's path is one a copy may have: relative, '/'-
+// separated, at most SKILL_PACKDEPTH parts and SKILL_PATHLEN bytes, of
+// valid UTF-8, no part empty or beginning with '.' (".", ".." and dot
+// files), no '\\', ':' or control character; on Windows (win), no
+// device's name in it, and no part ending in a dot or space, which
+// Windows would drop.
+static b32 skillpackpath(Str p, b32 win)
+{
+    if (!p.len || p.len>SKILL_PATHLEN) {
+        return 0;
+    }
+    i32 parts = 0;
+    for (Str rest = p;;) {
+        Cut c    = cut(rest, '/');
+        Str part = c.head;
+        if (!part.len || part[0]=='.' || ++parts>SKILL_PACKDEPTH) {
+            return 0;
+        } else if (win && (part[part.len-1]=='.' || part[part.len-1]==' ')) {
+            return 0;
+        }
+        for (iz i = 0; i < part.len;) {
+            i32 ch = utf8strict(part, &i);
+            if (ch<0x20 || ch==0x7f || ch=='\\' || ch==':' || (ch>=0xd800 && ch<=0xdfff)) {
+                return 0;  // -1 too, invalid UTF-8
+            }
+        }
+        if (!c.ok) {
+            break;
+        }
+        rest = c.tail;
+    }
+    return !win || !devicepath(p, 1);
+}
+
+// Whether a file goes as text: valid UTF-8, with no NUL.
+static b32 skilltextual(Str s)
+{
+    for (iz i = 0; i < s.len;) {
+        i32 c = utf8strict(s, &i);
+        if (c<=0 || (c>=0xd800 && c<=0xdfff)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static b32 skillfileless(SkillFile *a, SkillFile *b)
+{
+    b32 am = a->path=="SKILL.md";
+    b32 bm = b->path=="SKILL.md";
+    return am!=bm ? am : compare(a->path, b->path)<0;
+}
+
+// The paths of the files under a skill's directory that a package may
+// have, with their sizes in data.len (no data), up to SKILL_FILES+1.
+static Slice<SkillFile> skillpackfiles(Os *os, Arena *a, Str dir)
+{
+    Slice<SkillFile> r     = {};
+    Slice<Str>       stack = {};  // relative folders to list
+    stack = push(a, stack, Str{});
+    while (stack.len && r.len<=SKILL_FILES) {
+        Str rel = stack[stack.len-1];
+        stack.len--;
+        Str abs = rel.len ? concat(a, concat(a, dir, "/"), rel) : dir;
+        for (Dirent *d = os_list(os, a, abs); d && r.len<=SKILL_FILES; d = d->next) {
+            Str p = rel.len ? concat(a, concat(a, rel, "/"), d->name) : clone(a, d->name);
+            if (!skillpackpath(p, 0)) {
+                continue;  // dot-names too
+            } else if (d->isdir) {
+                stack = push(a, stack, p);
+            } else {
+                SkillFile f = {};
+                f.path      = p;
+                f.data.len  = (iz)d->size;
+                r = push(a, r, f);
+            }
+        }
+    }
+    sort(r.data, r.len, skillfileless, *a);
+    return r;
+}
+
+static void skillpackfile(JsonOut *w, Arena scratch, SkillFile *f)
+{
+    putobject(w);
+    putstrkey(w, "path", f->path);
+    if (skilltextual(f->data)) {
+        putstrkey(w, "text", f->data);
+    } else {
+        putstrkey(w, "data", base64(&scratch, f->data));
+    }
+    putend(w);
+}
+
+// A skill's package, at most max bytes but for SKILL.md alone (cut).
+static Str skillpack(Os *os, Arena *a, Skill *k, iz max)
+{
+    Arena            rd    = carve(a, max + (iz)SKILL_BYTES + (1<<16));
+    Slice<SkillFile> files = skillpackfiles(os, &rd, k->dir);
+    Buf              b(a, 1<<12);
+    JsonOut          w = {&b};
+    putobject(&w);
+    putstrkey(&w, "name", k->name);
+    putkey(&w, "files");
+    putarray(&w);
+    b32 cut = files.len>SKILL_FILES || !files.len || !(files[0].path=="SKILL.md");
+    for (iz i = 0; !cut && i < files.len; i++) {
+        Arena t  = rd;
+        iz    sz = files[i].data.len;
+        Read  r  = sz<=max ? os_read(os, &t, concat(&t, concat(&t, k->dir, "/"), files[i].path),
+                                     max) : Read{};
+        if (sz>max || r.err) {
+            cut = sz > max;
+            continue;  // too large, or gone or unreadable since listed
+        }
+        SkillFile f = {files[i].path, r.data};
+        skillpackfile(&w, t, &f);
+        cut = b.len > max;
+    }
+    if (cut) {
+        Arena t = rd;
+        Read  r = os_read(os, &t, k->path, SKILL_BYTES);
+        b.len = 0;
+        w     = {&b};
+        putobject(&w);
+        putstrkey(&w, "name", k->name);
+        putkey(&w, "files");
+        putarray(&w);
+        SkillFile f = {"SKILL.md", r.err ? Str{} : r.data};
+        skillpackfile(&w, t, &f);
+        putend(&w);
+        putintkey(&w, "cut", 1);
+        putend(&w);
+        return finish(&b);
+    }
+    putend(&w);
+    putend(&w);
+    return finish(&b);
+}
+
+// A package as a thin engine takes it, to copy (win, its own platform):
+// every path one a copy may have (skillpackpath), none twice, even
+// ignoring case, nor a file's also a folder's, at most SKILL_FILES, with
+// SKILL.md among them; data as base64. Else why not, in err.
+static SkillPack skillunpack(Arena *a, Json *pkg, b32 win)
+{
+    SkillPack r = {};
+    r.cut = jsonint(jsonget(pkg, "cut"), 0) != 0;
+    b32 md = 0;
+    for (Json *x = jsonget(pkg, "files")->child; x; x = x->next) {
+        SkillFile f    = {};
+        Json     *text = jsonget(x, "text");
+        f.path = jsonstr(jsonget(x, "path"));
+        if (r.files.len == SKILL_FILES) {
+            r.err = "it has too many files";
+            return r;
+        } else if (!skillpackpath(f.path, win)) {
+            r.err = "it names a file that a copy may not have";
+            return r;
+        } else if (text->type == JSON_STRING) {
+            f.data = jsonstr(text);
+        } else {
+            Unbase64 d = unbase64(a, jsonstr(jsonget(x, "data")));
+            if (!d.ok) {
+                r.err = "a file's data is not base64";
+                return r;
+            }
+            f.data = d.data;
+        }
+        for (iz i = 0; i < r.files.len; i++) {
+            Str  p = r.files[i].path;
+            Str  q = f.path;
+            iz   n = p.len<q.len ? p.len : q.len;
+            b32  folder = equalfold(takehead(p, n), takehead(q, n)) &&
+                          ((p.len>n && p[n]=='/') || (q.len>n && q[n]=='/'));
+            if (equalfold(p, q) || folder) {
+                r.err = "it names a file twice, or a file as a folder";
+                return r;
+            }
+        }
+        md |= f.path == "SKILL.md";
+        r.files = push(a, r.files, f);
+    }
+    if (!md) {
+        r.err = "it has no SKILL.md";
+    }
+    return r;
+}
+
+// A copy's name for a package's files, in order: the first 16 hex
+// digits of the SHA-256 of each one's path, NUL, length, NUL, data.
+static Str skillhash(Arena *a, Slice<SkillFile> files)
+{
+    iz n = 0;
+    for (iz i = 0; i < files.len; i++) {
+        n += files[i].path.len + files[i].data.len + 24;
+    }
+    Buf b(a, n);
+    for (iz i = 0; i < files.len; i++) {
+        print(&b, files[i].path);
+        putbyte(&b, 0);
+        print(&b, (i64)files[i].data.len);
+        putbyte(&b, 0);
+        print(&b, files[i].data);
+    }
+    return takehead(cfgsha256(a, finish(&b)), 16);
 }

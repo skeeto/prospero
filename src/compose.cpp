@@ -33,6 +33,8 @@ enum : i32 {
     SLASH_WORKTREE,
     SLASH_BACKGROUND,
     SLASH_SHELL,
+    SLASH_PAUSE,
+    SLASH_CONTINUE,
     SLASH_COUNT,
 };
 
@@ -56,6 +58,8 @@ static SlashInfo slashinfo[] = {
                             "in a new worktree, on a branch of its own"},
     {"/background", "",     "Let the running command or subagents go on in the background, and the agent with them"},
     {"/shell",   "[NAME]",  "Switch this session's shell, or pick one from a list"},
+    {"/pause",   "",        "Hold the agent before its next model request, until /continue"},
+    {"/continue", "",       "Resume a paused agent, or go on after Stop, without a message"},
 };
 static_assert(countof(slashinfo) == SLASH_COUNT);
 
@@ -123,6 +127,13 @@ static Slash parseslash(Str text)
     case SLASH_BACKGROUND:
         if (r.arg.len) {
             r.err = "/background takes nothing";
+        }
+        break;
+    case SLASH_PAUSE:
+    case SLASH_CONTINUE:
+        if (r.arg.len) {
+            r.err = r.cmd==SLASH_PAUSE ? Str("/pause takes nothing")
+                                       : Str("/continue takes nothing: send a message to say more");
         }
         break;
     }
@@ -614,9 +625,11 @@ static b32 mentionqueue(MentionEdit *e, iz beg, iz end, Str was, Str text)
 struct SkillItem {
     Str name;
     Str desc;
-    Str path;     // its SKILL.md, empty if built in
+    Str path;     // its SKILL.md, empty if built in or another computer's
     b32 hidden;   // never offered to the agent: the user's alone
     b32 builtin;  // Prospero's own
+    Str from;     // the computer that shares it with a thin engine, which
+                  // fetches it first (skill.fetch)
 };
 
 // Whether a command has a skill's name, which it then keeps.

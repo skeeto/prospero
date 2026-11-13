@@ -502,16 +502,17 @@ static void hostreply(Host *, HostClient *, Arena, i64, b32, Str, Str);
 // object with id replaced, and with from and attended replaced where
 // given (from < 0 drops it). Null if too many wait already. A models
 // command replies once its endpoints answer, mcp.auth and mcp.code once
-// their servers do, and git with status once git is done, after those
-// sent later, so each waits apart from the ring, whose replies come in
-// order; a full list of them gives up on the oldest, whose reply must
-// have been lost.
+// their servers do, git with status once git is done, config.get with
+// refresh once its includes are fetched, and skill.fetch once its skill
+// is, after those sent later, so each waits apart from the ring, whose
+// replies come in order; a full list of them gives up on the oldest,
+// whose reply must have been lost.
 static HostCmd *hostforward(Host *h, Arena scratch, Json *j, i32 cmd, i32 kind,
                             i64 from, i32 attended)
 {
     HostCmd *q = 0;
     if (cmd==CMD_MODELS || cmd==CMD_MCPAUTH || cmd==CMD_MCPCODE || cmd==CMD_GIT ||
-            cmd==CMD_EPAUTH) {
+            cmd==CMD_EPAUTH || cmd==CMD_CONFIGGET || cmd==CMD_SKILLFETCH) {
         if (h->latelen == HOST_LATE) {
             HostCmd old = h->late[0];
             if (old.client) {

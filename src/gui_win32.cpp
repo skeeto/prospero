@@ -78,6 +78,7 @@ extern "C" void      w32gui_wake(void *);
 extern "C" void      w32gui_newframe(void *);
 extern "C" void      w32gui_present(void *, int present, unsigned clear);
 extern "C" long long w32gui_refresh(void *);
+extern "C" void      w32gui_keyrepeat(void *, float *delay, float *interval);
 extern "C" void      w32gui_raise(void *);
 extern "C" void      w32gui_flash(void *, int how);  // FLASH_*
 extern "C" int       w32gui_focused(void *);
@@ -368,7 +369,30 @@ struct W32Gui {
     int                     showmax;     // show it maximized
     int                     drivetheme;  // the checklist's system theme:
                                          // 1 light, 2 dark, 0 the real one
+    float                   repdelay;    // the key repeat (keyrepeat): seconds
+    float                   repgap;      // to the first repeat, and between
 };
+
+// The Keyboard control panel's repeat delay, 0 to 3 for a quarter second
+// to a second, and repeat rate, 0 to 31 for about 2.5 to 30 a second.
+// Asked again at each press, so a change counts at once.
+static void keyrepeat(W32Gui *w)
+{
+    UINT delay = 1, speed = 31;  // the defaults
+    SystemParametersInfoW(SPI_GETKEYBOARDDELAY, 0, &delay, 0);
+    SystemParametersInfoW(SPI_GETKEYBOARDSPEED, 0, &speed, 0);
+    delay = delay>3  ? 3  : delay;
+    speed = speed>31 ? 31 : speed;
+    w->repdelay = 0.25f * (float)(delay + 1);
+    w->repgap   = 1 / (2.5f + 27.5f*(float)speed/31);
+}
+
+extern "C" void w32gui_keyrepeat(void *p, float *delay, float *interval)
+{
+    W32Gui *w = (W32Gui *)p;
+    *delay    = w->repdelay;
+    *interval = w->repgap;
+}
 
 // The program's icon (resources, above) at a system metric's size,
 // shared: loaded once, never destroyed.
@@ -511,6 +535,9 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
     if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wp, lp)) {
         return 1;
+    }
+    if ((msg==WM_KEYDOWN || msg==WM_SYSKEYDOWN) && !(lp & (1<<30))) {
+        keyrepeat(w);  // a press, not a repeat
     }
     int kind = inputkind(msg);
     if (kind >= 0) {
@@ -801,6 +828,7 @@ extern "C" void *w32gui_open(W32Hooks *hooks, unsigned short const *title,
     }
     w->hooks      = *hooks;
     w->framedark  = -1;
+    keyrepeat(w);
     w->taskbarmsg = RegisterWindowMessageW(L"TaskbarCreated");
     // A high-resolution timer waits precisely without raising the
     // system timer rate (Windows 10 1803+); otherwise a plain one.
@@ -1245,9 +1273,11 @@ extern "C" void w32gui_inject(void *p, int kind, float x, float y,
         PostMessageW(w->hwnd, WM_MOUSEMOVE, 0, xy);
         break;
     case 1: {  // button
-        UINT m = button ? (down ? WM_RBUTTONDOWN : WM_RBUTTONUP)
-                        : (down ? WM_LBUTTONDOWN : WM_LBUTTONUP);
-        PostMessageW(w->hwnd, m, down ? (button ? MK_RBUTTON : MK_LBUTTON) : 0, xy);
+        UINT m = button==2 ? (down ? WM_MBUTTONDOWN : WM_MBUTTONUP)
+               : button    ? (down ? WM_RBUTTONDOWN : WM_RBUTTONUP)
+               :             (down ? WM_LBUTTONDOWN : WM_LBUTTONUP);
+        WPARAM mk = button==2 ? MK_MBUTTON : button ? MK_RBUTTON : MK_LBUTTON;
+        PostMessageW(w->hwnd, m, down ? mk : 0, xy);
     } break;
     case 2: {  // wheel
         POINT pt = {(LONG)x, 0};
@@ -1260,7 +1290,7 @@ extern "C" void w32gui_inject(void *p, int kind, float x, float y,
             VK_TAB, VK_CONTROL, VK_ESCAPE, VK_RETURN, 'C', VK_SHIFT, 'A',
             VK_END, VK_CONTROL, VK_OEM_PLUS, VK_OEM_MINUS, '0', 'F', 'G', 'T',
             'R', VK_UP, VK_DOWN, 'V', 'B', '2', VK_OEM_COMMA, 'S', VK_OEM_3,
-            VK_BACK, VK_LEFT, 'D', 'K', 'O', 'W',
+            VK_BACK, VK_LEFT, 'D', 'K', 'O', 'W', VK_F3,
         };
         BYTE state[256];
         GetKeyboardState(state);
@@ -2018,6 +2048,11 @@ static i64 os_guirefresh(Os *os)
     return w32gui_refresh(os->gui);
 }
 
+static void os_guikeyrepeat(Os *os, f32 *delay, f32 *interval)
+{
+    w32gui_keyrepeat(os->gui, delay, interval);
+}
+
 static void os_guiinject(Os *os, GuiEvent *e)
 {
     Arena a = {};
@@ -2025,7 +2060,7 @@ static void os_guiinject(Os *os, GuiEvent *e)
     a.beg = (byte *)buf;
     a.end = (byte *)buf + countof(buf);
     unsigned short *text = 0;
-    if (e->kind==GEV_FLAGPASTE || e->kind==GEV_CLIPRACE) {
+    if (e->kind==GEV_FLAGPASTE || e->kind==GEV_CLIPRACE || e->kind==GEV_CLIPOWN) {
         e->x = -1;  // macOS only
         return;
     } else if (e->text.len) {

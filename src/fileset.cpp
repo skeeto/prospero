@@ -18,12 +18,15 @@ enum : i32 {
     FILES_LINES   = 100000,  // lines kept
     FILES_COLS    = 1000,    // columns a line runs to, unwrapped
     FILES_SECTION = 64,      // bytes of a heading's slug kept
+    FILES_HITS    = 1<<18,   // find hits kept
+    FILES_CHUNKS  = (FILES_LINES + FILES_CHUNK - 1)/FILES_CHUNK,  // at most
 };
 
 enum : iz {
     FILES_MAX    = (iz)4 << 20,   // bytes of text kept, normalized
     FILES_CACHE  = (iz)8 << 20,   // a body's own layout cache
     FILES_BUDGET = (iz)64 << 20,  // all bodies, image textures included
+    FILES_HITMEM = (iz)4 << 20,   // find hits' Region, FILES_HITS of them
 };
 
 enum : i64 {  // epoch ms
@@ -121,7 +124,10 @@ struct FileTab {
     i32       top;        // the line at the view's top, 0-based
     f32       dy;         // and how far past its top the view is
     f32       scrollx;    // unwrapped
-    FileWatch watch;      // whether it changed since it was read
+    i32       goline;     // where Open in editor opens, 1-based: the line
+    i32       gocol;      // last gone to (a link's first, or the current
+                          // find match's) and its column; else 0
+    FileWatch watch;     // whether it changed since it was read
     b32       astext;    // binary, but shown as text anyway
     Str       err;        // why it failed, a literal, or in errbuf
     u8        errbuf[128];
@@ -500,4 +506,244 @@ static iz filewhole(Str raw)
 static i32 fileclamp(i32 line, i32 lines)
 {
     return line<1 || lines<1 ? 0 : line>lines ? lines : line;
+}
+
+// Finding in a file's text: its bytes scanned as they are, matched as
+// the transcript's find matches (findnorm: ASCII case folded, and any
+// run of whitespace, line breaks and blank lines too, matching one
+// space), so a match may cross lines and chunks. No document is parsed,
+// so the layout cache keeps what is shown. Hits are in the terms of the
+// lines view's chunk messages: a chunk, the offset from its first byte,
+// and a length that may run into later chunks (filemarks).
+struct FileFind {
+    Str            text;     // the body searched, empty if none
+    Str            q;        // findnorm'd
+    iz             qmax;
+    Arena          hitmem;   // alone in its Region, to grow in place
+    byte          *hitbase;
+    iz             hitmax;
+    Slice<FindHit> hits;     // in order and apart
+    i32            cur;      // the current hit, -1 if none
+    iz             at;       // searched up to here
+    i32            line;     // lines before at, 0-based
+    b32            done;
+    b32            full;     // hitmax hits kept, and more found
+    i32            chunkat[FILES_CHUNKS+1];  // each chunk's first byte, as reached
+};
+
+static FileFind *newfilefind(Arena *perm, Region *hits, iz qmax, iz hitmax)
+{
+    FileFind *f = alloc<FileFind>(perm);
+    f->hitmem  = newarena(hits);
+    f->hitbase = f->hitmem.beg;
+    f->q.data  = alloc<u8>(perm, qmax);
+    f->qmax    = qmax;
+    f->hitmax  = hitmax;
+    f->cur     = -1;
+    f->done    = 1;
+    return f;
+}
+
+// Search text for q from its start, as filefindstep goes on to.
+static void filefindreset(FileFind *f, Str text, Str q)
+{
+    f->q.len      = findq(f->q.data, q, f->qmax);
+    f->text       = text;
+    f->hitmem.beg = f->hitbase;
+    f->hits       = {};
+    f->cur        = -1;
+    f->at         = 0;
+    f->line       = 0;
+    f->chunkat[0] = 0;
+    f->full       = 0;
+    f->done       = !f->q.len || !text.len;
+}
+
+// The length of a match of a findnorm'd q at t[at], else -1: a space in
+// q takes a whitespace byte and, unless it ends q, the rest of its run.
+// The bytes compared are added to *cost.
+static iz filefindmatch(Str t, iz at, Str q, iz *cost)
+{
+    iz i = at;
+    for (iz k = 0; k < q.len; k++) {
+        if (i == t.len) {
+            return -1;
+        }
+        u8 c = t[i++];
+        (*cost)++;
+        if (q[k] != ' ') {
+            if (lowercase(c) != q[k]) {
+                return -1;
+            }
+        } else if (!whitespace(c)) {
+            return -1;
+        } else if (k < q.len-1) {
+            for (; i<t.len && whitespace(t[i]); i++) {
+                (*cost)++;
+            }
+        }
+    }
+    return i - at;
+}
+
+// Go on searching, about budget bytes passed and compared at most, the
+// text past FILES_CHUNKS chunks ignored. Returns whether it is done:
+// all searched, or hitmax hits kept (full) once another is found.
+static b32 filefindstep(FileFind *f, iz budget)
+{
+    Str t  = f->text;
+    u8  q0 = f->q.len ? f->q[0] : 0;
+    while (!f->done && budget>0) {
+        if (f->at == t.len) {
+            f->done = 1;
+            break;
+        }
+        iz at   = f->at;
+        u8 c    = t[at];
+        b32 can = q0==' ' ? whitespace(c) && (!at || !whitespace(t[at-1]))
+                          : lowercase(c)==q0;
+        iz cost = 0;
+        iz n    = can ? filefindmatch(t, at, f->q, &cost) : -1;
+        budget -= cost;
+        if (n > 0) {
+            if (f->hits.len == f->hitmax) {
+                f->full = 1;
+                f->done = 1;
+                break;
+            }
+            i32     chunk = f->line / FILES_CHUNK;
+            FindHit h     = {chunk, (i32)(at - f->chunkat[chunk]), (i32)n};
+            f->hits = push(&f->hitmem, f->hits, h);
+        } else {
+            n = 1;
+        }
+        budget -= n;
+        for (iz end = at+n; f->at<end && !f->done; f->at++) {
+            if (t[f->at]=='\n' && !(++f->line % FILES_CHUNK)) {
+                i32 chunk = f->line / FILES_CHUNK;
+                f->chunkat[chunk] = (i32)(f->at + 1);
+                f->done = chunk == FILES_CHUNKS;
+            }
+        }
+    }
+    return f->done;
+}
+
+// The first hit in a chunk at or after an offset, else the next chunk's,
+// else hits.len.
+static iz filefindfrom(FileFind *f, i32 msg, i32 off)
+{
+    return hitfrom(f->hits, msg, off);
+}
+
+// A chunk's hits, start its first byte in the text, as drawmarks takes
+// them: into hits, unless a hit begun in an earlier chunk runs into it.
+// Then its tail there comes first, the chunk's own hits copied after it
+// into a, the current hit remapped, and *carried set.
+static Marks filemarks(Arena *a, FileFind *f, i32 msg, iz start, b32 *carried)
+{
+    *carried = 0;
+    Marks r  = hitmarks(f->hits, f->cur, msg);
+    iz    lo = hitfrom(f->hits, msg, 0);
+    if (!lo) {
+        return r;
+    }
+    FindHit *p   = &f->hits[lo-1];
+    iz       end = f->chunkat[p->msg] + p->off + p->len;
+    if (end <= start) {
+        return r;
+    }
+    Marks c = {};
+    c.h     = alloc<FindHit>(a, r.n+1);
+    c.h[0]  = {msg, 0, (i32)(end - start)};
+    for (iz i = 0; i < r.n; i++) {
+        c.h[i+1] = r.h[i];
+    }
+    c.n   = r.n + 1;
+    c.cur = r.cur>=0 ? r.cur+1 : f->cur==lo-1 ? 0 : -1;
+    *carried = 1;
+    return c;
+}
+
+// Where a chunk's line k (0-based) begins, else the chunk's end.
+static i32 filelineoff(Str chunk, i32 k)
+{
+    i32 n = 0;
+    for (iz i = 0; i<chunk.len && n<k; i++) {
+        if (chunk[i]=='\n' && ++n==k) {
+            return (i32)(i + 1);
+        }
+    }
+    return k>0 ? (i32)chunk.len : 0;
+}
+
+// The line and column of a byte of text, both 1-based. A column counts
+// code points from the line's start, a tab as one, as an editor's go to
+// line and column does.
+static void fileoffline(Str text, iz off, i32 *line, i32 *col)
+{
+    off = off<0 ? 0 : off>text.len ? text.len : off;
+    i32 l     = 1;
+    iz  begin = 0;
+    for (iz i = 0; i < off; i++) {
+        if (text[i] == '\n') {
+            l++;
+            begin = i + 1;
+        }
+    }
+    i32 c = 1;
+    for (iz i = begin; i < off; i++) {
+        c += (text[i]&0xc0) != 0x80;
+    }
+    *line = l;
+    *col  = c;
+}
+
+// The byte of a line's 1-based column, as fileoffline counts it, clamped
+// to the line's end, before its LF.
+static i32 filecolbyte(Str line, i32 col)
+{
+    iz i = 0;
+    for (i32 c = 1; c<col && i<line.len && line[i]!='\n'; c++) {
+        utf8decode(line, &i);
+    }
+    return (i32)i;
+}
+
+// Go to line's text as lines: N, N:C or A-B, as frefsuffix reads them
+// after a name, spaces dropped and one leading ':' allowed. A number
+// past FREF_MAXLINE is FREF_MAXLINE, past any file's end; a reversed
+// range is swapped and drops its column, as freflines has it. Returns
+// whether it is lines, else *out is empty.
+static b32 filegotoparse(Str s, FrefLines *out)
+{
+    *out = {};
+    u8  buf[32];
+    iz  n     = 0;
+    b32 colon = 0;
+    buf[n++] = ':';
+    for (iz i = 0; i < s.len; i++) {
+        u8 c = s[i];
+        if (whitespace(c)) {
+            continue;
+        } else if (c==':' && n==1 && !colon) {
+            colon = 1;
+            continue;
+        } else if (n == countof(buf)) {
+            return 0;
+        }
+        buf[n++] = c;
+    }
+    Str       t = {buf, n};
+    FrefLines l = {};
+    if (frefsuffix(t, &l)!=t.len || !l.ok || l.line0<1) {
+        return 0;
+    }
+    i32 a = l.line0<FREF_MAXLINE ? l.line0 : FREF_MAXLINE;
+    i32 b = l.line1<1 ? a : l.line1<FREF_MAXLINE ? l.line1 : FREF_MAXLINE;
+    out->line0 = a<b ? a : b;
+    out->line1 = a<b ? b : a;
+    out->col   = b<a || l.col<1 ? 0 : l.col<FREF_MAXLINE ? l.col : FREF_MAXLINE;
+    out->ok    = 1;
+    return 1;
 }

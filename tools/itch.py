@@ -32,7 +32,8 @@ whose tracked files must be committed), as the GitHub release is:
      tools/linuxgui's build.sh, as the GitHub release's are.
 
 Everything that signs must work: no aas-sign, no Developer ID identity
-in the keychain, or no notary credentials, and nothing is built. The display is kept
+in the keychain, or, building macOS, no notary credentials, and nothing
+is built. The display is kept
 awake while it builds: a locked screen hides the notary profile.
 
 DIR (default: build-itch) gets prospero-VERSION-macos-arm64.dmg,
@@ -118,11 +119,14 @@ def checks(args):
 
 
 def signchecks(args):
-    """The Developer ID and the notary's credentials."""
+    """The Developer ID, and the notary's credentials if the disk image is
+    built: the engines are signed but not notarized."""
     ids = subprocess.run(["security", "find-identity", "-v", "-p", "codesigning"],
                          capture_output=True, text=True).stdout
     if f'"{args.identity}"' not in ids:
         sys.exit(f"itch: no codesigning identity \"{args.identity}\" in the keychain")
+    if not args.notarizes:
+        return
     if not args.notary_profile and not os.environ.get("PROSPERO_NOTARY_KEY"):
         sys.exit("itch: no notary credentials: --notary-profile NAME, or "
                  "PROSPERO_NOTARY_KEY, PROSPERO_NOTARY_KEY_ID and PROSPERO_NOTARY_ISSUER")
@@ -302,6 +306,7 @@ def main():
     args.work = os.path.abspath(args.work)
     plats = args.only or PLATFORMS
     args.signs = "macos" in plats or "windows" in plats
+    args.notarizes = "macos" in plats
 
     checks(args)
     # The display kept awake until this exits, so that the screen does not

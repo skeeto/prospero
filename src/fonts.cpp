@@ -76,6 +76,8 @@ static Str fontemoji()   { return {(u8 *)emojittf, countof(emojittf)}; }
 #define ICON_TERMINAL   "\xee\xaa\x85"  // U+EA85
 #define ICON_DISCONNECT "\xee\xab\x90"  // U+EAD0, debug-disconnect
 #define ICON_STOP       "\xee\xab\x97"  // U+EAD7, debug-stop
+#define ICON_PAUSE      "\xee\xab\x91"  // U+EAD1, debug-pause
+#define ICON_CONTINUE   "\xee\xab\x8f"  // U+EACF, debug-continue
 #define ICON_FOLDER     "\xee\xab\xb7"  // U+EAF7, folder-opened
 #define ICON_PLUG       "\xee\xac\xad"  // U+EB2D
 #define ICON_REFRESH    "\xee\xac\xb7"  // U+EB37
@@ -96,7 +98,7 @@ static Str fontemoji()   { return {(u8 *)emojittf, countof(emojittf)}; }
 // Their characters, for the unit tests
 static Str fonticonsused =
     ICON_ADD ICON_TRASH ICON_HISTORY ICON_CHECK ICON_DISCARD ICON_EXTERNAL ICON_LIGHTBULB ICON_INFO ICON_CLOSE ICON_FILE ICON_REPLY
-    ICON_TERMINAL ICON_DISCONNECT ICON_STOP ICON_FOLDER ICON_PLUG
+    ICON_TERMINAL ICON_DISCONNECT ICON_STOP ICON_PAUSE ICON_CONTINUE ICON_FOLDER ICON_PLUG
     ICON_REFRESH ICON_TOOLS ICON_COPY ICON_SEND ICON_ATTACH ICON_UP ICON_SESSION ICON_SORT ICON_TREE
     ICON_ARCHIVE ICON_UNARCHIVE ICON_GRIPPER ICON_NEWFOLDER;
 
