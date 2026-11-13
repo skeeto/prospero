@@ -93,7 +93,7 @@ For a plan on this computer, the editor is `[ui] editor`, else `$VISUAL`
 or `$EDITOR` (see [Configuration](help:config)). For a remote, set
 `[remote NAME] viewer` in this window's configuration to a local,
 remote-aware editor command, for example
-`fresh ssh://{ssh}{path}`. The command template also takes `{path}`,
+`ghostty -e fresh ssh://{ssh}{path}`. The command template also takes `{path}`,
 `{wsl}`, `{exec}`, `{remote}`, `{line}` and `{col}`; see
 [Hosts and remotes](help:hosts#viewing-remote-files-in-a-local-editor).
 There is no `[ui] editor` fallback. The detached viewer holds no plan

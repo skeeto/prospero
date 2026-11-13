@@ -799,8 +799,9 @@ static CfgKey cfgschema[] = {
      "for that kind of connection), {remote} this section's name, and {line} "
      "and {col} Files' position (1 for either when none). Split it into "
      "arguments before replacing placeholders, quoting a word that holds "
-     "blanks, as in fresh ssh://{ssh}{path}. A terminal editor needs a "
-     "terminal wrapper, such as alacritty -e nvim {path}. Empty disables "
+     "blanks, as in ghostty -e fresh ssh://{ssh}{path}. A terminal "
+     "editor needs a terminal wrapper, as in ghostty -e nvim "
+     "scp://{ssh}/{path}. Empty disables "
      "those actions; [ui] editor is not a fallback"},
     {"remote", "path", CFG_STRING, "prospero", {}, {}, "remote",
      "The prospero executable there, a path or a name on its PATH; unset, "

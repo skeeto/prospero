@@ -184,10 +184,10 @@ window's `[remote NAME]` has a `viewer` command template:
 ```ini
 [remote test1]
 ssh = user@host
-viewer = fresh ssh://{ssh}{path}
+viewer = ghostty -e fresh ssh://{ssh}{path}
 ```
 
-That launches `fresh` with one argument,
+That opens Ghostty and runs `fresh` with one argument,
 `ssh://user@host/home/user/agent-context/plan.md`, for the example plan path.
 The Plan pane's **View in editor** and Files' **Open in editor** use the
 same detached launcher. There is no `[ui] editor` fallback.
@@ -201,7 +201,8 @@ template is split into arguments with `'...'` or `"..."` quoting before
 these values are substituted: replacement never splits an argument, and
 the command runs directly, without a shell. On Windows, use an executable,
 not a `.cmd` or `.bat` file. Terminal editors need an explicit terminal
-wrapper, such as `alacritty -e nvim …`.
+wrapper; Neovim's netrw uses
+`ghostty -e nvim scp://{ssh}/{path}`.
 
 A remote viewer never holds plan approval, tells the agent the plan was
 edited, or gets a Cancel button or exit-driven refresh. The approval

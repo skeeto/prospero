@@ -160,12 +160,13 @@ window's own `[remote NAME]` section:
 ```ini
 [remote test1]
 ssh = user@host
-viewer = fresh ssh://{ssh}{path}
+viewer = ghostty -e fresh ssh://{ssh}{path}
 ```
 
 For `/home/user/agent-context/plan.md` that runs the equivalent of
-`["fresh", "ssh://user@host/home/user/agent-context/plan.md"]`. There is no
-URI construction in Prospero: the template decides what the editor takes.
+`["ghostty", "-e", "fresh", "ssh://user@host/home/user/agent-context/plan.md"]`,
+so Fresh has a terminal. There is no URI construction in Prospero: the
+template decides what the editor takes.
 These placeholders are available:
 
 - `{path}`: the absolute remote file or directory path;
@@ -186,10 +187,12 @@ implicit shell. An executable beginning `~/` names one under this
 computer's home directory. On Windows, name a direct executable: `.cmd`
 and `.bat` files are not valid viewers, including when an extensionless
 name cannot find an `.exe`; `cmd.exe` is not used to run them. A terminal
-editor needs an explicit terminal wrapper, for example:
+editor needs an explicit terminal wrapper. With Neovim's netrw, use
+`scp://` and keep one slash before `{path}` (the resulting URI has two
+slashes before its absolute remote path):
 
 ```ini
-viewer = alacritty -e nvim ssh://{ssh}{path}
+viewer = ghostty -e nvim scp://{ssh}/{path}
 ```
 
 An unavailable placeholder, malformed or empty command, or missing
