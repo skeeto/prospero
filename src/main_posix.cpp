@@ -3047,9 +3047,19 @@ static void connreader(void *arg)
 {
     Conn *c   = (Conn *)arg;
     iz    max = mailmax(c->mbox);
+    #ifdef __APPLE__
+    // macOS can lose the wakeup of a read blocked on a local stream
+    // socket when the peer shuts down its side: the read sleeps on with
+    // the end already there, and any later read returns it at once. Seen
+    // a few times in 10,000 exchanges of a megabyte and its end under
+    // load, in C apart from Prospero. With a timeout the reader looks
+    // again, so a lost end costs half a second, not the connection.
+    struct timeval tv = {0, 500000};
+    setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    #endif
     for (;;) {
         iz n = read(c->fd, c->buf, CONN_BUFLEN);
-        if (n<0 && errno==EINTR) {
+        if (n<0 && (errno==EINTR || errno==EAGAIN)) {
             continue;
         } else if (n <= 0) {
             break;
