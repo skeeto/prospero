@@ -1269,12 +1269,14 @@ static void testpty(ProcTest *p, Arena scratch)
     os_procfree(os, pr);
 
     // Closing hangs up: SIGHUP to the shell, which a trap sees, while
-    // what ignores it (nohup) goes on, and the reaper, let go, ends
+    // what ignores it (nohup) goes on, and the reaper, let go, ends. The
+    // nap outlasts the waits below (up to 7 s, longer under load) and is
+    // left to finish, as no pid the shell reports is ever signaled.
     Str hup = join(&scratch, p->dir, "hup.log");
     Buf hc(&scratch, 512);
     print(&hc, "trap 'echo hup >\"");
     print(&hc, hup);
-    print(&hc, "\"; exit 7' HUP; nohup sleep 5 >/dev/null 2>&1 & "
+    print(&hc, "\"; exit 7' HUP; nohup sleep 30 >/dev/null 2>&1 & "
                "echo ready $! $PPID; while :; do sleep 0.05; done");
     pr = ptysh(p, scratch, finish(&hc), z, 64*kb);
     if (!check(t, pr!=0, "os_ptyspawn trapping SIGHUP")) return;
