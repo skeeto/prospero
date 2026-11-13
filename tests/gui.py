@@ -91,9 +91,11 @@ firstrun mode's configuration names no model and no remote host, so
 Settings and Hosts are in front with Help, and its display is too
 small for the first size (--display), so the window opens maximized.
 
-On Linux without a display it runs under xvfb-run. Otherwise it first
-waits for any other checklist on this desktop (~/.cache/prospero-gui.lock),
-since two at once share the clipboard and the pointer.
+On Linux without a display it runs under xvfb-run, as many at once as
+tests/slots.py has slots. Otherwise it first waits for any other
+checklist on this desktop (~/.cache/prospero-gui.lock), since two at
+once share the clipboard and the pointer. MODES gives each mode's
+timeout, and --modes-json prints it for tests/vm.py.
 """
 
 import argparse
@@ -117,6 +119,7 @@ import zlib
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fake_provider  # noqa: E402
+import slots  # noqa: E402
 import pids as P  # noqa: E402
 
 
@@ -1786,49 +1789,37 @@ class CtrWatch:
         return problems
 
 
-def desktoplock():
-    """Wait for any other checklist on this desktop, then hold it until
-    this process exits. Checklists on one desktop share its clipboard and
-    its pointer, so two at once fail each other's checks. Under xvfb-run
-    each has its own display, and needs none. The lock is a file in the
-    home directory, shared by every checkout and worktree."""
-    if sys.platform.startswith("linux") and not os.environ.get("DISPLAY") \
-            and not os.environ.get("WAYLAND_DISPLAY"):
-        return None
-    path = os.path.join(os.path.expanduser("~"), ".cache", "prospero-gui.lock")
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    f = open(path, "a+")
-    if sys.platform == "win32":
-        import msvcrt
-        def take(wait):
-            f.seek(0)
-            try:
-                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
-                return True
-            except OSError:
-                if wait:
-                    time.sleep(1)
-                return False
-    else:
-        import fcntl
-        def take(wait):
-            try:
-                fcntl.flock(f, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
-                return True
-            except BlockingIOError:
-                return False
-    if not take(False):
-        start = time.monotonic()
-        print(f"waiting for another GUI checklist on this desktop ({path})", flush=True)
-        while not take(True):
-            pass
-        print(f"waited {time.monotonic()-start:.0f} s for the desktop", flush=True)
-    return f  # held open, so held, until exit
+# Each mode: its timeout (seconds), whether tests/vm.py runs it by default,
+# and whether it takes the whole machine, as it measures (idle,
+# streamtest, bench) or adopts the daemon's new containers (CtrWatch).
+MODES = {
+    "drive":      dict(timeout=1200, default=True,  whole=False),
+    "idle":       dict(timeout=600,  default=False, whole=True),
+    "streamtest": dict(timeout=600,  default=False, whole=True),
+    "e2e":        dict(timeout=600,  default=False, whole=False),
+    "signals":    dict(timeout=600,  default=True,  whole=False),
+    "settings":   dict(timeout=600,  default=True,  whole=False),
+    "enginestop": dict(timeout=600,  default=True,  whole=False),
+    "bench":      dict(timeout=600,  default=False, whole=True),
+    "background": dict(timeout=600,  default=True,  whole=False),
+    "remote":     dict(timeout=600,  default=True,  whole=False),
+    "compose":    dict(timeout=600,  default=True,  whole=False),
+    "sessions":   dict(timeout=600,  default=True,  whole=False),
+    "plan":       dict(timeout=600,  default=True,  whole=False),
+    "launch":     dict(timeout=600,  default=True,  whole=False),
+    "firstrun":   dict(timeout=600,  default=True,  whole=False),
+    "mcp":        dict(timeout=600,  default=True,  whole=False),
+    "hosttask":   dict(timeout=600,  default=True,  whole=False),
+    "changes":    dict(timeout=600,  default=True,  whole=False),
+    "thin":       dict(timeout=600,  default=True,  whole=False),
+    "containers": dict(timeout=600,  default=False, whole=True),
+    "terminal":   dict(timeout=600,  default=True,  whole=False),
+}
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--prospero", required=True,
+    ap.add_argument("--prospero",
                     help="the binary, or with --host the .exe on that host")
     ap.add_argument("--subprocess", action="store_true",
                     help="the engine as prospero --headless")
@@ -1836,12 +1827,7 @@ def main():
                     help="the GUI's inbox, small to force lost records (default "
                          "256 KiB, but the GUI's own for --mode bench, which "
                          "measures how fast a history arrives)")
-    ap.add_argument("--mode", default="drive",
-                    choices=["drive", "idle", "streamtest", "e2e", "signals",
-                             "settings", "enginestop", "bench", "background", "remote",
-                             "compose", "sessions", "plan", "launch", "firstrun",
-                             "mcp", "hosttask", "changes", "thin", "containers",
-                             "terminal"])
+    ap.add_argument("--mode", default="drive", choices=list(MODES))
     ap.add_argument("--ssh", help="with --mode remote: the remote host, over real ssh "
                                   "(default: this machine, through a fake ssh)")
     ap.add_argument("--remote-prospero", help="with --ssh: the harness built there")
@@ -1856,7 +1842,8 @@ def main():
     ap.add_argument("--runtime", default="auto",
                     help="with --mode containers: docker, podman, or auto (the "
                          "first that answers, as the window picks)")
-    ap.add_argument("--timeout", type=float, default=600)
+    ap.add_argument("--timeout", type=float,
+                    help="seconds for the GUI (default: the mode's, in MODES)")
     ap.add_argument("--keep", action="store_true", help="keep the directories")
     ap.add_argument("--url", help="with --mode e2e: the endpoint (default http://localhost/)")
     ap.add_argument("--shots", help="save the checklist's screenshots here")
@@ -1864,8 +1851,18 @@ def main():
     ap.add_argument("--trace", action="store_true", help="log where presses land")
     ap.add_argument("--fake", action="store_true",
                     help="the fake agent, no engine: M1's checklist and measurements")
+    ap.add_argument("--modes-json", action="store_true",
+                    help="print the modes' table (MODES) as JSON and exit")
     args = ap.parse_args()
-    lock = None if args.host else desktoplock()  # noqa: F841, held to exit
+    if args.modes_json:
+        print(json.dumps(MODES))
+        return 0
+    if not args.prospero:
+        ap.error("--prospero is required")
+    if args.timeout is None:
+        args.timeout = MODES[args.mode]["timeout"]
+    lock = None if args.host else slots.take(  # noqa: F841, held to exit
+        f"gui.py --mode {args.mode}", MODES[args.mode]["whole"])
     if args.mode == "signals":
         return signals(args)
 
