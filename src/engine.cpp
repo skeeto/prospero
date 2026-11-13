@@ -850,6 +850,9 @@ struct Session {
     // The todo list
     Slice<TodoItem> todos;
     i32          mutations;  // mutating calls since the list changed
+    i64          todoseq;    // the record that last gave the agent the
+                             // list's items: a todo_write, its error, a
+                             // nudge that listed them
     // Plan mode and Bypass mode
     i32          mode;       // MODE_*, its own: a subagent's Bypass is
                              // its parent's (bypassing)
@@ -6848,6 +6851,7 @@ static void tooltodo(Session *s, Arena scratch, Args *args)
     Slice<TodoItem> now    = todoapply(&scratch, s->todos, args, &err);
     if (err.data) {
         toolend(s, scratch, "error", err, 0, 0, {}, 0);
+        s->todoseq = s->log.seq;  // the error lists it
         return;
     }
     Slice<TodoItem> items = {};
@@ -6876,6 +6880,7 @@ static void tooltodo(Session *s, Arena scratch, Args *args)
         }
         putend(&w.json);
         ssend(s, &w);
+        s->todoseq = s->log.seq;
     }
     // The slow habits, said here, where the agent reads them, since the
     // description alone didn't stop some models: the whole list sent
@@ -6908,18 +6913,59 @@ static void tooltodo(Session *s, Arena scratch, Args *args)
     toolend(s, scratch, "ok", text, 0, 0, {}, 0);
 }
 
+// Whether a compaction summarized away every message that gave the
+// agent the list: the checkpoint, then messages all after it. Then its
+// names may be gone, as a summary need not keep them word for word.
+static b32 todoforgot(Session *s)
+{
+    if (!s->summary.len) {
+        return 0;
+    }
+    return s->history.len<2 || s->history[1].seq>s->todoseq;
+}
+
 // At the end of a turn: items left undone are a reason to go on. Returns
 // 1 if the agent was nudged, and the next step began. An agent waiting
-// for a background job is not: the job's end brings it back.
+// for a background job is not: the job's end brings it back. The nudge
+// is one line, as todo_write's result: the agent has the items from its
+// own calls, and listing them cost every nudge input tokens (#47). Only
+// after a compaction took the list out of its history are they listed.
 static b32 todonudge(Session *s, Arena scratch)
 {
     Str left = todoleft(&scratch, s->todos);
     if (!left.data || (jobsrunning(s) && canresume(s))) {
         return 0;
     }
-    Buf b(&scratch, 256 + left.len);
-    print(&b, "Your todo list still has items that are not done:\n");
-    print(&b, left);
+    iz  open   = 0;
+    Str active = {};
+    for (iz i = 0; i < s->todos.len; i++) {
+        open += s->todos[i].status != TODO_DONE;
+        if (s->todos[i].status==TODO_ACTIVE && !active.data) {
+            active = s->todos[i].content;
+        }
+    }
+    b32 forgot = todoforgot(s);
+    Buf b(&scratch, 512 + active.len + (forgot ? left.len : 0));
+    print(&b, "Your todo list still has ");
+    print(&b, (i64)open);
+    print(&b, open==1 ? Str(" item") : Str(" items"));
+    print(&b, " not done");
+    if (forgot) {
+        print(&b, ":\n");
+        print(&b, left);
+    } else {
+        print(&b, " (");
+        print(&b, (i64)(s->todos.len - open));
+        print(&b, " of ");
+        print(&b, (i64)s->todos.len);
+        print(&b, " done)");
+        if (active.data) {
+            print(&b, "; in progress: ");
+            print(&b, active);
+        }
+        b32 stop = active.len && active[active.len-1]=='.';
+        print(&b, stop ? Str(" ") : Str(". "));
+    }
     print(&b, "Continue with them now. If some are finished already, or "
               "will not be done, mark them with todo_write (done, or remove) "
               "first, then end your turn.");
@@ -6927,6 +6973,7 @@ static b32 todonudge(Session *s, Arena scratch)
     if (!nudge(s, scratch, N_TODO, text)) {
         return 0;
     }
+    s->todoseq = forgot ? s->log.seq : s->todoseq;
     prepare(s, scratch);
     return 1;
 }
@@ -18890,6 +18937,7 @@ static void replaytools(Session *s, Arena scratch, EvRec *r)
             t.status  = t.status<0 ? TODO_PENDING : t.status;
             s->todos  = push(&s->perm, s->todos, t);
         }
+        s->todoseq = r->seq>s->todoseq ? r->seq : s->todoseq;
     } break;
 
     case EV_SNAP: {
@@ -19192,6 +19240,10 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             if (r.ev == EV_USER) {
                 Slice<Str> urls = geturls(&t, jsonget(j, "urls"));
                 webnoteuser(s, t, jsonstr(jsonget(j, "via")), m.text, urls);
+            } else if (jsonstr(jsonget(j, "kind"))=="todo" &&
+                       find(m.text, "not done:\n")>=0) {
+                // A todo nudge that listed the items
+                s->todoseq = r.seq>s->todoseq ? r.seq : s->todoseq;
             }
             break;
         case EV_COMPACT: {

@@ -5009,6 +5009,25 @@ def sc_compact_manual(model, n, req):
 sc_compact_cancel = sc_compact_manual
 
 
+def sc_todo_compact(model, n, req):
+    # "read them": a list, the first item done with the first read, eight
+    # big reads, an answer; any nudge or other prompt, an answer at once
+    last = last_user_text(req)
+    k = since_user(req)
+    if last != "read them":
+        yield from real_answer(model, req, "Not yet.")
+    elif k == 0:
+        yield from real_tool(model, req, n, "todo_write",
+                             {"todos": [{"content": "read the files", "status": "in_progress"},
+                                        {"content": "sum them", "status": "pending"}]})
+    elif k == 1:
+        yield from real_tool(model, req, n, "todo_write", {"done": "read the files"})
+    elif k < 10:
+        yield from real_tool(model, req, n, "read", {"path": f"f{k-2}.txt"})
+    else:
+        yield from real_answer(model, req, "Read them.")
+
+
 def sc_compact_heed(model, n, req):
     # "read them": saves a memory, reads sub/x.txt (which loads its
     # AGENTS.md) and eight big files, then answers; any other prompt is

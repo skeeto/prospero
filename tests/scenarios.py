@@ -2388,7 +2388,10 @@ def todo(t):
     kinds = [n["kind"] for n in r.all("nudge")]
     t.check(kinds == ["todo"], f"nudges {kinds}")
     text = r.last("nudge")["text"]
-    t.check("[>] write it" in text and "[ ] test it" in text, f"nudge {text!r}")
+    # One line, not the list again (#47)
+    t.check(text.startswith("Your todo list still has 2 items not done (0 of 2 done); "
+                            "in progress: write it. Continue") and "[ ]" not in text,
+            f"nudge {text!r}")
     todos = r.all("todo")
     t.check(len(todos) == 2 and all(i["status"] == "done" for i in todos[1]["items"]),
             f"todo records {todos}")
@@ -8263,6 +8266,35 @@ def an_model_switch(t):
 
 
 BIG = {"_listing": {"meta": {"n_ctx": 262144, "n_ctx_train": 262144}}}
+
+
+@scenario(conf=BIG, bound=40, alone=True)
+def todo_compact(t):
+    """The end-of-turn todo nudge is one line while the agent has the list
+    in its history, and lists the open items once a compaction took
+    every message that gave it the list (#47); then one line again."""
+    bigfiles(t, 8, 256)
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="read them")
+        ended(h, sid, 1)
+        r = h.call("compact", sid=sid)
+        t.check(r.get("ok") == 1, f"compact {r}")
+        ended(h, sid, 2)
+        h.send("prompt", sid=sid, text="again")
+        ended(h, sid, 3)
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+    nudges = [e for e in logged(t, sid) if e.get("ev") == "nudge"]
+    texts = [e["text"] for e in nudges]
+    t.check([e["kind"] for e in nudges] == ["todo"] * 6, f"nudges {texts}")
+    line = "1 item not done (1 of 2 done); in progress: sum them."
+    t.check(all(line in x and "[" not in x for x in texts[:3]), f"before {texts[:3]}")
+    t.check("not done:\n[>] sum them\n" in texts[3] and "read the files" not in texts[3],
+            f"after the compaction {texts[3]!r}")
+    t.check(all(line in x for x in texts[4:]), f"then {texts[4:]}")
 
 
 @scenario(conf=BIG, bound=25, alone=True)
