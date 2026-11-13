@@ -263,7 +263,7 @@ def machint(top):
         src = text.split("\n")
         every = 0 in lines
         for i in range(1, len(src) + 1):
-            if (every or i in lines) and (i in apple or "g->mac" in src[i - 1]):
+            if (every or i in lines) and (i in apple or re.search(r"g->mac\b", src[i - 1])):
                 hits.append(f"{name}:{i}")
                 break
     return hits
