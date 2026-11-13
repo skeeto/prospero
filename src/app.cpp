@@ -15147,14 +15147,16 @@ static DriveOp m3ops[] = {
     {OP_CHECK, CHK_STRIPFIT, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "1-etacramped"},
     {OP_WAIT, W_IDLE, 0, 0, 20000, ""},
-    {OP_MAXIMIZE, 0, 1, 0, 1500, ""},
+    // Maximized, not filling the display: no platform skips a maximize,
+    // while filling is skipped where there is no such thing (Windows,
+    // Wayland), and that skip takes the next op, this prompt, with it
+    {OP_MAXIMIZE, 0, 0, 0, 1500, ""},
     {OP_PROMPT, 0, 0, 0, 100, "Read a long prompt."},
     {OP_WAIT, W_STRIPFULL, 0, 0, 10000, ""},
     {OP_CHECK, CHK_ETASHOWN, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "1-eta"},
     {OP_WAIT, W_IDLE, 0, 0, 20000, ""},
     {OP_CHECK, CHK_WORKED, 0, 0, 0, ""},  // that turn's, a few seconds
-    {OP_MAXIMIZE, 0, 0, 0, 1500, ""},
     // When that message was sent, shown under the mouse
     {OP_MOVE, T_USERMSG, 0, 0, 300, ""},
     {OP_CHECK, CHK_CLOCKSHOWN, 0, 0, 0, ""},
