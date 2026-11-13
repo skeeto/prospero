@@ -136,6 +136,13 @@ cancels it.
 
 ## Dropping files
 
+- While files are dragged over the window, the place they would go is
+  outlined, and a card says what a drop there does: Open in Files,
+  Attach, or Fill in the path; or, in amber, why they would not be
+  attached. The card knows only where the drag is, not what it holds:
+  it counts no files, and a folder dragged shows where files would go,
+  until the drop says otherwise. So does text on macOS and Linux;
+  Windows refuses dragged text at once, with no outline or card.
 - A folder dropped on the window, anywhere, opens the New session
   dialog with it.
 - While Open file asks for a path, a file dropped anywhere on the

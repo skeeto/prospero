@@ -19,6 +19,10 @@
 // files still start their New session, so that drop is never refused
 // whole.
 //
+// As files are dragged over the window, the place a drop would go is
+// outlined with a card that says so, which cardplace puts in the place,
+// beside it, or by the pointer.
+//
 // This is free and unencumbered software released into the public domain.
 
 // What a drag or a drop holds, as the platform knows it
@@ -155,4 +159,37 @@ static DropWhere dropwhere(Arena *a, DropFacts f, DropLoad l)
         w.detail = w.detail.len ? concat(a, concat(a, w.detail, ", "), tail) : tail;
     }
     return w;
+}
+
+// A box, x0 and y0 its top left, empty unless x1>x0 and y1>y0
+struct DropBox {
+    f32 x0, y0, x1, y1;
+};
+
+// Where a drag's card w by h goes, kept within work: centered in the
+// place a drop would go if that is at least three cards tall (a pane,
+// the window), else centered above it, margin clear, or below it where
+// there is no room above (a field, the prompt); with no place, margin
+// below and right of the pointer at px, py.
+static DropBox cardplace(DropBox place, f32 w, f32 h, DropBox work, f32 px, f32 py,
+                         f32 margin)
+{
+    b32 some = place.x1>place.x0 && place.y1>place.y0;
+    f32 x    = px + margin;
+    f32 y    = py + margin;
+    if (some && place.y1-place.y0 >= 3*h) {
+        x = (place.x0 + place.x1 - w)/2;
+        y = (place.y0 + place.y1 - h)/2;
+    } else if (some) {
+        x = (place.x0 + place.x1 - w)/2;
+        y = place.y0 - margin - h;
+        y = y<work.y0 ? place.y1 + margin : y;
+    }
+    // The far edges first, so that a card wider than work starts at its
+    // near edge
+    x = x+w>work.x1 ? work.x1 - w : x;
+    y = y+h>work.y1 ? work.y1 - h : y;
+    x = x<work.x0 ? work.x0 : x;
+    y = y<work.y0 ? work.y0 : y;
+    return {x, y, x + w, y + h};
 }

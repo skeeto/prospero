@@ -188,6 +188,9 @@ struct GuiSdl {
     WinBox        normal;      // the window when last neither maximized,
                                // minimized nor full screen
     b32           max;         // maximized when last not full screen
+    DropLoad      dragload;    // what a drag over the window holds, as
+                               // far as known (DRAGLOAD_UNKNOWN: SDL's
+                               // drags never say)
     GlViewport    glviewport;
     GlClearColor  glclearcolor;
     GlClear       glclear;
@@ -407,7 +410,7 @@ static b32 wayland()
 
 static u32 os_guilimits(Os *)
 {
-    return wayland() ? GUI_NOPLACE|GUI_NOSERIAL : 0;
+    return (wayland() ? GUI_NOPLACE|GUI_NOSERIAL : 0) | GUI_NODRAGLOAD;
 }
 
 static i32 os_guidisplays(Os *, WinBox *out, i32 max)
@@ -1616,6 +1619,22 @@ static void dispatch(Os *os, GuiSdl *p, SDL_Event *e)
                      app, e->drop.x, e->drop.y, at);
         }
         return;
+    case SDL_EVENT_DROP_POSITION:
+        // A drag over the window, at a point in its coordinates, as the
+        // backend's MousePos is; the checklist's over the title bar at
+        // a point above it. No window: not a drag
+        if (e->drop.windowID) {
+            b32 at = e->drop.x>=0 && e->drop.y>=0;
+            gui_dragover(g, DRAG_OVER, e->drop.x, e->drop.y, at, p->dragload.kind,
+                         p->dragload.n, p->dragload.dirs);
+        }
+        return;
+    case SDL_EVENT_DROP_COMPLETE:
+        // Dropped, or gone: it left the window, or was cancelled
+        if (e->drop.windowID) {
+            gui_dragover(g, DRAG_LEAVE, 0, 0, 0, 0, 0, 0);
+        }
+        return;
     #ifndef __APPLE__
     case SDL_EVENT_DROP_TEXT:
         // Linux's drags say nothing of what they hold, so the drop of
@@ -2003,6 +2022,35 @@ static void os_guiinject(Os *os, GuiEvent *ge)
             e.drop.data = path;
             SDL_PushEvent(&e);
         }
+    } return;
+    case GEV_DRAG: {
+        // As SDL sends a drag, every event at its point (the title bar's
+        // above the window): positions as it moves, then as it drops,
+        // its files (or text) and its end, or its end alone as it
+        // leaves. What it holds is never said before the drop, so the
+        // platform is never told to refuse it.
+        e.drop.windowID    = id;
+        e.drop.x           = ge->x;
+        e.drop.y           = ge->y;
+        e.common.timestamp = SDL_GetTicksNS();
+        if (ge->button == 1) {
+            e.type = SDL_EVENT_DROP_POSITION;
+            SDL_PushEvent(&e);
+        } else if (ge->button == 2) {
+            char const *item = ge->text.cdata;  // NUL-separated, outliving dispatch
+            char const *end  = item + ge->text.len;
+            e.type = ge->key ? SDL_EVENT_DROP_TEXT : SDL_EVENT_DROP_FILE;
+            for (; item && item<end; item += SDL_strlen(item) + 1) {
+                e.drop.data = item;
+                SDL_PushEvent(&e);
+            }
+        }
+        if (ge->button != 1) {
+            e.type      = SDL_EVENT_DROP_COMPLETE;
+            e.drop.data = 0;
+            SDL_PushEvent(&e);
+        }
+        ge->x = -1;
     } return;
     }
     e.common.timestamp = SDL_GetTicksNS();

@@ -186,7 +186,10 @@ the Files pane, which opens them, or while Open file asks for a path,
 which takes the first), paste them, or pick them with the paper clip.
 Files dropped together are attached together or not at all: when the
 message has no room for them all, none are, and the note says why: how
-many more fit, or that ten is the most. Images go to a model that takes them, as pictures. Any other file goes as text, as `read` shows it:
+many more fit, or that ten is the most. While files are dragged over
+the window, the place they would go is outlined, with a card saying
+what a drop there does ([Dropping files](help:keys#dropping-files)).
+Images go to a model that takes them, as pictures. Any other file goes as text, as `read` shows it:
 numbered lines, the first 2000 or so, then a note to read on. The
 session keeps a copy in its own folder, so the agent can read the rest
 without asking. A PDF goes as its text, extracted, a `--- page N ---`
@@ -296,7 +299,9 @@ session's folder, which Tab completes. After the
 path, `:N` goes to line N and `:A-B` to lines A to B, marked with a
 band until text is selected; opening it again goes there again. A file
 dropped on the pane opens in a tab too, rather than being attached,
-and one dropped anywhere while Open file asks fills in its path.
+and one dropped anywhere while Open file asks fills in its path; as
+files are dragged, the pane or the field is outlined where they would
+go.
 
 A file shows as text, its lines numbered and highlighted, wrapped at
 the pane's width unless Wrap is off (then scrolled sideways), or a

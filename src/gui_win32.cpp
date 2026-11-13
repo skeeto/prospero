@@ -50,6 +50,10 @@ struct W32Hooks {
     void (*placed)(void *gui, int const *geom);  // moved, resized: GEOM_*
     // A file dropped, at x, y in the client area's pixels if at
     void (*drop)(void *gui, unsigned short const *path, int x, int y, int at);
+    // A drag over the window (W32DRAG_*) at x, y in the client area's
+    // pixels if at, else over its frame, holding n items of kind
+    // (W32LOAD_*), dirs of them folders: 1 if a drop there is refused
+    int  (*dragover)(void *gui, int how, int x, int y, int at, int kind, int n, int dirs);
     void (*toasted)(void *gui, int id, int refused);      // a toast clicked
     int    drive;                         // scripted: never take focus
 };
@@ -63,6 +67,11 @@ enum {
                  // the client area's first size, maximized if MAX
     GEOM_COUNT,
 };
+
+// A drag's phases and what it holds, as app.cpp numbers them (DRAG_*,
+// DRAGLOAD_*)
+enum { W32DRAG_OVER, W32DRAG_LEAVE };
+enum { W32LOAD_UNKNOWN, W32LOAD_FILES, W32LOAD_TEXT, W32LOAD_OTHER };
 
 // Input kinds, as app.cpp numbers them (INPUT_*)
 enum {
@@ -96,6 +105,13 @@ extern "C" void      w32gui_untoast(void *, int id);
 extern "C" void      w32gui_inject(void *, int kind, float x, float y,
                                    int button, int down, int key, int ctrl,
                                    int shift, int alt, unsigned short const *text);
+// The checklist's drag, through the window's drop target as Explorer's
+// comes: phase 1 over x, y in the client area (else over the frame
+// unless at), 2 dropped there, 0 gone; holding text, else the paths,
+// each ending in '\n'. 1 if the target takes it, 0 if it refuses it,
+// -1 with no target (the window shed, or no OLE).
+extern "C" int       w32gui_drag(void *, int phase, int x, int y, int at, int text,
+                                 unsigned short const *paths);
 extern "C" int       w32gui_systheme(void *);  // 1 if apps should be dark
 extern "C" int       w32gui_theme(void *, int dark);  // the title bar's
 extern "C" void      w32gui_close(void *);
@@ -371,6 +387,10 @@ struct W32Gui {
                                          // 1 light, 2 dark, 0 the real one
     float                   repdelay;    // the key repeat (keyrepeat): seconds
     float                   repgap;      // to the first repeat, and between
+    int                     ole;         // OleInitialize succeeded: an STA
+    int                     dropon;      // the window's drop target is registered
+    int                     dragfiles;   // the drag over it holds files (CF_HDROP)
+    IDataObject            *dragobj;     // the checklist's drag, while it lasts
 };
 
 // The Keyboard control panel's repeat delay, 0 to 3 for a quarter second
@@ -817,6 +837,113 @@ static void resetdevice(W32Gui *w)
     w->hooks.force(w->hooks.gui);
 }
 
+// The window's OLE drop target, through which drags and drops arrive
+// (DragAcceptFiles stays for sources that only post WM_DROPFILES). It
+// tells the core where a drag is, and answers COPY, or NONE where the
+// core would refuse a drop or the drag holds no files, never MOVE. A
+// drop's files are handed on as a copy of their HDROP, posted as
+// WM_DROPFILES, so that its walker stays the one way paths arrive, the
+// source let go before any is touched. Static, its count a constant,
+// as the window holds it, never the source.
+struct W32Drop : IDropTarget {
+    W32Gui *w = 0;
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void **out) override
+    {
+        if (IsEqualIID(id, __uuidof(IUnknown)) || IsEqualIID(id, __uuidof(IDropTarget))) {
+            *out = this;
+            return S_OK;
+        }
+        *out = 0;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override  { return 2; }
+    ULONG STDMETHODCALLTYPE Release() override { return 1; }
+
+    // At pt, on the screen: the hook's verdict, as an effect
+    DWORD over(POINTL pt, DWORD allowed)
+    {
+        if (!w->dragfiles || !w->hwnd) {
+            return DROPEFFECT_NONE;
+        }
+        POINT p  = {pt.x, pt.y};
+        RECT  cr = {};
+        ScreenToClient(w->hwnd, &p);
+        GetClientRect(w->hwnd, &cr);
+        int at      = PtInRect(&cr, p) != FALSE;
+        int refused = w->hooks.dragover(w->hooks.gui, W32DRAG_OVER, (int)p.x, (int)p.y, at,
+                                        W32LOAD_UNKNOWN, 0, 0);
+        return allowed&DROPEFFECT_COPY && !refused ? DROPEFFECT_COPY : DROPEFFECT_NONE;
+    }
+
+    void leave()
+    {
+        w->dragfiles = 0;
+        w->hooks.dragover(w->hooks.gui, W32DRAG_LEAVE, 0, 0, 0, 0, 0, 0);
+    }
+
+    HRESULT STDMETHODCALLTYPE DragEnter(IDataObject *o, DWORD, POINTL pt, DWORD *effect) override
+    {
+        // Files, or nothing: asked of the format, which renders nothing,
+        // as a lazy source (an archive's contents) would on GetData
+        FORMATETC fe = {CF_HDROP, 0, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+        w->dragfiles = o && o->QueryGetData(&fe)==S_OK;
+        *effect = over(pt, *effect);
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE DragOver(DWORD, POINTL pt, DWORD *effect) override
+    {
+        *effect = over(pt, *effect);
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE DragLeave() override
+    {
+        leave();
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE Drop(IDataObject *o, DWORD, POINTL pt, DWORD *effect) override
+    {
+        FORMATETC fe   = {CF_HDROP, 0, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+        STGMEDIUM sm   = {};
+        HGLOBAL   copy = 0;
+        if (w->hwnd && o && o->GetData(&fe, &sm)==S_OK) {
+            SIZE_T size = sm.tymed==TYMED_HGLOBAL ? GlobalSize(sm.hGlobal) : 0;
+            copy        = size>=sizeof(DROPFILES) ? GlobalAlloc(GMEM_MOVEABLE, size) : 0;
+            void *src   = copy ? GlobalLock(sm.hGlobal) : 0;
+            void *dst   = src  ? GlobalLock(copy) : 0;
+            if (dst) {
+                // Where, in client coordinates, or off the client area
+                memcpy(dst, src, size);
+                POINT p  = {pt.x, pt.y};
+                RECT  cr = {};
+                ScreenToClient(w->hwnd, &p);
+                GetClientRect(w->hwnd, &cr);
+                DROPFILES *df = (DROPFILES *)dst;
+                df->pt  = p;
+                df->fNC = !PtInRect(&cr, p);
+                GlobalUnlock(copy);
+            }
+            if (src) GlobalUnlock(sm.hGlobal);
+            if (!dst && copy) {
+                GlobalFree(copy);
+                copy = 0;
+            }
+            ReleaseStgMedium(&sm);
+        }
+        if (copy && !PostMessageW(w->hwnd, WM_DROPFILES, (WPARAM)copy, 0)) {
+            GlobalFree(copy);
+            copy = 0;
+        }
+        *effect = copy ? DROPEFFECT_COPY : DROPEFFECT_NONE;
+        leave();
+        return S_OK;
+    }
+};
+static constinit W32Drop w32drop;
+
 static int makewindow(W32Gui *w, unsigned short const *title, int const *geom);
 
 extern "C" void *w32gui_open(W32Hooks *hooks, unsigned short const *title,
@@ -864,6 +991,9 @@ extern "C" void *w32gui_open(W32Hooks *hooks, unsigned short const *title,
         return 0;
     }
     SetWindowLongPtrW(w->msgwin, GWLP_USERDATA, (LONG_PTR)w);
+    // OLE, not COM alone, for the window's drop target: this thread is
+    // a single-threaded apartment from here on
+    w->ole = SUCCEEDED(OleInitialize(0));
     return makewindow(w, title, geom) ? w : 0;
 }
 
@@ -925,6 +1055,8 @@ static int makewindow(W32Gui *w, unsigned short const *title, int const *geom)
     hooks->scale(hooks->gui, scale);
 
     SetWindowLongPtrW(w->hwnd, GWLP_USERDATA, (LONG_PTR)w);
+    w32drop.w = w;
+    w->dropon = w->ole && SUCCEEDED(RegisterDragDrop(w->hwnd, &w32drop));
     return 1;
 }
 
@@ -938,6 +1070,15 @@ extern "C" void w32gui_shed(void *p)
         return;
     }
     SetWindowLongPtrW(w->hwnd, GWLP_USERDATA, 0);
+    if (w->dropon) {
+        RevokeDragDrop(w->hwnd);
+        w->dropon = 0;
+    }
+    if (w->dragobj) {
+        w->dragobj->Release();
+        w->dragobj = 0;
+    }
+    w->dragfiles = 0;
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     dropdevice(w);
@@ -1280,6 +1421,81 @@ static HGLOBAL makehdrop(wchar_t const *paths, POINT pt, BOOL fnc)
     return mem;
 }
 
+// The checklist's drag, as Explorer's or an editor's comes: an object of
+// the shell's own holding its files (CF_HDROP) or text
+// (CF_UNICODETEXT), kept from its first move over the window to its
+// leaving or drop, handed to the window's drop target at points on the
+// screen.
+extern "C" int w32gui_drag(void *p, int phase, int x, int y, int, int text,
+                           unsigned short const *paths)
+{
+    W32Gui *w = (W32Gui *)p;
+    if (!w->hwnd || !w->dropon) {
+        return -1;
+    }
+    POINT pt = {x, y};
+    ClientToScreen(w->hwnd, &pt);
+    POINTL at     = {pt.x, pt.y};
+    DWORD  effect = DROPEFFECT_COPY|DROPEFFECT_MOVE|DROPEFFECT_LINK;  // as Explorer allows
+    if (!w->dragobj && phase) {
+        IDataObject *o = 0;
+        if (FAILED(SHCreateDataObject(0, 0, 0, 0, __uuidof(IDataObject), (void **)&o))) {
+            return -1;
+        }
+        HGLOBAL mem = 0;
+        if (text) {
+            int n = 0;
+            for (; paths && paths[n]; n++) {}
+            n -= n && paths[n-1]=='\n';  // the end of its one item
+            mem = GlobalAlloc(GMEM_MOVEABLE, (SIZE_T)(n + 1)*sizeof(wchar_t));
+            wchar_t *t = mem ? (wchar_t *)GlobalLock(mem) : 0;
+            if (t) {
+                for (int i = 0; i < n; i++) t[i] = paths[i];
+                t[n] = 0;
+                GlobalUnlock(mem);
+            }
+        } else {
+            mem = makehdrop(paths ? (wchar_t const *)paths : L"", {}, FALSE);
+        }
+        FORMATETC fe = {(CLIPFORMAT)(text ? CF_UNICODETEXT : CF_HDROP), 0, DVASPECT_CONTENT, -1,
+                        TYMED_HGLOBAL};
+        STGMEDIUM sm = {};
+        sm.tymed   = TYMED_HGLOBAL;
+        sm.hGlobal = mem;
+        if (!mem || FAILED(o->SetData(&fe, &sm, TRUE))) {
+            if (mem) GlobalFree(mem);
+            o->Release();
+            return -1;
+        }
+        w->dragobj = o;
+        w32drop.DragEnter(o, 0, at, &effect);
+        if (phase == 1) {
+            return effect != DROPEFFECT_NONE;
+        }
+        effect = DROPEFFECT_COPY|DROPEFFECT_MOVE|DROPEFFECT_LINK;
+    }
+    if (phase == 1) {
+        w32drop.DragOver(0, at, &effect);
+        return effect != DROPEFFECT_NONE;
+    } else if (phase == 2) {
+        w32drop.DragOver(0, at, &effect);
+        if (effect != DROPEFFECT_NONE) {
+            // As OLE drops only where the target said it would take it
+            effect = DROPEFFECT_COPY|DROPEFFECT_MOVE|DROPEFFECT_LINK;
+            w32drop.Drop(w->dragobj, 0, at, &effect);
+        } else {
+            w32drop.DragLeave();
+        }
+    } else {
+        w32drop.DragLeave();
+    }
+    if (w->dragobj) {
+        w->dragobj->Release();
+        w->dragobj = 0;
+    }
+    return phase==2 && effect!=DROPEFFECT_NONE;
+}
+
 extern "C" void w32gui_inject(void *p, int kind, float x, float y,
                               int button, int down, int key, int ctrl,
                               int shift, int alt, unsigned short const *text)
@@ -1534,6 +1750,10 @@ extern "C" void w32gui_close(void *p)
     DestroyWindow(w->msgwin);
     UnregisterClassW(L"prospero", GetModuleHandleW(0));
     UnregisterClassW(L"prospero-msg", GetModuleHandleW(0));
+    if (w->ole) {
+        OleUninitialize();
+        w->ole = 0;
+    }
 }
 
 // The save dialog runs on a thread of its own, so that the window's
@@ -1880,6 +2100,9 @@ static_assert(GEV_MOVE==0 && GEV_RESIZE==5 && GEV_MODALSIZE==6 && GEV_DPI==7 &&
               GEV_CLOSE==8 && GEV_MINIMIZE==9 && GEV_SYSTHEME==10 && GEV_TRAY==11 &&
               GEV_DROP==12 && GEV_TOAST==13);
 static_assert(TRAY_OPEN==0 && TRAY_STOPALL==1 && TRAY_QUIT==2);
+static_assert((i32)W32DRAG_OVER==DRAG_OVER && (i32)W32DRAG_LEAVE==DRAG_LEAVE);
+static_assert((i32)W32LOAD_UNKNOWN==DRAGLOAD_UNKNOWN && (i32)W32LOAD_FILES==DRAGLOAD_FILES &&
+              (i32)W32LOAD_TEXT==DRAGLOAD_TEXT && (i32)W32LOAD_OTHER==DRAGLOAD_OTHER);
 static_assert(FLASH_CANCEL==0 && FLASH_BRIEFLY==1 && FLASH_UNTILFOCUSED==2);
 
 W32(i32, GetCurrentThreadId());
@@ -1925,6 +2148,12 @@ static void hookdrop(void *p, unsigned short const *path, int x, int y, int at)
     for (; path[n]; n++) {}
     Str  s = fromwide(&g->frame, (c16 *)path, n);  // until the next frame
     gui_drop(g, s, 0, (f32)x, (f32)y, at);
+}
+
+// Client pixels are ImGui's units, as for hookdrop.
+static int hookdragover(void *g, int how, int x, int y, int at, int kind, int n, int dirs)
+{
+    return gui_dragover((Gui *)g, how, (f32)x, (f32)y, at, kind, n, dirs);
 }
 
 static i32 os_guidisplays(Os *, WinBox *out, i32 max)
@@ -2024,6 +2253,7 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
     h.toasted   = hooktoasted;
     h.placed    = hookplaced;
     h.drop      = hookdrop;
+    h.dragover  = hookdragover;
     h.drive     = g->drive;
     os->gui = w32gui_open(&h, wtitle, geom);
     if (!os->gui) {
@@ -2076,13 +2306,20 @@ static void os_guiinject(Os *os, GuiEvent *e)
     if (e->kind==GEV_FLAGPASTE || e->kind==GEV_CLIPRACE || e->kind==GEV_CLIPOWN) {
         e->x = -1;  // macOS only
         return;
-    } else if (e->kind == GEV_DROP) {
+    } else if (e->kind==GEV_DROP || e->kind==GEV_DRAG) {
         // Its paths each end in a NUL: the edge's end in '\n' instead
         Str16 paths = towide(&a, e->text);
         for (iz i = 0; i < paths.len; i++) {
             paths.data[i] = paths.data[i] ? paths.data[i] : '\n';
         }
         text = (unsigned short *)paths.data;
+        if (e->kind == GEV_DRAG) {
+            // Through the drop target, not as a message (no GEV number
+            // crosses the edge for it)
+            e->x = (f32)w32gui_drag(os->gui, e->button, (int)e->x, (int)e->y, e->down,
+                                    e->key, text);
+            return;
+        }
     } else if (e->text.len) {
         text = (unsigned short *)towide(&a, e->text).data;
     }
@@ -2475,7 +2712,7 @@ static b32 os_guiclipput(Os *os, Arena, Str png)
 
 static u32 os_guilimits(Os *)
 {
-    return 0;
+    return GUI_NODRAGLOAD;
 }
 
 static b32 os_guireveal(Os *, Arena scratch, Str dir)

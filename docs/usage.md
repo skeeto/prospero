@@ -57,7 +57,10 @@ Session → Open file... (Ctrl+O, Cmd+O) shows a file on the session's host
 Files pane, hidden until then: in a tab of the session shown, its lines
 numbered and highlighted, wrapped or not, a Markdown file rendered (or as
 text), and `path:N` or `path:A-B` scrolled to those lines and marked. Ctrl+W (Cmd+W) closes its front tab, Ctrl+F (Cmd+F) finds in its file, and Ctrl+G goes to a line, while it has the focus. A
-file dropped on the Files pane opens there too, not attached. The
+file dropped on the Files pane opens there too, not attached; while files
+are dragged over the window, the place they would go (Files, the prompt
+or Open file's field) is outlined, with a card saying what a
+drop there does or why the files would not be attached. The
 window opens where it was last, fitted to the displays there are; the
 first time, 1700 by 900 at the display's scale, or maximized on a display
 too small for that. The first run shows Help in front, with Settings and

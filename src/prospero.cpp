@@ -494,7 +494,9 @@ static void    os_wake(Os *);
 // ImGui's units if the platform knows it, or opened in the application
 // as a whole (macOS: Finder, the Dock, open -a), the files of one drop
 // one after another at one point, gui_droptext of text dropped on the
-// window where the platform could not refuse it first, and
+// window where the platform could not refuse it first, gui_dragover of
+// a drag over the window and of its leaving, which answers whether a
+// drop there would be refused, and
 // gui_toasted and gui_toastfail of a desktop notification clicked or
 // refused (os_guitoast).
 struct Gui;
@@ -639,6 +641,12 @@ enum {
                     // the checklist's own pasteboard and the real one;
                     // down 1 gives in x and y how far each moved since,
                     // or x -1 where there is no own pasteboard
+    GEV_DRAG,       // a drag over the window, as the platform's own drags
+                    // come: button 0 leaves, 1 is over, 2 drops; key 1
+                    // holds the words text, else the paths text as for
+                    // GEV_DROP; at x, y if down is set, else over the
+                    // title bar. Out, x 1 if the platform was told to
+                    // take it, 0 to refuse it, -1 where it says nothing
 };
 enum {
     GKEY_TAB,
@@ -762,10 +770,13 @@ static b32     os_guiopenurl(Os *, Arena scratch, Str url);
 // sets its place, and cannot leave being minimized by itself
 // (GUI_NOPLACE); it takes a new clipboard selection only with the serial
 // of a real input event newer than the last one's, which no synthetic
-// event has (GUI_NOSERIAL). The checklist allows for both.
+// event has (GUI_NOSERIAL). What a drag over the window holds may be
+// known only once it is dropped (GUI_NODRAGLOAD): Linux's drags never
+// say. The checklist allows for each.
 enum : u32 {
-    GUI_NOPLACE  = 1<<0,
-    GUI_NOSERIAL = 1<<1,
+    GUI_NOPLACE    = 1<<0,
+    GUI_NOSERIAL   = 1<<1,
+    GUI_NODRAGLOAD = 1<<2,
 };
 static u32     os_guilimits(Os *);
 #endif

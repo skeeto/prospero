@@ -2178,7 +2178,7 @@ def main():
         if args.shots:
             for name in ("history", "menu", "editing", "editfailed", "slash", "models",
                          "drafts", "attached", "images", "compacted", "paused", "continue",
-                         "restored"):
+                         "restored", "dragrefused"):
                 if not os.path.exists(os.path.join(args.shots, f"compose-{name}.png")):
                     problems.append(f"no compose-{name}.png")
     else:

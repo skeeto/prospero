@@ -1177,6 +1177,31 @@ struct DropAt {
 // doesn't fit is attached at once.
 enum { DROP_QUEUE = 1<<20 };
 
+// A drag over the window, as the platform tells of it (gui_dragover)
+enum : i32 {
+    DRAG_OVER,   // over the window, at a point or over its title bar
+    DRAG_LEAVE,  // gone: dropped, cancelled, or off the window
+};
+
+// Files dragged over the window, from the platform's first word of it
+// to its leaving, a drop, or pointer input (gui_input), which no
+// platform gives a window while a drag is over it. Each frame names
+// where a drop would go (dragwhere) and outlines that place with a card
+// that says so (drawdragover). Frames come only as it changes.
+struct DragOver {
+    b32      on;
+    f32      x, y;     // where, in ImGui's units, if at
+    b32      at;       // else over the title bar
+    DropLoad load;     // what it holds, as far as the platform knows
+    b32      refused;  // the platform was told a drop here is refused
+    i32      to;       // DROPTO_*, as this frame names it
+    b32      amber;    // the files would not go: why, in detail
+    char     label[FIELD_MAX];
+    char     detail[FIELD_MAX];
+    Rect     place[DROPTO_COUNT];  // the places drawn this frame (dragplace)
+    b32      shown;    // its card drew this frame
+};
+
 // A file dialog asked for (askpath), kept in case the platform has none
 // to show, as Linux without a desktop portal or zenity has not: a field
 // of this window asks instead, its answer posted as the dialog's would be.
@@ -2233,6 +2258,9 @@ struct Gui {
     Arena              dropa;        // next frame routes them (DROP_QUEUE)
     DropAt            *drophead;
     DropAt            *droptail;
+    DragOver           drag;         // files dragged over the window
+    f32                drivedragfx;  // OP_DRAG's answer: 1 taken, 0
+                                     // refused, -1 the platform says nothing
     u64                attask;       // the attach dialog's latest ask
     GuiSession        *attsess;      // and for which session
     b32                attpend;      // while that dialog is open
@@ -11530,6 +11558,7 @@ static void shed(Gui *g)
     if (!g->trayup) {
         g->trayup = os_trayopen(g->os, "Prospero: sessions running in the background");
     }
+    g->drag = {};  // its platform's word of leaving goes with the window
     os_guished(g->os);
     // The renderer is gone, and with it every texture it had (its
     // Shutdown destroys them): the dying ones' pixels go now, as no
@@ -12238,6 +12267,100 @@ static void gui_input(Gui *g, i32 kind)
         g->lastkey = os_ticks(g->os);
         ImGui::GetIO().ConfigInputTextCursorBlink = 1;
     }
+    if (g->drag.on && (kind==INPUT_MOVE || kind==INPUT_BUTTON)) {
+        // No platform moves or clicks a window's pointer while a drag is
+        // over it: the drag ended unsaid (X11's refused drop, macOS's
+        // failed one). Not a wheel, which macOS passes on mid-drag, nor
+        // keys and focus, which reach a window a drag hovers
+        g->drag.on = 0;
+        guilog(g, "drag ended by input");
+    }
+}
+
+// Whether a drop of l at x, y (if at) would be refused there, between
+// frames by what the last one left (dropfacts), as nothing moves while
+// a drag goes on; inside one (a COM call's reentry), its verdict.
+static b32 gui_dragrefuse(Gui *g, f32 x, f32 y, b32 at, DropLoad l)
+{
+    if (g->sched.inframe) {
+        return g->drag.refused;
+    }
+    Arena scratch = g->frame;
+    return dropwhere(&scratch, dropfacts(g, x, y, at), l).refuse;
+}
+
+// Files dragged over the window (DRAG_OVER), at x, y in ImGui's units
+// if at, else over its title bar, holding n items of kind (DRAGLOAD_*),
+// dirs of them folders, as far as the platform knows; or gone
+// (DRAG_LEAVE). Returns whether a drop there would be refused, for the
+// platform to say so. A frame follows a change alone: the platforms
+// repeat themselves as a drag rests. Leaving applies at once, inside a
+// frame too, being said only once; an OVER inside a frame changes
+// nothing, the next one coming soon enough.
+static b32 gui_dragover(Gui *g, i32 how, f32 x, f32 y, b32 at, i32 kind, i32 n, i32 dirs)
+{
+    DragOver *d = &g->drag;
+    g->woke |= WOKE_OTHER;
+    if (how == DRAG_LEAVE) {
+        if (d->on) {
+            d->on = 0;
+            scheddirty(&g->sched);
+            guilog(g, "drag left");
+        }
+        return 0;
+    } else if (g->sched.inframe) {
+        return d->refused;
+    }
+    DropLoad l = {kind, n, dirs};
+    d->refused = gui_dragrefuse(g, x, y, at, l);
+    if (d->on && d->x==x && d->y==y && d->at==at &&
+            d->load.kind==kind && d->load.n==n && d->load.dirs==dirs) {
+        return d->refused;
+    }
+    if (!d->on) {
+        Arena a = g->frame;
+        Buf   b(&a, 128);
+        print(&b, "drag over the window: ");
+        print(&b, kind==DRAGLOAD_FILES ? Str("files") : kind==DRAGLOAD_TEXT ? Str("text") :
+                  kind==DRAGLOAD_OTHER ? Str("other") : Str("not known"));
+        if (kind == DRAGLOAD_FILES) {
+            print(&b, ", ");
+            print(&b, (i64)n);
+            print(&b, " items, ");
+            print(&b, (i64)dirs);
+            print(&b, " folders");
+        }
+        print(&b, at ? Str("") : Str(", over the title bar"));
+        guilog(g, finish(&b));
+    }
+    d->on   = 1;
+    d->x    = x;
+    d->y    = y;
+    d->at   = at;
+    d->load = l;
+    scheddirty(&g->sched);
+    return d->refused;
+}
+
+// Where a drop of the files dragged over the window would go, for the
+// frame to outline and say (drawdragover): after ImGui's NewFrame, which
+// knows what was where, and before the places are drawn (dragplace).
+static void dragwhere(Gui *g)
+{
+    DragOver *d = &g->drag;
+    d->shown = 0;
+    for (i32 i = 0; i < DROPTO_COUNT; i++) {
+        d->place[i] = {};
+    }
+    if (!d->on) {
+        return;
+    }
+    DropWhere w = dropwhere(&g->frame, dropfacts(g, d->x, d->y, d->at), d->load);
+    d->to      = w.to;
+    d->amber   = w.amber;
+    d->refused = w.refuse;
+    fieldput(d->label, w.label);
+    fieldput(d->detail, w.detail);
 }
 
 static b32 drivewaitdone(Gui *g);
@@ -13124,12 +13247,20 @@ static void gui_frame(Gui *g)
         // The backend reads the real mouse when the window has focus and
         // the mouse is elsewhere: the script's mouse is the one
         io.AddMousePosEvent(g->drivex, g->drivey);
+    } else if (g->drag.on && !g->drive) {
+        // The backend reads the real mouse, as SDL's does when the window
+        // is key and its own pointer is elsewhere (a drag from a window
+        // behind): nothing is hovered under the drag, and no tooltip
+        // waits out its delay there
+        io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
     }
     uishiftpaste(g);
     ImGui::NewFrame();
     droproute(g);  // what was where, as NewFrame knows, before any is drawn
+    dragwhere(g);  // likewise, where a drag would go
     i64 t1 = os_ticks(g->os);
     dockwindows(g);
+    drawdragover(g);  // over all of it, its places drawn now (dragplace)
     codelinksflush(g);  // what inline code drawn asks of other hosts
     i64 t2 = os_ticks(g->os);
     ImGui::Render();
@@ -13707,6 +13838,15 @@ enum : i32 {
                   // in the session shown
     OP_MDOWN,     // middle button
     OP_MUP,
+    OP_DRAG,      // a drag over the window, as the platform's come: dx 0
+                  // leaves, 1 is over the target (T_NONE: the title bar),
+                  // 2 drops there; it holds the words text (dy 1), else
+                  // the comma-separated files text names in --cwd, a
+                  // folder by a trailing '/', made if missing, a file of
+                  // 3 lines if missing. The platform's answer goes to
+                  // drivedragfx (GEV_DRAG)
+    OP_IFDRAGLOAD,// unless the platform says what a drag holds before its
+                  // drop (no GUI_NODRAGLOAD), skip dx ops
 };
 // OP_TEXTCWD with text types the --cwd directory and text after it, on
 // Windows with backslashes, as a Windows user types a path.
@@ -14240,6 +14380,15 @@ enum : i32 {
                       // the bar, with text "hit" the current match's start,
                       // and "carry" a hit also drawn carried into a chunk
     CHK_CONTINUED,    // a turn began by Continue, with its note, not paused
+    CHK_DRAGTO,       // text "off": no drag; else "TO[|LABEL[|DETAIL]]", a
+                      // drag drawn going to TO (droptoname), its label and
+                      // its detail's start as said where the platform
+                      // says what it holds, or with dx 4 anywhere (words
+                      // that need no count, attachwhy's), and refused
+                      // (dx 1) or not there; dx 2: its place outlined is
+                      // New session's folder field (RECT_NEWCWD)
+    CHK_DRAGQUIET,    // no frames since the mark with a drag resting over
+                      // the window (dx 0), or after it ended (dx 1)
     CHK_COUNT,
 };
 
@@ -14563,6 +14712,8 @@ static Str chknames[] = {
     "the Files find bar is as said",
     "the spot in the file is in view",
     "a turn began by Continue, and nothing is paused",
+    "where a drag would drop, and what its card says",
+    "no frames with a drag resting, or after it",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -17252,6 +17403,76 @@ static DriveOp m3ops[] = {
     {OP_MOVE, T_EMPTY, 0, 0, 4500, ""},
     {OP_MARK, 0, 0, 0, 3000, ""},
     {OP_CHECK, CHK_FILEQUIET, 0, 0, 0, ""},
+    // Files dragged over the window: over Files, the pane outlined with a
+    // card saying they would open there, resting with no frames; over the
+    // prompt, and over the title bar, to be attached; and gone, the card
+    // with them, still no frames. Counts only where the platform says
+    // what a drag holds
+    {OP_DRAG, T_FILESPANE, 1, 0, 600, "files/drag1.txt,files/drag2.txt"},
+    {OP_CHECK, CHK_DRAGTO, 0, 0, 0, "files|Open 2 in Files|to read, not attached"},
+    {OP_SHOT, 0, 0, 0, 300, "files-dragover"},
+    {OP_MARK, 0, 0, 0, 3000, ""},
+    {OP_CHECK, CHK_DRAGQUIET, 0, 0, 0, ""},
+    {OP_DRAG, T_PROMPT, 1, 0, 600, "files/drag1.txt,files/drag2.txt"},
+    {OP_CHECK, CHK_DRAGTO, 0, 0, 0, "attach|Attach 2|to the next message"},
+    {OP_SHOT, 0, 0, 0, 300, "files-dragattach"},
+    {OP_DRAG, T_NONE, 1, 0, 600, "files/drag1.txt,files/drag2.txt"},
+    {OP_CHECK, CHK_DRAGTO, 0, 0, 0, "attach"},
+    {OP_DRAG, 0, 0, 0, 600, ""},
+    {OP_CHECK, CHK_DRAGTO, 0, 0, 0, "off"},
+    // past the hover the drag's points left behind, as CHK_FILEQUIET
+    {OP_MOVE, T_EMPTY, 0, 0, 4500, ""},
+    {OP_MARK, 0, 0, 0, 3000, ""},
+    {OP_CHECK, CHK_DRAGQUIET, 1, 0, 0, ""},
+    // With Open file up, its field, which a drop fills with the first;
+    // and a drag that ends unsaid ends with the pointer's next move
+    CMDKEY(GKEY_O, 500),
+    {OP_DRAG, T_FILESPANE, 1, 0, 600, "files/drag1.txt,files/drag2.txt"},
+    {OP_CHECK, CHK_DRAGTO, 0, 0, 0, "field|Fill in the path|the first of 2 files only"},
+    {OP_SHOT, 0, 0, 0, 300, "files-dragfield"},
+    {OP_DRAG, T_FILESPANE, 2, 0, 800, "files/drag1.txt,files/drag2.txt"},
+    {OP_CHECK, CHK_DRAGTO, 0, 0, 0, "off"},
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 300, ":2"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_FILEPATH, 0, 0, 0, "/files/drag1.txt"},
+    {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "2-2"},
+    {OP_CHECK, CHK_ATTACHED, 0, 0, 0, ""},
+    {OP_DRAG, T_FILESPANE, 1, 0, 600, "files/drag1.txt"},
+    {OP_MOVE, T_EMPTY, 0, 0, 600, ""},
+    {OP_CHECK, CHK_DRAGTO, 0, 0, 0, "off"},
+    {OP_DRAG, 0, 0, 0, 300, ""},
+    // Where the platform says what a drag holds: text, refused; a folder,
+    // to New session, its folder field outlined once that is up; and a
+    // folder with a file, each its own way
+    {OP_IFDRAGLOAD, 0, 23, 0, 0, ""},
+    {OP_DRAG, T_PROMPT, 1, 1, 600, "Some dragged words"},
+    {OP_CHECK, CHK_DRAGTO, 1, 0, 0, "none|Only files can be dropped here"},
+    {OP_SHOT, 0, 0, 0, 300, "files-dragtext"},
+    {OP_DRAG, 0, 0, 0, 300, ""},
+    {OP_DRAG, T_FILESPANE, 1, 0, 600, "files/dragdir/"},
+    {OP_CHECK, CHK_DRAGTO, 0, 0, 0, "newsession|New session|in the folder dropped"},
+    {OP_DRAG, 0, 0, 0, 300, ""},
+    {OP_DRAG, T_FILESPANE, 1, 0, 600, "files/drag1.txt,files/dragdir/"},
+    {OP_CHECK, CHK_DRAGTO, 0, 0, 0,
+     "files|Open in Files|to read, not attached, and New session for the folder"},
+    {OP_DRAG, 0, 0, 0, 300, ""},
+    {OP_MOVE, T_SESSMENU, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NEWBTN, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_DRAG, T_NEWCWD, 1, 0, 600, "files/dragdir/"},
+    {OP_CHECK, CHK_DRAGTO, 2, 0, 0, "newsession|New session|in the folder dropped"},
+    {OP_DRAG, 0, 0, 0, 300, ""},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 500, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
     // Closing with a turn running asks first; Cancel goes back, and
     // stopping quits
     {OP_PROMPT, 0, 0, 0, 100, "Close me: run a very slow command."},
@@ -21066,11 +21287,23 @@ static DriveOp composeops[] = {
     {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
     {OP_DROP, T_PROMPT, 0, 2, 800, "m1.txt,m2.txt,m3.txt,m4.txt,m5.txt,m6.txt,m7.txt,m8.txt"},
     {OP_CHECK, CHK_ATTACHED, 8, 0, 0, ""},
+    // Dragged first, where the platform says how many: refused, the card
+    // saying why
+    {OP_IFDRAGLOAD, 0, 3, 0, 0, ""},
+    {OP_DRAG, T_PROMPT, 1, 0, 600, "m9.txt,m10.txt,m11.txt"},
+    {OP_CHECK, CHK_DRAGTO, 1, 0, 0, "attach|Not attached|Room for 2 more in this message"},
+    {OP_DRAG, 0, 0, 0, 300, ""},
     {OP_DROP, T_PROMPT, 0, 2, 800, "m9.txt,m10.txt,m11.txt"},
     {OP_CHECK, CHK_ATTACHED, 8, 0, 0, ""},
     {OP_CHECK, CHK_NOTE, 0, 0, 0, "not attached: Room for 2 more in this message"},
     {OP_DROP, T_PROMPT, 0, 2, 800, "m9.txt,m10.txt"},
     {OP_CHECK, CHK_ATTACHED, 10, 0, 0, ""},
+    // A drag with the message full says why in amber, whatever it holds
+    {OP_DRAG, T_PROMPT, 1, 0, 600, "m11.txt"},
+    {OP_CHECK, CHK_DRAGTO, 5, 0, 0, "attach|Not attached|At most 10 files go in a message"},
+    {OP_SHOT, 0, 0, 0, 300, "compose-dragrefused"},
+    {OP_DRAG, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_DRAGTO, 0, 0, 0, "off"},
     {OP_DROP, T_PROMPT, 0, 2, 800, "m11.txt"},
     {OP_CHECK, CHK_ATTACHED, 10, 0, 0, ""},
     {OP_CHECK, CHK_NOTE, 0, 0, 0, "not attached: At most 10 files go in a message"},
@@ -23422,6 +23655,57 @@ static b32 drivecheck(Gui *g, i32 chk)
         ImGuiWindow *w = ImGui::FindWindowByName("Output");
         return !g->outopen && (!w || !w->Active);
     }
+    case CHK_DRAGTO: {
+        DriveOp  *op     = &g->ops[g->drivepc-1];
+        DragOver *d      = &g->drag;
+        i32       dx     = (i32)op->dx;
+        Str       label  = {(u8 *)d->label, (iz)__builtin_strlen(d->label)};
+        Str       detail = {(u8 *)d->detail, (iz)__builtin_strlen(d->detail)};
+        Rect      place  = d->place[DROPTO_NEWSESSION];
+        Rect      field  = g->rects[RECT_NEWCWD];
+        Arena     a      = g->frame;
+        Buf       b(&a, 512);
+        print(&b, "drive: the drag is ");
+        if (!d->on) {
+            print(&b, "off");
+        } else {
+            print(&b, droptoname(d->to));
+            putbyte(&b, '|');
+            print(&b, label);
+            putbyte(&b, '|');
+            print(&b, detail);
+            print(&b, d->refused ? Str(", refused") : Str(""));
+            print(&b, d->shown ? Str("") : Str(", not drawn"));
+        }
+        guilog(g, finish(&b));
+        if (op->text == Str("off")) {
+            return !d->on;
+        }
+        // The words and the verdict where the platform says what the
+        // drag holds, and so the counts; its answer, where it gives one
+        Cut  to    = cut(op->text, '|');
+        Cut  words = cut(to.tail, '|');
+        b32  known = !(os_guilimits(g->os) & GUI_NODRAGLOAD);
+        b32  ok    = d->on && d->shown && droptoname(d->to)==to.head;
+        if (to.ok && (known || dx&4)) {
+            ok &= label == words.head;
+            ok &= !words.ok || startswith(detail, words.tail);
+        }
+        if (known && g->drivedragfx>=0) {
+            ok &= d->refused == ((dx&1) != 0);
+            ok &= (g->drivedragfx == 0) == ((dx&1) != 0);
+        }
+        if (dx & 2) {
+            ok &= place.x0==field.x0 && place.y0==field.y0 && place.x1==field.x1 &&
+                  place.y1==field.y1 && place.x1>place.x0;
+        }
+        return ok;
+    }
+    case CHK_DRAGQUIET:
+        if (g->ops[g->drivepc-1].dx == 0) {
+            return g->drag.on && drivequiet(g, "with a drag resting over the window", 2);
+        }
+        return !g->drag.on && drivequiet(g, "after a drag", 2);
     case CHK_SHOTCLOSED: {
         ImGuiWindow *w = ImGui::FindWindowByName("Screenshot");
         return !g->img.view.open && !g->img.view.tex && !g->img.dying && (!w || !w->Active);
@@ -26017,6 +26301,65 @@ static void drivestep(Gui *g)
         }
         os_guiinject(g->os, &e);
     } break;
+    case OP_DRAG: {
+        // Its items as GEV_DROP has them, each ending in a NUL, kept for
+        // the events, which outlive this frame; or its words
+        Arena a = g->frame;
+        Buf   items(&g->perm, 4096);
+        b32   ok = 1;
+        if (op->dy == 1) {
+            print(&items, op->text);
+            putbyte(&items, 0);
+        }
+        for (Str rest = op->dy==1 ? Str{} : op->text; ok && rest.len;) {
+            Cut c    = cut(rest, ',');
+            rest     = c.tail;
+            b32 dir  = endswith(c.head, "/");
+            Str path = join(&a, g->drivecwd, dir ? cuttail(c.head, 1) : c.head);
+            i32 st   = os_stat(g->os, a, path).type;
+            if (dir && st!=STAT_DIR) {
+                ok = os_mkdirs(g->os, a, path);
+            } else if (!dir && st==STAT_MISSING) {
+                Str body = dropbody(&a, ".txt", 0, 0, 3);
+                ok = os_write(g->os, a, path, body);
+            }
+            print(&items, path);
+            putbyte(&items, 0);
+        }
+        if (!ok) {
+            guilog(g, "drive: FAIL could not make the files to drag");
+            g->drivechecks++;
+            g->drivefails++;
+            break;
+        }
+        // The title bar's point, T_NONE's, is above the window, as the
+        // platforms have it
+        ImVec2 p = op->target!=T_NONE ? targetpos(g, op->target) : v2(40, -10);
+        e.kind   = GEV_DRAG;
+        e.button = (i32)op->dx;
+        e.key    = op->dy == 1;
+        e.down   = op->target != T_NONE;
+        e.x      = p.x;
+        e.y      = p.y;
+        e.text   = finish(&items);
+        os_guiinject(g->os, &e);
+        g->drivedragfx = e.x;
+        // A fresh scratch: on Windows the inject reenters through the
+        // drop target's hook, whose own scratch went over a's
+        Arena l = g->frame;
+        Buf   b(&l, 128);
+        print(&b, "drive: drag ");
+        print(&b, op->dx==0 ? Str("left") : op->dx==1 ? Str("over") : Str("dropped"));
+        print(&b, e.x<0 ? Str(", the platform said nothing") :
+                  e.x>0 ? Str(", taken") : Str(", refused"));
+        guilog(g, finish(&b));
+    } break;
+    case OP_IFDRAGLOAD:
+        if (os_guilimits(g->os) & GUI_NODRAGLOAD) {
+            guilog(g, "drive: skip, with no word of what a drag holds before its drop");
+            g->drivepc += (i32)op->dx;
+        }
+        break;
     case OP_CLIPRACE: {
         e.kind = GEV_CLIPRACE;
         os_guiinject(g->os, &e);

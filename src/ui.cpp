@@ -117,6 +117,19 @@ static void itemrect(Gui *g, i32 which)
     g->rects[which] = {a.x, a.y, z.x, z.y};
 }
 
+// While files are dragged over the window, remember where the last item
+// went as the place a drop to (DROPTO_*) would go, for drawdragover to
+// outline: never in the checklist's rects, which go stale whenever their
+// item is not drawn.
+static void dragplace(Gui *g, i32 to)
+{
+    if (g->drag.on) {
+        ImVec2 a = ImGui::GetItemRectMin();
+        ImVec2 z = ImGui::GetItemRectMax();
+        g->drag.place[to] = {a.x, a.y, z.x, z.y};
+    }
+}
+
 static b32 checkbox(char const *label, b32 *v)
 {
     bool b = *v;
@@ -7151,6 +7164,7 @@ static void drawprompt(Gui *g)
     g->promptend = g->promptend==2 ? 0 : g->promptend;
     ImGui::PopID();
     itemrect(g, RECT_PROMPT);
+    dragplace(g, DROPTO_ATTACH);
     ImVec2 r0 = ImGui::GetItemRectMin();
     ImVec2 r1 = ImGui::GetItemRectMax();
     if (edited && !cb.recalled) {
@@ -9294,6 +9308,20 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other, 
     ImGui::PopID();
 }
 
+// A card over everything, c0 to c1, with a shadow below it: a dragged
+// session's (dragcard), or what a drop of files would do (drawdragover).
+static void cardbox(ImDrawList *dl, f32 sc, ImVec2 c0, ImVec2 c1, Palette *pal, u32 border)
+{
+    f32 rd = 6*sc;
+    for (i32 i = 4; i >= 1; i--) {
+        f32 d = (f32)i*2*sc;
+        dl->AddRectFilled(v2(c0.x - d/2, c0.y + d/2), v2(c1.x + d/2, c1.y + d),
+                          IM_COL32(0, 0, 0, 16), rd + d);
+    }
+    dl->AddRectFilled(c0, c1, fade(pal->rowhover, 0.88f), rd);
+    dl->AddRect(c0, c1, border, rd, sc);
+}
+
 // The dragged session's card, held under the pointer where its row was
 // taken hold of, as if lifted out of the list, with a shadow: its dot,
 // its title, and below, where it would go if dropped now. It moves up
@@ -9319,14 +9347,7 @@ static void dragcard(Gui *g, Arena a, GuiSession *s)
         c0.y = st.y - 4*sc - h;
     }
     ImVec2 c1 = v2(c0.x + w, c0.y + h);
-    f32    rd = 6*sc;
-    for (i32 i = 4; i >= 1; i--) {
-        f32 d = (f32)i*2*sc;
-        dl->AddRectFilled(v2(c0.x - d/2, c0.y + d/2), v2(c1.x + d/2, c1.y + d),
-                          IM_COL32(0, 0, 0, 16), rd + d);
-    }
-    dl->AddRectFilled(c0, c1, fade(g->pal->rowhover, 0.88f), rd);
-    dl->AddRect(c0, c1, fade(g->pal->active, 0.7f), rd, sc);
+    cardbox(dl, sc, c0, c1, g->pal, fade(g->pal->active, 0.7f));
 
     View *v     = s->view;
     i32   state = v ? v->state : s->state;
@@ -9344,6 +9365,88 @@ static void dragcard(Gui *g, Arena a, GuiSession *s)
     } else {
         pen(&b, sesswhere(&a, s), 0, g->pal->dim);
     }
+}
+
+// While files are dragged over the window, the place a drop would go,
+// tinted and outlined, with a card over it that says what a drop does,
+// or in amber why the files would not go (dragwhere): drawn over
+// everything, a modal's dim too, as no item of ImGui's, so that it takes
+// no input, no name and no cursor, the platform's own during a drag.
+// The places:
+// - Open file's field, and New session's folder field (else the whole
+//   window, under another dialog such as the fork's);
+// - the Files pane, as FindHoveredWindowEx finds it (dropfacts): docked,
+//   below its tab, as the dock's tab strip is not the pane's;
+// - the prompt, to attach to, through a modal's dim as well.
+static void drawdragover(Gui *g)
+{
+    DragOver *d = &g->drag;
+    if (!d->on) {
+        return;
+    }
+    f32            sc   = g->scale;
+    Palette       *pal  = g->pal;
+    ImDrawList    *dl   = ImGui::GetForegroundDrawList();
+    ImGuiViewport *vp   = ImGui::GetMainViewport();
+    DropBox        work = {vp->WorkPos.x, vp->WorkPos.y, vp->WorkPos.x + vp->WorkSize.x,
+                           vp->WorkPos.y + vp->WorkSize.y};
+    Rect           at   = {};
+    f32            rd   = ImGui::GetStyle().FrameRounding;
+    switch (d->to) {
+    case DROPTO_FIELD:
+    case DROPTO_ATTACH:
+        at = d->place[d->to];
+        break;
+    case DROPTO_FILES:
+        if (g->filesdrawn && g->fileswindow) {
+            ImRect r = g->fileswindow->OuterRectClipped;
+            at = {r.Min.x, r.Min.y, r.Max.x, r.Max.y};
+            rd = 6*sc;
+        }
+        break;
+    case DROPTO_NEWSESSION:
+        at = d->place[DROPTO_NEWSESSION];
+        if (at.x1<=at.x0 || at.y1<=at.y0) {
+            at = {work.x0 + 4*sc, work.y0 + 4*sc, work.x1 - 4*sc, work.y1 - 4*sc};
+            rd = 6*sc;
+        }
+        break;
+    }
+    u32 c = d->amber ? pal->amber : pal->active;
+    if (at.x1>at.x0 && at.y1>at.y0) {
+        dl->AddRectFilled(v2(at.x0, at.y0), v2(at.x1, at.y1), fade(c, d->amber ? 0.10f : 0.16f), rd);
+        dl->AddRect(v2(at.x0, at.y0), v2(at.x1, at.y1), fade(c, d->amber ? 0.6f : 0.85f), rd, 2*sc);
+    }
+
+    // The card: an icon, the label, and below it the detail
+    Str label  = {(u8 *)d->label, (iz)__builtin_strlen(d->label)};
+    Str detail = {(u8 *)d->detail, (iz)__builtin_strlen(d->detail)};
+    Str icon   = d->to==DROPTO_FIELD || d->to==DROPTO_FILES ? Str(ICON_FILE) :
+                 d->to==DROPTO_NEWSESSION                  ? Str(ICON_NEWFOLDER) :
+                                                             Str(ICON_ATTACH);
+    f32     size   = g->fonts.size;
+    f32     small  = smallsize(&g->fonts);
+    f32     lineh  = ImGui::GetTextLineHeight();
+    f32     padx   = 10*sc;
+    f32     pady   = 6*sc;
+    ImFont *prose  = stylefont(&g->fonts, 0);
+    f32     indent = textsize(prose, size, icon, 0).x + 6*sc;
+    f32     lw     = textsize(stylefont(&g->fonts, STYLE_BOLD), size, label, 0).x;
+    f32     dw     = detail.len ? textsize(prose, small, detail, 0).x : 0;
+    f32     w      = 2*padx + indent + (lw>dw ? lw : dw);
+    f32     h      = 2*pady + lineh + (detail.len ? lineh*small/size : 0);
+    w = w<work.x1-work.x0 ? w : work.x1-work.x0;
+    DropBox card = cardplace({at.x0, at.y0, at.x1, at.y1}, w, h, work, d->x, d->y, 8*sc);
+    ImVec2  c0   = v2(card.x0, card.y0);
+    ImVec2  c1   = v2(card.x1, card.y1);
+    cardbox(dl, sc, c0, c1, pal, c);
+    Pen p = {dl, &g->fonts, c0.x + padx, c0.y + pady, c1.x - padx, size};
+    pen(&p, icon, 0, c);
+    p.x = c0.x + padx + indent;
+    pen(&p, label, STYLE_BOLD, d->amber ? pal->amber : pal->text);
+    Pen q = {dl, &g->fonts, c0.x + padx + indent, c0.y + pady + lineh, c1.x - padx, small};
+    pen(&q, detail, 0, pal->dim);
+    d->shown = 1;
 }
 
 // While a session is dragged: the space below the rows, out of its
@@ -11161,6 +11264,9 @@ static void drawpathask(Gui *g, PathAsk *pa, char const *pid, char const *name, 
         ImGui::InputTextWithHint("##cwd", cstr0(&a, hint), pa->buf, FIELD_MAX,
                                  pf.flags, pathcb, &pf.cb);
         itemnamed(g, concat(&a, nm, " field"));
+        if (openfile) {
+            dragplace(g, DROPTO_FIELD);
+        }
         pathafter(g, &pf, pa->buf);
         b32 checking = openfile && g->fask.statid;
         if (checking) {
@@ -11614,6 +11720,7 @@ static b32 drawnewctr(Gui *g, Arena a, b32 *enter)
     ImGui::InputTextWithHint("##cwd", "A folder on this computer", g->newcwd, FIELD_MAX,
                              pf.flags, pathcb, &pf.cb);
     itemrect(g, RECT_NEWCWD);
+    dragplace(g, DROPTO_NEWSESSION);
     pathafter(g, &pf, g->newcwd);
     ImGui::SameLine();
     if (ImGui::Button(browse)) {
@@ -11768,6 +11875,7 @@ static void drawnew(Gui *g)
         PathField pf = pathbefore(g, host, g->newcwd, &enter, nofolder);
         ImGui::InputText("##cwd", g->newcwd, FIELD_MAX, pf.flags, pathcb, &pf.cb);
         itemrect(g, RECT_NEWCWD);
+        dragplace(g, DROPTO_NEWSESSION);  // not drawmove's: a folder starts New session
         pathafter(g, &pf, g->newcwd);
         ImGui::SameLine();
         b32 remote = host->kind == GH_REMOTE;

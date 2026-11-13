@@ -15,6 +15,62 @@ static Str dropsay(Arena *a, DropFacts f, DropLoad l)
     return finish(&b);
 }
 
+// A card's box as "x0,y0 x1,y1", whole numbers
+static Str boxsay(Arena *a, DropBox b)
+{
+    Buf o(a, 64);
+    print(&o, (i64)b.x0);
+    putbyte(&o, ',');
+    print(&o, (i64)b.y0);
+    putbyte(&o, ' ');
+    print(&o, (i64)b.x1);
+    putbyte(&o, ',');
+    print(&o, (i64)b.y1);
+    return finish(&o);
+}
+
+static void test_cardplace(Test *t)
+{
+    Arena   a    = t->perm;
+    DropBox work = {0, 0, 1000, 800};
+    DropBox none = {};
+
+    // Centered in a pane at least three cards tall
+    expect(t, "cardplace.pane", boxsay(&a, cardplace({600, 100, 1000, 700}, 200, 40, work, 0, 0, 8)),
+           "700,380 900,420");
+    // Exactly three cards tall is tall enough
+    expect(t, "cardplace.three", boxsay(&a, cardplace({0, 200, 400, 320}, 200, 40, work, 0, 0, 8)),
+           "100,240 300,280");
+    // Above a one-line field, centered over it
+    expect(t, "cardplace.above", boxsay(&a, cardplace({300, 400, 700, 430}, 200, 40, work, 0, 0, 8)),
+           "400,352 600,392");
+    // Below a field at the top, with no room above
+    expect(t, "cardplace.below", boxsay(&a, cardplace({300, 20, 700, 50}, 200, 40, work, 0, 0, 8)),
+           "400,58 600,98");
+    // No place: by the pointer
+    expect(t, "cardplace.pointer", boxsay(&a, cardplace(none, 200, 40, work, 100, 100, 8)),
+           "108,108 308,148");
+    // An empty place is no place
+    expect(t, "cardplace.empty", boxsay(&a, cardplace({300, 300, 300, 400}, 200, 40, work, 100, 100, 8)),
+           "108,108 308,148");
+    // Clamped at each edge
+    expect(t, "cardplace.right", boxsay(&a, cardplace(none, 200, 40, work, 900, 100, 8)),
+           "800,108 1000,148");
+    expect(t, "cardplace.bottom", boxsay(&a, cardplace(none, 200, 40, work, 100, 790, 8)),
+           "108,760 308,800");
+    expect(t, "cardplace.left", boxsay(&a, cardplace({-300, 400, 50, 430}, 200, 40, work, 0, 0, 8)),
+           "0,352 200,392");
+    expect(t, "cardplace.top", boxsay(&a, cardplace(none, 200, 40, work, -50, -30, 8)),
+           "0,0 200,40");
+    // Wider than work: at its near edge
+    expect(t, "cardplace.wide", boxsay(&a, cardplace(none, 1200, 40, work, 500, 100, 8)),
+           "0,108 1200,148");
+    // Work not at the origin (a menu bar above it)
+    DropBox below = {0, 20, 1000, 800};
+    expect(t, "cardplace.workoff", boxsay(&a, cardplace({300, 30, 700, 60}, 200, 40, below, 0, 0, 8)),
+           "400,68 600,108");
+}
+
 static void test_dropto(Test *t)
 {
     Arena a = t->perm;
@@ -135,4 +191,6 @@ static void test_dropto(Test *t)
     expect(t, "dropto.roomcount", istr(&a, attachroom(10, 8, 8, 14)), "2");
     expect(t, "dropto.roomslots", istr(&a, attachroom(10, 4, 13, 14)), "1");
     expect(t, "dropto.roomnone", istr(&a, attachroom(10, 10, 12, 14)), "0");
+
+    test_cardplace(t);
 }
