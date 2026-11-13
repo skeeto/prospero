@@ -17,12 +17,12 @@
 //             column of Jobs and Log over Plan and Terminal, with Files
 //             as their tab once a file opens
 //   Compact   Standard without its right column: Jobs behind Todo, Plan
-//             and Files behind Transcript, Log closed, and Terminal under
-//             Prompt
+//             and Files behind Transcript, Log closed, and Terminal a tab
+//             behind Prompt
 //   Focus     a session alone: Transcript, Todo and Plan as tabs, over
 //             Prompt, Files among them once a file opens
-// Compact and Focus hide Prompt's tab bar, for room; Standard, the
-// first layout, keeps it, so its menu is found.
+// Focus hides Prompt's tab bar, for room; Standard, the first layout,
+// keeps it, so its menu is found, and Compact, for its Terminal tab.
 //
 // A saved layout is kept in the layout file (imgui.ini), a section
 // each, with a line a part in pre-order (dockwrite, dockline):
@@ -488,8 +488,8 @@ static Str docknamewhy(Str name)
 // stay shown or hidden in Standard and Compact, whose side columns have
 // little room for them, and Files too, hidden until a file opens; Focus
 // hides it, and a file opened shows it in the center. Standard shows the terminal as a tab beside
-// Plan, where a first run finds it; Compact, under the prompt, as tall
-// as it, for a command or two; Focus leaves it out, and Ctrl+` brings it
+// Plan, where a first run finds it; Compact, as a tab behind the
+// prompt, Ctrl+` going between them; Focus leaves it out, and Ctrl+` brings it
 // back, its shells having run on, in the home dockaddterm gives it under
 // the prompt.
 static DockLayout dockpreset(i32 preset)
@@ -521,12 +521,9 @@ static DockLayout dockpreset(i32 preset)
         docksplit(&l, DOCK_Y, 1 - LAYOUT_TODO);
         dockline(&l, "Tabs", "Sessions");
         dockline(&l, "Tabs", "*Todo,Jobs,Log");
-        docksplit(&l, DOCK_Y, 1 - 2*LAYOUT_PROMPT);  // the terminal as tall
+        docksplit(&l, DOCK_Y, 1 - LAYOUT_PROMPT);
         dockline(&l, "Center", "*Transcript,Plan,Changes,Files,Help,Settings,Hosts");
-        docksplit(&l, DOCK_Y, 0.5f);
-        dockline(&l, "Tabs", "Prompt");
-        dockline(&l, "TabBar", "Hidden");
-        dockline(&l, "Tabs", "Terminal");
+        dockline(&l, "Tabs", "*Prompt,Terminal");
         l.keep = extras | 1u<<PANE_FILES;
         break;
     case PRESET_FOCUS:

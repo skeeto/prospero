@@ -13947,7 +13947,7 @@ enum : i32 {
     CHK_TERMTABS,     // the shown root's tab labels, '|' between, '*' front
     CHK_TERMKID,      // a subagent is shown, with its root's tabs
     CHK_TERMCLOSE,    // the quit dialog counted dx busy terminal tabs
-    CHK_TERMHOME,     // the terminal docked under the prompt, as placed
+    CHK_TERMHOME,     // the terminal in its home: beside Plan, with Prompt, or under it
     CHK_TERMHIST,     // its front tab keeps dx rows of history
     CHK_TERMVIEW,     // scrolled back into history (dx 1), or not (0)
     CHK_TERMSEL,      // the front tab's selection is the text
@@ -14229,7 +14229,7 @@ static Str chknames[] = {
     "the window opened at its first size, maximized on a small display",
     "a first run's Help floats centered in front, its tab selected",
     "the layout is as built: its panes' places and shares, Jobs selected",
-    "the Compact layout is as built: two columns, Plan with Transcript, Terminal under Prompt",
+    "the Compact layout is as built: two columns, Plan with Transcript, Terminal a tab behind Prompt",
     "the Focus layout is as built: one session, four panes",
     "the layout saved is back as it was saved",
     "Help shows the topic picked, its page from the top",
@@ -14291,7 +14291,7 @@ static Str chknames[] = {
     "that many terminals are open", "the terminal tabs are as said",
     "a subagent shows its root's terminal tabs",
     "the quit dialog counts the busy terminal tabs",
-    "the terminal is in its home under the prompt",
+    "the terminal is in its home: beside Plan, a tab with the prompt, or under it",
     "the terminal keeps as much history as configured",
     "the terminal's view is scrolled back, or at the bottom, as said",
     "the terminal's selection is as said",
@@ -19412,15 +19412,20 @@ static DriveOp termops[] = {
     {OP_WAIT, W_TERM, 0, 0, 5000, "\nkeyed"},
     {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "onetwo|*" TERMSH},
     // Each layout picked puts the terminal in its place, its tabs as they
-    // were, its size following: Compact under the prompt, as tall as it;
-    // Focus leaves it out, and Ctrl+` brings it back under the prompt;
-    // Standard beside Plan
+    // were, its size following: Compact as a tab behind the prompt, which
+    // Ctrl+` brings forward and goes back from, the tab staying; Focus
+    // leaves it out, and Ctrl+` brings it back under the prompt; Standard
+    // beside Plan
     LAYOUT("Compact"),
-    {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Terminal"},
-    {OP_CHECK, CHK_TERMHOME, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMHOME, 2, 0, 0, "Prompt"},
+    CTRLKEY(GKEY_GRAVE, 500),
+    {OP_CHECK, CHK_TERMHOME, 2, 0, 0, "Terminal"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
     {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "onetwo|*" TERMSH},
     {OP_CHECK, CHK_TERMSIZE, 0, 0, 1500, ""},
     {OP_SHOT, 0, 0, 0, 300, "terminal-compact"},
+    CTRLKEY(GKEY_GRAVE, 500),
+    {OP_CHECK, CHK_TERMHOME, 2, 0, 0, "Prompt"},
     LAYOUT("Focus"),
     {OP_CHECK, CHK_PANECLOSED, 0, 0, 0, "Terminal"},
     CTRLKEY(GKEY_GRAVE, 500),
@@ -21296,23 +21301,23 @@ static b32 layoutbackcheck(Gui *g, Str name)
 }
 
 // The Compact layout, as applied: Standard's left column at its width,
-// over the jobs; the center with Plan and the extras as tabs; no right.
+// over the jobs; the center with Plan and the extras as tabs, over
+// Prompt with Terminal a tab behind it, its tab bar shown; no right.
 static b32 compactcheck(Gui *g)
 {
     ImGuiDockNode *root = ImGui::DockBuilderGetNode(g->dockspace);
     ImGuiDockNode *left = root ? root->ChildNodes[0] : 0;
     ImGuiDockNode *center = root ? root->ChildNodes[1] : 0;
     ImGuiDockNode *top = center ? center->ChildNodes[0] : 0;
-    ImGuiDockNode *foot = center ? center->ChildNodes[1] : 0;  // Prompt over Terminal
-    if (!left || !top || !foot || !foot->ChildNodes[0] || !foot->ChildNodes[1]) {
+    ImGuiDockNode *foot = center ? center->ChildNodes[1] : 0;  // Prompt and Terminal
+    if (!left || !top || !foot || !foot->IsLeafNode()) {
         guilog(g, "drive: the dock space is not split in two columns");
         return 0;
     }
     if (!dockshare(root, ImGuiAxis_X, 0, dockcapped(LAYOUT_LEFT*(1-LAYOUT_RIGHT),
                                                     LAYOUT_LEFTMAX, root->Size.x, g->scale)) ||
         !dockshare(left, ImGuiAxis_Y, 1, LAYOUT_TODO) ||
-        !dockshare(center, ImGuiAxis_Y, 1, 2*LAYOUT_PROMPT) ||
-        !dockshare(foot, ImGuiAxis_Y, 0, 0.5f)) {
+        !dockshare(center, ImGuiAxis_Y, 1, LAYOUT_PROMPT)) {
         guilog(g, "drive: the compact layout's splits are not in their shares");
         return 0;
     }
@@ -21328,14 +21333,14 @@ static b32 compactcheck(Gui *g)
         {PANE_HELP,       top},
         {PANE_SETTINGS,   top},
         {PANE_HOSTS,      top},
-        {PANE_PROMPT,     foot->ChildNodes[0]},
-        {PANE_TERMINAL,   foot->ChildNodes[1]},
+        {PANE_PROMPT,     foot},
+        {PANE_TERMINAL,   foot},
     };
     return dockplacescheck(g, places, countof(places)) &&
            top->IsCentralNode() && tabselected("Todo") &&
            tabselected("Transcript") && g->panes[PANE_JOBS] &&
            g->panes[PANE_PLAN] && !g->panes[PANE_LOG] && g->panes[PANE_TERMINAL] &&
-           foot->ChildNodes[0]->IsHiddenTabBar();
+           tabselected("Prompt") && !foot->IsHiddenTabBar();
 }
 
 // The Focus layout, as applied: Transcript, Todo and Plan as tabs in
@@ -24083,16 +24088,22 @@ static b32 drivecheck(Gui *g, i32 chk)
         return (f32)(v.total - tt->rows) == g->ops[g->drivepc-1].dx;
     }
     case CHK_TERMHOME: {
-        // With dx, a tab of Plan's node (Standard); else the lower side of
-        // a vertical split, near its share, whose upper side holds the
-        // prompt (Compact's even split, or dockaddterm's)
+        // With dx 1, a tab of Plan's node (Standard); with dx 2, a tab of
+        // the prompt's (Compact), shown, the tab text names in front if any; else
+        // the lower side of a vertical split, near its share, whose upper
+        // side holds the prompt (dockaddterm's)
         ImGuiWindow   *w = ImGui::FindWindowByName(panenames[PANE_TERMINAL]);
         ImGuiWindow   *p = ImGui::FindWindowByName(panenames[PANE_PROMPT]);
         ImGuiDockNode *n = w ? w->DockNode : 0;
         ImGuiDockNode *s = n ? n->ParentNode : 0;
-        if (g->ops[g->drivepc-1].dx != 0) {
+        if (g->ops[g->drivepc-1].dx == 1) {
             ImGuiWindow *plan = ImGui::FindWindowByName(panenames[PANE_PLAN]);
             return n && plan && plan->DockNode==n;
+        } else if (g->ops[g->drivepc-1].dx == 2) {
+            Arena a     = g->frame;
+            Str   front = g->ops[g->drivepc-1].text;
+            return n && p && p->DockNode==n && g->panes[PANE_TERMINAL] &&
+                   (!front.len || tabselected(cstr0(&a, front)));
         }
         if (!s || !p || !p->DockNode || s->SplitAxis!=ImGuiAxis_Y || s->ChildNodes[1]!=n) {
             return 0;

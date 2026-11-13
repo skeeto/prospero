@@ -55,7 +55,7 @@ static void test_dock(Test *t)
            "Tabs=*Plan,Terminal,Changes,Files\n");
 
     // Compact keeps the left column's width, with no right column, and
-    // the terminal under the prompt, as tall as it
+    // the terminal a tab behind the prompt, its tab bar shown
     DockLayout compact = dockpreset(PRESET_COMPACT);
     expect(t, "dock.compact", dockstr(&a, &compact),
            "Shown=Sessions,Transcript,Prompt,Todo,Plan,Jobs,Terminal\n"
@@ -63,12 +63,9 @@ static void test_dock(Test *t)
            "Split=Y,0.75\n"
            "Tabs=Sessions\n"
            "Tabs=*Todo,Jobs,Log\n"
-           "Split=Y,0.44\n"
+           "Split=Y,0.72\n"
            "Center=*Transcript,Plan,Changes,Files,Help,Settings,Hosts\n"
-           "Split=Y,0.5\n"
-           "Tabs=Prompt\n"
-           "TabBar=Hidden\n"
-           "Tabs=Terminal\n");
+           "Tabs=*Prompt,Terminal\n");
 
     // Focus shows four panes, and is home to the rest above the prompt
     DockLayout focus = dockpreset(PRESET_FOCUS);
