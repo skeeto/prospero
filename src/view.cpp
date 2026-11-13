@@ -197,6 +197,7 @@ enum : i32 {
     LIVE_COMPACTING,  // a summary request runs
     LIVE_RELAY,       // paused: no connected computer relays its calls
     LIVE_AUTH,        // its endpoint's ChatGPT sign-in is refreshed
+    LIVE_PAUSED,      // the user paused it before its next request
     LIVE_CLOSED,
     LIVE_COUNT,
 };
@@ -204,7 +205,7 @@ enum : i32 {
 static Str livenames[] = {
     "idle", "discover", "waiting", "streaming", "error", "backoff", "tool",
     "ask", "queued", "task", "mcp", "worktree", "compacting", "relay", "auth",
-    "closed",
+    "paused", "closed",
 };
 static_assert(countof(livenames) == LIVE_COUNT);
 
@@ -690,6 +691,9 @@ struct View {
     Str             enderr;
     b32             endresume;   // the next turn began by itself
     b32             endcompact;  // a compaction's turn (compact) ended
+    b32             paused;      // the user paused it (pause records)
+    i32             contmsg;     // 1 + the note of a turn cut short, which
+                                 // offers Continue while idle; 0 if none
     b32             turncompact; // the running turn is one
 
     // Its work (viewwork), the session's and the running turn's
@@ -1053,6 +1057,7 @@ static void dropprov(View *v)
                 ps[k]->msg = ps[k]->msg==i ? (i32)n : ps[k]->msg;
             }
             v->movedat   = v->movedat==i+1 ? (i32)n+1 : v->movedat;
+            v->contmsg   = v->contmsg==i+1 ? (i32)n+1 : v->contmsg;
             v->msgs[n++] = v->msgs[i];
         }
         v->msgs.len = n;
@@ -2567,6 +2572,8 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         v->turnmsg  = v->msgs.len;
         v->pdone   = v->ptotal = 0;
         v->turncompact = jsonstr(jsonget(j, "via")) == "compact";
+        v->topsdirty  |= v->contmsg > 0;  // its Continue goes
+        v->contmsg     = 0;
         // The message that began it: a prompt just before, or, for a
         // turn the session began by itself, a note saying why
         Str via = jsonstr(jsonget(j, "via"));
@@ -2581,6 +2588,12 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
                            "finished, so the agent went on without a prompt.");
             v->msgs[i].seq        = r->seq;
             v->msgs[i].label      = "Resumed by itself";
+            v->msgs[i].startsturn = v->turn;
+        } else if (via == "continue") {
+            i32 i = addmsg(v, VIEW_NOTE, "You asked the agent to go on, "
+                           "without a message.");
+            v->msgs[i].seq        = r->seq;
+            v->msgs[i].label      = "Continued";
             v->msgs[i].startsturn = v->turn;
         } else if (via == "compact") {
             // Asked for by the user (compact), with no message of its
@@ -2959,6 +2972,10 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         v->msgs[i].seq   = r->seq;
         v->msgs[i].label = fb ? Str("Fallback") : Str("Retry");
     } return 1;
+
+    case EV_PAUSE:
+        v->paused = jsonint(jsonget(j, "on"), 0) != 0;
+        return 1;
 
     case EV_NUDGE: {
         fadeprov(v);
@@ -3450,6 +3467,8 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
             Buf   b(&a, 128 + err.len);
             print(&b, why=="cancel"      ? Str("Cancelled.") :
                       why=="interrupted" ? Str("Interrupted: the harness stopped during this turn.") :
+                      why=="paused"      ? Str("Paused when the harness stopped: its "
+                                               "commands ended, but the pause stays.") :
                       why=="budget"      ? Str("Stopped at the step budget.") :
                       why=="side"        ? Str("This side chat began here, while the "
                                                "main session's turn went on there.") :
@@ -3462,6 +3481,9 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
             v->msgs[i].seq   = r->seq;
             v->msgs[i].label = why=="error" ? Str("Error") :
                                why=="side"  ? Str("Side chat") : Str("Turn ended");
+            if (why!="side" && !v->endcompact) {
+                v->contmsg = i + 1;  // Continue, below it
+            }
         }
         clampsel(v);
     } return 1;
@@ -3718,7 +3740,8 @@ static f32 msgfoot(View *v, ViewMsg *m)
     if (th.h > 0) {
         return th.h + v->thumbpad;
     }
-    return (ask || force) && !v->readonly ? v->foot : 0;
+    b32 cont = v->contmsg && m==&v->msgs[v->contmsg-1] && !v->busy;
+    return (ask || force || cont) && !v->readonly ? v->foot : 0;
 }
 
 // Lay out message i at the width, updating its height. A collapsed

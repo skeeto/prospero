@@ -3450,6 +3450,193 @@ def cancel(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+def cutoff(msgs):
+    """Whether the request tells the agent to go on from a response cut off."""
+    return any(m.get("role") == "user" and "cut off" in str(m.get("content", ""))
+               for m in msgs)
+
+
+@scenario(bound=20)
+def pause(t):
+    """Pause stops a streaming response, keeping its text, and holds the
+    turn (live "paused") with no request until continue: a steer waits
+    with it. Continue tells the agent to go on from the cut, in the same
+    turn, with the steer."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        t.check(h.call("pause", sid=sid).get("ok") == 0, "nothing to pause while idle")
+        t.check(h.call("continue", sid=sid).get("ok") == 0, "nothing to continue yet")
+        h.send("prompt", sid=sid, text="stream")
+        h.wait(lambda e: e.get("ev") == "delta" and e.get("sid") == sid)
+        time.sleep(0.5)
+        t.check(h.call("continue", sid=sid).get("ok") == 0, "a running turn is no continue's")
+        t.check(h.call("pause", sid=sid).get("ok") == 1, "paused")
+        h.wait(lambda e: e.get("ev") == "live" and e.get("sid") == sid and
+               e.get("state") == "paused")
+        a = h.all("assistant", sid)
+        t.check(a and a[-1]["finish"] == "paused" and "word0" in str(a[-1]["blocks"]),
+                f"the partial text is kept: {a}")
+        p = h.all("pause", sid)
+        t.check(p and p[-1].get("on") == 1, f"the pause record: {p}")
+        h.send("steer", sid=sid, text="also this")
+        h.wait(lambda e: e.get("ev") == "queue" and e.get("sid") == sid and e.get("items"))
+        time.sleep(1)
+        t.check(len(t.requests()) == 1, f"no request while paused: {len(t.requests())}")
+        t.check(not h.all("turn.end", sid), "the turn waits")
+        t.check(h.call("continue", sid=sid).get("ok") == 1, "continued")
+        end = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        t.check(end["why"] == "done", f"done: {end}")
+        t.check(len(h.all("turn", sid)) == 1, "the same turn")
+        p = h.all("pause", sid)
+        t.check(p[-1].get("on") == 0, f"the pause ended: {p}")
+        msgs = t.requests()[-1]["body"]["messages"]
+        t.check(cutoff(msgs), f"told to go on: {msgs[-3:]}")
+        t.check(any("also this" in str(m.get("content", "")) for m in msgs),
+                f"with the steer: {msgs[-3:]}")
+        t.check(h.all("assistant", sid)[-1]["blocks"][-1].get("text") == "Resumed.",
+                "the answer")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=20)
+def pause_tool(t):
+    """Pause during a command lets it finish, then holds the next request;
+    continue sends it, with no note: the conversation ends with the result."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="go")
+        h.wait(lambda e: e.get("ev") == "tool.start" and e.get("sid") == sid)
+        t.check(h.call("pause", sid=sid).get("ok") == 1, "paused")
+        te = h.wait(lambda e: e.get("ev") == "tool.end" and e.get("sid") == sid)
+        t.check(te.get("status") == "ok" and "slept" in te.get("text", ""),
+                f"the command finished: {te}")
+        h.wait(lambda e: e.get("ev") == "live" and e.get("sid") == sid and
+               e.get("state") == "paused")
+        time.sleep(0.5)
+        t.check(len(t.requests()) == 1, "no request while paused")
+        t.check(h.call("continue", sid=sid).get("ok") == 1, "continued")
+        end = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        t.check(end["why"] == "done", f"done: {end}")
+        t.check(not cutoff(t.requests()[-1]["body"]["messages"]), "no note")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=30)
+def pause_restart(t):
+    """A quit while paused ends the turn as "paused" and keeps the pause:
+    opened again, continue begins a turn of its own (via "continue") that
+    goes on from the cut, and ends the pause. Stop instead ends a pause."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="stream")
+        h.wait(lambda e: e.get("ev") == "delta" and e.get("sid") == sid)
+        time.sleep(0.3)
+        t.check(h.call("pause", sid=sid).get("ok") == 1, "paused")
+        h.wait(lambda e: e.get("ev") == "live" and e.get("sid") == sid and
+               e.get("state") == "paused")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+    log = t.host.read(t.host.join(t.state, "sessions", sid, "events.jsonl"))
+    recs = [json.loads(x) for x in log.splitlines() if x.strip()]
+    ends = [r for r in recs if r.get("ev") == "turn.end"]
+    t.check(ends and ends[-1].get("why") == "paused", f"ended paused: {ends}")
+
+    h = t.headless()
+    try:
+        t.check(h.call("open", sid=sid).get("ok") == 1, "reopened")
+        r = h.call("fork", sid=sid)
+        t.check(r.get("ok") == 1, f"forked: {r}")
+        pauses = [e.get("on") for e in logged(t, r["sid"]) if e.get("ev") == "pause"]
+        t.check(pauses and pauses[-1] == 0, f"a fork is not paused: {pauses}")
+        t.check(h.call("continue", sid=sid).get("ok") == 1, "continued")
+        turn = h.wait(lambda e: e.get("ev") == "turn" and e.get("sid") == sid and
+                      e.get("n", 0) >= 2)
+        t.check(turn.get("via") == "continue", f"via continue: {turn}")
+        end = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid and
+                     e.get("turn") == turn.get("n"))
+        t.check(end["why"] == "done", f"done: {end}")
+        p = h.all("pause", sid)
+        t.check(p and p[-1].get("on") == 0, f"the pause ended: {p}")
+        t.check(cutoff(t.requests()[-1]["body"]["messages"]), "told to go on")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=20)
+def continue_stop(t):
+    """Continue after Stop: a turn with no message that goes on from the
+    text Stop kept; Stop also ends a pause."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="stream")
+        h.wait(lambda e: e.get("ev") == "delta" and e.get("sid") == sid)
+        time.sleep(0.3)
+        t.check(h.call("pause", sid=sid).get("ok") == 1, "paused")
+        h.call("cancel", sid=sid)
+        end = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        t.check(end["why"] == "cancel", f"cancelled: {end}")
+        p = h.all("pause", sid)
+        t.check(p and p[-1].get("on") == 0, f"Stop ended the pause: {p}")
+        t.check(h.call("continue", sid=sid).get("ok") == 1, "continued")
+        end = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid and
+                     e.get("why") == "done")
+        turns = h.all("turn", sid)
+        t.check(len(turns) == 2 and turns[-1].get("via") == "continue", f"turns: {turns}")
+        t.check(not [e for e in h.all("user", sid) if e.get("seq", 0) > turns[0].get("seq", 0)],
+                "no message of the user's")
+        t.check(cutoff(t.requests()[-1]["body"]["messages"]), "told to go on")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=30)
+def pause_task(t):
+    """Pausing the parent pauses its subagent's stream too; continue
+    resumes both, and the parent hears the report."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="go")
+        kid = h.wait(lambda e: e.get("ev") == "session" and e.get("parent") == sid)["sid"]
+        h.wait(lambda e: e.get("ev") == "delta" and e.get("sid") == kid)
+        time.sleep(0.3)
+        t.check(h.call("pause", sid=sid).get("ok") == 1, "paused")
+        h.wait(lambda e: e.get("ev") == "live" and e.get("sid") == kid and
+               e.get("state") == "paused")
+        t.check([e.get("on") for e in h.all("pause", kid)] == [1], "the subagent paused")
+        kb = fake_provider_second(t.model)
+        n = len(t.requests(kb))
+        time.sleep(1)
+        t.check(len(t.requests(kb)) == n, "no request of the subagent's while paused")
+        t.check(h.call("continue", sid=sid).get("ok") == 1, "continued")
+        end = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        t.check(end["why"] == "done", f"done: {end}")
+        t.check([e.get("on") for e in h.all("pause", kid)] == [1, 0], "and resumed")
+        last = h.all("assistant", sid)[-1]["blocks"][-1].get("text", "")
+        t.check("Child resumed." in last, f"the report: {last!r}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+def fake_provider_second(model):
+    """The model of the same run for scenario NAME_b."""
+    parts = model.split(":")
+    parts[1] += "_b"
+    return ":".join(parts)
+
+
 def asked(t, h, prompt="write outside"):
     """An attended session whose agent asks to write outside: (sid, ask)."""
     sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
@@ -3893,7 +4080,8 @@ def hello_caps(t):
                                                    "endpoint.logout", "term.open",
                                                    "term.input", "term.resize",
                                                    "term.ack", "term.close",
-                                                   "fs.read", "fs.stat"]
+                                                   "fs.read", "fs.stat",
+                                                   "pause", "continue"]
         t.check(cmds == want, f"cmds: {cmds}")
         caps = hello.get("caps", [])
         t.check(isinstance(caps, list) and all(isinstance(c, str) for c in caps) and
@@ -3904,7 +4092,7 @@ def hello_caps(t):
                  "message", "bypass", "nofolder", "dir", "config.create", "side", "background", "models",
                  "mcp", "mcp.auth", "task.remote", "task.host", "memory", "shell",
                  "git", "answer.trust", "trash", "cut", "endpoint.auth",
-                 "endpoint.copilot", "term", "ask.hold", "fs"} <= set(caps)
+                 "endpoint.copilot", "term", "ask.hold", "fs", "pause"} <= set(caps)
                 and "host" not in caps,
                 f"caps: {caps}")
         want = 0 if isinstance(t.host, XpHost) else 1  # ConPTY, from 10 1809

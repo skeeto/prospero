@@ -838,6 +838,7 @@ static u32 livecolor(Palette *p, i32 state)
     case LIVE_ASK:
     case LIVE_QUEUED:
     case LIVE_RELAY:
+    case LIVE_PAUSED:
     case LIVE_BACKOFF: return p->amber;
     case LIVE_ERROR:   return p->bad;
     }
@@ -862,6 +863,8 @@ static Str livelabel(View *v, i32 state)
 {
     if (v && v->busy && state==LIVE_IDLE) {
         return "working";
+    } else if (v && v->paused && state==LIVE_IDLE) {
+        return "paused";  // as a restart left it: Resume goes on
     }
     return state==LIVE_TASK     ? Str("subagents") :
            state==LIVE_MCP      ? Str("starting MCP servers") :
@@ -2132,6 +2135,24 @@ static void drawcutundo(Gui *g, GuiSession *s, ViewMsg *m)
         }
     } else {
         ImGui::TextDisabled("until the next message");
+    }
+}
+
+// Continue, below the note of the last turn if it was cut short (Stop,
+// a restart, an error): the agent goes on, with no message to send.
+// Only here, never where the prompt's buttons are, which a turn ending
+// would change under a click.
+static void drawcontinue(Gui *g, GuiSession *s)
+{
+    Str why = pausewhy(g, s, 1);
+    ImGui::BeginDisabled(why.len > 0);
+    b32 go = ImGui::Button(ICON_CONTINUE " Continue");
+    itemnamed(g, "continue");
+    ImGui::EndDisabled();
+    whytip(why.len ? why : Str("The agent goes on from where the turn stopped, "
+                               "without a message from you (/continue)"));
+    if (go) {
+        guicontinue(g, s);
     }
 }
 
@@ -5770,6 +5791,9 @@ static void drawtranscript(Gui *g)
         } else if (mfoot>0 && m->role==VIEW_REWIND && m->card->kind=="cut") {
             ImGui::SetCursorScreenPos(v2(x, y + head + m->h + pad/4));
             drawcutundo(g, gs, m);
+        } else if (mfoot>0 && m->role==VIEW_NOTE) {
+            ImGui::SetCursorScreenPos(v2(x, y + head + m->h + pad/4));
+            drawcontinue(g, gs);
         } else if (mfoot > 0) {
             ImGui::SetCursorScreenPos(v2(x, y + head + m->h + pad/4));
             drawforce(g, gs, m);
@@ -6034,7 +6058,16 @@ static void drawstrip(Gui *g)
         drawsesspicks(g, a, g->sess, v);
     }
     Strip st = {};
-    stripadd(&st, livelabel(v, v->state), {}, livecolor(g->pal, v->state));
+    stripadd(&st, livelabel(v, v->state), {},
+             v->paused && !v->busy ? g->pal->amber : livecolor(g->pal, v->state));
+    if (v->paused && v->busy && v->state!=LIVE_PAUSED) {
+        StripItem *it = stripadd(&st, "pausing before its next request", "pausing",
+                                 g->pal->amber);
+        if (it) {
+            it->tip = "Paused: what runs now goes on, and the agent waits "
+                      "before its next model request until Resume";
+        }
+    }
 
     if (v->busy && g->sess->readonly) {
         // Its records go to the other process: nothing here would see
@@ -6525,6 +6558,22 @@ static void runslash(Gui *g, GuiSession *s, Slash sl, Str text)
         }
         guimode(g, s, sl.off ? Str("default") : Str("plan"));
         sent = 1;
+    } break;
+    case SLASH_PAUSE:
+    case SLASH_CONTINUE: {
+        b32 cont = sl.cmd == SLASH_CONTINUE;
+        Str why  = hostcap(h, "pause") ? pausewhy(g, s, cont) : Str{};
+        if (why.len) {
+            setnote(g, s, concat(&g->frame, slashinfo[sl.cmd].name,
+                                 concat(&g->frame, ": ", why)), 1);
+            return;
+        } else if ((sent = hostcap(h, "pause"))) {
+            if (cont) {
+                guicontinue(g, s);
+            } else {
+                guipause(g, s);
+            }
+        }
     } break;
     case SLASH_BACKGROUND:
         // As Cmd+B, everything the turn waits for
@@ -7090,8 +7139,9 @@ static void drawprompt(Gui *g)
         g->promptfocus = 1;
     }
 
-    f32 bw = 1.5f*ImGui::GetFrameHeight();  // its buttons' icons
-    ImVec2 size = v2(ImGui::GetContentRegionAvail().x - bw - ImGui::GetStyle().ItemSpacing.x,
+    // Its buttons, icons in two columns beside it
+    f32 bw = 1.5f*ImGui::GetFrameHeight();
+    ImVec2 size = v2(ImGui::GetContentRegionAvail().x - 2*bw - 2*ImGui::GetStyle().ItemSpacing.x,
                      ImGui::GetContentRegionAvail().y);
     i32 selbefore = g->mentionsel;  // the pick before this frame's keys
     ImGui::PushID(s);
@@ -7290,6 +7340,9 @@ static void drawprompt(Gui *g)
         ImGui::EndPopup();
     }
 
+    // Every button always there, disabled when it can do nothing, so
+    // that none moves as a turn begins or ends: Send (Steer) and Attach,
+    // Stop and Folder, Pause (Resume) and Terminal
     ImGui::SameLine();
     ImGui::BeginGroup();
     ImGui::BeginDisabled(!can || editing);
@@ -7301,18 +7354,15 @@ static void drawprompt(Gui *g)
                                       "with your answers to its questions (Enter)"
             : waits==WAITS_ASK      ? "Steer: send to the running turn, which the agent reads "
                                       "once you answer what it asks (Enter)"
+            : v->paused             ? "Steer: send to the paused turn, which the agent reads "
+                                      "once it resumes (Enter)"
                                     : "Steer: send to the running turn, which the agent reads "
                                       "at its next step (Enter)");
-    if (v->busy) {
-        if (ImGui::Button(ICON_STOP "##stop", v2(bw, 0))) {
-            guicancel(g, g->sess);
-        }
-        itemnamed(g, "stop");
-        itemtip("Stop: cancel the turn, killing any command it runs (Esc)");
-    }
     ImGui::EndDisabled();
-    if (g->sess && hostcap(s->host, "images")) {
-        Str why = attachwhy(s);
+    ImGui::SameLine();
+    if (g->sess) {
+        Str why = !hostcap(s->host, "images") ? Str("This host's engine takes no attachments")
+                                              : attachwhy(s);
         why = why.len ? why : attachpending(g, s);
         ImGui::BeginDisabled(why.len>0 || editing);
         if (ImGui::Button(ICON_ATTACH "##attach", v2(bw, 0))) {
@@ -7326,9 +7376,21 @@ static void drawprompt(Gui *g)
                      "to the next message; or type @ in the prompt to mention a "
                      "file (its text is attached too)")
                : Str("Attach an image (PNG, JPEG, GIF, WebP, BMP) to the next message"));
+    } else {
+        ImGui::Dummy(v2(bw, ImGui::GetFrameHeight()));
     }
+
+    ImGui::BeginDisabled(!can || editing || !v->busy);
+    if (ImGui::Button(ICON_STOP "##stop", v2(bw, 0))) {
+        guicancel(g, g->sess);
+    }
+    ImGui::EndDisabled();
+    itemnamed(g, "stop");
+    whytip(v->busy ? Str("Stop: cancel the turn, killing any command it runs (Esc)")
+                   : Str("Stop: cancels a running turn (Esc); nothing runs now"));
+    ImGui::SameLine();
     if (g->sess) {
-        // Its folder and its terminal, as the Session menu opens them
+        // Its folder, as the Session menu opens it
         Str wwhy = {};
         Str cwd  = sesswork(g, &a, s, &wwhy);
         ImGui::BeginDisabled(wwhy.len > 0);
@@ -7338,6 +7400,37 @@ static void drawprompt(Gui *g)
         ImGui::EndDisabled();
         itemnamed(g, "prompt folder");
         whytip(wwhy.len ? wwhy : concat(&a, "Open working folder: ", cwd));
+    } else {
+        ImGui::Dummy(v2(bw, ImGui::GetFrameHeight()));
+    }
+
+    // Pause, which becomes Resume while paused: never in reply to the
+    // turn's own progress, so a click cannot land on the other one
+    b32 paused = g->sess && v->paused;
+    Str pwhy   = !can ? Str("Open the session") : pausewhy(g, s, paused);
+    ImGui::BeginDisabled(pwhy.len>0 || editing);
+    if (ImGui::Button(paused ? ICON_CONTINUE "###pause" : ICON_PAUSE "###pause", v2(bw, 0))) {
+        if (paused) {
+            guicontinue(g, s);
+        } else {
+            guipause(g, s);
+        }
+    }
+    ImGui::EndDisabled();
+    itemnamed(g, "pause");
+    if (paused) {
+        whytip(pwhy.len ? pwhy :
+               Str("Resume: the agent goes on from where it paused (/continue)"));
+    } else {
+        whytip(pwhy.len ? concat(&a, "Pause: holds the agent before its next model "
+                                 "request; ", pwhy) :
+               Str("Pause: hold the agent before its next model request, stopping "
+                   "one under way; a running command, question or subagent goes "
+                   "on, and its subagents pause too. The pause outlasts a restart "
+                   "(/pause)"));
+    }
+    ImGui::SameLine();
+    if (g->sess) {
         // The Terminal pane, on any host, else why not; only the fake
         // agent, which has no terminals, opens an external one instead
         b32 fake = g->enginekind==ENGINE_FAKE && s->host->kind==GH_ENGINE;

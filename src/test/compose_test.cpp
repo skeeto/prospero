@@ -102,6 +102,9 @@ static void test_compose(Test *t)
     expect(t, "slash.export", slashstr(&a, "/export\n"), "/export|");
     expect(t, "slash.background", slashstr(&a, "/background"), "/background|");
     expect(t, "slash.bgargs", slashstr(&a, "/background now"), "/background|now|err");
+    expect(t, "slash.pause", slashstr(&a, "/pause"), "/pause|");
+    expect(t, "slash.continue", slashstr(&a, " /continue "), "/continue|");
+    expect(t, "slash.contargs", slashstr(&a, "/continue please"), "/continue|please|err");
     expect(t, "slash.forkturn", slashstr(&a, "/fork 3"), "/fork|3");
     expect(t, "slash.forkn", istr(&a, parseslash("/fork 3").turn), "3");
     expect(t, "slash.forkall", istr(&a, parseslash("/fork").turn), "-1");
@@ -129,7 +132,7 @@ static void test_compose(Test *t)
     u32 all = slashmatches("/");
     expect(t, "slash.all", istr(&a, slashcount(all)), istr(&a, SLASH_COUNT-1));
     expect(t, "slash.first", slashinfo[slashnth(all, 0)].name, "/compact");
-    expect(t, "slash.last", slashinfo[slashnth(all, SLASH_COUNT-2)].name, "/shell");
+    expect(t, "slash.last", slashinfo[slashnth(all, SLASH_COUNT-2)].name, "/continue");
     expect(t, "slash.past", istr(&a, slashnth(all, SLASH_COUNT-1)), "0");
     u32 r = slashmatches("/r");
     expect(t, "slash.r", istr(&a, slashcount(r)), "1");
@@ -289,7 +292,8 @@ static void test_compose(Test *t)
             putbyte(&b, ' ');
         }
         expect(t, "skill.picks", finish(&b),
-               "/compact /model /rename /fork /export /plan /side /worktree /background /shell /pdf /review ");
+               "/compact /model /rename /fork /export /plan /side /worktree /background /shell "
+               "/pause /continue /pdf /review ");
         p = slashpicks(&a, "/pd", sk);  // not /plan
         expect(t, "skill.pick", istr(&a, p.len), "1");
         expect(t, "skill.pickdesc", slashpickinfo(&a, p[0], sk).desc, "Read PDFs");

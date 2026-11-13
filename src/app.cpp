@@ -4409,6 +4409,53 @@ static void guicancel(Gui *g, GuiSession *s)
     cmdsend(g, &w, a);
 }
 
+// Why the session cannot be paused (pause) or continued now, else null:
+// Pause while its turn runs and is not paused; continue to end a pause,
+// or after a turn cut short, while idle.
+static Str pausewhy(Gui *g, GuiSession *s, b32 cont)
+{
+    (void)g;
+    View *v = s ? s->view : 0;
+    if (!v) {
+        return "Open the session";
+    } else if (s->readonly) {
+        return "Another process has this session open";
+    } else if (!hostcap(s->host, "pause")) {
+        return "This host's engine is too old to pause; update the engine";
+    } else if (!cont && !v->busy) {
+        return "Nothing runs to pause";
+    } else if (!cont && v->paused) {
+        return "Paused already";
+    } else if (cont && v->busy && !v->paused) {
+        return "The turn runs: it is not paused";
+    } else if (cont && !v->busy && !v->paused && !v->contmsg) {
+        return "Nothing to continue: the last turn was not cut short";
+    }
+    return {};
+}
+
+static void guipause(Gui *g, GuiSession *s)
+{
+    if (pausewhy(g, s, 0).len) {
+        return;
+    }
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 128);
+    EvOut w = cmdopen(g, &b, CMD_PAUSE, s);
+    cmdsend(g, &w, a);
+}
+
+static void guicontinue(Gui *g, GuiSession *s)
+{
+    if (pausewhy(g, s, 1).len) {
+        return;
+    }
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 128);
+    EvOut w = cmdopen(g, &b, CMD_CONTINUE, s);
+    cmdsend(g, &w, a);
+}
+
 // A tool row the user may move to the background: a command running in
 // the foreground, or a task whose subagent is at work.
 static b32 bgrow(ViewTool *t)
@@ -14047,6 +14094,7 @@ enum : i32 {
     CHK_FILESPOT,     // the Files text's line dx, column dy is in view, below
                       // the bar, with text "hit" the current match's start,
                       // and "carry" a hit also drawn carried into a chunk
+    CHK_CONTINUED,    // a turn began by Continue, with its note, not paused
     CHK_COUNT,
 };
 
@@ -14369,6 +14417,7 @@ static Str chknames[] = {
     "the Output window is closed",
     "the Files find bar is as said",
     "the spot in the file is in view",
+    "a turn began by Continue, and nothing is paused",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -14459,6 +14508,7 @@ enum : i32 {
     W_FILEFRESH,  // and checked since its last mark, nothing in flight
     W_FILEFOUND,  // the Files find bar drew over the front file, searched
                   // it, and brought the match it went to into view
+    W_PAUSED,     // the session shown waits, paused, before a request
 };
 
 static Str waitnames[] = {
@@ -14485,9 +14535,9 @@ static Str waitnames[] = {
     "the changes", "the folder's probe", "the worktree's branch",
     "the thin remote", "a relayed stream", "the container",
     "the terminal's text", "the terminal's program", "the terminals' count",
-    "the file", "the file checked", "the file's find",
+    "the file", "the file checked", "the file's find", "the pause",
 };
-static_assert(countof(waitnames) == W_FILEFOUND+1);
+static_assert(countof(waitnames) == W_PAUSED+1);
 
 enum : i32 {
     KEY_CTRL  = 1,
@@ -21071,6 +21121,24 @@ static DriveOp composeops[] = {
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
     {OP_MOVE, T_EMPTY, 0, 0, 600, ""},
     {OP_MENTIONS, 0, 1, 0, 300, ""},
+    // Pause mid-stream holds the turn, and Resume, in its place, goes
+    // on; after Stop, the Transcript's Continue goes on with no message
+    {OP_NEWSESSION, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_PROMPT, 0, 0, 0, 0, "Stream slowly for a while."},
+    {OP_WAIT, W_STREAMING, 0, 0, 10000, ""},
+    CLICK(T_NAMED, "pause", 300),
+    {OP_WAIT, W_PAUSED, 0, 0, 5000, ""},
+    {OP_SHOT, 0, 0, 0, 300, "compose-paused"},
+    CLICK(T_NAMED, "pause", 300),
+    {OP_WAIT, W_STREAMING, 0, 0, 10000, ""},
+    CLICK(T_NAMED, "stop", 300),
+    {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
+    {OP_WAIT, W_NAMED, 0, 0, 5000, "continue"},
+    {OP_SHOT, 0, 0, 0, 300, "compose-continue"},
+    CLICK(T_NAMED, "continue", 300),
+    {OP_WAIT, W_TURNS, 2, 0, 20000, ""},
+    {OP_CHECK, CHK_CONTINUED, 0, 0, 0, ""},
     // C: enough of a conversation for /compact, with a focus
     {OP_NEWSESSION, 0, 0, 0, 0, ""},
     {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
@@ -22448,6 +22516,8 @@ static b32 drivewaitdone(Gui *g)
         return g->img.view.state==IMG_READY || g->img.view.state==IMG_FAILED;
     case W_STREAMING:
         return g->sess && v->state==LIVE_STREAMING && v->deltas>0;
+    case W_PAUSED:
+        return g->sess && v->busy && v->paused && v->state==LIVE_PAUSED;
     case W_THINKING:
         return g->sess && thinking(v) && (v->thinking==THINK_HIDE || g->thinkcount>0);
     case W_THINKSTALL:
@@ -23742,6 +23812,13 @@ static b32 drivecheck(Gui *g, i32 chk)
         ViewMsg *a = lastmsg(g, VIEW_ASSISTANT);
         return u && u->label.len && u->text=="Use the left door." &&
                a && find(a->text, "Steered")>=0 && find(a->text, "left door")>=0;
+    }
+    case CHK_CONTINUED: {
+        b32 noted = 0;
+        for (iz i = 0; i < v->msgs.len; i++) {
+            noted |= v->msgs[i].role==VIEW_NOTE && v->msgs[i].label=="Continued";
+        }
+        return noted && !v->busy && !v->paused && !v->contmsg;
     }
     case CHK_CANCELLED: {
         ViewMsg  *n = lastmsg(g, VIEW_NOTE);

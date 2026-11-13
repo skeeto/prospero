@@ -53,6 +53,7 @@ enum : i32 {
     EV_ASKDEADLINE, // a waiting ask's deadline, changed
     EV_CUT,         // the conversation ends before a turn (rewound)
     EV_UNCUT,       // that cut undone
+    EV_PAUSE,       // the user paused its model requests, or resumed them
     // Transient: sent, never logged
     EV_DELTA,
     EV_PROGRESS,
@@ -120,6 +121,7 @@ static EvInfo evinfo[] = {
     {"ask.deadline", 1, 0},
     {"cut",        1, 1},
     {"uncut",      1, 1},
+    {"pause",      1, 1},  // a restart keeps it paused
     {"delta",      0, 0},
     {"progress",   0, 0},
     {"tool.out",   0, 0},
@@ -212,6 +214,8 @@ enum : i32 {
     CMD_TERMCLOSE,   // hung up, or killed
     CMD_FSREAD,      // part of any file on the engine's machine, in base64
     CMD_FSSTAT,      // the types, sizes and times of paths there
+    CMD_PAUSE,       // hold the session's model requests, its tools running on
+    CMD_CONTINUE,    // resume them, or a turn without a message, as if not stopped
     CMD_COUNT,
 };
 
@@ -227,6 +231,7 @@ static Str cmdnames[] = {
     "relay.call", "offer", "ask.touch", "ask.hold", "shell.env", "call.stop", "cut",
     "uncut", "approve", "endpoint.auth", "endpoint.logout", "term.open",
     "term.input", "term.resize", "term.ack", "term.close", "fs.read", "fs.stat",
+    "pause", "continue",
 };
 static_assert(countof(cmdnames) == CMD_COUNT);
 
@@ -377,6 +382,13 @@ static Str capnames[] = {
                        // file on the engine's machine, by absolute path or
                        // ~, read in parts in base64, and paths' types, for
                        // a frontend showing files there (no session needed)
+    "pause",           // pause {sid} and continue {sid}: a turn's model
+                       // requests held (live state "paused"), its tools
+                       // running on, and its subagents' with it; a pause
+                       // record says so, and a turn left paused by a quit
+                       // or crash ends why "paused"; continue resumes, or
+                       // when idle begins a turn via "continue" with no
+                       // message, which a prompt also ends the pause of
 };
 
 static Str evname(i32 ev)
@@ -408,7 +420,8 @@ static b32 evdurable(i32 ev)
 // archiving a session never counts, nor do the steps of a turn.
 static b32 evactivity(i32 ev, Str why)
 {
-    return ev==EV_USER || ev==EV_TURN || (ev==EV_TURNEND && why!="interrupted");
+    return ev==EV_USER || ev==EV_TURN ||
+           (ev==EV_TURNEND && why!="interrupted" && why!="paused");
 }
 
 static Str cmdname(i32 cmd)
@@ -704,8 +717,10 @@ static void logforget(Slice<Str> *list, Str call)
 // answer to its ask if one was pending (denied, by "cancel"), then
 // tool.start and tool.end{status:"cancelled"}; every job.start without
 // a job.end gets job.end{status:"unknown"}; and last, an open turn gets
-// turn.end{why:"interrupted"}. Reading needs max bytes of scratch
-// at most (a larger log fails), plus parsing space for one line.
+// turn.end{why:"interrupted"}, or "paused" if a pause record left it
+// so (a restart keeps the pause, not its tools). Reading needs max bytes
+// of scratch at most (a larger log fails), plus parsing space for one
+// line.
 static EventLog logopen(Os *os, Arena *perm, Arena scratch, Str path,
                         Str sid, iz max)
 {
@@ -751,6 +766,7 @@ static EventLog logopen(Os *os, Arena *perm, Arena scratch, Str path,
     Str           asst     = {};  // the last assistant record
     Str           cwd      = {};  // raw, from the session record
     b32           turnopen = 0;
+    b32           paused   = 0;  // by the last pause record
     for (Str rest = data; rest.len;) {
         Cut c = cut(rest, '\n');
         rest = c.tail;
@@ -778,6 +794,9 @@ static EventLog logopen(Os *os, Arena *perm, Arena scratch, Str path,
             break;
         case EV_TURNEND:
             turnopen = 0;
+            break;
+        case EV_PAUSE:
+            paused = jsonint(jsonget(rec.root, "on"), 0) != 0;
             break;
         case EV_ASSISTANT:
             asst      = c.head;
@@ -987,7 +1006,7 @@ static EventLog logopen(Os *os, Arena *perm, Arena scratch, Str path,
         putkey(&w.json, "turn");
         putint(&w.json, r.turn);
         putkey(&w.json, "why");
-        putstr(&w.json, "interrupted");
+        putstr(&w.json, paused ? Str("paused") : Str("interrupted"));
         if (!logappend(&r, &w).data) {
             logclose(&r);
             return r;
@@ -1595,6 +1614,7 @@ static LogCopy logcopy(Arena *a, Arena scratch, Slice<Str> lines, Str from,
     // text of their ids, which point into lines: each push follows the
     // last use of that line's parse, as in logopen
     b32            bypass   = 0;
+    b32            paused   = 0;  // by the last pause record
     b32            memory   = 0;
     Str            planfile = {};
     Str            cwd      = {};  // raw, from the session record
@@ -1678,6 +1698,9 @@ static LogCopy logcopy(Arena *a, Arena scratch, Slice<Str> lines, Str from,
         case EV_MODE:
             bypass   = jsonstr(jsonget(rec.root, "mode")) == "bypass";
             planfile = clone(a, jsonstr(jsonget(rec.root, "path")));
+            break;
+        case EV_PAUSE:
+            paused = jsonint(jsonget(rec.root, "on"), 0) != 0;
             break;
         }
     }
@@ -1915,6 +1938,13 @@ static LogCopy logcopy(Arena *a, Arena scratch, Slice<Str> lines, Str from,
         putstrkey(&w.json, "why", "side");
         printreplaced(&out, evend(&w), o, n);
         r.open = 0;
+    }
+    if (paused) {
+        // So was a pause: the copy goes when asked
+        Buf   b(&scratch, 128);
+        EvOut w = evbegin(&b, to, ++last, now, EV_PAUSE);
+        putintkey(&w.json, "on", 0);
+        printreplaced(&out, evend(&w), o, n);
     }
     if (bypass && !imported) {
         // Bypass was the user's pick for that session alone

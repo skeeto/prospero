@@ -1316,6 +1316,29 @@ def sc_cancel_tool(model, n, req):
         yield from answer(model, "Should not be reached.")
 
 
+def sc_pause(model, n, req):
+    # A slow stream to pause, then the answer it resumes with
+    if n == 0:
+        yield S.head()
+        for i in range(100):
+            yield from text(model, f"word{i} ")
+            yield S.sleep(0.1)
+        yield from finish(model)
+    else:
+        yield from answer(model, "Resumed.")
+
+
+sc_pause_restart = sc_pause
+sc_continue_stop = sc_pause
+
+
+def sc_pause_tool(model, n, req):
+    if n == 0:
+        yield from tool(model, n, "shell", {"command": "sleep 1; echo slept"})
+    else:
+        yield from answer(model, "Done after the pause.")
+
+
 def sc_ask(model, n, req):
     # A write outside the workspace, which needs the user's approval,
     # then a reaction to the answer: done if allowed, inside instead if
@@ -1847,6 +1870,26 @@ def sc_task_parallel_b(model, n, req):
     else:
         lines = len(tool_results(req)[0].strip().splitlines())
         yield from answer(model, f"Report: {which} has {lines} lines.")
+
+
+def sc_pause_task(model, n, req):
+    if step(req) == 0:
+        yield from tool(model, n, "task", {"description": "Slow",
+                                           "prompt": "Talk slowly.",
+                                           "model": second(model)})
+    else:
+        yield from answer(model, "Parent heard: " + tool_results(req)[0])
+
+
+def sc_pause_task_b(model, n, req):
+    if step(req) == 0:
+        yield S.head()
+        for i in range(100):
+            yield from text(model, f"kid{i} ")
+            yield S.sleep(0.1)
+        yield from finish(model)
+    else:
+        yield from answer(model, "Child resumed.")
 
 
 def sc_task_depth(model, n, req):

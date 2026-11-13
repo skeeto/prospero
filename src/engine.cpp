@@ -163,11 +163,12 @@ enum : i32 {
     S_WORKTREE,  // waiting for git to make its worktree, before a turn
     S_RELAY,     // waiting for a computer to relay its model calls
     S_AUTH,      // waiting for its endpoint's sign-in to be refreshed
+    S_PAUSED,    // the user paused it before its next request (pause)
 };
 
 static Str statenames[] = {
     "idle", "discover", "waiting", "streaming", "error", "backoff", "tool",
-    "ask", "queued", "task", "mcp", "worktree", "relay", "auth",
+    "ask", "queued", "task", "mcp", "worktree", "relay", "auth", "paused",
 };
 
 enum : i32 {
@@ -738,6 +739,8 @@ struct Session {
     b32          contnext;   // nudge to continue after the tools
     b32          lengthcut;  // the response stopped at the length limit
     b32          cancelled;
+    b32          paused;     // the user paused it (pause): no request until
+                             // continue, nor a prompt to it while idle
     Slice<Queued> queued;    // prompts waiting for the turn to end
     Slice<Queued> steers;    // input for the next step: asks yield to it
     i64          queueid;    // the latest queued's id
@@ -2430,6 +2433,8 @@ static void compact(Session *, Arena, i64 enough, i64 goal, i32 why);
 static void beginturn(Session *, Arena, Str via);
 static void turnready(Session *, Arena);
 static b32  busy(Session *);
+static void setpause(Session *, Arena, b32 on);
+static b32  pausehold(Session *);
 static i32  get32(Str);
 static i64  get64(Str);
 static void starttasks(Session *, Arena);
@@ -2639,6 +2644,9 @@ static void discover(Session *, Arena);
 // room in the context, then its turn at the endpoint.
 static void proceed(Session *s, Arena scratch)
 {
+    if (!s->cancelled && pausehold(s)) {
+        return;  // after a compaction, say: continue goes on
+    }
     if (!s->discovered) {
         if (relaygate(s, scratch, &s->ep) && authgate(s, scratch, &s->ep)) {
             discover(s, scratch);
@@ -15004,6 +15012,9 @@ static void finalize(Session *s, Arena scratch)
 // Begin a step: one model response.
 static void prepare(Session *s, Arena scratch)
 {
+    if (!s->cancelled && pausehold(s)) {
+        return;  // steers wait with it: continue goes on
+    }
     for (iz i = 0; i < s->steers.len; i++) {
         adduser(s, scratch, s->steers[i].text, "steer", s->steers[i].images,
                 s->steers[i].files, s->steers[i].sessions);
@@ -15130,7 +15141,9 @@ static void settitle(Session *s, Arena scratch, Str title, Str by, Usage *u)
 // without input ("job": notices of background jobs; "message": a message
 // from another session, at hop; "task": the report of a subagent in the
 // background; "compact": the user asked for a compaction, the turn's
-// only work), else is null.
+// only work; "continue": the user asked it to go on, as after Stop),
+// else is null.
+static void contnote(Session *, Arena);
 static void beginturn(Session *s, Arena scratch, Str via)
 {
     titleend(s, scratch);  // the turn has the slot
@@ -15161,6 +15174,9 @@ static void beginturn(Session *s, Arena scratch, Str via)
     s->discovered = s->info.learned || (s->info.found && !s->info.llamacpp);
     s->sentest    = estimate(s);  // the gauge until the request (live)
     resetnudges(s, 1);
+    if (via == "continue") {
+        contnote(s, scratch);
+    }
     turnready(s, scratch);
 }
 
@@ -15215,6 +15231,9 @@ static void cool(Session *s)
 
 static void endturn(Session *s, Arena scratch, Str why, Str err)
 {
+    if (why=="cancel" && s->paused) {
+        why = "paused";  // a quit's: the pause outlives it (cancelturn)
+    }
     release(s, 0);
     stopreq(s);
     deskstop(s);
@@ -15316,6 +15335,9 @@ static void cancelturn(Session *s, Arena scratch)
         return;
     }
     s->cancelled = 1;
+    if (!s->e->quitting) {
+        setpause(s, scratch, 0);  // Stop ends it; a quit keeps it
+    }
     if (s->queued.len) {
         s->queued = {};
         sendqueue(s, scratch);
@@ -15366,6 +15388,113 @@ static void cancelturn(Session *s, Arena scratch)
         break;
     }
     endturn(s, scratch, "cancel", {});
+}
+
+
+// Pause and continue
+
+// The pause as the log keeps it, which a restart keeps (logopen).
+static void setpause(Session *s, Arena scratch, b32 on)
+{
+    if (s->paused == on) {
+        return;
+    }
+    s->paused = on;
+    Buf   b(&scratch, 128);
+    EvOut w = sbegin(s, &b, EV_PAUSE);
+    putintkey(&w.json, "on", on);
+    ssend(s, &w);
+}
+
+// Whether the turn's next request waits for the pause to end (S_PAUSED).
+// A compaction or title under way goes on: the step after it waits.
+static b32 pausehold(Session *s)
+{
+    if (!s->paused || s->purpose!=REQ_CHAT) {
+        return 0;
+    }
+    setstate(s, S_PAUSED);
+    return 1;
+}
+
+// Before a request whose conversation ends with the agent's own message,
+// cut short (a pause, Stop, a harness stopped): told to go on, as a
+// nudge, since a request cannot end with its own message (Anthropic
+// takes no prefill with reasoning). Uncounted: the user asked for it.
+static void contnote(Session *s, Arena scratch)
+{
+    iz n = s->history.len;
+    if (!n || s->history[n-1].role!=ROLE_ASSISTANT) {
+        return;
+    }
+    Str   text = "Your previous response was cut off before it finished. "
+                 "Continue from where you left off without repeating "
+                 "completed content.";
+    Buf   b(&scratch, 256 + text.len);
+    EvOut w = sbegin(s, &b, EV_NUDGE);
+    putstrkey(&w.json, "kind", "resume");
+    putstrkey(&w.json, "text", text);
+    ssend(s, &w);
+    Msg m = {};
+    m.role = ROLE_USER;
+    m.text = text;
+    addmsg(s, m);
+}
+
+// Pause the session's turn, and its subagents' here: a model request
+// under way stops, what it showed kept as Stop keeps it (its calls left
+// out, made again), and the step waits (S_PAUSED). Tools, asks, the
+// subagents' calls and a compaction go on; the turn waits at its next
+// step.
+static void pausenow(Session *s, Arena scratch)
+{
+    for (Session *c = s->e->sessions; c; c = c->next) {
+        if (c->parent==s && busy(c) && !c->paused) {
+            pausenow(c, scratch);
+        }
+    }
+    setpause(s, scratch, 1);
+    i32 st  = s->state;
+    b32 req = requesting(st) || st==S_BACKOFF || st==S_QUEUED ||
+              st==S_RELAY || st==S_AUTH;
+    if (!req || s->purpose!=REQ_CHAT || s->titling) {
+        return;
+    }
+    if (st == S_DISCOVER) {
+        s->discovered = 0;  // looked at again as it continues
+    } else if (s->part && committed(s->part)) {
+        s->part->calls = {};
+        Slice<Str> used = usedids(s, &scratch);
+        Finished   f    = finishpartial(&s->perm, s->part, 1, s->turn,
+                                        s->steps, used);
+        if (f.blocks.len) {
+            addassistant(s, scratch, f.blocks, "paused", 0);
+        }
+    }
+    stopreq(s);
+    release(s, 0);
+    cool(s);
+    disarm(s, T_BACKOFF);
+    disarm(s, T_ADMIT);
+    disarm(s, T_RELAY);
+    s->part  = 0;
+    s->steps = s->steps>0 ? s->steps-1 : 0;  // the step is made again
+    setstate(s, S_PAUSED);
+}
+
+// End the pause, its subagents' here too: a step waiting for it goes on.
+static void resumenow(Session *s, Arena scratch)
+{
+    for (Session *c = s->e->sessions; c; c = c->next) {
+        if (c->parent==s && c->paused) {
+            resumenow(c, scratch);
+        }
+    }
+    setpause(s, scratch, 0);
+    if (s->state == S_PAUSED) {
+        contnote(s, scratch);
+        prepare(s, scratch);
+    }
 }
 
 
@@ -17196,7 +17325,7 @@ static Str reporttext(Session *c, Arena *a, Str why, Str err, Str *status)
     } else if (why == "cancel") {
         *status = "cancelled";
         print(&b, "The subagent was cancelled before it finished.");
-    } else if (why == "interrupted") {
+    } else if (why=="interrupted" || why=="paused") {
         *status = "error";
         print(&b, "The subagent's harness stopped while it worked, so it "
                   "did not finish.");
@@ -19224,6 +19353,9 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
         } break;
         case EV_TASKREPORT:
             reported = 1;
+            break;
+        case EV_PAUSE:
+            s->paused = jsonint(jsonget(j, "on"), 0) != 0;
             break;
         case EV_TURN:
             s->turn = jsonint(jsonget(j, "n"), s->turn);
@@ -23879,6 +24011,7 @@ static void command(Engine *e, Arena scratch, Str line)
         reply(e, scratch, id, 1, {}, sid);
         sidecarwrite(e, scratch, s->sid, "draft", {});  // sent, so no draft
         if (!busy(s)) {
+            setpause(s, scratch, 0);  // the user's prompt: it goes
             startturn(s, scratch, text, cmd==CMD_PROMPT ? Str("prompt") : Str("steer"), imgs,
                       at.files, at.sessions);
         } else if (cmd == CMD_PROMPT) {
@@ -23901,6 +24034,32 @@ static void command(Engine *e, Arena scratch, Str line)
         reply(e, scratch, id, 1, {}, sid);
         cancelturn(s, scratch);
         taskquit(s, scratch);
+        return;
+    case CMD_PAUSE:
+        if (!busy(s)) {
+            reply(e, scratch, id, 0, "no turn runs to pause", sid);
+            return;
+        }
+        reply(e, scratch, id, 1, {}, sid);
+        pausenow(s, scratch);
+        return;
+    case CMD_CONTINUE:
+        if (busy(s) && !s->paused) {
+            reply(e, scratch, id, 0, "the turn runs: it is not paused", sid);
+        } else if (busy(s)) {
+            reply(e, scratch, id, 1, {}, sid);
+            resumenow(s, scratch);
+        } else if (!s->history.len) {
+            reply(e, scratch, id, 0, "nothing to continue: the session "
+                  "has no messages yet", sid);
+        } else {
+            // A turn with no message, as Stop or a restart left off
+            reply(e, scratch, id, 1, {}, sid);
+            setpause(s, scratch, 0);
+            s->cancelled = 0;
+            userinput(s);
+            beginturn(s, scratch, "continue");
+        }
         return;
     case CMD_BACKGROUND:
         cmdbackground(e, s, scratch, id, j);
