@@ -66,6 +66,7 @@ struct RelayPeer {
     Str            layer;    // its configuration layer, INI
     Slice<RelayEp> eps;
     b32            search;   // it runs web searches ([web] search)
+    Slice<Skill>   skills;   // its user's own that it shares, with no files
     Str            own;      // relays only sessions made with this token
     b32            away;     // no stream now: chosen by none
     b32            gone;
@@ -227,6 +228,26 @@ static Str relaymachine(Arena *a, Str s)
     return b.len ? finish(&b) : Str("another computer");
 }
 
+// A skill's description as an offer gives it, as the agent may read
+// it: on one line, of valid UTF-8 without control characters, at most
+// SKILL_DESC bytes.
+static Str relayskilldesc(Arena *a, Str s)
+{
+    Buf b(a, s.len<SKILL_DESC ? s.len : (iz)SKILL_DESC);
+    for (iz i = 0; i < s.len && b.len<4*SKILL_DESC;) {
+        iz  at = i;
+        i32 c  = utf8strict(s, &i);
+        if (c==-1 || (c>=0xd800 && c<=0xdfff) || c==0x7f) {
+            continue;
+        } else if (c < 0x20) {
+            putbyte(&b, ' ');
+        } else {
+            print(&b, Str(s.data+at, i-at));
+        }
+    }
+    return utf8head(skilloneline(a, finish(&b)), SKILL_DESC);
+}
+
 // A value as an offer's layer may carry it: printable, on one line.
 static b32 relayvalue(Str v)
 {
@@ -384,6 +405,19 @@ static void relayparse(RelayPeer *p, Arena *a, Json *o)
     if (p->layer.len > RELAY_LAYER) {
         p->layer = {};  // too much to take: offers nothing
         p->eps   = {};
+    }
+
+    // Skills by name, each once, never prospero, which this engine has
+    for (Json *x = jsonget(o, "skills")->child; x && p->skills.len<SKILL_MAX; x = x->next) {
+        Str name = jsonstr(jsonget(x, "name"));
+        if (!skillname(name) || name==skillbuiltin || skillbyname(p->skills, name)) {
+            continue;
+        }
+        Skill k = {};
+        k.name   = clone(a, name);
+        k.desc   = relayskilldesc(a, jsonstr(jsonget(x, "description")));
+        k.hidden = jsonflag(jsonget(x, "hidden"), 0);
+        p->skills = push(a, p->skills, k);
     }
 }
 
@@ -1208,6 +1242,7 @@ static EvOut relaydatabegin(Engine *e, Buf *b, HostLink *far, i64 cid, Str origi
 }
 
 static b32 farrelay(HostLink *, Str);
+static b32 farskills(HostLink *);
 
 // A thin engine's web search, run as one of a session's is, but with no
 // session: its records come by relayrecord, its deadline by relaytick.
@@ -1811,9 +1846,10 @@ static void relaymodelput(Engine *e, JsonOut *w, Arena scratch, Str name)
 // listing gave, but never its URL or key; each [model] section flattened
 // through like, and for each offered endpoint whose chain differs there,
 // its ENDPOINT/MODEL too, as like no longer joins the two; the defaults;
-// whether it searches; and own, a hostlink's token, for the sessions it
-// made alone.
-static void relayofferput(Engine *e, JsonOut *w, Arena scratch, Str own)
+// whether it searches; the user's own skills it shares (ownskills), by
+// name and description; and for a hostlink (link), own, its token, for
+// the sessions it made alone. Scanning skills takes some scratch.
+static void relayofferput(Engine *e, JsonOut *w, Arena scratch, Str own, HostLink *link)
 {
     Config *cfg = e->cfg;
     putobject(w);
@@ -1825,6 +1861,27 @@ static void relayofferput(Engine *e, JsonOut *w, Arena scratch, Str own)
     Str dmo = trim(cfgget(cfg, "", "", "model", 0));
     Str web = trim(cfgget(cfg, "web", "", "search", 0));
     putintkey(w, "search", web.len && !(web=="none"));
+
+    // None for a container with no network (farskills), and for any
+    // hostlink none of the user's alone: only /NAME invokes those
+    if (!link || farskills(link)) {
+        Arena        a    = scratch;
+        Slice<Skill> list = ownskills(e, &a, link != 0);
+        if (list.len) {
+            putkey(w, "skills");
+            putarray(w);
+            for (iz i = 0; i < list.len; i++) {
+                putobject(w);
+                putstrkey(w, "name", list[i].name);
+                putstrkey(w, "description", list[i].desc);
+                if (list[i].hidden) {
+                    putintkey(w, "hidden", 1);
+                }
+                putend(w);
+            }
+            putend(w);
+        }
+    }
 
     b32 named = 0;
     putkey(w, "endpoints");
@@ -1906,12 +1963,12 @@ static void relayofferput(Engine *e, JsonOut *w, Arena scratch, Str own)
 // offer: the reply's offer, for a client to pass on as relay.offer.
 static void cmdoffer(Engine *e, Arena scratch, i64 id)
 {
-    Arena work = carve(&scratch, (iz)1<<20);
+    Arena work = carve(&scratch, (iz)16<<20);  // skills scanned too
     Buf   b(&scratch, 1<<16);
     EvOut w = evbegin(&b, {}, 0, os_time(e->os), EV_REPLY);
     putintkey(&w.json, "id", id);
     putintkey(&w.json, "ok", 1);
     putkey(&w.json, "offer");
-    relayofferput(e, &w.json, work, {});
+    relayofferput(e, &w.json, work, {}, 0);
     emit(e, evend(&w));
 }

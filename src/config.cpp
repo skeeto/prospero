@@ -555,6 +555,10 @@ static CfgKey cfgschema[] = {
     {"skills", "disabled", CFG_STRING, "", {}, {}, "skills",
      "Names of skills left out altogether, from the agent and from "
      "/NAME, separated by blanks; prospero is Prospero's own"},
+    {"skills", "share", CFG_STRING, "yes", {}, {}, "skills",
+     "Which of your own skills (never a project's) thin remotes may use, "
+     "as they relay through this computer: yes, no, or their names, "
+     "separated by blanks"},
 
     {"memory", "enabled", CFG_BOOL, "true", {}, {}, "memory",
      "Give new sessions in a project the memory tool and the project's "

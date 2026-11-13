@@ -1103,6 +1103,7 @@ static void testcfgjson(Test *t)
         "skills//paths=*\n"
         "skills//hidden=*\n"
         "skills//disabled=*\n"
+        "skills//share=yes*\n"
         "memory//enabled=true*\n"
         "memory//path=*\n"
         "worktree//branch_prefix=prospero/*\n"

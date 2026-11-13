@@ -9608,12 +9608,30 @@ static b32 skillnamed(Arena scratch, Str list, Str name)
     return 0;
 }
 
+// Skills less those [skills] disabled names, every one of the name, so
+// that none further away takes its place, and those [skills] hidden
+// names marked the user's alone, as with disable-model-invocation.
+static Slice<Skill> skillfilter(Config *c, Arena *a, Slice<Skill> list)
+{
+    Str off  = cfgget(c, "skills", "", "disabled", 0);
+    Str hide = cfgget(c, "skills", "", "hidden", 0);
+    if (trim(off).len || trim(hide).len) {
+        iz n = 0;
+        for (iz i = 0; i < list.len; i++) {
+            Skill k = list[i];
+            if (!skillnamed(*a, off, k.name)) {
+                k.hidden |= skillnamed(*a, hide, k.name);
+                list[n++] = k;
+            }
+        }
+        list.len = n;
+    }
+    return list;
+}
+
 // A session's skills as they are now: none while [skills] is off. The
 // built-in one too, unless one of the user's own has its name, or the
-// session follows only its project's instructions. Those [skills]
-// disabled names are left out, every one of the name, so that none
-// further away takes its place; those [skills] hidden names are the
-// user's alone, as with disable-model-invocation.
+// session follows only its project's instructions. Then skillfilter.
 static Skills sessskills(Session *s, Arena *a)
 {
     if (skilldeny(s->e)) {
@@ -9624,20 +9642,76 @@ static Skills sessskills(Session *s, Arena *a)
         r.list = push(a, r.list, helpskill(a));
         sort(r.list.data, r.list.len, skillless, *a);
     }
-    Str off  = cfgget(s->e->cfg, "skills", "", "disabled", 0);
-    Str hide = cfgget(s->e->cfg, "skills", "", "hidden", 0);
-    if (trim(off).len || trim(hide).len) {
-        iz n = 0;
-        for (iz i = 0; i < r.list.len; i++) {
-            Skill k = r.list[i];
-            if (!skillnamed(*a, off, k.name)) {
-                k.hidden |= skillnamed(*a, hide, k.name);
-                r.list[n++] = k;
-            }
+    r.list = skillfilter(s->e->cfg, a, r.list);
+    return r;
+}
+
+// The directories of the user's own skills, by precedence, as this
+// computer shares them with thin engines (ownskills): [skills] paths
+// only as the user's own file gives them, and only absolute ones, as an
+// include must not choose what leaves the machine and a relative one is
+// a project's; --skillsdir; the configuration's; the same four under ~.
+static Slice<SkillDir> ownskilldirs(Config *c, Arena *a, Str home, Slice<Str> skillsdirs,
+                                    Str skilldir, b32 win)
+{
+    Slice<SkillDir> r  = {};
+    IniEntry       *en = inilookup(c->ini, "skills", "", "paths");
+    Str             v  = en && c->user && en->file==c->user ? en->value : Str{};
+    Slice<Str>      ps = splitpaths(a, v, home);
+    for (iz i = 0; i < ps.len; i++) {
+        if (iniroot(ps[i])) {
+            SkillDir x = {normpath(a, ps[i], ".", win), {}};
+            r = push(a, r, x);
         }
-        r.list.len = n;
+    }
+    for (iz i = 0; i < skillsdirs.len; i++) {
+        SkillDir x = {skillsdirs[i], {}};
+        r = push(a, r, x);
+    }
+    if (skilldir.len) {
+        SkillDir x = {skilldir, {}};
+        r = push(a, r, x);
+    }
+    for (iz i = 0; i<countof(skillhomes) && home.len; i++) {
+        SkillDir x = {normpath(a, home, skillhomes[i], win), {}};
+        r = push(a, r, x);
     }
     return r;
+}
+
+// Of the user's own skills, filtered (skillfilter), those this computer
+// shares: as [skills] share says (yes, no, or names), never one named
+// prospero, which a thin engine has of its own, and for a hostlink's
+// subagents (link) none of the user's alone, which only /NAME invokes.
+static Slice<Skill> skillshared(Config *c, Arena *a, Slice<Skill> list, b32 link)
+{
+    Str share = trim(cfgget(c, "skills", "", "share", 0));
+    i32 all   = share.len ? cfgbool(share) : 1;
+    iz  n     = 0;
+    for (iz i = 0; all && i < list.len; i++) {
+        Skill k = list[i];
+        b32   named = all==1 || skillnamed(*a, share, k.name);
+        if (named && !(k.name==skillbuiltin) && !(link && k.hidden)) {
+            list[n++] = k;
+        }
+    }
+    list.len = all ? n : 0;
+    return list;
+}
+
+// The user's own skills that thin engines may fetch through this
+// computer, as it offers them (relay.offer) and serves them
+// (relayserve), or a hostlink's (link): none while [skills] is off, nor
+// from a thin engine, as relays do not chain, else skillshared.
+static Slice<Skill> ownskills(Engine *e, Arena *a, b32 link)
+{
+    if (skilldeny(e) || e->cfg->thin) {
+        return {};
+    }
+    Slice<SkillDir> dirs = ownskilldirs(e->cfg, a, e->home, e->skillsdirs, e->skilldir,
+                                        HOST_WINDOWS);
+    Skills          sk   = skillfind(e->os, a, dirs, HOST_WINDOWS);
+    return skillshared(e->cfg, a, skillfilter(e->cfg, a, sk.list), link);
 }
 
 // The built-in skill's instructions, as this engine fills them.

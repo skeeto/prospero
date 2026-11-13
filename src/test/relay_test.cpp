@@ -146,6 +146,140 @@ static void testrelaylayer(Test *t)
     cfgfree(c);
 }
 
+// An offer's skills: each named as a skill may be, once, never
+// prospero, its description on one line of plain UTF-8, at most
+// SKILL_MAX of them.
+static void testrelayskills(Test *t)
+{
+    Arena a = t->perm;
+    Buf   b(&a, 1<<16);
+    print(&b, "{\"skills\":["
+              "{\"name\":\"notes\",\"description\":\"Take\\nnotes\\u0007 \\u00e9t\\u00e9\"},"
+              "{\"name\":\"notes\",\"description\":\"again\"},"
+              "{\"name\":\"deploy\",\"hidden\":1},"
+              "{\"name\":\"prospero\"},{\"name\":\"../x\"},{\"name\":\"a b\"},"
+              "{\"name\":\"\"},{\"description\":\"nameless\"},"
+              "{\"name\":\"long\",\"description\":\"");
+    for (i32 i = 0; i < 400; i++) {
+        print(&b, "x");
+    }
+    print(&b, "\"}");
+    for (i32 i = 0; i < 250; i++) {
+        print(&b, ",{\"name\":\"s");
+        print(&b, istr(&a, i));
+        print(&b, "\"}");
+    }
+    print(&b, "]}");
+    RelayPeer p = {};
+    relayparse(&p, &a, jsonparse(&a, finish(&b)).root);
+    expect(t, "relayskills.max", istr(&a, p.skills.len), istr(&a, SKILL_MAX));
+    expect(t, "relayskills.first", p.skills[0].name, "notes");
+    expect(t, "relayskills.desc", p.skills[0].desc, "Take notes \xc3\xa9t\xc3\xa9");
+    expect(t, "relayskills.hidden", istr(&a, p.skills[0].hidden), "0");
+    expect(t, "relayskills.deploy", p.skills[1].name, "deploy");
+    expect(t, "relayskills.deploy.hidden", istr(&a, p.skills[1].hidden), "1");
+    expect(t, "relayskills.long", p.skills[2].name, "long");
+    expect(t, "relayskills.long.desc", istr(&a, p.skills[2].desc.len), istr(&a, SKILL_DESC));
+    expect(t, "relayskills.then", p.skills[3].name, "s0");
+    expect(t, "relayskills.nodir", istr(&a, p.skills[0].dir.len + p.skills[0].path.len), "0");
+
+    // Control characters are spaced or dropped, and invalid UTF-8 too
+    // (JSON gives a lone surrogate as U+FFFD)
+    RelayPeer q = {};
+    relayparse(&q, &a, jsonparse(&a, "{\"skills\":[{\"name\":\"x\","
+                                      "\"description\":\"a\\tb\\u007f\\ud800c\"}]}").root);
+    expect(t, "relayskills.clean", q.skills[0].desc, "a b\xef\xbf\xbd" "c");
+    expect(t, "relayskills.raw", relayskilldesc(&a, "a\xed\xa0\x80" "b\xff" "c\x01"), "abc");
+}
+
+static Slice<Skill> skillsdup(Arena *a, Slice<Skill> list)
+{
+    Slice<Skill> r = {};
+    for (iz i = 0; i < list.len; i++) {
+        r = push(a, r, list[i]);
+    }
+    return r;
+}
+
+// What a computer shares of its user's skills: [skills] paths only as
+// the user's own file gives them, absolute; then --skillsdir, the
+// configuration's and those under ~; as [skills] share says, never
+// prospero, and for a hostlink none of the user's alone.
+static void testownskills(Test *t)
+{
+    Arena  a = t->perm;
+    CfgEnv v = newcfgenv(&a);
+    os_write(v.os, a, "/c/team.ini", "[skills]\npaths = /team/skills\n");
+    os_write(v.os, a, "/c/p.ini", "include = team.ini\n");
+    Config    *c  = newconfig(v.os, &a, v.scratch, "/c/p.ini", 0);
+    Slice<Str> sd = {};
+    sd = push(&a, sd, Str("/flag/skills"));
+    Slice<SkillDir> d = ownskilldirs(c, &a, "/home/u", sd, "/home/u/.config/prospero/skills", 0);
+    Buf b(&a, 256);
+    for (iz i = 0; i < d.len; i++) {
+        print(&b, i ? Str(" ") : Str(""));
+        print(&b, d[i].path);
+    }
+    expect(t, "ownskills.include", finish(&b),
+           "/flag/skills /home/u/.config/prospero/skills /home/u/.claude/skills "
+           "/home/u/.agents/skills /home/u/.cursor/skills /home/u/.codex/skills");
+    cfgfree(c);
+
+    os_write(v.os, a, "/c/p.ini", "include = team.ini\n[skills]\n"
+                                  "paths = /own/skills; rel/skills; ~/mine\n");
+    c = newconfig(v.os, &a, v.scratch, "/c/p.ini", 0);
+    d = ownskilldirs(c, &a, "/home/u", {}, {}, 0);
+    expect(t, "ownskills.own", istr(&a, d.len), "6");
+    expect(t, "ownskills.own0", d[0].path, "/own/skills");
+    expect(t, "ownskills.own1", d[1].path, "/home/u/mine");
+    expect(t, "ownskills.own2", d[2].path, "/home/u/.claude/skills");
+    cfgfree(c);
+
+    // [skills] share
+    Slice<Skill> list = {};
+    Str names[] = {"deploy", "notes", "prospero", "todo"};
+    for (iz i = 0; i < countof(names); i++) {
+        Skill k = {};
+        k.name   = names[i];
+        k.hidden = names[i] == "deploy";
+        list = push(&a, list, k);
+    }
+    struct {
+        Str ini;
+        b32 link;
+        Str want;
+    } cases[] = {
+        {"",                           0, "deploy* notes todo"},
+        {"",                           1, "notes todo"},
+        {"[skills]\nshare = yes\n",    0, "deploy* notes todo"},
+        {"[skills]\nshare = no\n",     0, ""},
+        {"[skills]\nshare = notes, deploy prospero\n", 0, "deploy* notes"},
+        {"[skills]\nshare = notes, deploy\n", 1, "notes"},
+        {"[skills]\nshare = nothing\n", 0, ""},
+    };
+    for (iz i = 0; i < countof(cases); i++) {
+        os_write(v.os, a, "/c/p.ini", cases[i].ini);
+        c = newconfig(v.os, &a, v.scratch, "/c/p.ini", 0);
+        Slice<Skill> got = skillshared(c, &a, skillsdup(&a, list), cases[i].link);
+        expect(t, concat(&a, "ownskills.share ", istr(&a, i)), skillnames(&a, got),
+               cases[i].want);
+        cfgfree(c);
+    }
+
+    // An include may narrow sharing, but never widen it past the user's
+    os_write(v.os, a, "/c/team.ini", "[skills]\nshare = notes\n");
+    os_write(v.os, a, "/c/p.ini", "include = team.ini\n");
+    c = newconfig(v.os, &a, v.scratch, "/c/p.ini", 0);
+    expect(t, "ownskills.narrowed", skillnames(&a, skillshared(c, &a, skillsdup(&a, list), 0)),
+           "notes");
+    cfgfree(c);
+    os_write(v.os, a, "/c/team.ini", "[skills]\nshare = yes\n");
+    os_write(v.os, a, "/c/p.ini", "include = team.ini\n[skills]\nshare = no\n");
+    c = newconfig(v.os, &a, v.scratch, "/c/p.ini", 0);
+    expect(t, "ownskills.users", skillnames(&a, skillshared(c, &a, skillsdup(&a, list), 0)), "");
+    cfgfree(c);
+}
+
 // A JSON value as text, to compare
 static Str relayjsontext(Arena *a, Json *j)
 {
@@ -238,5 +372,7 @@ static void test_relay(Test *t)
     testrelayparse(t);
     testrelaylayer(t);
     testrelaycall(t);
+    testrelayskills(t);
+    testownskills(t);
     testmailroom(t);
 }

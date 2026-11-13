@@ -7826,6 +7826,32 @@ static void guiofferask(Gui *g)
     cmdsend(g, &w, a);
 }
 
+// Whether a host may have the user's skills (guioffersend, guirelayin):
+// not the container of a subagent with no network, which runs unasked
+// as it can reach nothing but its own files and /out (hostlink.cpp).
+static b32 hostskills(GuiHost *h)
+{
+    b32 task = h->taskexec.len || startswith(h->name, "ctr:t-");
+    return !task || (h->taskctr && h->taskctr->network);
+}
+
+// An offer without its skills, for a host that may not have them.
+static Str offerunskilled(Arena *a, Str offer)
+{
+    JsonDoc d = jsonparse(a, offer);
+    Buf     b(a, offer.len);
+    JsonOut w = {&b};
+    putobject(&w);
+    for (Json *m = d.root->child; m; m = m->next) {
+        if (!(m->key == "skills")) {
+            putkey(&w, m->key);
+            putjson(&w, m);
+        }
+    }
+    putend(&w);
+    return finish(&b);
+}
+
 // The offer to each thin-capable host up that lacks it as it is now.
 static void guioffersend(Gui *g)
 {
@@ -7837,11 +7863,12 @@ static void guioffersend(Gui *g)
                 !hostcap(h, "relay")) {
             continue;
         }
-        Arena a = newarena(g->cmdr);
-        Buf   b(&a, 256 + g->offer.len);
+        Arena a     = newarena(g->cmdr);
+        Str   offer = hostskills(h) ? g->offer : offerunskilled(&a, g->offer);
+        Buf   b(&a, 256 + offer.len);
         EvOut w = cmdopen(g, &b, CMD_RELAYOFFER, 0, h);
         putkey(&w.json, "offer");
-        putraw(&w.json, g->offer);
+        putraw(&w.json, offer);
         cmdsend(g, &w, a);
         h->offered = 1;
     }

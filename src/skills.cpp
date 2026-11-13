@@ -43,10 +43,12 @@ enum : i64 {
 struct Skill {
     Str name;
     Str desc;     // one line, at most SKILL_DESC bytes
-    Str dir;      // its directory, normalized; null if built in
-    Str path;     // its SKILL.md; null if built in
+    Str dir;      // its directory, normalized; null if built in or relayed
+    Str path;     // its SKILL.md; null if built in or relayed
     b32 hidden;   // disable-model-invocation: the user's alone
     b32 builtin;  // Prospero's own (help.cpp), with no files
+    i64 peer;     // relayed: the computer that offers it (relay.cpp), else 0
+    Str from;     // and that computer's name
 };
 
 // The built-in skill's name, which only the user's own skills may take.
