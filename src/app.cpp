@@ -13479,6 +13479,8 @@ enum : i32 {
     OP_NODIALOG,  // the next file dialog cannot be shown, as without a portal
     OP_OPENFILE,  // open text in Files, as a reference (fileref) in --cwd,
                   // in the session shown
+    OP_MDOWN,     // middle button
+    OP_MUP,
 };
 // OP_TEXTCWD with text types the --cwd directory and text after it, on
 // Windows with backslashes, as a Windows user types a path.
@@ -16396,6 +16398,14 @@ static DriveOp m3ops[] = {
     {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
     {OP_CHECK, CHK_FILETABS, 0, 0, 0,
      "long.txt|a/x.c|b/x.c|notes.md|crlf.txt|blob.bin|huge.txt|*hello.txt"},
+    // A middle click closes the one tab under the pointer: ImGui closes
+    // it on the press, and the release, over the tab slid into its place,
+    // closes nothing (#51)
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file tab 1"},
+    {OP_MDOWN, 0, 0, 0, 60, ""},
+    {OP_MUP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_FILETABS, 0, 0, 0,
+     "a/x.c|b/x.c|notes.md|crlf.txt|blob.bin|huge.txt|*hello.txt"},
     // The second layout, Compact, keeps Files shown; Focus hides it, and
     // a file opened shows it in the center
     {OP_MOVE, T_TRANSCRIPT, 0, 0, 100, ""},
@@ -24984,11 +24994,14 @@ static void drivestep(Gui *g)
     case OP_UP:
     case OP_RDOWN:
     case OP_RUP:
+    case OP_MDOWN:
+    case OP_MUP:
         e.kind   = GEV_BUTTON;
         e.x      = g->drivex;
         e.y      = g->drivey;
-        e.button = op->op==OP_RDOWN || op->op==OP_RUP;
-        e.down   = op->op==OP_DOWN || op->op==OP_RDOWN;
+        e.button = op->op==OP_RDOWN || op->op==OP_RUP ? 1
+                 : op->op==OP_MDOWN || op->op==OP_MUP ? 2 : 0;
+        e.down   = op->op==OP_DOWN || op->op==OP_RDOWN || op->op==OP_MDOWN;
         os_guiinject(g->os, &e);
         if (e.down && g->tracedrive) {
             // What the press lands on, as of the last frame

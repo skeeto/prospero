@@ -1996,9 +1996,6 @@ static FileBar filetabs(Gui *g, GuiSession *root)
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip)) {
             tipnow("%s", cstr0(&a, ft->path));
         }
-        if (ImGui::IsItemHovered() && ImGui::IsMouseReleased(ImGuiMouseButton_Middle)) {
-            r.closed = i;
-        }
         Buf nb(&a, 32);
         print(&nb, "file tab ");
         print(&nb, (i64)i + 1);

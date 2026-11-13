@@ -1889,7 +1889,8 @@ static void os_guiinject(Os *os, GuiEvent *ge)
         e.type            = ge->down ? SDL_EVENT_MOUSE_BUTTON_DOWN : SDL_EVENT_MOUSE_BUTTON_UP;
         e.button.windowID = id;
         e.button.which    = 1;
-        e.button.button   = ge->button ? SDL_BUTTON_RIGHT : SDL_BUTTON_LEFT;
+        e.button.button   = ge->button==2 ? SDL_BUTTON_MIDDLE
+                          : ge->button ? SDL_BUTTON_RIGHT : SDL_BUTTON_LEFT;
         e.button.down     = ge->down;
         e.button.clicks   = 1;
         e.button.x        = ge->x;

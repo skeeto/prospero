@@ -1273,9 +1273,11 @@ extern "C" void w32gui_inject(void *p, int kind, float x, float y,
         PostMessageW(w->hwnd, WM_MOUSEMOVE, 0, xy);
         break;
     case 1: {  // button
-        UINT m = button ? (down ? WM_RBUTTONDOWN : WM_RBUTTONUP)
-                        : (down ? WM_LBUTTONDOWN : WM_LBUTTONUP);
-        PostMessageW(w->hwnd, m, down ? (button ? MK_RBUTTON : MK_LBUTTON) : 0, xy);
+        UINT m = button==2 ? (down ? WM_MBUTTONDOWN : WM_MBUTTONUP)
+               : button    ? (down ? WM_RBUTTONDOWN : WM_RBUTTONUP)
+               :             (down ? WM_LBUTTONDOWN : WM_LBUTTONUP);
+        WPARAM mk = button==2 ? MK_MBUTTON : button ? MK_RBUTTON : MK_LBUTTON;
+        PostMessageW(w->hwnd, m, down ? mk : 0, xy);
     } break;
     case 2: {  // wheel
         POINT pt = {(LONG)x, 0};

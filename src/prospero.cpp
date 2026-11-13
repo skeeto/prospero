@@ -604,7 +604,7 @@ static b32     os_guialtgr(Os *);
 // to x by y.
 enum {
     GEV_MOVE,
-    GEV_BUTTON,  // button 0 left, 1 right
+    GEV_BUTTON,  // button 0 left, 1 right, 2 middle
     GEV_WHEEL,   // y notches, positive up
     GEV_KEY,     // key GKEY_*, with ctrl held if set
     GEV_TEXT,
