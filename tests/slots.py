@@ -50,8 +50,10 @@ def headless():
 
 def default():
     """Slots for this machine when PROSPERO_GUI_SLOTS doesn't say: one
-    until measured (decisions.md)."""
-    return 1
+    per two processors. Checklists mostly wait, so on the 12-processor
+    VM six at once ran each mode as fast as one alone (decisions.md,
+    2026-11-13)."""
+    return max(1, (os.cpu_count() or 2) // 2)
 
 
 def count():
