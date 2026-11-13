@@ -529,4 +529,62 @@ static void test_guard(Test *t)
         expect(t, concat(a, nets[i].win ? Str("netpath win ") : Str("netpath posix "),
                          nets[i].path), got, want);
     }
+
+    // The drive a Windows path is on, by its letter alone
+    struct { Str path; Str want; } drives[] = {
+        {"C:\\x",             "C"},
+        {"c:/x",              "C"},
+        {"z:",                "Z"},
+        {"\\\\?\\d:\\x",      "D"},
+        {"//./E:/x",          "E"},
+        {"\\??\\F:\\x",       "F"},
+        {"C:x",               ""},  // drive-relative: not a root to ask of
+        {"\\\\srv\\share\\x", ""},
+        {"\\\\?\\UNC\\h\\s",  ""},
+        {"\\\\?\\Volume{x}\\", ""},
+        {"\\x",               ""},
+        {"x\\y",              ""},
+        {"1:\\x",             ""},
+        {"",                  ""},
+    };
+    for (iz i = 0; i < countof(drives); i++) {
+        u8  d   = windriveof(drives[i].path);
+        Str got = d ? Str{&d, 1} : Str{};
+        expect(t, concat(a, "windriveof ", drives[i].path), clone(a, got), drives[i].want);
+    }
+
+    // What a drive's DOS device target says: network redirectors' far,
+    // a subst onto another drive that drive's letter, the rest local
+    struct { Str target; Str want; } targets[] = {
+        {"\\Device\\HarddiskVolume3",                              "local"},
+        {"\\Device\\CdRom0",                                       "local"},
+        {"\\Device\\Floppy0",                                      "local"},
+        {"\\Device\\Mup\\;LanmanRedirector\\;Z:0000000000012345\\h\\s", "far"},
+        {"\\Device\\Mup\\h\\s",                                    "far"},
+        {"\\device\\mup\\h",                                       "far"},
+        {"\\Device\\Mup",                                          "far"},
+        {"\\Device\\Mupx\\h",                                      "local"},
+        {"\\Device\\LanmanRedirector\\;Z:0000000000012345\\h\\s",  "far"},
+        {"\\Device\\WebDavRedirector\\;Y:0000000000034567\\h\\s",  "far"},
+        {"\\Device\\VBoxMiniRdr\\;E:\\vboxsvr\\share",             "far"},
+        {"\\Device\\RdpDr\\;:1\\tsclient\\C",                      "far"},
+        {"\\Device\\Harddisk;Volume3",                             "local"},
+        {"\\??\\C:\\work",                                         "subst C"},
+        {"\\??\\d:\\",                                             "subst D"},
+        {"\\??\\E:",                                               "subst E"},
+        {"\\??\\UNC\\h\\s",                                        "far"},
+        {"\\??\\unc\\h\\s",                                        "far"},
+        {"\\??\\GLOBALROOT\\Device\\Mup\\h\\s",                    "far"},
+        {"\\??\\GLOBALROOT\\Device\\HarddiskVolume2",              "local"},
+        {"\\??\\Volume{1234}\\",                                   "local"},
+        {"\\??\\C:x",                                              "local"},
+        {"",                                                       "local"},
+    };
+    for (iz i = 0; i < countof(targets); i++) {
+        DosDrive d   = dosdrive(targets[i].target);
+        Str      got = d.kind==DOSDRIVE_FAR   ? Str("far")
+                     : d.kind==DOSDRIVE_LOCAL ? Str("local")
+                     : concat(a, "subst ", Str{&d.onto, 1});
+        expect(t, concat(a, "dosdrive ", targets[i].target), got, targets[i].want);
+    }
 }

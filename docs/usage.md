@@ -60,10 +60,12 @@ text), and `path:N` or `path:A-B` scrolled to those lines and marked. Ctrl+W (Cm
 file dropped on the Files pane opens there too, not attached; while files
 are dragged over the window, the place they would go (Files, the prompt
 or Open file's field) is outlined, with a card saying what a
-drop there does or why the files would not be attached; on macOS it
-knows what the drag holds, counting the files, sending a folder to New
-session and refusing text, and a drop that would be refused springs
-back. The
+drop there does or why the files would not be attached; on macOS and
+Windows it knows what the drag holds, counting the files, sending a
+folder to New session and refusing text, and a drop that would be
+refused springs back (on Linux, and on Windows for a drag with paths on
+a network drive or a disc, which are not looked at, it shows only the
+place). The
 window opens where it was last, fitted to the displays there are; the
 first time, 1700 by 900 at the display's scale, or maximized on a display
 too small for that. The first run shows Help in front, with Settings and

@@ -333,6 +333,73 @@ static b32 netpath(Str path, b32 win)
     return !equalfold(host, "wsl.localhost") && !equalfold(host, "wsl$");
 }
 
+// The drive letter a Windows path is on, in upper case, by its "C:"
+// with or without a "\\?\", "\\.\" or "\??\" before it, else 0: UNC
+// paths, the device namespace's others, and relative paths name none.
+static u8 windriveof(Str path)
+{
+    b32 dot = 0;
+    b32 nt  = path.len>=4 && issep(path[0], 1) && path[1]=='?' && path[2]=='?' &&
+              issep(path[3], 1);
+    Str p   = nt ? cuthead(path, 4) : winunprefix(path, &dot);
+    if (!isdrive(p) || (p.len>2 && !issep(p[2], 1))) {
+        return 0;
+    }
+    return (u8)(p[0] & ~0x20);
+}
+
+// What a Windows drive is, by its DOS device's target as QueryDosDeviceW
+// gives it for "X:", which only looks up the name and touches nothing
+// on the drive: far, a network redirector's, when the target is under
+// "\Device\Mup\" or has a component starting with ';', as a mapped
+// drive's has ("\Device\LanmanRedirector\;Z:000...\host\share", and
+// WebDAV's, RDP's and VirtualBox's alike), or names a UNC path
+// ("\??\UNC\"); a subst onto another drive ("\??\C:\work"), whose own
+// target the caller asks for once in turn; else local, a volume or an
+// optical or floppy drive ("\Device\HarddiskVolume3", "\Device\CdRom0"),
+// for GetDriveTypeW to tell apart.
+enum : i32 {
+    DOSDRIVE_LOCAL,
+    DOSDRIVE_FAR,
+    DOSDRIVE_SUBST,  // onto the drive DosDrive.onto
+};
+
+struct DosDrive {
+    i32 kind;
+    u8  onto;  // DOSDRIVE_SUBST's drive letter, in upper case
+};
+
+static DosDrive dosdrive(Str target)
+{
+    DosDrive r = {DOSDRIVE_LOCAL, 0};
+    Str      t = target;
+    if (t.len>=4 && t[0]=='\\' && t[1]=='?' && t[2]=='?' && t[3]=='\\') {
+        t = cuthead(t, 4);
+        if (t.len>=11 && equalfold(takehead(t, 11), "GLOBALROOT\\")) {
+            t = cuthead(t, 10);  // the NT path it names, "\Device\..."
+        } else if (t.len>=4 && equalfold(takehead(t, 4), "UNC\\")) {
+            r.kind = DOSDRIVE_FAR;
+            return r;
+        } else if (isdrive(t) && (t.len==2 || t[2]=='\\')) {
+            r.kind = DOSDRIVE_SUBST;
+            r.onto = (u8)(t[0] & ~0x20);
+            return r;
+        }
+    }
+    if ((t.len>=12 && equalfold(takehead(t, 12), "\\Device\\Mup\\")) ||
+            equalfold(t, "\\Device\\Mup")) {
+        r.kind = DOSDRIVE_FAR;
+        return r;
+    }
+    for (iz i = 0; i+1 < t.len; i++) {
+        if (t[i]=='\\' && t[i+1]==';') {
+            r.kind = DOSDRIVE_FAR;
+            return r;
+        }
+    }
+    return r;
+}
+
 // The other way: a path in the home directory as "~" or "~/x", else as
 // it is. A home with a drive (C:) is a Windows path, compared without
 // case, its separators either. The path keeps its own separators.

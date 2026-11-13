@@ -413,7 +413,7 @@ static u32 os_guilimits(Os *)
 {
     u32 r = wayland() ? GUI_NOPLACE|GUI_NOSERIAL : 0;
     #ifndef __APPLE__
-    r |= GUI_NODRAGLOAD;  // a drag says what it holds only on macOS
+    r |= GUI_NODRAGLOAD;  // Linux's drags never say what they hold
     #endif
     return r;
 }

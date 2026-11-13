@@ -4166,6 +4166,79 @@ static void os_httpfree(Os *, Http *h)
 }
 
 
+W32(i32, GetDriveTypeW(c16 *));
+W32(i32, QueryDosDeviceW(c16 *, c16 *, i32));
+
+enum : i32 {
+    DRIVE_UNKNOWN     = 0,
+    DRIVE_NO_ROOT_DIR = 1,
+    DRIVE_REMOVABLE   = 2,
+    DRIVE_FIXED       = 3,
+    DRIVE_REMOTE      = 4,
+    DRIVE_CDROM       = 5,
+    DRIVE_RAMDISK     = 6,
+};
+
+// How near a path's drive is, for what may be asked of it on a thread
+// that must not wait (w32drive)
+enum : i32 {
+    DRIVEAT_LOCAL,  // a fixed, removable or RAM disk: may be statted
+    DRIVEAT_OTHER,  // an optical drive, none, or not known: left untouched
+    DRIVEAT_FAR,    // a network share: left untouched
+};
+
+// The one Windows drive classifier, which never waits on a share. The
+// drive's DOS device target comes first (QueryDosDeviceW), since that
+// only looks up a name: GetDriveTypeW opens the drive's root, which
+// on a mapped drive whose server is gone waits for the network. So a
+// target dosdrive calls far is far without another call, a subst is
+// followed once to the drive it is on, and only then is GetDriveTypeW
+// asked, of a local device. UNC paths are far; other paths with no
+// drive letter (the device namespace, relative ones) are left alone.
+// The path is UTF-8, either separator. A path on a local drive can
+// still pass through a junction, symlink or mounted folder to a share,
+// which only opening it would tell.
+static i32 w32drive(Str path)
+{
+    u8 d = windriveof(path);
+    if (!d) {
+        return netpath(path, 1) ? DRIVEAT_FAR : DRIVEAT_OTHER;
+    }
+    for (i32 hop = 0; hop < 2; hop++) {
+        c16 name[]     = {(c16)d, ':', 0};
+        c16 target[1024];
+        i32 len = QueryDosDeviceW(name, target, countof(target));
+        if (len <= 0) {
+            return DRIVEAT_OTHER;  // no such drive, or a target too long to tell
+        }
+        // Its first string, as ASCII: the names it is told by are
+        u8 narrow[countof(target)];
+        iz n = 0;
+        for (; n<len && target[n]; n++) {
+            narrow[n] = target[n]<0x80 ? (u8)target[n] : 0x7f;
+        }
+        DosDrive dd = dosdrive({narrow, n});
+        if (dd.kind == DOSDRIVE_FAR) {
+            return DRIVEAT_FAR;
+        } else if (dd.kind == DOSDRIVE_SUBST) {
+            d = dd.onto;
+            continue;
+        }
+        c16 root[] = {(c16)d, ':', '\\', 0};
+        switch (GetDriveTypeW(root)) {
+        case DRIVE_REMOTE:
+            return DRIVEAT_FAR;
+        case DRIVE_FIXED:
+        case DRIVE_REMOVABLE:
+        case DRIVE_RAMDISK:
+            return DRIVEAT_LOCAL;
+        }
+        return DRIVEAT_OTHER;
+    }
+    return DRIVEAT_OTHER;  // a subst onto a subst: followed once only
+}
+
+
 #if PROSPERO_GUI
 #  include "app.cpp"
 #  include "gui_win32.cpp"
