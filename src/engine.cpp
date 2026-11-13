@@ -16300,18 +16300,81 @@ static Guard sessionguard(Session *s, Arena *perm)
     return g;
 }
 
+// An executable on a PATH, by its file name with each of exts appended
+// in turn (an empty one for the name alone), entry by entry, or null.
+// Strict, for a line cmd.exe runs, passes over an entry that is not a
+// full path or is a network one (which may stall for seconds), and
+// takes one in double quotes as Windows does.
+static Str findpathext(Os *os, Arena *perm, Arena scratch, Str path, Str name,
+                       Slice<Str> exts, b32 win, b32 strict)
+{
+    for (Str rest = path; rest.len;) {
+        Cut c = cut(rest, win ? ';' : ':');
+        Str d = strict ? trim(c.head) : c.head;
+        rest = c.tail;
+        if (strict && d.len>=2 && d[0]=='"' && d[d.len-1]=='"') {
+            d = takehead(cuthead(d, 1), d.len-2);
+        }
+        if (!d.len || (strict && (!pathroot(d, win) || netpath(d, win)))) {
+            continue;
+        }
+        for (iz i = 0; i < exts.len; i++) {
+            Arena a = scratch;
+            Str   p = join(&a, d, concat(&a, name, exts[i]));
+            if (os_stat(os, a, p).type == STAT_FILE) {
+                return clone(perm, p);
+            }
+        }
+    }
+    return {};
+}
+
 // An executable on a PATH, by its file name, or null.
 static Str findpath(Os *os, Arena *perm, Arena scratch, Str path, Str name,
                     b32 win)
 {
-    for (Str rest = path; rest.len;) {
-        Cut c = cut(rest, win ? ';' : ':');
-        rest = c.tail;
-        if (!c.head.len) {
-            continue;
+    Str        none[] = {{}};
+    Slice<Str> exts   = {none, 1, 1};
+    return findpathext(os, perm, scratch, path, name, exts, win, 0);
+}
+
+// Where a program that a command names, prog, is: with a separator (or
+// on Windows a drive) where it says, else on path (findpathext). On
+// Windows a name with no extension takes each of pathext's in turn
+// (.COM;.EXE;.BAT;.CMD without one), never none, as cmd.exe chooses,
+// and the answer is a full path for cmdabs: a relative program, and a
+// relative or network PATH entry, are not looked at. A program on a
+// network path counts as found, untouched. Null if nowhere.
+static Str findprog(Os *os, Arena *perm, Arena scratch, Str path, Str prog,
+                    Str pathext, b32 win)
+{
+    if (!prog.len) {
+        return {};
+    }
+    Slice<Str> exts = {};
+    if (!win || find(basename(prog), ".")>=0) {
+        exts = push(&scratch, exts, Str{});
+    } else {
+        pathext = trim(pathext);
+        for (Str rest = pathext.len ? pathext : Str(".COM;.EXE;.BAT;.CMD"); rest.len;) {
+            Cut c = cut(rest, ';');
+            rest = c.tail;
+            if (trim(c.head).len) {
+                exts = push(&scratch, exts, trim(c.head));
+            }
         }
+    }
+    b32 sep = find(prog, "/")>=0 || (win && (find(prog, "\\")>=0 || find(prog, ":")>=0));
+    if (!sep) {
+        return findpathext(os, perm, scratch, path, prog, exts, win, win);
+    } else if (win && !pathroot(prog, 1)) {
+        return {};
+    } else if (netpath(prog, win)) {
+        return clone(perm, prog);
+    }
+    for (iz i = 0; i < exts.len; i++) {
         Arena a = scratch;
-        Str   p = join(&a, c.head, name);
+        Str   p = concat(&a, prog, exts[i]);
         if (os_stat(os, a, p).type == STAT_FILE) {
             return clone(perm, p);
         }

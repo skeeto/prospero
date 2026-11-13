@@ -99,6 +99,13 @@ static void test_editjump(Test *t)
          "why: Its path holds %, \" or a control character, which cmd.exe cannot pass on"},
         {"control", "code", {}, "C:\\a\x01\\b.c", 6, 0, 1,
          "why: Its path holds %, \" or a control character, which cmd.exe cannot pass on"},
+        {"bestfit", "nano", {}, "C:\\a\xef\xbc\x82 +!calc \xef\xbc\x82", 6, 0, 1,
+         "why: Its path holds a character Windows may pass to the editor as \" or \\"},
+        {"yen", "nano", {}, "C:\\a\xc2\xa5", 6, 0, 1,
+         "why: Its path holds a character Windows may pass to the editor as \" or \\"},
+        {"fullwidth", "code", {}, "C:\\\xef\xbc\xa1.c", 6, 0, 1,
+         "code -g \"C:\\\xef\xbc\xa1.c:6\""},
+        {"shbestfit", "code", {}, "/a\xef\xbc\x82", 6, 0, 0, "code -g '/a\xef\xbc\x82:6'"},
         {"shpercent", "code", {}, "/100%/b.c", 6, 0, 0, "code -g '/100%/b.c:6'"},
         {"vim", "vim", {}, "/a/b.c", 6, 0, 0,
          "term: vim +6 '/a/b.c'"},
@@ -243,6 +250,7 @@ static void test_editjump(Test *t)
         {"percent", "ed \"C:\\f\"", "C:\\100%\\ed.exe", ""},
         {"quote", "ed \"C:\\f\"", "C:\\a\"b\\ed.exe", ""},
         {"control", "ed \"C:\\f\"", "C:\\a\x01\\ed.exe", ""},
+        {"bestfit", "ed \"C:\\f\"", "C:\\a\xef\xbc\xbc\\ed.exe", ""},
         {"none", "ed \"C:\\f\"", "", ""},
     };
     for (iz i = 0; i < countof(abss); i++) {

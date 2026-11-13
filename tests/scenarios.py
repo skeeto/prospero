@@ -4092,7 +4092,8 @@ def hello_caps(t):
                  "message", "bypass", "nofolder", "dir", "config.create", "side", "background", "models",
                  "mcp", "mcp.auth", "task.remote", "task.host", "memory", "shell",
                  "git", "answer.trust", "trash", "cut", "endpoint.auth",
-                 "endpoint.copilot", "term", "ask.hold", "fs", "pause", "skill.fetch"} <= set(caps)
+                 "endpoint.copilot", "term", "ask.hold", "fs", "pause", "skill.fetch",
+                 "term.edit"} <= set(caps)
                 and "host" not in caps,
                 f"caps: {caps}")
         want = 0 if isinstance(t.host, XpHost) else 1  # ConPTY, from 10 1809
@@ -17557,10 +17558,18 @@ def vtplain(data):
 
 
 def ttyprobe(t):
-    """[terminal] shell set to this harness's own --tty-probe. On Windows
-    it is a copy that runs as a console program, which ConPTY attaches,
-    as it never does a GUI program: the same image with its subsystem,
-    in the PE header (offset 0x3c, then 92), changed from 2 to 3."""
+    """[terminal] shell set to this harness's own --tty-probe (probeexe)."""
+    exe = probeexe(t)
+    # Quoted as a word of its own, and so the whole value too
+    t.host.write(t.config, (t.host.read(t.config) or "") +
+                 f'[terminal]\nshell = "\\"{exe}\\" --tty-probe"\n')
+
+
+def probeexe(t):
+    """This harness, to run as --tty-probe. On Windows it is a copy that
+    runs as a console program, which ConPTY attaches, as it never does a
+    GUI program: the same image with its subsystem, in the PE header
+    (offset 0x3c, then 92), changed from 2 to 3."""
     if isinstance(t.host, XpHost):
         raise Skip("no ConPTY before Windows 10 1809 (term_refused)")
     exe = getattr(t.host, "exe", None) or t.host.prospero
@@ -17577,9 +17586,7 @@ def ttyprobe(t):
                       f"if [ \"$(od -An -tu1 -j$at -N1 {probe} | tr -d ' ')\" = 2 ]; then "
                       f"printf '\\003' | dd of={probe} bs=1 seek=$at conv=notrunc 2>/dev/null; fi")
         exe = probe
-    # Quoted as a word of its own, and so the whole value too
-    t.host.write(t.config, (t.host.read(t.config) or "") +
-                 f'[terminal]\nshell = "\\"{exe}\\" --tty-probe"\n')
+    return exe
 
 
 class Tty:
@@ -18009,6 +18016,270 @@ def term_refused(t):
     finally:
         h.close()
 
+
+
+def probeargs(words):
+    """--tty-probe's "args" line for these words: each in brackets, with
+    controls, brackets and backslash as \\xHH."""
+    def esc(w):
+        out = []
+        for b in w.encode():
+            if b < 0x20 or b == 0x7f or b in b"[]\\":
+                out.append(f"\\x{b:02x}")
+            else:
+                out.append(chr(b))
+        return "".join(out).encode("latin-1").decode("utf-8")
+    return "args" + "".join(f" [{esc(w)}]" for w in words)
+
+
+def editready(tt, timeout=20):
+    """Waits for the editor, a probe, to start, past whatever the login
+    shell or the OSC 1 before it wrote."""
+    tt.pump(lambda x: b"probe ready\n" in x.text, timeout, "probe ready")
+    tt.cur = tt.text.index(b"probe ready\n") + len(b"probe ready\n")
+
+
+def editbin(t, names=("vi", "hx")):
+    """A folder of editors by these names, links to this harness, whose
+    --tty-probe stands in for one."""
+    bindir = t.host.join(t.base, "bin")
+    os.makedirs(bindir, exist_ok=True)
+    for name in names:
+        os.symlink(t.host.prospero, os.path.join(bindir, name))
+    return bindir
+
+
+def editargs(t, tt, want):
+    tt.type("args\n")
+    got = tt.line("args")
+    t.check(got == probeargs(want), f"args {got!r}, wanted {probeargs(want)!r}")
+
+
+@scenario(bound=60, posix=True)
+def term_edit(t):
+    """term.open's edit runs an editor on a file in a terminal, with the
+    preset's arguments ahead of the path, which no shell parses: blanks,
+    quotes, $ and a newline arrive whole. OSC 1 names it, the request's
+    variables are gone, and its exit is the terminal's. A template takes
+    {file} and {line}, and an editor missing where it says runs by its
+    name on the login shell's PATH."""
+    bindir = editbin(t)
+    vi = t.host.join(bindir, "vi")
+    hx = t.host.join(bindir, "hx")
+    # The profile puts the editors first on PATH, for the rebased one
+    t.host.write(t.host.join(t.home, ".profile"),
+                 f"PATH='{bindir}':$PATH; export PATH\n")
+    h = t.headless(env={"SHELL": "/bin/sh", "VISUAL": "", "EDITOR": ""})
+    try:
+        sid = termsession(t, h)
+        path = t.host.join(t.work, "a b'c\"$d\ne.txt")
+        t.host.write(path, "x\n")
+        tt = Tty(t, h, sid, edit={"path": path, "line": 12, "editor": f"'{vi}' --tty-probe"})
+        argv = tt.reply.get("argv")
+        t.check(argv and argv[-1] == "--tty-edit", f"argv {argv}")
+        t.check("editor" not in tt.reply, f"no editor in the reply: {tt.reply}")
+        t.check(samedir(t, tt.reply.get("cwd"), t.work), f"cwd {tt.reply.get('cwd')}")
+        editready(tt)
+        t.check(b"\x1b]1;vi\x07" in tt.data, f"OSC 1 vi: {bytes(tt.data[:300])!r}")
+        editargs(t, tt, ["--tty-probe", "+12", path])
+        tt.type("env PROSPERO_EDIT_FILE\n")
+        got = tt.line("env PROSPERO_EDIT_FILE")
+        t.check(got == "env PROSPERO_EDIT_FILE unset", got)
+        tt.type("cwd\n")
+        got = tt.line("cwd ")
+        t.check(samedir(t, got[4:], t.work), got)
+        tt.type("exit 3\n")
+        end = tt.ended()
+        t.check(end.get("code") == 3, f"term.end {end}")
+
+        # hx takes path:line:col
+        tt = Tty(t, h, sid, edit={"path": path, "line": 12, "col": 3,
+                                  "editor": f"'{hx}' --tty-probe"})
+        editready(tt)
+        t.check(b"\x1b]1;hx\x07" in tt.data, f"OSC 1 hx: {bytes(tt.data[:300])!r}")
+        editargs(t, tt, ["--tty-probe", f"{path}:12:3"])
+        tt.type("exit 0\n")
+        t.check(tt.ended().get("code") == 0, "exit 0")
+
+        # A template, with {file} and {line}
+        tt = Tty(t, h, sid, edit={"path": path, "line": 12,
+                                  "template": f"'{vi}' --tty-probe --at {{file}}:{{line}}"})
+        editready(tt)
+        editargs(t, tt, ["--tty-probe", "--at", f"{path}:12"])
+        tt.type("exit 0\n")
+        t.check(tt.ended().get("code") == 0, "exit 0")
+
+        # Not where it says: vi by its name, on the profile's PATH
+        tt = Tty(t, h, sid, edit={"path": path, "line": 7,
+                                  "editor": "/nonexistent/vi --tty-probe"})
+        editready(tt)
+        editargs(t, tt, ["--tty-probe", "+7", path])
+        tt.type("exit 0\n")
+        t.check(tt.ended().get("code") == 0, "exit 0")
+    finally:
+        h.close()
+
+
+@scenario(bound=60, posix=True)
+def term_edit_profile(t):
+    """With no editor given, the host's own runs: $VISUAL as the login
+    shell's profile sets it, bash's interactive ~/.bashrc too (-i); with
+    none on PATH, the terminal says so and ends with 127. An empty PATH
+    entry never runs a vi in the session's folder."""
+    bindir = editbin(t)
+    vi = t.host.join(bindir, "vi")
+    hx = t.host.join(bindir, "hx")
+    path = t.host.join(t.work, "f.txt")
+    t.host.write(path, "x\n")
+    profile = t.host.join(t.home, ".profile")
+    t.host.write(profile, f"VISUAL=\"'{vi}' --tty-probe\"; export VISUAL\n")
+    env = {"SHELL": "/bin/sh", "VISUAL": "", "EDITOR": ""}
+    h = t.headless(env=env)
+    try:
+        sid = termsession(t, h)
+        tt = Tty(t, h, sid, edit={"path": path, "line": 3})
+        editready(tt)
+        editargs(t, tt, ["--tty-probe", "+3", path])
+        tt.type("exit 0\n")
+        t.check(tt.ended().get("code") == 0, "exit 0")
+    finally:
+        h.close()
+
+    if os.path.exists("/bin/bash"):
+        # Behind Ubuntu's guard, which only an interactive shell passes
+        t.host.write(t.host.join(t.home, ".bashrc"),
+                     "case $- in *i*) ;; *) return;; esac\n"
+                     f"VISUAL=\"'{hx}' --tty-probe\"; export VISUAL\n")
+        t.host.write(t.host.join(t.home, ".bash_profile"), ". ~/.bashrc\n")
+        h = t.headless(env=dict(env, SHELL="/bin/bash",
+                                BASH_SILENCE_DEPRECATION_WARNING="1"))
+        try:
+            sid = termsession(t, h)
+            tt = Tty(t, h, sid, edit={"path": path, "line": 3})
+            editready(tt)
+            editargs(t, tt, ["--tty-probe", f"{path}:3"])
+            tt.type("exit 0\n")
+            t.check(tt.ended().get("code") == 0, "exit 0")
+        finally:
+            h.close()
+    else:
+        t.note("no /bin/bash: its -i case skipped")
+
+    # An empty PATH entry, which sh takes as the session's folder, where
+    # a vi waits: the one found on PATH's full-path entries runs
+    t.host.write(t.host.join(t.work, "vi"), "#!/bin/sh\necho planted; exit 9\n")
+    os.chmod(t.host.join(t.work, "vi"), 0o755)
+    t.host.write(profile, f"PATH=\":{bindir}:$PATH\"; export PATH\n"
+                          "VISUAL='vi --tty-probe'; export VISUAL\n")
+    h = t.headless(env=env)
+    try:
+        sid = termsession(t, h)
+        tt = Tty(t, h, sid, edit={"path": path, "line": 3})
+        editready(tt)
+        editargs(t, tt, ["--tty-probe", "+3", path])
+        tt.type("exit 0\n")
+        t.check(tt.ended().get("code") == 0, "exit 0")
+        t.check(b"planted" not in tt.data, f"output {bytes(tt.data[-300:])!r}")
+    finally:
+        h.close()
+        os.remove(t.host.join(t.work, "vi"))
+
+    # No editor at all: PATH set after the system's profile (macOS's
+    # path_helper puts /usr/bin, and its vi, back)
+    empty = t.host.join(t.base, "empty")
+    os.makedirs(empty, exist_ok=True)
+    t.host.write(profile, f"PATH='{empty}'; export PATH; unset VISUAL EDITOR\n")
+    h = t.headless(env=env)
+    try:
+        sid = termsession(t, h)
+        tt = Tty(t, h, sid, edit={"path": path, "line": 3})
+        end = tt.ended()
+        t.check(end.get("code") == 127, f"term.end {end}")
+        t.check(b"no editor here" in tt.data, f"output {bytes(tt.data[-300:])!r}")
+    finally:
+        h.close()
+
+
+@scenario(bound=60)
+def term_edit_windows(t):
+    """On Windows the editor is found up front with PATHEXT, by its path
+    or its name (vi.cmd), and runs through cmd.exe by its full path, the
+    file's path quoted with backslashes; the reply names it. A path that
+    holds %, or U+FF02, is refused, as are an editor that is nowhere and
+    one after VAR=value."""
+    if not t.host.windows:
+        raise Skip("Windows only (term_edit on POSIX)")
+    probe = probeexe(t).replace("/", "\\")
+    bindir = t.host.join(t.base, "bin")
+    t.host.mkdir(bindir)
+    # The probe stays off PATH, where plain vi would find vi.exe first
+    t.host.write(t.host.join(bindir, "vi.cmd"), f'@"{probe}" --tty-probe %*\r\n')
+    system = "C:\\Windows\\System32;C:\\Windows"
+    winbin = bindir.replace("/", "\\")
+    h = t.headless(env={"PATH": f"{winbin};{system}", "VISUAL": "", "EDITOR": ""})
+    try:
+        sid = termsession(t, h)
+        path = t.host.join(t.work, "a b.txt")
+        t.host.write(path, "x\n")
+        winpath = path.replace("/", "\\")
+        for editor in [t.host.join(bindir, "vi.cmd").replace("/", "\\"), "vi"]:
+            tt = Tty(t, h, sid, cols=400, edit={"path": path, "line": 12, "editor": editor})
+            t.check(tt.reply.get("editor") == "vi", f"reply {tt.reply}")
+            tt.line("probe ready")
+            editargs(t, tt, ["--tty-probe", "+12", winpath])
+            tt.type("exit 0\n")
+            t.check(tt.ended().get("code") == 0, f"{editor}: exit 0")
+        bad = t.host.join(t.work, "100%.txt")
+        r = h.call("term.open", sid=sid, cols=80, rows=24, edit={"path": bad, "editor": "vi"})
+        t.check(not r.get("ok") and "cmd.exe" in r.get("err", ""), f"a path with %: {r}")
+        # A fullwidth quote, which an ANSI editor gets as " (WorstFit)
+        bad = t.host.join(t.work, "a＂ +!calc ＂.txt")
+        r = h.call("term.open", sid=sid, cols=80, rows=24, edit={"path": bad, "editor": "vi"})
+        t.check(not r.get("ok") and "Windows may pass" in r.get("err", ""),
+                f"a path with U+FF02: {r}")
+        # cmd.exe takes no VAR=value words
+        r = h.call("term.open", sid=sid, cols=80, rows=24,
+                   edit={"path": path, "editor": "FOO=1 vi"})
+        t.check(not r.get("ok") and "VAR=value" in r.get("err", ""), f"FOO=1 vi: {r}")
+    finally:
+        h.close()
+
+    h = t.headless(env={"PATH": system, "VISUAL": "", "EDITOR": ""})
+    try:
+        sid = termsession(t, h)
+        r = h.call("term.open", sid=sid, cols=80, rows=24,
+                   edit={"path": t.host.join(t.work, "a b.txt"), "editor": "nosuchedit"})
+        t.check(not r.get("ok") and "no editor found here: nosuchedit" in r.get("err", ""),
+                f"a missing editor: {r}")
+    finally:
+        h.close()
+
+
+@scenario(bound=15)
+def term_edit_refused(t):
+    """term.open refuses an edit that is not an object, a relative path,
+    and both an editor and a template; with no ConPTY (XP), term_refused's
+    error comes first."""
+    h = t.headless()
+    try:
+        sid = termsession(t, h)
+        path = t.host.join(t.work, "f.txt")
+        cases = [
+            ("f.txt", "edit must be an object"),
+            ({"path": "f.txt"}, "edit.path must be an absolute path"),
+            ({"path": path, "editor": "vi", "template": "vi {file}"},
+             "edit: give editor or template, not both"),
+            ({"path": path, "line": "12"}, "edit.line must be a number"),
+        ]
+        for edit, want in cases:
+            r = h.call("term.open", sid=sid, cols=80, rows=24, edit=edit)
+            if isinstance(t.host, XpHost):
+                t.check(not r.get("ok") and "1809" in r.get("err", ""), f"term.open: {r}")
+            else:
+                t.check(not r.get("ok") and r.get("err") == want, f"{edit!r}: {r}")
+        t.check(h.call("status").get("terms") == 0, "no terminal")
+    finally:
+        h.close()
 
 # The soak: sessions under 10% random faults for a while
 

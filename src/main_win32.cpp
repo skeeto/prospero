@@ -4281,6 +4281,8 @@ extern "C" [[noreturn]] void prospero_desktop();
 // resize arrives as an event too, and writes through the console, which
 // ConPTY renders anew, so tests match its text and not its bytes. A hang
 // up is CTRL_CLOSE_EVENT, and "busy" and "nohup" run "--tty-nap MS".
+// "args" prints its arguments after its name as there: each in
+// brackets, with controls, brackets and backslash as \xHH.
 
 enum : i32 {
     PROBE_KEY_EVENT   = 1,
@@ -4385,7 +4387,7 @@ static uz probenap(Os *os, Arena scratch, i64 ms, b32 detach)
     return pi.process;
 }
 
-[[noreturn]] static void ttyprobe(Os *os, Arena a)
+[[noreturn]] static void ttyprobe(Os *os, Arena a, Slice<Str> args)
 {
     uz in  = os->std[0];
     uz out = os->std[1];
@@ -4450,6 +4452,24 @@ static uz probenap(Os *os, Arena scratch, i64 ms, b32 detach)
                 say = concat(&scratch, say, " unset");
             }
             probeline(os, scratch, say);
+        } else if (cmd == "args") {
+            Buf b(&scratch, 4096);
+            print(&b, "args");
+            for (iz i = 1; i < args.len; i++) {
+                print(&b, " [");
+                for (iz k = 0; k < args[i].len; k++) {
+                    u8 ch = args[i][k];
+                    if (ch<0x20 || ch==0x7f || ch=='[' || ch==']' || ch=='\\') {
+                        print(&b, "\\x");
+                        putbyte(&b, (u8)"0123456789abcdef"[ch>>4]);
+                        putbyte(&b, (u8)"0123456789abcdef"[ch&15]);
+                    } else {
+                        putbyte(&b, ch);
+                    }
+                }
+                putbyte(&b, ']');
+            }
+            probeline(os, scratch, finish(&b));
         } else if (c.head == "cwd") {
             c16 dir[1024];
             i32 dlen = GetCurrentDirectoryW(countof(dir), dir);
@@ -4541,7 +4561,7 @@ void mainCRTStartup()
         Sleep((i32)parseint(args[2]).val);
         ExitProcess(0);
     } else if (args.len>1 && args[1]=="--tty-probe") {
-        ttyprobe(&os, a);
+        ttyprobe(&os, a, args);
     }
 
     if (args.len>1 && args[1]=="desktop") {

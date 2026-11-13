@@ -5,8 +5,8 @@
 // shell's settings, while the frontend emulates the terminal (ariel).
 // The engine is only a flow-controlled pipe of bytes between the two:
 //
-//   term.open {sid, cols, rows, xpx?, ypx?, cwd?}
-//       replies {tid, shell, argv, cwd} before any output
+//   term.open {sid, cols, rows, xpx?, ypx?, cwd?, edit?}
+//       replies {tid, shell, argv, cwd, editor?} before any output
 //   term.input {tid, data}            typed bytes, base64, 16 KiB at most
 //   term.resize {tid, cols, rows, xpx?, ypx?}
 //   term.ack {tid, off, resend?}      output taken up to off
@@ -55,6 +55,45 @@
 // and its version, without another terminal's variables, nor COLUMNS
 // and LINES.
 //
+// An editor on a file (cap term.edit), in place of the shell:
+//
+//   edit {path, line?, col?, editor? | template?}
+//
+// path is absolute for this machine, line (1 to 1e9) and col (0 to 1e9)
+// are clamped, editor is the window's terminal editor's command and
+// template its [ui] editor_line; with neither, this host's own editor
+// runs. The command is built here, where the editor is: only this host
+// knows its login shell, its $VISUAL and $EDITOR, its PATH and how its
+// shell quotes. Without the cap an engine would ignore edit and open a
+// shell.
+//
+// On POSIX this program runs again as "--tty-edit" (main_posix.cpp),
+// /proc/self/exe on Linux, with the request in the environment, never
+// quoted: PROSPERO_EDIT_FILE, _LINE, _COL, _EDITOR or _TEMPLATE, and
+// _LOGIN (0 where a terminal's shell would not be a login shell). Phase
+// one becomes the login shell ($SHELL, else the account's, else
+// /bin/sh) with editshell's flags, which runs "exec SELF --tty-edit-in";
+// phase two picks the editor there (editpick: the window's, $VISUAL,
+// $EDITOR, vi, by the shell's PATH, less its empty and relative
+// entries, which sh would take as the session's folder), names it by
+// OSC 1, drops PROSPERO_EDIT_*, and becomes sh -c 'CMD "$@"' NAME ARGS,
+// the path a positional word (editorrun). The editor is then the
+// terminal's own process, its exit the terminal's; with none, it says so
+// and exits 127.
+// A profile can test PROSPERO_EDIT_FILE, set while it runs, to skip what
+// would keep an editor from starting (exec tmux).
+//
+// On Windows there is no login shell: the window's editor, %VISUAL%,
+// %EDITOR%, then vi, the first found on PATH with PATHEXT (findprog), or
+// a refusal before anything starts; cmd.exe runs its line (editorjump)
+// with the program, its first word, by its full path, quoted (cmdabs),
+// so that cmd.exe's own lookup, which tries the current folder first,
+// never picks it; an editor that starts with VAR=value is refused, and
+// so is a path an editor reading the ANSI code page might get as more
+// than one argument (cmdwordok). The reply's editor is its name. Either
+// way the editor runs in the session's folder, and a session whose
+// files are another OS's (a container's kept subagent) is refused.
+//
 // This is free and unencumbered software released into the public domain.
 
 enum : i32 {
@@ -69,6 +108,8 @@ enum : i32 {
     TERM_RETRY   = 5,           // ms between tries while held back
     TERM_BUSYMS  = 1000,        // between looks at who has the terminal
     TERM_DIMMAX  = 4096,        // columns or rows
+    TERM_EDITPATH = 32 << 10,   // an edit's path, in bytes, under this
+    TERM_EDITCMD  = 4 << 10,    // its editor or template
 };
 
 struct Term {
@@ -242,6 +283,105 @@ static Slice<Str> termargv(Arena *a, Str conf, Str home, Str kind, Str path,
         r = push(a, r, Str("-l"));
     }
     return r;
+}
+
+struct TermEditAsk {
+    b32 on;      // term.open has edit
+    Str path;
+    i32 line;    // 1-based, 0 for none
+    i32 col;     // 0 for none
+    Str editor;  // the window's editor, else null
+    Str tmpl;    // or its template, else null
+    Str why;     // why refused, else null
+};
+
+// A number of edit's, clamped to lo..1e9, or *why.
+static i32 termeditnum(Json *j, i32 lo, Str name, Str *why)
+{
+    if (j->type == JSON_MISSING) {
+        return 0;
+    } else if (j->type != JSON_NUMBER) {
+        *why = name;
+        return 0;
+    }
+    f64 v = jsonfloat(j, lo);
+    v = v<lo ? lo : v>1e9 ? 1e9 : v;
+    return (i32)v;
+}
+
+// term.open's edit, checked: absent, or an object whose path is
+// absolute for this machine (win: Windows), with no NUL and under
+// TERM_EDITPATH, and on Windows nothing cmd.exe cannot pass on (C10);
+// editor or template, not both, each a string under TERM_EDITCMD with
+// no NUL (empty is none).
+static TermEditAsk termeditask(Json *j, b32 win)
+{
+    TermEditAsk r  = {};
+    Json       *ed = jsonget(j, "edit");
+    if (ed->type == JSON_MISSING) {
+        return r;
+    }
+    r.on = 1;
+    if (ed->type != JSON_OBJECT) {
+        r.why = "edit must be an object";
+        return r;
+    }
+    Json *p = jsonget(ed, "path");
+    r.path = jsonstr(p);
+    if (p->type!=JSON_STRING || !pathroot(r.path, win) || cut(r.path, 0).ok) {
+        r.why = "edit.path must be an absolute path";
+        return r;
+    } else if (r.path.len >= TERM_EDITPATH) {
+        r.why = "edit.path is too long";
+        return r;
+    }
+    switch (win ? cmdwordok(r.path) : (i32)CMDWORD_OK) {
+    case CMDWORD_CMD:
+        r.why = "edit.path holds %, \" or a control character, which cmd.exe cannot pass on";
+        return r;
+    case CMDWORD_BESTFIT:
+        r.why = "edit.path holds a character Windows may pass to the editor as \" or \\";
+        return r;
+    }
+    r.line = termeditnum(jsonget(ed, "line"), 1, "edit.line must be a number", &r.why);
+    r.col  = termeditnum(jsonget(ed, "col"), 0, "edit.col must be a number", &r.why);
+    if (r.why.len) {
+        return r;
+    }
+    Str  names[] = {"editor", "template"};
+    Str *dsts[]  = {&r.editor, &r.tmpl};
+    for (iz i = 0; i < countof(names); i++) {
+        Json *v = jsonget(ed, names[i]);
+        if (v->type == JSON_MISSING) {
+            continue;
+        } else if (v->type != JSON_STRING) {
+            r.why = i ? Str("edit.template must be a string") : Str("edit.editor must be a string");
+            return r;
+        } else if (v->str.len>=TERM_EDITCMD || cut(v->str, 0).ok) {
+            r.why = i ? Str("edit.template must be under 4 KiB, with no NUL")
+                      : Str("edit.editor must be under 4 KiB, with no NUL");
+            return r;
+        }
+        *dsts[i] = trim(v->str);
+    }
+    if (r.editor.len && r.tmpl.len) {
+        r.why = "edit: give editor or template, not both";
+    }
+    return r;
+}
+
+// An editor's name, as the reply gives it: its program's file name
+// without .exe, .com, .cmd or .bat.
+static Str termeditname(Str prog)
+{
+    Str name = basename(prog);
+    Str exts[] = {".exe", ".com", ".cmd", ".bat"};
+    for (iz i = 0; i < countof(exts); i++) {
+        if (name.len>exts[i].len && equalfold(cuthead(name, name.len-exts[i].len), exts[i])) {
+            return takehead(name, name.len-exts[i].len);
+        }
+    }
+    return name;
 }
 
 
@@ -429,7 +569,100 @@ static Str termname(Engine *e, Arena scratch, b32 win)
     return "xterm";
 }
 
-// Start a terminal's shell, and reply with its tid, before its output.
+// Where editpick looks for an editor's program on Windows (findprog).
+struct TermFind {
+    Os *os;
+    Str path;
+    Str pathext;
+};
+
+static i32 termfound(void *ctx, Arena *a, Str prog)
+{
+    TermFind *f    = (TermFind *)ctx;
+    Arena     perm = *a;
+    Arena     tmp  = carve(&perm, 1<<20);
+    Str       exe  = findprog(f->os, &perm, tmp, f->path, prog, f->pathext, 1);
+    return exe.len ? EDITOR_FOUND : EDITOR_MISSING;
+}
+
+// The editor's command line on Windows, an edit's, by cmd.exe in env:
+// the first of the window's editor, %VISUAL%, %EDITOR% and vi found on
+// PATH (editpick), its line (editorjump) with the program by its full
+// path (cmdabs), *argv and *name set. Null and *why if there is none.
+static Str termeditwin(Engine *e, Arena *a, TermEditAsk *ed, Slice<Str> env,
+                       Slice<Str> *argv, Str *name, Str *why)
+{
+    // cmd.exe takes no VAR=value words: a line's program is its first
+    // word (editorjump), so one that starts with an assignment is
+    // refused if asked for, else passed over
+    Str asks[] = {ed->editor, ed->tmpl};
+    for (iz i = 0; i < countof(asks); i++) {
+        Str rest = asks[i];
+        if (cmdassign(cmdword(&rest))) {
+            *why = "edit: cmd.exe takes no VAR=value words ahead of the editor";
+            return {};
+        }
+    }
+    Str home   = e->home;
+    Str envs[] = {envget(env, "VISUAL", 1), envget(env, "EDITOR", 1)};
+    for (iz i = 0; i < countof(envs); i++) {
+        Str rest = envs[i];
+        envs[i]  = cmdassign(cmdword(&rest)) ? Str{} : cmdhome(a, envs[i], home);
+    }
+    TermFind f    = {e->os, envpath(env, 1), envget(env, "PATHEXT", 1)};
+    EditPick pick = editpick(a, cmdhome(a, ed->editor, home), cmdhome(a, ed->tmpl, home),
+                             envs[0], envs[1], termfound, &f);
+    Str use = pick.tmpl.len ? pick.tmpl : pick.cmd;
+    if (!use.len) {
+        Str asked = cmdprog(ed->tmpl.len ? ed->tmpl : ed->editor, 0);
+        if (asked.len) {
+            Buf b(a, 96 + asked.len);
+            print(&b, "no editor found here: ");
+            print(&b, basename(asked));
+            print(&b, " is not on PATH, nor are VISUAL, EDITOR or vi");
+            *why = finish(&b);
+        } else {
+            *why = "no editor found here: VISUAL, EDITOR and vi are not on PATH";
+        }
+        return {};
+    }
+    Str  rest  = use;
+    Str  prog  = cmdword(&rest);  // as editorjump takes it
+    Str  exe   = findprog(e->os, a, carve(a, 1<<20), f.path, prog, f.pathext, 1);
+    Str  file  = clone(a, ed->path);
+    for (iz i = 0; i < file.len; i++) {
+        file.data[i] = file[i]=='/' ? '\\' : file[i];
+    }
+    EditJump j = editorjump(a, pick.cmd, pick.tmpl, file, ed->line>0 ? ed->line : 1,
+                            ed->col, 1);
+    if (j.why.len) {
+        *why = j.why;
+        return {};
+    }
+    Str line = cmdabs(a, j.line, exe);
+    if (!line.len) {
+        *why = "cannot start the editor: its path holds %, \", a control character "
+               "or another character cmd.exe cannot pass on";
+        return {};
+    }
+    // cmd.exe itself by a full path, as CreateProcess would try the
+    // current folder for a bare name
+    Str comspec = trim(envget(env, "COMSPEC", 1));
+    if (!pathroot(comspec, 1)) {
+        comspec = findprog(e->os, a, carve(a, 1<<20), f.path, "cmd.exe", {}, 1);
+    }
+    if (!comspec.len) {
+        *why = "cannot start the editor: cmd.exe is not on PATH";
+        return {};
+    }
+    *argv = {};
+    *argv = push(a, *argv, comspec);
+    *name = termeditname(prog);
+    return cmdcline(a, comspec, line);
+}
+
+// Start a terminal's shell, or an edit's editor, and reply with its tid,
+// before its output.
 static Str termstart(Engine *e, Arena scratch, i64 id, Json *j, Session *s, Str sid)
 {
     i64   peer = jsonint(jsonget(j, "peer"), 0);
@@ -440,9 +673,17 @@ static Str termstart(Engine *e, Arena scratch, i64 id, Json *j, Session *s, Str 
     if (!t || termcount(e, peer)>=TERM_PERPEER) {
         return "too many terminals are open";
     }
+    b32         win = s->te.windows;
+    TermEditAsk ed  = termeditask(j, win);
+    if (ed.why.len) {
+        return ed.why;
+    } else if (ed.on && win!=HOST_WINDOWS) {
+        // A container's kept subagent on Windows: Linux's paths, in a
+        // folder gone, with no editor here to take them
+        return "edit: this session's files are not on this machine";
+    }
 
     // In its folder, or the one asked for if it is one
-    b32 win = s->te.windows;
     Str cwd = jsonstr(jsonget(j, "cwd"));
     cwd = cwd.len && os_stat(e->os, scratch, cwd).type==STAT_DIR ? cwd : s->cwd;
 
@@ -456,25 +697,71 @@ static Str termstart(Engine *e, Arena scratch, i64 id, Json *j, Session *s, Str 
     Str        path  = cfgsearchpath(e->cfg, &scratch, envpath(env, win), e->home, win);
     env = envsetpath(&scratch, env, path, win);
     env = shellover(s, &scratch, &sh, env, 1);
-    Str        conf = trim(cfgget(e->cfg, "terminal", {}, "shell", 0));
-    Slice<Str> argv = termargv(&scratch, conf, e->home, shellkinds[sh.kind],
-                               sh.path, sh.distro, envget(env, "SHELL", win),
-                               win, login);
-    if (!argv.len) {
-        return "[terminal] shell: a quote is left open";
+    Slice<Str> argv    = {};
+    Str        cmdline = {};
+    Str        editor  = {};  // the reply's, on Windows
+    if (ed.on && win) {
+        Str why = {};
+        cmdline = termeditwin(e, &scratch, &ed, env, &argv, &editor, &why);
+        if (!cmdline.len) {
+            return why;
+        }
+    } else if (ed.on) {
+        // This program again, which becomes the login shell and then the
+        // editor (main_posix.cpp): on Linux the very file this runs,
+        // even once a rebuild replaced it
+        Str self = PTY_LINUX ? Str("/proc/self/exe") : e->te.exe;
+        if (!self.len) {
+            return "cannot start the editor: this program's path is not known";
+        }
+        argv = push(&scratch, argv, self);
+        argv = push(&scratch, argv, Str("--tty-edit"));
+    } else {
+        Str conf = trim(cfgget(e->cfg, "terminal", {}, "shell", 0));
+        argv = termargv(&scratch, conf, e->home, shellkinds[sh.kind], sh.path, sh.distro,
+                        envget(env, "SHELL", win), win, login);
+        if (!argv.len) {
+            return "[terminal] shell: a quote is left open";
+        }
     }
     Str term = termname(e, scratch, win);  // a literal
     env = termenv(&scratch, env, win, PTY_MAC, term);
+    if (ed.on && !win) {
+        // Never quoted: no shell parses these
+        Str names[] = {
+            "PROSPERO_EDIT_FILE", "PROSPERO_EDIT_LINE", "PROSPERO_EDIT_COL",
+            "PROSPERO_EDIT_EDITOR", "PROSPERO_EDIT_TEMPLATE", "PROSPERO_EDIT_LOGIN",
+        };
+        for (iz i = 0; i < countof(names); i++) {
+            env = envdel(&scratch, env, names[i], 0);
+        }
+        env = envset(&scratch, env, names[0], ed.path, 0);
+        if (ed.line) {
+            env = envset(&scratch, env, names[1], deskint(&scratch, ed.line), 0);
+        }
+        if (ed.col) {
+            env = envset(&scratch, env, names[2], deskint(&scratch, ed.col), 0);
+        }
+        if (ed.editor.len) {
+            env = envset(&scratch, env, names[3], ed.editor, 0);
+        }
+        if (ed.tmpl.len) {
+            env = envset(&scratch, env, names[4], ed.tmpl, 0);
+        }
+        env = envset(&scratch, env, names[5], login ? Str("1") : Str("0"), 0);
+    }
 
-    Spawn sp = {};
-    sp.argv  = argv;
-    sp.cwd   = cwd;
-    sp.env   = env;
-    sp.mbox  = e->in;
-    sp.id    = ++e->nextid;
-    Proc *p  = os_ptyspawn(e->os, &sp, termsize(j), TERM_RING, scratch);
+    Spawn sp   = {};
+    sp.argv    = argv;
+    sp.cmdline = cmdline;
+    sp.cwd     = cwd;
+    sp.env     = env;
+    sp.mbox    = e->in;
+    sp.id      = ++e->nextid;
+    Proc *p    = os_ptyspawn(e->os, &sp, termsize(j), TERM_RING, scratch);
     if (!p) {
-        return concat(&scratch, "cannot start the shell: ", os_lasterr(e->os, &scratch));
+        Str what = ed.on ? Str("cannot start the editor: ") : Str("cannot start the shell: ");
+        return concat(&scratch, what, os_lasterr(e->os, &scratch));
     }
     *t = {};
     t->tid    = ++e->terms->nexttid;
@@ -497,6 +784,9 @@ static Str termstart(Engine *e, Arena scratch, i64 id, Json *j, Session *s, Str 
     }
     putend(&w.json);
     putstrkey(&w.json, "cwd", cwd);
+    if (editor.len) {
+        putstrkey(&w.json, "editor", editor);
+    }
     emit(e, evend(&w));
     return {};
 }

@@ -112,6 +112,40 @@ static Str cmdword(Str *rest)
     return w.data ? w : takehead(t, n);
 }
 
+// What a word in double quotes on a line cmd.exe runs cannot hold
+enum : i32 {
+    CMDWORD_OK,
+    CMDWORD_CMD,      // %, " or a control character, which cmd.exe cannot pass on
+    CMDWORD_BESTFIT,  // a character an ANSI program may read as " or \ (WorstFit)
+};
+
+// Whether s can be a word in double quotes on a line cmd.exe runs:
+// CMDWORD_*. cmd.exe reads the line as UTF-16, but a program that takes
+// its arguments in the ANSI code page (GetCommandLineA, as mingw builds
+// of nano, mg and joe do) gets a character the code page lacks best-fit,
+// some of them as " or \, which end or escape its quotes, and the rest
+// of the word becomes arguments of its own: U+FF02, U+02BA, U+030E,
+// U+2033 and U+3003 as "; U+FF3C, U+00A5, U+20A9, U+2216 and U+FE68 as
+// \. Not the whole fullwidth block, which Japanese names use.
+static i32 cmdwordok(Str s)
+{
+    static Str bestfit[] = {
+        "\xef\xbc\x82", "\xca\xba", "\xcc\x8e", "\xe2\x80\xb3", "\xe3\x80\x83",
+        "\xef\xbc\xbc", "\xc2\xa5", "\xe2\x82\xa9", "\xe2\x88\x96", "\xef\xb9\xa8",
+    };
+    i32 r = CMDWORD_OK;
+    for (iz i = 0; i < s.len; i++) {
+        u8 c = s[i];
+        if (c=='%' || c=='"' || c<0x20 || c==0x7f) {
+            return CMDWORD_CMD;
+        }
+        for (iz k = 0; c>=0x80 && k<countof(bestfit); k++) {
+            r = startswith(cuthead(s, i), bestfit[k]) ? CMDWORD_BESTFIT : r;
+        }
+    }
+    return r;
+}
+
 // Whether a word is a VAR=value assignment ahead of a command.
 static b32 cmdassign(Str w)
 {
@@ -261,7 +295,7 @@ static Str jumpfill(Buf *b, Str tmpl, Str file, i32 line, i32 col, b32 windows)
 // path alone; or tmpl, if not empty, with {file} (a quoted word),
 // {line} and {col} in it, the path appended when it has no {file}. An
 // editor that runs in a terminal gets its line too, marked term. A path
-// cmd.exe cannot pass is refused.
+// cmd.exe cannot pass on (cmdwordok) is refused.
 static EditJump editorjump(Arena *a, Str cmd, Str tmpl, Str path, i32 line, i32 col,
                            b32 windows)
 {
@@ -273,11 +307,13 @@ static EditJump editorjump(Arena *a, Str cmd, Str tmpl, Str path, i32 line, i32 
         r.why = "No editor: set [ui] editor in the settings (or $VISUAL or $EDITOR)";
         return r;
     }
-    for (iz i = 0; windows && i < path.len; i++) {
-        if (path[i]=='%' || path[i]=='"' || path[i]<0x20 || path[i]==0x7f) {
-            r.why = "Its path holds %, \" or a control character, which cmd.exe cannot pass on";
-            return r;
-        }
+    switch (windows ? cmdwordok(path) : (i32)CMDWORD_OK) {
+    case CMDWORD_CMD:
+        r.why = "Its path holds %, \" or a control character, which cmd.exe cannot pass on";
+        return r;
+    case CMDWORD_BESTFIT:
+        r.why = "Its path holds a character Windows may pass to the editor as \" or \\";
+        return r;
     }
     // cmd.exe takes no VAR=value words: its program is the first word
     Str rest = use;
@@ -374,17 +410,11 @@ static EditJump editorwindow(Arena *a, EditJump j)
 // the full path found for it, in double quotes and with backslashes:
 // given a bare name, cmd.exe looks in the current folder before PATH,
 // where anyone who can write a file there picks what runs. Null if exe
-// is not a full path, or holds %, " or a control character, which
-// cmd.exe cannot pass on.
+// is not a full path, or is no word cmd.exe can pass on (cmdwordok).
 static Str cmdabs(Arena *a, Str line, Str exe)
 {
-    if (!pathroot(exe, 1)) {
+    if (!pathroot(exe, 1) || cmdwordok(exe)!=CMDWORD_OK) {
         return {};
-    }
-    for (iz i = 0; i < exe.len; i++) {
-        if (exe[i]=='%' || exe[i]=='"' || exe[i]<0x20 || exe[i]==0x7f) {
-            return {};
-        }
     }
     Str rest = line;
     cmdword(&rest);

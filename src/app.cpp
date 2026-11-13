@@ -7230,7 +7230,8 @@ static Str editorabs(Gui *g, Arena *a, Str line, Str prog, Str name, Str *why)
     if (!exe.len) {
         *why = editormissing(a, prog, name);
     } else if (!r.len) {
-        *why = "Its editor's path holds %, \" or a control character, which cmd.exe cannot pass on";
+        *why = "Its editor's path holds %, \", a control character or another character "
+               "cmd.exe cannot pass on";
     }
     return r;
 }

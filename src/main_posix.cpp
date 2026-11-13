@@ -19,6 +19,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
+#include <pwd.h>  // getpwuid
 #include <signal.h>
 #include <spawn.h>
 #include <stdio.h>  // rename
@@ -38,7 +39,6 @@
 #include <unistd.h>
 #ifdef __APPLE__
 #  include <dlfcn.h>       // dlsym, for the responsibility functions
-#  include <pwd.h>         // getpwuid, for loginenviron
 #  include <libproc.h>     // proc_listpids, proc_pidinfo
 #  include <sys/event.h>   // EVFILT_PROC
 #  include <sys/sysctl.h>  // KERN_PROC_UID
@@ -4113,6 +4113,200 @@ static void loginenviron(Os *os, Arena *perm)
 #endif
 
 
+// prospero --tty-edit: an editor on a file in a terminal, as term.open's
+// edit starts it (ptyhost.cpp), with the request in PROSPERO_EDIT_*.
+// Phase one becomes the user's login shell, interactive as a terminal's
+// is, which runs phase two, "--tty-edit-in", by this program's full
+// path; phase two picks the editor by the PATH, $VISUAL and $EDITOR the
+// profile left, and becomes it, through sh -c. A chain of execs: the
+// editor ends as the terminal's own process, its exit the terminal's,
+// and with no shell above it, a Ctrl+Z never strands it stopped.
+
+static Str edstr(char const *s)
+{
+    Str r = {(u8 *)s, 0};
+    for (; s && s[r.len]; r.len++) {}
+    return r;
+}
+
+static Str edenv(char const *name)
+{
+    return edstr(getenv(name));
+}
+
+[[noreturn]] static void edfail(Str why)
+{
+    writeall(2, "prospero: ");
+    writeall(2, why);
+    writeall(2, "\n");
+    _exit(127);
+}
+
+static Arena edarena(Os *os)
+{
+    Region *r = os_reserve(os, (iz)1<<28);
+    if (!r) {
+        edfail("out of memory");
+    }
+    return newarena(r);
+}
+
+struct EdFind {
+    Os *os;
+    Str path;
+    Str home;
+};
+
+// Whether the shell's PATH has an editor's program, executable, and
+// whether it is busybox's or toybox's, whose vi takes no +N.
+static i32 edfound(void *ctx, Arena *a, Str prog)
+{
+    EdFind *f    = (EdFind *)ctx;
+    Arena   perm = *a;
+    if (cfgtilde(prog)) {
+        prog = concat(&perm, f->home, cuthead(prog, 1));
+    }
+    Arena tmp = carve(&perm, 1<<20);
+    Str   exe = findprog(f->os, &perm, tmp, f->path, prog, {}, 0);
+    if (!exe.len || hasnul(exe) || access(cstr(&perm, exe), X_OK)) {
+        return EDITOR_MISSING;
+    }
+    Str real = os_realpath(f->os, &perm, exe);
+    Str name = basename(real.len ? real : exe);
+    b32 box  = startswith(name, "busybox") || startswith(name, "toybox");
+    return box ? EDITOR_BOX : EDITOR_FOUND;
+}
+
+// Phase two: the editor, in place of this process.
+[[noreturn]] static void ttyeditin()
+{
+    Os    os = {};
+    Arena a  = edarena(&os);
+    Str   file = clone(&a, edenv("PROSPERO_EDIT_FILE"));
+    if (!file.len) {
+        edfail("no file to edit");
+    }
+    Int    line = parseint(edenv("PROSPERO_EDIT_LINE"));
+    Int    col  = parseint(edenv("PROSPERO_EDIT_COL"));
+    i32    ln   = line.ok && line.val>0 && line.val<=1000000000 ? (i32)line.val : 0;
+    i32    cn   = col.ok && col.val>0 && col.val<=1000000000 ? (i32)col.val : 0;
+    // sh takes an empty or relative PATH entry as one in the current
+    // folder, the session's, where the agent writes files: the editor
+    // is looked for, and run, by the full-path entries alone, so that
+    // what runs is what was found
+    Str path = edenv("PATH");
+    Buf pb(&a, path.len+1);
+    for (Str rest = path; rest.len;) {
+        Cut c = cut(rest, ':');
+        rest = c.tail;
+        if (c.head.len && c.head[0]=='/') {
+            if (pb.len) {
+                putbyte(&pb, ':');
+            }
+            print(&pb, c.head);
+        }
+    }
+    Str clean = finish(&pb);
+    if (clean.len) {
+        setenv("PATH", cstr(&a, clean), 1);
+    } else {
+        unsetenv("PATH");  // sh's own default
+    }
+    EdFind f    = {&os, clean, edenv("HOME")};
+    EditPick pick = editpick(&a, edenv("PROSPERO_EDIT_EDITOR"), edenv("PROSPERO_EDIT_TEMPLATE"),
+                             edenv("VISUAL"), edenv("EDITOR"), edfound, &f);
+    if (!pick.cmd.len && !pick.tmpl.len) {
+        edfail("no editor here: set $VISUAL or $EDITOR, or install vi");
+    }
+    EditRun run = editorrun(&a, pick.cmd, pick.tmpl, file, ln, cn, pick.nojump);
+    if (run.why.len) {
+        edfail(run.why);
+    }
+    char **av = alloc<char *>(&a, run.args.len+5);
+    av[0] = (char *)"sh";
+    av[1] = (char *)"-c";
+    av[2] = cstr(&a, run.script);
+    av[3] = cstr(&a, run.name);
+    for (iz i = 0; i < run.args.len; i++) {
+        av[4+i] = cstr(&a, run.args[i]);
+    }
+
+    // The tab's name, OSC 1, then none of the request for the editor
+    Buf b(&a, 16 + run.name.len);
+    print(&b, "\x1b]1;");
+    for (iz i = 0; i < run.name.len; i++) {
+        u8 c = run.name[i];
+        if (c>=0x20 && c!=0x7f) {
+            putbyte(&b, c);
+        }
+    }
+    putbyte(&b, 7);
+    writeall(1, finish(&b));
+    char const *names[] = {
+        "PROSPERO_EDIT_FILE", "PROSPERO_EDIT_LINE", "PROSPERO_EDIT_COL",
+        "PROSPERO_EDIT_EDITOR", "PROSPERO_EDIT_TEMPLATE", "PROSPERO_EDIT_LOGIN",
+    };
+    for (iz i = 0; i < countof(names); i++) {
+        unsetenv(names[i]);
+    }
+    execve("/bin/sh", av, environ);
+    edfail(concat(&a, "cannot run /bin/sh: ", os_lasterr(&os, &a)));
+}
+
+// Phase one: the login shell ($SHELL if a full path, else the account's,
+// else /bin/sh), which runs phase two; /bin/sh's if it will not start.
+// Where this program's path is not one every shell kind reads alike
+// (editshellsafe), phase two runs in place, without the profile.
+[[noreturn]] static void ttyedit()
+{
+    Os    os    = {};
+    Arena a     = edarena(&os);
+    Str   shell = edenv("SHELL");
+    if (!shell.len || shell[0]!='/') {
+        struct passwd *pw = getpwuid(getuid());
+        shell = pw ? clone(&a, edstr(pw->pw_shell)) : Str{};
+        shell = shell.len && shell[0]=='/' ? shell : Str("/bin/sh");
+    }
+    b32 login = !(edenv("PROSPERO_EDIT_LOGIN") == "0");
+
+    #ifdef __linux__
+    // Not os_exepath, which names a rebuild's replacement: that would be
+    // another program, which phase two must not be
+    Str self = {};
+    {
+        iz    cap = 4096;
+        char *buf = (char *)allocbytes(&a, cap);
+        iz    len = readlink("/proc/self/exe", buf, (uz)cap-1);
+        if (len > 0) {
+            buf[len] = 0;
+            self = {(u8 *)buf, len};
+            struct stat st;
+            if (endswith(self, " (deleted)") && stat(buf, &st)) {
+                edfail("cannot start the editor: this program was replaced on disk "
+                       "since its engine started, which must start again first");
+            }
+        }
+    }
+    #else
+    Str self = os_exepath(&os, &a);
+    #endif
+
+    if (editshellsafe(self)) {
+        Str cmd = concat(&a, concat(&a, "'", self), "' --tty-edit-in");
+        Str shells[] = {shell, "/bin/sh"};
+        for (iz k = 0; k < countof(shells); k++) {
+            Slice<Str> argv = editshell(&a, shells[k], cmd, login);
+            char     **av   = alloc<char *>(&a, argv.len+1);
+            for (iz i = 0; i < argv.len; i++) {
+                av[i] = cstr(&a, argv[i]);
+            }
+            execve(av[0], av, environ);
+        }
+    }
+    ttyeditin();
+}
+
+
 // prospero --tty-probe: a stand-in shell for testing terminals, which
 // reads a command a line from its terminal and answers on it, without
 // echo or output processing, so that what it writes arrives as written:
@@ -4122,6 +4316,9 @@ static void loginenviron(Os *os, Arena *perm)
 //   flood N        N bytes of floodbyte, then "flood end"
 //   env NAME       "env NAME=VALUE", or "env NAME unset"
 //   cwd            "cwd DIR"
+//   args           "args [WORD] [WORD]...", each of its own arguments
+//                  after its name, with controls, brackets and backslash
+//                  as \xHH
 //   hup FILE       on SIGHUP, write "hup" to FILE and exit 129
 //   sleep MS       "slept" once MS passed
 //   busy MS        a job in the foreground for MS, then "busy done"
@@ -4204,9 +4401,24 @@ static u8 floodbyte(i64 i)
     return (u8)(i%64==63 ? '\n' : 'a' + (i/64 + i%64)%26);
 }
 
+// A word of "args", in brackets: controls, brackets and backslash as \xHH.
+static void probeword(ProbeOut *o, Str w)
+{
+    probeput(o, " [");
+    for (iz i = 0; i < w.len; i++) {
+        u8 c = w[i];
+        if (c<0x20 || c==0x7f || c=='[' || c==']' || c=='\\') {
+            u8 hex[] = {'\\', 'x', (u8)"0123456789abcdef"[c>>4], (u8)"0123456789abcdef"[c&15]};
+            probeput(o, {hex, 4});
+        } else {
+            probeput(o, {w.data+i, 1});
+        }
+    }
+    probeput(o, "]");
+}
+
 static void ttyprobe(char **argv)
 {
-    (void)argv;
     struct termios tio = {};
     if (!tcgetattr(0, &tio)) {
         tio.c_oflag &= ~(tcflag_t)OPOST;
@@ -4273,6 +4485,12 @@ static void ttyprobe(char **argv)
                 probeput(&o, {(u8 *)v, (iz)strlen(v)});
             } else {
                 probeput(&o, " unset");
+            }
+            probeflush(&o);
+        } else if (cmd == "args") {
+            probeput(&o, "args");
+            for (char **w = argv+1; *w; w++) {
+                probeword(&o, edstr(*w));
             }
             probeflush(&o);
         } else if (c.head == "cwd") {
@@ -4347,6 +4565,10 @@ int main(int argc, char **argv)
         reap(argc, argv);
     } else if (argc>1 && !__builtin_strcmp(argv[1], "--tty-probe")) {
         ttyprobe(argv);
+    } else if (argc>1 && !__builtin_strcmp(argv[1], "--tty-edit")) {
+        ttyedit();
+    } else if (argc>1 && !__builtin_strcmp(argv[1], "--tty-edit-in")) {
+        ttyeditin();
     }
     #if PROSPERO_DESKTOP
     if (argc>1 && !__builtin_strcmp(argv[1], "desktop")) {

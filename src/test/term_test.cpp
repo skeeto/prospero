@@ -163,4 +163,133 @@ static void test_term(Test *t)
                "Path=C:/w|TERM=xterm-256color|COLORTERM=truecolor|"
                "TERM_PROGRAM=Prospero|TERM_PROGRAM_VERSION=" PROSPERO_VERSION);
     }
+
+    // term.open's edit: checked whole, clamped, or refused with a why
+    {
+        static struct { Str json; b32 win; Str want; } cases[] = {
+            {"{}", 0, "none"},
+            {"{\"edit\":null}", 0, "why edit must be an object"},
+            {"{\"edit\":\"x\"}", 0, "why edit must be an object"},
+            {"{\"edit\":[1]}", 0, "why edit must be an object"},
+            {"{\"edit\":{}}", 0, "why edit.path must be an absolute path"},
+            {"{\"edit\":{\"path\":3}}", 0, "why edit.path must be an absolute path"},
+            {"{\"edit\":{\"path\":\"a/b\"}}", 0, "why edit.path must be an absolute path"},
+            {"{\"edit\":{\"path\":\"/a\\u0000b\"}}", 0,
+             "why edit.path must be an absolute path"},
+            {"{\"edit\":{\"path\":\"/a b\"}}", 0, "path /a b line 0 col 0 editor  tmpl "},
+            {"{\"edit\":{\"path\":\"C:/a\"}}", 0, "why edit.path must be an absolute path"},
+            {"{\"edit\":{\"path\":\"C:/a\"}}", 1, "path C:/a line 0 col 0 editor  tmpl "},
+            {"{\"edit\":{\"path\":\"\\\\\\\\h\\\\s\\\\a\"}}", 1,
+             "path \\\\h\\s\\a line 0 col 0 editor  tmpl "},
+            {"{\"edit\":{\"path\":\"/a\"}}", 1, "why edit.path must be an absolute path"},
+            {"{\"edit\":{\"path\":\"\\\\a\"}}", 1, "why edit.path must be an absolute path"},
+            {"{\"edit\":{\"path\":\"C:a\"}}", 1, "why edit.path must be an absolute path"},
+            // cmd.exe's refusals (C10), on Windows alone
+            {"{\"edit\":{\"path\":\"C:/100%\"}}", 1,
+             "why edit.path holds %, \" or a control character, which cmd.exe cannot pass on"},
+            {"{\"edit\":{\"path\":\"C:/a\\\"b\"}}", 1,
+             "why edit.path holds %, \" or a control character, which cmd.exe cannot pass on"},
+            {"{\"edit\":{\"path\":\"C:/a\\nb\"}}", 1,
+             "why edit.path holds %, \" or a control character, which cmd.exe cannot pass on"},
+            // ...nor what an ANSI editor may get best-fit as " or \ (WorstFit)
+            {"{\"edit\":{\"path\":\"C:/a\\uff02 +!calc \\uff02\"}}", 1,
+             "why edit.path holds a character Windows may pass to the editor as \" or \\"},
+            {"{\"edit\":{\"path\":\"C:/a\\uff3c\"}}", 1,
+             "why edit.path holds a character Windows may pass to the editor as \" or \\"},
+            {"{\"edit\":{\"path\":\"C:/a\\u02bab\"}}", 1,
+             "why edit.path holds a character Windows may pass to the editor as \" or \\"},
+            {"{\"edit\":{\"path\":\"C:/\\uff21\\uff22\"}}", 1,
+             "path C:/\xef\xbc\xa1\xef\xbc\xa2 line 0 col 0 editor  tmpl "},
+            {"{\"edit\":{\"path\":\"/a\\uff02\"}}", 0,
+             "path /a\xef\xbc\x82 line 0 col 0 editor  tmpl "},
+            {"{\"edit\":{\"path\":\"/100%\\\"\\n\"}}", 0,
+             "path /100%\"\n line 0 col 0 editor  tmpl "},
+            // Numbers clamped
+            {"{\"edit\":{\"path\":\"/a\",\"line\":12,\"col\":3}}", 0,
+             "path /a line 12 col 3 editor  tmpl "},
+            {"{\"edit\":{\"path\":\"/a\",\"line\":0,\"col\":-4}}", 0,
+             "path /a line 1 col 0 editor  tmpl "},
+            {"{\"edit\":{\"path\":\"/a\",\"line\":-7}}", 0, "path /a line 1 col 0 editor  tmpl "},
+            {"{\"edit\":{\"path\":\"/a\",\"line\":1e30,\"col\":5000000000}}", 0,
+             "path /a line 1000000000 col 1000000000 editor  tmpl "},
+            {"{\"edit\":{\"path\":\"/a\",\"line\":2.5}}", 0, "path /a line 2 col 0 editor  tmpl "},
+            {"{\"edit\":{\"path\":\"/a\",\"line\":\"12\"}}", 0, "why edit.line must be a number"},
+            {"{\"edit\":{\"path\":\"/a\",\"col\":true}}", 0, "why edit.col must be a number"},
+            // An editor or a template, not both
+            {"{\"edit\":{\"path\":\"/a\",\"editor\":\" vim -p \"}}", 0,
+             "path /a line 0 col 0 editor vim -p tmpl "},
+            {"{\"edit\":{\"path\":\"/a\",\"template\":\"vi +{line} {file}\"}}", 0,
+             "path /a line 0 col 0 editor  tmpl vi +{line} {file}"},
+            {"{\"edit\":{\"path\":\"/a\",\"editor\":\"vi\",\"template\":\"vi {file}\"}}", 0,
+             "why edit: give editor or template, not both"},
+            {"{\"edit\":{\"path\":\"/a\",\"editor\":\"\",\"template\":\"vi {file}\"}}", 0,
+             "path /a line 0 col 0 editor  tmpl vi {file}"},
+            {"{\"edit\":{\"path\":\"/a\",\"editor\":7}}", 0, "why edit.editor must be a string"},
+            {"{\"edit\":{\"path\":\"/a\",\"template\":[]}}", 0,
+             "why edit.template must be a string"},
+            {"{\"edit\":{\"path\":\"/a\",\"editor\":\"v\\u0000i\"}}", 0,
+             "why edit.editor must be under 4 KiB, with no NUL"},
+            {"{\"edit\":{\"path\":\"/a\",\"template\":\"v\\u0000i {file}\"}}", 0,
+             "why edit.template must be under 4 KiB, with no NUL"},
+        };
+        for (iz i = 0; i < countof(cases); i++) {
+            Arena       s = *a;
+            JsonDoc     d = jsonparse(&s, cases[i].json);
+            TermEditAsk r = termeditask(d.root, cases[i].win);
+            Buf         b(&s, 256);
+            if (r.why.len) {
+                print(&b, "why ");
+                print(&b, r.why);
+            } else if (!r.on) {
+                print(&b, "none");
+            } else {
+                print(&b, "path ");
+                print(&b, r.path);
+                print(&b, " line ");
+                print(&b, (i64)r.line);
+                print(&b, " col ");
+                print(&b, (i64)r.col);
+                print(&b, " editor ");
+                print(&b, r.editor);
+                print(&b, " tmpl ");
+                print(&b, r.tmpl);
+            }
+            expect(t, concat(a, "termeditask ", istr(a, i)), finish(&b), cases[i].want);
+        }
+
+        // Lengths: a path under 32 KiB, an editor or template under 4 KiB
+        Arena s    = *a;
+        Buf   path(&s, 40000);
+        print(&path, "{\"edit\":{\"path\":\"/");
+        for (iz i = 0; i < TERM_EDITPATH; i++) putbyte(&path, 'a');
+        print(&path, "\"}}");
+        JsonDoc d = jsonparse(&s, finish(&path));
+        expect(t, "termeditask long path", termeditask(d.root, 0).why, "edit.path is too long");
+        Buf ed(&s, 8000);
+        print(&ed, "{\"edit\":{\"path\":\"/a\",\"editor\":\"");
+        for (iz i = 0; i < TERM_EDITCMD; i++) putbyte(&ed, 'v');
+        print(&ed, "\"}}");
+        d = jsonparse(&s, finish(&ed));
+        expect(t, "termeditask long editor", termeditask(d.root, 0).why,
+               "edit.editor must be under 4 KiB, with no NUL");
+        Buf tm(&s, 8000);
+        print(&tm, "{\"edit\":{\"path\":\"/a\",\"template\":\"");
+        for (iz i = 0; i < TERM_EDITCMD; i++) putbyte(&tm, 'v');
+        print(&tm, "\"}}");
+        d = jsonparse(&s, finish(&tm));
+        expect(t, "termeditask long template", termeditask(d.root, 0).why,
+               "edit.template must be under 4 KiB, with no NUL");
+        Buf wp(&s, 40000);
+        print(&wp, "{\"edit\":{\"path\":\"C:/");
+        for (iz i = 0; i < TERM_EDITPATH; i++) putbyte(&wp, 'a');
+        print(&wp, "\"}}");
+        d = jsonparse(&s, finish(&wp));
+        expect(t, "termeditask long path win", termeditask(d.root, 1).why,
+               "edit.path is too long");
+    }
+
+    // The reply's name of a Windows editor
+    expect(t, "termeditname", termeditname("C:/bin/Vim.BAT"), "Vim");
+    expect(t, "termeditname exe", termeditname("C:\\nvim\\nvim.exe"), "nvim");
+    expect(t, "termeditname bare", termeditname("vi"), "vi");
 }
