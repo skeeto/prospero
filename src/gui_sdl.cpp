@@ -581,8 +581,13 @@ using ObjcBool = signed char;
 static char const reopentypes[] = "c@:@c";
 #endif
 
+static b32 macinert;  // checklist windows ignore real input (machandsoff)
+
 static ObjcBool shouldreopen(void *, void *, void *, ObjcBool)
 {
+    if (macinert) {
+        return 0;  // a real click on the Dock's icon, dropped
+    }
     SDL_Event e = {};
     e.type      = reopenevent;
     e.user.code = TRAY_OPEN;
@@ -764,6 +769,7 @@ enum : uz {
 struct NsPoint { double x, y; };
 static void (*macsendevent)(void *, void *, void *);
 static b32    macmodsent;  // a key's modifiers were sent, to let go
+static b32    macsynth;    // macflagpaste's own events are being sent
 
 static uz sdlmodflags()
 {
@@ -785,6 +791,9 @@ static void macsend(void *self, void *sel, void *ev)
 {
     uz   type = objcsend<uz>(ev, "type");
     b32  key  = type==NSKEYDOWN || type==NSKEYUP;
+    if (macinert && !macsynth && (key || type==NSFLAGSCHANGED)) {
+        return;  // a real key, which a checklist's window ignores
+    }
     uz   mods = key ? objcsend<uz>(ev, "modifierFlags") : 0;
     iz   win  = key ? objcsend<iz>(ev, "windowNumber") : 0;
     if (key && (mods&NSMODMASK)!=sdlmodflags()) {
@@ -825,10 +834,12 @@ static void macflagpaste(GuiEvent *ge)
         return (m&SDL_KMOD_GUI ? KEY_CMD : 0) | (m&SDL_KMOD_CTRL ? KEY_CTRL : 0) |
                (m&SDL_KMOD_SHIFT ? KEY_SHIFT : 0) | (m&SDL_KMOD_ALT ? KEY_ALT : 0);
     };
+    macsynth = 1;
     objcsend<void>(app, "sendEvent:", nskeyevent(NSKEYDOWN, (uz)1<<20, 0, "v", (unsigned short)9));
     ge->x = (f32)mods();
     objcsend<void>(app, "sendEvent:", nskeyevent(NSKEYUP, (uz)1<<20, 0, "v", (unsigned short)9));
     ge->y = (f32)mods();
+    macsynth = 0;
     objc_autoreleasePoolPop(pool);
 }
 
@@ -895,6 +906,12 @@ static void macliprace(SDL_Window *w, GuiEvent *ge)
         objcsend<void>(center, "postNotificationName:object:", key, win);
         objc_autoreleasePoolPop(p);
     }
+    if (macinert) {
+        // It never really became key, and SDL's keyboard focus, which
+        // has ImGui read the real mouse, goes as it came
+        objcsend<void>(center, "postNotificationName:object:",
+                       nsstring("NSWindowDidResignKeyNotification"), win);
+    }
     i64 last = objcsend<i64>(macracepb, "changeCount");
     method_setImplementation(m, was);
     kill(pid, SIGTERM);
@@ -904,6 +921,162 @@ static void macliprace(SDL_Window *w, GuiEvent *ge)
     ge->x = (f32)n;
     ge->y = (f32)(last - first);
     objc_autoreleasePoolPop(pool);
+}
+
+// A checklist on the Mac, hands off (PROSPERO_TEST_HANDSOFF=1, which
+// tests/gui.py sets): it shares the desktop with its user, so it keeps
+// to a pasteboard of its own, and its windows ignore real input.
+//
+// The pasteboard: SDL's Cocoa clipboard asks +[NSPasteboard
+// generalPasteboard] each time, so that method answers a named
+// pasteboard of this process's, from before SDL_Init until after
+// SDL_Quit. Text, images, clears, and SDL's read of the types as the
+// window becomes key all land there, through SDL's real code. The
+// clipboard race (macliprace) swaps the method again within, and puts
+// this back. PROSPERO_TEST_CLIPBOARD=1 keeps the real one.
+//
+// The windows (unless PROSPERO_TEST_INPUT=1): never key, transparent to
+// the mouse, so that clicks and scrolls go to what is underneath; real
+// keys dropped as the application receives them (macsend); never the
+// active app (macnofront); an empty menu bar; the Dock's icon and the
+// tray's menu do nothing. Synthetic input, which the checklist pushes
+// into SDL's queue, is unaffected.
+extern "C" void *NSPasteboardNameGeneral;  // NSString *
+static void *macownpb;    // the private pasteboard, retained, or null
+static void *macownwas;   // generalPasteboard's own implementation
+static i64   macownmark[2];  // change counts at GEV_CLIPOWN's mark
+
+static void *macowngeneral(void *, void *)
+{
+    return macownpb;
+}
+
+static void machandsoff(Os *os, Arena scratch)
+{
+    if (!os_getenv(os, &scratch, "PROSPERO_TEST_HANDSOFF").len) {
+        return;
+    }
+    macinert = !os_getenv(os, &scratch, "PROSPERO_TEST_INPUT").len;
+    if (os_getenv(os, &scratch, "PROSPERO_TEST_CLIPBOARD").len) {
+        return;
+    }
+    void *pool = objc_autoreleasePoolPush();
+    char  name[64];
+    snprintf(name, sizeof(name), "com.nullprogram.prospero.checklist.%d", (int)getpid());
+    void *pb = objcsend<void *>(objc_getClass("NSPasteboard"), "pasteboardWithName:",
+                                nsstring(name));
+    void *m  = class_getClassMethod(objc_getClass("NSPasteboard"),
+                                    sel_registerName("generalPasteboard"));
+    if (pb && m) {
+        macownpb = objcsend<void *>(pb, "retain");
+        objcsend<iz>(macownpb, "clearContents");
+        macownwas = method_setImplementation(m, (void *)macowngeneral);
+    }
+    objc_autoreleasePoolPop(pool);
+}
+
+// After SDL_Quit, or a failed SDL_Init: the general pasteboard as it was.
+static void machandsoffend()
+{
+    if (!macownpb) {
+        return;
+    }
+    void *m = class_getClassMethod(objc_getClass("NSPasteboard"),
+                                   sel_registerName("generalPasteboard"));
+    method_setImplementation(m, macownwas);
+    objcsend<void>(macownpb, "releaseGlobally");
+    objcsend<void>(macownpb, "release");
+    macownpb  = 0;
+    macownwas = 0;
+}
+
+// The real general pasteboard's change count, by its name, past the
+// swapped method.
+static i64 macrealcount()
+{
+    void *pool = objc_autoreleasePoolPush();
+    void *pb   = objcsend<void *>(objc_getClass("NSPasteboard"), "pasteboardWithName:",
+                                  NSPasteboardNameGeneral);
+    i64   n    = pb && pb!=macownpb ? objcsend<i64>(pb, "changeCount") : -1;
+    objc_autoreleasePoolPop(pool);
+    return n;
+}
+
+// GEV_CLIPOWN: down 0 marks both change counts, down 1 gives how far
+// each moved since.
+static void macclipown(GuiEvent *ge)
+{
+    i64 real = macrealcount();
+    if (!macownpb || real<0) {
+        ge->x = -1;
+        return;
+    }
+    i64 own = objcsend<i64>(macownpb, "changeCount");
+    if (!ge->down) {
+        macownmark[0] = own;
+        macownmark[1] = real;
+    } else {
+        ge->x = (f32)(own - macownmark[0]);
+        ge->y = (f32)(real - macownmark[1]);
+    }
+}
+
+// Never in front: macOS activates a new process launched while the app
+// that launched it, in the end, is in front (a terminal, or the agent's
+// app), and the hand-off may too, so activation goes straight back to
+// the app in front before, as it changes. Real keys that come meanwhile
+// are dropped (macsend).
+static void *macfront;  // the latest other app in front, retained
+
+static void macfrontset(void *app)
+{
+    if (app && objcsend<i32>(app, "processIdentifier")!=(i32)getpid() && app!=macfront) {
+        objcsend<void *>(app, "retain");
+        if (macfront) {
+            objcsend<void>(macfront, "release");
+        }
+        macfront = app;
+    }
+}
+
+static void macnofront()
+{
+    void *pool = objc_autoreleasePoolPush();
+    void *ws   = objcsend<void *>(objc_getClass("NSWorkspace"), "sharedWorkspace");
+    macfrontset(objcsend<void *>(ws, "frontmostApplication"));
+    objcsend<void *>(objcsend<void *>(ws, "notificationCenter"),
+        "addObserverForName:object:queue:usingBlock:",
+        nsstring("NSWorkspaceDidActivateApplicationNotification"), (void *)0, (void *)0,
+        ^(void *note) {
+            void *info = objcsend<void *>(note, "userInfo");
+            macfrontset(objcsend<void *>(info, "objectForKey:",
+                                         nsstring("NSWorkspaceApplicationKey")));
+        });
+    objcsend<void *>(objcsend<void *>(objc_getClass("NSNotificationCenter"), "defaultCenter"),
+        "addObserverForName:object:queue:usingBlock:",
+        nsstring("NSApplicationDidBecomeActiveNotification"), (void *)0, (void *)0,
+        ^(void *) {
+            if (macfront && !objcsend<ObjcBool>(macfront, "isTerminated")) {
+                objcsend<ObjcBool>(macfront, "activateWithOptions:", (uz)0);
+            } else {
+                objcsend<void>(objcsend<void *>(objc_getClass("NSApplication"),
+                                                "sharedApplication"), "deactivate");
+            }
+        });
+    objc_autoreleasePoolPop(pool);
+}
+
+// An empty menu bar, which offers nothing after a Cmd+Tab.
+static void macnomenu()
+{
+    void *app  = objcsend<void *>(objc_getClass("NSApplication"), "sharedApplication");
+    void *menu = objcsend<void *>(objcsend<void *>(objc_getClass("NSMenu"), "alloc"), "init");
+    if (app && menu) {
+        objcsend<void>(app, "setMainMenu:", menu);
+    }
+    if (menu) {
+        objcsend<void>(menu, "release");
+    }
 }
 
 static void macwillpresent(void *, void *, void *, void *, void (^done)(uz))
@@ -1151,8 +1324,12 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
     }
     #ifdef __APPLE__
     nopersist();
+    machandsoff(os, g->frame);
     #endif
     if (!SDL_Init(SDL_INIT_VIDEO)) {
+        #ifdef __APPLE__
+        machandsoffend();
+        #endif
         return sdlfailed(os, g->frame, "no display (Wayland or X11)");
     }
     p->wakeevent  = SDL_RegisterEvents(3);
@@ -1164,6 +1341,10 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
     handlesettings(p->trayevent);
     handleclose(p->trayevent);
     handlemodflags();
+    if (macinert) {
+        macnomenu();
+        macnofront();
+    }
     #endif
     if (!sdlwindow(os, g, p, title)) {
         return 0;
@@ -1194,6 +1375,9 @@ static b32 sdlwindow(Os *os, Gui *g, GuiSdl *p, Str title)
 {
     SDL_WindowFlags flags = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE |
                             SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_HIDDEN;
+    #ifdef __APPLE__
+    flags |= macinert ? SDL_WINDOW_NOT_FOCUSABLE : 0;  // never key (machandsoff)
+    #endif
     // Where it was last, if anywhere, fitted to the displays once it
     // exists and its borders are known, before it shows. Else its first
     // size, at the primary display's scale: X11's windows are in pixels,
@@ -1287,6 +1471,14 @@ static b32 sdlwindow(Os *os, Gui *g, GuiSdl *p, Str title)
     }
     #ifdef __APPLE__
     g->clickthrough = firstmouse(p->window);
+    if (macinert) {
+        // Clicks and scrolls go to what is underneath (machandsoff)
+        void *win = SDL_GetPointerProperty(SDL_GetWindowProperties(p->window),
+                                           SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, 0);
+        if (win) {
+            objcsend<void>(win, "setIgnoresMouseEvents:", (ObjcBool)1);
+        }
+    }
     #else
     g->clickthrough = SDL_GetHintBoolean(SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH, 0);
     #endif
@@ -1611,6 +1803,13 @@ static void os_guiinject(Os *os, GuiEvent *ge)
         ge->x = -1;
         #endif
         return;
+    } else if (ge->kind == GEV_CLIPOWN) {
+        #ifdef __APPLE__
+        macclipown(ge);
+        #else
+        ge->x = -1;
+        #endif
+        return;
     } else if (ge->kind == GEV_TOAST) {
         // As the platform's click or refusal sends it
         e.type       = p->toastevent;
@@ -1792,6 +1991,11 @@ static void os_guished(Os *os)
 // inside the system's menu loop.
 static void SDLCALL traypick(void *ud, SDL_TrayEntry *)
 {
+    #ifdef __APPLE__
+    if (macinert) {
+        return;  // a real pick, which a checklist ignores (machandsoff)
+    }
+    #endif
     TrayItem *t = (TrayItem *)ud;
     SDL_Event e = {};
     e.type      = t->p->trayevent;
@@ -2759,4 +2963,7 @@ static void os_guiclose(Os *os)
     os_trayclose(os);
     os->gui = 0;
     SDL_Quit();
+    #ifdef __APPLE__
+    machandsoffend();
+    #endif
 }

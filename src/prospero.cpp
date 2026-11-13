@@ -628,6 +628,10 @@ enum {
                     // one, as fast as it can; out, x the times it became
                     // key and y the pasteboard's changes seen, or x -1
                     // where there is no such path
+    GEV_CLIPOWN,    // macOS, hands off: down 0 marks the change counts of
+                    // the checklist's own pasteboard and the real one;
+                    // down 1 gives in x and y how far each moved since,
+                    // or x -1 where there is no own pasteboard
 };
 enum {
     GKEY_TAB,

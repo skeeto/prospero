@@ -2189,6 +2189,9 @@ struct Gui {
     Str                clipkept;     // the clipboard's text, for the
                                      // checklist's paste to restore
     Str                clippng;      // and the image it put there
+    i32                clipowned;    // copies that reached the checklist's
+    i32                clipshared;   // own pasteboard alone, or with the
+                                     // real one's changing too (clipownafter)
     b32                promptfocus;  // activate the box when next drawn
     i32                promptend;    // 1: with the caret at the draft's end,
                                      // 2: the box is active to put it there
@@ -13454,6 +13457,9 @@ enum : i32 {
                   // changes the pasteboard (GEV_CLIPRACE), and lives
     OP_FLAGPASTE, // macOS: Cmd+V as dictation apps post it (GEV_FLAGPASTE),
                   // checked to press Cmd for V and let it go after
+    OP_CLIPOWN,   // macOS, hands off: at least dx copies so far reached the
+                  // checklist's own pasteboard, and none the real one
+                  // (clipownafter); elsewhere a skip line
     OP_OPENDIR,   // an open event (macOS: open -a) for the directory text
                   // in --cwd, or the launch's (prospero DIR) if empty
     OP_CLOSEMAIN, // close the session the checklist made, as Close does
@@ -14724,6 +14730,7 @@ static DriveOp driveops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 800, ""},
     {OP_CHECK, CHK_COPIED, 0, 0, 0, ""},
+    {OP_CLIPOWN, 0, 1, 0, 0, ""},
     // Idle: no frames at all once the probe has run
     {OP_MARK, 0, 0, 0, 3000, ""},
     {OP_IDLE, 0, 0, 0, 0, "idle 3 s"},
@@ -16650,6 +16657,7 @@ static DriveOp m3ops[] = {
     {OP_MINCLOSED, 0, 0, 0, 1000, ""},
     {OP_CHECK, CHK_CLOSEMODAL, 0, 0, 0, ""},
     {OP_CHECK, CHK_NOSTALE, 0, 0, 0, ""},
+    {OP_CLIPOWN, 0, 1, 0, 0, ""},
     {OP_SUMMARY, 0, 0, 0, 0, ""},
     {OP_MOVE, T_CLOSESTOP, 0, 0, 200, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -18456,6 +18464,7 @@ static DriveOp remoteops[] = {
     {OP_SHOT, 0, 0, 0, 300, "remote-5-closed"},
     {OP_CHECK, CHK_NOSTALE, 0, 0, 0, ""},
     {OP_SYSTHEME, 0, -1, 0, 300, ""},
+    {OP_CLIPOWN, 0, 1, 0, 0, ""},
     {OP_SUMMARY, 0, 0, 0, 0, ""},
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
@@ -19214,6 +19223,7 @@ static DriveOp planops[] = {
     {OP_CHECK, CHK_PLANMODE, 0, 0, 0, ""},
     {OP_CHECK, CHK_BYPASS, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "plan-9-build"},
+    {OP_CLIPOWN, 0, 1, 0, 0, ""},
     {OP_SUMMARY, 0, 0, 0, 0, ""},
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
@@ -19740,6 +19750,7 @@ static DriveOp termops[] = {
     {OP_TEXT, 0, 0, 0, 100, "echo $$ >shell.pid; trap 'echo hup >hup.txt; exit' HUP EXIT"},
     TERMKEY(GKEY_ENTER, 100),
     {OP_WAIT, W_TERM, 0, 0, 5000, "EXIT\ntty$"},  // set, at the next prompt
+    {OP_CLIPOWN, 0, 1, 0, 0, ""},
     {OP_SUMMARY, 0, 0, 0, 0, ""},
     {OP_CLOSE, 0, 0, 0, 0, ""},  // with nothing busy, it quits at once
 };
@@ -20696,6 +20707,7 @@ static DriveOp composeops[] = {
     {OP_CHECK, CHK_MAXIMIZED, 1, 0, 0, ""},
     {OP_MAXIMIZE, 0, 0, 0, 1500, ""},
     {OP_CHECK, CHK_MAXIMIZED, 0, 0, 0, ""},
+    {OP_CLIPOWN, 0, 1, 0, 0, ""},
     {OP_SUMMARY, 0, 0, 0, 0, ""},
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
@@ -22388,14 +22400,54 @@ static b32 pathendswith(Str path, Str tail)
 static Gui  *clipgui;
 static void (*clipset)(ImGuiContext *, char const *);
 
+// Every copy a checklist makes, bracketed by the change counts of its
+// own pasteboard and the real one (macOS, hands off: GEV_CLIPOWN), which
+// shows that copies stay off the user's clipboard. Only its own moved:
+// counted. Both moved: not counted, as the user may have copied
+// meanwhile. Its own did not move: the copy went elsewhere, a failure.
+// Counts, not contents, which may be left behind, and whose reading
+// may ask the user for paste access. Elsewhere nothing is marked.
+static b32 clipownmark(Gui *g)
+{
+    GuiEvent e = {};
+    e.kind = GEV_CLIPOWN;
+    os_guiinject(g->os, &e);
+    return e.x >= 0;
+}
+
+static void clipownafter(Gui *g, Str what)
+{
+    GuiEvent e = {};
+    e.kind = GEV_CLIPOWN;
+    e.down = 1;
+    os_guiinject(g->os, &e);
+    if (e.x < 0) {
+        return;
+    } else if (e.x == 0) {
+        Arena a = g->frame;
+        guilog(g, concat(&a, concat(&a, "drive: FAIL ", what),
+                         " did not reach the checklist's own pasteboard"));
+        g->drivechecks++;
+        g->drivefails++;
+    } else if (e.y != 0) {
+        g->clipshared++;
+    } else {
+        g->clipowned++;
+    }
+}
+
 static void driveclipset(ImGuiContext *c, char const *text)
 {
     Gui *g = clipgui;
     if (g) {
         g->driveclip = clone(&g->perm, Str{(u8 *)text, (iz)__builtin_strlen(text)});
     }
+    b32 mark = g && clipownmark(g);
     if (clipset) {
         clipset(c, text);
+    }
+    if (mark) {
+        clipownafter(g, "a copied text");
     }
 }
 
@@ -25130,10 +25182,13 @@ static void drivestep(Gui *g)
             char const *t = ImGui::GetClipboardText();
             g->clipkept = t ? clone(&g->perm, Str{(u8 *)t, (iz)__builtin_strlen(t)}) : Str{};
             g->clippng  = clone(&g->perm, png);
+            b32 mark    = clipownmark(g);
             if (!os_guiclipput(g->os, a, png)) {
                 guilog(g, "drive: FAIL could not put an image on the clipboard");
                 g->drivechecks++;
                 g->drivefails++;
+            } else if (mark) {
+                clipownafter(g, "a copied image");
             }
             break;
         }
@@ -25195,6 +25250,26 @@ static void drivestep(Gui *g)
         print(&b, " pressed, ");
         print(&b, (i64)e.y);
         print(&b, " released");
+        guilog(g, finish(&b));
+    } break;
+    case OP_CLIPOWN: {
+        if (!clipownmark(g)) {
+            guilog(g, "drive: skip the checklist's own pasteboard (macOS, hands off, only)");
+            break;
+        }
+        b32 ok = g->clipowned >= (i32)op->dx;
+        g->drivechecks++;
+        g->drivefails += !ok;
+        Arena a = g->frame;
+        Buf   b(&a, 128);
+        print(&b, ok ? Str("drive: ok   ") : Str("drive: FAIL "));
+        print(&b, (i64)g->clipowned);
+        print(&b, " copies reached the checklist's own pasteboard alone");
+        if (g->clipshared) {
+            print(&b, ", and ");
+            print(&b, (i64)g->clipshared);
+            print(&b, " not counted, as the real one changed meanwhile");
+        }
         guilog(g, finish(&b));
     } break;
     case OP_CLIPBACK: {
