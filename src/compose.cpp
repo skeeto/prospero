@@ -1040,8 +1040,9 @@ static EditJump editorjump(Arena *a, Str cmd, Str tmpl, Str path, i32 line, i32 
             return r;
         }
     }
-    Str rest = {};
-    r.prog = cmdprog(use, &rest);
+    // cmd.exe takes no VAR=value words: its program is the first word
+    Str rest = use;
+    r.prog = windows ? cmdword(&rest) : cmdprog(use, &rest);
     r.name = basename(r.prog);
     JumpKind *k = jumpkind(r.prog);
     b32 tty = k && k->term;
@@ -1167,6 +1168,34 @@ static EditJump editorjump(Arena *a, Str cmd, Str tmpl, Str path, i32 line, i32 
     r.known = k != 0;
     r.line  = finish(&b);
     return r;
+}
+
+// A line for cmd.exe with its first word, the program, replaced by exe,
+// the full path found for it, in double quotes and with backslashes:
+// given a bare name, cmd.exe looks in the current folder before PATH,
+// where anyone who can write a file there picks what runs. Null if exe
+// is not a full path, or holds %, " or a control character, which
+// cmd.exe cannot pass on.
+static Str cmdabs(Arena *a, Str line, Str exe)
+{
+    if (!pathroot(exe, 1)) {
+        return {};
+    }
+    for (iz i = 0; i < exe.len; i++) {
+        if (exe[i]=='%' || exe[i]=='"' || exe[i]<0x20 || exe[i]==0x7f) {
+            return {};
+        }
+    }
+    Str rest = line;
+    cmdword(&rest);
+    Buf b(a, exe.len + rest.len + 2);
+    putbyte(&b, '"');
+    for (iz i = 0; i < exe.len; i++) {
+        putbyte(&b, exe[i]=='/' ? '\\' : exe[i]);
+    }
+    putbyte(&b, '"');
+    print(&b, rest);
+    return finish(&b);
 }
 
 // An edited file as the new draft: without the newlines editors leave

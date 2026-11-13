@@ -276,7 +276,10 @@ fails with a link to sign up for Copilot Free.
   `subl -w` or `gvim -f` do. Empty, it is `$VISUAL`, else `$EDITOR`,
   else on macOS the default text editor, which you then quit. Started
   from the Finder or a desktop menu, Prospero has no `$VISUAL` or
-  `$EDITOR`: set this, with a full path if need be.
+  `$EDITOR`: set this, with a full path if need be. On Windows its
+  program is looked for by its full path or on PATH, and run by the
+  full path found, so a program of that name in the file's folder
+  never runs instead, and a relative path does not work.
 - **[`[ui] editor_line`](settings:ui#editor_line)**: the command that
   the Files pane's Open in editor runs, for an editor whose arguments
   for a line Prospero does not know: `{file}` is the file's path,

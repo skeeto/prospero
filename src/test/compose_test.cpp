@@ -451,6 +451,43 @@ static void test_compose(Test *t)
     expect(t, "editor.jump.known", istr(&a, ej.known), "1");
     ej = editorjump(&a, "open -a Zed", {}, "/f", 1, 0, 0);
     expect(t, "editor.jump.openunknown", istr(&a, ej.known), "0");
+    // cmd.exe takes no VAR=value words: the program is the first word
+    ej = editorjump(&a, "LANG=C code", {}, "C:\\f", 1, 0, 1);
+    expect(t, "editor.jump.winassign", ej.prog, "LANG=C");
+    ej = editorjump(&a, "\"C:\\Program Files\\VS Code\\code.cmd\" -n", {}, "C:\\f", 1, 0, 1);
+    expect(t, "editor.jump.winprog", ej.prog, "C:\\Program Files\\VS Code\\code.cmd");
+    ej = editorjump(&a, {}, "sh C:/t/e.sh +{line} {file}", "C:\\f", 3, 0, 1);
+    expect(t, "editor.jump.wintmpl", ej.prog, "sh");
+    // On Windows the program by the full path found for it, so that
+    // cmd.exe never looks in the current folder: quoted, with
+    // backslashes, the rest of the line as it was; refused when not a
+    // full path, or with what cmd.exe cannot pass on in quotes
+    struct {
+        Str name, line, exe, want;
+    } abss[] = {
+        {"plain", "code -g \"C:\\a\\b.c:6\"", "C:\\Tools\\code.cmd",
+         "\"C:\\Tools\\code.cmd\" -g \"C:\\a\\b.c:6\""},
+        {"blanks", "\"C:\\Program Files\\VS Code\\code.cmd\" -g \"C:\\a b\\c.c:1\"",
+         "C:\\Program Files\\VS Code\\code.cmd",
+         "\"C:\\Program Files\\VS Code\\code.cmd\" -g \"C:\\a b\\c.c:1\""},
+        {"slashes", "sh C:/t/e.sh +3 \"C:\\f\"", "C:/w64devkit/bin/sh.EXE",
+         "\"C:\\w64devkit\\bin\\sh.EXE\" C:/t/e.sh +3 \"C:\\f\""},
+        {"alone", "notepad", "C:\\Windows\\notepad.exe", "\"C:\\Windows\\notepad.exe\""},
+        {"lead", "  vim.bat \"C:\\f\"", "C:\\bin\\vim.bat", "\"C:\\bin\\vim.bat\" \"C:\\f\""},
+        {"amp", "ed \"C:\\f\"", "C:\\a&b ^c\\ed.exe", "\"C:\\a&b ^c\\ed.exe\" \"C:\\f\""},
+        {"unc", "ed \"C:\\f\"", "\\\\srv\\share\\ed.exe", "\"\\\\srv\\share\\ed.exe\" \"C:\\f\""},
+        {"relative", "ed \"C:\\f\"", "bin\\ed.exe", ""},
+        {"drel", "ed \"C:\\f\"", "C:ed.exe", ""},
+        {"rooted", "ed \"C:\\f\"", "\\bin\\ed.exe", ""},
+        {"percent", "ed \"C:\\f\"", "C:\\100%\\ed.exe", ""},
+        {"quote", "ed \"C:\\f\"", "C:\\a\"b\\ed.exe", ""},
+        {"control", "ed \"C:\\f\"", "C:\\a\x01\\ed.exe", ""},
+        {"none", "ed \"C:\\f\"", "", ""},
+    };
+    for (iz i = 0; i < countof(abss); i++) {
+        expect(t, concat(&a, "editor.abs.", abss[i].name),
+               cmdabs(&a, abss[i].line, abss[i].exe), abss[i].want);
+    }
     expect(t, "editor.text", editortext("line one\nline two\r\n\n"), "line one\nline two");
     expect(t, "editor.keep", editortext("  indented\n\nend"), "  indented\n\nend");
     // The terminal: its arguments by platform and program, and the

@@ -1855,8 +1855,8 @@ struct Gui {
     Str                editjump;   // Open in editor's latest command, for the
     i64                editjumps;  //   checklist, and how many
     u64                edfoundkey; // editorfound's last answer, by program
-    i64                edfoundat;  //   and PATH, when (µs, os_ticks), and whether it
-    b32                edfound;    //   was found
+    i64                edfoundat;  //   and PATH, when (µs, os_ticks), and the
+    Str                edfound;    //   path it found (in perm), null if none
     u8                 fjumpwhy[160]; // why the Files toolbar's Open in editor
     i32                fjumpwhylen;   //   is disabled, as last drawn
     Str                fontsset;   // [ui] fonts, at startup
@@ -7130,34 +7130,150 @@ static Str editorwhy(Gui *g, GuiSession *s, Arena *a)
     return {};
 }
 
-// Run the editor on a file, from dir, its output to log. Null on failure.
-static Proc *editrun(Gui *g, Arena a, Str cmd, Str path, Str dir, Str log)
+// Where a program the GUI would run is: at its path if it has a
+// separator (~/ the home directory), else on the GUI's PATH. On Windows
+// a name with no extension is tried with PATHEXT's extensions only,
+// never bare, as cmd.exe would choose: VS Code's bin holds both an
+// extensionless sh script "code" and "code.cmd". Null if nowhere.
+// Network paths are never touched (one may stall for seconds): a
+// program there counts as found, and a PATH entry there is passed over.
+// On Windows the path is a full one, for cmdabs: a program named by a
+// relative path, and a relative PATH entry, are not looked at.
+static Str editorfound(Gui *g, Arena *a, Str prog)
+{
+    if (cfgtilde(prog)) {
+        prog = concat(a, userhome(g->os, a), cuthead(prog, 1));
+    }
+    Slice<Str> exts = {};
+    if (!HOST_WINDOWS || find(basename(prog), ".")>=0) {
+        exts = push(a, exts, Str{});
+    } else {
+        Str pe = trim(os_getenv(g->os, a, "PATHEXT"));
+        for (Str rest = pe.len ? pe : Str(".COM;.EXE;.BAT;.CMD"); rest.len;) {
+            Cut c = cut(rest, ';');
+            rest = c.tail;
+            if (trim(c.head).len) {
+                exts = push(a, exts, trim(c.head));
+            }
+        }
+    }
+    b32 sep = find(prog, "/")>=0 || (HOST_WINDOWS && (find(prog, "\\")>=0 || find(prog, ":")>=0));
+    if (HOST_WINDOWS && sep && !pathroot(prog, 1)) {
+        return {};
+    } else if (sep && netpath(prog, HOST_WINDOWS)) {
+        return prog;
+    }
+    Str path = sep ? Str(".") : guipath(g, a);
+    for (Str rest = path; rest.len;) {
+        Cut c = cut(rest, HOST_WINDOWS ? ';' : ':');
+        Str d = trim(c.head);
+        rest = c.tail;
+        if (d.len>=2 && d[0]=='"' && d[d.len-1]=='"') {
+            d = takehead(cuthead(d, 1), d.len-2);
+        }
+        if (!d.len || (!sep && netpath(d, HOST_WINDOWS)) ||
+                (HOST_WINDOWS && !sep && !pathroot(d, 1))) {
+            continue;
+        }
+        for (iz i = 0; i < exts.len; i++) {
+            Arena t = *a;
+            Str   p = concat(&t, sep ? prog : join(&t, d, prog), exts[i]);
+            if (os_stat(g->os, t, p).type == STAT_FILE) {
+                *a = t;
+                return p;
+            }
+        }
+    }
+    return {};
+}
+
+// editorfound's answer for prog, kept: looked for again when the
+// program or PATH changes, else at most every few seconds, since menus
+// and the toolbar ask each frame. Null if not found.
+static Str editorexe(Gui *g, Arena *a, Str prog)
+{
+    u64 key = hash(prog) ^ (hash(guipath(g, a))*1111111111111111111u);
+    i64 now = os_ticks(g->os);
+    if (!g->edfoundat || key!=g->edfoundkey || now-g->edfoundat>=5000000) {
+        Str exe = editorfound(g, a, prog);
+        if (!(exe == g->edfound)) {
+            g->edfound = clone(&g->perm, exe);  // only when it changes
+        }
+        g->edfoundkey = key;
+        g->edfoundat  = now;
+    }
+    return g->edfound;
+}
+
+// Why the editor's program, prog (named name), cannot run: not found,
+// or on Windows not by a full path cmd.exe can take.
+static Str editormissing(Arena *a, Str prog, Str name)
+{
+    b32 sep = find(prog, "/")>=0 || (HOST_WINDOWS && find(prog, "\\")>=0);
+    Buf b(a, 64 + prog.len + name.len);
+    print(&b, "Its editor, ");
+    print(&b, sep ? prog : name);
+    if (HOST_WINDOWS && (sep || find(prog, ":")>=0) && !pathroot(prog, 1)) {
+        print(&b, ", is not named by its full path");
+    } else {
+        print(&b, sep ? Str(", is not there") : Str(", is not on PATH"));
+    }
+    return finish(&b);
+}
+
+// The editor's line for cmd.exe with its program by the full path
+// editorexe found (cmdabs), else null and *why.
+static Str editorabs(Gui *g, Arena *a, Str line, Str prog, Str name, Str *why)
+{
+    Str exe = editorexe(g, a, prog);
+    Str r   = exe.len ? cmdabs(a, line, exe) : Str{};
+    if (!exe.len) {
+        *why = editormissing(a, prog, name);
+    } else if (!r.len) {
+        *why = "Its editor's path holds %, \" or a control character, which cmd.exe cannot pass on";
+    }
+    return r;
+}
+
+// Run the editor on a file, from dir, its output to log. Null on
+// failure, and *err why, in a. On Windows cmd.exe runs it by the full
+// path editorexe found (editorabs).
+static Proc *editrun(Gui *g, Arena *a, Str cmd, Str path, Str dir, Str log, Str *err)
 {
     Spawn sp = {};
     #ifdef _WIN32
-    Str comspec = os_getenv(g->os, &a, "COMSPEC");
+    Str rest = cmd;
+    Str prog = cmdword(&rest);
+    Str line = editorabs(g, a, editorline(a, cmd, path, 1), prog, editorname(cmd), err);
+    if (!line.len) {
+        return 0;
+    }
+    Str comspec = os_getenv(g->os, a, "COMSPEC");
     comspec = comspec.len ? comspec : Str("cmd.exe");
-    Str line = editorline(&a, cmd, path, 1);
-    Buf c(&a, 64 + comspec.len + line.len);
+    Buf c(a, 64 + comspec.len + line.len);
     putbyte(&c, '"');
     print(&c, comspec);
     print(&c, "\" /d /s /c \"");
     print(&c, line);
     putbyte(&c, '"');
-    sp.argv    = push(&a, sp.argv, comspec);
+    sp.argv    = push(a, sp.argv, comspec);
     sp.cmdline = finish(&c);
     #else
-    sp.argv = push(&a, sp.argv, Str("/bin/sh"));
-    sp.argv = push(&a, sp.argv, Str("-c"));
-    sp.argv = push(&a, sp.argv, editorline(&a, cmd, path, 0));
+    sp.argv = push(a, sp.argv, Str("/bin/sh"));
+    sp.argv = push(a, sp.argv, Str("-c"));
+    sp.argv = push(a, sp.argv, editorline(a, cmd, path, 0));
     #endif
     sp.cwd      = dir;
-    sp.env      = guienv(g, &a);
+    sp.env      = guienv(g, a);
     sp.outpath  = log;
     sp.maxbytes = 1<<16;
     sp.mbox     = g->edbox;
     sp.id       = ++g->edid;
-    return os_spawn(g->os, &sp, a);
+    Proc *p = os_spawn(g->os, &sp, *a);
+    if (!p) {
+        *err = concat(a, "cannot start the editor: ", os_lasterr(g->os, a));
+    }
+    return p;
 }
 
 // The draft of session s in the editor, a its scratch.
@@ -7177,9 +7293,10 @@ static void editstart(Gui *g, Arena a, GuiSession *s)
         setnote(g, s, concat(&a, "cannot write the draft for the editor: ", os_lasterr(g->os, &a)), 1);
         return;
     }
-    Proc *p = editrun(g, a, cmd, path, dir, log);
+    Str   err = {};
+    Proc *p   = editrun(g, &a, cmd, path, dir, log, &err);
     if (!p) {
-        setnote(g, s, concat(&a, "cannot start the editor: ", os_lasterr(g->os, &a)), 1);
+        setnote(g, s, err, 1);
         os_remove(g->os, a, path);
         return;
     }
@@ -7220,9 +7337,15 @@ static void planedit(Gui *g, Arena a, GuiSession *s, Str path, Str req)
     Str cmd = editorcmd(g, &a);
     Str dir = join(&a, g->statedir, "edit");
     Str log = join(&a, dir, concat(&a, concat(&a, "plan-", s->sid), ".log"));
-    Proc *p = os_mkdirs(g->os, a, dir) ? editrun(g, a, cmd, path, dir, log) : 0;
+    Str   err = {};
+    Proc *p   = 0;
+    if (!os_mkdirs(g->os, a, dir)) {
+        err = concat(&a, "cannot start the editor: ", os_lasterr(g->os, &a));
+    } else {
+        p = editrun(g, &a, cmd, path, dir, log, &err);
+    }
     if (!p) {
-        setnote(g, s, concat(&a, "cannot start the editor: ", os_lasterr(g->os, &a)), 1);
+        setnote(g, s, err, 1);
         return;
     }
     g->edsess = s;
@@ -7251,8 +7374,10 @@ static void cfgeditrun(Gui *g, Arena a, Str path)
         err = why;
     } else if (!path.len) {
         err = "no configuration file location";
-    } else if (!(p = os_mkdirs(g->os, a, dir) ? editrun(g, a, cmd, path, dir, log) : 0)) {
+    } else if (!os_mkdirs(g->os, a, dir)) {
         err = concat(&a, "cannot start the editor: ", os_lasterr(g->os, &a));
+    } else {
+        p = editrun(g, &a, cmd, path, dir, log, &err);
     }
     if (!p) {
         cfgsay(g, err, 0);
@@ -7297,54 +7422,6 @@ static void guishow(Gui *g, Str path)
     }
 }
 
-// Whether a program the GUI would run is there: at its path if it has
-// a separator (~/ the home directory), else on the GUI's PATH, with
-// PATHEXT's extensions on Windows when it has none. Network paths are
-// never touched (one may stall for seconds): a program there counts as
-// found, and a PATH entry there is passed over.
-static b32 editorfound(Gui *g, Arena a, Str prog)
-{
-    if (cfgtilde(prog)) {
-        prog = concat(&a, userhome(g->os, &a), cuthead(prog, 1));
-    }
-    Slice<Str> exts = {};
-    exts = push(&a, exts, Str{});
-    if (HOST_WINDOWS && find(basename(prog), ".")<0) {
-        Str pe = trim(os_getenv(g->os, &a, "PATHEXT"));
-        for (Str rest = pe.len ? pe : Str(".COM;.EXE;.BAT;.CMD"); rest.len;) {
-            Cut c = cut(rest, ';');
-            rest = c.tail;
-            if (trim(c.head).len) {
-                exts = push(&a, exts, trim(c.head));
-            }
-        }
-    }
-    b32 sep = find(prog, "/")>=0 || (HOST_WINDOWS && (find(prog, "\\")>=0 || find(prog, ":")>=0));
-    if (sep && netpath(prog, HOST_WINDOWS)) {
-        return 1;
-    }
-    Str path = sep ? Str(".") : guipath(g, &a);
-    for (Str rest = path; rest.len;) {
-        Cut c = cut(rest, HOST_WINDOWS ? ';' : ':');
-        Str d = trim(c.head);
-        rest = c.tail;
-        if (d.len>=2 && d[0]=='"' && d[d.len-1]=='"') {
-            d = takehead(cuthead(d, 1), d.len-2);
-        }
-        if (!d.len || (!sep && netpath(d, HOST_WINDOWS))) {
-            continue;
-        }
-        for (iz i = 0; i < exts.len; i++) {
-            Arena t = a;
-            Str   p = concat(&t, sep ? prog : join(&t, d, prog), exts[i]);
-            if (os_stat(g->os, t, p).type == STAT_FILE) {
-                return 1;
-            }
-        }
-    }
-    return 0;
-}
-
 // Open in editor for path, a file here, at line (1-based) and col (0
 // for none): the command, or why not.
 static EditJump editorjumpfor(Gui *g, Arena *a, Str path, i32 line, i32 col)
@@ -7355,24 +7432,10 @@ static EditJump editorjumpfor(Gui *g, Arena *a, Str path, i32 line, i32 col)
         tmpl = cmdhome(a, tmpl, userhome(g->os, a));
     }
     EditJump j = editorjump(a, cmd, tmpl, path, line>0 ? line : 1, col, HOST_WINDOWS);
-    if (!j.why.len) {
-        // Looked for again when the program or PATH changes, else at
-        // most every few seconds: menus and the toolbar ask each frame
-        u64 key = hash(j.prog) ^ (hash(guipath(g, a))*1111111111111111111u);
-        i64 now = os_ticks(g->os);
-        if (!g->edfoundat || key!=g->edfoundkey || now-g->edfoundat>=5000000) {
-            g->edfound    = editorfound(g, *a, j.prog);
-            g->edfoundkey = key;
-            g->edfoundat  = now;
-        }
-    }
-    if (!j.why.len && !g->edfound) {
-        b32 sep = find(j.prog, "/")>=0 || (HOST_WINDOWS && find(j.prog, "\\")>=0);
-        Buf b(a, 64 + j.prog.len);
-        print(&b, "Its editor, ");
-        print(&b, sep ? j.prog : j.name);
-        print(&b, sep ? Str(", is not there") : Str(", is not on PATH"));
-        j.why = finish(&b);
+    if (!j.why.len && HOST_WINDOWS) {
+        j.line = editorabs(g, a, j.line, j.prog, j.name, &j.why);
+    } else if (!j.why.len && !editorexe(g, a, j.prog).len) {
+        j.why = editormissing(a, j.prog, j.name);
     }
     return j;
 }
@@ -14361,7 +14424,9 @@ enum : i32 {
                       // this computer, and dx 1 read there (fs.read); or
                       // dx 2 Open file's path is, checked there (fs.stat)
     CHK_EDITJUMP,     // Open in editor ran dx times, the latest's command
-                      // with text in it ('/' either way, '"' as '\'')
+                      // with text in it ('/' either way, '"' as '\'');
+                      // dy 1: its program is text (on Windows a quoted
+                      // full path whose name, less its extension, is text)
     CHK_EDITWHY,      // the Files toolbar's Open in editor is disabled,
                       // saying text
     CHK_REVEALED,     // the file shown in the file manager ends with text
@@ -17168,8 +17233,9 @@ static DriveOp m3ops[] = {
     {OP_UP, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_CLIPEND, 0, 0, 0, "/cite/hello.c"},
     // Its Open in editor, at its line ([ui] editor_line a test
-    // script's, only noted under the drive)
-    {OP_IFEDITOR, 0, 8, 0, 0, ""},
+    // script's, only noted under the drive), on Windows by sh's full
+    // path, which cmd.exe does not look for again
+    {OP_IFEDITOR, 0, 9, 0, 0, ""},
     {OP_MOVE, T_NAMED, 0, 0, 300, "link cite/hello.c:12"},
     {OP_RDOWN, 0, 0, 0, 60, ""},
     {OP_RUP, 0, 0, 0, 500, ""},
@@ -17178,6 +17244,7 @@ static DriveOp m3ops[] = {
     {OP_UP, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_EDITJUMP, 1, 0, 0, " +12 '"},
     {OP_CHECK, CHK_EDITJUMP, 1, 0, 0, "/cite/hello.c'"},
+    {OP_CHECK, CHK_EDITJUMP, 1, 1, 0, "sh"},
     {OP_MOVE, T_NAMED, 0, 0, 800, "link mailto:"},
     {OP_CHECK, CHK_TOOLTIP, 0, 0, 0, ""},
     {OP_CHECK, CHK_LINKTIP, 0, 0, 0,
@@ -22887,7 +22954,21 @@ static b32 drivefilecheck(Gui *g, i32 chk)
         print(&b, g->editjumps);
         print(&b, ", the latest ");
         print(&b, g->editjump);
-        ok = g->editjumps==(i64)op->dx && find(line, op->text)>=0;
+        ok = g->editjumps==(i64)op->dx;
+        if (op->dy == 1) {
+            Str rest = g->editjump;
+            Str prog = cmdword(&rest);
+            Str name = basename(prog);
+            if (HOST_WINDOWS) {
+                Cut c = cut(name, '.');
+                ok = ok && g->editjump.len && g->editjump[0]=='"' && pathroot(prog, 1) &&
+                     c.ok && equalfold(c.head, op->text);
+            } else {
+                ok = ok && prog==op->text;
+            }
+        } else {
+            ok = ok && find(line, op->text)>=0;
+        }
     } break;
     case CHK_EDITWHY: {
         Str why = {g->fjumpwhy, g->fjumpwhylen};

@@ -651,7 +651,9 @@ static CfgKey cfgschema[] = {
      "which must be quit. A GUI started from the Finder or a desktop menu "
      "has no shell environment: no $VISUAL, no $EDITOR, and its PATH may "
      "lack the editor, so name it in full here, or add its directory to "
-     "[tools] path_prepend"},
+     "[tools] path_prepend. On Windows its program is looked for here, by "
+     "its full path or on PATH, and cmd.exe runs it by the full path found: "
+     "never from the file's folder, nor by a relative path"},
     {"ui", "editor_line", CFG_STRING, "", {}, {}, "ui",
      "The command that Files' Open in editor runs, for an editor whose "
      "arguments for a line are not known: {file} the file's path, quoted "
