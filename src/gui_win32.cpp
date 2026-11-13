@@ -1253,6 +1253,33 @@ static DWORD WINAPI announcetheme(void *hwnd)
     return 0;
 }
 
+// An HDROP of paths, each ending in a '\n' (the last perhaps not), as
+// Explorer's drop gives one, at pt in client coordinates, or outside the
+// client area (fnc): for WM_DROPFILES, which frees it, else freed here.
+static HGLOBAL makehdrop(wchar_t const *paths, POINT pt, BOOL fnc)
+{
+    int n = 0;
+    for (; paths[n]; n++) {}
+    SIZE_T     size = sizeof(DROPFILES) + (SIZE_T)(n + 2)*sizeof(wchar_t);
+    HGLOBAL    mem  = GlobalAlloc(GMEM_MOVEABLE|GMEM_ZEROINIT, size);
+    DROPFILES *df   = mem ? (DROPFILES *)GlobalLock(mem) : 0;
+    if (!df) {
+        if (mem) GlobalFree(mem);
+        return 0;
+    }
+    df->pFiles = sizeof(DROPFILES);
+    df->pt     = pt;
+    df->fNC    = fnc;
+    df->fWide  = TRUE;
+    // Each path ends in a NUL, the list in another (zeroed)
+    wchar_t *out = (wchar_t *)(df + 1);
+    for (int i = 0; i < n; i++) {
+        out[i] = paths[i]==L'\n' ? 0 : paths[i];
+    }
+    GlobalUnlock(mem);
+    return mem;
+}
+
 extern "C" void w32gui_inject(void *p, int kind, float x, float y,
                               int button, int down, int key, int ctrl,
                               int shift, int alt, unsigned short const *text)
@@ -1348,25 +1375,11 @@ extern "C" void w32gui_inject(void *p, int kind, float x, float y,
         HANDLE t = CreateThread(0, 0, announcetheme, w->hwnd, 0, 0);
         if (t) CloseHandle(t);
     } break;
-    case 12: {  // a file dropped, as Explorer drops it, at x, y if down,
+    case 12: {  // files dropped, as Explorer drops them, at x, y if down,
                 // else outside the client area
-        int n = 0;
-        for (; text && text[n]; n++) {}
-        SIZE_T  size = sizeof(DROPFILES) + (SIZE_T)(n + 2)*sizeof(wchar_t);
-        HGLOBAL mem  = GlobalAlloc(GMEM_MOVEABLE|GMEM_ZEROINIT, size);
-        DROPFILES *df = mem ? (DROPFILES *)GlobalLock(mem) : 0;
-        if (!df) {
-            if (mem) GlobalFree(mem);
-            break;
-        }
-        df->pFiles = sizeof(DROPFILES);
-        df->pt.x   = (LONG)x;
-        df->pt.y   = (LONG)y;
-        df->fNC    = down ? FALSE : TRUE;
-        df->fWide  = TRUE;
-        memcpy(df + 1, text, (size_t)n*sizeof(wchar_t));
-        GlobalUnlock(mem);
-        if (!PostMessageW(w->hwnd, WM_DROPFILES, (WPARAM)mem, 0)) {
+        POINT   pt  = {(LONG)x, (LONG)y};
+        HGLOBAL mem = text ? makehdrop((wchar_t const *)text, pt, down ? FALSE : TRUE) : 0;
+        if (mem && !PostMessageW(w->hwnd, WM_DROPFILES, (WPARAM)mem, 0)) {
             GlobalFree(mem);
         }
     } break;
@@ -2056,13 +2069,20 @@ static void os_guikeyrepeat(Os *os, f32 *delay, f32 *interval)
 static void os_guiinject(Os *os, GuiEvent *e)
 {
     Arena a = {};
-    u8    buf[1024];
+    u8    buf[4096];
     a.beg = (byte *)buf;
     a.end = (byte *)buf + countof(buf);
     unsigned short *text = 0;
     if (e->kind==GEV_FLAGPASTE || e->kind==GEV_CLIPRACE || e->kind==GEV_CLIPOWN) {
         e->x = -1;  // macOS only
         return;
+    } else if (e->kind == GEV_DROP) {
+        // Its paths each end in a NUL: the edge's end in '\n' instead
+        Str16 paths = towide(&a, e->text);
+        for (iz i = 0; i < paths.len; i++) {
+            paths.data[i] = paths.data[i] ? paths.data[i] : '\n';
+        }
+        text = (unsigned short *)paths.data;
     } else if (e->text.len) {
         text = (unsigned short *)towide(&a, e->text).data;
     }

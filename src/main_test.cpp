@@ -731,6 +731,7 @@ static Str istr(Arena *a, i64 v)
 #  include "termset.cpp"
 #  include "fileset.cpp"
 #  include "palette.cpp"
+#  include "dropto.cpp"
 #  include "test/sched_test.cpp"
 #  include "test/highlight_test.cpp"
 #  include "test/doc_test.cpp"
@@ -749,6 +750,7 @@ static Str istr(Arena *a, i64 v)
 #  include "test/termset_test.cpp"
 #  include "test/fileset_test.cpp"
 #  include "test/palette_test.cpp"
+#  include "test/dropto_test.cpp"
 #endif
 
 int main()
@@ -846,6 +848,7 @@ int main()
     test_fileset(&t);
     test_filefind(&t);
     test_palette(&t);
+    test_dropto(&t);
     test_viewexport(&t);
     #endif
 

@@ -1867,15 +1867,39 @@ static void fileanswer(Gui *g, Str data)
 }
 
 
-// Files dropped at a point (gui_drop's queue), routed each frame after
-// ImGui's NewFrame, which says what windows were where last frame, and
-// before anything is drawn. With Open file up, the first fills its
-// field, a check in flight for the path it replaces let go, or, too
-// long for the field, says so there; the rest go nowhere. With another
-// modal up, each is attached, as a drop always was; else a file dropped
-// on the Files pane, drawn last frame, opens there, a file on this
-// computer, in the shown root's tabs, and one dropped elsewhere is
-// attached.
+// The facts of the window that decide where a drop at x, y (if at) goes
+// (dropwhere), as the last frame left them: ImGui's NewFrame says what
+// windows were where.
+static DropFacts dropfacts(Gui *g, f32 x, f32 y, b32 at)
+{
+    DropFacts f = {};
+    f.at        = at;
+    f.askshown  = g->fask.p.shown;
+    f.modal     = !f.askshown && ImGui::GetTopMostPopupModal();
+    f.attachwhy = attachwhy(g->sess);
+    f.room      = attachroom(g->sess ? g->sess->att : 0);
+    f.attachmax = ATTACH_MAX;
+    f.tabs      = FILES_TABS;
+    ImGuiWindow *files = ImGui::FindWindowByName(panenames[PANE_FILES]);
+    if (at && !f.modal && files && g->filesdrawn) {
+        ImGuiWindow *w = 0, *under = 0;
+        ImGui::FindHoveredWindowEx(v2(x, y), true, &w, &under);
+        f.overfiles = w && w->RootWindow==files;
+    }
+    return f;
+}
+
+// Files dropped on the window (gui_drop's queue), routed each frame
+// after ImGui's NewFrame and before anything is drawn, a drop at a time:
+// the files of one drop are consecutive, at one point. Where a drop goes
+// is dropwhere's, its facts gathered for it, as a drop before it may
+// have taken the message's room:
+// - Open file's field: the first fills it, a check in flight for the
+//   path it replaces let go, or, too long for the field, says so there;
+//   the rest go nowhere.
+// - the Files pane: each opens in the shown root's tabs.
+// - attached: all of them, or, with no room for them all, none, with
+//   one note that says why.
 static void droproute(Gui *g)
 {
     DropAt *d = g->drophead;
@@ -1883,40 +1907,52 @@ static void droproute(Gui *g)
         return;
     }
     g->drophead = g->droptail = 0;
-    ImGuiWindow *files = ImGui::FindWindowByName(panenames[PANE_FILES]);
-    b32          ask   = g->fask.p.shown;
-    b32          modal = !ask && ImGui::GetTopMostPopupModal();
-    for (; d; d = d->next) {
-        if (ask) {
-            ask = 0;  // the first only, and the rest nowhere
-            if (d->path.len >= FIELD_MAX) {
-                // Never cut, which would name another file
-                g->fask.p.err = "Its path is too long";
-                guilog(g, concat(&g->frame, "dropped on Open file, too long: ", d->path));
-                continue;
+    while (d) {
+        DropAt *end = d->next;
+        i32     n   = 1;
+        for (; end && end->x==d->x && end->y==d->y && end->at==d->at; end = end->next) {
+            n++;
+        }
+        DropFacts f = dropfacts(g, d->x, d->y, d->at);
+        DropWhere w = dropwhere(&g->frame, f, {DRAGLOAD_FILES, n, 0});
+        for (b32 first = 1; d != end; d = d->next, first = 0) {
+            switch (w.to) {
+            case DROPTO_FIELD:
+                if (!first) {
+                    guilog(g, concat(&g->frame, "dropped on Open file, which takes one: ", d->path));
+                } else if (d->path.len >= FIELD_MAX) {
+                    // Never cut, which would name another file
+                    g->fask.p.err = "Its path is too long";
+                    guilog(g, concat(&g->frame, "dropped on Open file, too long: ", d->path));
+                } else {
+                    fieldput(g->fask.p.buf, d->path);
+                    g->fask.p.err   = {};
+                    g->fask.statid  = 0;  // a check in flight is of the path replaced,
+                    g->fask.close   = 0;  // its answer to open nothing, as on Cancel
+                    g->fask.dropped = 1;
+                }
+                break;
+            case DROPTO_FILES: {
+                // From g->frame itself, past what filesopen's copies of it take
+                Str path = d->path;
+                path = pathroot(path, HOST_WINDOWS) ? normpath(&g->frame, {}, path, HOST_WINDOWS)
+                                                    : path;
+                filesopen(g, g->sess, 0, path, 0, 0, {});
+            } break;
+            case DROPTO_ATTACH:
+                if (!w.refuse) {
+                    dropattach(g, d->path);
+                } else if (first) {
+                    Str note = concat(&g->frame, "not attached: ", w.detail);
+                    if (g->sess) {
+                        setnote(g, g->sess, note, 1);
+                    } else {
+                        guilog(g, note);
+                    }
+                    scheddirty(&g->sched);
+                }
+                break;
             }
-            fieldput(g->fask.p.buf, d->path);
-            g->fask.p.err   = {};
-            g->fask.statid  = 0;  // a check in flight is of the path replaced,
-            g->fask.close   = 0;  // its answer to open nothing, as on Cancel
-            g->fask.dropped = 1;
-            continue;
-        } else if (g->fask.p.shown) {
-            guilog(g, concat(&g->frame, "dropped on Open file, which takes one: ", d->path));
-            continue;
-        }
-        ImGuiWindow *w = 0, *under = 0;
-        if (!modal && files && g->filesdrawn) {
-            ImGui::FindHoveredWindowEx(v2(d->x, d->y), true, &w, &under);
-        }
-        if (w && w->RootWindow==files) {
-            // From g->frame itself, past what filesopen's copies of it take
-            Str path = d->path;
-            path = pathroot(path, HOST_WINDOWS) ? normpath(&g->frame, {}, path, HOST_WINDOWS)
-                                                : path;
-            filesopen(g, g->sess, 0, path, 0, 0, {});
-        } else {
-            dropattach(g, d->path);
         }
     }
     os_release(g->os, g->dropr);

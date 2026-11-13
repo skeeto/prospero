@@ -77,6 +77,7 @@
 #include "termset.cpp"
 #include "fileset.cpp"
 #include "palette.cpp"
+#include "dropto.cpp"
 
 enum : i64 {
     STREAM_PERIOD = 1000000/30,  // µs between frames showing new deltas
@@ -1162,16 +1163,18 @@ enum : i32 {
     EXP_ASKING,   // the dialog is up
 };
 
-// A file dropped at a point of the window, kept for the next frame,
-// which routes it (droproute): ImGui knows only then what is there.
+// A file dropped on the window, kept for the next frame, which routes
+// it (droproute): ImGui knows only then what is there. The files of one
+// drop are consecutive, at one point.
 struct DropAt {
     DropAt *next;
     Str     path;
     f32     x, y;   // in ImGui's units, as its MousePos
+    b32     at;     // x and y are known: else at no point (a title bar)
 };
 
 // Bytes reserved for the files dropped before a frame routes them: what
-// doesn't fit is attached at once, as a drop with no point is.
+// doesn't fit is attached at once.
 enum { DROP_QUEUE = 1<<20 };
 
 // A file dialog asked for (askpath), kept in case the platform has none
@@ -5449,6 +5452,15 @@ static Str attachwhy(GuiSession *s)
     return {};
 }
 
+// Attachments the message has room for (dropto.cpp), all of them with
+// no message: the limit's, else its slots', where path-only chips take
+// slots but not the count.
+static i32 attachroom(AttBox *x)
+{
+    return x ? attachroom(ATTACH_MAX, attachcount(x), x->len, (i32)countof(x->imgs))
+             : (i32)ATTACH_MAX;
+}
+
 // An attachment's arena, kept at the start of its own region, so that an
 // attachment moved to another slot (attachremove) moves a pointer. An
 // Arena assigned from slot to slot is re-pointed, as the arena checker
@@ -5969,14 +5981,16 @@ static void dropattach(Gui *g, Str path)
     scheddirty(&g->sched);
 }
 
-// A dropped file, attached to the draft shown, or, dropped at a point
-// (at, x and y in ImGui's units), queued for the next frame to route
-// (droproute): there it may open in the Files pane, or fill Open file's
-// field. A directory has a new session there instead: at once if opened
-// in the application (app: Finder, the Dock, open -a), else through the
-// new session dialog, dropped on the window perhaps only to be
-// attached. The open event macOS makes of prospero DIR's argument is
-// ignored, as the launch has that session already.
+// A dropped file, opened in the application (app: Finder, the Dock,
+// open -a) and attached to the draft shown at once, or dropped on the
+// window and queued for the next frame to route (droproute), with its
+// point (at, x and y in ImGui's units) if the platform knows one: there
+// it may open in the Files pane, fill Open file's field, or be attached
+// with the files dropped with it. A directory has a new session there
+// instead: at once if opened in the application, else through the new
+// session dialog, dropped on the window perhaps only to be attached.
+// The open event macOS makes of prospero DIR's argument is ignored, as
+// the launch has that session already.
 static void gui_drop(Gui *g, Str path, b32 app, f32 x, f32 y, b32 at)
 {
     g->drops++;
@@ -5998,7 +6012,7 @@ static void gui_drop(Gui *g, Str path, b32 app, f32 x, f32 y, b32 at)
         scheddirty(&g->sched);
         return;
     }
-    if (at && !app) {
+    if (!app) {
         // Kept past this frame's scratch, which the next frame resets
         if (!g->dropr) {
             g->dropr = os_reserve(g->os, DROP_QUEUE);
@@ -6009,6 +6023,7 @@ static void gui_drop(Gui *g, Str path, b32 app, f32 x, f32 y, b32 at)
             d->path = clone(&g->dropa, path);
             d->x    = x;
             d->y    = y;
+            d->at   = at;
             if (g->droptail) {
                 g->droptail->next = d;
             } else {
@@ -6020,6 +6035,20 @@ static void gui_drop(Gui *g, Str path, b32 app, f32 x, f32 y, b32 at)
         }
     }
     dropattach(g, path);
+}
+
+// Text dropped on the window, where the platform could not refuse it
+// first (Linux): said where a refused attach is.
+static void gui_droptext(Gui *g)
+{
+    Str why  = dropwhere(&g->frame, {}, {DRAGLOAD_TEXT, 1, 0}).label;
+    Str note = concat(&g->frame, "not attached: ", why);
+    if (g->sess) {
+        setnote(g, g->sess, note, 1);
+    } else {
+        guilog(g, note);
+    }
+    scheddirty(&g->sched);
 }
 
 // Paste: the clipboard's image, or its file, attached, an image or
@@ -13649,7 +13678,8 @@ enum : i32 {
                   // Fill), else skip the next op where that is no maximum
     OP_DROP,      // write a dx by dy PNG (or dy lines, .txt; dy pages, .pdf) to
                   // --cwd as text, drop it on the target, or at no point
-                  // with T_NONE (a flat gray JPEG if text ends in .jpg)
+                  // with T_NONE (a flat gray JPEG if text ends in .jpg);
+                  // text may name several, comma-separated, one drop
     OP_CLIPPNG,   // the clipboard's text kept, a dx by dy PNG put there
     OP_CLIPBACK,  // the clipboard's text put back
     OP_CLIPRACE,  // macOS: the window becomes key while another process
@@ -17186,6 +17216,25 @@ static DriveOp m3ops[] = {
     {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
     {OP_CHECK, CHK_FILEPATH, 0, 0, 0, "/files/dropped2.txt"},
     {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "4-4"},
+    {OP_CHECK, CHK_ATTACHED, 0, 0, 0, ""},
+    // Files dropped together on the pane open together, the last in
+    // front; one dropped at no point (a title bar) while Open file is up
+    // fills its field, as one dropped on the window does
+    {OP_DROP, T_FILESPANE, 0, 5, 800, "files/both1.txt,files/both2.txt"},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEPATH, 0, 0, 0, "/files/both2.txt"},
+    {OP_CHECK, CHK_ATTACHED, 0, 0, 0, ""},
+    CMDKEY(GKEY_O, 500),
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_DROP, T_NONE, 0, 5, 800, "files/both1.txt"},
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 300, ":2"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_FILEPATH, 0, 0, 0, "/files/both1.txt"},
+    {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "2-2"},
     {OP_CHECK, CHK_ATTACHED, 0, 0, 0, ""},
     // Quiet with a file shown, its find bar open, its field let go, past
     // the tooltips and the layout's save
@@ -21010,6 +21059,27 @@ static DriveOp composeops[] = {
     {OP_CHECK, CHK_ATTACHED, 0, 0, 0, ""},
     {OP_CHECK, CHK_USERIMAGES, 0, 0, 0, "I see 4 lines, 0 lost."},
     {OP_CHECK, CHK_USERFILES, 0, 0, 0, "Attached: dropped.pdf"},
+    // E4: files dropped together attach together or not at all: three
+    // with room for two attach none, one note saying how many fit, as
+    // one past the message's ten says why
+    {OP_NEWSESSION, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_DROP, T_PROMPT, 0, 2, 800, "m1.txt,m2.txt,m3.txt,m4.txt,m5.txt,m6.txt,m7.txt,m8.txt"},
+    {OP_CHECK, CHK_ATTACHED, 8, 0, 0, ""},
+    {OP_DROP, T_PROMPT, 0, 2, 800, "m9.txt,m10.txt,m11.txt"},
+    {OP_CHECK, CHK_ATTACHED, 8, 0, 0, ""},
+    {OP_CHECK, CHK_NOTE, 0, 0, 0, "not attached: Room for 2 more in this message"},
+    {OP_DROP, T_PROMPT, 0, 2, 800, "m9.txt,m10.txt"},
+    {OP_CHECK, CHK_ATTACHED, 10, 0, 0, ""},
+    {OP_DROP, T_PROMPT, 0, 2, 800, "m11.txt"},
+    {OP_CHECK, CHK_ATTACHED, 10, 0, 0, ""},
+    {OP_CHECK, CHK_NOTE, 0, 0, 0, "not attached: At most 10 files go in a message"},
+    CLICK(T_PROMPT, "", 200),
+    {OP_TEXT, 0, 0, 0, 200, "Describe the files."},
+    KEY(GKEY_ENTER, 0, 300),
+    {OP_WAIT, W_TURNS, 1, 0, 10000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 600, ""},
+    {OP_CHECK, CHK_ATTACHED, 0, 0, 0, ""},  // sent: no draft left behind
     // Mentions: '@' at a word's start opens the picker of the session
     // folder's files and folders, which typing narrows, Up/Down pick in,
     // and Tab or a bare Enter insert without sending, a file's text
@@ -25615,6 +25685,27 @@ static Str flatjpeg(Arena *a, i32 w, i32 h)
     return finish(&b);
 }
 
+// A file for OP_DROP to drop, as its name says: w by h pixels px as a
+// PNG, a flat gray JPEG (.jpg) of that size, a PDF (.pdf) of h pages, or
+// h numbered lines of text (.txt).
+static Str dropbody(Arena *a, Str name, u8 *px, i32 w, i32 h)
+{
+    if (endswith(name, ".jpg")) {
+        return flatjpeg(a, w, h);
+    } else if (endswith(name, ".pdf")) {
+        return droppdf(a, h);
+    } else if (endswith(name, ".txt")) {
+        Buf t(a, 64*(iz)h);
+        for (i32 i = 1; i <= h; i++) {
+            print(&t, "Line ");
+            print(&t, (i64)i);
+            print(&t, " of the dropped notes.\n");
+        }
+        return finish(&t);
+    }
+    return pngencodez(a, px, w, h, 0);
+}
+
 static void drivestep(Gui *g)
 {
     ImGuiPlatformIO &pio = ImGui::GetPlatformIO();
@@ -25880,21 +25971,8 @@ static void drivestep(Gui *g)
                 p[3] = 255;
             }
         }
-        // A .txt is dy numbered lines of text instead
-        Str png = endswith(op->text, ".jpg") ? flatjpeg(&a, w, h) :
-                  pngencodez(&a, px, w, h, 0);
-        if (endswith(op->text, ".pdf")) {
-            png = droppdf(&a, (i32)op->dy);
-        } else if (endswith(op->text, ".txt")) {
-            Buf t(&a, 64*(iz)op->dy);
-            for (i32 i = 1; i <= (i32)op->dy; i++) {
-                print(&t, "Line ");
-                print(&t, (i64)i);
-                print(&t, " of the dropped notes.\n");
-            }
-            png = finish(&t);
-        }
         if (op->op == OP_CLIPPNG) {
+            Str png = pngencodez(&a, px, w, h, 0);
             char const *t = ImGui::GetClipboardText();
             g->clipkept = t ? clone(&g->perm, Str{(u8 *)t, (iz)__builtin_strlen(t)}) : Str{};
             g->clippng  = clone(&g->perm, png);
@@ -25908,16 +25986,28 @@ static void drivestep(Gui *g)
             }
             break;
         }
-        // Kept for the event, which outlives this frame
-        Str path = join(&g->perm, g->drivecwd, op->text);
-        if (!os_write(g->os, a, path, png)) {
-            guilog(g, "drive: FAIL could not write the image to drop");
+        // Its files, comma-separated, each written as its name says and
+        // dropped together; their paths each end in a NUL, kept for the
+        // event, which outlives this frame
+        Buf paths(&g->perm, 4096);
+        b32 ok = 1;
+        for (Str rest = op->text; ok && rest.len;) {
+            Cut c    = cut(rest, ',');
+            rest     = c.tail;
+            Str body = dropbody(&a, c.head, px, w, h);
+            Str path = join(&a, g->drivecwd, c.head);
+            ok = os_write(g->os, a, path, body);
+            print(&paths, path);
+            putbyte(&paths, 0);
+        }
+        if (!ok) {
+            guilog(g, "drive: FAIL could not write the file to drop");
             g->drivechecks++;
             g->drivefails++;
             break;
         }
         e.kind = GEV_DROP;
-        e.text = {(u8 *)cstr0(&g->perm, path), path.len};
+        e.text = finish(&paths);
         if (op->target != T_NONE) {
             // T_NONE's would be (0, 0): it is at no point instead
             ImVec2 p = targetpos(g, op->target);

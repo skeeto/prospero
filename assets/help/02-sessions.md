@@ -183,8 +183,10 @@ from the start.
 
 Attach adds files to the message: drop them on the window (but not on
 the Files pane, which opens them, or while Open file asks for a path,
-which takes the first), paste them, or pick them with the paper clip. Images go to a model that takes
-them, as pictures. Any other file goes as text, as `read` shows it:
+which takes the first), paste them, or pick them with the paper clip.
+Files dropped together are attached together or not at all: when the
+message has no room for them all, none are, and the note says why: how
+many more fit, or that ten is the most. Images go to a model that takes them, as pictures. Any other file goes as text, as `read` shows it:
 numbered lines, the first 2000 or so, then a note to read on. The
 session keeps a copy in its own folder, so the agent can read the rest
 without asking. A PDF goes as its text, extracted, a `--- page N ---`

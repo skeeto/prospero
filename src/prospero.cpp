@@ -492,7 +492,9 @@ static void    os_wake(Os *);
 // window moved, resized, maximized or restored (WinGeom, below), and
 // gui_drop of a file dropped on the window, by its path, at a point in
 // ImGui's units if the platform knows it, or opened in the application
-// as a whole (macOS: Finder, the Dock, open -a), and
+// as a whole (macOS: Finder, the Dock, open -a), the files of one drop
+// one after another at one point, gui_droptext of text dropped on the
+// window where the platform could not refuse it first, and
 // gui_toasted and gui_toastfail of a desktop notification clicked or
 // refused (os_guitoast).
 struct Gui;
@@ -618,8 +620,10 @@ enum {
                     // or back to what it really is (x -1)
     GEV_TRAY,       // the tray icon's menu item x (TRAY_*) is picked,
                     // tray or not, window or not
-    GEV_DROP,       // a file, its path the text, is dropped on the window,
-                    // at x, y if down is set, else at no known point
+    GEV_DROP,       // files are dropped on the window together, their
+                    // paths the text, each ending in a NUL (len counts
+                    // them all), at x, y if down is set, else at no
+                    // known point
     GEV_TOAST,      // toast x is clicked (y 0), or was refused (y 1),
                     // shown or not, by the platform's own path
     GEV_FLAGPASTE,  // macOS: Cmd+V as dictation apps post it, Cmd in V's

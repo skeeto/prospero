@@ -1616,6 +1616,15 @@ static void dispatch(Os *os, GuiSdl *p, SDL_Event *e)
                      app, e->drop.x, e->drop.y, at);
         }
         return;
+    #ifndef __APPLE__
+    case SDL_EVENT_DROP_TEXT:
+        // Linux's drags say nothing of what they hold, so the drop of
+        // text, a line an event, could not be refused first
+        if (e->drop.windowID) {
+            gui_droptext(g);
+        }
+        return;
+    #endif
     case SDL_EVENT_WINDOW_RESIZED:
     case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
     case SDL_EVENT_WINDOW_EXPOSED:
@@ -1980,13 +1989,21 @@ static void os_guiinject(Os *os, GuiEvent *ge)
         p->drivetheme = ge->x<0 ? 0 : ge->x>0 ? 2 : 1;
         e.type = SDL_EVENT_SYSTEM_THEME_CHANGED;
         break;
-    case GEV_DROP:
-        e.type          = SDL_EVENT_DROP_FILE;
-        e.drop.windowID = id;
-        e.drop.x        = ge->down ? ge->x : -1;  // else at no point
-        e.drop.y        = ge->down ? ge->y : -1;
-        e.drop.data     = ge->text.cdata;  // outlives dispatch
-        break;
+    case GEV_DROP: {
+        // An event a path, as SDL sends a drop of several files, each
+        // path ending in a NUL, outliving dispatch
+        char const *path = ge->text.cdata;
+        char const *end  = path + ge->text.len;
+        e.type             = SDL_EVENT_DROP_FILE;
+        e.drop.windowID    = id;
+        e.drop.x           = ge->down ? ge->x : -1;  // else at no point
+        e.drop.y           = ge->down ? ge->y : -1;
+        e.common.timestamp = SDL_GetTicksNS();
+        for (; path < end; path += SDL_strlen(path) + 1) {
+            e.drop.data = path;
+            SDL_PushEvent(&e);
+        }
+    } return;
     }
     e.common.timestamp = SDL_GetTicksNS();
     SDL_PushEvent(&e);
