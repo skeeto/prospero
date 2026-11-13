@@ -183,12 +183,12 @@ window's `[remote NAME]` has a `viewer` command template:
 
 ```ini
 [remote test1]
-ssh = ad@test1
+ssh = user@test1
 viewer = fresh ssh://{ssh}{path}
 ```
 
 That launches `fresh` with one argument,
-`ssh://ad@test1/home/ad/agent-context/plan.md`, for the example plan path.
+`ssh://user@test1/home/user/agent-context/plan.md`, for the example plan path.
 The Plan pane's **View in editor** and Files' **Open in editor** use the
 same detached launcher. There is no `[ui] editor` fallback.
 

@@ -7097,13 +7097,8 @@ static b32 editorfound(Gui *g, Arena a, Str prog, b32 direct)
         prog = concat(&a, userhome(g->os, &a), cuthead(prog, 1));
     }
     Slice<Str> exts = {};
-    exts = push(&a, exts, Str{});
-    if (HOST_WINDOWS && direct && find(basename(prog), ".")<0) {
-        // os_launch's childpath looks only for .exe when a direct viewer's
-        // name has no extension. Unlike the shell editor, do not accept a
-        // .cmd or .bat that CreateProcessW has no shell to interpret.
-        exts = push(&a, exts, Str(".exe"));
-    } else if (HOST_WINDOWS && !direct && find(basename(prog), ".")<0) {
+    exts = push(&a, exts, HOST_WINDOWS && direct ? winviewerext(prog) : Str{});
+    if (HOST_WINDOWS && !direct && find(basename(prog), ".")<0) {
         Str pe = trim(os_getenv(g->os, &a, "PATHEXT"));
         for (Str rest = pe.len ? pe : Str(".COM;.EXE;.BAT;.CMD"); rest.len;) {
             Cut c = cut(rest, ';');
@@ -7146,10 +7141,11 @@ static void editorfindfor(Gui *g, Arena *a, EditJump *j)
     if (j->why.len) {
         return;
     }
-    u64 key = hash(j->prog) ^ (hash(guipath(g, a))*1111111111111111111u);
+    b32 direct = j->argv.len>0;
+    u64 key = editorfindkey(j->prog, guipath(g, a), direct);
     i64 now = os_ticks(g->os);
     if (!g->edfoundat || key!=g->edfoundkey || now-g->edfoundat>=5000000) {
-        g->edfound    = editorfound(g, *a, j->prog, j->argv.len>0);
+        g->edfound    = editorfound(g, *a, j->prog, direct);
         g->edfoundkey = key;
         g->edfoundat  = now;
     }

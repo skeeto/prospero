@@ -459,12 +459,24 @@ static void test_compose(Test *t)
            "fresh|ssh://ad@test1/home/ad/agent-context/plan.md");
     expect(t, "viewer.fresh.argc", istr(&a, vj.argv.len), "2");
     expect(t, "viewer.fresh.ok", vj.why, "");
+    // A direct Windows viewer has only CreateProcessW's candidate, never
+    // the extensionless file or a shell's PATHEXT candidates.
+    expect(t, "viewer.winext.bare", winviewerext("code"), ".exe");
+    expect(t, "viewer.winext.path", winviewerext("C:\\Tools\\code"), ".exe");
+    expect(t, "viewer.winext.dotdir", winviewerext("C:\\Tools.1\\code"), ".exe");
+    expect(t, "viewer.winext.exe", winviewerext("code.exe"), "");
+    expect(t, "viewer.winext.cmd", winviewerext("code.cmd"), "");
     expect(t, "viewer.batch.cmd", istr(&a, viewerbatch("code.cmd")), "1");
     expect(t, "viewer.batch.upper", istr(&a, viewerbatch("C:\\Tools\\CODE.CMD")), "1");
     expect(t, "viewer.batch.bat", istr(&a, viewerbatch("/opt/code.bat")), "1");
     expect(t, "viewer.batch.exe", istr(&a, viewerbatch("code.exe")), "0");
     expect(t, "viewer.batch.name", istr(&a, viewerbatch("code")), "0");
     expect(t, "viewer.batch.script", istr(&a, viewerbatch("code.sh")), "0");
+    u64 shellkey = editorfindkey("code", "C:\\Tools", 0);
+    expect(t, "editor.findkey.mode",
+           istr(&a, shellkey!=editorfindkey("code", "C:\\Tools", 1)), "1");
+    expect(t, "editor.findkey.repeat",
+           istr(&a, shellkey==editorfindkey("code", "C:\\Tools", 0)), "1");
     vv.path = "/home/ad/agent-context";
     vj = viewerjump(&a, "fresh ssh://{ssh}{path}", vv);
     expect(t, "viewer.directory", argstr(&a, vj.argv),

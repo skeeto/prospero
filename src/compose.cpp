@@ -1012,6 +1012,13 @@ struct ViewerValues {
     i32 col;
 };
 
+// A direct Windows viewer's suffix: childpath/CreateProcessW appends .exe
+// to a name without an extension, never trying the bare file or PATHEXT.
+static Str winviewerext(Str prog)
+{
+    return find(basename(prog), ".")<0 ? Str(".exe") : Str{};
+}
+
 // Windows needs a program, never a batch script: a direct CreateProcessW
 // viewer has no cmd.exe to interpret one. Other platforms run scripts by
 // their shebang as any direct exec does, so this check is applied only there.
@@ -1020,6 +1027,13 @@ static b32 viewerbatch(Str prog)
     Str name = basename(prog);
     return name.len>4 && (equalfold(cuthead(name, name.len-4), ".cmd") ||
                           equalfold(cuthead(name, name.len-4), ".bat"));
+}
+
+// Program discovery depends on the launch mode as well as program and PATH:
+// on Windows a direct viewer and a shell editor consider different files.
+static u64 editorfindkey(Str prog, Str path, b32 direct)
+{
+    return hash(prog) ^ (hash(path)*1111111111111111111u) ^ (u64)(direct!=0);
 }
 
 // One template word after substitution. A braced identifier Prospero does
