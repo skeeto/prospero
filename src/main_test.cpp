@@ -684,6 +684,7 @@ static Str istr(Arena *a, i64 v)
 #include "test/edit_test.cpp"
 #include "test/tools_test.cpp"
 #include "test/guard_test.cpp"
+#include "test/editjump_test.cpp"
 #include "test/fileref_test.cpp"
 #include "test/admit_test.cpp"
 #include "test/compact_test.cpp"
@@ -780,6 +781,7 @@ int main()
     test_edit(&t);
     test_tools(&t);
     test_guard(&t);
+    test_editjump(&t);
     test_fileref(&t);
     test_admit(&t);
     test_compact(&t);

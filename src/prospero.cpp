@@ -805,6 +805,7 @@ static u32     os_guilimits(Os *);
 #include "desktop.cpp"
 #include "tools.cpp"
 #include "guard.cpp"
+#include "editjump.cpp"  // after tools.cpp and guard.cpp: basename, pathroot
 #include "search.cpp"
 #include "instructions.cpp"
 #include "memory.cpp"

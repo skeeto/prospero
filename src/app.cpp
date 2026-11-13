@@ -7250,14 +7250,8 @@ static Proc *editrun(Gui *g, Arena *a, Str cmd, Str path, Str dir, Str log, Str 
     }
     Str comspec = os_getenv(g->os, a, "COMSPEC");
     comspec = comspec.len ? comspec : Str("cmd.exe");
-    Buf c(a, 64 + comspec.len + line.len);
-    putbyte(&c, '"');
-    print(&c, comspec);
-    print(&c, "\" /d /s /c \"");
-    print(&c, line);
-    putbyte(&c, '"');
     sp.argv    = push(a, sp.argv, comspec);
-    sp.cmdline = finish(&c);
+    sp.cmdline = cmdcline(a, comspec, line);
     #else
     sp.argv = push(a, sp.argv, Str("/bin/sh"));
     sp.argv = push(a, sp.argv, Str("-c"));
@@ -7423,7 +7417,8 @@ static void guishow(Gui *g, Str path)
 }
 
 // Open in editor for path, a file here, at line (1-based) and col (0
-// for none): the command, or why not.
+// for none): the command, or why not. An editor that runs in a terminal
+// is refused: the window runs its line with no terminal.
 static EditJump editorjumpfor(Gui *g, Arena *a, Str path, i32 line, i32 col)
 {
     Str cmd  = editorcmd(g, a);
@@ -7432,6 +7427,7 @@ static EditJump editorjumpfor(Gui *g, Arena *a, Str path, i32 line, i32 col)
         tmpl = cmdhome(a, tmpl, userhome(g->os, a));
     }
     EditJump j = editorjump(a, cmd, tmpl, path, line>0 ? line : 1, col, HOST_WINDOWS);
+    j = editorwindow(a, j);
     if (!j.why.len && HOST_WINDOWS) {
         j.line = editorabs(g, a, j.line, j.prog, j.name, &j.why);
     } else if (!j.why.len && !editorexe(g, a, j.prog).len) {
@@ -7464,14 +7460,8 @@ static void editorjumprun(Gui *g, Arena a, Str path, i32 line, i32 col)
     #ifdef _WIN32
     Str comspec = os_getenv(g->os, &a, "COMSPEC");
     comspec = comspec.len ? comspec : Str("cmd.exe");
-    Buf c(&a, 64 + comspec.len + j.line.len);
-    putbyte(&c, '"');
-    print(&c, comspec);
-    print(&c, "\" /d /s /c \"");
-    print(&c, j.line);
-    putbyte(&c, '"');
     argv    = push(&a, argv, comspec);
-    cmdline = finish(&c);
+    cmdline = cmdcline(&a, comspec, j.line);
     #else
     argv = push(&a, argv, Str("/bin/sh"));
     argv = push(&a, argv, Str("-c"));
