@@ -124,7 +124,10 @@ struct FileTab {
     i32       top;        // the line at the view's top, 0-based
     f32       dy;         // and how far past its top the view is
     f32       scrollx;    // unwrapped
-    FileWatch watch;      // whether it changed since it was read
+    i32       goline;     // where Open in editor opens, 1-based: the line
+    i32       gocol;      // last gone to (a link's first, or the current
+                          // find match's) and its column; else 0
+    FileWatch watch;     // whether it changed since it was read
     b32       astext;    // binary, but shown as text anyway
     Str       err;        // why it failed, a literal, or in errbuf
     u8        errbuf[128];

@@ -4289,6 +4289,8 @@ struct ViewSearch {
     Slice<FindHit>   hits;      // in order
     Slice<FindSeen>  seen;      // the messages searched, in order
     i32              cur;       // the current hit, -1 if none
+    iz               hitmax;    // hits kept at most, 0 for no limit
+    b32              full;      // hitmax kept, and more found
 };
 
 static ViewSearch *newsearch(Arena *perm, Region *hits, Region *seen, iz qmax)
@@ -4342,6 +4344,7 @@ static void searchreset(ViewSearch *s, View *v, Str q)
     s->hits       = {};
     s->seen       = {};
     s->cur        = -1;
+    s->full       = 0;
 }
 
 static FindSeen seenof(View *v, ViewMsg *m)
@@ -4426,6 +4429,7 @@ static FindText findtext(Arena *a, Doc *d)
 // A message is searched in what it shows (findtext), from its document,
 // which stays in the cache for the next search, a text typed further,
 // and for showing it; one not made yet costs its parse too.
+// Past hitmax hits (if not 0) it stops, full, until a message changes.
 // Returns whether they are, else it goes on from there next call.
 static b32 searchstep(ViewSearch *s, Arena scratch, iz budget)
 {
@@ -4444,10 +4448,11 @@ static b32 searchstep(ViewSearch *s, Arena scratch, iz budget)
         s->hits.len = k;
         s->seen.len = first;
         s->cur      = s->cur<k ? s->cur : (i32)k-1;
+        s->full     = 0;
     }
 
     Str q = s->q;
-    for (iz i = s->seen.len; i < v->msgs.len; i++) {
+    for (iz i = s->seen.len; i<v->msgs.len && !s->full; i++) {
         if (budget <= 0) {
             return 0;
         }
@@ -4461,13 +4466,15 @@ static b32 searchstep(ViewSearch *s, Arena scratch, iz budget)
         Arena    a = scratch;
         FindText t = findtext(&a, msgdoc(v, (i32)i));
         u8       q0 = q[0];
-        for (iz at = 0; at+q.len <= t.len; at++) {
+        for (iz at = 0; at+q.len<=t.len && !s->full; at++) {
             if (t.text[at] != q0) {
                 continue;
             }
             iz k = 1;
             for (; k<q.len && t.text[at+k]==q[k]; k++) {}
-            if (k == q.len) {
+            if (k==q.len && s->hitmax && s->hits.len==s->hitmax) {
+                s->full = 1;
+            } else if (k == q.len) {
                 i32 beg = t.beg[at];
                 i32 end = t.end[at+q.len-1];
                 FindHit h = {(i32)i, beg, end>beg ? end-beg : 0};

@@ -21,7 +21,8 @@ except Ctrl+G in the prompt box, which is Ctrl there too.
 - **Ctrl+Shift+N**: New session, no folder, with the default model:
   no dialog, straight to its prompt box.
 - **Ctrl+F**: find in the transcript. In Help or Settings, while it has
-  the focus, its search field instead.
+  the focus, its search field instead, and in the Files pane its own
+  find bar, over the file shown.
 - **Ctrl+,**: the Settings pane, its search field taking the keyboard.
   On macOS, the Prospero menu's Settings... does the same.
 - **Alt+Up**: from a subagent or side chat, up to the session it
@@ -101,13 +102,24 @@ Files pane.
 
 ## Finding
 
-In the find bar, **Enter** or **Ctrl+G** goes to the next match, and
-**Shift+Enter** or **Ctrl+Shift+G** to the previous. Only what shows is
-searched, not folded tool output or reasoning: Ctrl+Shift+T or
-Ctrl+Shift+R opens them all to search them too. The search is in the
-text as shown, not its Markdown, ignoring case and how spaces and line
-breaks fall, so text copied from the transcript finds itself. **Esc**
-closes the bar.
+In the find bar, **Enter**, **Ctrl+G** or **F3** goes to the next match,
+and **Shift+Enter**, **Ctrl+Shift+G** or **Shift+F3** to the previous.
+Only what shows is searched, not folded tool output or reasoning:
+Ctrl+Shift+T or Ctrl+Shift+R opens them all to search them too. The
+search is in the text as shown, not its Markdown, ignoring case and how
+spaces and line breaks fall, so text copied from the transcript finds
+itself. **Esc** closes the bar.
+
+The Files pane has a find bar of its own: **Ctrl+F** while the pane has
+the focus, or Edit → Find in file.... It searches the file's text, or a
+Markdown file as rendered, ignoring case and how spaces, tabs and line
+breaks fall, so code copied from it finds itself; a tab pasted into the
+field is dropped, so type a space for it. It steps with the same keys,
+and F3 and Shift+F3 work from the text too, as on macOS do Cmd+G and
+Cmd+Shift+G. Matches are marked, the current one stronger, and the text
+scrolls only to bring one into view. **Esc** closes it, in the bar or
+the text. It stays with the pane, searching each file shown from the
+top of the view.
 
 ## Dialogs
 

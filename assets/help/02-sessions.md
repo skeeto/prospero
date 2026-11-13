@@ -284,11 +284,14 @@ and as its tab is picked or a link to it clicked, never by polling, at
 most once a second; the text stays at the same line. Reload (the
 circular arrow) reads it again at once, and a tab's menu closes tabs or
 copies the path. Ctrl+W (Cmd+W) closes the front tab while the pane
-has the focus. Reveal (the folder) shows the file in the file
-manager, and Open in editor opens it in your editor (`[ui] editor`,
-or [`[ui] editor_line`](settings:ui#editor_line) for one Prospero
-doesn't know) at the band's first line, else the line at the top,
-without waiting for it. Both work for a file on this computer, in a
+has the focus, and Ctrl+F (Cmd+F) there finds in the file shown, its
+text or its Markdown as rendered (Edit → Find in file... too). Reveal
+(the folder) shows the file in the file manager, and Open in editor
+opens it in your editor (`[ui] editor`, or
+[`[ui] editor_line`](settings:ui#editor_line) for one Prospero doesn't
+know) at the line last gone to (a link's first, or the current find
+match's, with its column), else the band's first line, else the line
+at the top, without waiting for it. Both work for a file on this computer, in a
 container's folder mounted here, or, on Windows, in a WSL distro;
 for another host's they say why not. A binary file says so, with Show
 as text anyway; past 4 MiB or 100,000 lines only the start shows.

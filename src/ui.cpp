@@ -4202,7 +4202,9 @@ static Str blocktext(Arena *a, Doc *d, DocBlock *b)
 // the code font: numbered in a gutter on the left, the cited lines
 // banded, scrolled to them once (centered if they fit, else from a
 // third of the way down), or to where the view was, and wrapped at the
-// pane's width or else at FILES_COLS columns, scrolled sideways. Until
+// pane's width or else at FILES_COLS columns, scrolled sideways. Find
+// hits (dl->find) are marked, and one revealed is scrolled to only if
+// it is out of view, or under the bar covering the view's top. Until
 // the pane has settled its size (its first frame, a layout applied, a
 // height that changed) a jump or a restore is made again each frame,
 // and not reported done, nor the place recorded.
@@ -4314,6 +4316,36 @@ static Str drawlines(Gui *g, DocView *d, char const *id, DocLines *dl)
         want  = y1-y0 <= vish-2*pad ? (y0+y1)/2 - vish/2 : y0 - vish/3;
         wantx = 0;
         dl->jumped = !pending;
+    } else if (dl->reveal.len>0 && dl->reveal.msg<v->msgs.len) {
+        // The hit's first and last bytes, the last maybe in a later chunk
+        FindHit h  = dl->reveal;
+        i32     k0 = h.msg, o0 = h.off;
+        i32     k1 = h.msg, o1 = h.off + h.len - 1;
+        for (; k1+1<v->msgs.len && o1>=(i32)v->msgs[k1].text.len; k1++) {
+            o1 -= (i32)v->msgs[k1].text.len;
+        }
+        f64 ya = linesy(v, g, width, pad, v->msgs[k0].line0 - 1);
+        lineslay(v, g, width, adv, fm.lineh, ya-winh, ya+winh);
+        MsgLayout *ml0 = msglayout(v, k0, &g->measure, width, sc);
+        MsgLayout *ml1 = msglayout(v, k1, &g->measure, width, sc);
+        viewtops(v, width, adv, fm.lineh);
+        MsgRow r0 = msgrowat(&g->measure, msgdoc(v, k0), ml0, o0);
+        MsgRow r1 = msgrowat(&g->measure, msgdoc(v, k1), ml1, o1);
+        f64    y0 = v->msgs[k0].top + pad + r0.y;
+        f64    y1 = v->msgs[k1].top + pad + r1.y + r1.h;
+        f32    x0 = r0.x<r1.x ? r0.x : r1.x;
+        f32    x1 = (r0.x>r1.x ? r0.x : r1.x) + adv;
+        f32    cx = d->win ? d->win->Scroll.x : 0;
+        f32    vw = avail.x - st.ScrollbarSize - pad - gutter;
+        f32    up = dl->covered;
+        if (y0<cur+up || y1>cur+vish) {
+            want = y1-y0 <= vish-up ? (y0+y1)/2 - (up+vish)/2 : y0 - up - (vish-up)/3;
+            want = want<0 ? 0 : want;  // the first lines stay under the bar
+        }
+        if (!dl->wrap && (x0<cx || x1>cx+vw)) {
+            wantx = x1<=vw ? 0 : x0 - vw/3;
+        }
+        dl->jumped = !pending;
     } else if (dl->restore && v->msgs.len) {
         i32 line = dl->top<0 ? 0 : dl->top>=dl->lines ? dl->lines-1 : dl->top;
         f64 y    = linesy(v, g, width, pad, line);
@@ -4371,7 +4403,7 @@ static Str drawlines(Gui *g, DocView *d, char const *id, DocLines *dl)
     Range               sel  = selrange(&v->sel);
     b32                 band = dl->band0>0 && poseq(sel.beg, sel.end);
     b32                 drew = 0;
-    Marks               mk   = {0, 0, -1};
+    b32                 carried = 0;
     f32                 ox   = wpos.x + pad + gutter - sx;
     f32                 seen = dl->seenw;
     Arena               a    = g->frame;
@@ -4387,6 +4419,12 @@ static Str drawlines(Gui *g, DocView *d, char const *id, DocLines *dl)
             break;
         }
         MsgLayout *ml = msglayout(v, i, &g->measure, width, sc);
+        Marks      mk = {0, 0, -1};
+        if (dl->find && dl->find->text.data==v->body.data) {
+            b32 carry = 0;
+            mk = filemarks(&a, dl->find, i, m->text.data - v->body.data, &carry);
+            carried |= carry;
+        }
         drawmsgtext(g, dr, sp, &ta, i, ml, v2(ox, y), sel, &mk, 1, 0);
         for (iz k = 0; k < ml->blocks.len; k++) {
             Placed *pl = &ml->blocks[k];
@@ -4484,6 +4522,8 @@ static Str drawlines(Gui *g, DocView *d, char const *id, DocLines *dl)
     fs->width   = width;
     fs->hbar    = ImGui::GetScrollMaxX() > 0;
     fs->band    = drew;
+    fs->carried = carried;
+    fs->winw    = ww;
     ImGui::EndChild();
     textkeys(g, v);
     return link;
@@ -4562,7 +4602,6 @@ static Str drawdoc(Gui *g, DocView *d, char const *id, f32 fit = 0, DocLines *li
     ImDrawList         *dl  = ImGui::GetWindowDrawList();
     ImDrawListSplitter *sp  = &g->splitter;
     Range               sel = selrange(&v->sel);
-    Marks               mk  = {0, 0, -1};
     sp->Split(dl, CH_COUNT);
     for (i32 i = viewfind(v, ta.scrolly - pad); i>=0 && i<v->msgs.len; i++) {
         ViewMsg *m = &v->msgs[i];
@@ -4571,6 +4610,8 @@ static Str drawdoc(Gui *g, DocView *d, char const *id, f32 fit = 0, DocLines *li
             break;
         }
         MsgLayout *ml = msglayout(v, i, &g->measure, width, sc);
+        Marks      mk = d->find && d->find->v==v ? hitmarks(d->find->hits, d->find->cur, i)
+                                                 : Marks{0, 0, -1};
         drawmsgtext(g, dl, sp, &ta, i, ml, v2(wpos.x + pad, y + pad), sel, &mk, 1, 0);
     }
     sp->Merge(dl);
@@ -4579,17 +4620,117 @@ static Str drawdoc(Gui *g, DocView *d, char const *id, f32 fit = 0, DocLines *li
     return link;
 }
 
-// The find bar, floating over the top right of the transcript (r0 to
-// r1) as the toasts do over its foot, so that opening and closing it
-// moves nothing: the text to find, the hits counted, and the buttons to
-// go between them. A new text or session searches again, a budget of
-// bytes a frame, and the first hit at or below the top of the screen
-// becomes the current one. Drawn after the transcript, to be over it,
-// so a jump it asks for lands next frame.
+// A find bar's chrome, the transcript's (drawfind) and the Files
+// pane's (filefindbar): a child floating over the top right of r0 to
+// r1, as the toasts do over the transcript's foot, so that opening and
+// closing it moves nothing. findbarbegin opens it, the cursor where its
+// field goes, fieldw wide; the caller draws the field and searches;
+// findbarend draws the arrows to go between the hits, their count, in a
+// column as wide as its widest so that the bar never changes width as
+// the count does, and the close button, and closes it.
+struct FindBar {
+    // In
+    char const  *child;     // the child's ID
+    Str          name;      // its controls' names, for the checklist
+    char const  *widest;    // the count at its widest
+    b32          arrows;    // the previous and next arrows, else the
+                            // field takes their room
+    i32          nextrect;  // RECT_* of the next arrow, else -1
+    // Out
+    f32          fieldw;
+    b32          prev;
+    b32          next;
+    b32          close;
+    b32          focused;   // the bar has the focus
+    f32          bottom;    // its foot, on screen
+    // Kept
+    ImGuiWindow *pw;
+    ImVec2       maxp;
+    f32          countw;
+};
+
+static void findbarbegin(Gui *g, FindBar *fb, ImVec2 r0, ImVec2 r1)
+{
+    f32         sc     = g->scale;
+    ImGuiStyle &st     = ImGui::GetStyle();
+    f32         pad    = 6*sc;
+    f32         fh     = ImGui::GetFrameHeight();
+    f32         sp     = st.ItemSpacing.x;
+    f32         countw = ImGui::CalcTextSize("No matches").x;
+    f32         countm = ImGui::CalcTextSize(fb->widest).x;
+    countw = countm>countw ? countm : countw;
+    f32 fieldw = 260*sc;
+    f32 arrows = 2*fh + 2*sp;
+    f32 rest   = arrows + countw + iconw() + 2*sp + 2*pad;
+    f32 room   = r1.x - r0.x - st.ScrollbarSize - 24*sc;
+    if (fieldw+rest > room) {
+        fieldw = room - rest;
+    }
+    if (fieldw < 60*sc) {
+        fieldw = 60*sc;  // narrower than this, let it overhang the left
+    }
+    f32 w = fieldw + rest;
+    f32 h = fh + 2*pad;
+    fb->fieldw = fb->arrows ? fieldw : fieldw + arrows;
+    fb->prev   = fb->next = fb->close = fb->focused = 0;
+    fb->countw = countw;
+    fb->pw     = ImGui::GetCurrentWindow();
+    fb->maxp   = fb->pw->DC.CursorMaxPos;
+    ImGui::SetCursorScreenPos(v2(r1.x - st.ScrollbarSize - 12*sc - w, r0.y + 8*sc));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, g->pal->frame);
+    ImGui::PushStyleColor(ImGuiCol_Border, g->pal->rule);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6*sc);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, v2(pad, pad));
+    ImGui::BeginChild(fb->child, v2(w, h), ImGuiChildFlags_Borders,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+                      ImGuiWindowFlags_NoSavedSettings);
+    ImGui::SetCursorPos(v2(pad, pad));
+    ImGui::SetNextItemWidth(fb->fieldw);
+}
+
+static void findbarend(Gui *g, FindBar *fb, Str count)
+{
+    Arena a  = g->frame;
+    f32   sp = ImGui::GetStyle().ItemSpacing.x;
+    if (fb->arrows) {
+        // a11y: "Previous match" and "Next match"
+        ImGui::SameLine();
+        fb->prev = ImGui::ArrowButton("##findprev", ImGuiDir_Up);
+        itemnamed(g, concat(&a, fb->name, " previous"));
+        itemtip("The previous match (Shift+Enter)");
+        ImGui::SameLine();
+        fb->next = ImGui::ArrowButton("##findnext", ImGuiDir_Down);
+        if (fb->nextrect >= 0) {
+            itemrect(g, fb->nextrect);
+        }
+        itemnamed(g, concat(&a, fb->name, " next"));
+        itemtip("The next match (Enter)");
+    }
+    ImGui::SameLine();
+    f32 x = ImGui::GetCursorPosX();
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextDisabled("%s", cstr0(&a, count));
+    ImGui::SameLine(x + fb->countw + sp);
+    fb->close = iconbutton(ICON_CLOSE "##findclose");
+    itemnamed(g, concat(&a, fb->name, " close"));
+    itemtip("Close the find bar (Esc)");
+    fb->focused = ImGui::IsWindowFocused();
+    fb->bottom  = ImGui::GetWindowPos().y + ImGui::GetWindowSize().y;
+
+    ImGui::EndChild();
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor(2);
+    fb->pw->DC.CursorMaxPos = fb->maxp;  // over the text, extending nothing
+}
+
+// The transcript's find bar (findbarbegin): the text to find, the hits
+// counted, and the buttons to go between them. A new text or session
+// searches again, a budget of bytes a frame, and the first hit at or
+// below the top of the screen becomes the current one. Drawn after the
+// transcript, to be over it, so a jump it asks for lands next frame.
 static void drawfind(Gui *g, View *v, f64 scrolly, ImVec2 r0, ImVec2 r1)
 {
     ViewSearch *s  = g->search;
-    f32         sc = g->scale;
     Arena       a  = g->frame;
     if (!g->findopen) {
         return;
@@ -4600,42 +4741,18 @@ static void drawfind(Gui *g, View *v, f64 scrolly, ImVec2 r0, ImVec2 r1)
     // it goes by last frame's.
     b32 held = g->findheld;
     g->findheld = 0;
-    ImGuiStyle &st     = ImGui::GetStyle();
-    f32         pad    = 6*sc;
-    f32         fh     = ImGui::GetFrameHeight();
-    f32         sp     = st.ItemSpacing.x;
-    f32         countw = ImGui::CalcTextSize("No matches").x;
-    f32         countm = ImGui::CalcTextSize("8888 of 8888+").x;
-    countw = countm>countw ? countm : countw;
-    f32 fieldw = 260*sc;
-    f32 rest   = 2*fh + countw + iconw() + 4*sp + 2*pad;
-    f32 room   = r1.x - r0.x - st.ScrollbarSize - 24*sc;
-    if (fieldw+rest > room) {
-        fieldw = room - rest;
-    }
-    if (fieldw < 60*sc) {
-        fieldw = 60*sc;  // narrower than this, let it overhang the left
-    }
-    f32 w = fieldw + rest;
-    f32 h = fh + 2*pad;
-
-    ImGuiWindow *pw   = ImGui::GetCurrentWindow();
-    ImVec2       maxp = pw->DC.CursorMaxPos;
-    ImGui::SetCursorScreenPos(v2(r1.x - st.ScrollbarSize - 12*sc - w, r0.y + 8*sc));
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, g->pal->frame);
-    ImGui::PushStyleColor(ImGuiCol_Border, g->pal->rule);
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6*sc);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, v2(pad, pad));
-    ImGui::BeginChild("##findbar", v2(w, h), ImGuiChildFlags_Borders,
-                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
-                      ImGuiWindowFlags_NoSavedSettings);
-    ImGui::SetCursorPos(v2(pad, pad));
+    FindBar fb = {};
+    fb.child    = "##findbar";
+    fb.name     = "find";
+    fb.widest   = "8888 of 8888+";
+    fb.arrows   = 1;
+    fb.nextrect = RECT_FINDNEXT;
+    findbarbegin(g, &fb, r0, r1);
 
     if (g->findfocus) {
         ImGui::SetKeyboardFocusHere();
         g->findfocus = 0;
     }
-    ImGui::SetNextItemWidth(fieldw);
     b32 enter = ImGui::InputTextWithHint("##find", "Find in the transcript", g->findbuf,
                                          FIELD_MAX, ImGuiInputTextFlags_EnterReturnsTrue|
                                                     ImGuiInputTextFlags_AutoSelectAll);
@@ -4671,14 +4788,6 @@ static void drawfind(Gui *g, View *v, f64 scrolly, ImVec2 r0, ImVec2 r1)
         g->findfrom  = done && s->cur<0 ? viewfind(v, scrolly) : g->findfrom;
     }
 
-    ImGui::SameLine();
-    b32 prev = ImGui::ArrowButton("##findprev", ImGuiDir_Up);
-    itemtip("The previous match (Shift+Enter)");
-    ImGui::SameLine();
-    b32 next = ImGui::ArrowButton("##findnext", ImGuiDir_Down);
-    itemrect(g, RECT_FINDNEXT);
-    itemtip("The next match (Enter)");
-    ImGui::SameLine();
     Buf b(&a, 64);
     if (s->q.len && !s->hits.len && done) {
         print(&b, "No matches");
@@ -4688,26 +4797,13 @@ static void drawfind(Gui *g, View *v, f64 scrolly, ImVec2 r0, ImVec2 r1)
         print(&b, (i64)s->hits.len);
         print(&b, done ? Str("") : Str("+"));
     }
-    // In a column as wide as its widest, so that the bar never changes
-    // width as the count does
-    f32 x = ImGui::GetCursorPosX();
-    ImGui::AlignTextToFramePadding();
-    ImGui::TextDisabled("%s", cstr0(&a, finish(&b)));
-    ImGui::SameLine(x + countw + sp);
-    b32 close = iconbutton(ICON_CLOSE "##findclose");
-    itemnamed(g, "find close");
-    itemtip("Close the find bar (Esc)");
-    g->findheld = ImGui::IsWindowFocused();
+    findbarend(g, &fb, finish(&b));
+    g->findheld = fb.focused;
 
-    ImGui::EndChild();
-    ImGui::PopStyleVar(2);
-    ImGui::PopStyleColor(2);
-    pw->DC.CursorMaxPos = maxp;  // over the transcript, extending nothing
-
-    if (esc || close) {
+    if (esc || fb.close) {
         gui_find_close(g);
-    } else if (enter || next || prev) {
-        gui_find_next(g, enter ? (ImGui::GetIO().KeyShift ? -1 : 1) : prev ? -1 : 1);
+    } else if (enter || fb.next || fb.prev) {
+        gui_find_next(g, enter ? (ImGui::GetIO().KeyShift ? -1 : 1) : fb.prev ? -1 : 1);
     }
     if (g->findjump) {
         scheddirty(&g->sched);  // the layout, before the child, goes there
@@ -5254,6 +5350,12 @@ static void drawtranscript(Gui *g)
         gui_find_next(g, 1);
     }
     if (g->findopen && ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_G)) {
+        gui_find_next(g, -1);
+    }
+    if (g->findopen && ImGui::Shortcut(ImGuiKey_F3)) {
+        gui_find_next(g, 1);
+    }
+    if (g->findopen && ImGui::Shortcut(ImGuiMod_Shift | ImGuiKey_F3)) {
         gui_find_next(g, -1);
     }
 
@@ -15093,11 +15195,23 @@ static void drawpalette(Gui *g)
     ImGui::EndPopup();
 }
 
+// Whether Files has the focus, its own popups (a tab's menu, the text's)
+// and its children included, and no dialog is up.
+static b32 filesfocused(Gui *g)
+{
+    ImGuiWindow *nav = GImGui->NavWindow;
+    while (g->fileswindow && nav && nav!=g->fileswindow) {
+        nav = nav->ParentWindow;
+    }
+    return !ImGui::GetTopMostPopupModal() && g->fileswindow && nav;
+}
+
 // The menus' shortcuts, wherever the focus is (a global route, which a
 // focused field's own use of a key goes ahead of): a new session, zoom
-// by key or by Ctrl+wheel (Cmd on macOS), find and the session's
-// folding toggles, Settings, the palette, up to a parent, and quitting on Linux, where
-// no system shortcut does (macOS has Cmd+Q, Windows Alt+F4). While the
+// by key or by Ctrl+wheel (Cmd on macOS), find (the Files find while
+// Files has the focus) and the session's folding toggles, Settings, the
+// palette, up to a parent, and quitting on Linux, where no system
+// shortcut does (macOS has Cmd+Q, Windows Alt+F4). While the
 // terminal holds the keyboard, which culls global routes, the ones it
 // leaves the app (termkept) route over it; the rest are its.
 static void menukeys(Gui *g)
@@ -15128,9 +15242,15 @@ static void menukeys(Gui *g)
             ImGui::Shortcut(ctrl|ImGuiKey_Keypad0, keep)) {
         setzoom(g, 1);
     }
-    // Find, and the session's toggles of its tool output and reasoning
-    if (g->sess && ImGui::Shortcut(ctrl|ImGuiKey_F, glob)) {
-        gui_find_open(g);
+    // Find, in the file Files shows while it has the focus, else in the
+    // transcript; and the session's toggles of its tool output and
+    // reasoning
+    if (ImGui::Shortcut(ctrl|ImGuiKey_F, glob)) {
+        if (filesfocused(g)) {
+            filefindopen(g);
+        } else if (g->sess) {
+            gui_find_open(g);
+        }
     }
     if (ImGui::Shortcut(ctrl|ImGuiKey_Comma, glob)) {
         opensettings(g);
@@ -15157,11 +15277,7 @@ static void menukeys(Gui *g)
     b32 closekey = ImGui::Shortcut(ctrl|ImGuiKey_W, wflags) || g->closekey;
     g->closekey = 0;
     if (closekey) {
-        ImGuiWindow *nav = c.NavWindow;  // in Files: its children and popups
-        while (g->fileswindow && nav && nav!=g->fileswindow) {
-            nav = nav->ParentWindow;
-        }
-        if (!ImGui::GetTopMostPopupModal() && g->fileswindow && nav) {
+        if (filesfocused(g)) {
             fileclosefront(g);
         } else {
             #if defined(__APPLE__)
@@ -15806,8 +15922,11 @@ static void drawmenubar(Gui *g)
         ImGui::EndMenu();
     }
 
-    // The transcript's selection, as its own context menu has it
-    if (ImGui::BeginMenu("Edit")) {
+    // The transcript's selection, as its own context menu has it, and
+    // the finds
+    menu = ImGui::BeginMenu("Edit");
+    itemnamed(g, "menu Edit");
+    if (menu) {
         View *v   = g->view;
         b32   any = !selempty(&v->sel);
         if (ImGui::MenuItem("Copy", cmdkey(g, &a, "C"), false, any)) {
@@ -15822,6 +15941,13 @@ static void drawmenubar(Gui *g)
         ImGui::Separator();
         if (ImGui::MenuItem("Find...", cmdkey(g, &a, "F"), false, g->sess!=0)) {
             gui_find_open(g);
+        }
+        char const *fkey = cmdkey(g, &a, "F");
+        Str         ftip = concat(&a, "Find in the file the Files pane shows (",
+                                  Str{(u8 *)fkey, (iz)__builtin_strlen(fkey)});
+        ftip = concat(&a, ftip, " while it has the focus)");
+        if (menutip(g, &a, "Find in file...", filefindwhy(g), ftip)) {
+            filefindopen(g);
         }
         ImGui::EndMenu();
     }
@@ -16357,7 +16483,8 @@ static void dockwindows(Gui *g)
         }
         ImGui::End();
     }
-    g->filesdrawn = 0;
+    g->filesdrawn  = 0;
+    g->ffind.drawn = 0;
     if (show[PANE_FILES]) {
         // Its first showing, or after a layout left it no home: beside
         // Plan, as the layout with it applied the next frame
@@ -16374,6 +16501,10 @@ static void dockwindows(Gui *g)
     }
     if (!g->filesdrawn) {
         fetchtick(g, 0);  // a far read only for the front tab shown
+    }
+    if (!g->ffind.drawn) {
+        g->ffind.active = 0;  // its field is gone with it
+        g->ffind.held   = 0;
     }
     g->inpane = 0;
 }

@@ -901,6 +901,7 @@ struct DocView {
     i32          pressmsg;  // in this message
     Str          section;   // a heading to scroll to once laid out
     LinkFrom     from;      // where its links to files are
+    ViewSearch  *find;      // hits marked, if over v, else null
 };
 
 static DocView *newdocview(Arena *perm, Os *os, ViewCache *c)
@@ -1241,12 +1242,15 @@ struct DocLines {
     i32 jump0;    // lines to scroll to, 1-based and clamped, else 0
     i32 jump1;
     b32 restore;  // go to top, dy and scrollx
+    FileFind *find;   // hits marked, else null
+    FindHit reveal;   // a hit brought into view if out of it, len 0 for none
+    f32 covered;  // the height a bar covers at the view's top
     // In with restore, and out
     i32 top;      // the line at the view's top, 0-based
     f32 dy;       // how far past its top
     f32 scrollx;
     // Out
-    b32 jumped;   // the jump landed
+    b32 jumped;   // the jump landed, or the reveal
     b32 restored; // and the restore
     b32 recorded; // top, dy and scrollx are as drawn
     // Kept
@@ -1266,6 +1270,38 @@ struct FileShown {
     f32    width;   // laid out at
     b32    hbar;    // a horizontal scrollbar
     b32    band;    // the band was drawn
+    b32    carried; // a hit was drawn carried over a chunk's start
+    f32    winw;    // the view's width, without its scrollbar
+};
+
+// The Files pane's find bar (files.cpp), one for the pane, over the
+// file shown: its text searched as it is (FileFind), or a Markdown
+// file as rendered (a ViewSearch of its own).
+enum : i32 {
+    FBAR_FIND,
+};
+
+struct FileFindBar {
+    FileFind   *text;
+    ViewSearch *md;
+    char       *q;          // the field, FIELD_MAX
+    b32         open;
+    i32         mode;       // FBAR_*
+    b32         focus;      // focus its field next frame
+    b32         held;       // the bar had the focus last frame
+    b32         active;     // its field had the keyboard
+    FileBody   *body;       // what the search is of
+    i32         bmode;      // as FMODE_*
+    u32         serial;     // the front tab it was opened for
+    FindHit     from;       // the first hit at or after this is picked
+    b32         pick;       // pick a hit, cur < 0
+    b32         typed;      // and go to it
+    b32         reveal;     // the current hit, brought into view
+    b32         done;       // searched to the end
+    b32         drawn;      // this frame
+    f32         barh;       // the bar's bottom below the text's top
+    u8          shown[48];  // the count as drawn, for the checklist
+    i32         shownlen;
 };
 
 struct Export {
@@ -1985,6 +2021,7 @@ struct Gui {
     FileFetch          ffetch;       // a file on another host, coming
     DocLines           flines;       // the text view's state, as drawn
     FileShown          fshown;       // and where, for the checklist
+    FileFindBar        ffind;        // its find bar
     FileTab           *fshowing;     // the tab drawn last
     u32                fshowingserial; // its serial then
     i32                fshowingmode; // and its mode
@@ -6171,6 +6208,8 @@ static void filesframe(Gui *);
 static void filesfont(Gui *);
 static void fileaskopen(Gui *);
 static void fileclosefront(Gui *);
+static void filefindopen(Gui *);
+static Str  filefindwhy(Gui *);
 static Str  fileaskwhy(Gui *);
 static void fileanswer(Gui *, Str);
 static void onfsread(Gui *, Arena, Json *, b32, Str, i64);
@@ -14004,6 +14043,12 @@ enum : i32 {
                       // with text "fit" fit to its room, else "unfit" at
                       // its own size
     CHK_OUTCLOSED,    // the Output window is closed
+    CHK_FILEFIND,     // the Files find bar is not drawn (dx 0), in find mode
+                      // with its field active (1) or not (2), its count
+                      // ending with text; or Find in file's why is text (4)
+    CHK_FILESPOT,     // the Files text's line dx, column dy is in view, below
+                      // the bar, with text "hit" the current match's start,
+                      // and "carry" a hit also drawn carried into a chunk
     CHK_COUNT,
 };
 
@@ -14324,6 +14369,8 @@ static Str chknames[] = {
     "inline code is a link once its file is found, and only then",
     "the image file is shown at its size, fit or not as said",
     "the Output window is closed",
+    "the Files find bar is as said",
+    "the spot in the file is in view",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -14412,6 +14459,8 @@ enum : i32 {
     W_TERMCOUNT,  // dx terminals are open, in every session
     W_FILEREADY,  // the front file is read and drawn, jumped or restored
     W_FILEFRESH,  // and checked since its last mark, nothing in flight
+    W_FILEFOUND,  // the Files find bar drew over the front file, searched
+                  // it, and brought the match it went to into view
 };
 
 static Str waitnames[] = {
@@ -14438,9 +14487,9 @@ static Str waitnames[] = {
     "the changes", "the folder's probe", "the worktree's branch",
     "the thin remote", "a relayed stream", "the container",
     "the terminal's text", "the terminal's program", "the terminals' count",
-    "the file", "the file checked",
+    "the file", "the file checked", "the file's find",
 };
-static_assert(countof(waitnames) == W_FILEFRESH+1);
+static_assert(countof(waitnames) == W_FILEFOUND+1);
 
 enum : i32 {
     KEY_CTRL  = 1,
@@ -14469,6 +14518,28 @@ struct DriveOp {
     {OP_KEYDOWN, 0, key, KEY_CMD, 50, ""}, \
     {OP_KEYUP, 0, key, KEY_CMD, 50, ""}, \
     {OP_KEYUP, 0, GKEY_CMD, 0, ms, ""}
+// And with Shift too
+#define CMDSHIFTKEY(key, ms) \
+    {OP_KEYDOWN, 0, GKEY_CMD, KEY_CMD, 50, ""}, \
+    {OP_KEYDOWN, 0, GKEY_SHIFT, KEY_CMD|KEY_SHIFT, 50, ""}, \
+    {OP_KEYDOWN, 0, key, KEY_CMD|KEY_SHIFT, 50, ""}, \
+    {OP_KEYUP, 0, key, KEY_CMD|KEY_SHIFT, 50, ""}, \
+    {OP_KEYUP, 0, GKEY_SHIFT, KEY_CMD, 50, ""}, \
+    {OP_KEYUP, 0, GKEY_CMD, 0, ms, ""}
+// Physical Ctrl and a key, pressed and let go
+#define CTRLKEY(key, ms) \
+    {OP_KEYDOWN, 0, GKEY_CTRL, KEY_CTRL, 50, ""}, \
+    {OP_KEYDOWN, 0, key, KEY_CTRL, 50, ""}, \
+    {OP_KEYUP, 0, key, KEY_CTRL, 50, ""}, \
+    {OP_KEYUP, 0, GKEY_CTRL, 0, ms, ""}
+// Physical Ctrl+Shift and a key
+#define CTRLSHIFTKEY(key, ms) \
+    {OP_KEYDOWN, 0, GKEY_CTRL, KEY_CTRL, 50, ""}, \
+    {OP_KEYDOWN, 0, GKEY_SHIFT, KEY_CTRL|KEY_SHIFT, 50, ""}, \
+    {OP_KEYDOWN, 0, key, KEY_CTRL|KEY_SHIFT, 50, ""}, \
+    {OP_KEYUP, 0, key, KEY_CTRL|KEY_SHIFT, 50, ""}, \
+    {OP_KEYUP, 0, GKEY_SHIFT, KEY_CTRL, 50, ""}, \
+    {OP_KEYUP, 0, GKEY_CTRL, 0, ms, ""}
 
 // Files on a session's host, through its engine (fs.read and fs.stat):
 // Open file there, its folder typed by op (OP_TEXTRCWD, or OP_TEXT of
@@ -15338,6 +15409,13 @@ static DriveOp m3ops[] = {
     {OP_CHECK, CHK_FOUNDNEXT, 0, 0, 0, ""},
     {OP_KEYDOWN, 0, GKEY_ENTER, KEY_SHIFT, 50, ""},
     {OP_KEYUP, 0, GKEY_ENTER, KEY_SHIFT, 600, ""},
+    {OP_CHECK, CHK_FOUNDPREV, 0, 0, 0, ""},
+    // and F3 and Shift+F3 too
+    {OP_KEYDOWN, 0, GKEY_F3, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_F3, 0, 600, ""},
+    {OP_CHECK, CHK_FOUNDNEXT, 0, 0, 0, ""},
+    {OP_KEYDOWN, 0, GKEY_F3, KEY_SHIFT, 50, ""},
+    {OP_KEYUP, 0, GKEY_F3, KEY_SHIFT, 600, ""},
     {OP_CHECK, CHK_FOUNDPREV, 0, 0, 0, ""},
     {OP_MOVE, T_EMPTY, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -16254,6 +16332,68 @@ static DriveOp m3ops[] = {
     {OP_MOVE, T_FILETEXT, 0, 0, 100, "257"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
+    // Find in the file (Ctrl/Cmd+F while Files has the focus): whitespace
+    // as one space, across lines and a chunk's end, marked, nothing
+    // scrolled for a match in view; then from the top line down, the
+    // view going to the match
+    CMDKEY(GKEY_F, 300),
+    {OP_CHECK, CHK_FILEFIND, 1, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 300, "line 255  line 257 "},
+    {OP_WAIT, W_FILEFOUND, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEFIND, 1, 0, 0, "1 of 1"},
+    {OP_CHECK, CHK_FILESPOT, 255, 1, 0, "carry"},
+    {OP_SHOT, 0, 0, 0, 300, "files-find"},
+    CMDKEY(GKEY_A, 100),
+    {OP_TEXT, 0, 0, 0, 300, "line 12"},
+    {OP_WAIT, W_FILEFOUND, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEFIND, 1, 0, 0, "12 of 109"},
+    {OP_CHECK, CHK_FILESPOT, 1200, 1, 0, "hit"},
+    // Stepping: Enter and Shift+Enter in the field, its arrows, and
+    // Ctrl/Cmd(+Shift)+G in the bar, F3 and Shift+F3 in Files
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 600, ""},
+    {OP_CHECK, CHK_FILEFIND, 1, 0, 0, "13 of 109"},
+    {OP_CHECK, CHK_FILESPOT, 1201, 1, 0, "hit"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, KEY_SHIFT, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, KEY_SHIFT, 600, ""},
+    {OP_CHECK, CHK_FILEFIND, 1, 0, 0, "12 of 109"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file find previous"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 600, ""},
+    {OP_CHECK, CHK_FILEFIND, 2, 0, 0, "11 of 109"},
+    {OP_CHECK, CHK_FILESPOT, 129, 1, 0, "hit"},
+    CMDKEY(GKEY_G, 600),
+    {OP_CHECK, CHK_FILEFIND, 2, 0, 0, "12 of 109"},
+    CMDSHIFTKEY(GKEY_G, 600),
+    {OP_CHECK, CHK_FILEFIND, 2, 0, 0, "11 of 109"},
+    {OP_KEYDOWN, 0, GKEY_F3, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_F3, 0, 600, ""},
+    {OP_CHECK, CHK_FILEFIND, 2, 0, 0, "12 of 109"},
+    {OP_KEYDOWN, 0, GKEY_F3, KEY_SHIFT, 50, ""},
+    {OP_KEYUP, 0, GKEY_F3, KEY_SHIFT, 600, ""},
+    {OP_CHECK, CHK_FILEFIND, 2, 0, 0, "11 of 109"},
+    // Esc closes it; Edit, Find in file opens it again as it was; and
+    // with no match, Esc from the text closes it
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_CHECK, CHK_FILEFIND, 0, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "menu Edit"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Find in file..."},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 600, ""},
+    {OP_CHECK, CHK_FILEFIND, 1, 0, 0, "11 of 109"},
+    {OP_TEXT, 0, 0, 0, 300, "zzz"},
+    {OP_WAIT, W_FILEFOUND, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEFIND, 1, 0, 0, "No matches"},
+    {OP_MOVE, T_FILETEXT, 0, 0, 100, "129"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_FILEFIND, 2, 0, 0, "No matches"},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_CHECK, CHK_FILEFIND, 0, 0, 0, ""},
     // Past the end: a note, and the last line
     {OP_OPENFILE, 0, 0, 0, 300, "files/lines.txt:5000"},
     {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
@@ -16287,6 +16427,37 @@ static DriveOp m3ops[] = {
     {OP_MOVE, T_NAMED, 0, 0, 100, "file wrap"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 800, ""},
+    // Found in a wrapped line, none below the top: from the start, and
+    // wrapping around; unwrapped, scrolled sideways to the match
+    CMDKEY(GKEY_F, 300),
+    CMDKEY(GKEY_A, 100),
+    {OP_TEXT, 0, 0, 0, 300, "abcdefghi"},
+    {OP_WAIT, W_FILEFOUND, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEFIND, 1, 0, 0, "1 of 40"},
+    {OP_CHECK, CHK_FILESPOT, 100, 6, 0, "hit"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, KEY_SHIFT, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, KEY_SHIFT, 600, ""},
+    {OP_CHECK, CHK_FILEFIND, 1, 0, 0, "40 of 40"},
+    {OP_CHECK, CHK_FILESPOT, 100, 396, 0, "hit"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file wrap"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file find field"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 600, ""},
+    {OP_CHECK, CHK_FILESPOT, 100, 6, 0, "hit"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, KEY_SHIFT, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, KEY_SHIFT, 600, ""},
+    {OP_CHECK, CHK_FILESPOT, 100, 396, 0, "hit"},
+    {OP_SHOT, 0, 0, 0, 300, "files-find-x"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file wrap"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_CHECK, CHK_FILEFIND, 0, 0, 0, ""},
     // Two files of one name, told apart by their folders
     {OP_OPENFILE, 0, 0, 0, 300, "files/a/x.c"},
     {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
@@ -16312,6 +16483,33 @@ static DriveOp m3ops[] = {
     {OP_OPENFILE, 0, 0, 0, 300, "files/notes.md#notes"},
     {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
     {OP_CHECK, CHK_FILEMODE, FMODE_MARKDOWN, 0, 500, ""},
+    // Markdown is searched as it shows, a link's target not, but as text
+    // it is; the bar stays open across the modes
+    CMDKEY(GKEY_F, 300),
+    CMDKEY(GKEY_A, 100),
+    {OP_TEXT, 0, 0, 0, 300, "lines.txt"},
+    {OP_WAIT, W_FILEFOUND, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEFIND, 1, 0, 0, "No matches"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file markdown"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_FILEFOUND, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEFIND, 2, 0, 0, "1 of 1"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file markdown"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_FILEFOUND, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEFIND, 2, 0, 0, "No matches"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file find field"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    CMDKEY(GKEY_A, 100),
+    {OP_TEXT, 0, 0, 0, 300, "the lines"},
+    {OP_WAIT, W_FILEFOUND, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEFIND, 1, 0, 0, "1 of 1"},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_CHECK, CHK_FILEFIND, 0, 0, 0, ""},
     // CRLF and a byte order mark: neither shown nor copied
     {OP_OPENFILE, 0, 0, 0, 300, "files/crlf.txt"},
     {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
@@ -16333,16 +16531,34 @@ static DriveOp m3ops[] = {
     {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
     {OP_CHECK, CHK_FILENOTE, 0, 0, 0, "This is a binary file (14 bytes)."},
     {OP_SHOT, 0, 0, 0, 300, "files-binary"},
+    CMDKEY(GKEY_F, 300),
+    {OP_CHECK, CHK_FILEFIND, 0, 0, 0, ""},
+    {OP_CHECK, CHK_FINDCLOSED, 0, 0, 0, ""},
+    {OP_CHECK, CHK_FILEFIND, 4, 0, 0, "The file shown has no text"},
     {OP_MOVE, T_NAMED, 0, 0, 100, "file astext"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 500, ""},
     {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
     {OP_CHECK, CHK_FILENOTE, 0, 0, 0, ""},
     {OP_CHECK, CHK_FILEMODE, FMODE_TEXT, 0, 0, ""},
-    // Past FILES_LINES, cut
+    CMDKEY(GKEY_F, 300),
+    {OP_CHECK, CHK_FILEFIND, 1, 0, 0, ""},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_CHECK, CHK_FILEFIND, 0, 0, 0, ""},
+    // Past FILES_LINES, cut, and found to its end
     {OP_OPENFILE, 0, 0, 0, 300, "files/huge.txt"},
     {OP_WAIT, W_FILEREADY, 0, 0, 10000, ""},
     {OP_CHECK, CHK_FILENOTE, 0, 0, 0, "Only its first 100000 lines are shown."},
+    CMDKEY(GKEY_F, 300),
+    CMDKEY(GKEY_A, 100),
+    {OP_TEXT, 0, 0, 0, 300, "huge 99999"},
+    {OP_WAIT, W_FILEFOUND, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_FILEFIND, 1, 0, 0, "1 of 1"},
+    {OP_CHECK, CHK_FILESPOT, 99999, 1, 0, "hit"},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_CHECK, CHK_FILEFIND, 0, 0, 0, ""},
     // A ninth file closes the tab opened least recently
     {OP_OPENFILE, 0, 0, 0, 300, "hello.txt"},
     {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
@@ -16398,6 +16614,16 @@ static DriveOp m3ops[] = {
     {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
     {OP_CHECK, CHK_FILETABS, 0, 0, 0,
      "long.txt|a/x.c|b/x.c|notes.md|crlf.txt|blob.bin|huge.txt|*hello.txt"},
+    // So does Ctrl/Cmd+F find in the file, not the transcript
+    {OP_MOVE, T_FILETEXT, 0, 0, 100, "1"},
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    CMDKEY(GKEY_F, 500),
+    {OP_CHECK, CHK_FILEFIND, 1, 0, 0, ""},
+    {OP_CHECK, CHK_FINDCLOSED, 0, 0, 0, ""},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_CHECK, CHK_FILEFIND, 0, 0, 0, ""},
     // A middle click closes the one tab under the pointer: ImGui closes
     // it on the press, and the release, over the tab slid into its place,
     // closes nothing (#51)
@@ -16594,21 +16820,52 @@ static DriveOp m3ops[] = {
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_CHECK, CHK_EDITJUMP, 2, 0, 0, " +1200 '"},
     {OP_CHECK, CHK_EDITJUMP, 2, 0, 0, "/files/lines.txt'"},
+    // and at the current match, found
+    CMDKEY(GKEY_F, 300),
+    CMDKEY(GKEY_A, 100),
+    {OP_TEXT, 0, 0, 0, 300, "line 1205"},
+    {OP_WAIT, W_FILEFOUND, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEFIND, 1, 0, 0, "1 of 1"},
+    {OP_IFEDITOR, 0, 4, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "file editor"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_EDITJUMP, 3, 0, 0, " +1205 '"},
+    // The bar left open over what the edit changes: searched again
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file find field"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    CMDKEY(GKEY_A, 100),
+    {OP_TEXT, 0, 0, 0, 300, "edited"},
+    {OP_WAIT, W_FILEFOUND, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEFIND, 1, 0, 0, "No matches"},
+    {OP_MOVE, T_FILETEXT, 0, 0, 100, "1200"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
     {OP_PROMPT, 0, 0, 0, 1500, "Edit the lines."},
     {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
     {OP_WAIT, W_FILEFRESH, 0, 0, 5000, ""},
     {OP_CHECK, CHK_FILETEXT, 0, 0, 0, "edited 1\n"},
     {OP_CHECK, CHK_FILELINE, 0, 0, 0, "kept"},
+    {OP_WAIT, W_FILEFOUND, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEFIND, 2, 0, 0, "1 of 1"},
     {OP_SHOT, 0, 0, 0, 300, "files-reloaded"},
     // Deleted, it says so; put back, a mark reads it again
     {OP_PROMPT, 0, 0, 0, 1500, "Remove the lines."},
     {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
     {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
     {OP_CHECK, CHK_FILENOTE, 0, 0, 0, "No such file"},
+    {OP_CHECK, CHK_FILEFIND, 0, 0, 0, ""},
     {OP_PROMPT, 0, 0, 0, 1500, "Restore the lines."},
     {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
     {OP_WAIT, W_FILEFRESH, 0, 0, 5000, ""},
     {OP_CHECK, CHK_FILETEXT, 0, 0, 0, "restored 1\n"},
+    {OP_WAIT, W_FILEFOUND, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEFIND, 2, 0, 0, "No matches"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file find close"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_FILEFIND, 0, 0, 0, ""},
     // An image file shows as an image, fit to the pane, or at its own
     // size; a line to it just opens it; one it cannot decode says why
     {OP_OPENFILE, 0, 0, 0, 300, "files/pixels.png"},
@@ -16626,6 +16883,10 @@ static DriveOp m3ops[] = {
     {OP_OPENFILE, 0, 0, 0, 300, "files/pixels.png:5"},
     {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
     {OP_CHECK, CHK_FILEIMAGE, 40, 30, 0, "fit"},
+    CMDKEY(GKEY_F, 300),
+    {OP_CHECK, CHK_FILEFIND, 0, 0, 0, ""},
+    {OP_CHECK, CHK_FINDCLOSED, 0, 0, 0, ""},
+    {OP_CHECK, CHK_FILEFIND, 4, 0, 0, "The file shown has no text"},
     {OP_OPENFILE, 0, 0, 0, 300, "files/corrupt.png"},
     {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
     {OP_CHECK, CHK_FILENOTE, 0, 0, 0, "Not an image it can show: "},
@@ -16650,7 +16911,19 @@ static DriveOp m3ops[] = {
     {OP_CHECK, CHK_FILEPATH, 0, 0, 0, "/files/dropped2.txt"},
     {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "4-4"},
     {OP_CHECK, CHK_ATTACHED, 0, 0, 0, ""},
-    // Quiet with a file shown, past the tooltips and the layout's save
+    // Quiet with a file shown, its find bar open, its field let go, past
+    // the tooltips and the layout's save
+    {OP_MOVE, T_FILETEXT, 0, 0, 100, "1"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    CMDKEY(GKEY_F, 300),
+    {OP_TEXT, 0, 0, 0, 300, "line"},
+    {OP_WAIT, W_FILEFOUND, 0, 0, 5000, ""},
+    // line 4, since the bar covers the first lines
+    {OP_MOVE, T_FILETEXT, 0, 0, 100, "4"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_FILEFIND, 2, 0, 0, ""},
     {OP_MOVE, T_EMPTY, 0, 0, 4500, ""},
     {OP_MARK, 0, 0, 0, 3000, ""},
     {OP_CHECK, CHK_FILEQUIET, 0, 0, 0, ""},
@@ -17944,20 +18217,6 @@ static DriveOp stopops[] = {
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
 
-// Physical Ctrl and a key, pressed and let go
-#define CTRLKEY(key, ms) \
-    {OP_KEYDOWN, 0, GKEY_CTRL, KEY_CTRL, 50, ""}, \
-    {OP_KEYDOWN, 0, key, KEY_CTRL, 50, ""}, \
-    {OP_KEYUP, 0, key, KEY_CTRL, 50, ""}, \
-    {OP_KEYUP, 0, GKEY_CTRL, 0, ms, ""}
-// Physical Ctrl+Shift and a key
-#define CTRLSHIFTKEY(key, ms) \
-    {OP_KEYDOWN, 0, GKEY_CTRL, KEY_CTRL, 50, ""}, \
-    {OP_KEYDOWN, 0, GKEY_SHIFT, KEY_CTRL|KEY_SHIFT, 50, ""}, \
-    {OP_KEYDOWN, 0, key, KEY_CTRL|KEY_SHIFT, 50, ""}, \
-    {OP_KEYUP, 0, key, KEY_CTRL|KEY_SHIFT, 50, ""}, \
-    {OP_KEYUP, 0, GKEY_SHIFT, KEY_CTRL, 50, ""}, \
-    {OP_KEYUP, 0, GKEY_CTRL, 0, ms, ""}
 // The terminal's copy and paste chords: Cmd on macOS, Ctrl on Windows
 // (Ctrl+C copying while there is a selection), else Ctrl+Shift
 #if defined(__APPLE__) || defined(_WIN32)
@@ -21989,6 +22248,67 @@ static b32 drivefilecheck(Gui *g, i32 chk)
         print(&b, g->revealed);
         ok = g->revealed.len && driveendsep(g->revealed, op->text);
         break;
+    case CHK_FILEFIND: {
+        FileFindBar *fb    = &g->ffind;
+        Str          count = {fb->shown, fb->shownlen};
+        i32          dx    = (i32)op->dx;
+        print(&b, "drive: the Files find bar is ");
+        print(&b, !fb->drawn ? Str("not drawn") : fb->active ? Str("active, ")
+                                                             : Str("inactive, "));
+        print(&b, fb->drawn ? count : Str(""));
+        if (dx == 4) {
+            Str why = filefindwhy(g);
+            print(&b, "; Find in file's why: ");
+            print(&b, why);
+            ok = why == op->text;
+        } else if (dx == 0) {
+            ok = !fb->drawn;
+        } else {
+            ok = fb->drawn && fb->open && fb->mode==FBAR_FIND && fb->active==(dx==1) &&
+                 count.len>=op->text.len && cuthead(count, count.len-op->text.len)==op->text;
+        }
+    } break;
+    case CHK_FILESPOT: {
+        // Its row's top below the bar, its foot above the view's, and
+        // unwrapped its x within the text shown
+        i32    line = (i32)op->dx;
+        i32    col  = (i32)op->dy;
+        f32    h    = 0;
+        ImVec2 p    = filespotat(g, line, col, &h);
+        f32    top  = fs->wpos.y + g->ffind.barh;
+        f32    bot  = fs->wpos.y + fs->winh;
+        f32    left = fs->wpos.x + fs->pad + fs->gutter;
+        f32    rgt  = fs->wpos.x + fs->winw;
+        ok = fs->v && p.y>=top && p.y+h<=bot && p.x>=left && p.x<=rgt;
+        print(&b, "drive: line ");
+        print(&b, (i64)line);
+        print(&b, ", column ");
+        print(&b, (i64)col);
+        print(&b, " at ");
+        print(&b, (i64)(p.x - left));
+        print(&b, ", ");
+        print(&b, (i64)(p.y - fs->wpos.y));
+        print(&b, " in a view ");
+        print(&b, (i64)(rgt - left));
+        print(&b, " by ");
+        print(&b, (i64)fs->winh);
+        print(&b, ", the bar ");
+        print(&b, (i64)g->ffind.barh);
+        print(&b, " tall");
+        if (find(op->text, "hit") >= 0) {
+            i32 hl = 0, hc = 0;
+            b32 at = filefindcur(g, ft, &hl, &hc);
+            print(&b, "; the current match at ");
+            print(&b, (i64)hl);
+            putbyte(&b, ':');
+            print(&b, (i64)hc);
+            ok &= at && hl==line && hc==col;
+        }
+        if (find(op->text, "carry") >= 0) {
+            print(&b, fs->carried ? Str("; a hit drawn carried") : Str("; none carried"));
+            ok &= fs->carried;
+        }
+    } break;
     case CHK_FILETOP: {
         // A heading scrolled to may sit a line below the top, past the pad
         i32 top = ft ? ft->top+1 : 0;
@@ -22174,6 +22494,12 @@ static b32 drivewaitdone(Gui *g)
         FileWatch *w  = ft ? &ft->watch : 0;
         return drivefileready(g) && ft->body && !w->stale && !w->force && !w->id &&
                g->ffetch.ft!=ft;
+    }
+    case W_FILEFOUND: {
+        FileTab     *ft = filefront(g);
+        FileFindBar *fb = &g->ffind;
+        return ft && fb->drawn && fb->done && fb->body==ft->body && fb->bmode==ft->mode &&
+               !fb->reveal;  // and the match it went to in view
     }
     case W_VIA:
         return g->sess && v->state==LIVE_STREAMING && v->relaylen>0 && v->deltas>0;
@@ -24177,6 +24503,8 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_REVEALED:
     case CHK_FILELINK:
     case CHK_FILEIMAGE:
+    case CHK_FILEFIND:
+    case CHK_FILESPOT:
         return drivefilecheck(g, chk);
     case CHK_TERMQUIET:
         return g->panes[PANE_TERMINAL] && drivequiet(g, "idle with the terminal shown", 2);
@@ -26394,6 +26722,10 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->findbuf    = alloc<char>(&g->perm, FIELD_MAX);
     g->search     = newsearch(&g->perm, os_reserve(os, 256*mb), os_reserve(os, 256*mb),
                               FIELD_MAX);
+    g->ffind.text = newfilefind(&g->perm, os_reserve(os, FILES_HITMEM), FIELD_MAX, FILES_HITS);
+    g->ffind.md   = newsearch(&g->perm, os_reserve(os, 16*mb), os_reserve(os, mb), FIELD_MAX);
+    g->ffind.md->hitmax = FILES_HITS;  // 3 MiB of FindHit
+    g->ffind.q    = alloc<char>(&g->perm, FIELD_MAX);
     g->drivecodemsg = -1;
     g->remdest    = alloc<char>(&g->perm, FIELD_MAX);
     g->rempath    = alloc<char>(&g->perm, FIELD_MAX);

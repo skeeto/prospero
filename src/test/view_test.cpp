@@ -2262,6 +2262,24 @@ static void test_viewtranscript(Test *t)
         expect(t, "view.findspace", hits("line a line b"), "1:Line A\nline  B;");
         expect(t, "view.findmarkup", hits("**"), "");
         expect(t, "view.findmany", hits("O"), "0:o;0:o;0:o;0:o;0:o;0:o;");
+        expect(t, "find.unfull", istr(&a, s->full), "0");
+
+        // Capped: hitmax kept, then full, done; searched again, it is
+        // not, nor once a message it searched changes
+        s->hitmax = 4;
+        expect(t, "find.capped", hits("o"), "0:o;0:o;0:o;0:o;");
+        expect(t, "find.full", istr(&a, s->full), "1");
+        expect(t, "find.fulldone", istr(&a, searchstep(s, a, 1)), "1");
+        expect(t, "find.capfew", hits("line"), "1:Line;1:line;");
+        expect(t, "find.capfewfull", istr(&a, s->full), "0");
+        hits("o");
+        v->msgs[0].ver++;
+        searchstep(s, a, 0);
+        expect(t, "find.cutunfull", istr(&a, s->full), "0");
+        expect(t, "find.cutkept", istr(&a, s->hits.len), "0");
+        searchstep(s, a, 1<<20);
+        expect(t, "find.refull", istr(&a, s->full), "1");
+        s->hitmax = 0;
     }
 
     // The context gauge: usage, then the engine's own numbers
