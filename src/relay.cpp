@@ -173,6 +173,8 @@ struct RelayServe {
     b32         finished; // done was sent: it goes once its request has
     b32         search;   // a web search, run with this engine's [web]
     WebRun     *web;      // which runs now
+    b32         skill;    // skill/NAME: one of the user's own skills
+    b32         invoked;  // the window vouches: the user's own /NAME
     i64         webby;    // until this deadline (ticks)
 };
 
@@ -1302,6 +1304,50 @@ static void relaysearched(Engine *e, Arena scratch, RelayServe *v, Str status,
     relayfinish(v, "ok", {});
 }
 
+// A relayed fetch of skill/NAME: that skill's package (skillpack), if
+// it is one of the user's own that this computer shares (ownskills),
+// and to a link, if it shares skills with it. A skill that is the
+// user's alone (hidden) goes only when the window vouches that the
+// user's own /NAME asked for it (invoked), and never over a link.
+static void relayskill(Engine *e, Arena scratch, RelayServe *v)
+{
+    Str          name = cuthead(v->path, 6);
+    b32          far  = !!v->far;
+    Slice<Skill> list = far && !farskills(v->far) ? Slice<Skill>{}
+                                                  : ownskills(e, &scratch, far);
+    Skill       *k    = skillbyname(list, name);
+    if (!k) {
+        relayfinish(v, "connect", concat(&scratch, concat(&scratch, "no skill named ", name),
+                                         " is shared here"));
+        return;
+    } else if (k->hidden && !v->invoked) {
+        Str why = concat(&scratch, name, " is the user's alone: only their own /");
+        relayfinish(v, "connect", concat(&scratch, concat(&scratch, why, name), " fetches it"));
+        return;
+    }
+    // Packed in its own reservation: a file's text may grow six times
+    // as JSON before the package is found too large and cut
+    Region *mem = os_reserve(e->os, 64<<20);
+    if (!mem) {
+        relayfinish(v, "connect", "out of memory");
+        return;
+    }
+    Arena a    = newarena(mem);
+    Str   body = skillpack(e->os, &a, k, SKILL_PACK);
+    if (body.len > RELAY_HOLD) {
+        os_release(e->os, mem);
+        relayfinish(v, "connect", concat(&scratch, name, " is too large to send"));
+        return;
+    }
+    v->status  = 200;
+    v->headers = "Content-Type: application/json\r\n";
+    v->head    = 1;
+    copybytes(v->hold, body.data, body.len);
+    v->held    = body.len;
+    os_release(e->os, mem);
+    relayfinish(v, "ok", {});
+}
+
 // The keys of a thin engine's relay record (relaypartline) that its
 // client passes on in relay.call: all but its number (rid), peer, ts
 // and ev. Only these, as the record is the remote's, which must not
@@ -1435,7 +1481,13 @@ static void relayserve(Engine *e, Arena scratch, Json *j, i64 cid, Str origin,
                    v->ep.name==name && !v->ep.relay.len;
         i32 svc  = websearchservice(e);
         v->search = v->path=="search";
-        if (v->search) {
+        v->skill  = startswith(v->path, "skill/");
+        if (v->skill) {
+            v->invoked = !far && jsonflag(jsonget(j, "invoked"), 0);
+            if (v->method != "GET") {
+                relayfinish(v, "connect", "not a skill's fetch");
+            }
+        } else if (v->search) {
             Str why = svc==WEBS_NONE || svc==WEBS_RELAY ? Str("web search is off here")
                                                         : webunready(e, &scratch);
             if (v->method!="POST" || why.len) {
@@ -1471,6 +1523,9 @@ static void relayserve(Engine *e, Arena scratch, Json *j, i64 cid, Str origin,
     }
     if (v->search) {
         relaysearch(e, scratch, v);
+        return;
+    } else if (v->skill) {
+        relayskill(e, scratch, v);
         return;
     }
     Str p = cut(v->path, '?').head;

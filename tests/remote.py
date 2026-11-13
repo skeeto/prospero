@@ -3634,7 +3634,7 @@ class Served:
 
     def call(self, body, path="v1/chat/completions", base=None, keep=1,
              endpoint="fake", model=None, session="s1", deflate=False, parts=1,
-             kind=None, hint=None):
+             kind=None, hint=None, method="POST", extra=None):
         self.next += 1
         cid = self.next
         data = body if base is None else simpledelta(base, body)
@@ -3651,11 +3651,12 @@ class Served:
                    "parts": len(pieces), "data": base64.b64encode(piece).decode()}
             if k == 0:
                 obj.update(session=session, endpoint=endpoint, anthropic=0, path=path,
-                           method="POST", accept="text/event-stream", model=model or "",
+                           method=method, accept="text/event-stream", model=model or "",
                            readms=0, keep=keep, len=len(body), size=size)
                 if kind:
                     obj["kind"] = kind
                 obj.update(hint or {})
+                obj.update(extra or {})
                 if z is not None:
                     obj["zlen"] = len(z)
                 if base is not None:
@@ -3937,6 +3938,89 @@ def relay_search_serve(t):
     t.check(res["status"] == "ok" and res["searches"] == 1 and
             "Widget docs" in res["text"] and "--- begin web content" in res["text"],
             f"result {res}")
+
+
+def skillhome(t):
+    """A home of the scenario's own, whose ~/.claude/skills the engine
+    shares, rather than this machine's."""
+    home = os.path.join(t.root, "home")
+    os.makedirs(os.path.join(home, ".claude", "skills"), exist_ok=True)
+    return home, dict(t.env, HOME=home, XDG_CONFIG_HOME=os.path.join(t.root, "xdg"),
+                      USERPROFILE=home)
+
+
+def writeskill(root, name, desc, files=None, hidden=False):
+    d = os.path.join(root, name)
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "SKILL.md"), "w") as f:
+        f.write(f"---\nname: {name}\ndescription: {desc}\n" +
+                ("disable-model-invocation: true\n" if hidden else "") +
+                f"---\nThe {name} skill. Read ref.txt.\n")
+    for path, data in (files or {}).items():
+        full = os.path.join(d, *path.split("/"))
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "wb") as f:
+            f.write(data if isinstance(data, bytes) else data.encode())
+    return d
+
+
+@scenario
+def relay_skill_serve(t):
+    """An engine offers the user's own skills, by name, and serves one's
+    package for skill/NAME: its files but dot files and links; a skill
+    that is the user's alone only when the window vouches (invoked); the
+    rest of a large one cut; no project's skills, and no other calls."""
+    home, env = skillhome(t)
+    skills = os.path.join(home, ".claude", "skills")
+    d = writeskill(skills, "notes", "Take notes", {
+        "ref.txt": "reference\n", "bin/run.sh": "#!/bin/sh\necho hi\n",
+        ".env": "SECRET=1\n", "img.bin": b"PK\0\x01\xff"})
+    if os.name != "nt":
+        os.symlink("/etc/hosts", os.path.join(d, "hosts"))
+    writeskill(skills, "deploy", "Deploy it", hidden=True)
+    writeskill(skills, "big", "Big", {"blob.bin": os.urandom(3 << 20)})
+    writeskill(os.path.join(t.work, ".claude", "skills"), "proj", "A project's")
+    c = Client(t)
+    c.attach(env=env)
+    c.call("hello")
+
+    r = c.call("offer")
+    sk = {s["name"]: s for s in r["offer"].get("skills", [])}
+    t.check(sorted(sk) == ["big", "deploy", "notes"], f"offered {sorted(sk)}")
+    t.check(sk.get("deploy", {}).get("hidden") == 1 and "hidden" not in sk.get("notes", {}) and
+            sk.get("notes", {}).get("description") == "Take notes", f"skills {sk}")
+    t.check(home not in json.dumps(r["offer"]), "no paths offered")
+
+    sv = Served(t, c)
+    def fetch(name, **kw):
+        a = sv.call(b"", path=f"skill/{name}", endpoint="", keep=0, method=kw.pop("method", "GET"), **kw)
+        return sv.done(a), a
+
+    dn, a = fetch("notes")
+    t.check(dn["err"] == "ok", f"notes: {dn}")
+    pkg = json.loads(sv.text(a))
+    paths = [f["path"] for f in pkg["files"]]
+    t.check(paths == ["SKILL.md", "bin/run.sh", "img.bin", "ref.txt"], f"paths {paths}")
+    files = {f["path"]: f for f in pkg["files"]}
+    t.check(files["ref.txt"].get("text") == "reference\n" and
+            base64.b64decode(files["img.bin"]["data"]) == b"PK\0\x01\xff", f"files {files}")
+    t.check("cut" not in pkg, "whole")
+
+    dn, _ = fetch("deploy")
+    t.check(dn["err"] == "connect" and "alone" in dn["text"], f"hidden: {dn}")
+    dn, a = fetch("deploy", extra={"invoked": 1})
+    t.check(dn["err"] == "ok" and json.loads(sv.text(a))["name"] == "deploy", f"invoked: {dn}")
+
+    dn, a = fetch("big")
+    pkg = json.loads(sv.text(a)) if dn["err"] == "ok" else {}
+    t.check(pkg.get("cut") == 1 and [f["path"] for f in pkg["files"]] == ["SKILL.md"],
+            f"big: {dn} {str(pkg)[:200]}")
+
+    for name in ("proj", "prospero", "nope"):
+        dn, _ = fetch(name)
+        t.check(dn["err"] == "connect" and "shared here" in dn["text"], f"{name}: {dn}")
+    dn, _ = fetch("notes", method="POST")
+    t.check(dn["err"] == "connect", f"post: {dn}")
 
 
 @scenario

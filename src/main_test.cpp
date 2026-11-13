@@ -786,6 +786,7 @@ int main()
     test_memory(&t);
     test_skills(&t);
     test_helpskill(&t);
+    test_skillpack(&t);
     test_engine(&t);
     test_git(&t);
     test_worktree(&t);
