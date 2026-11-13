@@ -216,6 +216,19 @@ static void testbulk(ProcTest *p, Arena scratch)
     say(os, "bulk output done");
 }
 
+static Read launchread(ProcTest *p, Arena *a, Str out)
+{
+    Read rd = {};
+    for (i32 i = 0; i < 100; i++) {
+        rd = os_read(p->os, a, out, 1<<10);
+        if (rd.err == READ_OK) {
+            break;
+        }
+        mailwait(p->mb, 50);
+    }
+    return rd;
+}
+
 // A program launched apart, as a terminal is: it runs in the folder
 // given, with the environment given, and no one waits for it.
 static void testlaunch(ProcTest *p, Arena scratch)
@@ -237,16 +250,83 @@ static void testlaunch(ProcTest *p, Arena scratch)
         say(os, os_lasterr(os, &scratch));
         return;
     }
-    Read rd = {};
-    for (i32 i = 0; i < 100; i++) {
-        rd = os_read(os, &scratch, out, 1<<10);
-        if (rd.err == READ_OK) {
-            break;
-        }
-        mailwait(p->mb, 50);
-    }
+    Read rd = launchread(p, &scratch, out);
     check(t, rd.err==READ_OK && trim(rd.data)=="launched",
           "a launched program runs in its folder");
+}
+
+// An absolute path as a relative one from this process's directory, by
+// going up to the root. The test's real, normalized paths make this safe.
+static Str launchrelative(Os *os, Arena *a, Str path)
+{
+    Str here = os_realpath(os, a, ".");
+    if (!here.len || here[0]!='/' || !path.len || path[0]!='/') {
+        return {};
+    }
+    Buf b(a, 3*here.len + path.len);
+    if (here != "/") {
+        for (iz i = 0; i < here.len; i++) {
+            if (here[i] == '/') print(&b, "../");
+        }
+    }
+    print(&b, cuthead(path, 1));
+    return finish(&b);
+}
+
+// Lookup happens in the launcher's directory, execution in the child's.
+// Both an explicit relative executable and a relative PATH entry must
+// survive that change, with the environment passed through unchanged.
+static void testlaunchrelative(ProcTest *p, Arena scratch)
+{
+    if (HOST_WINDOWS) {
+        return;
+    }
+    Selftest *t  = p->t;
+    Os       *os = p->os;
+    Str bin     = join(&scratch, p->dir, "launch-bin");
+    Str cwd     = join(&scratch, p->dir, "launch-cwd");
+    Str program = join(&scratch, bin, "prospero-relative-viewer");
+    // Make the child's directory deeper than the ascent below: without
+    // an absolute executable path, those same ".." components miss it.
+    Str here = os_realpath(os, &scratch, ".");
+    for (iz i = 0; i < here.len; i++) {
+        if (here[i] == '/') cwd = join(&scratch, cwd, "deep");
+    }
+    if (!check(t, os_mkdirs(os, scratch, bin) && os_mkdirs(os, scratch, cwd),
+               "os_mkdirs for relative launches")) {
+        return;
+    }
+    Str script = "#!/bin/sh\nprintf '%s\\n' \"$PATH\" >\"$1\"\n";
+    if (!check(t, os_writemode(os, scratch, program, script, 0700),
+               "os_writemode for a relative launch")) {
+        return;
+    }
+    Str relprogram = launchrelative(os, &scratch, program);
+    Str relbin     = launchrelative(os, &scratch, bin);
+    if (!check(t, relprogram.len && relbin.len, "relative launch fixture paths")) {
+        return;
+    }
+
+    Str path = concat(&scratch, Str(":"), relbin);  // an empty entry first
+    Str entries[] = {concat(&scratch, Str("PATH="), path)};
+    Slice<Str> env = {entries, 1, 1};
+    Str explicitargv[] = {relprogram, "launch-explicit.txt"};
+    Slice<Str> explicitav = {explicitargv, 2, 2};
+    if (check(t, os_launch(os, scratch, explicitav, cwd, env),
+              "os_launch of an explicit relative executable")) {
+        Read rd = launchread(p, &scratch, join(&scratch, cwd, "launch-explicit.txt"));
+        check(t, rd.err==READ_OK && trim(rd.data)==path,
+              "an explicit relative executable runs after chdir, with PATH intact");
+    }
+
+    Str pathargv[] = {"prospero-relative-viewer", "launch-path.txt"};
+    Slice<Str> pathav = {pathargv, 2, 2};
+    if (check(t, os_launch(os, scratch, pathav, cwd, env),
+              "os_launch through a relative PATH entry")) {
+        Read rd = launchread(p, &scratch, join(&scratch, cwd, "launch-path.txt"));
+        check(t, rd.err==READ_OK && trim(rd.data)==path,
+              "a relative PATH executable runs after chdir, with PATH intact");
+    }
 }
 
 static void testholder(ProcTest *p, Arena scratch)
@@ -1366,6 +1446,7 @@ static void testprocs(Selftest *t, Arena *perm, Arena scratch, Str dir)
     testholder(p, scratch);
     testletgo(p, scratch);
     testlaunch(p, scratch);
+    testlaunchrelative(p, scratch);
     testladder(p, scratch);
     testoverhead(p, scratch);
     testresponsible(p, scratch);

@@ -2038,7 +2038,7 @@ static Proc *os_ptyspawn(Os *os, Spawn *sp, PtySize z, iz ring, Arena scratch)
 // child starts a session, forks it, and exits at once. Between fork and
 // exec only async-signal-safe calls, everything prepared ahead. cmdline
 // and window are Windows' only.
-static b32 os_launch(Os *, Arena scratch, Slice<Str> argv, Str cwd, Slice<Str> env, Str, b32)
+static b32 os_launch(Os *os, Arena scratch, Slice<Str> argv, Str cwd, Slice<Str> env, Str, b32)
 {
     if (!argv.len || hasnul(cwd)) {
         errno = EINVAL;
@@ -2074,6 +2074,15 @@ static b32 os_launch(Os *, Arena scratch, Slice<Str> argv, Str cwd, Slice<Str> e
     char *dir  = cstr(&scratch, cwd);
     if (access(file, X_OK)) {
         return 0;
+    }
+    if (file[0] != '/') {
+        // The grandchild changes directory before exec: resolve the path
+        // validated above while it still names the selected executable.
+        Str real = os_realpath(os, &scratch, prog);
+        if (!real.len) {
+            return 0;
+        }
+        file = cstr(&scratch, real);
     }
 
     pid_t pid = fork();
