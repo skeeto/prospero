@@ -4366,6 +4366,7 @@ static Str drawlines(Gui *g, DocView *d, char const *id, DocLines *dl)
         // first line, or the column's row
         f64 yc = col ? v->msgs[k].top + pad + cr.y : y0;
         want  = y1-y0 <= vish-2*pad ? (y0+y1)/2 - vish/2 : yc - vish/3;
+        want  = want<0 ? 0 : want;  // near the top: the top, not "stay put"
         wantx = 0;
         if (col && !dl->wrap) {
             f32 vw = avail.x - st.ScrollbarSize - pad - gutter;

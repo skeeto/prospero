@@ -16818,6 +16818,12 @@ static DriveOp m3ops[] = {
     {OP_CHECK, CHK_FILENOTE, 0, 0, 0, "The file has only 3000 lines."},
     {OP_CHECK, CHK_FILELINE, 3000, 0, 0, ""},
     {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "3000-3000"},
+    // From the bottom, a line too near the top to center: scrolled to
+    // the top, not left where it was
+    {OP_OPENFILE, 0, 0, 0, 300, "files/lines.txt:2"},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "2-2"},
+    {OP_CHECK, CHK_FILELINE, 2, 0, 0, ""},
     // A long line wraps; unwrapped it takes a row, scrolled sideways,
     // the top line kept
     {OP_OPENFILE, 0, 0, 0, 300, "files/long.txt:150"},
