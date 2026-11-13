@@ -112,6 +112,27 @@ def sc_remote_search(model, n, req):
             fake_provider.tool_results(req)))
 
 
+def sc_remote_skill(model, n, req):
+    """The skill notes, then its ref.txt read from where it was copied,
+    then what both said; a prompt that invokes a skill, just answered."""
+    u = fake_provider.last_user_text(req) or ""
+    k = fake_provider.since_user(req)
+    if u.startswith("<skill"):
+        yield from fake_provider.answer(model, "Invoked.")
+    elif k == 0:
+        yield from fake_provider.tool(model, n, "skill", {"name": "notes", "args": "the args"})
+    elif k == 1:
+        base = ""
+        for line in fake_provider.tool_results(req)[0].split("\n"):
+            if line.startswith("Base directory for this skill: "):
+                base = line.split(": ", 1)[1]
+        yield from fake_provider.tool(model, n, "read", {"path": base + "/ref.txt"})
+    else:
+        yield from fake_provider.answer(model, "Heard: " + " | ".join(
+            fake_provider.tool_results(req)))
+
+
+fake_provider.SCENARIOS["remote_skill"] = sc_remote_skill
 fake_provider.SCENARIOS["remote_slow"] = sc_remote_slow
 fake_provider.SCENARIOS["remote_search"] = sc_remote_search
 fake_provider.SCENARIOS["remote_tool"] = sc_remote_tool
@@ -2125,6 +2146,25 @@ def sc_far_task_b(model, n, req):
     yield from F.answer(model, f"Done ({where}): {F.task_prompt(req)}")
 
 
+def sc_relay_far_skill(model, n, req):
+    """One subagent on y, which uses a skill its parent's computer shares."""
+    if F.step(req) == 0:
+        yield from F.tool(model, n, "task", {"description": "Skill", "prompt": "Use it.",
+                                             "host": "y", "cwd": os.environ["FAR_WORK"],
+                                             "model": F.second(model)})
+    else:
+        yield from F.answer(model, "Parent heard: " + F.tool_results(req)[0])
+
+
+def sc_relay_far_skill_b(model, n, req):
+    if F.step(req) == 0:
+        yield from F.tool(model, n, "skill", {"name": "farnotes"})
+    else:
+        text = F.tool_results(req)[0]
+        last = [x for x in text.split("\n") if x.strip()][-1]
+        yield from F.answer(model, f"Skill: {last}")
+
+
 def sc_far_fallback(model, n, req):
     """No model given: the parent's own, which y has, runs it there."""
     if "# Subagent" in F.system_of(req):
@@ -2172,7 +2212,8 @@ def sc_far_ask_b(model, n, req):
         yield from F.answer(model, "Wrote: " + F.tool_results(req)[0][:80])
 
 
-for _name in ("far_task", "far_task_b", "far_fallback", "far_sleep", "far_sleep_b"):
+for _name in ("far_task", "far_task_b", "far_fallback", "far_sleep", "far_sleep_b",
+              "relay_far_skill", "relay_far_skill_b"):
     fake_provider.SCENARIOS[_name] = globals()["sc_" + _name]
 for _name in ("far_cancel", "far_quit", "far_restart"):
     fake_provider.SCENARIOS[_name] = sc_far_sleep
@@ -3220,14 +3261,150 @@ def thinconfig(t, extra=""):
 
 
 def offer(t, model, machine="testbox", budget=None, name="fake", search=0, listed=(),
-          kind="openai"):
+          kind="openai", skills=()):
     ep = {"name": name, "kind": kind, "first_byte_timeout": "5",
           "idle_timeout": "5", "progress_timeout": "10", "models": list(listed)}
     if budget:
         ep["slow_retry_budget"] = str(budget)
-    return {"machine": machine, "endpoint": name, "model": model, "endpoints": [ep],
-            "search": search,
-            "models": [{"name": model, "settings": {"context": "100000"}}]}
+    o = {"machine": machine, "endpoint": name, "model": model, "endpoints": [ep],
+         "search": search,
+         "models": [{"name": model, "settings": {"context": "100000"}}]}
+    if skills:
+        o["skills"] = list(skills)
+    return o
+
+
+def skillpkg(name, files, cut=False):
+    """A package as relayskill sends it: files [(path, str or bytes)]."""
+    out = []
+    for path, data in files:
+        if isinstance(data, bytes):
+            out.append({"path": path, "data": base64.b64encode(data).decode()})
+        else:
+            out.append({"path": path, "text": data})
+    pkg = {"name": name, "files": out}
+    if cut:
+        pkg["cut"] = 1
+    return json.dumps(pkg)
+
+
+NOTESMD = "---\nname: notes\ndescription: Take notes\n---\nRead ref.txt for the rules.\n"
+
+
+@scenario
+def relay_skill(t):
+    """A thin host lists the skills the computer shares, from it: the
+    skill tool fetches one and copies it under the session, scripts
+    executable, the same version's folder reused; skill.fetch, then a
+    prompt that invokes it, names the copy; a prompt for one never
+    fetched fails; a refused fetch and an unsound package fail, and
+    nothing is written outside."""
+    thinconfig(t)
+    model = t.model("remote_skill")
+    shared = [{"name": "notes", "description": "Take notes"},
+              {"name": "other", "description": "Another"},
+              {"name": "gone", "description": "Refused"},
+              {"name": "bad", "description": "Unsound"},
+              {"name": "deploy", "description": "Deploy", "hidden": 1}]
+    c, rl = relayclient(t, model, skills=shared)
+    files = [("SKILL.md", NOTESMD), ("bin/run.sh", "#!/bin/sh\necho hi\n"),
+             ("ref.txt", "the reference"), ("img.bin", b"PK\0\x01\xff")]
+    rl.skills = {
+        "notes": skillpkg("notes", files),
+        "other": skillpkg("other", [("SKILL.md", "---\nname: other\ndescription: x\n---\nO.\n")]),
+        "bad": skillpkg("bad", [("SKILL.md", "x"), ("../escaped", "x")]),
+        "deploy": skillpkg("deploy", [("SKILL.md", "---\nname: deploy\ndescription: D\n"
+                                                   "disable-model-invocation: true\n---\nShip.\n")]),
+    }
+    try:
+        r = c.call("new", cwd=t.work, prompt="go")
+        sid = r["sid"]
+        end = c.stream.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid,
+                            timeout=30, what="turn.end")
+        t.check(end.get("why") == "done", f"turn.end {end}")
+        te = [r for r in c.all() if r.get("ev") == "tool.end" and r.get("sid") == sid]
+        t.check(len(te) == 2 and te[0]["status"] == "ok", f"tool.end {te[:1]}")
+        text = te[0]["text"] if te else ""
+        base = ""
+        for line in text.split("\n"):
+            if line.startswith("Base directory for this skill: "):
+                base = line.split(": ", 1)[1]
+        t.check(os.sep.join(["sessions", sid, "skills", "notes"]) in base and
+                "copy of one from testbox" in text and "ARGUMENTS: the args" in text,
+                f"the skill's text {text!r}")
+        t.check(len(te) == 2 and te[1]["status"] == "ok" and "the reference" in te[1]["text"],
+                f"ref.txt read {te[1:]}")
+        if base and os.name != "nt":
+            mode = os.stat(os.path.join(base, "bin", "run.sh")).st_mode & 0o777
+            t.check(mode == 0o700, f"run.sh mode {mode:o}")
+            mode = os.stat(os.path.join(base, "ref.txt")).st_mode & 0o777
+            t.check(mode == 0o600, f"ref.txt mode {mode:o}")
+        if base:
+            with open(os.path.join(base, "img.bin"), "rb") as f:
+                t.check(f.read() == b"PK\0\x01\xff", "a binary file")
+        gets = [h for h, b in rl.calls if h["path"] == "skill/notes"]
+        t.check(len(gets) == 1 and gets[0]["method"] == "GET" and gets[0]["endpoint"] == "",
+                f"the fetch relayed {gets}")
+
+        # The list: from the computer, with no path
+        r = c.call("skills", sid=sid)
+        sk = {k["name"]: k for k in r.get("skills", [])}
+        t.check(sk.get("notes", {}).get("from") == "testbox" and not sk["notes"].get("path")
+                and sk.get("deploy", {}).get("hidden") is True, f"skills {sk}")
+
+        # Again: the same version's folder
+        c.call("prompt", sid=sid, text="go")
+        c.stream.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid
+                      and r is not end, timeout=30, what="the second turn.end")
+        top = os.path.dirname(base) if base else t.root
+        t.check(sorted(os.listdir(top)) == [os.path.basename(base)],
+                f"one version: {os.listdir(top)}")
+
+        # skill.fetch, then the prompt that invokes it; one of the user's
+        # alone too
+        r = c.call("prompt", sid=sid, skill="other", text="now")
+        t.check(r.get("ok") == 0 and "fetch the skill first" in r.get("err", ""),
+                f"never fetched: {r}")
+        for name in ("other", "deploy"):
+            r = c.call("skill.fetch", sid=sid, name=name, timeout=30)
+            t.check(r.get("ok") == 1, f"skill.fetch {name}: {r}")
+            r = c.call("prompt", sid=sid, skill=name, text="now")
+            t.check(r.get("ok") == 1, f"prompt {name}: {r}")
+            u = c.stream.wait(lambda r: r.get("ev") == "user" and r.get("sid") == sid and
+                              f'<skill name="{name}"' in r.get("text", ""), timeout=30,
+                              what=f"the user record of {name}")
+            want = os.sep.join(["sessions", sid, "skills", name])
+            t.check(want in u["text"] and "copy of one from testbox" in u["text"],
+                    f"names the copy: {u['text'][:200]!r}")
+            c.stream.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid
+                          and r.get("ts", 0) >= u.get("ts", 0), timeout=30, what="turn.end")
+        r = c.call("skill.fetch", sid=sid, name="nosuch")
+        t.check(r.get("ok") == 0 and "no such skill" in r.get("err", ""), f"no such: {r}")
+
+        # A late reply, after one to a command sent later, through the host
+        rl.skilldelay = 1
+        c.nextcmd += 1
+        late = c.nextcmd
+        c.stream.command({"cmd": "skill.fetch", "id": late, "sid": sid, "name": "notes"})
+        r = c.call("skills", sid=sid)
+        t.check(r.get("ok") == 1, f"skills meanwhile: {r}")
+        r = c.stream.wait(lambda r: r.get("ev") == "reply" and r.get("id") == late, 30,
+                          "the late reply")
+        t.check(r.get("ok") == 1, f"late skill.fetch: {r}")
+        rl.skilldelay = 0
+
+        # Refused, and unsound: failed, nothing outside
+        r = c.call("skill.fetch", sid=sid, name="gone", timeout=30)
+        t.check(r.get("ok") == 0 and "shared here" in r.get("err", ""), f"refused: {r}")
+        r = c.call("skill.fetch", sid=sid, name="bad", timeout=30)
+        t.check(r.get("ok") == 0 and "unsound" in r.get("err", ""), f"unsound: {r}")
+        found = [os.path.join(d, f) for d, _, fs in os.walk(t.root) for f in fs
+                 if f == "escaped"]
+        t.check(not found, f"written outside: {found}")
+        t.check(not os.path.exists(os.path.join(os.path.dirname(top), "bad")),
+                "no copy of the unsound one")
+    finally:
+        rl.stop = True
 
 
 class Relayer:
@@ -3245,6 +3422,8 @@ class Relayer:
         self.stop = False
         self.mute = False     # takes calls, answers none
         self.found = "FOUND"  # a search's text, then its query
+        self.skills = {}      # name: a package's JSON, as relayskill sends it
+        self.skilldelay = 0   # seconds before a package is sent
         threading.Thread(target=self.run, daemon=True).start()
 
     def send(self, obj):
@@ -3291,6 +3470,17 @@ class Relayer:
         with self.lock:
             self.calls.append((head, body))
         if self.mute:
+            return
+        if head["path"].startswith("skill/"):
+            pkg = self.skills.get(head["path"][6:])
+            if pkg is None or head["method"] != "GET":
+                self.send({"rid": rid, "done": {"err": "connect",
+                                                "text": "no skill named that is shared here"}})
+                return
+            time.sleep(self.skilldelay)
+            self.send({"rid": rid, "head": {"status": 200, "headers": ""}})
+            self.send({"rid": rid, "body": base64.b64encode(pkg.encode()).decode()})
+            self.send({"rid": rid, "done": {"err": "ok", "text": ""}})
             return
         if head["path"] == "search":
             text = json.dumps({"status": "ok", "searches": 1,
@@ -4140,6 +4330,26 @@ def relay_far(t):
         c.stream.wait(lambda x: x.get("ev") == "live" and x.get("sid") == r["sid"] and
                       x.get("state") == "relay", what="not the link's: paused")
         c.call("cancel", sid=r["sid"])
+    finally:
+        f.quit()
+
+
+@scenario
+def relay_far_skill(t):
+    """A subagent on a thin host uses a skill of its parent computer's
+    user, which the link offers and serves."""
+    thinconfig(t)
+    home, env = skillhome(t)
+    writeskill(os.path.join(home, ".claude", "skills"), "farnotes", "Far notes")
+    f = Far(t, "relay_far_skill",
+            xenv={k: env[k] for k in ("HOME", "XDG_CONFIG_HOME", "USERPROFILE")})
+    try:
+        sid = f.parent()
+        end = f.ends(sid)
+        t.check(end.get("why") == "done", f"turn end {end}")
+        te = [r for r in f.x.records if r.get("ev") == "tool.end" and r.get("sid") == sid]
+        text = report(te[0].get("text", "")) if te else ""
+        t.check("Skill: This skill is a copy of one from " in text, f"report {text!r}")
     finally:
         f.quit()
 

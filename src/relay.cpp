@@ -694,6 +694,44 @@ static i64 relaysearcher(Engine *e, Session *s)
     return best ? best->peer : 0;
 }
 
+// The computer whose shared skills session s lists: of the offers in
+// its scope that are not gone, one connected now before one away, then
+// the one its model calls went to last, then the newest. Null if none.
+static RelayPeer *skillpeer(Engine *e, Session *s)
+{
+    RelayPeer *best = 0;
+    i32        rank = 0;
+    for (RelayPeer *p = e->relay->peers; p; p = p->next) {
+        if (p->gone || (p->own.len && !(p->own==s->rrelay))) {
+            continue;
+        }
+        i32 k = (!p->away)*2 + (p->peer==s->relaypeer);
+        if (!best || k>rank || (k==rank && p->seq>best->seq)) {
+            best = p;
+            rank = k;
+        }
+    }
+    return best;
+}
+
+// The skills session s lists from the computer that shares them with it
+// (skillpeer), each with its number and name, in a.
+static Slice<Skill> relayskills(Engine *e, Session *s, Arena *a)
+{
+    RelayPeer   *p = skillpeer(e, s);
+    Slice<Skill> r = {};
+    for (iz i = 0; p && i < p->skills.len; i++) {
+        Skill k = {};
+        k.name   = clone(a, p->skills[i].name);
+        k.desc   = clone(a, p->skills[i].desc);
+        k.hidden = p->skills[i].hidden;
+        k.peer   = p->peer;
+        k.from   = clone(a, p->machine);
+        r = push(a, r, k);
+    }
+    return r;
+}
+
 // Choose the computer for the session's next request at ep: the one it
 // used last, if it still may, else the newest offer that may and lists
 // the model, else the newest that may. Returns 0 if none may.
@@ -743,16 +781,18 @@ static void relayfailpeer(Engine *e, RelayPeer *p, Str why)
 }
 
 // Start relaying a request for session s (or none), to the computer its
-// gate chose, or with no ep, a web search, to one that searches. Never
-// fails here: a failure ends it at the next pass.
+// gate chose, or with no ep, at relay://PATH: a web search (search), to
+// one that searches, or a skill's fetch (skill/NAME), to the one that
+// listed it (to). Never fails here: a failure ends it at the next pass.
 static RelayCall *relaystart(Engine *e, Endpoint *ep, HttpReq *req,
-                             Session *s, b32 keep, Arena scratch)
+                             Session *s, b32 keep, Arena scratch, i64 to)
 {
     Relay *r    = e->relay;
-    Str    pre  = ep ? concat(&scratch, ep->url, "/") : Str{};
-    Str    path = !ep ? Str("search") :
-                  startswith(req->url, pre) ? cuthead(req->url, pre.len) : Str{};
-    i64    peer = !ep ? relaysearcher(e, s) : s ? s->relaypeer : 0;
+    Str    pre  = ep ? concat(&scratch, ep->url, "/") : Str("relay://");
+    Str    path = startswith(req->url, pre) ? cuthead(req->url, pre.len) : Str{};
+    b32    skill = !ep && startswith(path, "skill/");
+    path = ep || skill || path=="search" ? path : Str{};
+    i64    peer = skill ? to : !ep ? relaysearcher(e, s) : s ? s->relaypeer : 0;
     Str    sid  = s ? s->sid : Str{};
     Str    body = req->body;
     if (!peer && ep) {
@@ -827,8 +867,11 @@ static RelayCall *relaystart(Engine *e, Endpoint *ep, HttpReq *req,
 
     RelayPeer *p = relaypeerbynum(e, peer);
     if (!p || p->away || p->gone || !path.len || body.len>relaybodymax()) {
+        Str whose = p ? concat(&scratch, p->machine, ", whose skill it is, is not connected now")
+                      : Str("the computer whose skill it is is not connected now");
         relayend(c, HTTP_ELOST, !path.len ? Str("not a relayed URL") :
                  body.len>relaybodymax() ? Str("the request is too large to relay") :
+                 skill ? whose :
                  !ep ? Str("no connected computer runs web searches now") :
                  Str("no connected computer relays it"));
     }

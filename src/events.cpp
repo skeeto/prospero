@@ -216,6 +216,7 @@ enum : i32 {
     CMD_FSSTAT,      // the types, sizes and times of paths there
     CMD_PAUSE,       // hold the session's model requests, its tools running on
     CMD_CONTINUE,    // resume them, or a turn without a message, as if not stopped
+    CMD_SKILLFETCH,  // a session's copy of a relayed skill, made current, late
     CMD_COUNT,
 };
 
@@ -232,6 +233,7 @@ static Str cmdnames[] = {
     "uncut", "approve", "endpoint.auth", "endpoint.logout", "term.open",
     "term.input", "term.resize", "term.ack", "term.close", "fs.read", "fs.stat",
     "pause", "continue",
+    "skill.fetch",
 };
 static_assert(countof(cmdnames) == CMD_COUNT);
 
@@ -389,6 +391,10 @@ static Str capnames[] = {
                        // or crash ends why "paused"; continue resumes, or
                        // when idle begins a turn via "continue" with no
                        // message, which a prompt also ends the pause of
+    "skill.fetch",     // skill.fetch {sid, name}: a thin engine's copy of a
+                       // skill that the computer it relays to shares, made
+                       // current, replied to late, before a prompt {skill}
+                       // that invokes it; skills' from, that computer
 };
 
 static Str evname(i32 ev)

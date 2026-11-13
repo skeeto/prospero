@@ -519,6 +519,36 @@ struct WebRun {
     Endpoint    ep;
 };
 
+// A fetch of a skill that the computer a thin engine relays to shares
+// (relay://skill/NAME), for a session's skill tool or for the frontend
+// (skill.fetch), before a prompt invokes it: see "Skills relayed".
+struct SkillFetch {
+    SkillFetch *next;
+    Region     *mem;
+    Arena       arena;
+    struct Session *s;
+    Str         name;
+    Str         from;     // the computer's name
+    i64         peer;
+    EHttp      *http;
+    u64         hid;      // its records'
+    i32         status;
+    Buf         body;
+    b32         over;     // the body passed SKILL_FETCHMAX: cancelled
+    b32         retried;  // once, after the computer's connection broke
+    i64         by;       // its deadline, in ticks
+    i64         cmd;      // a skill.fetch's id, else 0, the skill tool's
+    Str         args;     // the tool's arguments
+};
+
+// The copy of a relayed skill that a session's last fetch of it made.
+struct SkillCopy {
+    Str name;
+    Str dir;
+    Str from;
+    b32 cut;  // SKILL.md alone: the rest was too large
+};
+
 // A page web_fetch read, kept for reading on (offset) without asking or
 // fetching again.
 struct WebSpill {
@@ -772,6 +802,8 @@ struct Session {
                                  // (a PDF's), each a file under out/
     DeskRun      desk;       // the desktop helper
     WebRun      *web;        // the web call running, if one is
+    SkillFetch  *skillcall;  // the skill tool's fetch, if one runs
+    Slice<SkillCopy> skillcopies;  // in perm: each relayed skill's last copy
     Proc        *proc;
     u64          procid;
     ShellRun     sh;
@@ -1022,6 +1054,7 @@ struct Engine {
     u64         farserial;
     EHttp      *freehttp; // handles to reuse (ehttp)
     Relay      *relay;    // offers, relayed calls, and those served (relay.cpp)
+    SkillFetch *skillfetches;  // relayed skills being fetched
     Terms      *terms;    // terminals' shells (ptyhost.cpp)
     b32         gui;      // the GUI's own engine, in its process
     Slice<Str>  distros;  // the WSL distros installed, as last listed
@@ -1732,6 +1765,9 @@ static void putskills(JsonOut *w, Slice<Skill> list, b32 all)
             putstrkey(w, "path", list[i].path);
             putkey(w, "hidden");
             putbool(w, list[i].hidden);
+            if (list[i].from.len) {
+                putstrkey(w, "from", list[i].from);
+            }
             if (list[i].builtin) {
                 putkey(w, "builtin");
                 putbool(w, 1);
@@ -2143,7 +2179,9 @@ static b32 admit(Session *s, Arena scratch)
 // Model calls, made here or relayed (relay.cpp)
 
 static RelayCall *relaystart(Engine *, Endpoint *, HttpReq *, Session *,
-                             b32 keep, Arena scratch);
+                             b32 keep, Arena scratch, i64 to);
+struct RelayPeer;
+static Slice<Skill> relayskills(Engine *, Session *, Arena *);
 static void relaycancel(Engine *, RelayCall *);
 static void relayfree(Engine *, RelayCall *);
 static Relay *newrelay(Os *, Arena *);
@@ -2170,12 +2208,13 @@ static Terms *newterms(Arena *);
 
 // Start a request to an endpoint, its records to req->mbox with its id,
 // for a session (s) or not; with no endpoint, a plain request, or at
-// relay://search, a web search that a connected computer runs. A relayed
+// relay://search, a web search that a connected computer runs, or at
+// relay://skill/NAME, a skill's fetch from that computer (to). A relayed
 // one never fails here: a failure arrives as its HTTP_DONE, after the
 // caller's own next steps. A body that keep marks is the base of the
 // next one's delta. Null on failure, as os_lasterr explains.
 static EHttp *ehttp(Engine *e, Endpoint *ep, HttpReq *req, Session *s,
-                    b32 keep, Arena scratch)
+                    b32 keep, Arena scratch, i64 to = 0)
 {
     EHttp *h = e->freehttp;
     if (h) {
@@ -2185,9 +2224,9 @@ static EHttp *ehttp(Engine *e, Endpoint *ep, HttpReq *req, Session *s,
     }
     *h = {};
     if (ep && ep->relay.len) {
-        h->relay = relaystart(e, ep, req, s, keep, scratch);
+        h->relay = relaystart(e, ep, req, s, keep, scratch, 0);
     } else if (!ep && startswith(req->url, "relay://")) {
-        h->relay = relaystart(e, 0, req, s, 0, scratch);  // a search
+        h->relay = relaystart(e, 0, req, s, 0, scratch, to);  // a search or skill
     } else {
         h->os = os_http(e->os, req, scratch);
     }
@@ -9642,6 +9681,16 @@ static Skills sessskills(Session *s, Arena *a)
         r.list = push(a, r.list, helpskill(a));
         sort(r.list.data, r.list.len, skillless, *a);
     }
+    if (s->e->cfg->thin && !s->projinstr) {
+        // Below its own, those the computer it relays to shares
+        Slice<Skill> far = relayskills(s->e, s, a);
+        for (iz i = 0; i<far.len && r.list.len<SKILL_MAX; i++) {
+            if (!skillbyname(r.list, far[i].name)) {
+                r.list = push(a, r.list, far[i]);
+            }
+        }
+        sort(r.list.data, r.list.len, skillless, *a);
+    }
     r.list = skillfilter(s->e->cfg, a, r.list);
     return r;
 }
@@ -9919,9 +9968,14 @@ static void skillgrant(Session *s, Arena scratch, Str dir)
     }
 }
 
+static SkillFetch *skillfetchstart(Session *, Arena, Skill *, i64 cmd, Str args, Str *why);
+static SkillCopy  *skillcopyof(Session *, Str name);
+static Str         skillcopynote(Arena *, SkillCopy *);
+static void        reply(Engine *, Arena, i64 id, b32 ok, Str err, Str sid);
+
 // The skill tool: a skill's instructions, by name, never one of the
-// user's alone.
-static void toolskill(Session *s, Arena scratch, Args *args)
+// user's alone. A relayed skill is fetched first: 0 while it is.
+static b32 toolskill(Session *s, Arena scratch, Args *args)
 {
     Skills sk = sessskills(s, &scratch);
     Skill *k  = skillbyname(sk.list, args->name);
@@ -9941,22 +9995,34 @@ static void toolskill(Session *s, Arena scratch, Args *args)
         Str text = finish(&b);
         s->callfail = "skill";
         toolend(s, scratch, "error", text, 0, 0, {}, 0);
-        return;
+        return 1;
     } else if (k->builtin) {
         Str text = builtintext(s->e, &scratch, args->args);
         toolend(s, scratch, "ok", text, 0, 0, {}, 0);
-        return;
+        return 1;
+    } else if (k->peer) {
+        Str why = {};
+        s->skillcall = skillfetchstart(s, scratch, k, 0, args->args, &why);
+        if (!s->skillcall) {
+            Str text = concat(&scratch, concat(&scratch, "Not loaded: ", why), Str("."));
+            s->callfail = "skill";
+            toolend(s, scratch, "error", text, 0, 0, {}, 0);
+            return 1;
+        }
+        setstate(s, S_TOOL);
+        return 0;
     }
     SkillMeta m = skillload(s->e->os, &scratch, k);
     if (m.err.data) {
         Str text = concat(&scratch, "The skill cannot be used: ", m.err);
         s->callfail = "skill";
         toolend(s, scratch, "error", text, 0, 0, {}, 0);
-        return;
+        return 1;
     }
     skillgrant(s, scratch, k->dir);
     Str text = skilltext(&scratch, k, m.body, args->args);
     toolend(s, scratch, "ok", text, 0, 0, {}, 0);
+    return 1;
 }
 
 // The text of a prompt invoking a skill (prompt {skill}): its
@@ -9979,14 +10045,375 @@ static SkillUse skillinvoke(Session *s, Arena *a, Str name, Str args)
         r.text = skillprompt(a, k, builtinbody(s->e, a), args);
         return r;
     }
+    SkillCopy *c = k->peer ? skillcopyof(s, k->name) : 0;
+    if (k->peer && !c) {
+        r.err = concat(a, concat(a, "fetch the skill first: ", k->name),
+                       " is a copy from another computer (skill.fetch)");
+        return r;
+    } else if (c) {
+        k->dir  = c->dir;
+        k->path = join(a, c->dir, "SKILL.md");
+    }
     SkillMeta m = skillload(s->e->os, a, k);
     if (m.err.data) {
         r.err = concat(a, "the skill cannot be used: ", m.err);
         return r;
     }
     skillgrant(s, *a, k->dir);
-    r.text = skillprompt(a, k, m.body, args);
+    Str body = c ? concat(a, concat(a, trim(m.body), "\n\n"), skillcopynote(a, c)) : m.body;
+    r.text = skillprompt(a, k, body, args);
     return r;
+}
+
+// Skills relayed (relay.cpp)
+//
+// On a thin engine a session lists, below its own, the skills that the
+// computer it relays to shares (relayskills). Each use fetches one's
+// package (relay://skill/NAME, relayskill there) and copies it into the
+// session's directory, skills/NAME/HASH16 (skillhash), one folder per
+// version, never changed once made, since a script may still run from
+// it; the two newest are kept. The skill tool waits for its fetch. A
+// prompt invoking one (/NAME) goes after the frontend's skill.fetch, and
+// uses the copy it made, so that the reply to the prompt is never late.
+
+enum {
+    SKILL_FETCHMAX = SKILL_PACK + (1<<20),  // a package's body, at most
+    SKILL_FETCHMEM = 32 << 20,              // a fetch's reservation
+};
+
+static SkillCopy *skillcopyof(Session *s, Str name)
+{
+    for (iz i = 0; i < s->skillcopies.len; i++) {
+        if (s->skillcopies[i].name == name) {
+            return &s->skillcopies[i];
+        }
+    }
+    return 0;
+}
+
+// Send the fetch's request: 1 if it went.
+static b32 skillfetchsend(Engine *e, SkillFetch *f, Arena scratch)
+{
+    HttpReq r = {};
+    r.method    = "GET";
+    r.url       = concat(&scratch, "relay://skill/", f->name);
+    r.headers   = "Accept: application/json\r\n";
+    r.connectms = 15000;
+    r.maxbytes  = SKILL_FETCHMAX;
+    r.mbox      = e->in;
+    r.id        = f->hid = ++e->nextid;
+    f->status   = 0;
+    f->over     = 0;
+    f->body     = Buf(&f->arena, 1<<14);
+    f->http     = ehttp(e, 0, &r, f->s, 0, scratch, f->peer);
+    return !!f->http;
+}
+
+// Start fetching skill k for session s, for a skill.fetch (cmd) or the
+// skill tool (args). Null if it could not start, with why.
+static SkillFetch *skillfetchstart(Session *s, Arena scratch, Skill *k, i64 cmd,
+                                   Str args, Str *why)
+{
+    Engine *e   = s->e;
+    Region *mem = os_reserve(e->os, SKILL_FETCHMEM);
+    if (!mem) {
+        *why = "out of memory";
+        return 0;
+    }
+    Arena       a = newarena(mem);
+    SkillFetch *f = alloc<SkillFetch>(&a);
+    f->mem   = mem;
+    f->s     = s;
+    f->name  = clone(&a, k->name);
+    f->from  = clone(&a, k->from);
+    f->peer  = k->peer;
+    f->cmd   = cmd;
+    f->args  = clone(&a, args);
+    f->by    = os_ticks(e->os) + 2*e->minute;
+    f->arena = a;
+    if (!skillfetchsend(e, f, scratch)) {
+        *why = os_lasterr(e->os, &scratch);
+        *why = why->len ? *why : Str("the fetch could not be made");
+        os_release(e->os, mem);
+        return 0;
+    }
+    f->next = e->skillfetches;
+    e->skillfetches = f;
+    return f;
+}
+
+static void skillfetchfree(Engine *e, SkillFetch *f)
+{
+    for (SkillFetch **p = &e->skillfetches; *p; p = &(*p)->next) {
+        if (*p == f) {
+            *p = f->next;
+            break;
+        }
+    }
+    if (f->http) {
+        ehttpcancel(e, f->http);
+        ehttpfree(e, f->http);
+    }
+    if (f->s && f->s->skillcall==f) {
+        f->s->skillcall = 0;
+    }
+    os_release(e->os, f->mem);
+}
+
+// All but the two newest copies of a skill, removed, best-effort: never
+// the one just made (keep), and never one being made (a dot-name).
+static void skillprune(Os *os, Arena scratch, Str top, Str keep)
+{
+    Dirent *newest = 0;
+    for (Dirent *d = os_list(os, &scratch, top); d; d = d->next) {
+        b32 other = d->isdir && d->name.len && d->name[0]!='.' && !(d->name==keep);
+        if (other && (!newest || d->mtime>newest->mtime)) {
+            newest = d;
+        }
+    }
+    for (Dirent *d = os_list(os, &scratch, top); d; d = d->next) {
+        b32 other = d->isdir && d->name.len && d->name[0]!='.' && !(d->name==keep);
+        if (other && !(newest && d->name==newest->name)) {
+            Str path = join(&scratch, top, d->name);
+            os_removetree(os, scratch, path);
+        }
+    }
+}
+
+// Copy a package into the session's directory, its folder for this
+// version made whole under a temporary name and then renamed, or kept if
+// it is there. Its folder, else null, with why.
+static Str skillcopy(Session *s, Arena *a, Str name, SkillPack *p, Str *why)
+{
+    Os  *os   = s->e->os;
+    Str  top  = join(a, join(a, s->dir, "skills"), name);
+    Str  hash = skillhash(a, p->files);
+    Str  dir  = join(a, top, hash);
+    Arena t   = *a;
+    Str   md  = join(&t, dir, "SKILL.md");
+    if (os_stat(os, t, md).type == STAT_FILE) {
+        return dir;
+    }
+    Buf b(&t, 64);
+    print(&b, ".tmp-");
+    printhex(&b, os_random(os), 16);
+    Str tmp = join(&t, top, finish(&b));
+    b32 ok  = os_mkdirs(os, t, tmp);
+    for (iz i = 0; ok && i < p->files.len; i++) {
+        Str data = p->files[i].data;
+        Str path = join(&t, tmp, p->files[i].path);
+        b32 exec = startswith(data, "#!") || startswith(data, "\x7f" "ELF");
+        ok = os_mkdirs(os, t, parentdir(path)) &&
+             os_writemode(os, t, path, data, exec ? 0700 : 0600);
+    }
+    ok = ok && os_rename(os, t, tmp, dir);
+    if (!ok) {
+        os_removetree(os, t, tmp);
+        *why = "its copy could not be written here";
+        return {};
+    }
+    skillprune(os, t, top, hash);
+    return dir;
+}
+
+// What the agent is told of a copy, after the skill's instructions.
+static Str skillcopynote(Arena *a, SkillCopy *c)
+{
+    Str r = concat(a, concat(a, "This skill is a copy of one from ", c->from), Str("."));
+    if (c->cut) {
+        r = concat(a, r, " Only its SKILL.md was copied: its other files were too large.");
+    }
+    return r;
+}
+
+// The fetch ended, with err and text as its HTTP_DONE says: the copy
+// made, then the tool's result or the command's reply. Frees it.
+static void skillfetchend(Engine *e, SkillFetch *f, Arena scratch, i32 err, Str text)
+{
+    Session *s   = f->s;
+    Str      why = {};
+    Str      dir = {};
+    b32      cut = 0;
+    if (err != HTTP_OK) {
+        why = text.len ? text : Str("the computer did not send it");
+    } else if (f->over) {
+        why = "it is too large";
+    } else if (f->status != 200) {
+        why = "the computer did not send it";
+    } else {
+        JsonDoc   d = jsonparse(&scratch, finish(&f->body));
+        SkillPack p = {};
+        if (!d.ok || !(jsonstr(jsonget(d.root, "name"))==f->name)) {
+            why = "the computer sent something else";
+        } else if ((p = skillunpack(&scratch, d.root, HOST_WINDOWS)).err.data) {
+            why = concat(&scratch, "the computer sent an unsound copy: ", p.err);
+        } else {
+            dir = skillcopy(s, &scratch, f->name, &p, &why);
+            cut = p.cut;
+        }
+    }
+    if (dir.len) {
+        SkillCopy *c = skillcopyof(s, f->name);
+        if (!c) {
+            SkillCopy n = {};
+            n.name = clone(&s->perm, f->name);
+            s->skillcopies = push(&s->perm, s->skillcopies, n);
+            c = &s->skillcopies[s->skillcopies.len-1];
+        }
+        c->dir  = clone(&s->perm, dir);
+        c->from = clone(&s->perm, f->from);
+        c->cut  = cut;
+    }
+    why = why.len ? concat(&scratch, concat(&scratch, concat(&scratch, "fetching ", f->name),
+                                            concat(&scratch, " from ", f->from)),
+                           concat(&scratch, " failed: ", why)) : Str{};
+
+    if (f->cmd) {
+        i64 id = f->cmd;
+        skillfetchfree(e, f);
+        reply(e, scratch, id, !why.len, why, s->sid);
+        return;
+    }
+    Str args = clone(&scratch, f->args);
+    Str name = clone(&scratch, f->name);
+    skillfetchfree(e, f);
+    setstate(s, S_IDLE);
+    if (why.len) {
+        Str t = concat(&scratch, concat(&scratch, "Not loaded: ", why), Str("."));
+        s->callfail = "skill";
+        toolend(s, scratch, "error", t, 0, 0, {}, 0);
+        nexttool(s, scratch);
+        return;
+    }
+    SkillCopy *c = skillcopyof(s, name);
+    Skill      k = {};
+    k.name = c->name;
+    k.dir  = c->dir;
+    k.path = join(&scratch, c->dir, "SKILL.md");
+    SkillMeta m = skillload(e->os, &scratch, &k);
+    if (m.err.data) {
+        Str t = concat(&scratch, "The skill cannot be used: ", m.err);
+        s->callfail = "skill";
+        toolend(s, scratch, "error", t, 0, 0, {}, 0);
+    } else {
+        Str t = skilltext(&scratch, &k, m.body, args);
+        t = concat(&scratch, concat(&scratch, t, "\n\n"), skillcopynote(&scratch, c));
+        toolend(s, scratch, "ok", t, 0, 0, {}, 0);
+    }
+    nexttool(s, scratch);
+}
+
+static SkillFetch *skillfetchbyhttp(Engine *e, u64 id)
+{
+    for (SkillFetch *f = e->skillfetches; id && f; f = f->next) {
+        if (f->hid == id) {
+            return f;
+        }
+    }
+    return 0;
+}
+
+static void skillfetchrecord(Engine *e, SkillFetch *f, Arena scratch, Record r)
+{
+    switch (r.type) {
+    case HTTP_HEAD:
+        f->status = get32(r.data);
+        return;
+    case HTTP_BODY:
+        if (f->over) {
+            return;
+        } else if (f->body.len+r.data.len > SKILL_FETCHMAX) {
+            f->over = 1;
+            ehttpcancel(e, f->http);  // ends with HTTP_ECANCEL
+            return;
+        }
+        print(&f->body, r.data);
+        return;
+    case HTTP_DONE: {
+        i32 err = get32(r.data);
+        ehttpfree(e, f->http);
+        f->http = 0;
+        if (err==HTTP_ELOST && !f->retried) {
+            // Once more, to the same computer, which may be back
+            f->retried = 1;
+            if (skillfetchsend(e, f, scratch)) {
+                return;
+            }
+        }
+        skillfetchend(e, f, scratch, f->over ? HTTP_OK : err, cuthead(r.data, 4));
+    } return;
+    }
+}
+
+// The next fetch's deadline, else I64MAX.
+static i64 skillfetchnext(Engine *e)
+{
+    i64 next = I64MAX;
+    for (SkillFetch *f = e->skillfetches; f; f = f->next) {
+        next = f->by<next ? f->by : next;
+    }
+    return next;
+}
+
+// Fetches out of time, ended.
+static void skillfetchtimeout(Engine *e, Arena scratch, i64 now)
+{
+    for (SkillFetch *f = e->skillfetches; f;) {
+        if (f->by <= now) {
+            skillfetchend(e, f, scratch, HTTP_ECONNECT, "it did not come within 2 minutes");
+            f = e->skillfetches;  // the list changed
+        } else {
+            f = f->next;
+        }
+    }
+}
+
+// Whether a fetch for s runs.
+static b32 skillfetching(Session *s)
+{
+    for (SkillFetch *f = s->e->skillfetches; f; f = f->next) {
+        if (f->s == s) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// The fetches for s, which goes: a frontend's told so, from the fetch's
+// own memory, the tool's not.
+static void skillfetchdrop(Engine *e, Session *s)
+{
+    for (SkillFetch *f = e->skillfetches; f;) {
+        if (f->s == s) {
+            if (f->cmd) {
+                reply(e, f->arena, f->cmd, 0, "the session closed", s->sid);
+            }
+            skillfetchfree(e, f);
+            f = e->skillfetches;
+        } else {
+            f = f->next;
+        }
+    }
+}
+
+// skill.fetch {sid, name}: the session's copy of a relayed skill made
+// current, for a prompt that invokes it next. A reply at once for a
+// skill of the engine's own, else when the fetch ends (late).
+static void cmdskillfetch(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
+{
+    Str    name = jsonstr(jsonget(j, "name"));
+    Skills sk   = sessskills(s, &scratch);
+    Skill *k    = skillbyname(sk.list, name);
+    Str    why  = {};
+    if (!k) {
+        why = concat(&scratch, "no such skill: ", utf8head(name, SKILL_NAME));
+        reply(e, scratch, id, 0, why, s->sid);
+    } else if (!k->peer) {
+        reply(e, scratch, id, 1, {}, s->sid);
+    } else if (!skillfetchstart(s, scratch, k, id, {}, &why)) {
+        why = concat(&scratch, "fetching the skill failed: ", why);
+        reply(e, scratch, id, 0, why, s->sid);
+    }
 }
 
 
@@ -14220,7 +14647,7 @@ static b32 runtool(Session *s, Arena scratch)
     case TOOL_JOBS:    tooljobs(s, scratch);           return 1;
     case TOOL_JOBOUT:  tooljobout(s, scratch, &args);  return 1;
     case TOOL_JOBKILL: tooljobkill(s, scratch, &args); return 1;
-    case TOOL_SKILL:   toolskill(s, scratch, &args);   return 1;
+    case TOOL_SKILL:   return toolskill(s, scratch, &args);
     case TOOL_SESSIONS: toolsessions(s, scratch);      return 1;
     case TOOL_MESSAGE: toolmessage(s, scratch, &args); return 1;
     case TOOL_MEMORY:  toolmemory(s, scratch, &args);  return 1;
@@ -15421,6 +15848,12 @@ static void cancelturn(Session *s, Arena scratch)
         if (s->web) {
             webcallend(s, scratch, "cancelled", "Stopped: the user cancelled the turn.");
             return;
+        } else if (s->skillcall) {
+            skillfetchfree(s->e, s->skillcall);
+            setstate(s, S_IDLE);
+            toolend(s, scratch, "cancelled", "Stopped: the user cancelled the turn.", 0, 0, {}, 0);
+            nexttool(s, scratch);
+            return;
         } else if (s->mcpsrv) {
             mcpcancel(s, scratch, "cancelled", "Stopped: the user cancelled the "
                       "turn, perhaps after the MCP server did some of it.");
@@ -15818,6 +16251,7 @@ static void dropsession(Engine *e, Session *s)
         os_release(e->os, s->desk.region);
     }
     webstop(s);
+    skillfetchdrop(e, s);
     Region *r1 = s->perm.region;
     os_release(e->os, s->aregion);
     os_release(e->os, r1);  // holds s itself
@@ -17817,7 +18251,7 @@ static b32 parkable(Session *s)
     }
     return !busy(s) && !s->intask && !s->notices.len && !s->queued.len &&
            !s->steers.len && !s->http && !s->ctl && s->slot==SLOT_NONE &&
-           !s->e->quitting;
+           !skillfetching(s) && !s->e->quitting;
 }
 
 static void park(Engine *e, Session *s)
@@ -21862,6 +22296,12 @@ static void cmdfork(Engine *e, Arena scratch, i64 id, Json *j)
     if (ok && !move && os_stat(os, scratch, work).type==STAT_DIR) {
         ok = copytree(os, scratch, work, wcopy, 0);
     }
+    // Copies of relayed skills, which the copied log names
+    Str skills = join(&scratch, from, "skills");
+    Str scopy  = join(&scratch, dir, "skills");
+    if (ok && os_stat(os, scratch, skills).type==STAT_DIR) {
+        ok = copytree(os, scratch, skills, scopy, 0);
+    }
     Str group = sidecarget(e, &scratch, sid, "group", GROUP_MAX);
     ok = ok && (!c.title.len || sidecarwrite(e, scratch, to, "title", c.title));
     ok = ok && (!group.len || sidecarwrite(e, scratch, to, "group", group));
@@ -24019,6 +24459,9 @@ static void command(Engine *e, Arena scratch, Str line)
     case CMD_COMPACT:
         cmdcompact(e, s, scratch, id, j);
         return;
+    case CMD_SKILLFETCH:
+        cmdskillfetch(e, s, scratch, id, j);
+        return;
     case CMD_SKILLS: {
         // What the user may invoke as /name: every skill, theirs too
         Arena  a  = scratch;
@@ -24267,6 +24710,11 @@ static void onrecord(Engine *e, Arena scratch, Record r)
             webrecord(e, ws->web, scratch, r);
             return;
         }
+        SkillFetch *sf = skillfetchbyhttp(e, r.id);
+        if (sf) {
+            skillfetchrecord(e, sf, scratch, r);
+            return;
+        }
     }
     Session *s = sessionbyid(e, r.id, proc);
     if (!s) {
@@ -24453,6 +24901,7 @@ static void enginethread(void *arg)
         next = !e->quitting && e->trashat<next ? e->trashat : next;
         next = relaynext(e, now)<next ? relaynext(e, now) : next;
         next = termnext(e, now)<next ? termnext(e, now) : next;
+        next = skillfetchnext(e)<next ? skillfetchnext(e) : next;
         for (Lister *l = e->listers; l; l = l->next) {
             next = !l->replied && l->by<next ? l->by : next;
         }
@@ -24498,6 +24947,9 @@ static void enginethread(void *arg)
         listertimeout(e, newarena(e->scratch), now);
         relaytick(e, newarena(e->scratch));
         termtick(e, newarena(e->scratch));
+        if (skillfetchnext(e) <= now) {
+            skillfetchtimeout(e, newarena(e->scratch), now);
+        }
         if (mcpnext(e) <= now) {
             mcptick(e, newarena(e->scratch), now);
         }
