@@ -569,11 +569,22 @@ def fdinfopid(fd):
     return None
 
 
-def sweep(marks, sig):
+def cmdline(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            args = f.read().rstrip(b"\0").replace(b"\0", b" ")
+    except OSError:
+        return "?"
+    text = args.decode(errors="replace") or "?"
+    return text if len(text) <= 120 else text[:117] + "..."
+
+
+def sweep(marks, sig, names=None):
     """Signal every process whose environment holds all of marks (exact
     NAME=value entries). Each goes through a pidfd, with its environment
     checked again after pidfd_open and the pidfd's process still that
-    pid, so no unvalidated pid is ever signaled. Returns what it hit."""
+    pid, so no unvalidated pid is ever signaled. Returns what it hit;
+    names, if given, gets each one's command line."""
     marks = {m.encode() for m in marks}
     hit = []
     me = os.getpid()
@@ -590,6 +601,8 @@ def sweep(marks, sig):
         try:
             env = environ(pid)
             if env and marks <= env and fdinfopid(fd) == pid:
+                if names is not None:
+                    names[pid] = cmdline(pid)
                 signal.pidfd_send_signal(fd, sig)
                 hit.append(pid)
         except OSError:
@@ -601,10 +614,12 @@ def sweep(marks, sig):
 
 def cleanup(marks, what):
     """TERM, then KILL, whatever still carries marks."""
-    left = sweep(marks, signal.SIGTERM)
+    names = {}
+    left = sweep(marks, signal.SIGTERM, names)
     if not left:
         return
-    say(f"{what}: TERM to {len(left)} left behind: {left}")
+    say(f"{what}: TERM to {len(left)} left behind: "
+        + "; ".join(f"{pid} {names.get(pid, '?')}" for pid in left))
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline and sweep(marks, 0):
         time.sleep(0.25)

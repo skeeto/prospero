@@ -2335,7 +2335,14 @@ def main():
             problems.append("a tab's Close ended a child ignoring SIGHUP")
         else:
             print("terminal: a child ignoring SIGHUP outlived a tab's Close")
+            # Its loop's sleep, orphaned by this, ends within its second:
+            # waited for, unsignaled, so that nothing of the run is left
+            kids = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True,
+                                  text=True).stdout.split()
             P.signal_ours(pid, P.KILL, lambda q: ours(q, host.root), "stray")
+            deadline = time.monotonic() + 3
+            while any(alive(int(k)) for k in kids) and time.monotonic() < deadline:
+                time.sleep(0.1)
         problems += far.close(args.keep)
     if args.mode == "terminal" and args.shots and os.name != "nt":  # SDL's alone
         for name in ("terminal", "terminal-small", "terminal-vim", "terminal-big",
