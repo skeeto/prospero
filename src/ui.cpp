@@ -4201,7 +4201,8 @@ static Str blocktext(Arena *a, Doc *d, DocBlock *b)
 // documents, but laid out a screen at a time around what is shown, in
 // the code font: numbered in a gutter on the left, the cited lines
 // banded, scrolled to them once (centered if they fit, else from a
-// third of the way down), or to where the view was, and wrapped at the
+// third of the way down, and sideways to a column of the first if one
+// is asked for), or to where the view was, and wrapped at the
 // pane's width or else at FILES_COLS columns, scrolled sideways. Find
 // hits (dl->find) are marked, and one revealed is scrolled to only if
 // it is out of view, or under the bar covering the view's top. Until
@@ -4310,11 +4311,31 @@ static Str drawlines(Gui *g, DocView *d, char const *id, DocLines *dl)
         i32 l1 = (dl->jump1>=dl->jump0 ? dl->jump1 : dl->jump0) - 1;
         f64 y0 = linesy(v, g, width, pad, l0);
         lineslay(v, g, width, adv, fm.lineh, y0-winh, y0);
+        // A column on the first line (Go to line's N:C): its row, laid
+        // out, and its x
+        i32    k   = l0 / FILES_CHUNK;
+        b32    col = dl->jumpcol>0 && k<v->msgs.len;
+        MsgRow cr  = {};
+        if (col) {
+            Str        ch = v->msgs[k].text;
+            i32        lo = filelineoff(ch, l0 % FILES_CHUNK);
+            i32        at = lo + filecolbyte(cuthead(ch, lo), dl->jumpcol);
+            MsgLayout *ml = msglayout(v, k, &g->measure, width, sc);
+            viewtops(v, width, adv, fm.lineh);
+            cr = msgrowat(&g->measure, msgdoc(v, k), ml, at);
+        }
         y0 = linesy(v, g, width, pad, l0);
         f64 y1 = linesy(v, g, width, pad, l1) + linesh(v, g, width, l1);
         y0 = linesy(v, g, width, pad, l0);  // tops as laid out
-        want  = y1-y0 <= vish-2*pad ? (y0+y1)/2 - vish/2 : y0 - vish/3;
+        // Centered if they fit, else from a third of the way down: the
+        // first line, or the column's row
+        f64 yc = col ? v->msgs[k].top + pad + cr.y : y0;
+        want  = y1-y0 <= vish-2*pad ? (y0+y1)/2 - vish/2 : yc - vish/3;
         wantx = 0;
+        if (col && !dl->wrap) {
+            f32 vw = avail.x - st.ScrollbarSize - pad - gutter;
+            wantx = cr.x+adv <= vw ? 0 : cr.x - vw/3;
+        }
         dl->jumped = !pending;
     } else if (dl->reveal.len>0 && dl->reveal.msg<v->msgs.len) {
         // The hit's first and last bytes, the last maybe in a later chunk
@@ -4636,6 +4657,7 @@ struct FindBar {
     b32          arrows;    // the previous and next arrows, else the
                             // field takes their room
     i32          nextrect;  // RECT_* of the next arrow, else -1
+    char const  *closetip;  // the close button's tooltip, else the find's
     // Out
     f32          fieldw;
     b32          prev;
@@ -4713,7 +4735,7 @@ static void findbarend(Gui *g, FindBar *fb, Str count)
     ImGui::SameLine(x + fb->countw + sp);
     fb->close = iconbutton(ICON_CLOSE "##findclose");
     itemnamed(g, concat(&a, fb->name, " close"));
-    itemtip("Close the find bar (Esc)");
+    itemtip("%s", fb->closetip ? fb->closetip : "Close the find bar (Esc)");
     fb->focused = ImGui::IsWindowFocused();
     fb->bottom  = ImGui::GetWindowPos().y + ImGui::GetWindowSize().y;
 
@@ -15948,6 +15970,11 @@ static void drawmenubar(Gui *g)
         ftip = concat(&a, ftip, " while it has the focus)");
         if (menutip(g, &a, "Find in file...", filefindwhy(g), ftip)) {
             filefindopen(g);
+        }
+        if (menutip(g, &a, "Go to line...", filefindwhy(g),
+                    "Go to a line of the file the Files pane shows (Ctrl+G while it has "
+                    "the focus)", "Ctrl+G")) {
+            filelineopen(g);
         }
         ImGui::EndMenu();
     }

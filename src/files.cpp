@@ -2244,6 +2244,78 @@ static void filefindclose(Gui *g)
     scheddirty(&g->sched);
 }
 
+// Go to line (Ctrl+G while Files has the focus, physical Ctrl on macOS,
+// or Edit, Go to line): the bar in line mode, over the file shown. One
+// already in line mode only takes the focus again, keeping what was
+// typed and where it leaves to: the find bar, if it was open.
+static void filelineopen(Gui *g)
+{
+    FileFindBar *fb = &g->ffind;
+    FileTab     *ft = filesetfront(&filesroot(g)->files);
+    if (filefindwhy(g).len) {
+        return;
+    }
+    setpane(g, PANE_FILES, 1);
+    if (!(fb->open && fb->mode==FBAR_LINE)) {
+        fb->back    = fb->open && fb->mode==FBAR_FIND;
+        fb->open    = 1;
+        fb->mode    = FBAR_LINE;
+        fb->line[0] = 0;
+        fb->bad     = 0;
+        fb->serial  = ft->serial;
+    }
+    fb->focus = 1;
+    scheddirty(&g->sched);
+}
+
+// Line mode left: to the find bar if it was open, else closed. With
+// focus, the focus to the text, so that the Files keys go on working.
+static void filelineleave(Gui *g, b32 focus)
+{
+    FileFindBar *fb = &g->ffind;
+    if (!fb->open || fb->mode!=FBAR_LINE) {
+        return;
+    }
+    fb->open   = fb->back;
+    fb->mode   = fb->back ? FBAR_FIND : FBAR_LINE;
+    fb->back   = 0;
+    fb->bad    = 0;
+    fb->active = 0;
+    fb->held   = 0;
+    fb->focus  = 0;
+    fb->reveal = fb->open && fb->reveal;
+    FileTab  *ft = filesetfront(&filesroot(g)->files);
+    FileBody *b  = ft ? ft->body : 0;
+    DocView  *d  = !b ? 0 : ft->mode==FMODE_MARKDOWN ? b->md : b->text;
+    if (focus && d && d->win) {
+        ImGui::FocusWindow(d->win);
+    } else if (focus && g->fileswindow) {
+        ImGui::FocusWindow(g->fileswindow);  // the text, not drawn yet
+    }
+    if (focus) {
+        // FocusWindow restores the text's last nav item, and the keys
+        // typed in the field left the nav cursor showing: hidden, else
+        // the window's Esc takes it for keyboard navigation and the next
+        // Esc would not close the find bar
+        ImGui::SetNavCursorVisible(false);
+    }
+    scheddirty(&g->sched);
+}
+
+// To lines l of a tab's file, as a link to them goes: as text, banded,
+// scrolled to once, and the place Open in editor opens, its column too.
+static void filegoto(Gui *g, FileTab *ft, FrefLines l)
+{
+    ft->mode   = FMODE_TEXT;
+    ft->band0  = l.line0;
+    ft->band1  = l.line1;
+    ft->goline = l.line0;
+    ft->gocol  = l.col;
+    ft->jump   = l.line0;
+    ft->jumped = 0;
+    scheddirty(&g->sched);
+}
+
 // Open in editor goes where the current hit begins, its line and column.
 static void filefindgo(Gui *g, FileTab *ft)
 {
@@ -2316,16 +2388,94 @@ static b32 filemdreveal(Gui *g, FileBody *b, FindHit h)
     return 1;
 }
 
+// The bar in line mode (filefindbar): the line typed, gone to on Enter,
+// or 'Not a line'; Enter on nothing, Esc or its close leaves.
+static void filelinebar(Gui *g, FileTab *ft, FileBody *b, ImVec2 r0, ImVec2 r1,
+                        b32 held, b32 esc)
+{
+    FileFindBar *fb = &g->ffind;
+    Arena        a  = g->frame;
+    FindBar      bar = {};
+    bar.child    = "##filefindbar";
+    bar.name     = "file line";
+    bar.widest   = "888888 of 888888+";
+    bar.arrows   = 0;
+    bar.nextrect = -1;
+    bar.closetip = "Leave Go to line (Esc)";
+    findbarbegin(g, &bar, r0, r1);
+    if (fb->focus) {
+        ImGui::FocusWindow(ImGui::GetCurrentWindow());
+        ImGui::SetKeyboardFocusHere();
+        fb->focus = 0;
+    }
+    // a11y: "Go to line"
+    b32 enter = ImGui::InputTextWithHint("##line", "Line, line:column or first-last", fb->line,
+                                         countof(fb->line),
+                                         ImGuiInputTextFlags_EnterReturnsTrue|
+                                         ImGuiInputTextFlags_AutoSelectAll);
+    itemnamed(g, "file line field");
+    if (ImGui::IsItemEdited()) {
+        fb->bad = 0;
+    }
+    esc |= ImGui::IsKeyPressed(ImGuiKey_Escape, false) && (ImGui::IsItemDeactivated() || held);
+    fb->active = ImGui::IsItemActive();
+
+    Buf cb(&a, 64);
+    if (fb->bad) {
+        print(&cb, "Not a line");
+    } else {
+        print(&cb, "of ");
+        print(&cb, (i64)b->lines);
+    }
+    Str count = finish(&cb);
+    iz  n     = count.len<countof(fb->shown) ? count.len : countof(fb->shown);
+    copybytes(fb->shown, count.data, n);
+    fb->shownlen = (i32)n;
+    findbarend(g, &bar, count);
+    fb->held  = bar.focused;
+    fb->barh  = bar.bottom - r0.y;
+    fb->drawn = 1;
+
+    if (esc || bar.close) {
+        filelineleave(g, 1);
+    } else if (enter) {
+        Str       t = trim(Str{(u8 *)fb->line, (iz)__builtin_strlen(fb->line)});
+        FrefLines l = {};
+        if (!t.len) {
+            filelineleave(g, 1);
+        } else if (filegotoparse(t, &l)) {
+            filegoto(g, ft, l);
+            filelineleave(g, 1);
+        } else {
+            fb->bad   = 1;
+            fb->focus = 1;  // Enter let go of the field: take it back
+            scheddirty(&g->sched);
+        }
+    }
+}
+
 // The bar, over the text drawn from r0 to r1 (filefindbar's chrome),
 // drawn only over a text or Markdown body, after it. Its keys are the
-// Files window's, so a tab with no text never steps: F3 and Shift+F3,
-// on macOS Cmd+G and Cmd+Shift+G too, and Esc from the text; in the
-// bar, Enter, Shift+Enter, the arrows, and Ctrl/Cmd(+Shift)+G.
+// Files window's, so a tab with no text never steps: Ctrl+G to go to a
+// line (physical Ctrl on macOS); F3 and Shift+F3, on macOS Cmd+G and
+// Cmd+Shift+G too, and Esc from the text; in the bar, Enter,
+// Shift+Enter, the arrows, and Ctrl/Cmd(+Shift)+G.
 static void filefindbar(Gui *g, FileTab *ft, FileBody *b, ImVec2 r0, ImVec2 r1)
 {
     FileFindBar *fb = &g->ffind;
     Arena        a  = g->frame;
-    if (!fb->open || fb->mode!=FBAR_FIND) {
+    // Go to line. In the find field Ctrl+G is the next match, the bar's
+    // own key going ahead of this one; on macOS ImGui holds back Super
+    // (physical Ctrl) chords from an active field, so there it is read
+    // as it is, as the prompt box does, once a frame
+    ImGuiIO &io = ImGui::GetIO();
+    if (ImGui::Shortcut((g->mac ? ImGuiMod_Super : ImGuiMod_Ctrl)|ImGuiKey_G)) {
+        filelineopen(g);
+    } else if (g->mac && fb->open && fb->mode==FBAR_FIND && fb->active &&
+               io.KeyMods==ImGuiMod_Super && ImGui::IsKeyPressed(ImGuiKey_G, false)) {
+        filelineopen(g);
+    }
+    if (!fb->open) {
         return;
     }
     // Esc while the bar has the focus but its field does not, as after
@@ -2333,26 +2483,34 @@ static void filefindbar(Gui *g, FileTab *ft, FileBody *b, ImVec2 r0, ImVec2 r1)
     b32 held = fb->held;
     fb->held = 0;
     i32 step = 0;
-    if (ImGui::Shortcut(ImGuiKey_F3)) {
-        step = 1;
-    }
-    if (ImGui::Shortcut(ImGuiMod_Shift|ImGuiKey_F3)) {
-        step = -1;
-    }
-    if (g->mac && ImGui::Shortcut(ImGuiMod_Ctrl|ImGuiKey_G)) {
-        step = 1;  // Cmd+G
-    }
-    if (g->mac && ImGui::Shortcut(ImGuiMod_Ctrl|ImGuiMod_Shift|ImGuiKey_G)) {
-        step = -1;
+    if (fb->mode == FBAR_FIND) {
+        if (ImGui::Shortcut(ImGuiKey_F3)) {
+            step = 1;
+        }
+        if (ImGui::Shortcut(ImGuiMod_Shift|ImGuiKey_F3)) {
+            step = -1;
+        }
+        if (g->mac && ImGui::Shortcut(ImGuiMod_Ctrl|ImGuiKey_G)) {
+            step = 1;  // Cmd+G
+        }
+        if (g->mac && ImGui::Shortcut(ImGuiMod_Ctrl|ImGuiMod_Shift|ImGuiKey_G)) {
+            step = -1;
+        }
     }
     // Esc from the text: not while ImGui's keyboard navigation shows its
-    // cursor or is in a menu bar, nor over a popup, as escapecancel
+    // cursor or is in a menu bar, nor over a popup, as escapecancel; nor
+    // while the field has the keyboard, which takes its own, so no
+    // RouteOverActive
     ImGuiContext &c   = *GImGui;
     b32           nav = (c.NavCursorVisible && c.NavId && c.NavId!=c.ActiveId) ||
                         c.NavLayer!=ImGuiNavLayer_Main;
     b32 esc = !fb->active && !held && !nav &&
               !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId) &&
               ImGui::Shortcut(ImGuiKey_Escape);
+    if (fb->mode == FBAR_LINE) {
+        filelinebar(g, ft, b, r0, r1, held, esc);
+        return;
+    }
 
     FindBar bar = {};
     bar.child    = "##filefindbar";
@@ -2535,6 +2693,7 @@ static void drawfiles(Gui *g)
     }
     fetchtick(g, ft);
     if (g->ffind.serial != ft->serial) {
+        filelineleave(g, 0);  // Go to line is the tab's it was opened over
         g->ffind.serial = ft->serial;  // opened for another tab: not this one's focus
         g->ffind.focus  = 0;
     }
@@ -2717,7 +2876,8 @@ static void drawfiles(Gui *g)
         print(&nb, " lines are shown.");
         filenote(g, finish(&nb), 0);
     }
-    if (ft->band0 > b->lines) {
+    if (ft->band0>b->lines && !(b->flags&FTEXT_CUT)) {
+        // A cut file's own note says why
         Buf nb(&a, 64);
         print(&nb, "The file has only ");
         print(&nb, (i64)b->lines);
@@ -2763,7 +2923,7 @@ static void drawfiles(Gui *g)
         }
         // Its find's hits marked, and the current one brought into view
         FileFindBar *fb  = &g->ffind;
-        b32          fon = fb->open && fb->mode==FBAR_FIND && fb->body==b &&
+        b32          fon = fb->open && (fb->mode==FBAR_FIND || fb->back) && fb->body==b &&
                            fb->bmode==FMODE_MARKDOWN;
         d->find = fon ? fb->md : 0;
         if (fon && fb->reveal && fb->md->cur>=0 &&
@@ -2803,10 +2963,12 @@ static void drawfiles(Gui *g)
     dl->band1 = fileclamp(ft->band1, lines);
     dl->jump0 = ft->jump && !ft->jumped ? fileclamp(ft->band0, lines) : 0;
     dl->jump1 = dl->jump0 ? fileclamp(ft->band1, lines) : 0;
+    // Go to line's column, on its line
+    dl->jumpcol = dl->jump0 && ft->goline==ft->band0 && ft->band0<=lines ? ft->gocol : 0;
     // Its find's hits marked, under the bar, and the current one brought
     // into view
     FileFindBar *fb  = &g->ffind;
-    b32          fon = fb->open && fb->mode==FBAR_FIND && fb->body==b &&
+    b32          fon = fb->open && (fb->mode==FBAR_FIND || fb->back) && fb->body==b &&
                        fb->bmode==FMODE_TEXT;
     FileFind    *ff  = fb->text;
     dl->find    = fon ? ff : 0;

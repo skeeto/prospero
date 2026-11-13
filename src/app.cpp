@@ -1241,6 +1241,7 @@ struct DocLines {
     i32 band1;
     i32 jump0;    // lines to scroll to, 1-based and clamped, else 0
     i32 jump1;
+    i32 jumpcol;  // a column on jump0's line shown, 1-based, else 0
     b32 restore;  // go to top, dy and scrollx
     FileFind *find;   // hits marked, else null
     FindHit reveal;   // a hit brought into view if out of it, len 0 for none
@@ -1276,9 +1277,11 @@ struct FileShown {
 
 // The Files pane's find bar (files.cpp), one for the pane, over the
 // file shown: its text searched as it is (FileFind), or a Markdown
-// file as rendered (a ViewSearch of its own).
+// file as rendered (a ViewSearch of its own); or, in line mode, Go to
+// line's field.
 enum : i32 {
     FBAR_FIND,
+    FBAR_LINE,
 };
 
 struct FileFindBar {
@@ -1302,6 +1305,9 @@ struct FileFindBar {
     f32         barh;       // the bar's bottom below the text's top
     u8          shown[48];  // the count as drawn, for the checklist
     i32         shownlen;
+    char        line[32];   // Go to line's field
+    b32         back;       // line mode leaves to find mode
+    b32         bad;        // Enter found no line in it
 };
 
 struct Export {
@@ -6209,6 +6215,7 @@ static void filesfont(Gui *);
 static void fileaskopen(Gui *);
 static void fileclosefront(Gui *);
 static void filefindopen(Gui *);
+static void filelineopen(Gui *);
 static Str  filefindwhy(Gui *);
 static Str  fileaskwhy(Gui *);
 static void fileanswer(Gui *, Str);
@@ -14016,7 +14023,8 @@ enum : i32 {
                       // with a horizontal scrollbar, "nohbar" without
     CHK_FILETABS,     // the shown root's file tab labels, '|' between, '*' front
     CHK_FILEMODE,     // the front file is drawn in mode dx (FMODE_*)
-    CHK_FILENOTE,     // the pane's notes have text, or none for ""
+    CHK_FILENOTE,     // the pane's notes have text, or none for ""; or
+                      // with dx 1, they do not have text
     CHK_FILEASKERR,   // Open file is up, saying text
     CHK_FILESHOWN,    // Files is hidden (dx 0), shown (1), or shown central (2)
     CHK_FILEBODIES,   // the bodies fit the budget, dx files read at least
@@ -14045,7 +14053,8 @@ enum : i32 {
     CHK_OUTCLOSED,    // the Output window is closed
     CHK_FILEFIND,     // the Files find bar is not drawn (dx 0), in find mode
                       // with its field active (1) or not (2), its count
-                      // ending with text; or Find in file's why is text (4)
+                      // ending with text; or Find in file's why is text (4);
+                      // or in line mode (3), its column ending with text
     CHK_FILESPOT,     // the Files text's line dx, column dy is in view, below
                       // the bar, with text "hit" the current match's start,
                       // and "carry" a hit also drawn carried into a chunk
@@ -16394,6 +16403,78 @@ static DriveOp m3ops[] = {
     {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
     {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
     {OP_CHECK, CHK_FILEFIND, 0, 0, 0, ""},
+    // Go to line (Ctrl+G while Files has the focus, physical Ctrl on
+    // macOS): lines banded and centered, as a link's are
+    CTRLKEY(GKEY_G, 300),
+    {OP_CHECK, CHK_FILEFIND, 3, 0, 0, "of 3000"},
+    {OP_TEXT, 0, 0, 0, 300, "1500-1504"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEFIND, 0, 0, 0, ""},
+    {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "1500-1504"},
+    {OP_CHECK, CHK_FILELINE, 1500, 1504, 0, "centered"},
+    {OP_SHOT, 0, 0, 0, 300, "files-goto"},
+    // Not a line: it says so, and Esc leaves
+    CTRLKEY(GKEY_G, 300),
+    {OP_TEXT, 0, 0, 0, 300, "abc"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_CHECK, CHK_FILEFIND, 3, 0, 0, "Not a line"},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_CHECK, CHK_FILEFIND, 0, 0, 0, ""},
+    // From the text while finding: a line and column, then back to the
+    // find bar
+    CMDKEY(GKEY_F, 300),
+    {OP_MOVE, T_FILETEXT, 0, 0, 100, "1500"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    CTRLKEY(GKEY_G, 300),
+    {OP_CHECK, CHK_FILEFIND, 3, 0, 0, "of 3000"},
+    {OP_TEXT, 0, 0, 0, 300, "100:3"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEFIND, 2, 0, 0, ""},
+    {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "100-100"},
+    {OP_CHECK, CHK_FILELINE, 100, 0, 0, "centered"},
+    {OP_CHECK, CHK_FILESPOT, 100, 3, 0, ""},
+    #if defined(__APPLE__)
+    // On macOS physical Ctrl+G goes to a line from the find field too,
+    // where Cmd+G is the next match (elsewhere Ctrl+G is, checked above)
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file find field"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_FILEFIND, 1, 0, 0, ""},
+    CTRLKEY(GKEY_G, 300),
+    {OP_CHECK, CHK_FILEFIND, 3, 0, 0, "of 3000"},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_CHECK, CHK_FILEFIND, 2, 0, 0, ""},
+    #endif
+    // Edit, Go to line...; Esc back to the find bar, then closing it
+    {OP_MOVE, T_NAMED, 0, 0, 100, "menu Edit"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Go to line..."},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 600, ""},
+    {OP_CHECK, CHK_FILEFIND, 3, 0, 0, "of 3000"},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_CHECK, CHK_FILEFIND, 2, 0, 0, ""},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_CHECK, CHK_FILEFIND, 0, 0, 0, ""},
+    // Past the end: the last line, with the note
+    CTRLKEY(GKEY_G, 300),
+    {OP_TEXT, 0, 0, 0, 300, "5000"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILENOTE, 0, 0, 0, "The file has only 3000 lines."},
+    {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "3000-3000"},
     // Past the end: a note, and the last line
     {OP_OPENFILE, 0, 0, 0, 300, "files/lines.txt:5000"},
     {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
@@ -16458,6 +16539,26 @@ static DriveOp m3ops[] = {
     {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
     {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
     {OP_CHECK, CHK_FILEFIND, 0, 0, 0, ""},
+    // Go to a line and column: unwrapped, scrolled sideways to it;
+    // wrapped, its row in view
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file wrap"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    CTRLKEY(GKEY_G, 300),
+    {OP_TEXT, 0, 0, 0, 300, "100:380"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILESPOT, 100, 380, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file wrap"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    CTRLKEY(GKEY_G, 300),
+    {OP_TEXT, 0, 0, 0, 300, "100:380"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILESPOT, 100, 380, 0, ""},
     // Two files of one name, told apart by their folders
     {OP_OPENFILE, 0, 0, 0, 300, "files/a/x.c"},
     {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
@@ -16510,6 +16611,15 @@ static DriveOp m3ops[] = {
     {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
     {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
     {OP_CHECK, CHK_FILEFIND, 0, 0, 0, ""},
+    // Go to line from Markdown shows the text there
+    CTRLKEY(GKEY_G, 300),
+    {OP_CHECK, CHK_FILEFIND, 3, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 300, "5"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEMODE, FMODE_TEXT, 0, 0, ""},
+    {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "5-5"},
     // CRLF and a byte order mark: neither shown nor copied
     {OP_OPENFILE, 0, 0, 0, 300, "files/crlf.txt"},
     {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
@@ -16559,6 +16669,15 @@ static DriveOp m3ops[] = {
     {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
     {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
     {OP_CHECK, CHK_FILEFIND, 0, 0, 0, ""},
+    // Gone to past the lines shown: the last, with only the cut's note
+    CTRLKEY(GKEY_G, 300),
+    {OP_TEXT, 0, 0, 0, 300, "100050"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_FILENOTE, 0, 0, 0, "Only its first 100000 lines are shown."},
+    {OP_CHECK, CHK_FILENOTE, 1, 0, 0, "has only"},
+    {OP_CHECK, CHK_FILELINE, 100000, 0, 0, ""},
     // A ninth file closes the tab opened least recently
     {OP_OPENFILE, 0, 0, 0, 300, "hello.txt"},
     {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
@@ -16887,6 +17006,8 @@ static DriveOp m3ops[] = {
     {OP_CHECK, CHK_FILEFIND, 0, 0, 0, ""},
     {OP_CHECK, CHK_FINDCLOSED, 0, 0, 0, ""},
     {OP_CHECK, CHK_FILEFIND, 4, 0, 0, "The file shown has no text"},
+    CTRLKEY(GKEY_G, 300),
+    {OP_CHECK, CHK_FILEFIND, 0, 0, 0, ""},
     {OP_OPENFILE, 0, 0, 0, 300, "files/corrupt.png"},
     {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
     {OP_CHECK, CHK_FILENOTE, 0, 0, 0, "Not an image it can show: "},
@@ -22083,7 +22204,8 @@ static b32 drivefilecheck(Gui *g, i32 chk)
         Str notes = {g->fnotes, g->fnoteslen};
         print(&b, "drive: the file's notes: ");
         print(&b, notes);
-        ok = g->filesdrawn && (op->text.len ? find(notes, op->text)>=0 : !notes.len);
+        ok = g->filesdrawn && (op->dx==1   ? find(notes, op->text)<0  :
+                               op->text.len ? find(notes, op->text)>=0 : !notes.len);
     } break;
     case CHK_FILEASKERR:
         print(&b, "drive: Open file says ");
@@ -22255,6 +22377,7 @@ static b32 drivefilecheck(Gui *g, i32 chk)
         print(&b, "drive: the Files find bar is ");
         print(&b, !fb->drawn ? Str("not drawn") : fb->active ? Str("active, ")
                                                              : Str("inactive, "));
+        print(&b, fb->drawn && fb->mode==FBAR_LINE ? Str("in line mode, ") : Str(""));
         print(&b, fb->drawn ? count : Str(""));
         if (dx == 4) {
             Str why = filefindwhy(g);
@@ -22263,6 +22386,9 @@ static b32 drivefilecheck(Gui *g, i32 chk)
             ok = why == op->text;
         } else if (dx == 0) {
             ok = !fb->drawn;
+        } else if (dx == 3) {
+            ok = fb->drawn && fb->open && fb->mode==FBAR_LINE &&
+                 count.len>=op->text.len && cuthead(count, count.len-op->text.len)==op->text;
         } else {
             ok = fb->drawn && fb->open && fb->mode==FBAR_FIND && fb->active==(dx==1) &&
                  count.len>=op->text.len && cuthead(count, count.len-op->text.len)==op->text;

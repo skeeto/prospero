@@ -1,7 +1,8 @@
 # Keyboard and mouse
 
 On macOS, Cmd takes the place of Ctrl in every shortcut on this page,
-except Ctrl+G in the prompt box, which is Ctrl there too.
+except Ctrl+G in the prompt box and in the Files pane, which is Ctrl
+there too.
 
 ## Anywhere
 
@@ -16,6 +17,13 @@ except Ctrl+G in the prompt box, which is Ctrl there too.
 - **Ctrl+O**: Open file: a path on the session's host, shown in the Files
   pane. Tab completes it, and `:N` or `:A-B` after it goes to that line
   or those lines, marked.
+- **Ctrl+G**, while the Files pane has the focus: go to a line of its
+  file. Type `N`, `N:C` for a column too, or `A-B` for lines A to B,
+  and Enter goes there and bands them as a link's lines are; past the
+  end it goes to the last line, saying how many there are (or, for a
+  file shown only in part, that only its start is shown). In its find
+  bar, Ctrl+G is the next match instead (on macOS Cmd+G is, and Ctrl+G
+  still goes to a line). Edit → Go to line... does the same.
 - **Ctrl+W**, while the Files pane has the focus: close its front tab.
   Elsewhere on macOS, Cmd+W closes the window, as before.
 - **Ctrl+Shift+N**: New session, no folder, with the default model:
