@@ -275,9 +275,9 @@ static void test_compose(Test *t)
     }
     // Skills: /name exactly, after the commands, which keep their names
     {
-        SkillItem items[] = {{"pdf", "Read PDFs", "/s/pdf/SKILL.md", 0, 0},
-                             {"compact", "", "/s/compact/SKILL.md", 0, 0},
-                             {"review", "", "/s/review/SKILL.md", 1, 0}};
+        SkillItem items[] = {{"pdf", "Read PDFs", "/s/pdf/SKILL.md", 0, 0, {}},
+                             {"compact", "", "/s/compact/SKILL.md", 0, 0, {}},
+                             {"review", "", "/s/review/SKILL.md", 1, 0, {}}};
         Slice<SkillItem> sk = {items, countof(items)};
         Slash k = parseskill("  /pdf  file.pdf ", sk);
         expect(t, "skill.parse", concat(&a, concat(&a, k.skill, "|"), k.arg), "pdf|file.pdf");

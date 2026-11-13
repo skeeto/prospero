@@ -1404,8 +1404,9 @@ static Str relaycallkeys[] = {
 
 // The relay.call line for part of a thin engine's call, from its relay
 // record (rec), numbered cid by the client, which knows the engine as
-// origin: relaycallkeys of the record, and nothing else of it.
-static Str relaycallline(Arena *a, Json *rec, i64 cid, Str origin)
+// origin: relaycallkeys of the record, and nothing else of it, but the
+// client's own word that the user's /NAME asked for a skill (invoked).
+static Str relaycallline(Arena *a, Json *rec, i64 cid, Str origin, b32 invoked = 0)
 {
     Buf     b(a, 1024 + origin.len + jsonstr(jsonget(rec, "data")).len);
     JsonOut w = {&b};
@@ -1419,6 +1420,9 @@ static Str relaycallline(Arena *a, Json *rec, i64 cid, Str origin)
             putkey(&w, relaycallkeys[i]);
             putjson(&w, m);
         }
+    }
+    if (invoked) {
+        putintkey(&w, "invoked", 1);
     }
     putend(&w);
     return finish(&b);

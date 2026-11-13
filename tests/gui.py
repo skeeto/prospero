@@ -2074,8 +2074,15 @@ def main():
         far = Far(args, host, curl, model, nonce, extra=termcfg)
         before += far.hostsection().replace("[remote far]", "[remote r]")
     elif args.mode == "thin":
-        # r has no endpoint: it runs on this window's models
+        # r has no endpoint: it runs on this window's models, and has the
+        # user's skills here, one of them theirs alone
         far = Far(args, host, curl, model, nonce, thin=True)
+        skills = host.path("skills")
+        host.mkdir(skills + "/gnotes")
+        host.write(skills + "/gnotes/SKILL.md",
+                   "---\nname: gnotes\ndescription: Take notes, for the user alone\n"
+                   "disable-model-invocation: true\n---\nTake notes in notes.md.\n")
+        before += f"\n# The user's own skills, which r may use\n[skills]\npaths = {skills}\n"
         before += far.hostsection().replace("[remote far]", "[remote r]")
     elif args.mode == "containers":
         # The image first in New session's list; its container copies work

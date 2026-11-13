@@ -286,7 +286,12 @@ alone. `[skills] enabled = false` turns them off. Without editing a
 the same way, and `[skills] disabled = NAME…` leaves them out
 altogether, from the agent and from `/NAME`; each takes names
 separated by blanks, and covers every skill of a name, so none further
-away takes its place. Either may name `prospero`.
+away takes its place. Either may name `prospero`. A thin remote's
+sessions also use the user's own skills of the computer relaying for
+it (never a project's, nor `prospero`), copied there as used;
+`[skills] share` says which: `yes` (the default), `no`, or names
+separated by blanks. An include can only narrow it, as the user's own
+file wins. See [remote.md](remote.md).
 
 One skill is built in: `prospero`, Prospero's Help and every setting,
 served by the engine itself, so that the agent can answer questions

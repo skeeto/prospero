@@ -2860,7 +2860,8 @@ static void drawinfo(Gui *g, GuiSession *s, View *v)
             itemtip("%s", cstr0(&a, k->desc));
         }
         ImGui::SameLine();
-        Str where = k->builtin ? Str("built into Prospero") : showpath(v, k->path);
+        Str where = k->builtin  ? Str("built into Prospero") :
+                    k->from.len ? concat(&a, "from ", k->from) : showpath(v, k->path);
         ImGui::TextDisabled("%s%s", cstr0(&a, where),
                             k->hidden ? ", for you alone: not offered to the agent" : "");
     }
@@ -7471,9 +7472,11 @@ static void drawprompt(Gui *g)
         Slash sk = parseskill(p, s->skills);
         if (sl.cmd) {
             runslash(g, s, sl, p);
+        } else if (s->fetchid && p.len) {
+            setnote(g, s, concat(&a, concat(&a, "wait for ", s->fetchskill), " to be fetched"), 1);
         } else if (sk.skill.len && hostcap(s->host, "skills")) {
             draftdone(&s->dclock);
-            guiskill(g, s, sk.skill, sk.arg, p);
+            guiskillgo(g, s, sk.skill, sk.arg, p);
             draftput(g, s, "");
         } else if (s->att && s->att->state!=ATT_IDLE) {
             setnote(g, s, "wait for the images being sent", 1);

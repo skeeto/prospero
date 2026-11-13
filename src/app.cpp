@@ -670,6 +670,10 @@ struct GuiSession {
     b32          gone;      // deleted: shown nowhere
     Slice<SkillItem> skills;  // what /name invokes, as its engine lists them
     i64          skillsid;  // that list's skills in flight, 0 if none
+    i64          fetchid;   // skill.fetch in flight, before its prompt
+    Str          fetchskill;  // which, and the prompt that follows it
+    Str          fetchargs;
+    Str          fetchtext;
     GitWatch     git;       // its branch, and asking for it (guigit)
     // Desktop notifications (toastpass): its history, as of its open, its
     // records up to histseq (else written by histts) being no news; the
@@ -4352,6 +4356,37 @@ static void guiskill(Gui *g, GuiSession *s, Str skill, Str args, Str text)
     cmdsend(g, &w, a);
 }
 
+static void setnote(Gui *, GuiSession *, Str, b32, b32);
+
+// Invoke a skill (guiskill), one that another computer shares fetched
+// first where the session's engine can (skill.fetch): the prompt goes
+// once its copy is current (onskillfetch). Meanwhile the window vouches
+// for this fetch to that computer as the user's own (guirelayin).
+static void guiskillgo(Gui *g, GuiSession *s, Str skill, Str args, Str text)
+{
+    SkillItem *k = 0;
+    for (iz i = 0; !k && i < s->skills.len; i++) {
+        k = s->skills[i].name==skill ? &s->skills[i] : 0;
+    }
+    if (!k || !k->from.len || !hostcap(s->host, "skill.fetch")) {
+        guiskill(g, s, skill, args, text);
+        return;
+    }
+    Arena a    = newarena(g->cmdr);
+    Str   note = concat(&a, concat(&a, "fetching ", skill), concat(&a, " from ", k->from));
+    Buf   b(&a, 256 + skill.len);
+    EvOut w = cmdopen(g, &b, CMD_SKILLFETCH, s);
+    putkey(&w.json, "name");
+    putstr(&w.json, skill);
+    s->fetchid    = g->nextid;
+    s->fetchskill = clone(&g->perm, skill);
+    s->fetchargs  = clone(&g->perm, args);
+    s->fetchtext  = clone(&g->perm, text);
+    s->stick      = 1;
+    setnote(g, s, note, 0, 0);
+    cmdsend(g, &w, a);
+}
+
 // A skills reply: the list kept anew only when it changed.
 static void onskills(Gui *g, GuiSession *s, Json *j, b32 ok)
 {
@@ -4364,7 +4399,8 @@ static void onskills(Gui *g, GuiSession *s, Json *j, b32 ok)
                t->desc==jsonstr(jsonget(k, "description")) &&
                t->path==jsonstr(jsonget(k, "path")) &&
                t->hidden==(jsonget(k, "hidden")->boolean != 0) &&
-               t->builtin==(jsonget(k, "builtin")->boolean != 0);
+               t->builtin==(jsonget(k, "builtin")->boolean != 0) &&
+               t->from==jsonstr(jsonget(k, "from"));
     }
     if (!ok || same) {
         return;
@@ -4377,6 +4413,7 @@ static void onskills(Gui *g, GuiSession *s, Json *j, b32 ok)
         t.path   = clone(&g->perm, jsonstr(jsonget(k, "path")));
         t.hidden  = jsonget(k, "hidden")->boolean != 0;
         t.builtin = jsonget(k, "builtin")->boolean != 0;
+        t.from    = clone(&g->perm, jsonstr(jsonget(k, "from")));
         s->skills = push(&g->perm, s->skills, t);
     }
     scheddirty(&g->sched);
@@ -6019,6 +6056,22 @@ static b32 attachpaste(Gui *g, GuiSession *s)
     return got;
 }
 
+// skill.fetch replied (guiskillgo): the prompt that invokes the skill
+// now, else the failure's note, and the text back in the box if it is
+// still empty.
+static void onskillfetch(Gui *g, GuiSession *s, b32 ok, Str err)
+{
+    s->fetchid = 0;
+    if (!ok) {
+        setnote(g, s, err.len ? err : Str("fetching the skill failed"), 1);
+        if (s->fetchtext.len && !draftstr(s).len) {
+            setdraft(g, s, s->fetchtext);
+        }
+    } else if (s->view && !s->gone) {
+        guiskill(g, s, s->fetchskill, s->fetchargs, s->fetchtext);
+    }
+}
+
 // The reply to a session operation from the box (guicompact and the
 // rest): its note, or its error with the command put back in the box,
 // if it is still empty, to try again; a fork's new session is shown.
@@ -6344,6 +6397,12 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
         if (q.s && q.s->skillsid==id) {
             q.s->skillsid = 0;
             onskills(g, q.s, j, ok);
+        }
+        return;
+
+    case CMD_SKILLFETCH:
+        if (q.s && q.s->fetchid==id) {
+            onskillfetch(g, q.s, ok, err);
         }
         return;
 
@@ -7726,9 +7785,14 @@ static void guirelaylostall(Gui *g, Arena a, Str why)
 }
 
 // A host went down or away: the main engine stops its calls, and what
-// waited for it goes.
+// waited for it goes, a skill's fetch too, whose reply will not come.
 static void guirelaydrop(Gui *g, Arena a, GuiHost *h)
 {
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        if (s->host==h && s->fetchid) {
+            onskillfetch(g, s, 0, "fetching the skill stopped: the connection broke");
+        }
+    }
     b32 any = 0;
     for (i32 i = 0; i < GUI_RELAYS; i++) {
         any |= g->relays[i].host == h->uid;
@@ -7744,7 +7808,12 @@ static void guirelaydrop(Gui *g, Arena a, GuiHost *h)
     h->offered = 0;
 }
 
-// A thin host's relay record: part of a call, to the main engine.
+static b32 hostskills(GuiHost *);
+
+// A thin host's relay record: part of a call, to the main engine. A
+// skill's fetch (skill/NAME) from a host that may have none is refused;
+// one of the user's alone goes only while the user's own /NAME in that
+// session waits for it, as the window vouches (invoked).
 static void guirelayin(Gui *g, GuiHost *h, Arena a, Json *j)
 {
     i64 rid = jsonint(jsonget(j, "rid"), 0);
@@ -7756,7 +7825,17 @@ static void guirelayin(Gui *g, GuiHost *h, Arena a, Json *j)
         }
         return;
     }
-    i64 part = jsonint(jsonget(j, "part"), -1);
+    i64 part    = jsonint(jsonget(j, "part"), -1);
+    Str path    = jsonstr(jsonget(j, "path"));
+    b32 skill   = part==0 && startswith(path, "skill/");
+    b32 invoked = 0;
+    if (skill && !hostskills(h)) {
+        guirelaylost(g, a, h, rid, "this computer shares no skills with this container");
+        return;
+    } else if (skill) {
+        GuiSession *s = findsess(g, h, jsonstr(jsonget(j, "session")));
+        invoked = s && s->fetchid && s->fetchskill==cuthead(path, 6);
+    }
     if (part == 0) {
         GuiRelay *x = guirelayat(g, h->uid, rid);
         for (i32 i = 0; !x && i < GUI_RELAYS; i++) {
@@ -7771,7 +7850,7 @@ static void guirelayin(Gui *g, GuiHost *h, Arena a, Json *j)
         return;  // ended already
     }
     // Only what a call is, never keys of the remote's choosing
-    Str line = relaycallline(&a, j, rid, relayorigin(&a, h));
+    Str line = relaycallline(&a, j, rid, relayorigin(&a, h), invoked);
     if (!guimainline(g, a, line)) {
         guirelaylost(g, a, h, rid, "this computer's engine took no call");
     }
@@ -7871,6 +7950,11 @@ static void guioffersend(Gui *g)
         putraw(&w.json, offer);
         cmdsend(g, &w, a);
         h->offered = 1;
+        for (GuiSession *s = g->sessions; s; s = s->next) {
+            if (s->host==h && s->view && !s->gone) {
+                guiskills(g, s);  // which the offer may change
+            }
+        }
     }
 }
 
@@ -11290,6 +11374,9 @@ static void guigit(Gui *g)
     if (s && ((focused && !g->gitfocused) || (pane && !g->gitpane))) {
         s->git.stale = 1;
     }
+    if (focused && !g->gitfocused) {
+        guiofferask(g);  // the user's skills may have changed meanwhile
+    }
     g->gitfocused = focused;
     g->gitpane    = pane;
     if (!s || s->gone || g->quitting || !hostcap(s->host, "git") || !hostlive(g, s)) {
@@ -14041,6 +14128,7 @@ enum : i32 {
     CHK_WTFRESH,      // the session shown, from the worktree dialog, is fresh,
                       // nested under its original
     CHK_THIN,         // the remote r is up and thin, the Hosts pane saying so
+    CHK_THINSKILL,    // the shown session's skill gnotes is as text says (thinskill)
     CHK_VIA,          // the session shown streams via this computer
     CHK_CFGSEARCH,    // the settings' search field has the keyboard
     CHK_CTR,          // the first container is as text says (ctrcheck)
@@ -14398,7 +14486,7 @@ static Str chknames[] = {
     "the folder can have a worktree, its changes counted",
     "the session works in its worktree, on its branch",
     "the worktree session starts fresh, under its original",
-    "the remote is thin", "its calls go via this computer",
+    "the remote is thin", "its skill is as expected", "its calls go via this computer",
     "the settings' search field has the keyboard",
     "the container is as expected",
     "the '@' picker listed the rows it should",
@@ -14526,6 +14614,7 @@ enum : i32 {
     W_WORKTREE,   // the session shown is on a branch starting with text
     W_THIN,       // the remote r is up and thin
     W_VIA,        // the session shown streams, relayed
+    W_THINSKILL,  // its skill gnotes is as text says (thinskill)
     W_CTR,        // the container runtime, or the first container, is as
                   // text says (ctrwait)
     W_TERM,       // the shown session's terminal shows text
@@ -14560,7 +14649,7 @@ static Str waitnames[] = {
     "the endpoint's ChatGPT state", "the ChatGPT sign-in",
     "the subagent on far", "the subagent on far shown", "a toast",
     "the changes", "the folder's probe", "the worktree's branch",
-    "the thin remote", "a relayed stream", "the container",
+    "the thin remote", "a relayed stream", "the thin remote's skill", "the container",
     "the terminal's text", "the terminal's program", "the terminals' count",
     "the file", "the file checked", "the file's find", "the pause",
 };
@@ -19221,11 +19310,43 @@ static DriveOp ctrops[] = {
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
 
+static ViewMsg *lastof(View *, i32 role);
+
+// The shown session's skill gnotes, which this window's engine shares
+// with r (tests/gui.py): "listed", from this computer, the user's alone;
+// "used", its fetch done, and the prompt that invoked it shown as typed,
+// the instructions it sent naming r's copy, from this computer.
+static b32 thinskill(Gui *g, Str what)
+{
+    GuiSession *s = g->sess;
+    if (!s || !s->view || s->host->kind!=GH_REMOTE) {
+        return 0;
+    } else if (what == "listed") {
+        for (iz i = 0; i < s->skills.len; i++) {
+            if (s->skills[i].name == "gnotes") {
+                return s->skills[i].from==g->machine && s->skills[i].hidden;
+            }
+        }
+        return 0;
+    }
+    Arena    a    = g->frame;
+    View    *v    = s->view;
+    ViewMsg *u    = lastof(v, VIEW_USER);
+    ViewMsg *n    = lastof(v, VIEW_NOTE);
+    b32      copy = n && (find(n->text, "/skills/gnotes/")>=0 ||
+                          find(n->text, "\\skills\\gnotes\\")>=0);
+    return !s->fetchid && u && u->text=="/gnotes the args" && copy &&
+           n->label=="To the agent: skill gnotes" &&
+           find(n->text, concat(&a, "copy of one from ", g->machine))>=0;
+}
+
 // A thin remote (--thin, tests/gui.py --mode thin): r's configuration
 // has no endpoint, so once up it is offered this window's models, and the
 // Hosts pane says so; a session there streams via this computer, which
-// the session bar names; its stream's link dropped mid-turn, the call is
-// lost and the turn goes on once r is back.
+// the session bar names, and lists the user's skills here, one of which,
+// the user's alone, /gnotes invokes, r fetching a copy first; its
+// stream's link dropped mid-turn, the call is lost and the turn goes on
+// once r is back.
 static DriveOp thinops[] = {
     {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
     {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
@@ -19272,6 +19393,21 @@ static DriveOp thinops[] = {
     {OP_CHECK, CHK_VIA, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "thin-2-via"},
     {OP_WAIT, W_IDLE, 0, 0, 60000, ""},
+    // The user's own skill here, theirs alone: /gnotes, typed and sent,
+    // has r fetch its copy before the prompt that invokes it
+    {OP_WAIT, W_THINSKILL, 0, 0, 30000, "listed"},
+    {OP_CHECK, CHK_THINSKILL, 0, 0, 0, "listed"},
+    {OP_MOVE, T_PROMPT, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 200, ""},
+    {OP_TEXT, 0, 0, 0, 300, "/gnotes the args"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_THINSKILL, 0, 0, 60000, "used"},
+    {OP_WAIT, W_IDLE, 0, 0, 60000, ""},
+    {OP_MARK, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_THINSKILL, 0, 0, 0, "used"},
+    {OP_SHOT, 0, 0, 0, 300, "thin-3-skill"},
     // The link dropped mid-stream: r fails the call as lost, and the
     // turn goes on once r is back
     {OP_PROMPT, 0, 0, 0, 100, "Stream for the link."},
@@ -19282,7 +19418,7 @@ static DriveOp thinops[] = {
     {OP_WAIT, W_REMOTEUP, 0, 0, 60000, ""},
     {OP_WAIT, W_IDLE, 0, 0, 90000, ""},
     {OP_MARK, 0, 0, 0, 1000, ""},
-    {OP_SHOT, 0, 0, 0, 300, "thin-3-after"},
+    {OP_SHOT, 0, 0, 0, 300, "thin-4-after"},
     {OP_SUMMARY, 0, 0, 0, 0, ""},
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
@@ -22688,6 +22824,8 @@ static b32 drivewaitdone(Gui *g)
     }
     case W_CTR:
         return ctrwait(g, g->ops[g->drivepc-1].text);
+    case W_THINSKILL:
+        return thinskill(g, g->ops[g->drivepc-1].text);
     case W_TERM: {
         Arena a = g->frame;
         return find(termscreen(g, &a), g->ops[g->drivepc-1].text) >= 0;
@@ -24873,6 +25011,8 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_CTR:
         return ctrcheck(g, g->ops[g->drivepc-1].text);
+    case CHK_THINSKILL:
+        return thinskill(g, g->ops[g->drivepc-1].text);
     case CHK_VIA:
         // The view names this computer, as the session bar shows it
         return g->sess && g->sess->host->kind==GH_REMOTE && g->machine.len &&

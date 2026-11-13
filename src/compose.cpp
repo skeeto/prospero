@@ -625,9 +625,11 @@ static b32 mentionqueue(MentionEdit *e, iz beg, iz end, Str was, Str text)
 struct SkillItem {
     Str name;
     Str desc;
-    Str path;     // its SKILL.md, empty if built in
+    Str path;     // its SKILL.md, empty if built in or another computer's
     b32 hidden;   // never offered to the agent: the user's alone
     b32 builtin;  // Prospero's own
+    Str from;     // the computer that shares it with a thin engine, which
+                  // fetches it first (skill.fetch)
 };
 
 // Whether a command has a skill's name, which it then keeps.

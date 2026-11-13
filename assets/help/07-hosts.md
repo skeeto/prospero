@@ -204,6 +204,19 @@ parent's models the same way, with no window needed. Guard, tools and
 shell settings are the remote's own, its built-in defaults if it has
 no file.
 
+Such a remote also has your own skills here ([Skills](help:instructions#skills)):
+those of `[skills] paths` in your own file, `--skillsdir`, `skills`
+next to your configuration and the four folders under `~`, but never a
+project's, nor the built-in `prospero`, which the remote has of its
+own. Its sessions list them below its own skills, and the Info list
+says "from" this computer. Each use copies the skill's whole folder
+into the session's folder there, where its scripts run (past 2 MB,
+`SKILL.md` alone). A skill for you alone (`disable-model-invocation`,
+`[skills] hidden`) goes there only for your own /NAME, which fetches
+its copy first, and never to an agent's subagent. `[skills] share =
+no` in your own file shares none, and names share only those. A
+subagent's container with no network gets none.
+
 An `[endpoint]` in the remote's own configuration makes it independent:
 its sessions then use only its own models.
 

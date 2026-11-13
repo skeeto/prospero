@@ -350,6 +350,15 @@ static void testrelaycall(Test *t)
         n++;
     }
     expect(t, "relaycall.once", istr(&a, n), istr(&a, countof(relaycallkeys) + 3));
+
+    // The client's own word for the user's /NAME, once, whatever the
+    // remote said
+    call = jsonparse(&a, relaycallline(&a, rec, 7, "h1", 1)).root;
+    n    = 0;
+    for (Json *m = call->child; m; m = m->next) {
+        n += m->key == "invoked";
+    }
+    expect(t, "relaycall.invoked", istr(&a, jsonint(jsonget(call, "invoked"), 0)*10 + n), "11");
 }
 
 static void testmailroom(Test *t)

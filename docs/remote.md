@@ -187,3 +187,38 @@ thin engine's `web_search` goes the same way, as a call to the path
 `search`, which the client's engine runs with its own `[web]`. A thin
 engine offers nothing, so relays never chain, and `prospero connect`
 does not relay.
+
+The offer also lists the user's own skills that the client's engine
+shares (`skills`: name, description, hidden), as `[skills] share`
+says: from absolute `[skills] paths` of the user's own file,
+`--skillsdir`, the configuration's `skills` and the four under `~`,
+filtered by `disabled` and `hidden`, never a project's nor `prospero`;
+a hostlink's offer has none of the user's alone, and none for a
+container with no network (nor does the window's offer to such a
+container). A thin session lists, below its own skills, those of one
+offer in its scope: one connected before one away, then the session's
+last relaying client, then the newest; the `skills` reply names that
+client as `from`. A use fetches `skill/NAME` (GET, no endpoint) from
+the client that listed it, retried once if lost. The client's engine
+answers with the skill's package, JSON `{name, files: [{path, text |
+data}], cut?}`: every file under its folder but dot-names, links and
+special files, sorted, `SKILL.md` first, each as text if valid UTF-8
+without NUL, else base64 `data`; past 2 MiB as encoded, `SKILL.md`
+alone with `cut`. The thin engine checks every path (relative, at most
+8 parts and 200 bytes, no empty, `.`-led, `\`, `:` or control
+character, none twice ignoring case, nor a file also a folder; on
+Windows no device names nor a part ending in a dot or space) and
+copies it to `sessions/SID/skills/NAME/HASH16`, the first 16 hex
+digits of the SHA-256 of each path, NUL, length, NUL, bytes: a folder
+per version, made under a temporary name and renamed, reused if
+there, never changed, the two newest kept; files starting `#!` or
+ELF are 0700, the rest 0600. The skill tool waits for its fetch.
+`skill.fetch {sid, name}` (cap `skill.fetch`) replies once the copy is
+current, late, so a host waits for it apart from its in-order replies
+(as for `config.get {refresh}`); `prompt {skill}` for a relayed skill
+uses the session's last copy, and fails without one. A skill of the
+user's alone is served only when part 0 of its call says `invoked`,
+which the window adds, never from the remote's record, while that
+session's `skill.fetch` of that skill waits: the window vouches for the
+user's own /NAME. `relay.call` carries only the keys of a call, so
+that a remote can name neither the command nor anything else.
