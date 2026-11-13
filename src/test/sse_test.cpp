@@ -202,10 +202,13 @@ static Str sselabel(Arena *a, Str name, Str mode, iz i, iz j)
 }
 
 // Chunking must not matter: split src once at every offset (empty chunks
-// at either end included), twice at every pair of offsets if it's short,
-// and into single bytes, and compare each trace with the whole one. Each
-// mode reports its first difference, labeled with the offsets.
-static void ssesplits(Test *t, Arena a, Str name, Str src, iz max, Str whole)
+// at either end included), twice at every pair of offsets if it's short
+// and pairs is set, and into single bytes, and compare each trace with
+// the whole one. Each mode reports its first difference, labeled with
+// the offsets. The pairs are quadratic in the length, and under the arena
+// checker they once took most of the unit tests' time.
+static void ssesplits(Test *t, Arena a, Str name, Str src, iz max, Str whole,
+                      b32 pairs = 1)
 {
     Arena tmp = a;
     Str   got = whole;
@@ -217,7 +220,7 @@ static void ssesplits(Test *t, Arena a, Str name, Str src, iz max, Str whole)
     }
     expect(t, sselabel(&tmp, name, ".split", at, -1), got, whole);
 
-    if (src.len <= 256) {
+    if (pairs && src.len<=256) {
         tmp = a;
         got = whole;
         at  = -1;
@@ -523,7 +526,7 @@ static void test_sse(Test *t)
             if (n < 100) {
                 Str name = sselabel(&tmp, "random", "", n, -1);
                 expect(t, sselabel(&tmp, name, ".model", -1, -1), whole, model);
-                ssesplits(t, tmp, name, src, max, whole);
+                ssesplits(t, tmp, name, src, max, whole, n<10);  // pairs: few
             } else if (whole != model) {
                 miss = n;  // keep tmp, which holds both
                 got  = whole;

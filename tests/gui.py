@@ -91,9 +91,9 @@ firstrun mode's configuration names no model and no remote host, so
 Settings and Hosts are in front with Help, and its display is too
 small for the first size (--display), so the window opens maximized.
 
-On Linux without a display it runs under xvfb-run. --serve only runs the
-provider and writes the configuration, for a GUI started elsewhere (a
-Windows console session): it prints the directories and waits.
+On Linux without a display it runs under xvfb-run. Otherwise it first
+waits for any other checklist on this desktop (~/.cache/prospero-gui.lock),
+since two at once share the clipboard and the pointer.
 """
 
 import argparse
@@ -1786,6 +1786,46 @@ class CtrWatch:
         return problems
 
 
+def desktoplock():
+    """Wait for any other checklist on this desktop, then hold it until
+    this process exits. Checklists on one desktop share its clipboard and
+    its pointer, so two at once fail each other's checks. Under xvfb-run
+    each has its own display, and needs none. The lock is a file in the
+    home directory, shared by every checkout and worktree."""
+    if sys.platform.startswith("linux") and not os.environ.get("DISPLAY") \
+            and not os.environ.get("WAYLAND_DISPLAY"):
+        return None
+    path = os.path.join(os.path.expanduser("~"), ".cache", "prospero-gui.lock")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    f = open(path, "a+")
+    if sys.platform == "win32":
+        import msvcrt
+        def take(wait):
+            f.seek(0)
+            try:
+                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                return True
+            except OSError:
+                if wait:
+                    time.sleep(1)
+                return False
+    else:
+        import fcntl
+        def take(wait):
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+                return True
+            except BlockingIOError:
+                return False
+    if not take(False):
+        start = time.monotonic()
+        print(f"waiting for another GUI checklist on this desktop ({path})", flush=True)
+        while not take(True):
+            pass
+        print(f"waited {time.monotonic()-start:.0f} s for the desktop", flush=True)
+    return f  # held open, so held, until exit
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--prospero", required=True,
@@ -1825,6 +1865,7 @@ def main():
     ap.add_argument("--fake", action="store_true",
                     help="the fake agent, no engine: M1's checklist and measurements")
     args = ap.parse_args()
+    lock = None if args.host else desktoplock()  # noqa: F841, held to exit
     if args.mode == "signals":
         return signals(args)
 
