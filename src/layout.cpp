@@ -866,13 +866,26 @@ static i32 blockhit(Measure *m, Doc *d, Placed *p, f32 x, f32 y)
     return runend(pieces, last);
 }
 
-// The top of the line holding a source offset in a message laid out by
-// layoutmsg, relative to the message's top: the first of the lines that
-// begin last at or before it, or 0 if none does.
-static f32 msgy(Doc *d, MsgLayout *ml, i32 off)
+// A row of a message laid out by layoutmsg: its top, relative to the
+// message's top, its height, and an x on it.
+struct MsgRow {
+    f32 y;
+    f32 h;
+    f32 x;
+};
+
+// The row holding a source offset in a message laid out by layoutmsg:
+// the first of the rows that begin last at or before it, an empty line
+// of a file at its own offset, else all zero. With m, x is the offset's
+// place on the row, in the last of its runs that begins at or before
+// it, or 0 on an empty row.
+static MsgRow msgrowat(Measure *m, Doc *d, MsgLayout *ml, i32 off)
 {
-    f32 y    = 0;
-    i32 best = -1;
+    MsgRow  r      = {};
+    i32     best   = -1;
+    Line   *row    = 0;
+    Placed *rowp   = 0;
+    Piece  *rowpcs = 0;
     for (iz k = 0; k < ml->blocks.len; k++) {
         Placed      *p      = &ml->blocks[k];
         BlockLayout *bl     = p->bl;
@@ -889,12 +902,35 @@ static f32 msgy(Doc *d, MsgLayout *ml, i32 off)
                 continue;
             }
             if (b<=off && b>best) {
-                best = b;
-                y    = p->y + l->y;
+                best   = b;
+                row    = l;
+                rowp   = p;
+                rowpcs = pieces;
             }
         }
     }
-    return y;
+    if (!row) {
+        return r;
+    }
+    r.y = rowp->y + row->y;
+    r.h = row->h;
+    if (m && row->nrun) {
+        Run *runs = rowp->bl->runs.data + row->run0;
+        i32  k    = 0;
+        for (i32 j = 1; j < row->nrun; j++) {
+            k = runbeg(rowpcs, &runs[j])<=off ? j : k;
+        }
+        r.x = runx(m, rowpcs, &runs[k], off);
+    }
+    return r;
+}
+
+// The top of the line holding a source offset in a message laid out by
+// layoutmsg, relative to the message's top: the first of the lines that
+// begin last at or before it, or 0 if none does.
+static f32 msgy(Doc *d, MsgLayout *ml, i32 off)
+{
+    return msgrowat(0, d, ml, off).y;
 }
 
 // The source offset nearest to (x, y) in a message laid out by

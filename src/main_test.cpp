@@ -843,6 +843,7 @@ int main()
     test_dock(&t);
     test_termset(&t);
     test_fileset(&t);
+    test_filefind(&t);
     test_palette(&t);
     test_viewexport(&t);
     #endif

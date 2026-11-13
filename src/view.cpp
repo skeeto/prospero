@@ -4261,6 +4261,14 @@ struct FindHit {
     i32 len;
 };
 
+// A message's find hits, in order, and which of them is current, -1
+// if none.
+struct Marks {
+    FindHit *h;
+    iz       n;
+    iz       cur;
+};
+
 // A message as a search last saw it.
 struct FindSeen {
     u8 *data;
@@ -4309,18 +4317,25 @@ static b32 findnorm(u8 *c, u8 prev)
     return 1;
 }
 
-// Search a view for q from the start, as searchstep goes on to.
-static void searchreset(ViewSearch *s, View *v, Str q)
+// A query as a search compares it, findnorm'd into dst, cut at qmax
+// bytes of q. Returns its length.
+static iz findq(u8 *dst, Str q, iz qmax)
 {
-    q = q.len>s->qmax ? takehead(q, s->qmax) : q;
+    q = q.len>qmax ? takehead(q, qmax) : q;
     iz n = 0;
     for (iz i = 0; i < q.len; i++) {
         u8 c = q[i];
-        if (findnorm(&c, n ? s->q.data[n-1] : 0)) {
-            s->q.data[n++] = c;
+        if (findnorm(&c, n ? dst[n-1] : 0)) {
+            dst[n++] = c;
         }
     }
-    s->q.len      = n;
+    return n;
+}
+
+// Search a view for q from the start, as searchstep goes on to.
+static void searchreset(ViewSearch *s, View *v, Str q)
+{
+    s->q.len      = findq(s->q.data, q, s->qmax);
     s->v          = v;
     s->hitmem.beg = s->hitbase;
     s->seenmem.beg = s->seenbase;
@@ -4464,14 +4479,14 @@ static b32 searchstep(ViewSearch *s, Arena scratch, iz budget)
     return 1;
 }
 
-// The first hit in a message at or after an offset, else the next
-// message's, else hits.len.
-static iz searchfrom(ViewSearch *s, i32 msg, i32 off)
+// The first of hits in a message at or after an offset, or holding it,
+// else the next message's, else hits.len.
+static iz hitfrom(Slice<FindHit> hits, i32 msg, i32 off)
 {
-    iz lo = 0, hi = s->hits.len;
+    iz lo = 0, hi = hits.len;
     while (lo < hi) {
         iz mid = lo + (hi - lo)/2;
-        FindHit *h = &s->hits[mid];
+        FindHit *h = &hits[mid];
         if (h->msg<msg || (h->msg==msg && h->off+h->len<=off)) {
             lo = mid + 1;
         } else {
@@ -4479,6 +4494,26 @@ static iz searchfrom(ViewSearch *s, i32 msg, i32 off)
         }
     }
     return lo;
+}
+
+// A message's hits, and which of them is current, cur being an index
+// into hits, -1 for none.
+static Marks hitmarks(Slice<FindHit> hits, iz cur, i32 msg)
+{
+    iz    lo = hitfrom(hits, msg, 0);
+    iz    hi = hitfrom(hits, msg+1, 0);
+    Marks r  = {};
+    r.h   = hits.data + lo;
+    r.n   = hi - lo;
+    r.cur = cur>=lo && cur<hi ? cur-lo : -1;
+    return r;
+}
+
+// The first hit in a message at or after an offset, else the next
+// message's, else hits.len.
+static iz searchfrom(ViewSearch *s, i32 msg, i32 off)
+{
+    return hitfrom(s->hits, msg, off);
 }
 
 

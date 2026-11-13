@@ -286,5 +286,49 @@ static void test_layout(Test *t)
         MsgLayout  el = layoutmsg(&cache, &a, &m, e, 50, 1);
         expect(t, "layout.liney", istr(&a, (i64)msgy(e, &el, 4)), "28");
         expect(t, "layout.linehit", istr(&a, msghit(&m, e, &el, 30, 30)), "4");
+
+        // The row of an offset, as "y+h@x": on a line wrapped to three
+        // rows, the second row's, its x as runx has it; an empty line
+        // its own, at x 0
+        auto rowstr = [&](MsgRow r) {
+            Buf b(&a, 32);
+            print(&b, (i64)r.y);
+            putbyte(&b, '+');
+            print(&b, (i64)r.h);
+            putbyte(&b, '@');
+            print(&b, (i64)r.x);
+            return finish(&b);
+        };
+        Doc       *w  = parsesource(&a, "abcdefghijklmn\nz\n", {}, 0);
+        MsgLayout  wl = layoutmsg(&cache, &a, &m, w, 50, 1);
+        BlockLayout *wb = wl.blocks[0].bl;
+        expect(t, "layout.rowrows", istr(&a, wb->lines.len), "3");
+        MsgRow r = msgrowat(&m, w, &wl, 7);
+        Line  *l = &wb->lines[1];
+        Piece *pw = w->pieces.data + w->blocks[0].piece0;
+        f32    x = runx(&m, pw, &wb->runs[l->run0+l->nrun-1], 7);
+        expect(t, "layout.rowat", rowstr(r), "14+14@20");
+        expect(t, "layout.rowatx", istr(&a, r.x==x && l->nrun==1), "1");
+
+        // A row of several runs: x in the last run that begins at or
+        // before the offset, not the row's first or last run
+        Doc       *v  = parsesource(&a, "ab\tcd\tef\n", {}, 0);
+        MsgLayout  vl = layoutmsg(&cache, &a, &m, v, 500, 1);
+        expect(t, "layout.rowruns", layoutshow(&a, v, &vl.blocks[0]),
+               "0:0[ab]20[>]40[cd]60[>]80[ef] ");
+        Line  *vline = &vl.blocks[0].bl->lines[0];
+        Run   *vr    = &vl.blocks[0].bl->runs[vline->run0];
+        Piece *pv    = v->pieces.data + v->blocks[0].piece0;
+        f32    x4    = msgrowat(&m, v, &vl, 4).x;
+        f32    x1    = msgrowat(&m, v, &vl, 1).x;
+        expect(t, "layout.rowatrun", istr(&a, x4==runx(&m, pv, &vr[2], 4)), "1");
+        expect(t, "layout.rowatrun", istr(&a, x4!=runx(&m, pv, &vr[0], 4)), "1");
+        expect(t, "layout.rowatrun", istr(&a, x4!=runx(&m, pv, &vr[4], 4)), "1");
+        expect(t, "layout.rowatrun", istr(&a, x1==runx(&m, pv, &vr[0], 1)), "1");
+        expect(t, "layout.rowatrun", istr(&a, x1!=runx(&m, pv, &vr[4], 1)), "1");
+        expect(t, "layout.rowaty", istr(&a, r.y==msgy(w, &wl, 7)), "1");
+        expect(t, "layout.rowatnom", rowstr(msgrowat(0, w, &wl, 7)), "14+14@0");
+        expect(t, "layout.rowatnext", rowstr(msgrowat(&m, w, &wl, 15)), "42+14@0");
+        expect(t, "layout.rowatempty", rowstr(msgrowat(&m, e, &el, 4)), "28+14@0");
     }
 }

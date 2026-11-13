@@ -910,14 +910,6 @@ enum : i32 {
     CH_COUNT,
 };
 
-// A message's find hits, in order, and which of them is current, -1
-// if none.
-struct Marks {
-    FindHit *h;
-    iz       n;
-    iz       cur;
-};
-
 // The part of a run a message's hits cover, highlighted behind its text:
 // the current hit stronger.
 static void drawmarks(Gui *g, ImDrawList *dl, Marks *mk, Piece *pieces, Run *r,
@@ -3706,12 +3698,7 @@ static Marks msgmarks(Gui *g, View *v, i32 msg)
     if (!g->findopen || s->v!=v || !s->hits.len) {
         return r;
     }
-    iz lo = searchfrom(s, msg, 0);
-    iz hi = searchfrom(s, msg+1, 0);
-    r.h   = s->hits.data + lo;
-    r.n   = hi - lo;
-    r.cur = s->cur>=lo && s->cur<hi ? s->cur-lo : -1;
-    return r;
+    return hitmarks(s->hits, s->cur, msg);
 }
 
 // A code block's Copy button, at its top right while the mouse is over

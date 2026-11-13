@@ -386,3 +386,263 @@ static void test_fileset(Test *t)
         }
     }
 }
+
+// A file find's hits as "chunk:off+len;", then "+" if full.
+static Str filehitstr(Arena *a, FileFind *f)
+{
+    Buf b(a, 64);
+    for (iz i = 0; i < f->hits.len; i++) {
+        FindHit *h = &f->hits[i];
+        print(&b, (i64)h->msg);
+        putbyte(&b, ':');
+        print(&b, (i64)h->off);
+        putbyte(&b, '+');
+        print(&b, (i64)h->len);
+        putbyte(&b, ';');
+    }
+    print(&b, f->full ? Str("+") : Str(""));
+    return finish(&b);
+}
+
+// Marks as filehitstr has hits, then "@cur", and "*" if carried.
+static Str filemarkstr(Arena *a, Marks mk, b32 carried)
+{
+    Buf b(a, 64);
+    for (iz i = 0; i < mk.n; i++) {
+        print(&b, (i64)mk.h[i].msg);
+        putbyte(&b, ':');
+        print(&b, (i64)mk.h[i].off);
+        putbyte(&b, '+');
+        print(&b, (i64)mk.h[i].len);
+        putbyte(&b, ';');
+    }
+    putbyte(&b, '@');
+    print(&b, (i64)mk.cur);
+    print(&b, carried ? Str("*") : Str(""));
+    return finish(&b);
+}
+
+// Go to line's parse as "line0-line1:col", else "no".
+static Str filegotostr(Arena *a, Str s)
+{
+    FrefLines l = {};
+    if (!filegotoparse(s, &l)) {
+        return "no";
+    }
+    Buf b(a, 64);
+    print(&b, (i64)l.line0);
+    putbyte(&b, '-');
+    print(&b, (i64)l.line1);
+    putbyte(&b, ':');
+    print(&b, (i64)l.col);
+    return finish(&b);
+}
+
+// Lines "x" to fill a chunk up to line k (0-based), then rest.
+static Str filelinesto(Arena *a, i32 k, Str rest)
+{
+    Buf b(a, 64);
+    for (i32 i = 0; i < k; i++) {
+        print(&b, "x\n");
+    }
+    print(&b, rest);
+    return finish(&b);
+}
+
+static void test_filefind(Test *t)
+{
+    Arena     a  = t->perm;
+    Os       *os = newos(&a, 1<<12);
+    FileFind *f  = newfilefind(&a, os_reserve(os, FILES_HITMEM), 256, FILES_HITS);
+
+    auto find = [&](Str text, Str q) {
+        filefindreset(f, text, q);
+        filefindstep(f, (iz)1<<30);
+        return filehitstr(&a, f);
+    };
+
+    // Matching: ASCII case folded, a run of whitespace one space, across
+    // lines; hits apart, a leading space a run's start, a trailing space
+    // one byte of its run, and other bytes compared as they are
+    expect(t, "filefind.case", find("a line here\n", "LINE"), "0:2+4;");
+    expect(t, "filefind.space", find("xa \t\n\n by", "a b"), "0:1+7;");
+    expect(t, "filefind.lines", find("one\n\ntwo\n", "one  TWO"), "0:0+8;");
+    expect(t, "filefind.apart", find("aaaa", "aa"), "0:0+2;0:2+2;");
+    expect(t, "filefind.lead", find("x  b\tb", " b"), "0:1+3;0:4+2;");
+    expect(t, "filefind.lead", find("x a  a b", " a "), "0:1+3;");
+    expect(t, "filefind.trail", find("a  b", "a "), "0:0+2;");
+    expect(t, "filefind.utf8", find("\xc3\x9cn\xc3\x8f \xc3\xbcn\xc3\xaf \xc3\x9cN\xc3\x8f",
+                                    "\xc3\x9cN\xc3\x8f"), "0:0+5;0:12+5;");
+    expect(t, "filefind.none", find("abc", "abcd"), "");
+
+    // Hits by chunk: line 255 to 257 across a blank line 256, from line
+    // 255's start in chunk 0, and chunk 1 from the 256th line break
+    {
+        Buf b(&a, 64);
+        iz  at255 = 0, at256 = 0, at299 = 0;
+        for (i32 i = 0; i < 300; i++) {
+            at255 = i==255 ? b.len : at255;
+            at256 = i==256 ? b.len : at256;
+            at299 = i==299 ? b.len : at299;
+            if (i != 256) {
+                print(&b, "line ");
+                print(&b, (i64)i);
+            }
+            putbyte(&b, '\n');
+        }
+        Str text = finish(&b);
+        Str want = concat(&a, concat(&a, "0:", istr(&a, at255)), "+18;");
+        expect(t, "filefind.chunk", find(text, "line 255 line 257"), want);
+        expect(t, "filefind.chunkat", istr(&a, f->chunkat[1]), istr(&a, at256));
+        want = concat(&a, concat(&a, "1:", istr(&a, at299 - at256)), "+8;");
+        expect(t, "filefind.chunk1", find(text, "line 299"), want);
+    }
+
+    // Stepping: a small budget goes on where it left off, to the same
+    // hits; a cap keeps hitmax hits, full once another is found; nothing
+    // to find is done at once
+    {
+        Str text = filelinesto(&a, 600, "the end x\n");
+        Str all  = find(text, "x ");
+        filefindreset(f, text, "x ");
+        expect(t, "filefind.budget", istr(&a, filefindstep(f, 10)), "0");
+        i32 steps = 1;
+        for (; !filefindstep(f, 10); steps++) {}
+        expect(t, "filefind.budget", filehitstr(&a, f), all);
+        expect(t, "filefind.steps", istr(&a, steps>100), "1");
+
+        FileFind *g = newfilefind(&a, os_reserve(os, FILES_HITMEM), 256, 4);
+        filefindreset(g, "aaaaaaaaaa", "a");
+        expect(t, "filefind.cap", istr(&a, filefindstep(g, 1<<20)), "1");
+        expect(t, "filefind.cap", filehitstr(&a, g), "0:0+1;0:1+1;0:2+1;0:3+1;+");
+        filefindreset(g, "aaaa", "a");
+        filefindstep(g, 1<<20);
+        expect(t, "filefind.capexact", filehitstr(&a, g), "0:0+1;0:1+1;0:2+1;0:3+1;");
+
+        // The real cap in its real Region: FILES_HITS hits kept, full
+        Buf hb(&a, FILES_HITS+1);
+        for (i32 i = 0; i <= FILES_HITS; i++) {
+            putbyte(&hb, 'a');
+        }
+        filefindreset(f, finish(&hb), "a");
+        expect(t, "filefind.hitsmax", istr(&a, filefindstep(f, (iz)1<<30)), "1");
+        expect(t, "filefind.hitsmax", istr(&a, f->hits.len), istr(&a, FILES_HITS));
+        expect(t, "filefind.hitsmax", istr(&a, f->full), "1");
+
+        filefindreset(f, "abc", "");
+        expect(t, "filefind.empty", istr(&a, f->done && filefindstep(f, 1)), "1");
+        expect(t, "filefind.empty", istr(&a, f->hits.len), "0");
+        filefindreset(f, "", "abc");
+        expect(t, "filefind.empty", istr(&a, f->done && filefindstep(f, 1)), "1");
+        filefindreset(f, "abc", "   ");
+        filefindstep(f, 1<<20);
+        expect(t, "filefind.blank", filehitstr(&a, f), "");
+
+        find("ab ab ab", "ab");
+        expect(t, "filefind.from", istr(&a, filefindfrom(f, 0, 4)), "1");  // inside
+        expect(t, "filefind.from", istr(&a, filefindfrom(f, 0, 5)), "2");
+        expect(t, "filefind.from", istr(&a, filefindfrom(f, 0, 8)), "3");  // past
+        expect(t, "filefind.from", istr(&a, filefindfrom(f, 1, 0)), "3");
+    }
+
+    // Marks by chunk: into hits as they are, unless a hit from an
+    // earlier chunk runs into it, whose tail then comes first, and the
+    // current hit is remapped past it
+    {
+        b32 carried = 0;
+        find("ab ab\n", "ab");
+        Marks mk = filemarks(&a, f, 0, 0, &carried);
+        expect(t, "filemarks.plain", filemarkstr(&a, mk, carried), "0:0+2;0:3+2;@-1");
+        expect(t, "filemarks.plain", istr(&a, mk.h == f->hits.data), "1");
+
+        Str text = filelinesto(&a, 255, "foo\nbar\nfoo bar\n");
+        find(text, "FOO BAR");
+        iz  c1   = f->chunkat[1];
+        expect(t, "filemarks.chunkat", istr(&a, c1), istr(&a, 255*2 + 4));
+        mk = filemarks(&a, f, 0, 0, &carried);
+        expect(t, "filemarks.carry0", filemarkstr(&a, mk, carried), "0:510+7;@-1");
+        mk = filemarks(&a, f, 1, c1, &carried);
+        expect(t, "filemarks.carry", filemarkstr(&a, mk, carried), "1:0+3;1:4+7;@-1*");
+        f->cur = 1;
+        mk = filemarks(&a, f, 1, c1, &carried);
+        expect(t, "filemarks.cur", filemarkstr(&a, mk, carried), "1:0+3;1:4+7;@1*");
+        f->cur = 0;
+        mk = filemarks(&a, f, 1, c1, &carried);
+        expect(t, "filemarks.curtail", filemarkstr(&a, mk, carried), "1:0+3;1:4+7;@0*");
+        mk = filemarks(&a, f, 2, f->text.len, &carried);
+        expect(t, "filemarks.after", filemarkstr(&a, mk, carried), "@-1");
+
+        // A hit through 300 blank lines, from chunk 0 into chunks 1 and 2
+        Buf b(&a, 64);
+        print(&b, filelinesto(&a, 255, "foo\n"));
+        for (i32 i = 0; i < 300; i++) {
+            putbyte(&b, '\n');
+        }
+        print(&b, "bar\n");
+        text = finish(&b);
+        find(text, "foo bar");
+        iz end = text.len - 1;
+        expect(t, "filemarks.span", filehitstr(&a, f), "0:510+307;");
+        for (i32 c = 1; c <= 2; c++) {
+            mk = filemarks(&a, f, c, f->chunkat[c], &carried);
+            Str want = concat(&a, concat(&a, concat(&a, istr(&a, c), ":0+"),
+                                         istr(&a, end - f->chunkat[c])), ";@-1*");
+            expect(t, "filemarks.span", filemarkstr(&a, mk, carried), want);
+        }
+    }
+
+    // Lines and columns: a chunk's line offsets, and a byte's line and
+    // column, a column counting code points and a tab one, both ways
+    {
+        Str chunk = "ab\ncd\n\nef";
+        expect(t, "fileline.off", istr(&a, filelineoff(chunk, 0)), "0");
+        expect(t, "fileline.off", istr(&a, filelineoff(chunk, 1)), "3");
+        expect(t, "fileline.off", istr(&a, filelineoff(chunk, 2)), "6");
+        expect(t, "fileline.off", istr(&a, filelineoff(chunk, 3)), "7");
+        expect(t, "fileline.off", istr(&a, filelineoff(chunk, 4)), "9");
+        expect(t, "fileline.off", istr(&a, filelineoff(chunk, 99)), "9");
+
+        auto lc = [&](Str text, iz off) {
+            i32 line = 0, col = 0;
+            fileoffline(text, off, &line, &col);
+            Str l = cuthead(text, filelineoff(text, line-1));
+            Buf b(&a, 32);
+            print(&b, (i64)line);
+            putbyte(&b, ':');
+            print(&b, (i64)col);
+            putbyte(&b, '=');
+            print(&b, (i64)(filelineoff(text, line-1) + filecolbyte(l, col)));
+            return finish(&b);
+        };
+        expect(t, "filecol.ascii", lc("abc\ndef\n", 5), "2:2=5");
+        expect(t, "filecol.ascii", lc("abc\ndef\n", 0), "1:1=0");
+        expect(t, "filecol.ascii", lc("abc\ndef\n", 4), "2:1=4");
+        expect(t, "filecol.tab", lc("\t\tx\n", 2), "1:3=2");
+        expect(t, "filecol.utf8", lc("a\xc3\xa9\xe2\x82\xac" "b\n", 6), "1:4=6");
+        expect(t, "filecol.utf8", lc("z\na\xc3\xa9\xe2\x82\xac" "b\n", 8), "2:4=8");
+        expect(t, "filecol.clamp", istr(&a, filecolbyte("ab\ncd", 9)), "2");
+        expect(t, "filecol.clamp", istr(&a, filecolbyte("ab\ncd", 0)), "0");
+        expect(t, "filecol.clamp", istr(&a, filecolbyte("a\xc3\xa9", 3)), "3");
+    }
+
+    // Go to line: N, N:C or A-B, spaces and a leading ':' allowed, past
+    // FREF_MAXLINE clamped, a reversed range swapped without its column
+    expect(t, "filegoto.n", filegotostr(&a, "12"), "12-12:0");
+    expect(t, "filegoto.nc", filegotostr(&a, "12:5"), "12-12:5");
+    expect(t, "filegoto.range", filegotostr(&a, "10-20"), "10-20:0");
+    expect(t, "filegoto.swap", filegotostr(&a, "20-10"), "10-20:0");
+    expect(t, "filegoto.colon", filegotostr(&a, ":12"), "12-12:0");
+    expect(t, "filegoto.space", filegotostr(&a, " 1500 - 1504 "), "1500-1504:0");
+    expect(t, "filegoto.space", filegotostr(&a, " : 1500 : 7 "), "1500-1500:7");
+    expect(t, "filegoto.big", filegotostr(&a, "99999999"), "10000000-10000000:0");
+    expect(t, "filegoto.big", filegotostr(&a, "5:99999999"), "5-5:10000000");
+    expect(t, "filegoto.zero", filegotostr(&a, "0"), "no");
+    expect(t, "filegoto.zero", filegotostr(&a, "12:0"), "12-12:0");
+    expect(t, "filegoto.bad", filegotostr(&a, "abc"), "no");
+    expect(t, "filegoto.bad", filegotostr(&a, "1:2:3"), "no");
+    expect(t, "filegoto.bad", filegotostr(&a, "-5"), "no");
+    expect(t, "filegoto.bad", filegotostr(&a, "12-"), "no");
+    expect(t, "filegoto.bad", filegotostr(&a, ""), "no");
+    expect(t, "filegoto.bad", filegotostr(&a, "::12"), "no");
+    expect(t, "filegoto.bad", filegotostr(&a, "123456789012345678901234567890123"), "no");
+}
