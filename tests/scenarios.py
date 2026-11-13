@@ -4081,7 +4081,7 @@ def hello_caps(t):
                                                    "term.input", "term.resize",
                                                    "term.ack", "term.close",
                                                    "fs.read", "fs.stat",
-                                                   "pause", "continue"]
+                                                   "pause", "continue", "skill.fetch"]
         t.check(cmds == want, f"cmds: {cmds}")
         caps = hello.get("caps", [])
         t.check(isinstance(caps, list) and all(isinstance(c, str) for c in caps) and
@@ -4092,7 +4092,7 @@ def hello_caps(t):
                  "message", "bypass", "nofolder", "dir", "config.create", "side", "background", "models",
                  "mcp", "mcp.auth", "task.remote", "task.host", "memory", "shell",
                  "git", "answer.trust", "trash", "cut", "endpoint.auth",
-                 "endpoint.copilot", "term", "ask.hold", "fs", "pause"} <= set(caps)
+                 "endpoint.copilot", "term", "ask.hold", "fs", "pause", "skill.fetch"} <= set(caps)
                 and "host" not in caps,
                 f"caps: {caps}")
         want = 0 if isinstance(t.host, XpHost) else 1  # ConPTY, from 10 1809
