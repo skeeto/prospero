@@ -3025,7 +3025,7 @@ GUI_PROMPTS = ("Stream slowly", "Run the tools", "be allowed", "wait for nobody"
                "Answer with links", "Ask me questions", "Describe the files",
                "Cite the files", "Read the cited lines", "Link the far file",
                "Edit the lines", "Edit the far file", "Remove the lines",
-               "Restore the lines",
+               "Restore the lines", "Plan the viewer test",
                "Run a command to stop", "Read a long prompt",
                "Start a subagent in a container", "Sleep in a container as a subagent")
 
@@ -3121,7 +3121,11 @@ def gui_turn(req):
 def sc_gui(model, n, req):
     prompt, step, after = gui_turn(req)
     last = after[-1] if after else {}
-    if "Describe the images" in prompt:
+    if "Plan the viewer test" in prompt:
+        # The remote-viewer checklist needs a plan on the remote engine;
+        # ordinary GUI turns keep following this scenario below.
+        yield from sc_plan(model, n, req)
+    elif "Describe the images" in prompt:
         # Attached in the compose box: as many as it sent, each a PNG or
         # a JPEG
         images = user_images(req)

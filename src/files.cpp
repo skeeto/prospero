@@ -1318,6 +1318,14 @@ static EditJump filejump(Gui *g, Arena *a, u64 host, Str path, i32 line, i32 col
     Str      here = filelocal(g, a, host, path, &why);
     EditJump j    = {};
     if (why.len) {
+        GuiHost *h = filehost(g, host);
+        if (h && h->kind==GH_REMOTE && !startswith(h->name, "ctr:")) {
+            // No path here: a remote-aware local editor, configured for this
+            // remote, receives the path there. Never substitute [ui] editor.
+            // Synthetic container hosts have no persistent local viewer row;
+            // their original mounted-only explanation remains accurate.
+            return remoteviewerfor(g, a, h->name, path, line, col);
+        }
         j.why = why;
         return j;
     }
@@ -1330,7 +1338,12 @@ static void filejumprun(Gui *g, Arena a, u64 host, Str path, i32 line, i32 col)
     Str why  = {};
     Str here = filelocal(g, &a, host, path, &why);
     if (why.len) {
-        g->lasterr = clone(&g->perm, why);
+        GuiHost *h = filehost(g, host);
+        if (h && h->kind==GH_REMOTE && !startswith(h->name, "ctr:")) {
+            remoteviewerrun(g, a, h->name, path, line, col);
+        } else {
+            g->lasterr = clone(&g->perm, why);
+        }
         return;
     }
     editorjumprun(g, a, here, line, col);
@@ -1340,6 +1353,9 @@ static void filejumprun(Gui *g, Arena a, u64 host, Str path, i32 line, i32 col)
 // editor whose arguments for a line aren't known, how to give them.
 static Str filejumptip(Arena *a, EditJump *j)
 {
+    if (j->argv.len) {
+        return concat(a, "Open the remote file with its configured viewer: ", j->line);
+    }
     Str tip = concat(a, "Open the file in your editor: ", j->line);
     if (!j->known) {
         tip = concat(a, tip, ". Its editor is not one known to take a line: "

@@ -176,6 +176,39 @@ when it changes, as a file on this computer is ([Files](help:sessions#files)).
 An engine older than this window says it is
 too old to show its files: update it (below).
 
+### Viewing remote files in a local editor
+
+A remote-aware editor installed here can open files there when this
+window's `[remote NAME]` has a `viewer` command template:
+
+```ini
+[remote test1]
+ssh = ad@test1
+viewer = fresh ssh://{ssh}{path}
+```
+
+That launches `fresh` with one argument,
+`ssh://ad@test1/home/ad/agent-context/plan.md`, for the example plan path.
+The Plan pane's **View in editor** and Files' **Open in editor** use the
+same detached launcher. There is no `[ui] editor` fallback.
+
+The placeholders are `{path}` (the absolute remote file or directory),
+`{ssh}` (the configured destination or ssh alias), `{wsl}` and `{exec}`
+(the connection value where applicable), `{remote}` (the section name),
+and Files' `{line}` and `{col}` (1 for either when none). Values for a
+different connection kind are unavailable and explain the problem. The
+template is split into arguments with `'...'` or `"..."` quoting before
+these values are substituted: replacement never splits an argument, and
+the command runs directly, without a shell. On Windows, use an executable,
+not a `.cmd` or `.bat` file. Terminal editors need an explicit terminal
+wrapper, such as `alacritty -e nvim …`.
+
+A remote viewer never holds plan approval, tells the agent the plan was
+edited, or gets a Cancel button or exit-driven refresh. The approval
+card's **Edit plan** remains local-only. Existing local, mounted-container
+and Windows-WSL editor paths still work as before, and Reveal is unchanged.
+Generated `ctr:` hosts keep their mounted-only behavior.
+
 ## A remote with no models of its own
 
 A remote needs no configuration. One whose configuration has no

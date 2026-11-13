@@ -790,6 +790,18 @@ static CfgKey cfgschema[] = {
      "without a shell (quote a word with spaces): docker exec -i NAME, say, "
      "for a container that is already running, or podman, incus or kubectl "
      "the same way. The machine needs /bin/sh"},
+    {"remote", "viewer", CFG_STRING, "", {}, {}, "remote",
+     "The local command that opens this remote's files in a remote-aware "
+     "editor from Plan's View in editor and Files' Open in editor, launched "
+     "detached and without a shell. The whole command is a template: {path} "
+     "the absolute remote file or directory, {ssh} its ssh destination, "
+     "{wsl} its distro, {exec} its connection command (each available only "
+     "for that kind of connection), {remote} this section's name, and {line} "
+     "and {col} Files' position (1 for either when none). Split it into "
+     "arguments before replacing placeholders, quoting a word that holds "
+     "blanks, as in fresh ssh://{ssh}{path}. A terminal editor needs a "
+     "terminal wrapper, such as alacritty -e nvim {path}. Empty disables "
+     "those actions; [ui] editor is not a fallback"},
     {"remote", "path", CFG_STRING, "prospero", {}, {}, "remote",
      "The prospero executable there, a path or a name on its PATH; unset, "
      "the engine prospero deploy put there, else prospero"},

@@ -150,6 +150,64 @@ one or this executable built from source on Linux, gets none. `tools/engines.py`
 engines. The engine works without a helper, so one
 that cannot be put there, or does not run there, is only a warning.
 
+## Viewing remote files in a local editor
+
+The Plan pane's **View in editor** and the Files pane's **Open in editor**
+can give a remote path to an editor installed on this computer that knows
+how to reach the remote itself. Configure a full command template in the
+window's own `[remote NAME]` section:
+
+```ini
+[remote test1]
+ssh = ad@test1
+viewer = fresh ssh://{ssh}{path}
+```
+
+For `/home/ad/agent-context/plan.md` that runs the equivalent of
+`["fresh", "ssh://ad@test1/home/ad/agent-context/plan.md"]`. There is no
+URI construction in Prospero: the template decides what the editor takes.
+These placeholders are available:
+
+- `{path}`: the absolute remote file or directory path;
+- `{ssh}`: the configured SSH destination, whether an address or a Host
+  alias from `~/.ssh/config`;
+- `{wsl}` or `{exec}`: the WSL distro or connection command when that is
+  how the remote is reached;
+- `{remote}`: the remote section's name;
+- `{line}` and `{col}`: the Files pane's position, each defaulting to 1,
+  as in `editor --goto "{path}:{line}:{col}"`.
+
+Quoting belongs to the command template, which is split into arguments
+with `'...'` or `"..."` quoting before substitution. A substituted value
+never splits its argument, even when it contains spaces, quotes, Unicode
+or shell metacharacters. The resulting argv runs directly, with the
+window's environment and PATH, not through `/bin/sh`, `cmd.exe` or another
+implicit shell. An executable beginning `~/` names one under this
+computer's home directory. On Windows, name a direct executable: `.cmd`
+and `.bat` files are not valid viewers, including when an extensionless
+name cannot find an `.exe`; `cmd.exe` is not used to run them. A terminal
+editor needs an explicit terminal wrapper, for example:
+
+```ini
+viewer = alacritty -e nvim ssh://{ssh}{path}
+```
+
+An unavailable placeholder, malformed or empty command, or missing
+executable disables the action with a reason and does not fall back to
+`[ui] editor`. With no `viewer`, the action says how to configure one.
+Existing local files, mounted container folders and Windows-WSL path
+mappings keep using the existing editor actions; Reveal is unchanged.
+Generated `ctr:` container hosts have no persistent viewer row and retain
+their original mounted-only behavior.
+
+The viewer is detached: it holds neither the draft/plan editor process nor
+plan approval, and closing it does not tell the agent that the plan was
+edited or cause an exit-driven refresh. A pending plan-approval card's
+**Edit plan** remains local-only in this stage. The remote Plan pane uses
+**View in editor** instead, including while approval waits.
+
+## A remote with no models of its own
+
 An engine whose own configuration has no `[endpoint]` with a real URL
 is thin: it uses the models of the clients connected to it. A client
 that knows the `relay` cap sends `relay.offer` with its offer, the

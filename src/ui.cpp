@@ -2207,6 +2207,24 @@ static void planeditbutton(Gui *g, GuiSession *s, Str path, Str req, char const 
     whytip(why.len ? why : tip);
 }
 
+// A remote plan's detached View in editor. Unlike planeditbutton this has no
+// process or approval state: it starts the local viewer and returns. The
+// pending approval card does not use it; its Edit plan stays as above.
+static void planviewbutton(Gui *g, GuiSession *s, Str path)
+{
+    Arena a = g->frame;
+    EditJump j = remoteviewerfor(g, &a, s->host->name, path, 0, 0);
+    ImGui::BeginDisabled(j.why.len != 0);
+    if (ImGui::Button("View in editor")) {
+        remoteviewerrun(g, a, s->host->name, path, 0, 0);
+    }
+    ImGui::EndDisabled();
+    itemnamed(g, "plan viewer");
+    whytip(j.why.len ? j.why : Str("Open the remote plan with this remote's configured "
+                                   "viewer. It runs independently: closing it refreshes "
+                                   "nothing here and tells the agent nothing"));
+}
+
 // The form for a session's waiting questions, started over for each new
 // ask with its recommended options picked.
 static QForm *qformof(Gui *g, GuiSession *s, ViewTool *t)
@@ -9959,10 +9977,10 @@ static b32 samelineif(f32);
 
 // The session's plan file, as plan mode writes it, fetched as it
 // changes (guiplan), shown as a document (drawdoc): its text selectable,
-// copied as text or as Markdown. While the file is there, it opens in
-// the editor, as the waiting plan's Edit plan, else edited by hand with
-// the agent not told, and in the system's file manager, both only on
-// this computer.
+// copied as text or as Markdown. A local file opens in the editor, as the
+// waiting plan's Edit plan, else edited by hand with the agent not told. A
+// remote one opens in its configured detached viewer instead. Reveal and
+// the local editor work only on this computer.
 static void drawplan(Gui *g)
 {
     GuiSession *s = g->sess;
@@ -9994,8 +10012,13 @@ static void drawplan(Gui *g)
     if (shown) {
         i32       k = planask(v);
         ViewTool *t = k>=0 ? v->msgs[k].tool : 0;
-        if (t) {
-            Str path = t->path.len ? t->path : v->planpath;
+        Str path = t && t->path.len ? t->path : v->planpath;
+        if (s->host->kind==GH_REMOTE && !startswith(s->host->name, "ctr:")) {
+            // Detached even while approval waits. The card's Edit plan remains
+            // the local, waiting editor flow (and stays disabled remotely).
+            // Synthetic ctr: hosts have no persistent viewer configuration.
+            planviewbutton(g, s, path);
+        } else if (t) {
             planeditbutton(g, s, path, t->req, "Edit plan", "plan editor", planedittip);
         } else {
             planeditbutton(g, s, v->planpath, {}, "View in editor", "plan editor",

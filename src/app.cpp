@@ -7086,18 +7086,24 @@ static void guishow(Gui *g, Str path)
 }
 
 // Whether a program the GUI would run is there: at its path if it has
-// a separator (~/ the home directory), else on the GUI's PATH, with
-// PATHEXT's extensions on Windows when it has none. Network paths are
-// never touched (one may stall for seconds): a program there counts as
-// found, and a PATH entry there is passed over.
-static b32 editorfound(Gui *g, Arena a, Str prog)
+// a separator (~/ the home directory), else on the GUI's PATH. The shell
+// editor tries PATHEXT on Windows; a direct viewer matches os_launch's
+// extensionless .exe lookup only. Network paths are never touched (one may
+// stall for seconds): a program there counts as found, and a PATH entry
+// there is passed over.
+static b32 editorfound(Gui *g, Arena a, Str prog, b32 direct)
 {
     if (cfgtilde(prog)) {
         prog = concat(&a, userhome(g->os, &a), cuthead(prog, 1));
     }
     Slice<Str> exts = {};
     exts = push(&a, exts, Str{});
-    if (HOST_WINDOWS && find(basename(prog), ".")<0) {
+    if (HOST_WINDOWS && direct && find(basename(prog), ".")<0) {
+        // os_launch's childpath looks only for .exe when a direct viewer's
+        // name has no extension. Unlike the shell editor, do not accept a
+        // .cmd or .bat that CreateProcessW has no shell to interpret.
+        exts = push(&a, exts, Str(".exe"));
+    } else if (HOST_WINDOWS && !direct && find(basename(prog), ".")<0) {
         Str pe = trim(os_getenv(g->os, &a, "PATHEXT"));
         for (Str rest = pe.len ? pe : Str(".COM;.EXE;.BAT;.CMD"); rest.len;) {
             Cut c = cut(rest, ';');
@@ -7133,6 +7139,30 @@ static b32 editorfound(Gui *g, Arena a, Str prog)
     return 0;
 }
 
+// Look for the program an EditJump names, as menus and toolbars ask for it
+// every frame: again when it or PATH changes, else at most every few seconds.
+static void editorfindfor(Gui *g, Arena *a, EditJump *j)
+{
+    if (j->why.len) {
+        return;
+    }
+    u64 key = hash(j->prog) ^ (hash(guipath(g, a))*1111111111111111111u);
+    i64 now = os_ticks(g->os);
+    if (!g->edfoundat || key!=g->edfoundkey || now-g->edfoundat>=5000000) {
+        g->edfound    = editorfound(g, *a, j->prog, j->argv.len>0);
+        g->edfoundkey = key;
+        g->edfoundat  = now;
+    }
+    if (!g->edfound) {
+        b32 sep = find(j->prog, "/")>=0 || (HOST_WINDOWS && find(j->prog, "\\")>=0);
+        Buf b(a, 64 + j->prog.len);
+        print(&b, j->argv.len ? Str("Its viewer, ") : Str("Its editor, "));
+        print(&b, sep ? j->prog : j->name);
+        print(&b, sep ? Str(", is not there") : Str(", is not on PATH"));
+        j->why = finish(&b);
+    }
+}
+
 // Open in editor for path, a file here, at line (1-based) and col (0
 // for none): the command, or why not.
 static EditJump editorjumpfor(Gui *g, Arena *a, Str path, i32 line, i32 col)
@@ -7143,29 +7173,32 @@ static EditJump editorjumpfor(Gui *g, Arena *a, Str path, i32 line, i32 col)
         tmpl = cmdhome(a, tmpl, userhome(g->os, a));
     }
     EditJump j = editorjump(a, cmd, tmpl, path, line>0 ? line : 1, col, HOST_WINDOWS);
-    if (!j.why.len) {
-        // Looked for again when the program or PATH changes, else at
-        // most every few seconds: menus and the toolbar ask each frame
-        u64 key = hash(j.prog) ^ (hash(guipath(g, a))*1111111111111111111u);
-        i64 now = os_ticks(g->os);
-        if (!g->edfoundat || key!=g->edfoundkey || now-g->edfoundat>=5000000) {
-            g->edfound    = editorfound(g, *a, j.prog);
-            g->edfoundkey = key;
-            g->edfoundat  = now;
-        }
-    }
-    if (!j.why.len && !g->edfound) {
-        b32 sep = find(j.prog, "/")>=0 || (HOST_WINDOWS && find(j.prog, "\\")>=0);
-        Buf b(a, 64 + j.prog.len);
-        print(&b, "Its editor, ");
-        print(&b, sep ? j.prog : j.name);
-        print(&b, sep ? Str(", is not there") : Str(", is not on PATH"));
-        j.why = finish(&b);
-    }
+    editorfindfor(g, a, &j);
     return j;
 }
 
-// Launch the editor on path at a line, left to run on its own: in the
+// Launch a remote viewer's argv, left to run on its own: in the checklist
+// only noted (g->editjump), never run. Its independent process never becomes
+// g->edproc, so no editor-exit record, Cancel or plan change belongs to it.
+static void viewerlaunch(Gui *g, Arena a, EditJump j)
+{
+    g->editjump = clone(&g->perm, j.line);
+    g->editjumps++;
+    guilog(g, concat(&a, "opening in the viewer: ", j.line));
+    if (g->drive) {
+        return;
+    }
+    // A remote path is no working directory here. The detached viewer gets
+    // the window's own environment and PATH, without an intervening shell.
+    Str        dir = userhome(g->os, &a);
+    Slice<Str> env = guienv(g, &a);
+    if (!os_launch(g->os, a, j.argv, dir, env)) {
+        g->lasterr = clone(&g->perm, concat(&a, "cannot start the viewer: ",
+                                            os_lasterr(g->os, &a)));
+    }
+}
+
+// Launch the local editor on path at a line, left to run on its own: in the
 // checklist only noted (g->editjump), never run.
 static void editorjumprun(Gui *g, Arena a, Str path, i32 line, i32 col)
 {
@@ -8365,6 +8398,78 @@ static Reach remotelink(Gui *g, Str name)
     t.wsl  = remoteset(g, name, "wsl");
     t.exec = remoteset(g, name, "exec");
     return reachof(&t);
+}
+
+// The local window's detached viewer for a remote file: its [remote NAME]
+// viewer and connection values as they are in effect here, never the remote
+// engine's configuration. An unset or bad one is a reason, not a fallback to
+// [ui] editor. line and col are Files' position, 0 for none (the Plan pane).
+static EditJump remoteviewerfor(Gui *g, Arena *a, Str name, Str path, i32 line, i32 col)
+{
+    EditJump j = {};
+    Str tmpl = trim(remoteset(g, name, "viewer"));
+    if (!tmpl.len) {
+        Buf b(a, 128 + 2*name.len);
+        print(&b, "No viewer: set viewer in this window's [remote ");
+        print(&b, name);
+        print(&b, "] section to a local command using {path}");
+        j.why = finish(&b);
+        return j;
+    }
+    Reach l = remotelink(g, name);
+    ViewerValues v = {};
+    v.path   = path;
+    v.ssh    = trim(l.ssh);
+    v.wsl    = trim(l.wsl);
+    v.exec   = trim(l.exec);
+    v.remote = name;
+    v.line   = line;
+    v.col    = col;
+    j = viewerjump(a, tmpl, v);
+    if (j.why.len) {
+        Buf b(a, 64 + name.len + j.why.len);
+        print(&b, "[remote ");
+        print(&b, name);
+        print(&b, "] viewer: ");
+        print(&b, j.why);
+        j.why = finish(&b);
+        return j;
+    }
+
+    // GUI command templates treat a leading ~/ (or ~\\ on Windows) as the
+    // local home, both when looking for the executable and when launching it.
+    if (cfgtilde(j.prog)) {
+        Str home = userhome(g->os, a);
+        if (home.len) {
+            j.argv[0] = concat(a, home, cuthead(j.prog, 1));
+            j.prog    = j.argv[0];
+            j.name    = basename(j.prog);
+            j.line    = viewershow(a, j.argv);
+        }
+    }
+    if (HOST_WINDOWS && viewerbatch(j.prog)) {
+        Buf b(a, 128 + name.len + j.prog.len);
+        print(&b, "[remote ");
+        print(&b, name);
+        print(&b, "] viewer: ");
+        print(&b, j.prog);
+        print(&b, " is a batch script; name a direct executable instead "
+                  "(a remote viewer does not use cmd.exe)");
+        j.why = finish(&b);
+        return j;
+    }
+    editorfindfor(g, a, &j);
+    return j;
+}
+
+static void remoteviewerrun(Gui *g, Arena a, Str name, Str path, i32 line, i32 col)
+{
+    EditJump j = remoteviewerfor(g, &a, name, path, line, col);
+    if (j.why.len) {
+        g->lasterr = clone(&g->perm, j.why);
+        return;
+    }
+    viewerlaunch(g, a, j);
 }
 
 // Whether connecting to a remote deploys an engine there as needed:
@@ -13470,6 +13575,8 @@ enum : i32 {
     OP_NODIALOG,  // the next file dialog cannot be shown, as without a portal
     OP_OPENFILE,  // open text in Files, as a reference (fileref) in --cwd,
                   // in the session shown
+    OP_VIEWERSET, // the shown remote's viewer: empty, invalid, valid, or a
+                  // template (a checklist override, not a configuration edit)
 };
 // OP_TEXTCWD with text types the --cwd directory and text after it, on
 // Windows with backslashes, as a Windows user types a path.
@@ -18393,7 +18500,25 @@ static DriveOp remoteops[] = {
     // refused; a link to a file there, and to one not there
     REMOTEFILES(OP_TEXTRCWD, "", "/hello.txt", "/nope.txt"),
     {OP_SHOT, 0, 0, 0, 300, "remote-files"},
-    {OP_CHECK, CHK_EDITWHY, 0, 0, 0, "Its file is on another computer"},
+    // Its configured viewer gets the path there, not [ui] editor or a local
+    // mapping. Unset and malformed ones say why; a valid one has its argv
+    // noted, never launched, with no blocking editor or plan state of ours.
+    {OP_CHECK, CHK_EDITWHY, 0, 0, 0,
+     "No viewer: set viewer in this window's [remote r] section to a local command using {path}"},
+    {OP_VIEWERSET, 0, 0, 0, 300, "invalid"},
+    {OP_CHECK, CHK_EDITWHY, 0, 0, 0,
+     "[remote r] viewer: cannot parse the viewer command: a single quote is not closed"},
+    {OP_VIEWERSET, 0, 0, 0, 300, "/definitely/not/a/prospero-viewer {path}"},
+    {OP_CHECK, CHK_EDITWHY, 0, 0, 0,
+     "Its viewer, /definitely/not/a/prospero-viewer, is not there"},
+    {OP_VIEWERSET, 0, 0, 0, 300, "valid"},
+    {OP_CHECK, CHK_EDITWHY, 0, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file editor"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_EDITJUMP, 1, 0, 0, " remote=r ssh://"},
+    {OP_CHECK, CHK_EDITJUMP, 1, 0, 0, "/hello.txt:1:1"},
+    {OP_CHECK, CHK_NOTEDITING, 0, 0, 0, ""},
     // Inline code naming the file there: a link once fs.stat there
     // found it
     {OP_CHECK, CHK_FILELINK, 1, 0, 0, "hello.txt"},
@@ -18418,6 +18543,42 @@ static DriveOp remoteops[] = {
     {OP_CHECK, CHK_FILEHOST, 1, 0, 0, ""},
     {OP_CHECK, CHK_FILEIMAGE, 40, 30, 0, "fit"},
     {OP_SHOT, 0, 0, 0, 300, "remote-image"},
+    // A remote plan pending approval: its card's Edit plan remains the
+    // disabled local flow, but the Plan pane's detached View in editor runs
+    // the same viewer without touching that approval or the local editor.
+    {OP_MOVE, T_NAMED, 0, 0, 100, "session mode"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "session mode Plan"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_MARK, 0, 0, 5000, "Plan mode"},
+    {OP_PROMPT, 0, 0, 0, 200, "Plan the viewer test"},
+    {OP_WAIT, W_ASK, 0, 0, 30000, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "edit plan"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_NOTEDITING, 0, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "session mode"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "show the plan"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_PLAN, 0, 0, 10000, "# Plan"},
+    {OP_MOVE, T_NAMED, 0, 0, 800, "plan viewer"},
+    {OP_CHECK, CHK_TOOLTIP, 0, 0, 0, "Open the remote plan"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_EDITJUMP, 2, 0, 0, "/plan.md:1:1"},
+    {OP_CHECK, CHK_NOTEDITING, 0, 0, 0, ""},
+    {OP_CHECK, CHK_PLANASK, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "remote-plan-view"},
+    {OP_MOVE, T_ALLOW, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_SAID, 0, 0, 15000, "Done"},
+    {OP_CHECK, CHK_PLANMODE, 0, 0, 0, ""},
     // URL includes, fetched again from the settings window
     {OP_MOVE, T_SETTINGSTAB, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -25530,6 +25691,44 @@ static void drivestep(Gui *g)
             break;
         }
         filesopen(g, g->sess, 0, p.path, ref.line0, ref.line1, ref.section);
+    } break;
+    case OP_VIEWERSET: {
+        Str name = g->sess && g->sess->host->kind==GH_REMOTE ? g->sess->host->name : Str{};
+        Str set  = op->text;
+        Arena a  = g->frame;
+        if (set == "invalid") {
+            set = "fresh '{path}";
+        } else if (set == "valid") {
+            // The running executable is a known local program. Quote its path
+            // for mcpwords; the checklist never launches it as a viewer.
+            Str exe = os_exepath(g->os, &a);
+            Buf b(&a, exe.len*2 + 96);
+            putbyte(&b, '"');
+            for (iz i = 0; i < exe.len; i++) {
+                if (exe[i]=='\\' || exe[i]=='"') {
+                    putbyte(&b, '\\');
+                }
+                putbyte(&b, exe[i]);
+            }
+            print(&b, "\" remote={remote} ssh://{ssh}{path}:{line}:{col}");
+            set = finish(&b);
+        }
+        b32 found = 0;
+        for (iz i = 0; name.len && i < g->cfgrows.len; i++) {
+            CfgRow *r = &g->cfgrows[i];
+            if (r->kind=="remote" && r->name==name && r->key=="viewer") {
+                r->value  = clone(&g->cfgmem, op->text.len ? set : Str{});
+                r->valid  = 1;
+                r->isdflt = !op->text.len;
+                found     = 1;
+            }
+        }
+        if (!found) {
+            guilog(g, "drive: FAIL no remote viewer setting to override");
+            g->drivechecks++;
+            g->drivefails++;
+        }
+        scheddirty(&g->sched);
     } break;
     case OP_PLACE:
         if (op->dx != 0) {

@@ -83,10 +83,20 @@ approval, rendered as the transcript renders Markdown. Select its
 text, and right-click to copy it as text or as Markdown.
 
 - **View in editor** opens the file in your editor at any time. While
-  a plan waits, this is the card's Edit plan; otherwise the agent is
-  not told.
+  a local plan waits, this is the card's Edit plan; otherwise the agent
+  is not told. On a remote, the approval card's Edit plan stays
+  disabled; this action instead uses the detached viewer below.
 - **Reveal** shows the file in Finder, File Explorer or the file
   manager.
 
-Both are only for a plan on this computer. The editor is `[ui] editor`,
-else `$VISUAL` or `$EDITOR` (see [Configuration](help:config)).
+For a plan on this computer, the editor is `[ui] editor`, else `$VISUAL`
+or `$EDITOR` (see [Configuration](help:config)). For a remote, set
+`[remote NAME] viewer` in this window's configuration to a local,
+remote-aware editor command, for example
+`fresh ssh://{ssh}{path}`. The command template also takes `{path}`,
+`{wsl}`, `{exec}`, `{remote}`, `{line}` and `{col}`; see
+[Hosts and remotes](help:hosts#viewing-remote-files-in-a-local-editor).
+There is no `[ui] editor` fallback. The detached viewer holds no plan
+approval, tells the agent nothing about edits, and has no Cancel or
+exit-driven refresh. The pending card's **Edit plan** remains local-only.
+Reveal is unchanged and only works for a file on this computer.

@@ -447,6 +447,114 @@ static void test_compose(Test *t)
     expect(t, "editor.jump.known", istr(&a, ej.known), "1");
     ej = editorjump(&a, "open -a Zed", {}, "/f", 1, 0, 0);
     expect(t, "editor.jump.openunknown", istr(&a, ej.known), "0");
+
+    // A remote viewer: split the template first, then substitute within each
+    // argument. No value becomes shell text or splits the argument it is in.
+    ViewerValues vv = {};
+    vv.path   = "/home/ad/agent-context/plan.md";
+    vv.ssh    = "ad@test1";
+    vv.remote = "test1";
+    EditJump vj = viewerjump(&a, "fresh ssh://{ssh}{path}", vv);
+    expect(t, "viewer.fresh", argstr(&a, vj.argv),
+           "fresh|ssh://ad@test1/home/ad/agent-context/plan.md");
+    expect(t, "viewer.fresh.argc", istr(&a, vj.argv.len), "2");
+    expect(t, "viewer.fresh.ok", vj.why, "");
+    expect(t, "viewer.batch.cmd", istr(&a, viewerbatch("code.cmd")), "1");
+    expect(t, "viewer.batch.upper", istr(&a, viewerbatch("C:\\Tools\\CODE.CMD")), "1");
+    expect(t, "viewer.batch.bat", istr(&a, viewerbatch("/opt/code.bat")), "1");
+    expect(t, "viewer.batch.exe", istr(&a, viewerbatch("code.exe")), "0");
+    expect(t, "viewer.batch.name", istr(&a, viewerbatch("code")), "0");
+    expect(t, "viewer.batch.script", istr(&a, viewerbatch("code.sh")), "0");
+    vv.path = "/home/ad/agent-context";
+    vj = viewerjump(&a, "fresh ssh://{ssh}{path}", vv);
+    expect(t, "viewer.directory", argstr(&a, vj.argv),
+           "fresh|ssh://ad@test1/home/ad/agent-context");
+
+    vv.path = "/srv/a plan.txt";
+    vv.line = 12;
+    vv.col  = 4;
+    vj = viewerjump(&a, "edit --name={remote} --uri=ssh://{ssh}{path} "
+                        "--goto \"{path}:{line}:{col}\"", vv);
+    expect(t, "viewer.embedded", argstr(&a, vj.argv),
+           "edit|--name=test1|--uri=ssh://ad@test1/srv/a plan.txt|--goto|"
+           "/srv/a plan.txt:12:4");
+    expect(t, "viewer.embedded.argc", istr(&a, vj.argv.len), "5");
+    vj = viewerjump(&a, "code --remote ssh-remote+{ssh} --goto {path}:{line}:{col}", vv);
+    expect(t, "viewer.layout", argstr(&a, vj.argv),
+           "code|--remote|ssh-remote+ad@test1|--goto|/srv/a plan.txt:12:4");
+    expect(t, "viewer.layout.argc", istr(&a, vj.argv.len), "5");
+    vv.line = vv.col = 0;
+    vj = viewerjump(&a, "edit +{line} --column={col} {path}", vv);
+    expect(t, "viewer.defaults", argstr(&a, vj.argv),
+           "edit|+1|--column=1|/srv/a plan.txt");
+
+    vv.ssh = "build-alias";
+    vj = viewerjump(&a, "fresh ssh://{ssh}{path}", vv);
+    expect(t, "viewer.alias", argstr(&a, vj.argv),
+           "fresh|ssh://build-alias/srv/a plan.txt");
+    vv.ssh = "other@example.com:2222";
+    vj = viewerjump(&a, "fresh ssh://{ssh}{path}", vv);
+    expect(t, "viewer.destination", argstr(&a, vj.argv),
+           "fresh|ssh://other@example.com:2222/srv/a plan.txt");
+    vv.ssh  = {};
+    vv.wsl  = "Debian Test";
+    vj = viewerjump(&a, "edit --distro={wsl} {path}", vv);
+    expect(t, "viewer.wsl", argstr(&a, vj.argv),
+           "edit|--distro=Debian Test|/srv/a plan.txt");
+    vv.wsl  = {};
+    vv.exec = "docker exec -i \"box name\"";
+    vj = viewerjump(&a, "edit --connection {exec} {path}", vv);
+    expect(t, "viewer.exec", argstr(&a, vj.argv),
+           "edit|--connection|docker exec -i \"box name\"|/srv/a plan.txt");
+    expect(t, "viewer.exec.argc", istr(&a, vj.argv.len), "4");
+
+    vv.ssh = "ad@test1";
+    Str oddpath = "/tmp/a b/'\"%☃;$HOME&|*?<>";
+    vv.path = oddpath;
+    vj = viewerjump(&a, "fresh ssh://{ssh}{path}", vv);
+    expect(t, "viewer.special.argc", istr(&a, vj.argv.len), "2");
+    expect(t, "viewer.special", vj.argv[1], concat(&a, "ssh://ad@test1", oddpath));
+    vj = viewerjump(&a, "fresh --open \"before {path} after\" '{ssh}'", vv);
+    expect(t, "viewer.special.embedded.argc", istr(&a, vj.argv.len), "4");
+    expect(t, "viewer.special.embedded", vj.argv[2], concat(&a, "before ", concat(&a, oddpath, " after")));
+    expect(t, "viewer.special.ssh", vj.argv[3], "ad@test1");
+    expect(t, "viewer.special.line", vj.line,
+           concat(&a, "fresh --open before ", concat(&a, oddpath, " after ad@test1")));
+
+    struct { Str name, tmpl, want; } vbad[] = {
+        {"empty", "", "the viewer command is empty"},
+        {"blank", " \t ", "the viewer command is empty"},
+        {"single", "fresh '{path}", "cannot parse the viewer command: a single quote is not closed"},
+        {"double", "fresh \"{path}", "cannot parse the viewer command: a double quote is not closed"},
+        {"program", "'' {path}", "the viewer command has no executable"},
+        {"unknown", "fresh {file}", "unknown placeholder {file}; expected {path}, {ssh}, "
+         "{wsl}, {exec}, {remote}, {line} or {col}"},
+        {"braces", "fresh {{path}}", ""},
+    };
+    for (iz i = 0; i < countof(vbad); i++) {
+        EditJump bad = viewerjump(&a, vbad[i].tmpl, vv);
+        expect(t, concat(&a, "viewer.bad.", vbad[i].name), bad.why, vbad[i].want);
+    }
+    ViewerValues missing = vv;
+    missing.ssh = {};
+    expect(t, "viewer.unavailable.ssh", viewerjump(&a, "fresh {ssh}", missing).why,
+           "placeholder {ssh} is unavailable for this remote");
+    missing = vv;
+    missing.wsl = {};
+    expect(t, "viewer.unavailable.wsl", viewerjump(&a, "fresh {wsl}", missing).why,
+           "placeholder {wsl} is unavailable for this remote");
+    missing = vv;
+    missing.exec = {};
+    expect(t, "viewer.unavailable.exec", viewerjump(&a, "fresh {exec}", missing).why,
+           "placeholder {exec} is unavailable for this remote");
+    missing.path = {};
+    expect(t, "viewer.unavailable.path", viewerjump(&a, "fresh {path}", missing).why,
+           "placeholder {path} is unavailable for this remote");
+    missing = vv;
+    missing.remote = {};
+    expect(t, "viewer.unavailable.remote", viewerjump(&a, "fresh {remote}", missing).why,
+           "placeholder {remote} is unavailable for this remote");
+
     expect(t, "editor.text", editortext("line one\nline two\r\n\n"), "line one\nline two");
     expect(t, "editor.keep", editortext("  indented\n\nend"), "  indented\n\nend");
     // The terminal: its arguments by platform and program, and the

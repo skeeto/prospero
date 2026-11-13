@@ -1,6 +1,6 @@
 // The compose box's logic, apart from ImGui: slash commands, recalling
-// the session's own prompts, a draft's debounce, and the command line
-// that opens the draft in an editor
+// the session's own prompts, a draft's debounce, the command line that
+// opens a draft or local file in an editor, and a remote viewer's argv
 //
 // Slash commands are recognized only as the message's first word, and
 // only these exact words: anything else that starts with a slash, such
@@ -991,12 +991,131 @@ static JumpKind *jumpkind(Str word)
 }
 
 struct EditJump {
-    Str line;  // the shell command, or null
-    Str prog;  // the program it runs, unquoted, to look for
-    Str name;  // its file name, as the user wrote it
-    b32 known; // its editor takes a line (else the path alone)
-    Str why;   // why not, else null
+    Str        line;  // the shell command, or a remote viewer's argv shown
+    Str        prog;  // the program it runs, unquoted, to look for
+    Str        name;  // its file name, as the user wrote it
+    Slice<Str> argv;  // a remote viewer's: launched directly, without a shell
+    b32        known; // its editor takes a line (else the path alone)
+    Str        why;   // why not, else null
 };
+
+// Values a remote's viewer template may name. Empty connection values are
+// unavailable, rather than empty strings to substitute. Lines are 1-based;
+// a column of 0 means none, and both default to 1 as editorjump's do.
+struct ViewerValues {
+    Str path;
+    Str ssh;
+    Str wsl;
+    Str exec;
+    Str remote;
+    i32 line;
+    i32 col;
+};
+
+// Windows needs a program, never a batch script: a direct CreateProcessW
+// viewer has no cmd.exe to interpret one. Other platforms run scripts by
+// their shebang as any direct exec does, so this check is applied only there.
+static b32 viewerbatch(Str prog)
+{
+    Str name = basename(prog);
+    return name.len>4 && (equalfold(cuthead(name, name.len-4), ".cmd") ||
+                          equalfold(cuthead(name, name.len-4), ".bat"));
+}
+
+// One template word after substitution. A braced identifier Prospero does
+// not know is an error; other braces are ordinary argument data. Replacing
+// after mcpwords split the command keeps every word one argument, whatever
+// blanks, quotes or shell metacharacters a value holds.
+static Str viewerword(Arena *a, Str word, ViewerValues v, Str *why)
+{
+    Buf b(a, word.len + v.path.len + 32);
+    for (iz i = 0; i < word.len;) {
+        if (word[i] != '{') {
+            putbyte(&b, word[i++]);
+            continue;
+        }
+        iz end = i + 1;
+        while (end<word.len && ((word[end]>='a' && word[end]<='z') ||
+                                (word[end]>='A' && word[end]<='Z') ||
+                                (word[end]>='0' && word[end]<='9') || word[end]=='_')) {
+            end++;
+        }
+        if (end==i+1 || end>=word.len || word[end]!='}') {
+            putbyte(&b, word[i++]);
+            continue;
+        }
+        Str key = span(word.data+i+1, word.data+end);
+        Str val = key=="path"   ? v.path :
+                  key=="ssh"    ? v.ssh :
+                  key=="wsl"    ? v.wsl :
+                  key=="exec"   ? v.exec :
+                  key=="remote" ? v.remote : Str{};
+        if (key=="line" || key=="col") {
+            i64 n = key=="line" ? (v.line>0 ? v.line : 1) : (v.col>0 ? v.col : 1);
+            print(&b, n);
+        } else if (val.len) {
+            print(&b, val);
+        } else {
+            Buf e(a, 192 + key.len);
+            if (!val.data && key!="path" && key!="ssh" && key!="wsl" &&
+                    key!="exec" && key!="remote") {
+                print(&e, "unknown placeholder {");
+                print(&e, key);
+                print(&e, "}; expected {path}, {ssh}, {wsl}, {exec}, "
+                          "{remote}, {line} or {col}");
+            } else {
+                print(&e, "placeholder {");
+                print(&e, key);
+                print(&e, "} is unavailable for this remote");
+            }
+            *why = finish(&e);
+            return {};
+        }
+        i = end + 1;
+    }
+    return finish(&b);
+}
+
+// How the GUI shows a finished argv. It is never a command to run: blanks
+// in an argument are not quoted here, so tests and callers use argv itself.
+static Str viewershow(Arena *a, Slice<Str> argv)
+{
+    Buf b(a, 256);
+    for (iz i = 0; i < argv.len; i++) {
+        print(&b, i ? Str(" ") : Str(""));
+        print(&b, argv[i]);
+    }
+    return finish(&b);
+}
+
+// A remote viewer's command, split before substitution and launched as
+// argv. line is only how the GUI shows and logs it, never a shell command.
+static EditJump viewerjump(Arena *a, Str tmpl, ViewerValues v)
+{
+    EditJump r = {};
+    McpWords w = mcpwords(a, tmpl);
+    if (w.err.len) {
+        r.why = w.err=="the command is empty" ? Str("the viewer command is empty") :
+                concat(a, "cannot parse the viewer command: ", w.err);
+        return r;
+    }
+    for (iz i = 0; i < w.words.len; i++) {
+        Str word = viewerword(a, w.words[i], v, &r.why);
+        if (r.why.len) {
+            return r;
+        }
+        r.argv = push(a, r.argv, word);
+    }
+    if (!r.argv.len || !r.argv[0].len) {
+        r.why = "the viewer command has no executable";
+        return r;
+    }
+    r.prog  = r.argv[0];
+    r.name  = basename(r.prog);
+    r.known = 1;
+    r.line  = viewershow(a, r.argv);
+    return r;
+}
 
 // A word for the shell: sh's quotes, or cmd.exe's double quotes.
 static Str jumpquote(Arena *a, Str s, b32 windows)

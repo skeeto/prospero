@@ -289,8 +289,14 @@ manager, and Open in editor opens it in your editor (`[ui] editor`,
 or [`[ui] editor_line`](settings:ui#editor_line) for one Prospero
 doesn't know) at the band's first line, else the line at the top,
 without waiting for it. Both work for a file on this computer, in a
-container's folder mounted here, or, on Windows, in a WSL distro;
-for another host's they say why not. A binary file says so, with Show
+container's folder mounted here, or, on Windows, in a WSL distro. For
+another host, Open in editor uses that remote's `viewer` command template
+in this window's `[remote NAME]` section: a local, remote-aware editor,
+launched detached without a shell or any `[ui] editor` fallback. With no
+viewer, or a bad one, it is disabled and says how to configure or fix it.
+Reveal still requires a local or mounted path. See
+[Hosts and remotes](help:hosts#viewing-remote-files-in-a-local-editor).
+A binary file says so, with Show
 as text anyway; past 4 MiB or 100,000 lines only the start shows.
 
 An image file (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp` or `.bmp`)
