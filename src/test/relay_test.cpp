@@ -1,6 +1,7 @@
 // Relay tests: relayed endpoints' URLs, an offer as a configuration
 // layer, with nothing unsound or secret in it, the layer under the
-// user's file only while that is thin, and mailroom's holding back.
+// user's file only while that is thin, what a client passes on of a
+// thin engine's call, and mailroom's holding back.
 
 static void testrelayurl(Test *t)
 {
@@ -145,6 +146,78 @@ static void testrelaylayer(Test *t)
     cfgfree(c);
 }
 
+// A JSON value as text, to compare
+static Str relayjsontext(Arena *a, Json *j)
+{
+    Buf     b(a, 256);
+    JsonOut w = {&b};
+    putjson(&w, j);
+    return finish(&b);
+}
+
+// A client passes on what a thin engine's call is, as relay.call, but
+// nothing else of the remote's record: not the command, nor its id, a
+// session, whose call it is, or what only the client may say.
+static void testrelaycall(Test *t)
+{
+    Arena     a = t->perm;
+    RelayCall c = {};
+    c.id                 = 3;
+    c.peer               = 2;
+    c.sid                = "s1";
+    c.endpoint           = "cp";
+    c.path               = "v1/messages";
+    c.method             = "POST";
+    c.accept             = "text/event-stream";
+    c.model              = "m1";
+    c.readms             = 5000;
+    c.kind               = EP_COPILOT;
+    c.hint.initiator     = "user";
+    c.hint.interaction   = "conversation-panel";
+    c.hint.vision        = 1;
+    c.keep               = 1;
+    c.base               = 0x1234;
+    c.len                = 10;
+    c.size               = 8;
+    c.zlen               = 6;
+    c.data               = "abcdef";
+    c.parts              = 1;
+    Str   part = relaypartline(&a, &c, 1<<10, 1);
+    Json *rec  = jsonparse(&a, part).root;
+    Json *call = jsonparse(&a, relaycallline(&a, rec, 7, "h1")).root;
+    i32   kept = 0;
+    for (Json *m = rec->child; m; m = m->next) {
+        if (m->key=="rid" || m->key=="peer" || m->key=="ts" || m->key=="ev") {
+            continue;
+        }
+        kept++;
+        expect(t, concat(&a, "relaycall.kept ", m->key),
+               relayjsontext(&a, jsonget(call, m->key)), relayjsontext(&a, m));
+    }
+    expect(t, "relaycall.all", istr(&a, kept), istr(&a, countof(relaycallkeys)));
+
+    // The remote's own keys of those names, and others, are not
+    Str forged = trim(part);
+    forged = concat(&a, cuttail(forged, 1),
+                    ",\"cmd\":\"new\",\"id\":5,\"sid\":\"x\",\"cid\":9,"
+                    "\"origin\":\"h9\",\"invoked\":1,\"cancel\":1,\"rid\":4}");
+    rec  = jsonparse(&a, forged).root;
+    call = jsonparse(&a, relaycallline(&a, rec, 7, "h1")).root;
+    expect(t, "relaycall.cmd", jsonstr(jsonget(call, "cmd")), "relay.call");
+    expect(t, "relaycall.cid", istr(&a, jsonint(jsonget(call, "cid"), 0)), "7");
+    expect(t, "relaycall.origin", jsonstr(jsonget(call, "origin")), "h1");
+    Str gone[] = {"id", "sid", "invoked", "cancel", "rid", "peer", "ts", "ev"};
+    for (iz i = 0; i < countof(gone); i++) {
+        expect(t, concat(&a, "relaycall.dropped ", gone[i]),
+               istr(&a, jsonget(call, gone[i])->type==JSON_MISSING), "1");
+    }
+    i32 n = 0;
+    for (Json *m = call->child; m; m = m->next) {
+        n++;
+    }
+    expect(t, "relaycall.once", istr(&a, n), istr(&a, countof(relaycallkeys) + 3));
+}
+
 static void testmailroom(Test *t)
 {
     Arena    a = t->perm;
@@ -164,5 +237,6 @@ static void test_relay(Test *t)
     testrelayurl(t);
     testrelayparse(t);
     testrelaylayer(t);
+    testrelaycall(t);
     testmailroom(t);
 }

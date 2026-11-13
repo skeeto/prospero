@@ -7723,20 +7723,9 @@ static void guirelayin(Gui *g, GuiHost *h, Arena a, Json *j)
     } else if (!guirelayat(g, h->uid, rid)) {
         return;  // ended already
     }
-    Buf     b(&a, 1024 + jsonstr(jsonget(j, "data")).len);
-    JsonOut w = {&b};
-    putobject(&w);
-    putstrkey(&w, "cmd", "relay.call");
-    putintkey(&w, "cid", rid);
-    putstrkey(&w, "origin", relayorigin(&a, h));
-    for (Json *m = j->child; m; m = m->next) {
-        if (!(m->key=="rid") && !(m->key=="peer") && !(m->key=="ts") && !(m->key=="ev")) {
-            putkey(&w, m->key);
-            putjson(&w, m);
-        }
-    }
-    putend(&w);
-    if (!guimainline(g, a, finish(&b))) {
+    // Only what a call is, never keys of the remote's choosing
+    Str line = relaycallline(&a, j, rid, relayorigin(&a, h));
+    if (!guimainline(g, a, line)) {
         guirelaylost(g, a, h, rid, "this computer's engine took no call");
     }
 }

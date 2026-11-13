@@ -1267,6 +1267,39 @@ static void relaysearched(Engine *e, Arena scratch, RelayServe *v, Str status,
     relayfinish(v, "ok", {});
 }
 
+// The keys of a thin engine's relay record (relaypartline) that its
+// client passes on in relay.call: all but its number (rid), peer, ts
+// and ev. Only these, as the record is the remote's, which must not
+// name the command, its id, a session to revive, or whose call it is
+// (cid, origin), as the last of keys repeated would.
+static Str relaycallkeys[] = {
+    "session", "endpoint", "anthropic", "kind", "path", "method", "accept",
+    "model", "readms", "initiator", "interaction", "vision", "keep", "base",
+    "len", "size", "zlen", "part", "parts", "data",
+};
+
+// The relay.call line for part of a thin engine's call, from its relay
+// record (rec), numbered cid by the client, which knows the engine as
+// origin: relaycallkeys of the record, and nothing else of it.
+static Str relaycallline(Arena *a, Json *rec, i64 cid, Str origin)
+{
+    Buf     b(a, 1024 + origin.len + jsonstr(jsonget(rec, "data")).len);
+    JsonOut w = {&b};
+    putobject(&w);
+    putstrkey(&w, "cmd", "relay.call");
+    putintkey(&w, "cid", cid);
+    putstrkey(&w, "origin", origin);
+    for (iz i = 0; i < countof(relaycallkeys); i++) {
+        Json *m = jsonget(rec, relaycallkeys[i]);
+        if (m->type != JSON_MISSING) {
+            putkey(&w, relaycallkeys[i]);
+            putjson(&w, m);
+        }
+    }
+    putend(&w);
+    return finish(&b);
+}
+
 // Part of a thin engine's call, which its client passed on (relay.call)
 // or a hostlink's host sent (far), or a cancel of one, or of every call
 // of the origin without a cid.
@@ -1509,14 +1542,15 @@ static b32 relayemit(Engine *e, Str line, RelayServe *v = 0)
     return 1;
 }
 
-static Str relaypart(Engine *e, Arena *a, RelayCall *c)
+// The relay record of c's next part, of at most part bytes, at time ts:
+// the first also says what the call is, in the keys relaycallkeys names.
+static Str relaypartline(Arena *a, RelayCall *c, iz part, i64 ts)
 {
-    iz    part = e->relay->part;
     iz    off  = (iz)c->sent * part;
     iz    n    = c->data.len-off<part ? c->data.len-off : part;
     Str   data = base64(a, Str(c->data.data+off, n));
     Buf   b(a, 1024 + data.len + c->sid.len + c->path.len + c->model.len);
-    EvOut w = evbegin(&b, {}, 0, os_time(e->os), EV_RELAY);
+    EvOut w = evbegin(&b, {}, 0, ts, EV_RELAY);
     putintkey(&w.json, "rid", (i64)c->id);
     putintkey(&w.json, "peer", c->peer);
     if (!c->sent) {
@@ -1554,6 +1588,11 @@ static Str relaypart(Engine *e, Arena *a, RelayCall *c)
     putintkey(&w.json, "parts", c->parts);
     putstrkey(&w.json, "data", data);
     return evend(&w);
+}
+
+static Str relaypart(Engine *e, Arena *a, RelayCall *c)
+{
+    return relaypartline(a, c, e->relay->part, os_time(e->os));
 }
 
 static Str relayout(Engine *e, Arena *a, RelayServe *v, Str key)
