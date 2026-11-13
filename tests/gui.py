@@ -91,14 +91,17 @@ firstrun mode's configuration names no model and no remote host, so
 Settings and Hosts are in front with Help, and its display is too
 small for the first size (--display), so the window opens maximized.
 
-On Linux without a display it runs under xvfb-run, as many at once as
-tests/slots.py has slots. Otherwise it first waits for any other
-checklist on this desktop (~/.cache/prospero-gui.lock), since two at
-once share the clipboard and the pointer. MODES gives each mode's
+On Linux without a display it makes a desktop of its own
+(tests/headless.py: Xvfb at --screen, openbox or --wm, and a session
+bus), as many at once as tests/slots.py has slots. Otherwise it first
+waits for any other checklist on this desktop
+(~/.cache/prospero-gui.lock), since two at once share the clipboard and
+the pointer. MODES gives each mode's
 timeout, and --modes-json prints it for tests/vm.py.
 """
 
 import argparse
+import atexit
 import base64
 import difflib
 import json
@@ -119,6 +122,7 @@ import zlib
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fake_provider  # noqa: E402
+import headless  # noqa: E402
 import slots  # noqa: E402
 import pids as P  # noqa: E402
 
@@ -450,7 +454,7 @@ def docktype(pid):
 
 
 def guipid(prospero, state):
-    """The GUI process: the harness, not xvfb-run, not the engine."""
+    """The GUI process: the harness, not the engine."""
     try:
         out = subprocess.run(["ps", "-eo", "pid=,args="], capture_output=True,
                              text=True).stdout
@@ -603,9 +607,6 @@ class Local:
         """Run the GUI, echoing its log (each line after tag, if any), in
         cwd (default the working directory). Returns (status, lines)."""
         cmd = [self.prospero] + ([sub] if sub else []) + guiargs
-        if sys.platform.startswith("linux") and not os.environ.get("DISPLAY") \
-                and not os.environ.get("WAYLAND_DISPLAY"):
-            cmd = ["xvfb-run", "-a", "-s", "-screen 0 1920x1080x24"] + cmd
         print(" ".join(cmd), flush=True)
         p = subprocess.Popen(cmd, cwd=cwd or self.path("work"), stdin=subprocess.DEVNULL,
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -872,9 +873,6 @@ def signals(args):
         root = tempfile.mkdtemp(prefix="prospero-sig-")
         state = os.path.join(root, "state")
         cmd = [prospero, "gui", "--fake", "--statedir", state]
-        if sys.platform.startswith("linux") and not os.environ.get("DISPLAY") \
-                and not os.environ.get("WAYLAND_DISPLAY"):
-            cmd = ["xvfb-run", "-a", "-s", "-screen 0 1920x1080x24"] + cmd
         env = dict(os.environ, SDL_WINDOW_ACTIVATE_WHEN_SHOWN="0")
         p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL, env=env, start_new_session=True)
@@ -962,7 +960,7 @@ def launch(args, host, guiargs, guicwd):
     problems = []
     first = {}
     t = threading.Thread(target=lambda: first.update(r=host.run(
-        guiargs, args.timeout, guicwd, tag="[1] ")))
+        guiargs, args.timeout, guicwd, tag="[1] ")), daemon=True)
     t.start()
     more = []
     plain = ["-c", host.path("prospero.ini"), "--statedir", host.path("state")]
@@ -1190,7 +1188,7 @@ def background(args, host, guiargs, guicwd):
     # short enough to end it all soon after
     t = threading.Thread(target=lambda: first.update(r=host.run(
         ["--background", "--host-idle", "20"] + guiargs, args.timeout, guicwd,
-        tag="[1] ")))
+        tag="[1] ")), daemon=True)
     t.start()
     more = []
     if not waitfor(lambda: host.read(host.path("work", "bg-ready")), 120, 1):
@@ -1369,9 +1367,6 @@ def crashed(args):
 
     def start():
         cmd = [prospero, "gui", "--fake", "--statedir", state]
-        if sys.platform.startswith("linux") and not os.environ.get("DISPLAY") \
-                and not os.environ.get("WAYLAND_DISPLAY"):
-            cmd = ["xvfb-run", "-a", "-s", "-screen 0 1920x1080x24"] + cmd
         env = dict(os.environ, SDL_WINDOW_ACTIVATE_WHEN_SHOWN="0")
         return subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL, env=env, start_new_session=True)
@@ -1849,6 +1844,10 @@ def main():
     ap.add_argument("--shots", help="save the checklist's screenshots here")
     ap.add_argument("--host", help="run the GUI on this Windows host's console")
     ap.add_argument("--trace", action="store_true", help="log where presses land")
+    ap.add_argument("--screen", default="1920x1080",
+                    help="headless on Linux: the private display's size")
+    ap.add_argument("--wm", default="openbox",
+                    help="headless on Linux: openbox, none, or a window manager's command")
     ap.add_argument("--fake", action="store_true",
                     help="the fake agent, no engine: M1's checklist and measurements")
     ap.add_argument("--modes-json", action="store_true",
@@ -1863,6 +1862,23 @@ def main():
         args.timeout = MODES[args.mode]["timeout"]
     lock = None if args.host else slots.take(  # noqa: F841, held to exit
         f"gui.py --mode {args.mode}", MODES[args.mode]["whole"])
+    # Ended by a signal, it still cleans up (atexit): the display, and
+    # the GUI and engine it started, which have sessions of their own
+    for sig in ("SIGTERM", "SIGHUP"):
+        if hasattr(signal, sig):
+            signal.signal(getattr(signal, sig), lambda n, _: sys.exit(128 + n))
+    if not args.host and slots.headless():
+        # A display, window manager and bus of its own, before any thread
+        desk = headless.Desktop(args.screen, args.wm, slots.count(),
+                                keepruntime=args.mode == "containers")
+        atexit.register(desk.stop)
+        desk.start()
+    elif sys.platform == "darwin":
+        # Nothing it starts takes the focus from the user's work, and the
+        # GUI keeps its hands off the user's clipboard and input
+        for k in ("SDL_WINDOW_ACTIVATE_WHEN_SHOWN", "SDL_WINDOW_ACTIVATE_WHEN_RAISED"):
+            os.environ.setdefault(k, "0")
+        os.environ.setdefault("PROSPERO_TEST_HANDSOFF", "1")
     if args.mode == "signals":
         return signals(args)
 
@@ -1894,6 +1910,15 @@ def main():
     for name, listing in M4MODELS.items():
         fake_provider.STATE.register(f"fake:{name}:{nonce}", **listing)
     host = Remote(args, srv.server_address[1]) if args.host else Local(args)
+    closed = []
+
+    def leftovers():
+        # Exited early, by an error or a signal: what it started goes
+        if not closed:
+            host.strays()
+            srv.shutdown()
+            host.close(args.keep)
+    atexit.register(leftovers)
     work = host.path("work")
     state = host.path("state")
     ini = host.path("prospero.ini")
@@ -2388,6 +2413,7 @@ def main():
 
     srv.shutdown()
     host.close(args.keep)
+    closed.append(True)
     if problems:
         for msg in problems:
             print("FAIL: " + msg)
