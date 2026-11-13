@@ -772,7 +772,8 @@ static b32     os_guiopenurl(Os *, Arena scratch, Str url);
 // of a real input event newer than the last one's, which no synthetic
 // event has (GUI_NOSERIAL). What a drag over the window holds may be
 // known only once it is dropped (GUI_NODRAGLOAD): Linux's drags never
-// say. The checklist allows for each.
+// say, and Windows' are not read for it, while macOS reads a drag's
+// pasteboard as it enters. The checklist allows for each.
 enum : u32 {
     GUI_NOPLACE    = 1<<0,
     GUI_NOSERIAL   = 1<<1,

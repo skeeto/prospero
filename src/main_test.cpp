@@ -849,6 +849,7 @@ int main()
     test_filefind(&t);
     test_palette(&t);
     test_dropto(&t);
+    test_dropload(&t);
     test_viewexport(&t);
     #endif
 

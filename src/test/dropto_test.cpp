@@ -71,6 +71,35 @@ static void test_cardplace(Test *t)
            "400,68 600,108");
 }
 
+// A load as "kind n dirs"
+static Str loadsay(Arena *a, DropLoad l)
+{
+    static Str const kinds[] = {"unknown", "files", "text", "other"};
+    Buf b(a, 64);
+    print(&b, kinds[l.kind]);
+    putbyte(&b, ' ');
+    print(&b, (i64)l.n);
+    putbyte(&b, ' ');
+    print(&b, (i64)l.dirs);
+    return finish(&b);
+}
+
+static void test_dropload(Test *t)
+{
+    Arena a = t->perm;
+    expect(t, "dropload.files", loadsay(&a, dropload(3, 3, 3, 1, 0)), "files 3 1");
+    // Past the scan, all files when all the scanned were
+    expect(t, "dropload.past", loadsay(&a, dropload(40, DROPLOAD_SCAN, DROPLOAD_SCAN, 2, 0)),
+           "files 40 2");
+    // Items neither files nor text are left out, the rest unknown
+    expect(t, "dropload.mixed", loadsay(&a, dropload(40, DROPLOAD_SCAN, 5, 0, 1)), "files 5 0");
+    expect(t, "dropload.huge", loadsay(&a, dropload((i64)1<<40, 16, 16, 0, 0)),
+           "files 2147483647 0");
+    expect(t, "dropload.text", loadsay(&a, dropload(2, 2, 0, 0, 1)), "text 0 0");
+    expect(t, "dropload.other", loadsay(&a, dropload(2, 2, 0, 0, 0)), "other 0 0");
+    expect(t, "dropload.empty", loadsay(&a, dropload(0, 0, 0, 0, 0)), "other 0 0");
+}
+
 static void test_dropto(Test *t)
 {
     Arena a = t->perm;

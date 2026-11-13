@@ -43,6 +43,24 @@ struct DropLoad {
     i32 dirs;  // folders among the first DROPLOAD_SCAN
 };
 
+// What a drag holds, from what a platform read of it: of items in all,
+// the first scanned (at most DROPLOAD_SCAN) held files, dirs of them
+// folders, and, of those not files, some held text. The items past the
+// scan are taken as files when all the scanned were; items neither
+// files nor text are left out where there are files, as the drop leaves
+// them.
+static DropLoad dropload(i64 items, i32 scanned, i32 files, i32 dirs, b32 text)
+{
+    DropLoad l = {DRAGLOAD_OTHER, 0, 0};
+    if (files > 0) {
+        i64 n = files==scanned ? items : files;
+        l = {DRAGLOAD_FILES, n>0x7fffffff ? 0x7fffffff : (i32)n, dirs};
+    } else if (text) {
+        l.kind = DRAGLOAD_TEXT;
+    }
+    return l;
+}
+
 // Where a drop goes (DEST_* is help's)
 enum : i32 {
     DROPTO_NONE,        // nowhere: refused

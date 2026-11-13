@@ -138,11 +138,16 @@ cancels it.
 
 - While files are dragged over the window, the place they would go is
   outlined, and a card says what a drop there does: Open in Files,
-  Attach, or Fill in the path; or, in amber, why they would not be
-  attached. The card knows only where the drag is, not what it holds:
-  it counts no files, and a folder dragged shows where files would go,
-  until the drop says otherwise. So does text on macOS and Linux;
-  Windows refuses dragged text at once, with no outline or card.
+  Attach, Fill in the path, or New session; or, in amber, why they
+  would not be attached. On macOS the card knows what a drag holds: it
+  counts the files and folders, a folder goes to New session, and
+  text is refused ("Only files can be dropped here"); where nothing in
+  the drag would be taken, the drop is refused and the drag springs
+  back. On Linux and Windows the card knows only where the
+  drag is, not what it holds: it counts no files, and a folder dragged
+  shows where files would go, until the drop says otherwise. So does
+  text on Linux; Windows refuses dragged text at once, with no outline
+  or card.
 - A folder dropped on the window, anywhere, opens the New session
   dialog with it.
 - While Open file asks for a path, a file dropped anywhere on the

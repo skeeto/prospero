@@ -12269,9 +12269,10 @@ static void gui_input(Gui *g, i32 kind)
     }
     if (g->drag.on && (kind==INPUT_MOVE || kind==INPUT_BUTTON)) {
         // No platform moves or clicks a window's pointer while a drag is
-        // over it: the drag ended unsaid (X11's refused drop, macOS's
-        // failed one). Not a wheel, which macOS passes on mid-drag, nor
-        // keys and focus, which reach a window a drag hovers
+        // over it: the drag ended unsaid (X11's refused drop; macOS's
+        // failed ones end through draggingEnded:). Not a wheel, which
+        // macOS passes on mid-drag, nor keys and focus, which reach a
+        // window a drag hovers
         g->drag.on = 0;
         guilog(g, "drag ended by input");
     }

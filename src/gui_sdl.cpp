@@ -189,8 +189,9 @@ struct GuiSdl {
                                // minimized nor full screen
     b32           max;         // maximized when last not full screen
     DropLoad      dragload;    // what a drag over the window holds, as
-                               // far as known (DRAGLOAD_UNKNOWN: SDL's
-                               // drags never say)
+                               // far as known: macOS reads its pasteboard
+                               // as it enters (macdragload); Linux's
+                               // drags never say (DRAGLOAD_UNKNOWN)
     GlViewport    glviewport;
     GlClearColor  glclearcolor;
     GlClear       glclear;
@@ -410,7 +411,11 @@ static b32 wayland()
 
 static u32 os_guilimits(Os *)
 {
-    return (wayland() ? GUI_NOPLACE|GUI_NOSERIAL : 0) | GUI_NODRAGLOAD;
+    u32 r = wayland() ? GUI_NOPLACE|GUI_NOSERIAL : 0;
+    #ifndef __APPLE__
+    r |= GUI_NODRAGLOAD;  // a drag says what it holds only on macOS
+    #endif
+    return r;
 }
 
 static i32 os_guidisplays(Os *, WinBox *out, i32 max)
@@ -830,6 +835,258 @@ static void handlemodflags()
     if (m && !macsendevent) {
         macsendevent = (void (*)(void *, void *, void *))method_setImplementation(m, (void *)macsend);
     }
+}
+
+// What a drag holds, before its drop. AppKit lets the window read the
+// drag's pasteboard as it enters, which SDL never does, so SDL's window
+// class gets its own draggingEntered: and draggingUpdated:. Each lets
+// SDL's run (which sends the drag's positions), then answers no
+// (NSDragOperationNone) where the core would refuse a drop at that point
+// (gui_dragrefuse), so Finder shows no badge and the drag snaps back,
+// and else SDL's own answer (Generic or Copy). A draggingEnded: is added
+// that calls SDL's draggingExited:, which ends SDL's drag and sends its
+// DROP_COMPLETE, as SDL's drops that fail (no type it wants, no data)
+// never do; after a real drop it is a second end, which changes
+// nothing. Installed once, before any window exists, as handlemodflags
+// is: a second time would save its own methods as SDL's.
+enum : uz {
+    NSDRAGNONE    = 0,
+    NSDRAGCOPY    = 1,
+    NSDRAGGENERIC = 4,
+    NSDRAGMOVE    = 16,
+};
+using MacDragOp = uz (*)(void *, void *, void *);
+static GuiSdl   *macdragp;
+static MacDragOp macdragentered;  // SDL's own
+static MacDragOp macdragupdated;
+static void    (*macdragended)(void *, void *, void *);  // NSWindow's, or null
+
+extern "C" void *method_getImplementation(void *);
+
+// What the drag info's pasteboard holds: an item with a file URL is a
+// file, a folder if the URL ends in '/', which NSURL writes for a
+// directory, a file reference URL (Finder's) too. Only the first
+// DROPLOAD_SCAN items are read (dropload). Nothing resolves or stats
+// a URL, so a folder on a share never holds up the drag. No file URL:
+// text if an item holds text, else something else.
+static DropLoad macdragload(void *info)
+{
+    void    *pool  = objc_autoreleasePoolPush();
+    void    *pb    = objcsend<void *>(info, "draggingPasteboard");
+    void    *items = pb ? objcsend<void *>(pb, "pasteboardItems") : 0;
+    uz       n     = items ? objcsend<uz>(items, "count") : 0;
+    uz       scan  = n<(uz)DROPLOAD_SCAN ? n : (uz)DROPLOAD_SCAN;
+    void    *furl  = nsstring("public.file-url");
+    void    *text  = nsstring("public.utf8-plain-text");
+    i32      files = 0;
+    i32      dirs  = 0;
+    b32      words = 0;
+    for (uz i = 0; i < scan; i++) {
+        void       *it  = objcsend<void *>(items, "objectAtIndex:", i);
+        char const *url = cstring(objcsend<void *>(it, "stringForType:", furl));
+        if (url) {
+            uz len = __builtin_strlen(url);
+            files++;
+            dirs += len && url[len-1]=='/';
+        } else {
+            void *types = objcsend<void *>(it, "types");
+            words |= types && objcsend<ObjcBool>(types, "containsObject:", text);
+        }
+    }
+    objc_autoreleasePoolPop(pool);
+    return dropload(n>(uz)I64MAX ? I64MAX : (i64)n, (i32)scan, files, dirs, words);
+}
+
+// The answer to a drag at the info's point, SDL's own (r) unless the
+// core would refuse a drop there. The point is in the window's own
+// coordinates, its origin at the bottom left, as SDL turns it.
+static uz macdragverdict(void *self, void *info, uz r)
+{
+    GuiSdl *p   = macdragp;
+    void   *win = p && p->window
+                  ? SDL_GetPointerProperty(SDL_GetWindowProperties(p->window),
+                                           SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, 0)
+                  : 0;
+    if (r==NSDRAGNONE || !win || win!=self) {
+        return r;  // nothing taken, or not the app's window
+    }
+    i32     h  = 0;
+    SDL_GetWindowSize(p->window, 0, &h);
+    NsPoint at = objcsend<NsPoint>(info, "draggingLocation");
+    f32     x  = (f32)at.x;
+    f32     y  = (f32)(h - at.y);
+    b32     in = x>=0 && y>=0;  // else over the title bar
+    return gui_dragrefuse(p->gui, x, y, in, p->dragload) ? NSDRAGNONE : r;
+}
+
+static uz macdragenter(void *self, void *sel, void *info)
+{
+    if (macdragp) {
+        macdragp->dragload = macdragload(info);
+    }
+    uz r = macdragentered(self, sel, info);
+    // SDL sends nothing as a drag enters: its first position, now, so
+    // the place shows from the start
+    macdragupdated(self, sel_registerName("draggingUpdated:"), info);
+    return macdragverdict(self, info, r);
+}
+
+static uz macdragupdate(void *self, void *sel, void *info)
+{
+    return macdragverdict(self, info, macdragupdated(self, sel, info));
+}
+
+static void macdragend(void *self, void *sel, void *info)
+{
+    objcsend<void>(self, "draggingExited:", info);
+    if (macdragended) {
+        macdragended(self, sel, info);
+    }
+}
+
+static void handledrags(GuiSdl *p)
+{
+    void *cls = objc_getClass("SDL3Window");
+    void *in  = sel_registerName("draggingEntered:");
+    void *up  = sel_registerName("draggingUpdated:");
+    void *end = sel_registerName("draggingEnded:");
+    void *mi  = cls ? class_getInstanceMethod(cls, in) : 0;
+    void *mu  = cls ? class_getInstanceMethod(cls, up) : 0;
+    if (!mi || !mu || macdragentered || macdragupdated) {
+        return;
+    }
+    macdragp       = p;
+    macdragentered = (MacDragOp)method_setImplementation(mi, (void *)macdragenter);
+    macdragupdated = (MacDragOp)method_setImplementation(mu, (void *)macdragupdate);
+    // NSWindow's own, inherited, is chained to; should SDL ever define
+    // one, it is replaced, and chained to likewise
+    void *me = class_getInstanceMethod(cls, end);
+    macdragended = me ? (void (*)(void *, void *, void *))method_getImplementation(me) : 0;
+    if (!class_addMethod(cls, end, (void *)macdragend, "v@:@")) {
+        method_setImplementation(me, (void *)macdragend);
+    }
+}
+
+// The checklist's drag (GEV_DRAG), as Finder's or an editor's comes: a
+// drag info of a class made here (ProsperoDragInfo), over a pasteboard of
+// its own holding a file URL per path or the words, handed to the
+// window's own dragging methods, SDL's and those above. It lasts from
+// its first move over the window to its leaving or drop, or until one
+// holding something else comes. A drop goes through SDL's own
+// performDragOperation:, as AppKit calls it only where the drag was
+// taken, which reads the pasteboard and sends its files.
+static void  *macdraginfo;  // the drag info, made once
+static void  *macdragpb;    // the drag's pasteboard, retained, or null
+static u64    macdraghash;  // what it holds
+static f32    macdragx;     // where, in the window's coordinates
+static f32    macdragy;
+
+static void *macinfopb(void *, void *)
+{
+    return macdragpb;
+}
+
+static NsPoint macinfoloc(void *, void *)
+{
+    i32 h = 0;
+    if (macdragp && macdragp->window) {
+        SDL_GetWindowSize(macdragp->window, 0, &h);
+    }
+    return {macdragx, h - (f64)macdragy};
+}
+
+static uz macinfomask(void *, void *)
+{
+    return NSDRAGCOPY|NSDRAGGENERIC|NSDRAGMOVE;  // as Finder allows
+}
+
+// Ends the checklist's drag, if any: left, or dropped where taken.
+static void macdragstop(void *win, b32 drop)
+{
+    if (!macdragpb) {
+        return;
+    }
+    if (drop) {
+        objcsend<ObjcBool>(win, "performDragOperation:", macdraginfo);
+    } else {
+        objcsend<void>(win, "draggingExited:", macdraginfo);
+    }
+    objcsend<void>(win, "draggingEnded:", macdraginfo);
+    objcsend<void>(macdragpb, "releaseGlobally");
+    objcsend<void>(macdragpb, "release");
+    macdragpb = 0;
+}
+
+static void macdrag(GuiSdl *p, GuiEvent *ge)
+{
+    void *pool = objc_autoreleasePoolPush();
+    void *win  = SDL_GetPointerProperty(SDL_GetWindowProperties(p->window),
+                                        SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, 0);
+    if (!macdraginfo) {
+        void *cls = objc_allocateClassPair(objc_getClass("NSObject"), "ProsperoDragInfo", 0);
+        if (cls) {
+            class_addMethod(cls, sel_registerName("draggingPasteboard"), (void *)macinfopb,
+                            "@@:");
+            class_addMethod(cls, sel_registerName("draggingLocation"), (void *)macinfoloc,
+                            "{CGPoint=dd}@:");
+            class_addMethod(cls, sel_registerName("draggingSourceOperationMask"),
+                            (void *)macinfomask, "Q@:");
+            objc_registerClassPair(cls);
+            macdraginfo = objcsend<void *>(objcsend<void *>(cls, "alloc"), "init");
+        }
+    }
+    if (!win || !macdraginfo || !macdragentered) {
+        ge->x = -1;  // no word of the drag to give
+        objc_autoreleasePoolPop(pool);
+        return;
+    }
+
+    u64 held = hash(ge->text) ^ (u64)ge->key;
+    if (macdragpb && (ge->button==0 || held!=macdraghash)) {
+        macdragstop(win, 0);
+    }
+    if (ge->button == 0) {
+        ge->x = 0;
+        objc_autoreleasePoolPop(pool);
+        return;
+    }
+
+    // The window's coordinates are ImGui's; the title bar's point is
+    // above them, as the platform has it
+    macdragx = ge->x;
+    macdragy = ge->y;
+    uz answer = NSDRAGNONE;
+    if (!macdragpb) {
+        void *list = objcsend<void *>(objc_getClass("NSMutableArray"), "array");
+        char const *item = ge->text.cdata;  // NUL-separated
+        char const *end  = item + ge->text.len;
+        for (; item && item<end; item += __builtin_strlen(item) + 1) {
+            void *ns = nsstring(item);
+            objcsend<void>(list, "addObject:", ge->key ? ns
+                : objcsend<void *>(objc_getClass("NSURL"), "fileURLWithPath:", ns));
+        }
+        void *pb = objcsend<void *>(objc_getClass("NSPasteboard"), "pasteboardWithUniqueName");
+        if (!pb) {
+            ge->x = -1;
+            objc_autoreleasePoolPop(pool);
+            return;
+        }
+        macdragpb   = objcsend<void *>(pb, "retain");
+        macdraghash = held;
+        objcsend<iz>(macdragpb, "clearContents");
+        objcsend<ObjcBool>(macdragpb, "writeObjects:", list);
+        answer = objcsend<uz>(win, "draggingEntered:", macdraginfo);
+        if (ge->button == 2) {
+            answer = objcsend<uz>(win, "draggingUpdated:", macdraginfo);
+        }
+    } else {
+        answer = objcsend<uz>(win, "draggingUpdated:", macdraginfo);
+    }
+    if (ge->button == 2) {
+        macdragstop(win, answer != NSDRAGNONE);
+    }
+    ge->x = answer != NSDRAGNONE;
+    objc_autoreleasePoolPop(pool);
 }
 
 // The checklist's paste as dictation apps post it (GEV_FLAGPASTE), sent
@@ -1351,6 +1608,7 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
     handlesettings(p->trayevent);
     handleclose(p->trayevent);
     handlemodflags();
+    handledrags(p);
     if (macinert) {
         macnomenu();
         macnofront();
@@ -2024,6 +2282,11 @@ static void os_guiinject(Os *os, GuiEvent *ge)
         }
     } return;
     case GEV_DRAG: {
+        #ifdef __APPLE__
+        // Through the window's own dragging methods, which read what it
+        // holds and may refuse it
+        macdrag(p, ge);
+        #else
         // As SDL sends a drag, every event at its point (the title bar's
         // above the window): positions as it moves, then as it drops,
         // its files (or text) and its end, or its end alone as it
@@ -2051,6 +2314,7 @@ static void os_guiinject(Os *os, GuiEvent *ge)
             SDL_PushEvent(&e);
         }
         ge->x = -1;
+        #endif
     } return;
     }
     e.common.timestamp = SDL_GetTicksNS();
