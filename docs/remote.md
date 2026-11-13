@@ -159,12 +159,12 @@ window's own `[remote NAME]` section:
 
 ```ini
 [remote test1]
-ssh = ad@test1
+ssh = user@host
 viewer = fresh ssh://{ssh}{path}
 ```
 
-For `/home/ad/agent-context/plan.md` that runs the equivalent of
-`["fresh", "ssh://ad@test1/home/ad/agent-context/plan.md"]`. There is no
+For `/home/user/agent-context/plan.md` that runs the equivalent of
+`["fresh", "ssh://user@host/home/user/agent-context/plan.md"]`. There is no
 URI construction in Prospero: the template decides what the editor takes.
 These placeholders are available:
 

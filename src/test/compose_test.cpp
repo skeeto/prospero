@@ -451,12 +451,12 @@ static void test_compose(Test *t)
     // A remote viewer: split the template first, then substitute within each
     // argument. No value becomes shell text or splits the argument it is in.
     ViewerValues vv = {};
-    vv.path   = "/home/ad/agent-context/plan.md";
-    vv.ssh    = "ad@test1";
+    vv.path   = "/home/user/agent-context/plan.md";
+    vv.ssh    = "user@host";
     vv.remote = "test1";
     EditJump vj = viewerjump(&a, "fresh ssh://{ssh}{path}", vv);
     expect(t, "viewer.fresh", argstr(&a, vj.argv),
-           "fresh|ssh://ad@test1/home/ad/agent-context/plan.md");
+           "fresh|ssh://user@host/home/user/agent-context/plan.md");
     expect(t, "viewer.fresh.argc", istr(&a, vj.argv.len), "2");
     expect(t, "viewer.fresh.ok", vj.why, "");
     // A direct Windows viewer has only CreateProcessW's candidate, never
@@ -477,10 +477,10 @@ static void test_compose(Test *t)
            istr(&a, shellkey!=editorfindkey("code", "C:\\Tools", 1)), "1");
     expect(t, "editor.findkey.repeat",
            istr(&a, shellkey==editorfindkey("code", "C:\\Tools", 0)), "1");
-    vv.path = "/home/ad/agent-context";
+    vv.path = "/home/user/agent-context";
     vj = viewerjump(&a, "fresh ssh://{ssh}{path}", vv);
     expect(t, "viewer.directory", argstr(&a, vj.argv),
-           "fresh|ssh://ad@test1/home/ad/agent-context");
+           "fresh|ssh://user@host/home/user/agent-context");
 
     vv.path = "/srv/a plan.txt";
     vv.line = 12;
@@ -488,12 +488,12 @@ static void test_compose(Test *t)
     vj = viewerjump(&a, "edit --name={remote} --uri=ssh://{ssh}{path} "
                         "--goto \"{path}:{line}:{col}\"", vv);
     expect(t, "viewer.embedded", argstr(&a, vj.argv),
-           "edit|--name=test1|--uri=ssh://ad@test1/srv/a plan.txt|--goto|"
+           "edit|--name=test1|--uri=ssh://user@host/srv/a plan.txt|--goto|"
            "/srv/a plan.txt:12:4");
     expect(t, "viewer.embedded.argc", istr(&a, vj.argv.len), "5");
     vj = viewerjump(&a, "code --remote ssh-remote+{ssh} --goto {path}:{line}:{col}", vv);
     expect(t, "viewer.layout", argstr(&a, vj.argv),
-           "code|--remote|ssh-remote+ad@test1|--goto|/srv/a plan.txt:12:4");
+           "code|--remote|ssh-remote+user@host|--goto|/srv/a plan.txt:12:4");
     expect(t, "viewer.layout.argc", istr(&a, vj.argv.len), "5");
     vv.line = vv.col = 0;
     vj = viewerjump(&a, "edit +{line} --column={col} {path}", vv);
@@ -520,18 +520,18 @@ static void test_compose(Test *t)
            "edit|--connection|docker exec -i \"box name\"|/srv/a plan.txt");
     expect(t, "viewer.exec.argc", istr(&a, vj.argv.len), "4");
 
-    vv.ssh = "ad@test1";
+    vv.ssh = "user@host";
     Str oddpath = "/tmp/a b/'\"%☃;$HOME&|*?<>";
     vv.path = oddpath;
     vj = viewerjump(&a, "fresh ssh://{ssh}{path}", vv);
     expect(t, "viewer.special.argc", istr(&a, vj.argv.len), "2");
-    expect(t, "viewer.special", vj.argv[1], concat(&a, "ssh://ad@test1", oddpath));
+    expect(t, "viewer.special", vj.argv[1], concat(&a, "ssh://user@host", oddpath));
     vj = viewerjump(&a, "fresh --open \"before {path} after\" '{ssh}'", vv);
     expect(t, "viewer.special.embedded.argc", istr(&a, vj.argv.len), "4");
     expect(t, "viewer.special.embedded", vj.argv[2], concat(&a, "before ", concat(&a, oddpath, " after")));
-    expect(t, "viewer.special.ssh", vj.argv[3], "ad@test1");
+    expect(t, "viewer.special.ssh", vj.argv[3], "user@host");
     expect(t, "viewer.special.line", vj.line,
-           concat(&a, "fresh --open before ", concat(&a, oddpath, " after ad@test1")));
+           concat(&a, "fresh --open before ", concat(&a, oddpath, " after user@host")));
 
     struct { Str name, tmpl, want; } vbad[] = {
         {"empty", "", "the viewer command is empty"},

@@ -408,7 +408,7 @@ static void testcfgviewer(Test *t)
     addenv(v.os, &a, "HOME=/home/u");
     os_write(v.os, a, "/v/prospero.ini",
         "[remote test1]\n"
-        "ssh = ad@test1\n"
+        "ssh = user@host\n"
         "viewer = fresh ssh://{ssh}{path}\n");
     Config *c = newconfig(v.os, &a, v.scratch, "/v/prospero.ini", 0);
     expect(t, "viewer.cfg.load", cfgget(c, "remote", "test1", "viewer", 0),
@@ -426,7 +426,7 @@ static void testcfgviewer(Test *t)
            "fresh --goto \"{path}:{line}:{col}\"");
     cfgfree(c);
 
-    os_write(v.os, a, "/v/main.ini", "include = team.ini\n[remote test1]\nssh = ad@test1\n");
+    os_write(v.os, a, "/v/main.ini", "include = team.ini\n[remote test1]\nssh = user@host\n");
     os_write(v.os, a, "/v/team.ini", "[remote test1]\nviewer = included {path}\n");
     c = newconfig(v.os, &a, v.scratch, "/v/main.ini", 0);
     expect(t, "viewer.cfg.include", inidiags(&a, c->ini),
