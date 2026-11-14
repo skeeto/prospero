@@ -744,6 +744,8 @@ class Remote:
         q = lambda a: '"' + win(a) + '"' if "/" in a or " " in a else a
         name = "run" + tag.strip(" :[]")
         task = self.task + tag.strip(" :[]")
+        import scenarios
+        env = scenarios.pathenv(self.h.binpath, env)  # a newer w64devkit's sh
         sets = "".join(f"set {k}={win(v)}\r\n" for k, v in (env or {}).items())
         bat = ("@echo off\r\ncd /d \"%~dp0\"\r\n" + sets +
                q(self.h.exe) + (f" {sub} " if sub else " ") + " ".join(q(a) for a in guiargs) +
@@ -1454,7 +1456,11 @@ def fakescp(home):
             f"exec cp \"$src\" '{home}'/\"${{dst#*:}}\"\n")
 
 # The same for Windows, built there with w64devkit: the remote command
-# is a command line of its own, run as is with standard I/O inherited.
+# is a command line of its own, run as is with standard I/O inherited,
+# from fakessh.exe's own directory, its "home", where nothing else is:
+# CreateProcess looks for a program in its parent's directory and the
+# current one first, which as the run's root holds a prospero.exe. One
+# not found exits 127, as sh's does, and the remote is missing.
 FAKESSH_C = r"""
 #include <windows.h>
 #include <shellapi.h>
@@ -1474,6 +1480,15 @@ int main(void)
     if (i+1 >= argc) {
         return 255;
     }
+    wchar_t home[MAX_PATH];
+    DWORD   len = GetModuleFileNameW(0, home, MAX_PATH);
+    while (len && home[len-1] != L'\\') {
+        len--;
+    }
+    home[len] = 0;
+    if (!len || !SetCurrentDirectoryW(home)) {
+        return 255;
+    }
     STARTUPINFOW        si = {sizeof(si)};
     PROCESS_INFORMATION pi;
     si.dwFlags    = STARTF_USESTDHANDLES;
@@ -1481,7 +1496,8 @@ int main(void)
     si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
     si.hStdError  = GetStdHandle(STD_ERROR_HANDLE);
     if (!CreateProcessW(0, argv[i+1], 0, 0, TRUE, 0, 0, 0, &si, &pi)) {
-        return 255;
+        DWORD err = GetLastError();
+        return err==ERROR_FILE_NOT_FOUND || err==ERROR_PATH_NOT_FOUND ? 127 : 255;
     }
     WaitForSingleObject(pi.hProcess, INFINITE);
     DWORD code = 255;
@@ -1580,9 +1596,11 @@ class Far:
             host.write(self.work + "/pixels.png", pngfixture(40, 30))
             host.mkdir(self.work + "/nested")  # for the directory's completion
             if self.windows:
-                self.ssh = host.path("fakessh.exe")
+                fakehome = host.path("fakehome")
+                self.ssh = fakehome + "/fakessh.exe"
+                host.mkdir(fakehome)
                 host.write(host.path("fakessh.c"), FAKESSH_C)
-                host.h.sh(f"cd {host.root} && gcc -O2 -o fakessh.exe fakessh.c -lshell32")
+                host.h.sh(f"cd {host.root} && gcc -O2 -o {self.ssh} fakessh.c -lshell32")
             else:
                 # Its home directory, not this user's: deploying there
                 # writes .prospero

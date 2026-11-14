@@ -19,7 +19,9 @@ ssh for a remote host's files and processes.
 With --host, the fake provider runs here and the harness runs on the
 Windows host over ssh, reaching the provider through a reverse tunnel;
 PATH is the prospero.exe already on that host. busybox.exe is copied next
-to it from the host's w64devkit, which is how the harness finds its shell.
+to it from the host's w64devkit, which is how the harness finds its shell;
+from a newer w64devkit, whose busybox has no shell applet, its sh.exe too,
+and the harness runs with w64devkit's bin first on PATH (see stageshell).
 
   uv run tests/scenarios.py --prospero 'C:/DOCUME~1/u/LOCALS~1/Temp/prospero.exe' \\
       --xp XPHOST [NAME ...]
@@ -172,9 +174,34 @@ class LocalHost:
             print(f"     kill: {e}", flush=True)
 
 
+def stageshell(host, root):
+    """Copy w64devkit's shell into the run's root, where the harness
+    finds it next to itself: busybox.exe, or, from a newer w64devkit
+    whose busybox.exe has no shell applet, its separate sh.exe beside
+    it, as in w64devkit's bin. That sh.exe finds the usual tools on
+    PATH alone, so then the bin's own path, for the harness's PATH
+    (pathenv), else None."""
+    bb = '"$HOME/w64devkit/bin/busybox.exe"'
+    ok = host.sh(f'{bb} sh -c "echo ok" 2>/dev/null || true', check=False)
+    host.sh(f"mkdir -p {root} && cp {bb} {root}/busybox.exe")
+    if ok.strip() == "ok":
+        return None
+    host.sh(f'cp "$HOME/w64devkit/bin/sh.exe" {root}/sh.exe')
+    return host.sh('cd "$HOME/w64devkit/bin" && pwd -W').strip().replace("/", "\\")
+
+
+def pathenv(binpath, env):
+    """env, with binpath (stageshell's) first on the inherited PATH,
+    which cmd.exe expands; a PATH of env's own stays as given."""
+    if not binpath or "PATH" in (env or {}):
+        return env
+    return dict(env or {}, PATH=binpath + ";%PATH%")
+
+
 class SshHost:
     """A Windows host reached over ssh, with busybox from w64devkit."""
     windows = True
+    binpath = None  # w64devkit's bin, for PATH, as stageshell says
 
     def __init__(self, host, prospero, port, rport):
         self.host = host
@@ -190,9 +217,8 @@ class SshHost:
             self.url = f"http://127.0.0.1:{rport}"
             tmp = self.sh("echo \"$TMP\"").strip()
             self.root = f"{tmp}/prospero-scen-{random.randrange(1 << 32):08x}"
-            self.sh(f"mkdir -p {self.root} && cp $HOME/w64devkit/bin/busybox.exe "
-                    f"{self.root}/busybox.exe && cp {shlex.quote(prospero)} "
-                    f"{self.root}/prospero.exe")
+            self.binpath = stageshell(self, self.root)
+            self.sh(f"cp {shlex.quote(prospero)} {self.root}/prospero.exe")
         except BaseException:
             self.close()
             raise
@@ -283,6 +309,7 @@ class SshHost:
             return '"' + a + '"' if (" " in a or not a) else a
         win = lambda p: p.replace("/", "\\")
         # cmd.exe keeps a blank before && in the value, hence the quotes
+        env = pathenv(self.binpath, env)
         sets = "".join(f'set "{k}={v}"&& ' for k, v in (env or {}).items())
         cmd = (f"{sets}cd /d {win(cwd)} && {win(self.exe)} " +
                " ".join(q(a) for a in args))
@@ -342,9 +369,8 @@ class XpHost(SshHost):
         # A name of the run's own, which no other run's harness, nor any
         # engine of the user's, has
         self.exename = f"p-{run}.exe"
-        self.sh(f"mkdir -p {self.root} && "
-                f"cp \"$HOME/w64devkit/bin/busybox.exe\" {self.root}/busybox.exe && "
-                f"cp {shlex.quote(prospero)} {self.root}/{self.exename}")
+        self.binpath = stageshell(self, self.root)
+        self.sh(f"cp {shlex.quote(prospero)} {self.root}/{self.exename}")
         self.exe = f"{self.root}/{self.exename}"
 
     def close(self):
@@ -370,6 +396,8 @@ class XpHost(SshHost):
 
     def popen(self, args, cwd, stdin=False, env=None):
         sets = "".join(f"{k}={shlex.quote(v)} " for k, v in (env or {}).items())
+        if self.binpath and "PATH" not in (env or {}):
+            sets += f'PATH={shlex.quote(self.binpath)}";$PATH" '
         cmd = (f"cd {shlex.quote(cwd)} && {sets}{shlex.quote(self.exe)} " +
                " ".join(shlex.quote(a) for a in args))
         return subprocess.Popen(
