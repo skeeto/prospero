@@ -39,6 +39,21 @@ enum : i32 {
     FILES_TRIES = 3,  // checks that failed in a row, kept stale, then left
 };
 
+// Tabs kept in the layout file (filekeepline, filekeeptext)
+enum : i32 {
+    FILES_KEEPROOTS = 32,    // roots kept
+    FILES_KEEPPATH  = 1024,  // bytes of a tab's path, decoded
+    FILES_KEEPHOST  = 256,   // bytes of a root's host name, decoded
+};
+
+enum : iz {
+    FILES_KEEPBYTES = (iz)64 << 10,  // the section's text, of the file's 1 MiB
+};
+
+enum : i64 {  // epoch ms
+    FILES_KEEPAGE = 90LL*24*60*60*1000,  // a root unmatched this long is dropped
+};
+
 // Whether a tab's file may have changed since it was read, and the
 // checking of it (filenext). Nothing polls: marks set stale, as tools,
 // jobs and turns end on its host, as a turn is rewound or a cut undone,
@@ -231,6 +246,7 @@ struct FileTab {
     u8        section[FILES_SECTION];  // a heading to scroll to
     i32       sectionlen;
     FileBody *body;       // null until read, and once freed
+    b32       ems;        // dy and scrollx are in ems, as restored, until drawn
 };
 
 struct FileSet {
@@ -320,12 +336,14 @@ static FileTab *filesetadd(FileSet *s, FileTab *ft)
 
 // Take the bar's order, n tabs as it has them: the set's tabs in that
 // order, then any it doesn't have yet (not yet drawn) as they were.
-// Tabs not in the set are ignored. The front tab stays front.
-static void filesetorder(FileSet *s, FileTab **order, i32 n)
+// Tabs not in the set are ignored. The front tab stays front. Returns
+// whether the order changed.
+static b32 filesetorder(FileSet *s, FileTab **order, i32 n)
 {
     FileTab *front = filesetfront(s);
     FileTab *was[FILES_TABS];
-    i32      nwas = s->n;
+    i32      nwas    = s->n;
+    b32      changed = 0;
     for (i32 i = 0; i < nwas; i++) {
         was[i] = s->tabs[i];
     }
@@ -333,6 +351,7 @@ static void filesetorder(FileSet *s, FileTab **order, i32 n)
     for (i32 i = 0; i < n; i++) {
         for (i32 j = 0; j < nwas; j++) {
             if (was[j] && was[j]==order[i]) {
+                changed |= j != k;
                 s->tabs[k++] = was[j];
                 was[j] = 0;
                 break;
@@ -341,6 +360,7 @@ static void filesetorder(FileSet *s, FileTab **order, i32 n)
     }
     for (i32 j = 0; j < nwas; j++) {
         if (was[j]) {
+            changed |= j != k;
             s->tabs[k++] = was[j];
         }
     }
@@ -348,6 +368,533 @@ static void filesetorder(FileSet *s, FileTab **order, i32 n)
     for (i32 i = 0; front && i < s->n; i++) {
         s->front = s->tabs[i]==front ? i : s->front;
     }
+    return changed;
+}
+
+// Tabs that last: each root's tabs as lines of the layout file, in its
+// [Prospero][Files] section (app.cpp's ini handler). The file is read
+// before any session is listed, so what it holds is kept as records
+// (FileKeep) until their roots are found, and written back as read
+// until then, since the file is written whole.
+//
+//   [Prospero][Files]
+//   Wrap=0
+//   Root=here,u1794480000000,s20261112-101500-abcd
+//   Tab=m,o0,t202,p/w/files/guide.md
+//   Tab=*,u,o1,t1487,y0.51,b1500-1504,p/w/files/lines.txt
+//   Root=remote,u1794480000000,s20261112-101500-abcd,hpi
+//   Tab=*,r,o0,p/home/me/notes.txt
+//
+// Every line starts with a key, so ImGui never takes one for a comment
+// or a header. Wrap=0 is Wrap's last choice for new tabs, written only
+// when off. A Root line opens a record: its kind, then u, when its root
+// was last known alive (epoch ms), s its session's id and h its host's
+// name. none is the window's own set, with neither; here is a session
+// in this state directory, by its id alone; remote is one on another
+// host, by that host's name (1 to FILES_KEEPHOST bytes) and its id. Up
+// to FILES_TABS Tab lines follow, in the bar's order, each its flags,
+// then its tokens, and its path last, to the line's end:
+//
+//   *  the front tab          oRANK     opened order, 0 the least recent
+//   r  on the root's host     tTOP      the line at the view's top, 0-based
+//   w  which ignores case     yDY       how far past it, in ems
+//   m  Markdown               xSCROLLX  unwrapped, in ems
+//   u  unwrapped              bA-B      the cited lines, banded
+//   n  not fitted             pPATH     absolute
+//   a  shown as text anyway
+//
+// Paths, ids and names escape as %XX each byte below 0x20 (ImGui ends a
+// line at CR or LF, and a string at NUL), DEL, '%', ',' and a space
+// ending them, which editors strip; every other byte is raw, since a
+// path is bytes, UTF-8 or not. Reading is strict and bounded by the
+// same caps as writing. A line that cannot be read is refused, and a
+// refused Root refuses its Tab lines; a known token with a bad value,
+// an unknown token and an unknown key are ignored.
+
+enum : i32 {  // FileKeep.kind
+    FKEEP_NONE,    // the window's own set
+    FKEEP_HERE,    // a session in this state directory, by sid
+    FKEEP_REMOTE,  // a session on a remote host, by its name and sid
+};
+
+enum : i32 {  // FileKeepTab.flags
+    FKT_FRONT  = 1<<0,  // *
+    FKT_FAR    = 1<<1,  // r: on the root's remote host
+    FKT_WIN    = 1<<2,  // w: which compares without case (with r)
+    FKT_MD     = 1<<3,  // m
+    FKT_NOWRAP = 1<<4,  // u
+    FKT_NOFIT  = 1<<5,  // n
+    FKT_ASTEXT = 1<<6,  // a
+};
+
+struct FileKeepTab {
+    Str path;
+    i32 flags;    // FKT_*
+    i32 rank;     // opened order among its root's, 0 the least recent
+    i32 top;      // 0-based
+    f32 dy;       // ems
+    f32 scrollx;  // ems
+    i32 band0;    // 1-based, else 0
+    i32 band1;
+};
+
+struct FileKeep {
+    i32         kind;  // FKEEP_*
+    Str         sid;
+    Str         host;  // a remote's name
+    i64         seen;  // when last known alive, epoch ms
+    b32         live;  // from a live set, never aged
+    b32         done;  // attached or dropped: not written as a record
+    i32         n;
+    FileKeepTab tabs[FILES_TABS];
+};
+
+// What the layout file held, until each record's root is found. All
+// zero is nothing read.
+struct FileKeeps {
+    FileKeep  keeps[FILES_KEEPROOTS];
+    i32       n;
+    b32       nowrap;  // Wrap=0
+    i32       bad;     // lines refused, counted by the caller
+    FileKeep *at;      // the record a Tab line goes to, else null
+};
+
+static Str const filekeepkinds[] = {"none", "here", "remote"};
+static u8  const filekeepflags[] = "*rwmuna";  // FKT_* by bit
+
+// A path, id or name as a token's value, escaped.
+static void filekeepesc(Buf *b, Str s)
+{
+    for (iz i = 0; i < s.len; i++) {
+        u8 c = s[i];
+        if (c<0x20 || c==0x7f || c=='%' || c==',' || (c==' ' && i==s.len-1)) {
+            putbyte(b, '%');
+            putbyte(b, "0123456789ABCDEF"[c>>4]);
+            putbyte(b, "0123456789ABCDEF"[c&15]);
+        } else {
+            putbyte(b, c);
+        }
+    }
+}
+
+// A token's value unescaped, else *ok cleared: each '%' needs two hex
+// digits, of either case.
+static Str filekeepunesc(Arena *a, Str s, b32 *ok)
+{
+    *ok = 1;
+    Str r = {};
+    if (!s.len) {
+        return r;
+    }
+    r.data = allocbytes(a, s.len);
+    for (iz i = 0; i < s.len; i++) {
+        u8 c = s[i];
+        if (c == '%') {
+            i32 hi = i+2<s.len ? hexval(s[i+1]) : -1;
+            i32 lo = i+2<s.len ? hexval(s[i+2]) : -1;
+            if (hi<0 || lo<0) {
+                *ok = 0;
+                return {};
+            }
+            c  = (u8)(hi<<4 | lo);
+            i += 2;
+        }
+        r.data[r.len++] = c;
+    }
+    return r;
+}
+
+static b32 filekeepnul(Str s)
+{
+    for (iz i = 0; i < s.len; i++) {
+        if (!s[i]) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Whether a kept path is absolute: '/' first, a drive's letter, ':' and
+// a slash either way, or two slashes either way.
+static b32 filekeepabs(Str p)
+{
+    b32 s0 = p.len>0 && (p[0]=='/' || p[0]=='\\');
+    b32 s1 = p.len>1 && (p[1]=='/' || p[1]=='\\');
+    b32 s2 = p.len>2 && (p[2]=='/' || p[2]=='\\');
+    b32 az = p.len>0 && (p[0]|0x20)>='a' && (p[0]|0x20)<='z';
+    return (s0 && p[0]=='/') || (s0 && s1) || (az && p.len>1 && p[1]==':' && s2);
+}
+
+// Whether a record's key is one filekeepline reads: a valid sid (here,
+// remote) and a host of 1 to FILES_KEEPHOST bytes with no NUL (remote).
+// filekeeptext writes no other, so its tabs are not lost on reading.
+static b32 filekeepok(FileKeep *k)
+{
+    return (k->kind==FKEEP_NONE || validsid(k->sid)) &&
+           (k->kind!=FKEEP_REMOTE ||
+            (k->host.len && k->host.len<=FILES_KEEPHOST && !filekeepnul(k->host)));
+}
+
+// One line of the section, as the ini handler hands it, cut at its first
+// '=': its decoded strings into perm. Returns 0 if refused, for the
+// caller to count in bad.
+static b32 filekeepline(FileKeeps *ks, Arena *perm, Str key, Str val)
+{
+    if (key == "Wrap") {
+        ks->nowrap |= val == "0";
+        return 1;
+
+    } else if (key == "Root") {
+        ks->at = 0;
+        if (ks->n == FILES_KEEPROOTS) {
+            return 0;
+        }
+        Arena    t = *perm;  // kept only if read
+        FileKeep k = {};
+        Cut      c = cut(val, ',');
+        k.kind = -1;
+        for (i32 i = 0; i < countof(filekeepkinds); i++) {
+            k.kind = c.head==filekeepkinds[i] ? i : k.kind;
+        }
+        b32 ok = k.kind >= 0;
+        for (Str rest = c.tail; ok && rest.len;) {
+            c    = cut(rest, ',');
+            rest = c.tail;
+            Str tok = c.head;
+            Str v   = tok.len ? cuthead(tok, 1) : tok;
+            if (!tok.len) {
+                continue;
+            } else if (tok[0] == 'u') {
+                Int u = parseint(v);
+                k.seen = u.ok && u.val>0 ? u.val : k.seen;
+            } else if (tok[0]=='s' && k.kind!=FKEEP_NONE) {
+                k.sid = filekeepunesc(&t, v, &ok);
+            } else if (tok[0]=='h' && k.kind==FKEEP_REMOTE) {
+                k.host = filekeepunesc(&t, v, &ok);
+            }
+        }
+        if (!ok || !filekeepok(&k)) {
+            return 0;
+        }
+        *perm = t;
+        ks->keeps[ks->n] = k;
+        ks->at = &ks->keeps[ks->n++];
+        return 1;
+
+    } else if (key == "Tab") {
+        FileKeep *k = ks->at;
+        if (!k || k->n==FILES_TABS) {
+            return 0;
+        }
+        FileKeepTab kt   = {};
+        Str         path = {};
+        b32         has  = 0;
+        for (Str rest = val; rest.len;) {
+            if (rest[0] == 'p') {
+                path = cuthead(rest, 1);  // the rest of the line
+                has  = 1;
+                break;
+            }
+            Cut c   = cut(rest, ',');
+            Str tok = c.head;
+            Str v   = tok.len ? cuthead(tok, 1) : tok;
+            rest = c.tail;
+            if (tok.len == 1) {
+                for (i32 i = 0; filekeepflags[i]; i++) {
+                    kt.flags |= tok[0]==filekeepflags[i] ? 1<<i : 0;
+                }
+            } else if (!tok.len) {
+                continue;
+            } else if (tok[0] == 'o') {
+                Int o = parseint(v);
+                kt.rank = o.ok && o.val>=0 && o.val<FILES_TABS ? (i32)o.val : kt.rank;
+            } else if (tok[0] == 't') {
+                Int x = parseint(v);
+                kt.top = x.ok && x.val>=0 && x.val<1<<30 ? (i32)x.val : kt.top;
+            } else if (tok[0]=='y' || tok[0]=='x') {
+                Float f  = parsefloat(v);
+                f32  *to = tok[0]=='y' ? &kt.dy : &kt.scrollx;
+                *to = f.ok && f.val>=0 && f.val<=1e5 ? (f32)f.val : *to;
+            } else if (tok[0] == 'b') {
+                Cut ab = cut(v, '-');
+                Int lo = parseint(ab.head);
+                Int hi = parseint(ab.tail);
+                if (ab.ok && lo.ok && hi.ok && lo.val>=1 && lo.val<=hi.val && hi.val<1<<30) {
+                    kt.band0 = (i32)lo.val;
+                    kt.band1 = (i32)hi.val;
+                }
+            }
+        }
+        kt.flags &= kt.flags&FKT_FAR ? ~0 : ~FKT_WIN;
+        if (!has || path.len>3*FILES_KEEPPATH) {
+            return 0;
+        }
+        Arena t  = *perm;  // kept only if read
+        b32   ok = 0;
+        kt.path = filekeepunesc(&t, path, &ok);
+        if (!ok || kt.path.len>FILES_KEEPPATH || filekeepnul(kt.path) ||
+            !filekeepabs(kt.path)) {
+            return 0;
+        }
+        *perm = t;
+        k->tabs[k->n++] = kt;
+        return 1;
+    }
+    return 1;
+}
+
+// After the section is read: roots with no tabs dropped, and those
+// keyed (kind, sid, host) as one before them; in each root only its
+// first front tab kept as front, and its ranks made 0 to n-1, by rank
+// then place. The same path twice stays, as a local and a remote tab
+// may have it; filesetrestore passes over a true duplicate.
+static void filekeepdone(FileKeeps *ks)
+{
+    i32 n = 0;
+    for (i32 i = 0; i < ks->n; i++) {
+        FileKeep *k   = &ks->keeps[i];
+        b32       dup = !k->n;
+        for (i32 j = 0; !dup && j < n; j++) {
+            FileKeep *o = &ks->keeps[j];
+            dup = o->kind==k->kind && o->sid==k->sid && o->host==k->host;
+        }
+        if (dup) {
+            continue;
+        }
+
+        b32 front = 0;
+        i32 rank[FILES_TABS];
+        for (i32 a = 0; a < k->n; a++) {
+            FileKeepTab *kt = &k->tabs[a];
+            kt->flags &= front ? ~FKT_FRONT : ~0;
+            front     |= kt->flags & FKT_FRONT;
+            rank[a]    = 0;
+            for (i32 b = 0; b < k->n; b++) {
+                i32 r = k->tabs[b].rank;
+                rank[a] += r<kt->rank || (r==kt->rank && b<a);
+            }
+        }
+        for (i32 a = 0; a < k->n; a++) {
+            k->tabs[a].rank = rank[a];
+        }
+        if (n != i) {
+            ks->keeps[n] = *k;
+        }
+        n++;
+    }
+    ks->n  = n;
+    ks->at = 0;
+}
+
+// One record's lines.
+static void filekeepwrite(Buf *b, FileKeep *k)
+{
+    print(b, "Root=");
+    print(b, filekeepkinds[k->kind]);
+    if (k->seen) {
+        print(b, ",u");
+        print(b, k->seen);
+    }
+    if (k->sid.len) {
+        print(b, ",s");
+        filekeepesc(b, k->sid);
+    }
+    if (k->host.len) {
+        print(b, ",h");
+        filekeepesc(b, k->host);
+    }
+    putbyte(b, '\n');
+
+    for (i32 i = 0; i < k->n; i++) {
+        FileKeepTab *kt = &k->tabs[i];
+        print(b, "Tab=");
+        for (i32 f = 0; filekeepflags[f]; f++) {
+            if (kt->flags & 1<<f) {
+                putbyte(b, filekeepflags[f]);
+                putbyte(b, ',');
+            }
+        }
+        print(b, "o");
+        print(b, kt->rank);
+        if (kt->top > 0) {
+            print(b, ",t");
+            print(b, kt->top);
+        }
+        if (kt->dy >= 0.005f) {
+            print(b, ",y");
+            printfloat(b, kt->dy, 2);
+        }
+        if (kt->scrollx >= 0.005f) {
+            print(b, ",x");
+            printfloat(b, kt->scrollx, 2);
+        }
+        if (kt->band0 > 0) {
+            print(b, ",b");
+            print(b, kt->band0);
+            putbyte(b, '-');
+            print(b, kt->band1);
+        }
+        print(b, ",p");
+        filekeepesc(b, kt->path);
+        putbyte(b, '\n');
+    }
+}
+
+// The section's text, from n records, newest seen first (in the order
+// given among equals), with a blank line ending it: those done, with
+// no tabs, or with a key filekeepline would refuse passed over, and
+// pending ones (not live) seen more than FILES_KEEPAGE before now. A
+// pending one never seen (u missing or bad) is stamped now, its age
+// counted from its first save. At most FILES_KEEPROOTS roots, stopping
+// before one that would take it past FILES_KEEPBYTES. Empty if it would
+// hold neither a root nor Wrap=0.
+static Str filekeeptext(Arena *a, FileKeep **keeps, i32 n, b32 nowrap, i64 now)
+{
+    FileKeep **order = alloc<FileKeep *>(a, n);
+    i32        m     = 0;
+    for (i32 i = 0; i < n; i++) {
+        FileKeep *k = keeps[i];
+        k->seen = !k->live && k->seen<=0 ? now : k->seen;
+        if (k->done || !k->n || !filekeepok(k) ||
+            (!k->live && k->seen<now-FILES_KEEPAGE)) {
+            continue;
+        }
+        i32 j = m++;
+        for (; j>0 && order[j-1]->seen<k->seen; j--) {
+            order[j] = order[j-1];
+        }
+        order[j] = k;
+    }
+
+    Buf b(a, 1024);
+    print(&b, "[Prospero][Files]\n");
+    if (nowrap) {
+        print(&b, "Wrap=0\n");
+    }
+    i32 roots = 0;
+    for (; roots<m && roots<FILES_KEEPROOTS; roots++) {
+        iz len = b.len;
+        filekeepwrite(&b, order[roots]);
+        if (b.len+1 > FILES_KEEPBYTES) {
+            b.len = len;
+            break;
+        }
+    }
+    putbyte(&b, '\n');
+    return roots || nowrap ? finish(&b) : Str{};
+}
+
+// A live set as a record (k's tabs), at em pixels an em: its tabs in the
+// bar's order, those on this computer and those on far, its remote host
+// (0 for none), with any other host's, or with a path past
+// FILES_KEEPPATH, passed over. The caller fills in the rest.
+static void filesetkeep(FileSet *s, u64 far, f32 em, FileKeep *k)
+{
+    FileTab *kept[FILES_TABS];
+    k->n = 0;
+    for (i32 i = 0; i < s->n; i++) {
+        FileTab *ft = s->tabs[i];
+        if ((ft->host && ft->host!=far) || ft->path.len>FILES_KEEPPATH) {
+            continue;
+        }
+        f32          per = ft->ems || em<=0 ? 1 : em;
+        FileKeepTab *kt  = &k->tabs[k->n];
+        *kt = {};
+        kt->path     = ft->path;
+        kt->flags   |= i==s->front              ? FKT_FRONT  : 0;
+        kt->flags   |= ft->host                 ? FKT_FAR    : 0;
+        kt->flags   |= ft->host && ft->win      ? FKT_WIN    : 0;
+        kt->flags   |= ft->mode==FMODE_MARKDOWN ? FKT_MD     : 0;
+        kt->flags   |= !ft->wrap                ? FKT_NOWRAP : 0;
+        kt->flags   |= !ft->fit                 ? FKT_NOFIT  : 0;
+        kt->flags   |= ft->astext               ? FKT_ASTEXT : 0;
+        kt->top      = ft->top;
+        kt->dy       = ft->dy / per;
+        kt->scrollx  = ft->scrollx / per;
+        kt->band0    = ft->band0>0 ? ft->band0 : 0;
+        kt->band1    = ft->band0>0 ? ft->band1 : 0;
+        kept[k->n++] = ft;
+    }
+    for (i32 i = 0; i < k->n; i++) {
+        i32 rank = 0;
+        for (i32 j = 0; j < k->n; j++) {
+            i64 o = kept[j]->opened;
+            rank += o<kept[i]->opened || (o==kept[i]->opened && j<i);
+        }
+        k->tabs[i].rank = rank;
+    }
+}
+
+// A record's tab onto a new tab, as its caller made it (path, host, an
+// unread body): its mode, Wrap, Fit and text anyway, band and place,
+// that place in ems until drawn, and its rank as opened, for
+// filesetrestore.
+static void filekeeptab(FileTab *ft, FileKeepTab *kt)
+{
+    ft->mode    = kt->flags&FKT_MD ? FMODE_MARKDOWN : FMODE_TEXT;
+    ft->wrap    = !(kt->flags & FKT_NOWRAP);
+    ft->fit     = !(kt->flags & FKT_NOFIT);
+    ft->astext  = !!(kt->flags & FKT_ASTEXT);
+    ft->band0   = kt->band0;
+    ft->band1   = kt->band1;
+    ft->top     = kt->top;
+    ft->dy      = kt->dy;
+    ft->scrollx = kt->scrollx;
+    ft->ems     = 1;
+    ft->opened  = kt->rank;
+}
+
+// Restore n tabs (filekeeptab), in the bar's order, front the index of
+// the record's front tab, else -1: each appended unless the set has it
+// (filesetfind, so a true duplicate is passed over) or is full. Those
+// not taken are moved to tabs[took..n), for the caller to free, and
+// took returned. Into an empty set they keep their ranks and the front
+// one shows, else the highest ranked; into a set with tabs, they rank
+// below its own, evicted first, and its front stays.
+static i32 filesetrestore(FileSet *s, FileTab **tabs, i32 n, i32 front)
+{
+    assert(n <= FILES_TABS);
+    FileTab *want  = front>=0 && front<n ? tabs[front] : 0;
+    b32      empty = !s->n;
+    i64      low   = 0;  // the set's least recently opened
+    for (i32 i = 0; i < s->n; i++) {
+        i64 o = s->tabs[i]->opened;
+        low = !i || o<low ? o : low;
+    }
+    i64 span = 0;  // ranks the record has
+    for (i32 i = 0; i < n; i++) {
+        span = tabs[i]->opened+1>span ? tabs[i]->opened+1 : span;
+    }
+
+    FileTab *rest[FILES_TABS];
+    i32      nrest = 0;
+    i32      took  = 0;
+    for (i32 i = 0; i < n; i++) {
+        FileTab *ft = tabs[i];
+        if (s->n==FILES_TABS || filesetfind(s, ft->host, ft->path, ft->win)>=0) {
+            rest[nrest++] = ft;
+            continue;
+        }
+        ft->opened = empty ? s->opens + ft->opened + 1 : low - span + ft->opened;
+        s->tabs[s->n++] = ft;
+        tabs[took++]    = ft;
+    }
+    for (i32 i = 0; i < nrest; i++) {
+        tabs[took+i] = rest[i];
+    }
+
+    if (empty && took) {
+        i32 at   = -1;
+        i32 best = 0;
+        for (i32 i = 0; i < s->n; i++) {
+            at   = s->tabs[i]==want ? i : at;
+            best = s->tabs[i]->opened>s->tabs[best]->opened ? i : best;
+        }
+        s->front    = at>=0 ? at : best;
+        s->frontset = 1;
+        s->opens   += span;
+    }
+    return took;
 }
 
 // A normalized path's last k names, or all of it if it has no more,

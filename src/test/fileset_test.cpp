@@ -1,5 +1,6 @@
 // Files tab sets: adding, evicting, dropping and reordering, which tab
-// shows after each, the labels tabs show, and a file's bytes as text.
+// shows after each, the labels tabs show, a file's bytes as text, and
+// tabs kept in the layout file.
 
 static Str filesetstr(Arena *a, FileSet *s, FileTab *tabs)
 {
@@ -131,6 +132,15 @@ static void test_fileset(Test *t)
     FileTab *order2[] = {tabs+7, tabs+2, tabs+1};
     filesetorder(&o, order2, 3);
     expect(t, "fileset.orderpart", filesetstr(&a, &o, tabs), "c*bda");
+
+    // Whether the order changed, for a save: not for the same order, nor
+    // for a bar that lacks tabs at its end
+    FileTab *order3[] = {tabs+2, tabs+1, tabs+3, tabs+0};
+    expect(t, "fileset.ordersame", istr(&a, filesetorder(&o, order3, 4)), "0");
+    expect(t, "fileset.ordershort", istr(&a, filesetorder(&o, order3, 2)), "0");
+    FileTab *order4[] = {tabs+1, tabs+2};
+    expect(t, "fileset.orderswap", istr(&a, filesetorder(&o, order4, 2)), "1");
+    expect(t, "fileset.orderswapped", filesetstr(&a, &o, tabs), "*bcda");
 
     // Labels: the name, with as few folders as tell it apart
     {
@@ -383,6 +393,589 @@ static void test_fileset(Test *t)
         for (auto &c : cases) {
             b32 got = filechanged(c.size, c.mtime, c.readat, c.size1, c.mtime1);
             expect(t, "filechanged", istr(&a, got), istr(&a, c.want));
+        }
+    }
+}
+
+// The Files section's lines as ImGui's loader hands them to the ini
+// handler: split at CR and at LF, with blank lines, headers and comments
+// skipped, each cut at its first '='. Then filekeepdone.
+static void keepread(FileKeeps *ks, Arena *a, Str text)
+{
+    for (iz i = 0; i < text.len;) {
+        iz e = i;
+        for (; e<text.len && text[e]!='\n' && text[e]!='\r'; e++) {}
+        Str line = {text.data+i, e-i};
+        i = e + 1;
+        if (!line.len || line[0]=='[' || line[0]==';') {
+            continue;
+        }
+        Cut kv = cut(line, '=');
+        if (kv.ok && !filekeepline(ks, a, kv.head, kv.tail)) {
+            ks->bad++;
+        }
+    }
+    filekeepdone(ks);
+}
+
+// Every record written again, as pending.
+static Str keepwrite(Arena *a, FileKeeps *ks, i64 now)
+{
+    FileKeep **list = alloc<FileKeep *>(a, ks->n);
+    for (i32 i = 0; i < ks->n; i++) {
+        list[i] = &ks->keeps[i];
+    }
+    return filekeeptext(a, list, ks->n, ks->nowrap, now);
+}
+
+// Read, then written again.
+static Str keepagain(Arena *a, Str text, i64 now)
+{
+    FileKeeps *ks = alloc<FileKeeps>(a);
+    keepread(ks, a, text);
+    return keepwrite(a, ks, now);
+}
+
+// How many times a needle is in s.
+static i32 keepcount(Str s, Str needle)
+{
+    i32 n = 0;
+    for (iz i = find(s, needle); i >= 0; n++) {
+        s = cuthead(s, i+needle.len);
+        i = find(s, needle);
+    }
+    return n;
+}
+
+// "sidNN", for many roots apart.
+static Str keepsid(Arena *a, i32 i)
+{
+    Buf b(a, 8);
+    print(&b, "sid");
+    printpad(&b, i, 2);
+    return finish(&b);
+}
+
+static void test_filekeep(Test *t)
+{
+    Arena a   = t->perm;
+    i64   now = 1794480000000;
+    Str   sid = "20261112-101500-abcd";
+
+    // Escaped: control bytes, DEL, '%', ',' and a space ending it; all
+    // else raw, UTF-8 or not
+    struct { Str raw; Str enc; } escs[] = {
+        {"a,b",           "a%2Cb"},
+        {"50%",           "50%25"},
+        {"x\r\ny",        "x%0D%0Ay"},
+        {Str("\0"),       "%00"},
+        {"\x7f",          "%7F"},
+        {"trail ",        "trail%20"},
+        {"\xff\xfe",      "\xff\xfe"},
+        {"\xc3\xa9",      "\xc3\xa9"},
+        {"[x]",           "[x]"},
+        {"a=b;c|d",       "a=b;c|d"},
+        {"C:\\x",         "C:\\x"},
+        {" lead",         " lead"},
+    };
+    for (iz i = 0; i < countof(escs); i++) {
+        Buf b(&a, 32);
+        filekeepesc(&b, escs[i].raw);
+        expect(t, concat(&a, "filekeep esc ", escs[i].enc), finish(&b), escs[i].enc);
+        b32 ok  = 0;
+        Str got = filekeepunesc(&a, escs[i].enc, &ok);
+        expect(t, concat(&a, "filekeep unesc ", escs[i].enc),
+               ok ? got : Str("!"), escs[i].raw);
+    }
+    Str badescs[] = {"%", "%4", "%zz", "a%g0"};
+    for (iz i = 0; i < countof(badescs); i++) {
+        b32 ok = 1;
+        filekeepunesc(&a, badescs[i], &ok);
+        expect(t, concat(&a, "filekeep unesc bad ", badescs[i]), istr(&a, ok), "0");
+    }
+    {
+        b32 ok  = 0;
+        Str got = filekeepunesc(&a, "%2c", &ok);
+        expect(t, "filekeep unesc lower", ok ? got : Str("!"), ",");
+    }
+
+    // A live set as its lines, in ems at 15 pixels an em
+    static FileTab tabs[16];
+    for (i32 i = 0; i < countof(tabs); i++) {
+        tabs[i] = {};
+    }
+    Str text = "[Prospero][Files]\n"
+               "Wrap=0\n"
+               "Root=here,u1794480000000,s20261112-101500-abcd\n"
+               "Tab=m,o0,t202,p/w/files/guide.md\n"
+               "Tab=o1,p/w/files/manual.md\n"
+               "Tab=u,o2,b150-150,p/w/files/long.txt\n"
+               "Tab=*,u,o3,t1487,y0.51,b1500-1504,p/w/files/lines.txt\n"
+               "\n";
+    {
+        FileSet s = {};
+        Str paths[] = {"/w/files/guide.md", "/w/files/manual.md", "/w/files/long.txt",
+                       "/w/files/lines.txt"};
+        for (i32 i = 0; i < 4; i++) {
+            tabs[i].path = paths[i];
+            tabs[i].wrap = 1;
+            tabs[i].fit  = 1;
+            filesetadd(&s, tabs+i);
+        }
+        tabs[0].mode  = FMODE_MARKDOWN;
+        tabs[0].top   = 202;
+        tabs[2].wrap  = 0;
+        tabs[2].band0 = tabs[2].band1 = 150;
+        tabs[3].wrap  = 0;
+        tabs[3].band0 = 1500;
+        tabs[3].band1 = 1504;
+        tabs[3].top   = 1487;
+        tabs[3].dy    = 7.65f;
+        FileKeep  k  = {};
+        FileKeep *kp = &k;
+        filesetkeep(&s, 0, 15, &k);
+        k.kind = FKEEP_HERE;
+        k.sid  = sid;
+        k.seen = now;
+        k.live = 1;
+        expect(t, "filekeep text", filekeeptext(&a, &kp, 1, 1, now), text);
+
+        // A remote root: tabs on this computer and on its host, those on
+        // any other host passed over
+        FileSet r = {};
+        tabs[4].path = "/w/a.txt";
+        tabs[5].path = "/w/b.txt";
+        tabs[5].host = 5;
+        tabs[6].path = "C:/w/c.txt";
+        tabs[6].host = 9;
+        tabs[6].win  = 1;
+        for (i32 i = 4; i < 7; i++) {
+            tabs[i].wrap = tabs[i].fit = 1;
+            filesetadd(&r, tabs+i);
+        }
+        FileKeep rk = {};
+        filesetkeep(&r, 9, 15, &rk);
+        rk.kind = FKEEP_REMOTE;
+        rk.sid  = sid;
+        rk.host = "ctr:box";
+        rk.seen = now;
+        rk.live = 1;
+        FileKeep *both[] = {&k, &rk};
+        Str       two    = filekeeptext(&a, both, 2, 0, now);
+        expect(t, "filekeep text remote", cuthead(two, find(two, "Root=remote")),
+               "Root=remote,u1794480000000,s20261112-101500-abcd,hctr:box\n"
+               "Tab=o0,p/w/a.txt\n"
+               "Tab=*,r,w,o1,pC:/w/c.txt\n"
+               "\n");
+        expect(t, "filekeep again remote", keepagain(&a, two, now), two);
+    }
+
+    // Read and written again, the same, with CRLF too; a path of bytes
+    // that need escaping, and some that don't, byte for byte. A NUL is
+    // escaped, but no path has one: decoded, it is refused
+    expect(t, "filekeep again", keepagain(&a, text, now), text);
+    {
+        Buf b(&a, 512);
+        for (iz i = 0; i < text.len; i++) {
+            print(&b, text[i]=='\n' ? Str("\r\n") : Str{text.data+i, 1});
+        }
+        expect(t, "filekeep again crlf", keepagain(&a, finish(&b), now), text);
+    }
+    {
+        Str       path = "/x\r\ny\t,%=;[x]\x7f\xff\xc3\xa9 ";
+        FileKeep  k    = {};
+        FileKeep *kp   = &k;
+        k.kind = FKEEP_NONE;
+        k.seen = now;
+        k.n    = 1;
+        k.tabs[0].path = path;
+        Str        out = filekeeptext(&a, &kp, 1, 0, now);
+        FileKeeps *ks  = alloc<FileKeeps>(&a);
+        keepread(ks, &a, out);
+        expect(t, "filekeep again bytes", ks->n==1 && ks->keeps[0].n==1 ?
+               ks->keeps[0].tabs[0].path : Str("!"), path);
+        expect(t, "filekeep again lines", istr(&a, keepcount(out, "\n")), "4");
+        FileKeeps *kn = alloc<FileKeeps>(&a);
+        keepread(kn, &a, "Root=none,u1\nTab=o0,p/x%00y\n");
+        expect(t, "filekeep again nul", istr(&a, kn->bad), "1");
+    }
+
+    // Restored into an empty set: in order, the front shown, each as it
+    // was, evicted by rank
+    {
+        Str rtext = "[Prospero][Files]\n"
+                    "Root=here,u1794480000000,s20261112-101500-abcd\n"
+                    "Tab=m,o2,t202,y0.51,p/w/a.md\n"
+                    "Tab=o0,p/w/b.txt\n"
+                    "Tab=u,n,a,o3,b150-150,p/w/c.txt\n"
+                    "Tab=*,o1,x1.33,p/w/d.txt\n";
+        FileKeeps *ks = alloc<FileKeeps>(&a);
+        keepread(ks, &a, rtext);
+        FileKeep *k     = &ks->keeps[0];
+        FileTab  *made[FILES_TABS];
+        i32       front = -1;
+        for (i32 i = 0; i < k->n; i++) {
+            tabs[i] = {};
+            tabs[i].path = k->tabs[i].path;
+            filekeeptab(tabs+i, &k->tabs[i]);
+            made[i] = tabs+i;
+            front   = k->tabs[i].flags&FKT_FRONT ? i : front;
+        }
+        FileSet s = {};
+        expect(t, "filekeep restore took", istr(&a, filesetrestore(&s, made, k->n, front)), "4");
+        expect(t, "filekeep restore", filesetstr(&a, &s, tabs), "abc*d");
+        expect(t, "filekeep restore frontset", istr(&a, s.frontset), "1");
+        expect(t, "filekeep restore modes",
+               concat(&a, concat(&a, istr(&a, tabs[0].mode), istr(&a, tabs[1].mode)),
+                      concat(&a, istr(&a, tabs[2].mode), istr(&a, tabs[3].mode))),
+               "1000");
+        expect(t, "filekeep restore c",
+               concat(&a, concat(&a, istr(&a, tabs[2].wrap), istr(&a, tabs[2].fit)),
+                      istr(&a, tabs[2].astext)),
+               "001");
+        expect(t, "filekeep restore band",
+               concat(&a, concat(&a, istr(&a, tabs[2].band0), "-"), istr(&a, tabs[2].band1)),
+               "150-150");
+        expect(t, "filekeep restore top", istr(&a, tabs[0].top), "202");
+        f32 dy = tabs[0].dy - 0.51f;
+        expect(t, "filekeep restore dy", dy>-0.01f && dy<0.01f ? Str("near") : Str("far"),
+               "near");
+        f32 sx = tabs[3].scrollx - 1.33f;
+        expect(t, "filekeep restore scrollx", sx>-0.01f && sx<0.01f ? Str("near") : Str("far"),
+               "near");
+        expect(t, "filekeep restore ems", istr(&a, tabs[0].ems && tabs[3].ems), "1");
+
+        // Eight more: four fill the set, then each evicts by rank
+        Buf gone(&a, 8);
+        for (i32 i = 4; i < 12; i++) {
+            tabs[i] = {};
+            FileTab *ft = filesetadd(&s, tabs+i);
+            if (ft) {
+                putbyte(&gone, (u8)('a' + (ft - tabs)));
+            }
+        }
+        expect(t, "filekeep restore evicts", finish(&gone), "bdac");
+    }
+
+    // Restored into a set with tabs: those it has passed over, a Windows
+    // host's without case, only as many as fit, ranked below its own
+    {
+        FileSet s = {};
+        Str     paths[] = {"/w/0", "/w/1", "/w/2", "/w/3", "/w/4", "C:/W/A.c"};
+        for (i32 i = 0; i < 6; i++) {
+            tabs[i] = {};
+            tabs[i].path = paths[i];
+            filesetadd(&s, tabs+i);
+        }
+        tabs[5].host = 3;
+        tabs[5].win  = 1;
+        filesetshow(&s, 2);
+        Str cand[]  = {"/w/1", "c:/w/a.C", "/w/x", "/w/y"};
+        i32 ranks[] = {2, 3, 1, 0};
+        FileTab *made[4];
+        for (i32 i = 0; i < 4; i++) {
+            FileKeepTab kt = {};
+            kt.path = cand[i];
+            kt.rank = ranks[i];
+            tabs[6+i] = {};
+            tabs[6+i].path = cand[i];
+            filekeeptab(tabs+6+i, &kt);
+            made[i] = tabs+6+i;
+        }
+        tabs[7].host = 3;
+        tabs[7].win  = 1;
+        expect(t, "filekeep merge took", istr(&a, filesetrestore(&s, made, 4, 2)), "2");
+        expect(t, "filekeep merge", filesetstr(&a, &s, tabs), "ab*cdefij");
+        expect(t, "filekeep merge rest",
+               made[0]==tabs+8 && made[1]==tabs+9 && made[2]==tabs+6 && made[3]==tabs+7 ?
+               Str("ijgh") : Str("other"), "ijgh");
+        FileTab *gone = filesetadd(&s, tabs+10);
+        expect(t, "filekeep merge evicts", gone==tabs+9 ? Str("j") : Str("other"), "j");
+    }
+
+    // Caps: the newest 32 roots, the text's bytes, a path's bytes, the
+    // tabs and roots read, and a host's bytes
+    {
+        FileKeep  *ks   = alloc<FileKeep>(&a, 40);
+        FileKeep **list = alloc<FileKeep *>(&a, 40);
+        for (i32 i = 0; i < 40; i++) {
+            ks[i].kind = FKEEP_HERE;
+            ks[i].sid  = keepsid(&a, i);
+            ks[i].seen = now - 40 + i;
+            ks[i].live = 1;
+            ks[i].n    = 1;
+            ks[i].tabs[0].path = "/w/a";
+            list[i] = ks + i;
+        }
+        Str out = filekeeptext(&a, list, 40, 0, now);
+        expect(t, "filekeep caps roots", istr(&a, keepcount(out, "Root=")), "32");
+        expect(t, "filekeep caps newest", istr(&a, find(out, ",ssid39\n")>=0), "1");
+        expect(t, "filekeep caps oldest kept", istr(&a, find(out, ",ssid08\n")>=0), "1");
+        expect(t, "filekeep caps oldest", istr(&a, find(out, ",ssid07\n")>=0), "0");
+
+        Buf pb(&a, FILES_KEEPPATH);
+        putbyte(&pb, '/');
+        for (i32 i = 1; i < FILES_KEEPPATH; i++) {
+            putbyte(&pb, '%');
+        }
+        Str big = finish(&pb);
+        for (i32 i = 0; i < 4; i++) {
+            ks[i].n = FILES_TABS;
+            for (i32 j = 0; j < FILES_TABS; j++) {
+                ks[i].tabs[j].path = big;
+            }
+        }
+        out = filekeeptext(&a, list, 4, 0, now);
+        expect(t, "filekeep caps bytes", istr(&a, out.len<=FILES_KEEPBYTES), "1");
+        expect(t, "filekeep caps bytes roots", istr(&a, keepcount(out, "Root=")), "2");
+        expect(t, "filekeep caps bytes newest",
+               istr(&a, find(out, ",ssid03\n")>=0 && find(out, ",ssid02\n")>=0), "1");
+        expect(t, "filekeep caps bytes end", istr(&a, endswith(out, "\n\n")), "1");
+
+        FileSet s = {};
+        tabs[0] = {};
+        tabs[0].path = concat(&a, big, "x");
+        tabs[1] = {};
+        tabs[1].path = big;
+        filesetadd(&s, tabs+0);
+        filesetadd(&s, tabs+1);
+        FileKeep k = {};
+        filesetkeep(&s, 0, 15, &k);
+        expect(t, "filekeep caps path", istr(&a, k.n==1 && k.tabs[0].path.len==FILES_KEEPPATH),
+               "1");
+
+        Buf tb(&a, 512);
+        print(&tb, "Root=none,u1\n");
+        for (i32 i = 0; i < 9; i++) {
+            print(&tb, "Tab=o0,p/w/");
+            print(&tb, (i64)i);
+            putbyte(&tb, '\n');
+        }
+        FileKeeps *kt = alloc<FileKeeps>(&a);
+        keepread(kt, &a, finish(&tb));
+        expect(t, "filekeep caps tabs", istr(&a, kt->keeps[0].n), "8");
+        expect(t, "filekeep caps tabs bad", istr(&a, kt->bad), "1");
+
+        Buf rb(&a, 2048);
+        for (i32 i = 0; i < 33; i++) {
+            print(&rb, "Root=here,u1,s");
+            print(&rb, keepsid(&a, i));
+            print(&rb, "\nTab=o0,p/w/a\n");
+        }
+        FileKeeps *kr = alloc<FileKeeps>(&a);
+        keepread(kr, &a, finish(&rb));
+        expect(t, "filekeep caps read roots", istr(&a, kr->n), "32");
+        expect(t, "filekeep caps read bad", istr(&a, kr->bad), "2");
+
+        for (i32 len = 256; len <= 257; len++) {
+            Buf hb(&a, 512);
+            print(&hb, "Root=remote,u1,s20261112-101500-abcd,h");
+            for (i32 i = 0; i < len; i++) {
+                putbyte(&hb, 'h');
+            }
+            print(&hb, "\nTab=r,o0,p/w/a\n");
+            FileKeeps *kh = alloc<FileKeeps>(&a);
+            keepread(kh, &a, finish(&hb));
+            expect(t, concat(&a, "filekeep caps host ", istr(&a, len)),
+                   istr(&a, kh->n), len==256 ? Str("1") : Str("0"));
+        }
+
+        // Only what reading takes is written: a live remote record with
+        // a 257-byte host, an empty host or a bad sid writes no root
+        Str longhost = {};
+        {
+            Buf hb(&a, 512);
+            for (i32 i = 0; i < 257; i++) {
+                putbyte(&hb, 'h');
+            }
+            longhost = finish(&hb);
+        }
+        Str hosts[] = {longhost, "", "pi"};
+        Str sids[]  = {"20261112-101500-abcd", "20261112-101500-abcd", "a/b"};
+        for (iz i = 0; i < countof(hosts); i++) {
+            FileKeep kw = {};
+            kw.kind = FKEEP_REMOTE;
+            kw.sid  = sids[i];
+            kw.host = hosts[i];
+            kw.seen = 5;
+            kw.live = 1;
+            kw.n    = 1;
+            kw.tabs[0].flags = FKT_FAR;
+            kw.tabs[0].path  = "/w/a";
+            FileKeep *kp = &kw;
+            expect(t, concat(&a, "filekeep caps write ", istr(&a, i)),
+                   filekeeptext(&a, &kp, 1, 0, 5), "");
+        }
+    }
+
+    // A root without a valid u is pending of unknown age: stamped at its
+    // first save, kept FILES_KEEPAGE from then, not dropped at once
+    {
+        i64 now = 1794480000000;
+        Str in  = "Root=remote,s20261112-101500-abcd,hpi\n"
+                  "Tab=r,o0,p/w/a\n"
+                  "Root=here,ux,s20261112-101500-beef\n"
+                  "Tab=o0,p/w/b\n";
+        Str want = "[Prospero][Files]\n"
+                   "Root=remote,u1794480000000,s20261112-101500-abcd,hpi\n"
+                   "Tab=r,o0,p/w/a\n"
+                   "Root=here,u1794480000000,s20261112-101500-beef\n"
+                   "Tab=o0,p/w/b\n"
+                   "\n";
+        Str out = keepagain(&a, in, now);
+        expect(t, "filekeep unseen", out, want);
+        expect(t, "filekeep unseen kept", keepagain(&a, out, now+FILES_KEEPAGE), want);
+        expect(t, "filekeep unseen aged", keepagain(&a, out, now+FILES_KEEPAGE+1), "");
+    }
+
+    // Tolerance: what is ignored, the tab kept, and what is refused and
+    // counted, the next good root read all the same
+    {
+        Str in = "Tab=o0,p/w/z\n"
+                 "Root=here,u1,s20261112-101500-abcd\n"
+                 "Tab=q7,z,o9,t-1,p/w/a\n"
+                 "Foo=1\n"
+                 "Tab=tq,y1e9,b5-3,p/w/b\n"
+                 "Tab=o1\n"
+                 "Tab=o1,p/w/%zz\n"
+                 "Tab=o1,pw/rel\n"
+                 "Root=elsewhere,u1,s20261112-101500-abcd\n"
+                 "Tab=o0,p/w/c\n"
+                 "Root=here,u1\n"
+                 "Tab=o0,p/w/d\n"
+                 "Root=here,u1,sa/b\n"
+                 "Root=remote,u1,s20261112-101500-abcd\n"
+                 "Tab=r,o0,p/w/e\n"
+                 "Root=here,u1,s20261112-101500-beef\n"
+                 "Tab=*,o0,p/w/f\n";
+        FileKeeps *ks = alloc<FileKeeps>(&a);
+        keepread(ks, &a, in);
+        expect(t, "filekeep tolerance bad", istr(&a, ks->bad), "11");
+        expect(t, "filekeep tolerance", keepwrite(&a, ks, 1),
+               "[Prospero][Files]\n"
+               "Root=here,u1,s20261112-101500-abcd\n"
+               "Tab=o0,p/w/a\n"
+               "Tab=o1,p/w/b\n"
+               "Root=here,u1,s20261112-101500-beef\n"
+               "Tab=*,o0,p/w/f\n"
+               "\n");
+
+        // Absolute either way, a drive's or a share's
+        Str abs[] = {"/a", "C:/a", "c:\\a", "\\\\srv\\s", "//srv/s", "\\/x"};
+        Str rel[] = {"a", "C:a", "1:/a", "\\a", ""};
+        for (iz i = 0; i < countof(abs); i++) {
+            expect(t, concat(&a, "filekeep abs ", abs[i]), istr(&a, filekeepabs(abs[i])), "1");
+        }
+        for (iz i = 0; i < countof(rel); i++) {
+            expect(t, concat(&a, "filekeep rel ", rel[i]), istr(&a, filekeepabs(rel[i])), "0");
+        }
+    }
+
+    // Duplicates: a root's key as one before it, two none roots, two
+    // fronts; the same path twice stays, as a local and a remote tab may
+    // have it, and a true duplicate is not restored
+    {
+        Str in = "Root=here,u5,s20261112-101500-abcd\n"
+                 "Tab=*,o0,p/w/a\n"
+                 "Tab=*,o1,p/w/b\n"
+                 "Tab=o2,p/w/a\n"
+                 "Tab=r,o3,p/w/a\n"
+                 "Root=here,u9,s20261112-101500-abcd\n"
+                 "Tab=o0,p/w/z\n"
+                 "Root=none,u5\n"
+                 "Tab=o0,p/w/n1\n"
+                 "Root=none,u5\n"
+                 "Tab=o0,p/w/n2\n";
+        FileKeeps *ks = alloc<FileKeeps>(&a);
+        keepread(ks, &a, in);
+        expect(t, "filekeep dups", keepwrite(&a, ks, 1),
+               "[Prospero][Files]\n"
+               "Root=here,u5,s20261112-101500-abcd\n"
+               "Tab=*,o0,p/w/a\n"
+               "Tab=o1,p/w/b\n"
+               "Tab=o2,p/w/a\n"
+               "Tab=r,o3,p/w/a\n"
+               "Root=none,u5\n"
+               "Tab=o0,p/w/n1\n"
+               "\n");
+        FileKeep *k = &ks->keeps[0];
+        FileTab  *made[FILES_TABS];
+        for (i32 i = 0; i < k->n; i++) {
+            tabs[i] = {};
+            tabs[i].path = k->tabs[i].path;
+            tabs[i].host = k->tabs[i].flags&FKT_FAR ? 7 : 0;
+            filekeeptab(tabs+i, &k->tabs[i]);
+            made[i] = tabs+i;
+        }
+        FileSet s = {};
+        expect(t, "filekeep dups took", istr(&a, filesetrestore(&s, made, k->n, 0)), "3");
+        expect(t, "filekeep dups restore", filesetstr(&a, &s, tabs), "*abd");
+        expect(t, "filekeep dups rest", made[3]==tabs+2 ? Str("c") : Str("other"), "c");
+    }
+
+    // Age: a pending root unseen 90 days is dropped, a live one never,
+    // and a stamp in the future kept
+    {
+        i64 day = 24*60*60*1000LL;
+        struct { i64 seen; b32 live; Str want; } ages[] = {
+            {now - 91*day,  0, "0"},
+            {now - 89*day,  0, "1"},
+            {now - 200*day, 1, "1"},
+            {now + day,     0, "1"},
+        };
+        for (iz i = 0; i < countof(ages); i++) {
+            FileKeep  k  = {};
+            FileKeep *kp = &k;
+            k.kind = FKEEP_NONE;
+            k.seen = ages[i].seen;
+            k.live = ages[i].live;
+            k.n    = 1;
+            k.tabs[0].path = "/w/a";
+            Str out = filekeeptext(&a, &kp, 1, 0, now);
+            expect(t, concat(&a, "filekeep age ", istr(&a, (i64)i)),
+                   istr(&a, keepcount(out, "Root=")), ages[i].want);
+        }
+    }
+
+    // Ems: as restored, written as they are; else by the em
+    {
+        FileSet s = {};
+        tabs[0] = {};
+        tabs[0].path = "/w/a";
+        tabs[0].dy   = 0.51f;
+        tabs[0].ems  = 1;
+        tabs[1] = {};
+        tabs[1].path    = "/w/b";
+        tabs[1].dy      = 7.5f;
+        tabs[1].scrollx = 20;
+        filesetadd(&s, tabs+0);
+        filesetadd(&s, tabs+1);
+        FileKeep  k  = {};
+        FileKeep *kp = &k;
+        filesetkeep(&s, 0, 15, &k);
+        k.kind = FKEEP_NONE;
+        k.seen = now;
+        k.live = 1;
+        Str out = filekeeptext(&a, &kp, 1, 0, now);
+        expect(t, "filekeep ems", out,
+               "[Prospero][Files]\n"
+               "Root=none,u1794480000000\n"
+               "Tab=u,n,o0,y0.51,p/w/a\n"
+               "Tab=*,u,n,o1,y0.5,x1.33,p/w/b\n"
+               "\n");
+    }
+
+    // Wrap: only 0 turns it off, and is written alone with no roots
+    {
+        struct { Str in; Str want; } wraps[] = {
+            {"Wrap=0\n", "[Prospero][Files]\nWrap=0\n\n"},
+            {"Wrap=1\n", ""},
+            {"Wrap=x\n", ""},
+            {"",         ""},
+        };
+        for (iz i = 0; i < countof(wraps); i++) {
+            expect(t, concat(&a, "filekeep wrap ", wraps[i].in),
+                   keepagain(&a, wraps[i].in, now), wraps[i].want);
         }
     }
 }

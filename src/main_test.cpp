@@ -879,6 +879,7 @@ int main()
     test_sidebar(&t);
     test_dock(&t);
     test_fileset(&t);
+    test_filekeep(&t);
     test_filereadall(&t);
     test_filefind(&t);
     test_palette(&t);
