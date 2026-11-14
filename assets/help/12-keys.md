@@ -79,7 +79,10 @@ there too.
   sessions, ranked as you type. **Tab** or a
   plain **Enter** puts the pick in the message without sending it,
   **Up** and **Down** move the pick, and **Esc** closes the list before
-  it reaches the turn.
+  it reaches the turn. The files of a folder on this computer are found
+  in the background, the folder's own entries listed meanwhile. A
+  search held up by a share that stops answering is given up, and the
+  next one, a minute later, leaves that folder out.
 - **Ctrl+G** opens the draft in your editor (`[ui] editor`), which
   must open a window of its own; the draft becomes what you save, once
   the editor exits. A terminal `[ui] editor`, such as `vim`, is

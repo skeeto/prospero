@@ -57,7 +57,8 @@
 // own spelling (Win32's '\\' real paths) is compared with either
 // separator, and without case on Windows. A listing's paths are exact:
 // it holds and marks its folder alone, not what lies below, nor its
-// mount.
+// mount. So is the GUI's '@' walk (filewalk.cpp), which marks the folder
+// or link it stopped on, never the tree it walks.
 //
 // Locks. Dispatch decides under the pool's lock, then lets go of it to
 // run an inline job and to call finish and drop, which may call fsput

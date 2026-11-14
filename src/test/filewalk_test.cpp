@@ -63,6 +63,60 @@ static void walkto(FileWalk *w, Os *os, Arena *mem, Str root,
     while (filewalkstep(w)) {}
 }
 
+// A gate refusing one path and what lies below it, as fsat refuses a
+// path under a mark, counting the paths it was asked.
+struct WalkGate {
+    Str no;
+    i32 asked;
+};
+
+static b32 walkgate(void *ctx, Str path)
+{
+    WalkGate *g = (WalkGate *)ctx;
+    g->asked++;
+    return !(startswith(path, g->no) && (path.len==g->no.len || path[g->no.len]=='/'));
+}
+
+// A walk's job answered on a pool: "ERR" or the paths, in a's memory.
+struct WalkJobLog {
+    Arena *a;
+    Str    got;
+    b32    scratch;  // its scratch reservation still held
+};
+
+static void walkjobfinish(void *owner, FsJob *j, Arena)
+{
+    WalkJobLog *l = (WalkJobLog *)owner;
+    FileWalk   *w = (FileWalk *)j->res;
+    l->scratch = w && w->scratchreg;
+    l->got     = j->err.len ? concat(l->a, "!", j->err) : walkshow(l->a, walksorted(l->a, w));
+    if (w && w->truncated) {
+        l->got = concat(l->a, l->got, " (truncated)");
+    }
+}
+
+// Put a walk of root on p, inline as the test's pool runs it.
+static Str walkjob(FsPool *p, Arena *a, WalkJobLog *l, Str root, i64 limit)
+{
+    FileWalkJob *j = alloc<FileWalkJob>(a);
+    j->root  = root;
+    j->limit = limit;
+    j->w.mem = carve(a, 1<<20);
+    FsPut put = {};
+    put.id    = 1;
+    put.kind  = 1;
+    put.run   = filewalkrun;
+    put.ctx   = j;
+    put.paths = {&root, 1, 1};
+    put.exact = 1;
+    Str why = {};
+    l->got  = {};
+    if (!fsput(p, &put, &why, *a)) {
+        return concat(a, "-", why);
+    }
+    return l->got;
+}
+
 static void test_filewalk(Test *t)
 {
     Arena *a = &t->perm;
@@ -234,5 +288,63 @@ static void test_filewalk(Test *t)
                istr(&a2, filewalklinked(&a2, "/private/tmp", "x", "/somewhere/else")), "1");
         expect(t, "walk.linknone",
                istr(&a2, filewalklinked(&a2, "/w", "x", {})), "1");
+    }
+
+    // A gate refuses a folder: it is passed over, its link not resolved,
+    // and the rest is walked; a root refused is an empty walk
+    {
+        Os *os = newos(a, 1<<20);
+        os_mkdirs(os, *a, "/w");
+        os_mkdirs(os, *a, "/w/src");
+        os_mkdirs(os, *a, "/w/src/sub");
+        os_mkdirs(os, *a, "/w/doc");
+        os_write(os, *a, "/w/a.txt", "a\n");
+        os_write(os, *a, "/w/src/x.c", "x\n");
+        os_write(os, *a, "/w/src/sub/y.h", "y\n");
+        os_write(os, *a, "/w/doc/z.md", "z\n");
+        Arena    mem = carve(a, 1<<20);
+        WalkGate g   = {"/w/src", 0};
+        FileWalk w   = {};
+        filewalkbegin(&w, os, &mem, "/w", 0);
+        w.gate = walkgate;
+        w.ctx  = &g;
+        while (filewalkstep(&w)) {}
+        expect(t, "walk.gate", walkshow(a, walksorted(a, &w)), "a.txt doc/ doc/z.md");
+        expect(t, "walk.gate.asked", istr(a, g.asked), "4");  // /w, both links, doc
+        filewalkfree(&w);
+
+        g = {"/w", 0};
+        w = {};
+        filewalkbegin(&w, os, &mem, "/w", 0);
+        w.gate = walkgate;
+        w.ctx  = &g;
+        expect(t, "walk.gate.root", istr(a, filewalkstep(&w)*10 + (i32)w.paths.len), "0");
+        filewalkfree(&w);
+    }
+
+    // As a pool's job (inline here, as no thread starts): the whole walk,
+    // a folder under a mark passed over, a root under one refused, the
+    // budget's end truncating it, and its scratch gone as it ends
+    {
+        Os *os = newos(a, 1<<20);
+        os_mkdirs(os, *a, "/j");
+        os_mkdirs(os, *a, "/j/src");
+        os_mkdirs(os, *a, "/j/dead");
+        os_write(os, *a, "/j/a.txt", "a\n");
+        os_write(os, *a, "/j/src/x.c", "x\n");
+        os_write(os, *a, "/j/dead/y.c", "y\n");
+        WalkJobLog l = {a, {}, 0};
+        FsPool    *p = fsnew(os, a, 0, 77, &l, walkjobfinish);
+        expect(t, "walk.job", walkjob(p, a, &l, "/j", FILEWALK_TIME),
+               "a.txt dead/ dead/y.c src/ src/x.c");
+        expect(t, "walk.job.scratch", istr(a, l.scratch), "0");
+        fsmark(p, *a, "/j/dead", 1, 0);
+        expect(t, "walk.job.marked", walkjob(p, a, &l, "/j", FILEWALK_TIME),
+               "a.txt src/ src/x.c");
+        fsmark(p, *a, "/j", 1, 0);
+        expect(t, "walk.job.refused", walkjob(p, a, &l, "/j", FILEWALK_TIME),
+               concat(a, "-", fsstuck));
+        fsunmark(p, 0);
+        expect(t, "walk.job.budget", walkjob(p, a, &l, "/j", 0), " (truncated)");
     }
 }

@@ -1,17 +1,19 @@
 // The '@' picker's adapter between the compose box and its candidate
 // sources: one typed query in, the candidates it may become out, and a
 // line saying what they are. Two sources, chosen here: the workspace
-// index of the session's working tree (filewalk.cpp), walked one directory
-// a frame-step on this machine, and one folder of that tree listed through
-// dirget, which serves a remote host and is the fallback for a tree the
-// index could not be given memory for.
+// index of the session's working tree (filewalk.cpp), walked on this
+// machine by a worker of the window's file pool (GFS_WALK), and one
+// folder of that tree listed through dirget, which serves a remote host
+// and stands in while the walk goes on, or when it could not be had.
 //
-// It knows the GUI only for dirget, the scheduler (scheddirty) and the
-// attachments (attachfile, attachwhy, attachremove): nothing here draws,
-// reads a key or waits. Its arena is the frame's, so the candidates and
-// their paths live for one frame, and the caller keeps none of them; the
-// index is the exception, kept per session in g->perm and the 16 MiB
-// reservation its paths are cloned into.
+// It knows the GUI only for dirget, the window's pool (guifsput), the
+// scheduler (scheddirty) and the attachments (attachfile, attachwhy,
+// attachremove): nothing here draws, reads a key or waits. Its arena is
+// the frame's, so the candidates and their paths live for one frame, and
+// the caller keeps none of them; the index is the exception, kept per
+// session in g->perm and the 16 MiB reservation its walk and paths are
+// in. The walk makes no frames: its answer is sorted on the window's
+// thread, and draws again only if the picker is up.
 //
 // This is free and unencumbered software released into the public domain.
 
@@ -23,11 +25,10 @@ enum : i32 {
 };
 
 enum : i64 {
-    MENTION_TTL = 60000000,  // µs: an index older than this is rebuilt
-};
-
-enum : i32 {
-    MENTION_WALK_MS = 4,  // the walk's slice of one frame, in ms
+    MENTION_TTL  = 60000000,  // µs: an index older than this is rebuilt, and
+                              // no walk is begun this long after one given
+                              // up or refused (its tree not responding)
+    MENTION_BUSY = 1000000,   // µs: or this long after the pool was busy
 };
 
 enum : iz {
@@ -126,20 +127,20 @@ static b32 mentionidxless(i32 *a, i32 *b)
 // it (a copy of an arena grows it, and this one's end is not refreshed).
 static void mentionidxsort(MentionIdx *idx)
 {
-    Slice<Str> paths  = idx->w.paths;
-    Slice<i64> mtimes = idx->w.mtimes;
-    Slice<u8>  isdirs = idx->w.isdirs;
+    Slice<Str> paths  = idx->w->paths;
+    Slice<i64> mtimes = idx->w->mtimes;
+    Slice<u8>  isdirs = idx->w->isdirs;
     iz         n      = paths.len;
     if (n < 2) {
         return;
     }
-    i32 *ord = alloc<i32>(&idx->w.mem, n);
+    i32 *ord = alloc<i32>(&idx->w->mem, n);
     for (iz i = 0; i < n; i++) {
         ord[i] = (i32)i;
     }
     mentionidxsorts = mtimes;
     mentionidxpaths = paths;
-    sort(ord, n, mentionidxless, idx->w.mem);
+    sort(ord, n, mentionidxless, idx->w->mem);
     mentionidxsorts = {};
     mentionidxpaths = {};
     for (iz i = 0; i < n; i++) {
@@ -153,38 +154,55 @@ static void mentionidxsort(MentionIdx *idx)
     }
 }
 
+// A walk's Region let go, by the pool once its worker is out of it (an
+// index that gave its walk up), or by the index itself.
+static void mentionwalkdrop(Os *os, void *own)
+{
+    FileWalkJob *j = (FileWalkJob *)own;
+    Region      *r = j->r;
+    filewalkfree(&j->w);
+    os_release(os, r);
+}
+
+// An index emptied: a walk still out is abandoned, its Region left to the
+// pool when its worker still runs, else let go here.
 static void mentionidxfree(Gui *g, MentionIdx *idx)
 {
-    filewalkfree(&idx->w);
-    Region *r = idx->w.mem.region;
-    idx->w.mem = {};
-    if (r) {
-        os_release(g->os, r);
+    b32 pools = idx->walkid && g->fs && fsabandon(g->fs, idx->walkid);
+    if (idx->job && !pools) {
+        mentionwalkdrop(g->os, idx->job);
     }
-    idx->root = {};
-    idx->born = 0;
-    // The cached rank indexes paths this arena held: it goes with them
+    idx->job    = 0;
+    idx->w      = 0;
+    idx->walkid = 0;
+    idx->root   = {};
+    idx->born   = 0;
+    // The cached rank indexes paths this Region held: it goes with them
     idx->ranked = 0;
     idx->qlen   = 0;
     idx->npicks = 0;
 }
 
-// Start an index's walk over root, in a reservation of its own. Returns 0
-// when the reservation cannot be made. win is the host's own rule for
-// paths and .gitignore chains, as hostwin reads it.
+// Set an index up for a walk over root, in a reservation of its own, its
+// job not yet put (mentionidxput). Returns 0 when the reservation cannot
+// be made. win is the host's own rule for paths and .gitignore chains, as
+// hostwin reads it.
 static b32 mentionidxbegin(Gui *g, MentionIdx *idx, Str root, b32 win)
 {
     Region *r = os_reserve(g->os, MENTION_IDX_MEM);
     if (!r) {
         return 0;
     }
-    idx->w.mem = newarena(r);
-    filewalkbegin(&idx->w, g->os, &idx->w.mem, root, win);
-    if (!idx->w.scratchreg) {  // no room to list a directory: nothing to index
-        mentionidxfree(g, idx);
-        return 0;
-    }
-    idx->root = clone(&idx->w.mem, root);
+    Arena        a = newarena(r);
+    FileWalkJob *j = alloc<FileWalkJob>(&a);
+    j->r     = r;
+    j->root  = clone(&a, root);
+    j->win   = win;
+    j->limit = FILEWALK_TIME;
+    j->w.mem = a;  // the rest of the Region, the walk's
+    idx->job  = j;
+    idx->w    = &j->w;
+    idx->root = j->root;
     idx->born = os_ticks(g->os);
     // A new walk: any rank cached against the last one is of no use, and
     // the generation is what says so
@@ -193,44 +211,54 @@ static b32 mentionidxbegin(Gui *g, MentionIdx *idx, Str root, b32 win)
     return 1;
 }
 
-// Advance a walk by at most one frame's slice of it, and sort it once when
-// it is done. Returns 1 while there is more to do, so that the caller can
-// say why its frame differs (scheddirty): a walk run to its end in one
-// frame would stall the keystroke that opened the popup. A step lists one
-// directory, so the budget is checked between listings; one listing is not
-// interruptible and is the frame's worst case.
-static b32 mentionidxstep(Gui *g, MentionIdx *idx, i64 budget)
+static b32 guifsput(Gui *, FsPut *, Str *);
+
+// The slot being walked, its job put on the window's pool unless it is
+// already out. Refused (its tree's file system not responding, the pool
+// busy), the slot is let go and the index served stays: no walk is begun
+// again for a while.
+static void mentionidxput(Gui *g, MentionIdxs *m, Arena scratch)
 {
-    if (idx->w.done) {
-        return 0;
+    MentionIdx *idx = m->next>=0 ? &m->slot[m->next] : 0;
+    if (!idx || !idx->job || idx->walkid) {
+        return;
     }
-    i64 end = os_ticks(g->os) + budget*1000;  // budget is ms, ticks are µs
-    while (!idx->w.done && os_ticks(g->os) < end) {
-        filewalkstep(&idx->w);  // one directory a step: the budget's unit
+    Str   norm = normpath(&scratch, idx->root, ".", HOST_WINDOWS);
+    FsPut put  = {};
+    put.id    = ++g->nextid;
+    put.kind  = GFS_WALK;
+    put.run   = filewalkrun;
+    put.ctx   = idx->job;
+    put.paths = {&norm, 1, 1};
+    put.exact = 1;  // a stuck walk marks where it was alone, not the tree
+    put.own   = idx->job;
+    put.drop  = mentionwalkdrop;
+    idx->walkid = put.id;  // first: an inline job is answered in guifsput
+    Str why     = {};
+    if (!guifsput(g, &put, &why)) {
+        idx->walkid = 0;
+        mentionidxfree(g, idx);
+        m->next  = -1;
+        m->again = os_ticks(g->os) + (why==fsbusy ? MENTION_BUSY : MENTION_TTL);
     }
-    if (idx->w.done) {
-        mentionidxsort(idx);
-        return 0;
-    }
-    return 1;
 }
 
 // The session's index of root to serve, its walk done, else null, and the
-// listing stands in. It is walked here a frame's slice at a time, *walking
-// saying a walk goes on. It is built on first use, and built again in the
+// listing stands in. It is built on first use, and built again in the
 // other slot when it is older than MENTION_TTL or a turn has ended since,
 // as a turn may make or delete the very files the picker should offer; the
 // old one is served until the new one is done, so a rebuild costs the
 // picker nothing. A turn's start makes nothing stale, and a turn going on
-// leaves the index alone: the user may be writing while it works.
-static MentionIdx *mentionidx(Gui *g, GuiSession *s, Str root, b32 *walking)
+// leaves the index alone: the user may be writing while it works. The walk
+// goes to the window's pool, unless a checklist holds it (mentionhold):
+// then its slot waits, set up, and the listing answers.
+static MentionIdx *mentionidx(Gui *g, GuiSession *s, Str root, Arena scratch)
 {
-    *walking = 0;
     MentionIdxs *m = s->midx;
     if (!m) {
         // Kept even when no index can be had (nomem), so that a shortage
         // costs one reservation and not one a frame while the popup is open
-        m = alloc<MentionIdxs>(&g->perm);  // zeroed, as filewalkbegin expects
+        m = alloc<MentionIdxs>(&g->perm);
         m->cur  = -1;
         m->next = -1;
         s->midx = m;
@@ -252,8 +280,9 @@ static MentionIdx *mentionidx(Gui *g, GuiSession *s, Str root, b32 *walking)
         }
     }
     MentionIdx *cur = m->cur>=0 ? &m->slot[m->cur] : 0;
-    b32 old = !cur || m->stale || os_ticks(g->os)-cur->born > MENTION_TTL;
-    if (old && m->next<0) {
+    i64 now = os_ticks(g->os);
+    b32 old = !cur || m->stale || now-cur->born > MENTION_TTL;
+    if (old && m->next<0 && now>=m->again) {
         i32 k = m->cur==0 ? 1 : 0;
         mentionidxfree(g, &m->slot[k]);
         m->stale = 0;
@@ -263,28 +292,71 @@ static MentionIdx *mentionidx(Gui *g, GuiSession *s, Str root, b32 *walking)
             m->nomem = 1;  // no more trying: the listing answers instead
             return 0;
         } else {
-            cur->born = os_ticks(g->os);  // the old one again, for a while
+            cur->born = now;  // the old one again, for a while
         }
     }
-    if (m->next >= 0) {
-        i64 budget = g->mentionhold ? 0 : MENTION_WALK_MS;  // a checklist's hold
-        MentionIdx *nx = &m->slot[m->next];
-        mentionidxstep(g, nx, budget);
-        if (nx->w.done) {
-            if (cur) {
-                mentionidxfree(g, cur);
+    if (!g->mentionhold) {
+        mentionidxput(g, m, scratch);
+    }
+    return m->cur>=0 ? &m->slot[m->cur] : 0;  // an inline walk is served now
+}
+
+// A checklist's hold let go (OP_MENTIONHOLD 0): the walk held is put.
+static void mentionidxgo(Gui *g, GuiSession *s, Arena scratch)
+{
+    if (s->midx) {
+        mentionidxput(g, s->midx, scratch);
+    }
+}
+
+// The window's pool's answer to a walk (GFS_WALK), on the window's
+// thread: sorted here and served, the index it replaces let go, and the
+// picker drawn again if it is up. One given up or refused (back unset,
+// or err) keeps the index served, and none is begun again for
+// MENTION_TTL, or MENTION_BUSY when it waited in the queue past FS_STUCK
+// (fsbusy); its Region is the pool's when back is unset.
+static void mentionwalkdone(Gui *g, FsJob *job, b32 back, Str err)
+{
+    MentionIdxs *m = 0;
+    i32          k = -1;
+    for (GuiSession *s = g->sessions; s && k<0; s = s->next) {
+        for (i32 i = 0; s->midx && i<2 && k<0; i++) {
+            if (s->midx->slot[i].walkid == job->put.id) {
+                m = s->midx;
+                k = i;
             }
-            m->cur  = m->next;
-            m->next = -1;
-            cur     = nx;
         }
     }
-    *walking = m->next >= 0;
-    return cur;
+    if (k < 0) {  // not kept: an index abandons its walk as it goes
+        if (back) {
+            mentionwalkdrop(g->os, job->put.own);
+        }
+        return;
+    }
+    MentionIdx *idx = &m->slot[k];
+    if (!back) {
+        idx->job = 0;  // the pool's, dropped once its worker is out of it
+    }
+    idx->walkid = 0;
+    if (!back || err.len || k!=m->next) {
+        mentionidxfree(g, idx);
+        m->next  = m->next==k ? -1 : m->next;
+        m->again = os_ticks(g->os) + (err==fsbusy ? MENTION_BUSY : MENTION_TTL);
+        return;
+    }
+    mentionidxsort(idx);
+    if (m->cur >= 0) {
+        mentionidxfree(g, &m->slot[m->cur]);
+    }
+    m->cur  = k;
+    m->next = -1;
+    if (g->mentionshown) {
+        scheddirty(&g->sched);  // the picker's list is now the index's
+    }
 }
 
 // A session's indexes go with the session: their reservations must not
-// outlive the tree they were made for.
+// outlive the tree they were made for, and a walk out is abandoned.
 static void mentionidxdrop(Gui *g, GuiSession *s)
 {
     MentionIdxs *m = s->midx;
@@ -295,6 +367,7 @@ static void mentionidxdrop(Gui *g, GuiSession *s)
         mentionidxfree(g, &m->slot[1]);
         m->cur   = m->next = -1;
         m->stale = m->nomem = 0;
+        m->again = 0;
     }
 }
 
@@ -327,7 +400,7 @@ static Slice<MentionPick> mentionidxpicks(Arena *a, MentionIdx *idx, Str query)
         Str{idx->qtext, idx->qlen} == q) {
         return Slice<MentionPick>{idx->picks, idx->npicks, idx->npicks};
     }
-    Slice<MentionPick> picks = mentionpicks(a, idx->w.paths, q, MENTION_PICKS, 1);
+    Slice<MentionPick> picks = mentionpicks(a, idx->w->paths, q, MENTION_PICKS, 1);
     idx->ranked = 0;  // what it held is about to be another word's
     if (q.len > MENTION_QUERY) {
         return picks;
@@ -355,18 +428,18 @@ static void mentionfillindex(Arena *a, Gui *g, GuiSession *s, Str query,
                              MentionSrc *src, MentionIdx *idx)
 {
     src->kind      = MENTION_INDEX;
-    src->truncated = idx->w.truncated;  // capped, and still the better source
+    src->truncated = idx->w->truncated;  // capped, and still the better source
     Slice<MentionPick> picks = mentionidxpicks(a, idx, query);
     Slice<MentionCand> cands = {};
     for (iz i = 0; i < picks.len; i++) {
         iz  k    = (iz)picks[i].i;
-        Str path = idx->w.paths[k];
+        Str path = idx->w->paths[k];
         Str name = basename(path);
         Str dir  = cuttail(path, name.len);
         if (dir.len && dir[dir.len-1] == '/') {
             dir.len--;  // the separator before the name
         }
-        cands = push(a, cands, MentionCand{path, name, dir, idx->w.isdirs[k]!=0, 0, {},
+        cands = push(a, cands, MentionCand{path, name, dir, idx->w->isdirs[k]!=0, 0, {},
                                            picks[i].score});
     }
     mentionmarkattached(a, s, src->root, cands);
@@ -380,15 +453,15 @@ static void mentionfillindex(Arena *a, Gui *g, GuiSession *s, Str query,
     // still going.
     Buf b(a, 64);
     if (!trim(query).len) {
-        print(&b, idx->w.paths.len ? Str("recent files") : Str("no files here"));
+        print(&b, idx->w->paths.len ? Str("recent files") : Str("no files here"));
     } else if (!cands.len) {
-        print(&b, idx->w.paths.len ? Str("no files match") : Str("no files here"));
+        print(&b, idx->w->paths.len ? Str("no files match") : Str("no files here"));
     } else {
         print(&b, (i64)cands.len);
         print(&b, " of ");
-        print(&b, (i64)idx->w.paths.len);
+        print(&b, (i64)idx->w->paths.len);
     }
-    if (idx->w.truncated) {
+    if (idx->w->truncated) {
         print(&b, " \xc2\xb7 index capped");
     }
     src->cands  = cands;
@@ -397,13 +470,15 @@ static void mentionfillindex(Arena *a, Gui *g, GuiSession *s, Str query,
 
 // The candidates a typed mention query offers, from one of two sources.
 //
-// The index (filewalk.cpp) when this machine holds the tree: it is walked a
-// directory a frame, so no frame waits for a big tree, and ranked against the
-// whole typed word. A capped index is still the index: it holds the tree's
-// first FILEWALK_FILES paths, which is more than the one folder a listing can
-// reach, so a truncated walk does not give way to the listing. The listing is
-// the fallback for three cases: a remote host, whose files are not here,
-// an index that could not be given memory, and the first walk still going.
+// The index (filewalk.cpp) when this machine holds the tree: it is walked by
+// a worker of the window's file pool, so no frame waits for a big tree or a
+// folder that stopped answering, and ranked against the whole typed word. A
+// capped index is still the index: it holds the tree's first FILEWALK_FILES
+// paths, which is more than the one folder a listing can reach, so a
+// truncated walk does not give way to the listing. The listing is the
+// fallback for four cases: a remote host, whose files are not here, an index
+// that could not be given memory, the first walk still going (or held by a
+// checklist), and a first walk given up or refused.
 //
 // The listing: one folder of the session's working tree, through dirget.
 // The query is split as a path — the folder typed, then the word that
@@ -431,11 +506,7 @@ static void mentionfillsrc(Arena *a, Gui *g, GuiSession *s, Str query, MentionSr
     src->root = root;
     // The index: this machine's tree, and only this machine's, since a
     // remote's files are on the other host
-    b32         walking = 0;
-    MentionIdx *idx     = s->host->kind!=GH_REMOTE ? mentionidx(g, s, root, &walking) : 0;
-    if (walking) {
-        scheddirty(&g->sched);  // the walk has work: this frame is justified
-    }
+    MentionIdx *idx = s->host->kind!=GH_REMOTE ? mentionidx(g, s, root, *a) : 0;
     if (idx) {
         mentionfillindex(a, g, s, query, src, idx);
         return;

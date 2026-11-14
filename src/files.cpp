@@ -29,10 +29,11 @@
 // is answered at once, by its caller. So do the folders listed for a
 // path typed (dirget's GFS_LIST): Open file's Tab completion, the new
 // session's folder field and the '@' list's folders, "Listing..." once
-// one has taken FILES_NOTEDELAY. On the window's thread still: one-off
-// actions on a path picked in a dialog or dropped (drops, attachments,
-// import's folder, Browse, the typed-path dialog's OK, a container's
-// folder), the '@' index, and the editor's look-up on PATH.
+// one has taken FILES_NOTEDELAY. The '@' list's index is walked there
+// too (mention.cpp's GFS_WALK, filewalk.cpp's filewalkrun). On the
+// window's thread still: one-off actions on a path picked in a dialog or
+// dropped (drops, attachments, import's folder, Browse, the typed-path
+// dialog's OK, a container's folder), and the editor's look-up on PATH.
 //
 // A file opens from Open file, or from a link to it (filelinkopen) in
 // the transcript, the plan or a Markdown file shown here.
@@ -472,13 +473,6 @@ static void filesfit(Gui *g, FileTab *keep, iz extra)
 }
 
 // Files on this computer, through the window's own file workers
-
-enum : i32 {  // the window's file jobs (FsPut.kind)
-    GFS_FILE = 1,  // the fetch's read (filereadall), into its Region's buffer
-    GFS_STAT,      // a path's stat: a tab's check (filewatch), or Open file's
-    GFS_LINKS,     // inline code's paths, each with its rootlen (codelinksflush)
-    GFS_LIST,      // a folder's entries, for a path typed (dirget)
-};
 
 // A listing's answer (GFS_LIST): the entries, else why not, as dirget
 // says it.
@@ -2391,6 +2385,9 @@ static void guifsdone(void *owner, FsJob *job, Arena scratch)
         break;
     case GFS_LIST:
         dirlocal(g, job, back, err);
+        break;
+    case GFS_WALK:
+        mentionwalkdone(g, job, back, err);
         break;
     }
     g->fsmem = keep;

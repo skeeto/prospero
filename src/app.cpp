@@ -1252,7 +1252,15 @@ enum : i64 {
     FILES_NOTEDELAY = 250000,  // ticks a read or check takes before it says so
 };
 
-// A read on the window's pool (files.cpp's GFS_FILE): where its worker
+enum : i32 {  // the window's file jobs (FsPut.kind, files.cpp's guifs)
+    GFS_FILE = 1,  // the fetch's read (filereadall), into its Region's buffer
+    GFS_STAT,      // a path's stat: a tab's check (filewatch), or Open file's
+    GFS_LINKS,     // inline code's paths, each with its rootlen (codelinksflush)
+    GFS_LIST,      // a folder's entries, for a path typed (dirget)
+    GFS_WALK,      // the '@' index's walk (mention.cpp, filewalkrun)
+};
+
+// A read on the window's pool (GFS_FILE): where its worker
 // writes, at the start of its fetch's Region, set before the job is put
 // and never changed after.
 struct GfsFile {
@@ -2276,8 +2284,9 @@ struct Gui {
                                      //   from (the enum is not defined yet)
     b32                mentiontrunc; // its list was capped
     b32                mentiontag;   // its pick was drawn marked attached
-    b32                mentionhold;  // the '@' index's walk is held, so the
-                                     //   picker lists a folder (OP_MENTIONHOLD)
+    b32                mentionhold;  // the '@' index's walk is held, not put,
+                                     //   so the picker lists a folder
+                                     //   (OP_MENTIONHOLD)
     b32                cmenushown;   // the compose box's context menu drew
     u32                cmenustate;   // and what it enabled: 1 undo, 2 redo,
                                      // 4 cut and copy, 8 paste, 16 editor
@@ -6390,6 +6399,7 @@ static void sessgone(Gui *, GuiSession *);
 // The '@' picker's index (mention.cpp), which sessgone lets go: mention.cpp
 // is included with ui.cpp, further down, so its freeing is named here
 static void mentionidxdrop(Gui *, GuiSession *);
+static void mentionidxgo(Gui *, GuiSession *, Arena);
 static void mentionlate(Gui *);
 static b32  trashtoasted(Gui *, GuiSession *);
 static void updatestatus(Gui *, GuiHost *, b32 idle);
@@ -14014,9 +14024,10 @@ enum : i32 {
     OP_NOTIFY,    // [ui] notify is dx (NOTIFY_*), as a setting would
     OP_TOASTMARK, // remember the toasts shown and withdrawn so far
     OP_TOASTCLICK,// click the latest toast, which gives the window focus
-    OP_MENTIONHOLD,// dx 1: the shown session's '@' index begins again and is
-                  // not walked, as a tree too big for one frame is not, so
-                  // the picker lists a folder; dx 0 lets the walk go on
+    OP_MENTIONHOLD,// dx 1: the shown session's '@' index begins again and its
+                  // walk is not put on the window's pool, as a walk still
+                  // going is not done, so the picker lists a folder; dx 0
+                  // puts the walk held
     OP_MENTIONS,  // dx 0 as [ui] mentions = false would, dx 1 as true
     OP_NODIALOG,  // the next file dialog cannot be shown, as without a portal
     OP_OPENFILE,  // open text in Files, as a reference (fileref) in --cwd,
@@ -15012,8 +15023,9 @@ enum : i32 {
                   // it, and brought the match it went to into view
     W_PAUSED,     // the session shown waits, paused, before a request
     W_FILEASKED,  // Open file's check answered: closed, or an error
-    W_FSIDLE,     // no file work out: no job on the window's file workers,
-                  // no folder listing asked, no inline code's batch here or
+    W_FSIDLE,     // no file work out: no job on the window's file workers
+                  // (an '@' walk held, never put, is none), no folder
+                  // listing asked, no inline code's batch here or
                   // elsewhere, and none turned away
 };
 
@@ -21813,6 +21825,7 @@ static DriveOp composeops[] = {
     {OP_TOUCH, 0, 0, 0, 300, "mention-send.txt"},
     CLICK(T_PROMPT, "", 300),
     TYPE1("@"),
+    {OP_WAIT, W_FSIDLE, 0, 0, 5000, ""},  // the walk, on the window's file pool
     {OP_CHECK, CHK_MENTION, 0, 0, 0, ""},  // dx 0: one row or more
     {OP_SHOT, 0, 0, 0, 300, "compose-mention"},
     TYPE1("m"), TYPE1("e"), TYPE1("n"), TYPE1("t"), TYPE1("i"), TYPE1("o"),
@@ -21893,6 +21906,7 @@ static DriveOp composeops[] = {
     // one-folder listing standing in for it would draw just as well
     CLICK(T_PROMPT, "", 300),
     TYPE1("@"),
+    {OP_WAIT, W_FSIDLE, 0, 0, 5000, ""},
     {OP_CHECK, CHK_MENTION, 0, 0, 0, ""},  // dx 0: one row or more
     {OP_CHECK, CHK_MENTIONKIND, 0, 0, 0, "index"},
     // A query that matches nothing leaves the popup up, its one line
@@ -21987,12 +22001,13 @@ static DriveOp composeops[] = {
     // Left as the steps after expect: no text, no attachment
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
     {OP_CHECK, CHK_ATTACHED, 0, 0, 0, ""},
-    // The folder listing that stands in for the index while a tree too big
-    // for one frame is walked, on this machine: the tree above is walked
-    // in the frame that opens the picker, so it never gets here. Held, the
-    // walk stays at its start, and the picker lists the folder; a pick
-    // from it attaches as the index's does, and a folder typed is listed
-    // in its turn
+    // The folder listing that stands in for the index while its walk goes
+    // on, on this machine: the tree above is walked by a worker in a few
+    // milliseconds, so it is seldom seen. Held, the walk is set up but
+    // not put on the window's pool, and the picker lists the folder; a
+    // pick from it attaches as the index's does, and a folder typed is
+    // listed in its turn. Let go, the walk is put, and W_FSIDLE waits
+    // for it
     {OP_MENTIONHOLD, 0, 1, 0, 300, ""},
     CLICK(T_PROMPT, "", 300),
     TYPE1("@"),
@@ -22021,6 +22036,7 @@ static DriveOp composeops[] = {
     {OP_CHECK, CHK_ATTACHED, 0, 0, 0, ""},
     {OP_MOVE, T_EMPTY, 0, 0, 600, ""},
     {OP_MENTIONHOLD, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_FSIDLE, 0, 0, 5000, ""},
     // A file whose contents cannot come, a binary one (gui.py writes it):
     // its token goes in with a path-only chip, and a note that typing
     // leaves; the message, with that chip alone, goes as its text, the
@@ -27236,7 +27252,9 @@ static void drivestep(Gui *g)
     case OP_MENTIONHOLD:
         g->mentionhold = op->dx != 0;
         if (g->mentionhold && g->sess) {
-            mentionidxdrop(g, g->sess);  // begun again, and held unwalked
+            mentionidxdrop(g, g->sess);  // begun again, and held unput
+        } else if (g->sess) {
+            mentionidxgo(g, g->sess, g->frame);  // the walk held is put
         }
         break;
     case OP_MENTIONS:
