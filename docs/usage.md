@@ -63,7 +63,7 @@ numbered and highlighted, wrapped or not, a Markdown file rendered (or as
 text), and `path:N` or `path:A-B` scrolled to those lines and marked;
 reading a file, or checking it, never holds up the window, so a file on a
 share that stops answering says so after ten seconds ("The file system is
-not responding") while the rest carries on. Ctrl+W (Cmd+W) closes its front tab, Ctrl+F (Cmd+F) finds in its file, and Ctrl+G goes to a line, while it has the focus. Its tabs of files on this computer, in sessions on this computer and its own, where each was and how it showed, are kept with the window's layout across a restart, each file read again only once shown; a session on another host does not keep them yet. A
+not responding") while the rest carries on. Ctrl+W (Cmd+W) closes its front tab, Ctrl+F (Cmd+F) finds in its file, and Ctrl+G goes to a line, while it has the focus. Its tabs, each session's and its own, where each was and how it showed, are kept with the window's layout across a restart, each file read again only once shown; a session on another host gets its tabs back once that host is connected and lists it, a container's at once. A
 file dropped on the Files pane opens there too, not attached; while files
 are dragged over the window, the place they would go (Files, the prompt
 or Open file's field) is outlined, with a card saying what a

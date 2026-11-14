@@ -8710,6 +8710,18 @@ static GuiCtr *ctrofhost(Gui *g, GuiHost *h)
     return h && h->kind==GH_REMOTE ? ctrof(g, h->name) : 0;
 }
 
+// Whether a host's name is that of a container a subagent runs in:
+// ctr:t- and 8 hex digits (hostlink.cpp).
+static b32 ctrtaskhost(Str hostname)
+{
+    Str name = startswith(hostname, "ctr:t-") ? cuthead(hostname, 4) : Str{};
+    b32 ok   = name.len == 10;
+    for (iz i = 2; ok && i < name.len; i++) {
+        ok = hexval(name[i]) >= 0;
+    }
+    return ok;
+}
+
 // The host of the container a subagent runs in, by its name ctr:t-NAME
 // (hostlink.cpp): made from the container.ini that the parent's engine
 // keeps in this state directory while the container is there, else null.
@@ -8717,12 +8729,9 @@ static GuiCtr *ctrofhost(Gui *g, GuiHost *h)
 // no GuiCtr: the parent's engine made it, and removes it.
 static GuiHost *ctrtask(Gui *g, Arena scratch, Str hostname)
 {
-    Str  name = startswith(hostname, "ctr:t-") ? cuthead(hostname, 4) : Str{};
-    b32  ok   = name.len == 10;
-    for (iz i = 2; ok && i < name.len; i++) {
-        ok = hexval(name[i]) >= 0;
-    }
-    GuiHost *h = ok ? findhost(g, GH_REMOTE, hostname) : 0;
+    b32      ok   = ctrtaskhost(hostname);
+    Str      name = ok ? cuthead(hostname, 4) : Str{};
+    GuiHost *h    = ok ? findhost(g, GH_REMOTE, hostname) : 0;
     if (!ok || (h && h->taskexec.len)) {
         return h;
     }
@@ -12986,6 +12995,8 @@ static void saveini(Gui *g, b32 last)
 //   Root=here,u1763100000000,s20261114-101500-ab12
 //   Tab=m,o0,t202,y0.51,p/home/me/src/notes.md
 //   Tab=*,u,o1,t1499,b1500-1504,p/home/me/src/main.c
+//   Root=remote,u1763100000000,s20261114-102000-cd34,hbox
+//   Tab=*,r,o0,p/srv/app/README
 //   [Prospero][Layout Review]
 //   Shown=Sessions,Transcript,Prompt
 //   Split=X,0.22
@@ -13001,11 +13012,11 @@ static void saveini(Gui *g, b32 last)
 // order, written only when not the default, recent activity. Help keeps
 // its topic by name (help.cpp), an unknown one the first. Files keeps
 // each root's tabs (fileset.cpp's filekeepline): a Root line, the
-// window's own (none), a session's here or a remote's by sid, when
-// last known alive, then its tabs in the bar's order, each its flags,
-// opened rank, place (in ems) and band, its path last, %-escaped; a
-// line that cannot be read is dropped and counted, the rest kept, and
-// Wrap is Wrap's last choice when off. Each layout
+// window's own (none), a session's here, or a remote's by sid and its
+// host's name, when last known alive, then its tabs in the bar's order,
+// each its flags, opened rank, place (in ems) and band, its path last,
+// %-escaped; a line that cannot be read is dropped and counted, the
+// rest kept, and Wrap is Wrap's last choice when off. Each layout
 // the user saved has a section, in the order saved (dock.cpp); one
 // that cannot be read, or named as one before it, is dropped (iniapply).
 
@@ -14093,6 +14104,8 @@ enum : i32 {
     OP_NOSESS,    // show no session: the empty view, whose Files tabs are
                   // the window's own
     OP_SHOWFILES, // Files in front, as opening a file puts it
+    OP_FILESROOT, // show the first session on the remote text whose Files
+                  // tabs are not empty, Files in front; none fails
 };
 // OP_TEXTCWD with text types the --cwd directory and text after it, on
 // Windows with backslashes, as a Windows user types a path.
@@ -15073,6 +15086,8 @@ enum : i32 {
                   // (an '@' walk held, never put, is none), no folder
                   // listing asked, no inline code's batch here or
                   // elsewhere, and none turned away
+    W_FILESKEPT,  // no Files record of a session on the remote text still
+                  // waits: each attached or dropped (filesrestore)
 };
 
 static Str waitnames[] = {
@@ -15101,8 +15116,9 @@ static Str waitnames[] = {
     "the terminal's text", "the terminal's banner", "the terminal's program", "the terminals' count",
     "the file", "the file checked", "the file's find", "the pause",
     "Open file's check", "the file work",
+    "Files tabs of the remote attached or dropped",
 };
-static_assert(countof(waitnames) == W_FSIDLE+1);
+static_assert(countof(waitnames) == W_FILESKEPT+1);
 
 enum : i32 {
     KEY_CTRL  = 1,
@@ -19657,6 +19673,46 @@ static DriveOp remoteops[] = {
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
 
+// After a restart (--remote-again): the Files tabs of the session made
+// on r wait in the layout file, written back as read, until r is
+// connected again and lists it; then they are back as left, the front
+// image and hello.txt read there, and written as a live root once r is
+// closed again.
+static DriveOp remote2ops[] = {
+    {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
+    {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_SIDEINI, 0, 0, 0, ",hr\nTab="},
+    {OP_CHECK, CHK_SIDEINI, 0, 0, 0, "pixels.png\n"},
+    // Connected from the sidebar, whose place the restored layout keeps
+    // (the Hosts tab's moves as the tabs beside it are drawn)
+    {OP_MOVE, T_NAMED, 0, 0, 300, "connect r"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_NAMEDUP, 0, 0, 90000, "r"},
+    {OP_WAIT, W_FILESKEPT, 0, 0, 30000, "r"},
+    {OP_FILESROOT, 0, 0, 0, 300, "r"},
+    {OP_WAIT, W_OPENED, 0, 0, 30000, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 20000, ""},
+    {OP_CHECK, CHK_FILETABS, 0, 0, 0, "hello.txt|nope.txt|*pixels.png"},
+    {OP_CHECK, CHK_FILEHOST, 1, 0, 0, ""},
+    {OP_CHECK, CHK_FILEIMAGE, 40, 30, 0, "fit"},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "file tab 1"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 20000, ""},
+    {OP_CHECK, CHK_FILETEXT, 0, 0, 0, "hullo "},
+    {OP_CHECK, CHK_FILEHOST, 1, 0, 0, ""},
+    {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "1-1"},
+    {OP_SHOT, 0, 0, 0, 300, "remote-files-restored"},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "connect r"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_NAMEDCLOSED, 0, 0, 15000, "r"},
+    {OP_CHECK, CHK_SIDEINI, 0, 0, 0, ",hr\nTab="},  // live, its host down
+    {OP_SUMMARY, 0, 0, 0, 0, ""},
+    {OP_QUIT, 0, 0, 0, 0, ""},
+};
+
 // The checklist's container: the latest made, removed or not.
 static GuiCtr *ctrfirst(Gui *g)
 {
@@ -23814,6 +23870,16 @@ static b32 drivewaitdone(Gui *g)
         return drivefileready(g) && ft->body && !w->stale && !w->force && !w->id &&
                g->ffetch.ft!=ft;
     }
+    case W_FILESKEPT: {
+        Str name = g->ops[g->drivepc-1].text;
+        for (i32 i = 0; i < g->fkeep.n; i++) {
+            FileKeep *k = &g->fkeep.keeps[i];
+            if (k->kind==FKEEP_REMOTE && k->host==name && !k->done) {
+                return 0;
+            }
+        }
+        return 1;
+    }
     case W_FILEFOUND: {
         FileTab     *ft = filefront(g);
         FileFindBar *fb = &g->ffind;
@@ -27495,6 +27561,22 @@ static void drivestep(Gui *g)
     case OP_SHOWFILES:
         setpane(g, PANE_FILES, 1);
         break;
+    case OP_FILESROOT: {
+        // By its Files tabs, as an imported copy has its original's title
+        GuiHost    *h = findhost(g, GH_REMOTE, op->text);
+        GuiSession *s = g->sessions;
+        for (; s && (!h || s->host!=h || !s->files.n); s = s->next) {}
+        if (!s) {
+            Arena a = g->frame;
+            guilog(g, concat(&a, concat(&a, "drive: FAIL no session on remote ", op->text),
+                             " has Files tabs"));
+            g->drivechecks++;
+            g->drivefails++;
+            break;
+        }
+        guiselect(g, s);
+        setpane(g, PANE_FILES, 1);
+    } break;
     case OP_OPENFILE: {
         Arena    a   = g->frame;
         FileRef  ref = fileref(&a, op->text);
@@ -27796,6 +27878,7 @@ static Str guiusage =
 "                 then come back from the tray (tests/gui.py drives it)\n"
 "  --attach       a second window while one runs in the background\n"
 "  --remote       a remote host, [remote r], its link dropped mid-turn\n"
+"  --remote-again  its Files tabs after a restart, [remote r] connected again\n"
 "  --rcwd DIR     the remote checklist's working directory there\n"
 "  --compose      the compose box's checklist: drafts, history, the menu,\n"
 "                 the editor, slash commands ([ui] editor a test script)\n"
@@ -28053,6 +28136,9 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
             attach = probe = 1;
         } else if (a == "--remote") {
             remote = probe = 1;
+        } else if (a == "--remote-again") {
+            remote = 2;
+            probe  = 1;
         } else if (a == "--compose") {
             compose = probe = 1;
         } else if (a == "--launch") {
@@ -28187,8 +28273,8 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
             g->ops  = attachops;
             g->nops = countof(attachops);
         } else if (remote) {
-            g->ops  = remoteops;
-            g->nops = countof(remoteops);
+            g->ops  = remote==1 ? remoteops : remote2ops;
+            g->nops = remote==1 ? countof(remoteops) : countof(remote2ops);
         } else if (settings) {
             g->ops  = settingsops;
             g->nops = countof(settingsops);

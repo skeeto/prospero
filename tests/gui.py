@@ -53,7 +53,12 @@ Files tabs in a session and with none, then the GUI again, to find each
 session's draft back from its engine and the tabs back as they were,
 only the shown one read, beside Files records appended to the layout
 file in between (a session gone, a remote's, a duplicate); no draft
-file for the editor may be left over. The plan mode makes a session in plan
+file for the editor may be left over. The remote mode connects a remote
+host "r" (this computer through a stand-in for ssh, or --ssh's), makes
+a session there and works in it, its files read there, then runs the
+GUI again (--remote-again): the Files tabs left in that session wait in
+the layout file until r is connected again and lists it, then are back
+as they were, read there. The plan mode makes a session in plan
 mode from the new session dialog, its agent refused a change, then
 asking to approve its plan: kept planning with a note, revised by hand
 with Edit plan ([ui] editor a test script, here only), then approved;
@@ -2320,6 +2325,18 @@ def main():
                          "restored", "dragrefused", "files"):
                 if not os.path.exists(os.path.join(args.shots, f"compose-{name}.png")):
                     problems.append(f"no compose-{name}.png")
+    elif args.mode == "remote":
+        # Twice: the second finds the Files tabs the first left on r
+        status, lines = host.run(guiargs, args.timeout, guicwd, env=far.env())
+        problems += summaryproblems(status, lines, "the window")
+        with fake_provider.STATE.lock:
+            fetched = fake_provider.STATE.includes  # the first run's alone
+        status = 0
+        if not problems:
+            again = ["--remote-again" if a == "--remote" else a for a in guiargs]
+            st, more = host.run(again, args.timeout, guicwd, env=far.env(), tag="again: ")
+            problems += summaryproblems(st, more, "the window again")
+            lines += more
     else:
         env = far.env() if far else None
         if args.mode == "drive" and args.host and not args.fake:
@@ -2337,13 +2354,12 @@ def main():
     if ctrwatch:
         problems += ctrwatch.close(state)
     if args.mode == "remote":
-        problems += summaryproblems(status, lines, "the window")
         with fake_provider.STATE.lock:
-            fetched = fake_provider.STATE.includes
+            total = fake_provider.STATE.includes
         if fetched < 2:
             problems.append(f"the URL include was fetched {fetched} times, not again")
         else:
-            print(f"the URL include was fetched {fetched} times")
+            print(f"the URL include was fetched {fetched} times ({total} in both runs)")
         problems += far.close(args.keep)
     if args.mode == "mcp":
         mcpsrv.terminate()

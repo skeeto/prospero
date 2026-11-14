@@ -184,6 +184,14 @@ drive), the rest of that share is refused at once too, with the same
 words, until the stuck read comes back; a folder on that host's own
 disks is never refused whole.
 
+Such a session's Files tabs last across a restart, as on this
+computer, those on its host and those here: they come back once its
+host is connected and lists the session. Until then they wait in the
+window's layout, and they are dropped if the host no longer has the
+session. A container's come back at once, saying its host is not
+connected until it is started. A subagent's container keeps none, as
+it is removed when the subagent ends.
+
 Open in editor on such a file opens a Terminal tab of its session
 there, where that host's engine runs the editor on it, at the line in
 view, as on this computer ([Files](help:sessions#files)): the tab

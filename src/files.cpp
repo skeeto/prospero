@@ -1373,10 +1373,14 @@ static FileTab *filesopen(Gui *g, GuiSession *s, u64 host, Str path, i32 line0, 
 // [Prospero][Files] section (fileset.cpp's filekeep*), read before any
 // session is known into g->fkeep, a record for each root, until its
 // root is found (filesrestore). The window's own set is found at once,
-// a session of this state directory once its engine lists it; a remote
-// session's records wait, written back as read. Restored tabs are
-// unread, each read once shown (drawfiles), so a launch reads only the
-// shown front file, on the window's file workers as any other.
+// a session of this state directory once its engine lists it, and a
+// remote session's, known by its host's name and its sid, once that
+// host is connected and lists it (a container's sessions are known at
+// launch); until then a record waits, written back as read. A
+// subagent's container (ctrtaskhost) is never kept: its parent's engine
+// removes it. Restored tabs are unread, each read once shown
+// (drawfiles), so a launch reads only the shown front file, on the
+// window's file workers as any other.
 
 // A record's tabs into root's set (filesetrestore), each made as
 // opening would (filetabnew), then shown as kept (filekeeptab): those
@@ -1415,9 +1419,10 @@ static void filesattach(Gui *g, GuiSession *root, FileKeep *k, u64 far)
 // dropped if it is deleted or in the Trash, or if listed's sessions
 // (this state directory's engine, or this window's own background
 // host), which cover the whole state directory, the Trash too, lack
-// it. A remote session's wait for its host. At startup, with listed
-// null, and as each host lists its sessions, before --session shows
-// one.
+// it. A remote session's likewise once its host (by name) has it, its
+// far tabs on that host, or dropped once that host lists its sessions
+// without it; until then it waits. At startup, with listed null, and as
+// each host lists its sessions, before --session shows one.
 static void filesrestore(Gui *g, GuiHost *listed)
 {
     FileKeeps *ks    = &g->fkeep;
@@ -1438,15 +1443,26 @@ static void filesrestore(Gui *g, GuiHost *listed)
             } else if (whole) {
                 k->done = 1;
             }
+        } else if (k->kind == FKEEP_REMOTE) {
+            GuiHost    *h = findhost(g, GH_REMOTE, k->host);
+            GuiSession *s = h ? findsess(g, h, k->sid) : 0;
+            if (ctrtaskhost(k->host) || (s && (s->gone || s->trashed))) {
+                k->done = 1;
+            } else if (s) {
+                filesattach(g, termroot(g, s), k, h->uid);
+            } else if (listed && listed==h) {
+                k->done = 1;
+            }
         }
     }
 }
 
 // The layout file's Files section (filekeeptext), in a: the live roots,
 // each written as last known alive now, the window's own and those of
-// this state directory's sessions with tabs, not deleted nor in the
-// Trash; then the records still waiting, unless a live root has the
-// same key, as it wins.
+// sessions with tabs, not deleted nor in the Trash, of this state
+// directory or of a remote host, connected or not, with its far tabs,
+// though not of a subagent's container; then the records still
+// waiting, unless a live root has the same key, as it wins.
 static Str filekeepsection(Gui *g, Arena *a)
 {
     i64 now = os_time(g->os);
@@ -1459,14 +1475,17 @@ static Str filekeepsection(Gui *g, Arena *a)
     GuiSession *roots[] = {&g->nosession, g->sessions};
     for (i32 r = 0; r < countof(roots); r++) {
         for (GuiSession *s = roots[r]; s; s = r ? s->next : 0) {
+            GuiHost *h   = r ? s->host : 0;
+            b32      far = h && h->kind==GH_REMOTE;
             if (r && (!s->files.n || s->gone || s->trashed ||
-                      (s->host->kind!=GH_ENGINE && s->host->kind!=GH_LOCAL))) {
+                      (far && (ctrtaskhost(h->name) || h->taskexec.len)))) {
                 continue;
             }
             FileKeep *k = alloc<FileKeep>(a);
-            filesetkeep(&s->files, 0, g->fonts.size, k);
-            k->kind = r ? FKEEP_HERE : FKEEP_NONE;
+            filesetkeep(&s->files, far ? h->uid : 0, g->fonts.size, k);
+            k->kind = far ? FKEEP_REMOTE : r ? FKEEP_HERE : FKEEP_NONE;
             k->sid  = r ? s->sid : Str{};
+            k->host = far ? h->name : Str{};
             k->seen = now;
             k->live = 1;
             list[n++] = k;
