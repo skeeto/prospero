@@ -293,3 +293,203 @@ static void test_term(Test *t)
     expect(t, "termeditname exe", termeditname("C:\\nvim\\nvim.exe"), "nvim");
     expect(t, "termeditname bare", termeditname("vi"), "vi");
 }
+
+// Lines committed from typed input, as KIND:TEXT joined by '|', K for a
+// candidate and S for a secret.
+static Str termcommits(Arena *a, TermLine *l, Str in, i32 kind)
+{
+    Slice<TermCommit> m = termlinefeed(a, l, in, kind);
+    Buf b(a, 256);
+    for (iz i = 0; i < m.len; i++) {
+        if (i) putbyte(&b, '|');
+        putbyte(&b, m[i].kind==TL_SECRET ? 'S' : 'K');
+        putbyte(&b, ':');
+        print(&b, m[i].text);
+    }
+    return finish(&b);
+}
+
+// A session table for termrootwalk: "sid parent sideof worktree cwd"
+// rows, '-' for empty.
+static TermNode termlookrows(void *ctx, Arena *a, Str sid)
+{
+    Str     *rows = (Str *)ctx;
+    TermNode n    = {};
+    for (iz i = 0; rows[i].len; i++) {
+        Slice<Str> w = termsplit(a, rows[i], {}, 0);
+        if (w.len==5 && w[0]==sid) {
+            n.found    = 1;
+            n.parent   = w[1]==Str("-") ? Str{} : w[1];
+            n.sideof   = w[2]==Str("-") ? Str{} : w[2];
+            n.worktree = w[3]==Str("1");
+            n.cwd      = w[4];
+        }
+    }
+    return n;
+}
+
+static void test_termsecret(Test *t)
+{
+    Arena *a = &t->perm;
+
+    // Typed lines, their editing, and the sequences that are not text
+    {
+        static struct { Str in; i32 kind; Str want; } cases[] = {
+            {"hunter2\r",                  TL_SECRET, "S:hunter2"},
+            {"hunter2\n",                  TL_CAND,   "K:hunter2"},
+            {"hunter2\r",                  TL_SKIP,   ""},
+            {"hux\x7fnter2\r",             TL_SECRET, "S:hunter2"},
+            {"wrong\x15hunter2\r",         TL_SECRET, "S:hunter2"},
+            {"a b\x17hunter2\r",           TL_SECRET, "S:a hunter2"},
+            {"ab cd  \x17\x17x\r",         TL_SECRET, "S:x"},
+            {"h\xc3\xa9\x7f" "e\r",        TL_SECRET, "S:he"},
+            {"one\rtwo\r",                 TL_SECRET, "S:one|S:two"},
+            {"abc\x03hunter2\r",           TL_SECRET, "S:hunter2"},
+            {"abc\x1b",                    TL_SECRET, ""},
+            {"\x1b[Ihunter\x1b[O" "2\r",   TL_SECRET, "S:hunter2"},  // focus
+            {"hun\x1b[<0;3;4Mter2\r",      TL_SECRET, "S:hunter2"},  // mouse
+            {"hun\x1b]11;rgb:0/0/0\x1b\\ter2\r", TL_SECRET, "S:hunter2"},
+            {"hun\x1b]10;x\x07ter2\r",     TL_SECRET, "S:hunter2"},
+            {"hun\x1bP1$r0m\x1b\\ter2\r",  TL_SECRET, "S:hunter2"},
+            {"\x1b[200~hun\x15ter2\x1b[201~\r", TL_SECRET, "S:hunter2"},
+            {"hunter\x1b[D2\r",            TL_SECRET, ""},   // moved within
+            {"\x1b[Ahunter2\r",            TL_SECRET, "S:hunter2"},
+            {"hun\tter\r",                 TL_CAND,   ""},   // completion
+            {"hun\x1b" "bter\r",           TL_CAND,   "K:ter"},  // Alt+b
+            {"\r\r",                       TL_SECRET, ""},
+        };
+        for (iz i = 0; i < countof(cases); i++) {
+            TermLine l = {};
+            Arena    s = *a;
+            Buf name(&s, 64);
+            print(&name, "termlinefeed ");
+            print(&name, (i64)i);
+            expect(t, finish(&name), termcommits(&s, &l, cases[i].in, cases[i].kind),
+                   cases[i].want);
+        }
+    }
+
+    // A kind latches at a line's first byte, across chunks; a long line
+    // is not kept; a sequence may span chunks
+    {
+        TermLine l = {};
+        Arena    s = *a;
+        expect(t, "termlinefeed latch", termcommits(&s, &l, "hun", TL_CAND), "");
+        expect(t, "termlinefeed latch 2", termcommits(&s, &l, "ter2\rpass\r", TL_SECRET),
+               "K:hunter2|S:pass");
+        Buf b(&s, 512);
+        for (i32 i = 0; i < TERMLINE_CAP+1; i++) putbyte(&b, 'x');
+        putbyte(&b, '\r');
+        expect(t, "termlinefeed long", termcommits(&s, &l, finish(&b), TL_SECRET), "");
+        expect(t, "termlinefeed after long", termcommits(&s, &l, "ok12\r", TL_SECRET),
+               "S:ok12");
+        expect(t, "termlinefeed split", termcommits(&s, &l, "ab\x1b[<0;1", TL_SECRET), "");
+        expect(t, "termlinefeed split 2", termcommits(&s, &l, ";1Mcd\r", TL_SECRET),
+               "S:abcd");
+    }
+
+    // Password prompts, by the text before the cursor
+    {
+        static struct { Str row; b32 want; } cases[] = {
+            {"Password:",                                 1},
+            {"[sudo] password for chris: ",               1},
+            {"Enter passphrase for key '/h/.ssh/id':  ",  1},
+            {"Enter PIN:",                                1},
+            {"Pass phrase:",                              1},
+            {"API token:",                                1},
+            {"Client secret:",                            1},
+            {"New passwd:",                               1},
+            {"Password",                                  0},
+            {"Password: x",                               0},
+            {"spinner:",                                  0},
+            {"tokenizer:",                                0},
+            {"passwords.txt:",                            0},
+            {"$ ",                                        0},
+            {"",                                          0},
+        };
+        Buf got(a, 256), want(a, 256);
+        for (iz i = 0; i < countof(cases); i++) {
+            putbyte(&got, termprompt(cases[i].row) ? '1' : '0');
+            putbyte(&want, cases[i].want ? '1' : '0');
+        }
+        expect(t, "termprompt", finish(&got), finish(&want));
+    }
+
+    // Masking: long secrets anywhere, short ones as whole words, the
+    // longest where two begin at once
+    {
+        TermSecrets ss = {};
+        expect(t, "termsecretadd short", termsecretadd(&ss, "abc", 2) ? Str("kept") : Str("no"), "no");
+        termsecretadd(&ss, "hunter2", 2);
+        termsecretadd(&ss, "pass", 1);
+        termsecretadd(&ss, "hunter22", 1);
+        Arena s = *a;
+        iz    n = 0;
+        Str   in = "x hunter2y passport pass hunter22 (pass)";
+        expect(t, "termmask", termmask(&s, in, &ss, &n),
+               "x [hidden]y passport [hidden] [hidden] ([hidden])");
+        expect(t, "termmask count", n==4 ? Str("4") : Str("not 4"), "4");
+        Str plain = "nothing here";
+        Str r     = termmask(&s, plain, &ss, &n);
+        expect(t, "termmask none", r.data==plain.data && !n ? Str("same") : Str("copied"), "same");
+        expect(t, "termmask edges", termmask(&s, "pass", &ss, &n), "[hidden]");
+        expect(t, "termmask unicode", termmask(&s, "\xc3\xa9pass", &ss, &n), "\xc3\xa9pass");
+    }
+
+    // The secret set: deduplicated, the lowest rank evicted first, and
+    // zeroed
+    {
+        TermSecrets ss = {};
+        termsecretadd(&ss, "keepme-2", 2);
+        for (i32 i = 0; i < TERMSECRETS; i++) {
+            u8 v[8] = {'s', 'e', 'c', 'r', 'e', 't', (u8)('a'+i/26), (u8)('a'+i%26)};
+            termsecretadd(&ss, Str{v, 8}, 1);
+        }
+        termsecretadd(&ss, "keepme-2", 1);
+        i32 n = 0, keep = 0;
+        for (i32 i = 0; i < TERMSECRETS; i++) {
+            n    += ss.s[i].len > 0;
+            keep += Str{ss.s[i].buf, ss.s[i].len} == Str("keepme-2");
+        }
+        expect(t, "termsecretadd full", n==TERMSECRETS ? Str("full") : Str("not"), "full");
+        expect(t, "termsecretadd rank", keep==1 ? Str("once") : Str("not"), "once");
+        Arena s = *a;
+        iz    h = 0;
+        expect(t, "termsecretadd evicted", termmask(&s, "secretaa secretap", &ss, &h),
+               "secretaa [hidden]");
+        TermSecrets top = {};
+        for (i32 i = 0; i < TERMSECRETS; i++) {
+            u8 v[6] = {'t', 'o', 'p', '-', (u8)('a'+i), 'x'};
+            termsecretadd(&top, Str{v, 6}, 2);
+        }
+        expect(t, "termsecretadd outranked", termsecretadd(&top, "lowly1", 1) ? Str("kept") : Str("no"),
+               "no");
+    }
+
+    // The owner of a session's terminals
+    {
+        static Str rows[] = {
+            "root - - 0 /p",
+            "kid root - 0 /p",
+            "grandkid kid - 0 /p",
+            "side - root 0 /p",
+            "sidekid side - 0 /p",
+            "wtside - root 1 /w",
+            "away - root 0 /q",
+            "orphan gone - 0 /p",
+            "loop loop - 0 /p",
+            {},
+        };
+        Arena s = *a;
+        expect(t, "termrootwalk root", termrootwalk(&s, "root", termlookrows, rows), "root");
+        expect(t, "termrootwalk kid", termrootwalk(&s, "grandkid", termlookrows, rows), "root");
+        expect(t, "termrootwalk side", termrootwalk(&s, "sidekid", termlookrows, rows), "root");
+        expect(t, "termrootwalk worktree", termrootwalk(&s, "wtside", termlookrows, rows),
+               "wtside");
+        expect(t, "termrootwalk folder", termrootwalk(&s, "away", termlookrows, rows), "away");
+        expect(t, "termrootwalk orphan", termrootwalk(&s, "orphan", termlookrows, rows),
+               "orphan");
+        expect(t, "termrootwalk loop", termrootwalk(&s, "loop", termlookrows, rows), "loop");
+        expect(t, "termrootwalk unknown", termrootwalk(&s, "who", termlookrows, rows), "who");
+    }
+}

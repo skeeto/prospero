@@ -550,6 +550,7 @@ static void  os_ptytake(Os *, Proc *, iz) {}
 static b32   os_ptyresize(Os *, Proc *, PtySize) { return 0; }
 static b32   os_ptybusy(Os *, Proc *) { return 0; }
 static b32   os_ptyable(Os *) { return 0; }
+static i32   os_ptymode(Os *, Proc *) { return PTY_UNKNOWN; }
 static void  os_httpcancel(Os *, Http *) {}
 static void  os_httpfree(Os *, Http *) {}
 static Str   os_lasterr(Os *, Arena *) { return "not supported in tests"; }
@@ -712,6 +713,7 @@ static Str istr(Arena *a, i64 v)
 #include "test/delta_test.cpp"
 #include "test/relay_test.cpp"  // after config's test platform
 #include "test/term_test.cpp"
+#include "test/termset_test.cpp"
 #include "dbus.cpp"
 #include "test/dbus_test.cpp"
 #include "test/door_test.cpp"
@@ -729,7 +731,6 @@ static Str istr(Arena *a, i64 v)
 #  include "pathpick.cpp"
 #  include "sidebar.cpp"
 #  include "dock.cpp"
-#  include "termset.cpp"
 #  include "fileset.cpp"
 #  include "palette.cpp"
 #  include "dropto.cpp"
@@ -748,7 +749,6 @@ static Str istr(Arena *a, i64 v)
 #  include "test/pathpick_test.cpp"
 #  include "test/sidebar_test.cpp"
 #  include "test/dock_test.cpp"
-#  include "test/termset_test.cpp"
 #  include "test/fileset_test.cpp"
 #  include "test/palette_test.cpp"
 #  include "test/dropto_test.cpp"
@@ -820,6 +820,8 @@ int main()
     test_delta(&t);
     test_relay(&t);
     test_term(&t);
+    test_termsecret(&t);
+    test_termset(&t);
     test_dbus(&t);
     test_door(&t);
     #if PROSPERO_GUI
@@ -846,7 +848,6 @@ int main()
     test_pathpick(&t);
     test_sidebar(&t);
     test_dock(&t);
-    test_termset(&t);
     test_fileset(&t);
     test_filefind(&t);
     test_palette(&t);

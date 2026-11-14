@@ -74,7 +74,6 @@
 #include "filewalk.cpp"
 #include "sidebar.cpp"
 #include "dock.cpp"
-#include "termset.cpp"
 #include "fileset.cpp"
 #include "palette.cpp"
 #include "dropto.cpp"

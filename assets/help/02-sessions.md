@@ -470,6 +470,29 @@ before this prompt puts that prompt in the fork's box to edit and
 send, and Fork after this turn keeps the conversation up to that
 point.
 
+## The agent and your terminals
+
+The agent can read the session's Terminal pane tabs with its
+`read_terminal` tool: a list of them, newest first, each with its
+number (the tab's tooltip shows it, as "Terminal 7"), and a tab's last
+lines as its screen and history show them, up to as many as the tab
+keeps, at most 2000. It reads the tab you used last unless it names
+one. It cannot type, and runs nothing. A subagent reads its session's
+tabs, and a side chat in the same folder its original's. The tool is
+offered to sessions you open while `[terminal] agent` is on (the
+default), and refuses once you turn it off.
+
+What you type at a password prompt is hidden from it as `[hidden]`,
+wherever it shows: a prompt with echo off, or a line that asks for a
+password, passphrase, PIN, secret or token, and a line typed just
+ahead of such a prompt. So are the values of secret settings, such as
+an endpoint's `key`. A secret of six bytes or more is hidden anywhere,
+a shorter one only as a whole word. Not hidden: a password you type
+into a shell before you ever type it at a prompt, and what a program
+prints of secrets Prospero does not know (`env`, `cat .env`). In a
+shell without a line editor, such as dash, a command typed just
+before a password prompt may be hidden too.
+
 ## Side chats
 
 A side chat asks about a session without disturbing it, even while its

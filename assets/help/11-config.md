@@ -323,6 +323,10 @@ fails with a link to sign up for Copilot Free.
   macOS an application's name (`iTerm`, `Ghostty`), elsewhere a program
   (`wt.exe`, `konsole`, `kitty`, `wezterm`), whose options for its
   folder and command Prospero knows; another gets `-e`.
+- **[`[terminal] agent`](settings:terminal#agent)**: whether the agent
+  may read the session's Terminal pane tabs (read_terminal), for which
+  the engine keeps a copy of each tab's screen. What is typed at
+  password prompts is hidden from it ([Sessions](help:sessions)).
 - **[`[ui] notify`](settings:ui#notify)**: desktop notifications while the window is in the
   background, minimized, or showing another session: `allow` when a
   permission ask waits for your answer, `done` when a session stops by

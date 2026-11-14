@@ -764,6 +764,7 @@ struct Session {
     u64          lastset;    // hash of the last step's calls
     i32          setrepeat;
     u64          seen;       // what the last step's desktop looks saw
+    u64          termseen;   // what the last read_terminal showed, hashed
     b32          blocked;    // this step's calls repeat too often
     b32          progressed; // a tool succeeded this step
     b32          contnext;   // nudge to continue after the tools
@@ -2204,6 +2205,9 @@ static i64  termnext(Engine *, i64 now);
 static i32  termcount(Engine *, i64 peer);
 static void termhangupall(Engine *, i64 peer, Str sid);
 static void termaway(Engine *, i64 peer, b32 away);
+static void termstatus(Engine *, JsonOut *);
+static b32  termagent(Engine *);
+static void toolreadterm(Session *, Arena, Args *);
 static Terms *newterms(Arena *);
 
 // Start a request to an endpoint, its records to req->mbox with its id,
@@ -8482,6 +8486,16 @@ static b32 webfetchon(Engine *e)
            cfgbool(trim(cfgget(e->cfg, "web", "", "fetch", 0))) != 0;
 }
 
+// read_terminal's bit, denied to a new session but where the user has
+// terminals to read and the agent may: [terminal] agent on, terminals
+// possible here, and a session the user attends (a subagent: one whose
+// parent was offered it). Off later, it refuses at the call instead,
+// which leaves tool lists and the prompt's cache as they were.
+static u32 termdeny(Engine *e, b32 attended)
+{
+    return attended && termagent(e) && os_ptyable(e->os) ? 0 : (u32)TOOL_TERMMASK;
+}
+
 // The web tools' bits denied to a new session: each unless configured.
 static u32 webdeny(Engine *e)
 {
@@ -8632,7 +8646,7 @@ static void webnotetool(Session *s, Arena scratch, Str name, Str status, Str tex
     b32 counts = t==TOOL_READ   || t==TOOL_GREP  || t==TOOL_GLOB  ||
                  t==TOOL_SHELL  || t==TOOL_JOBOUT || t==TOOL_SKILL ||
                  t==TOOL_DESKTOP || t==TOOL_WEBSEARCH || t==TOOL_WEBFETCH ||
-                 startswith(name, "mcp__");
+                 t==TOOL_READTERM || startswith(name, "mcp__");
     if (counts) {
         webnote(s, scratch, text, 0);
     }
@@ -14651,6 +14665,7 @@ static b32 runtool(Session *s, Arena scratch)
     case TOOL_SESSIONS: toolsessions(s, scratch);      return 1;
     case TOOL_MESSAGE: toolmessage(s, scratch, &args); return 1;
     case TOOL_MEMORY:  toolmemory(s, scratch, &args);  return 1;
+    case TOOL_READTERM: toolreadterm(s, scratch, &args); return 1;
     case TOOL_WEBSEARCH:
     case TOOL_WEBFETCH:  assert(0);  // webcall
     case TOOL_TASK:      assert(0);  // starttasks has these
@@ -15499,6 +15514,13 @@ static void finalize(Session *s, Arena scratch)
     if (desklooking(s, scratch, calls)) {
         // Looking again repeats only if the last look saw no change
         set ^= (s->seen + 1) * 0x9e3779b97f4a7c15u;
+    }
+    for (iz i = 0; i < calls.len; i++) {
+        if (toolfind(calls[i].name) == TOOL_READTERM) {
+            // Likewise reading a terminal again, by what the last read showed
+            set ^= (s->termseen + 1) * 0xbf58476d1ce4e5b9u;
+            break;
+        }
     }
     s->setrepeat = set==s->lastset ? s->setrepeat+1 : 1;
     s->lastset   = set;
@@ -17212,7 +17234,8 @@ static void logsession(Session *s, Arena scratch)
     // the memory record; questions to the user, by questions. The web's
     // are listed when offered, so that a session from before them
     // replays without them.
-    u32 plain = TOOL_OFFMASK | TOOL_WEBMASK | (s->role.len ? (u32)TOOL_PLANMASK : 0);
+    u32 plain = TOOL_OFFMASK | TOOL_WEBMASK | TOOL_TERMMASK |
+                (s->role.len ? (u32)TOOL_PLANMASK : 0);
     u32 aside = TOOL_MEMMASK | TOOL_ASKMASK;
     if ((s->te.deny | aside) != (plain | aside)) {
         putkey(&w.json, "tools");
@@ -17573,6 +17596,7 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err)
     s->depth   = p->depth + 1;
     s->te.deny = r.deny | (s->depth>=TASK_DEPTH ? (u32)1<<TOOL_TASK : 0) |
                  deskdeny(e, scratch, 1) | skilldeny(e) | webdeny(e) |
+                 (p->te.deny & TOOL_TERMMASK) | termdeny(e, 1) |
                  TOOL_PLANMASK | TOOL_ASKMASK;
     s->mcpfilter = r.mcp.data ? clone(&s->perm, r.mcp) :
                    p->mcpfilter.data ? clone(&s->perm, p->mcpfilter) : Str{};
@@ -19463,6 +19487,7 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
     // session of their own, attended as it begins, with every tool
     b32 asks = s->attended && !task.ok && !role.ok && !tools.data;
     s->te.deny |= asks ? 0 : (u32)TOOL_ASKMASK;
+    s->te.deny |= termdeny(e, s->attended && !task.ok);
     s->mcpfilter  = tools.data ? clone(&s->perm, tools) :
                     role.mcp.data ? clone(&s->perm, role.mcp) : Str{};
     s->stepmax    = steps>0 ? steps : 0;
@@ -19836,7 +19861,7 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             } else {
                 // As it began: every tool but those offered by name, and
                 // plan mode's for a role
-                s->te.deny = TOOL_OFFMASK | TOOL_WEBMASK |
+                s->te.deny = TOOL_OFFMASK | TOOL_WEBMASK | TOOL_TERMMASK |
                              (s->role.len ? (u32)TOOL_PLANMASK : 0);
             }
             // Its edit format as it began: absent, the first one
@@ -24338,6 +24363,7 @@ static void command(Engine *e, Arena scratch, Str line)
         putintkey(&w.json, "turns", turns);
         putintkey(&w.json, "jobs", jobs);
         putintkey(&w.json, "terms", termcount(e, -1));
+        termstatus(e, &w.json);
         emit(e, evend(&w));
     } return;
     case CMD_STOP:

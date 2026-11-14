@@ -6545,6 +6545,60 @@ def sc_rs_reasoning(model, n, req):
         yield from finish(model)
 
 
+# read_terminal: the user's Terminal tabs, as the scenario set them up
+# before the prompt
+
+def sc_read_terminal(model, n, req):
+    reads = [{}, {"tab": 2, "lines": 5}, {"tab": 9}, {"tab": 1}]
+    k = step(req)
+    if k < len(reads):
+        yield from tool(model, n, "read_terminal", reads[k])
+    else:
+        yield from answer(model, "Read them.")
+
+
+def sc_read_terminal_secret(model, n, req):
+    if step(req) == 0:
+        yield from tool(model, n, "read_terminal", {"lines": 2000})
+    else:
+        yield from answer(model, "Read it.")
+
+
+def sc_read_terminal_root(model, n, req):
+    if "root" in task_prompt(req) and step(req) == 0:
+        yield from tool(model, n, "task", {"description": "Read the terminal",
+                                           "prompt": "Read the user's terminal.",
+                                           "model": second(model)})
+    elif step(req) == 0:
+        yield from tool(model, n, "read_terminal", {})
+    else:
+        yield from answer(model, "Saw: " + " / ".join(tool_results(req)))
+
+
+def sc_read_terminal_root_b(model, n, req):
+    if step(req) == 0:
+        yield from tool(model, n, "read_terminal", {})
+    else:
+        yield from answer(model, "Subagent saw: " + " / ".join(tool_results(req)))
+
+
+def sc_read_terminal_loop(model, n, req):
+    if step(req) < 7:
+        yield from tool(model, n, "read_terminal", {"tab": 1})
+    else:
+        yield from answer(model, "Done reading.")
+
+
+def sc_read_terminal_off(model, n, req):
+    if step(req) == 0:
+        yield from tool(model, n, "read_terminal", {})
+    else:
+        yield from answer(model, "Tools: " + ",".join(tool_names(req)))
+
+
+sc_read_terminal_replay = sc_read_terminal_off
+
+
 SCENARIOS = {name[3:]: fn for name, fn in globals().items()
              if name.startswith("sc_")}
 

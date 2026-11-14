@@ -5477,7 +5477,7 @@ def role_words(t):
                 f"roles {list(roles)}")
         default = ["read", "write", "edit", "shell", "grep", "glob", "todo_write", "jobs",
                    "job_output", "job_kill", "task", "skill", "sessions", "send_message",
-                   "memory", "web_search", "web_fetch"]
+                   "memory", "web_search", "web_fetch", "read_terminal"]
         every = default[:11] + ["desktop"] + default[11:]
         t.check(roles["general"]["tools"] == default, f"general {roles['general']}")
         t.check(roles["every"]["tools"] == every, f"* {roles['every']}")
@@ -17878,6 +17878,9 @@ def term_flood(t):
                 f"{tt.dups} records again, {tt.resends} resends")
         t.check(tt.window > TERM_WINDOW * 3 // 4, f"the window never filled: {tt.window}")
         t.note(f"{tt.records} records, window {tt.window}")
+        st = h.call("status")
+        t.check(st.get("screens") == 1 and st.get("fed") == len(tt.data),
+                f"the engine's screen was fed {st.get('fed')} of {len(tt.data)}: {st}")
         tt.type("exit 0\n")
         t.check(tt.ended().get("code") == 0, "exit 0")
     finally:
@@ -17917,6 +17920,9 @@ def term_resend(t):
         t.check(floodof(tt, start, n) == floodbytes(n), "the flood is whole")
         t.check(tt.window <= TERM_WINDOW, f"{tt.window} bytes unacked at once")
         t.check(tt.end is None, f"no end: {tt.end}")
+        st = h.call("status")
+        t.check(st.get("fed") == len(tt.data),
+                f"the screen was fed once, all of it: {st.get('fed')} of {len(tt.data)}")
     finally:
         h.close()
 
@@ -18362,6 +18368,239 @@ def soak(host, minutes, workers):
     for p in problems[:20]:
         print("  " + p)
     return not problems
+
+
+# read_terminal: the agent reads the session's terminals, through the
+# engine's own screen of each, with what was typed at password prompts
+# hidden
+
+def readsession(t, h, cwd=None, attended=True):
+    return h.call("new", cwd=cwd or t.work, model=t.model, endpoint="fake",
+                  attended=attended)["sid"]
+
+
+def turnof(h, sid, text="go", timeout=30):
+    """Prompt a session and wait for its turn's end: the turn's events."""
+    def mine():
+        return [e for e in h.events if e.get("sid") == sid]
+    with h.cond:
+        before = sum(1 for e in mine() if e.get("ev") == "turn.end")
+    h.send("prompt", sid=sid, text=text)
+    deadline = time.monotonic() + timeout
+    with h.cond:
+        while True:
+            evs = mine()
+            ends = [i for i, e in enumerate(evs) if e.get("ev") == "turn.end"]
+            if len(ends) > before:
+                start = ends[before - 1] + 1 if before else 0
+                return evs[start:ends[before] + 1]
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise Failure(f"timed out waiting for the turn; saw "
+                              f"{compact([e.get('ev') for e in evs])}")
+            h.cond.wait(left)
+
+
+def toolends(evs):
+    return [e for e in evs if e.get("ev") == "tool.end"]
+
+
+def saidin(evs):
+    """The visible text of a turn's assistant messages."""
+    return "".join(b.get("text", "") for e in evs if e.get("ev") == "assistant"
+                   for b in e.get("blocks", []) if b.get("t") == "text")
+
+
+@scenario(bound=40)
+def read_terminal(t):
+    """read_terminal lists the session's terminals newest first, reads the
+    one used last by default, a tab's last lines, a title as its label,
+    a full-screen program's screen, and says when nothing is new."""
+    ttyprobe(t)
+    h = t.headless()
+    try:
+        sid = readsession(t, h)
+        one = Tty(t, h, sid)
+        one.line("probe ready")
+        one.type("lines 150\r")
+        one.line("line 150")
+        two = Tty(t, h, sid)
+        two.line("probe ready")
+        two.type("title build box\r")
+        two.type("say \x1b[?1049hfullscreen\r")
+        two.pump(lambda x: b"fullscreen" in x.text, 10, "the full screen")
+        one.type("say hello there\r")
+        one.line("hello there")
+        st = h.call("status")
+        t.check(st.get("screens") == 2, f"two screens: {st}")
+        ends = toolends(turnof(h, sid))
+        statuses = [e.get("status") for e in ends]
+        t.check(statuses == ["ok", "ok", "error", "ok"], f"statuses {statuses}")
+        first, second, third, fourth = [e.get("text", "") for e in ends]
+        t.check(first.find(f"terminal {two.tid}: build box") <
+                first.find(f"terminal {one.tid}:") and "at its prompt" in first,
+                f"newest first, the title its label: {first[:300]!r}")
+        t.check(f"Terminal {one.tid}, its last lines:" in first and
+                "hello there" in first and "line 150" in first and
+                "line 40\n" not in first, f"the last 100 lines of the one used last: {first[-400:]!r}")
+        t.check("fullscreen" in second and "full-screen program" in second and
+                "line 150" not in second, f"tab 2's screen: {second!r}")
+        t.check("No terminal 9 is among them" in third, f"no such tab: {third!r}")
+        t.check("no new output since you last read it" in fourth,
+                f"nothing new: {fourth[-200:]!r}")
+    finally:
+        h.close()
+
+
+@scenario(conf={"_extra": "[endpoint stored]\nurl = http://127.0.0.1:9/v1\n"
+                          "key = literal-config-secret\n"
+                          "[endpoint viaenv]\nurl = http://127.0.0.1:9/v1\n"
+                          "key = env:PROSPERO_TERMKEY\n"}, bound=40)
+def read_terminal_secret(t):
+    """What was typed at a password prompt is hidden wherever it shows,
+    a program's slip included; a line typed ahead of the prompt too
+    (POSIX); a short one only as a whole word; secret settings' values
+    too; and secrets are hidden before lines are cut."""
+    ttyprobe(t)
+    h = t.headless(env={"PROSPERO_TERMKEY": "env-config-secret-9"})
+    try:
+        sid = readsession(t, h)
+        tt = Tty(t, h, sid)
+        tt.line("probe ready")
+        tt.type("pass\r")
+        tt.pump(lambda x: b"Password: " in x.text, 10, "the prompt")
+        tt.type("hunter2-secret\r")
+        tt.line("pass got")
+        tt.type("say my pw is hunter2-secret, again\r")
+        tt.line("my pw is")
+        # A short secret, hidden only where it stands as a word
+        tt.type("pass\r")
+        tt.pump(lambda x: x.text.count(b"Password: ") >= 2, 10, "the second prompt")
+        tt.type("abcd\r")
+        tt.pump(lambda x: x.text.count(b"pass got") >= 2, 10, "the second answer")
+        tt.type("say abcdef abcd xabcdx\r")
+        tt.line("abcdef")
+        tt.type("env PROSPERO_TERMKEY\r")
+        tt.line("env PROSPERO_TERMKEY")
+        tt.type("say literal-config-secret\r")
+        tt.line("literal-config")
+        if not t.host.windows:
+            # Cut at READ_LINEMAX (2000) bytes, the secret across the cut
+            # (ConPTY repaints a long line as rows, which line() can't match)
+            tt.type("say " + "x" * 1995 + "hunter2-secret\r")
+            tt.line("x" * 100)
+            # Typed ahead, echoed, while the program had not yet turned
+            # echo off: learned once it did
+            tt.type("cooked\r")
+            tt.line("cooked")
+            tt.type("pass 600\rtyped-ahead-pw\r")
+            tt.pump(lambda x: b"pass got typed" in x.text, 10, "the typed-ahead answer")
+        ends = toolends(turnof(h, sid))
+        text = ends[0].get("text", "") if ends else ""
+        t.check(ends and ends[0].get("status") == "ok", f"read: {ends}")
+        for leak in ["hunter2-secret", "literal-config-secret", "env-config-secret-9",
+                     "typed-ahead-pw", "hunte", " abcd "]:
+            t.check(leak not in text, f"{leak!r} shows: {text[-1500:]!r}")
+        t.check("pass got [hidden]" in text and "my pw is [hidden], again" in text,
+                f"hidden where it shows: {text[:800]!r}")
+        t.check("abcdef [hidden] xabcdx" in text, f"a short one as a word only: {text!r}")
+        t.check("PROSPERO_TERMKEY=[hidden]" in text, f"an env: setting's value: {text!r}")
+        t.check("secrets are hidden" in text, f"the count is told: {text[-300:]!r}")
+        t.check(t.host.windows or "x" * 1995 + "[hidden"[:5] in text,
+                f"cut after hiding: {text[-2200:-2000]!r}")
+        if not t.host.windows:
+            t.check("pass got typed" not in text or "pass got [hidden]" in text,
+                    "typed ahead, hidden")
+    finally:
+        h.close()
+
+
+@scenario(bound=40)
+def read_terminal_root(t):
+    """A subagent reads its root's terminals; a session of its own in
+    another folder sees none of them."""
+    ttyprobe(t)
+    h = t.headless()
+    try:
+        sid = readsession(t, h)
+        tt = Tty(t, h, sid)
+        tt.line("probe ready")
+        tt.type("say the root's own tab\r")
+        tt.line("the root's own tab")
+        turnof(h, sid, text="root", timeout=40)
+        kids = [e for e in h.all("tool.end") if e.get("sid") != sid]
+        t.check(kids and "the root's own tab" in kids[0].get("text", ""),
+                f"the subagent read it: {kids}")
+        other = t.host.join(t.base, "elsewhere")
+        t.host.mkdir(other)
+        osid = readsession(t, h, cwd=other)
+        ends = toolends(turnof(h, osid, text="other"))
+        t.check(ends and "no Terminal tabs open" in ends[0].get("text", ""),
+                f"another session sees none: {ends}")
+    finally:
+        h.close()
+
+
+@scenario(bound=60)
+def read_terminal_loop(t):
+    """Reading a terminal again and again with nothing new is stopped as
+    a loop, as any repeated call is."""
+    ttyprobe(t)
+    h = t.headless()
+    try:
+        sid = readsession(t, h)
+        tt = Tty(t, h, sid)
+        tt.line("probe ready")
+        ends = toolends(turnof(h, sid, timeout=50))
+        st = [e.get("status") for e in ends]
+        t.check(st == ["ok"] * 6 + ["error"], f"statuses {st}")
+        t.check("already made 4 times" in ends[-1].get("text", ""), f"loop: {ends[-1]}")
+    finally:
+        h.close()
+
+
+@scenario(bound=30)
+def read_terminal_off(t):
+    """With [terminal] agent off, no session is offered read_terminal and
+    the engine keeps no screens."""
+    ttyprobe(t)
+    t.host.write(t.config, t.host.read(t.config) + "agent = false\n")  # [terminal]
+    h = t.headless()
+    try:
+        sid = readsession(t, h)
+        tt = Tty(t, h, sid)
+        tt.line("probe ready")
+        t.check(h.call("status").get("screens") == 0, "no screens")
+        evs = turnof(h, sid)
+        ends = toolends(evs)
+        t.check(ends and "is not available" in ends[0].get("text", ""), f"unknown: {ends}")
+        said = saidin(evs)
+        t.check("Tools: " in said and "read_terminal" not in said, f"not offered: {said!r}")
+    finally:
+        h.close()
+
+
+@scenario(bound=40)
+def read_terminal_replay(t):
+    """A session offered read_terminal keeps it when it opens again, and
+    one born without it (unattended) never gains it."""
+    h = t.headless()
+    try:
+        sid = readsession(t, h)
+        plain = readsession(t, h, attended=False)
+    finally:
+        h.close()
+    h = t.headless()
+    try:
+        for s, want in [(sid, True), (plain, False)]:
+            t.check(h.call("open", sid=s).get("ok") == 1, "reopened")
+            evs = turnof(h, s)
+            said = saidin(evs)
+            t.check("Tools: " in said and
+                    ("read_terminal" in said.split("Tools: ")[-1]) == want,
+                    f"offered {want}: {said!r}")
+    finally:
+        h.close()
 
 
 def main():

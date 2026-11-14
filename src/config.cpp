@@ -796,6 +796,10 @@ static CfgKey cfgschema[] = {
     {"terminal", "copy_on_select", CFG_BOOL, "false", {}, {}, "terminal",
      "Whether selecting text in a terminal copies it at once, without "
      "the copy key"},
+    {"terminal", "agent", CFG_BOOL, "true", {}, {}, "terminal",
+     "Whether the agent may read the session's terminal tabs "
+     "(read_terminal), for which the engine keeps a copy of each "
+     "screen. Text typed at password prompts is hidden from it"},
 
     {"host", "idle_exit", CFG_SECONDS, "600", {}, {}, "host",
      "Seconds a host waits with no client connected and nothing running, "

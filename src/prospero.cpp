@@ -353,6 +353,11 @@ static b32     os_ptyresize(Os *, Proc *, PtySize);
 static b32     os_ptybusy(Os *, Proc *);
 // Whether os_ptyspawn can work here: on Windows, from 10 version 1809.
 static b32     os_ptyable(Os *);
+// How the terminal reads typing now, as its foreground program set it:
+// a password's way (lines, no echo), a shell's (lines, echoed), raw (a
+// line editor, a full-screen program), or unknown (ConPTY hides it).
+enum { PTY_UNKNOWN, PTY_RAW, PTY_ECHO, PTY_SECRET };
+static i32     os_ptymode(Os *, Proc *);
 #if defined(_WIN32)
 enum { PTY_MAC = 0, PTY_LINUX = 0 };
 #elif defined(__APPLE__)
@@ -818,6 +823,9 @@ static u32     os_guilimits(Os *);
 #include "help.cpp"   // after config.cpp and mcp.cpp: cfgkinds, hexval
 #include "engine.cpp"
 #include "relay.cpp"
+#include "../ariel/ariel.h"
+#include "termset.cpp"
+#include "termsecret.cpp"
 #include "ptyhost.cpp"  // after relay.cpp
 #include "git.cpp"
 #include "worktree.cpp"

@@ -181,17 +181,17 @@ if(PROSPERO_GUI)
 endif()
 
 # ariel, the terminal emulator behind the Terminal pane (ariel/), a C
-# library kept self-contained so it can move out of this repository. Only
-# the GUI and the unit tests link it. Its assertions trap in every build,
-# since it parses untrusted bytes in the process holding every session.
-if(PROSPERO_GUI)
-  if(NOT CMAKE_CROSSCOMPILING OR PROSPERO_CROSS_TESTS)
-    set(ARIEL_TESTS ON CACHE BOOL "" FORCE)
-  endif()
-  set(ARIEL_TOOLS OFF CACHE BOOL "")
-  add_subdirectory(ariel)
-  target_compile_definitions(ariel PRIVATE ARIEL_TRAP)
+# library kept self-contained so it can move out of this repository.
+# Every program links it: the GUI emulates its terminals with it, and
+# every engine keeps a screen of each terminal it runs, for the agent's
+# read_terminal (ptyhost.cpp). Its assertions trap in every build, since
+# it parses untrusted bytes in the process holding every session.
+if(NOT CMAKE_CROSSCOMPILING OR PROSPERO_CROSS_TESTS)
+  set(ARIEL_TESTS ON CACHE BOOL "" FORCE)
 endif()
+set(ARIEL_TOOLS OFF CACHE BOOL "")
+add_subdirectory(ariel)
+target_compile_definitions(ariel PRIVATE ARIEL_TRAP)
 
 if(WIN32 AND PROSPERO_GUI)
   # The GUI build has CRT startup, since FreeType, md4c and ImGui need a
@@ -250,7 +250,7 @@ elseif(WIN32)
   add_executable(prospero src/main_win32.cpp src/deskwin32.cpp)
   target_link_options(prospero PRIVATE -nostartfiles -static-libgcc
     -Wl,--disable-auto-import)
-  target_link_libraries(prospero PRIVATE kernel32 advapi32 winhttp user32 gdi32)
+  target_link_libraries(prospero PRIVATE ariel kernel32 advapi32 winhttp user32 gdi32)
 else()
   # HTTP goes through the httpedge object, the one translation unit
   # with the C++ standard library (and so libc++/libstdc++ at link).
@@ -260,9 +260,9 @@ else()
   target_link_libraries(httpedge PUBLIC httpnet)
   target_compile_options(httpedge PRIVATE -fno-exceptions)
   add_executable(prospero src/main_posix.cpp)
-  target_link_libraries(prospero PRIVATE httpedge Threads::Threads)
+  target_link_libraries(prospero PRIVATE httpedge Threads::Threads ariel)
   if(PROSPERO_GUI)
-    target_link_libraries(prospero PRIVATE imgui md4c ariel)
+    target_link_libraries(prospero PRIVATE imgui md4c)
   endif()
   # Every tool process starts under a reaper, this executable, so its
   # startup is on the critical path: loading libstdc++ dynamically costs
@@ -469,11 +469,11 @@ endif()
 if(NOT CMAKE_CROSSCOMPILING OR PROSPERO_CROSS_TESTS)
   enable_testing()
   add_executable(prospero_test src/main_test.cpp)
-  target_link_libraries(prospero_test PRIVATE prospero_core_flags wuffs)
+  target_link_libraries(prospero_test PRIVATE prospero_core_flags wuffs ariel)
   target_compile_definitions(prospero_test PRIVATE PROSPERO_ARENACHECK=1)
   if(PROSPERO_GUI)
     # The GUI's pure modules: scheduler, markdown, layout, view model.
-    target_link_libraries(prospero_test PRIVATE md4c ariel)
+    target_link_libraries(prospero_test PRIVATE md4c)
     target_compile_definitions(prospero_test PRIVATE PROSPERO_GUI=1)
   endif()
   if(PROSPERO_HAS_NOSTDLIBXX)

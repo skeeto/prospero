@@ -634,6 +634,7 @@ static void termlaunch(Gui *g, GuiSession *s, TermTab *tt, i32 cols, i32 rows)
     EvOut w = cmdopen(g, &b, CMD_TERMOPEN, s);
     putintkey(&w.json, "cols", cols);
     putintkey(&w.json, "rows", rows);
+    putintkey(&w.json, "scrollback", tt->histlines);  // the engine's screen's
     if (tt->edit) {
         // The editor as the settings are now, a Restart's too
         EditAsk ask = editask(g, &a, s->host);
@@ -1886,12 +1887,22 @@ static TermBar termtabs(Gui *g, GuiSession *s)
         if (tt->busy || (tt->edit && tt->state==TT_LIVE)) {
             flags |= ImGuiTabItemFlags_UnsavedDocument;
         }
+        if (tt->tid) {
+            flags |= ImGuiTabItemFlags_NoTooltip;  // its own, below
+        }
         Buf b(&a, TERMTITLECAP + tt->edpath.len + 32);
         termlabel(&b, tt);
         print(&b, "###tt");
         print(&b, (i64)tt->serial);
         b32 shown = ImGui::BeginTabItem(cstr0(&a, finish(&b)), &open, flags);
         ids[i] = ImGui::GetItemID();
+        if (tt->tid) {
+            // The engine's number, by which the agent knows it
+            Buf lb(&a, TERMTITLECAP + tt->edpath.len + 32);
+            termlabel(&lb, tt);
+            Str label = finish(&lb);
+            itemtip("%.*s\nTerminal %lld", (int)label.len, label.cdata, (long long)tt->tid);
+        }
         if (ImGui::IsItemDeactivated()) {
             // On release, not press: focus takes the active ID, which
             // would end a drag before it started

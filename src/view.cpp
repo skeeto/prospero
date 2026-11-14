@@ -819,7 +819,7 @@ static b32 toolauto(ViewMsg *m)
         }
     }
     return t->name=="read" || t->name=="write" || t->name=="todo_write" ||
-           t->name=="web_search" || t->name=="web_fetch";
+           t->name=="web_search" || t->name=="web_fetch" || t->name=="read_terminal";
 }
 
 // Whether a tool row folds: as the user chose, else as the session's
@@ -1425,6 +1425,15 @@ static Str toolsummary(Arena *perm, Arena scratch, Str name, Str args, Str cwd)
     } else if (name == "web_fetch") {
         Str url = jsonstr(jsonget(j, "url"));
         return oneline(perm, url.len ? url : args);
+    } else if (name == "read_terminal") {
+        // "Terminal 7", else the one used last
+        i64 tab = jsonint(jsonget(j, "tab"), 0);
+        Buf b(perm, 32);
+        print(&b, tab>0 ? Str("Terminal ") : Str("Terminals"));
+        if (tab > 0) {
+            print(&b, tab);
+        }
+        return finish(&b);
     } else if (name=="edit" && patch->type==JSON_STRING) {
         // The files the patch names, as it names them
         Slice<Str> paths = patchpaths(&scratch, patch->str);

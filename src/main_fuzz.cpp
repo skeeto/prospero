@@ -7,20 +7,24 @@
 // the web tools' text work (web.cpp), or with -DFUZZ_PDF the PDF reader
 // (pdf.cpp), or with -DFUZZ_PDFENC its text encodings (pdfenc.cpp), or
 // with -DFUZZ_PDFIMG its image decoding (pdfimage.cpp): CCITT fax,
-// samples to RGBA, and showing one as a PNG or a JPEG. Every target
-// links Wuffs, from the release file CMake fetched:
+// samples to RGBA, and showing one as a PNG or a JPEG, or with
+// -DFUZZ_TERMSECRET the typed lines and masking of terminal secrets
+// (termsecret.cpp). Every target links Wuffs, from the release file CMake
+// fetched, and ariel:
 //   $ afl-clang-fast -O2 -g3 -fsanitize=address,undefined \
 //         -fsanitize-trap=undefined -I build/_deps/wuffs-src \
 //         -c -o wuffs.o src/wuffs.c
+//   $ afl-clang-fast -std=c11 -O2 -g3 -fsanitize=address,undefined \
+//         -fsanitize-trap=undefined -c -o ariel.o ariel/ariel.c
 //   $ afl-clang-fast++ -std=c++20 -fno-exceptions -fno-rtti -g3 \
 //         -fsanitize=address,undefined -fsanitize-trap=undefined \
-//         -o fuzzjson src/main_fuzz.cpp wuffs.o
+//         -o fuzzjson src/main_fuzz.cpp wuffs.o ariel.o
 //   $ mkdir i && printf '{"a":[1,"\\u00e9",null]}' >i/doc
 //   $ afl-fuzz -i i -o o ./fuzzjson
 //
 // Likewise with -DFUZZ_EVENTS, -DFUZZ_PROVIDER, -DFUZZ_FRAMES,
-// -DFUZZ_IMAGE, -DFUZZ_WEB, -DFUZZ_PDF, -DFUZZ_PDFENC or -DFUZZ_PDFIMG
-// for the other targets. FUZZ_PDFIMG takes its parameters from the first
+// -DFUZZ_IMAGE, -DFUZZ_WEB, -DFUZZ_PDF, -DFUZZ_PDFENC, -DFUZZ_PDFIMG or
+// -DFUZZ_TERMSECRET for the other targets. FUZZ_PDFIMG takes its parameters from the first
 // 16 bytes; seeds are test/pdfimage_test.cpp's fax fixtures after 16
 // bytes that pick their kind (byte 0: K+1, then the align and BlackIs1
 // bits; bytes 1 and 2: the columns, little endian; byte 3: twice the
@@ -255,6 +259,7 @@ static void  os_ptytake(Os *, Proc *, iz) {}
 static b32   os_ptyresize(Os *, Proc *, PtySize) { return 0; }
 static b32   os_ptybusy(Os *, Proc *) { return 0; }
 static b32   os_ptyable(Os *) { return 0; }
+static i32   os_ptymode(Os *, Proc *) { return PTY_UNKNOWN; }
 static iz    os_lockfile(Os *, Arena, Str) { return -1; }
 static void  os_unlockfile(Os *, iz) {}
 static b32   os_lockheld(Os *, Arena, Str) { return 0; }
@@ -1339,6 +1344,48 @@ static void fuzzpdfimages(Arena rest, Str src, PdfOut *r)
 }
 #endif
 
+#if FUZZ_TERMSECRET
+// Typed input in chunks, each led by a byte: its length less one (low 6
+// bits) and the kind of a line begun in it (high 2). Lines committed are
+// learned as secrets, then the rest of the input is masked: no secret of
+// TERMSECRET_SUB bytes or more may remain in it, but one of brackets or
+// within "[hidden]", which the mask itself writes.
+static void fuzztermsecret(Arena a, Str in)
+{
+    TermLine    l  = {};
+    TermSecrets ss = {};
+    while (in.len) {
+        u8  lead = in[0];
+        iz  n    = (lead & 63) + 1;
+        i32 kind = lead>>6;
+        in = cuthead(in, 1);
+        n  = n<in.len ? n : in.len;
+        Arena s = a;
+        Slice<TermCommit> m = termlinefeed(&s, &l, takehead(in, n), kind);
+        for (iz i = 0; i < m.len; i++) {
+            assert(m[i].kind==TL_CAND || m[i].kind==TL_SECRET);
+            assert(m[i].text.len>0 && m[i].text.len<=TERMLINE_CAP);
+            termsecretadd(&ss, m[i].text, m[i].kind==TL_SECRET ? 2 : 1);
+        }
+        in = cuthead(in, n);
+        if (n == 64) {
+            break;  // the rest is the text to mask
+        }
+    }
+    iz  hidden = 0;
+    Str out    = termmask(&a, in, &ss, &hidden);
+    assert(hidden || out.data==in.data);
+    for (i32 k = 0; k < TERMSECRETS; k++) {
+        Str v = {ss.s[k].buf, ss.s[k].len};
+        if (v.len<TERMSECRET_SUB || find(v, "[")>=0 || find(v, "]")>=0 ||
+            find("[hidden]", v)>=0) {
+            continue;
+        }
+        assert(find(out, v) < 0);
+    }
+}
+#endif
+
 #if FUZZ_PDFIMG
 // Pixels converted, checked opaque and of the size asked for, else the
 // arena as it was.
@@ -1532,6 +1579,8 @@ int main()
         fuzzpdfenc(a, {src, len});
         #elif FUZZ_PDFIMG
         fuzzpdfimg(a, {src, len});
+        #elif FUZZ_TERMSECRET
+        fuzztermsecret(a, {src, len});
         #else
         fuzzjson(a, {src, len});
         #endif

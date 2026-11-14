@@ -2230,6 +2230,18 @@ static b32 os_ptyable(Os *)
     return 1;
 }
 
+// The master reports the terminal's modes, which the slave's side set
+static i32 os_ptymode(Os *, Proc *p)
+{
+    struct termios tio = {};
+    if (tcgetattr(p->master, &tio)) {
+        return PTY_UNKNOWN;
+    } else if (!(tio.c_lflag & ICANON)) {
+        return PTY_RAW;
+    }
+    return tio.c_lflag&ECHO ? PTY_ECHO : PTY_SECRET;
+}
+
 static b32 os_ptybusy(Os *, Proc *p)
 {
     pid_t fg  = tcgetpgrp(p->master);
@@ -4308,8 +4320,9 @@ static i32 edfound(void *ctx, Arena *a, Str prog)
 
 
 // prospero --tty-probe: a stand-in shell for testing terminals, which
-// reads a command a line from its terminal and answers on it, without
-// echo or output processing, so that what it writes arrives as written:
+// reads a command a line from its terminal and answers on it, raw (no
+// line discipline, echo or output processing), so that what it writes
+// arrives as written, and never as a password prompt would read:
 //
 //   size           "size COLSxROWS XPXxYPX"
 //   echo TEXT      "TEXT"
@@ -4325,6 +4338,13 @@ static i32 edfound(void *ctx, Arena *a, Str prog)
 //   nohup SECONDS  a child that ignores SIGHUP and lives that long,
 //                  "nohup PID"
 //   exit N         exit with status N
+//   pass [MS]      after MS, echo off in line mode, "Password: ", a line
+//                  read, then "\r\npass got LINE\r\n", as a program that
+//                  prints what it read
+//   cooked, raw    a shell's line mode with echo, or back: "cooked", "raw"
+//   say TEXT       "TEXT\r\n"
+//   lines N        "line 1\r\n" to "line N\r\n"
+//   title TEXT     OSC 2, the window's title
 //
 // It starts with "probe ready", and a resize prints "winch COLSxROWS".
 
@@ -4417,14 +4437,30 @@ static void probeword(ProbeOut *o, Str w)
     probeput(o, "]");
 }
 
-static void ttyprobe(char **argv)
+// The probe's terminal modes: raw (no line discipline, no echo, so that
+// it never looks like a password prompt), cooked (a shell's: lines and
+// echo), or a password's (lines, no echo). Signals stay on throughout.
+enum { PROBE_RAW, PROBE_COOKED, PROBE_PASS };
+
+static void probemode(i32 mode, i32 when)
 {
     struct termios tio = {};
-    if (!tcgetattr(0, &tio)) {
-        tio.c_oflag &= ~(tcflag_t)OPOST;
-        tio.c_lflag &= ~(tcflag_t)(ECHO|ECHONL);
-        tcsetattr(0, TCSANOW, &tio);
+    if (tcgetattr(0, &tio)) {
+        return;
     }
+    tio.c_oflag &= ~(tcflag_t)OPOST;
+    tio.c_lflag &= ~(tcflag_t)(ECHO|ECHONL|ICANON);
+    tio.c_lflag |= mode==PROBE_COOKED ? (tcflag_t)(ECHO|ICANON) :
+                   mode==PROBE_PASS   ? (tcflag_t)ICANON : 0;
+    tio.c_cc[VMIN]  = 1;
+    tio.c_cc[VTIME] = 0;
+    tcsetattr(0, when, &tio);
+}
+
+static void ttyprobe(char **argv)
+{
+    i32 mode = PROBE_RAW;
+    probemode(mode, TCSANOW);
     struct sigaction sa = {};
     sa.sa_handler = probeonwinch;  // no SA_RESTART: read returns
     sigaction(SIGWINCH, &sa, 0);
@@ -4542,6 +4578,51 @@ static void ttyprobe(char **argv)
             probeflush(&o);
         } else if (c.head=="exit" && n.ok) {
             _exit((int)n.val);
+        } else if (c.head=="pass" && (!arg.len || n.ok)) {
+            // As sudo asks: after a pause (typing may go ahead of it),
+            // echo off with what was typed kept, a prompt, then a line;
+            // what was read is printed, a program's slip
+            probenap(arg.len ? n.val : 0);
+            probemode(PROBE_PASS, TCSADRAIN);
+            writeall(1, "Password: ");
+            u8 pw[256];
+            iz pwlen = 0;
+            for (;;) {
+                iz r = read(0, pw+pwlen, (size_t)(countof(pw)-pwlen));
+                if (r<0 && errno==EINTR) {
+                    continue;
+                } else if (r <= 0) {
+                    _exit(0);
+                }
+                pwlen += r;
+                if (pw[pwlen-1]=='\n' || pwlen==countof(pw)) {
+                    break;
+                }
+            }
+            pwlen -= pwlen && pw[pwlen-1]=='\n';
+            probemode(mode, TCSANOW);
+            writeall(1, "\r\npass got ");
+            writeall(1, {pw, pwlen});
+            writeall(1, "\r\n");
+        } else if (cmd=="cooked" || cmd=="raw") {
+            mode = cmd=="cooked" ? PROBE_COOKED : PROBE_RAW;
+            probemode(mode, TCSANOW);
+            probeput(&o, cmd);
+            probeflush(&o);
+        } else if (c.head == "say") {
+            writeall(1, arg);
+            writeall(1, "\r\n");
+        } else if (c.head=="lines" && n.ok) {
+            for (i64 i = 1; i <= n.val; i++) {
+                probeput(&o, "line ");
+                probeint(&o, i);
+                probeput(&o, "\r");
+                probeflush(&o);
+            }
+        } else if (c.head == "title") {
+            writeall(1, "\x1b]2;");
+            writeall(1, arg);
+            writeall(1, "\x07");
         } else if (cmd.len) {
             probeput(&o, "? ");
             probeput(&o, cmd);

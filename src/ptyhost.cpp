@@ -110,6 +110,10 @@ enum : i32 {
     TERM_DIMMAX  = 4096,        // columns or rows
     TERM_EDITPATH = 32 << 10,   // an edit's path, in bytes, under this
     TERM_EDITCMD  = 4 << 10,    // its editor or template
+    TERM_HIST     = 2000,       // history lines a screen keeps, at most
+    TERM_TYPEAHEAD = 2,         // seconds a line typed may precede echo off
+    TERM_CWDCAP   = 1024,       // bytes of a terminal's folder kept
+    TERM_SHELLCAP = 64,         // of its shell's name
 };
 
 struct Term {
@@ -132,6 +136,28 @@ struct Term {
     b32   away;     // its frontend's link is down: no stalls meanwhile
     i64   stallat;  // ticks: send again, 0 while nothing is unacked
     i32   tries;
+
+    // The screen read_terminal reads, while [terminal] agent is on, fed
+    // the output ahead of what is sent (termscan): fed >= sent >= acked
+    Region     *region;   // the screen's block, alone in it
+    ariel_Term *screen;
+    i32         capcols;
+    i32         caprows;
+    i32         hist;
+    i64         fed;
+    i64         readfed;  // fed as of the agent's last read of it
+    i64         used;     // ticks: opened, or typed into
+    i32         mode;     // os_ptymode as last looked at
+    TermLine    line;     // the line being typed (termsecret.cpp)
+    u8          cand[TERMLINE_CAP];  // the latest echoed line, and when
+    i32         candlen;
+    i64         candat;
+    u8          title[TERMTITLECAP];
+    iz          titlelen;
+    u8          shell[TERM_SHELLCAP];
+    iz          shelllen;
+    u8          cwd[TERM_CWDCAP];
+    iz          cwdlen;
 };
 
 struct Terms {
@@ -139,6 +165,8 @@ struct Terms {
     i64  nexttid;
     b32  held;      // a record waited for room in the outbox
     i64  busyat;    // ticks: look at who has each terminal
+    TermSecrets secrets;  // typed at prompts, in any terminal
+    i64  lastread;  // the tid read_terminal read last
 };
 
 static Terms *newterms(Arena *perm)
@@ -384,8 +412,67 @@ static Str termeditname(Str prog)
     return name;
 }
 
+// A session as the walk to its terminals' owner sees it.
+struct TermNode {
+    b32 found;
+    Str parent;    // a subagent's on this host, else empty
+    Str sideof;    // a side chat's original, else empty
+    b32 worktree;  // in a worktree of its own
+    Str cwd;
+};
+
+typedef TermNode TermLook(void *ctx, Arena *, Str sid);
+
+// The session whose terminals a session shares, as the frontend files
+// them (term.cpp's termroot): the top of its parents on this host, then
+// a side chat's original's, if in the same folder, and so on. A
+// worktree session, in a folder of its own, has its own.
+static Str termrootwalk(Arena *a, Str sid, TermLook *look, void *ctx)
+{
+    for (i32 side = 0; side < 8; side++) {
+        TermNode n = look(ctx, a, sid);
+        for (i32 up = 0; up<16 && n.found && n.parent.len && !(n.parent==sid); up++) {
+            TermNode p = look(ctx, a, n.parent);
+            if (!p.found) {
+                break;
+            }
+            sid = n.parent;
+            n   = p;
+        }
+        if (!n.found || !n.sideof.len || n.worktree || n.sideof==sid) {
+            break;
+        }
+        TermNode o = look(ctx, a, n.sideof);
+        if (!o.found || !(o.cwd == n.cwd)) {
+            break;
+        }
+        sid = n.sideof;
+    }
+    return sid;
+}
+
 
 // The table
+
+// Whether the agent may read terminals, and so the engine keeps their
+// screens: [terminal] agent.
+static b32 termagent(Engine *e)
+{
+    return cfgbool(cfgget(e->cfg, "terminal", {}, "agent", 0)) != 0;
+}
+
+// For status: the screens kept and the output they were fed, for tests.
+static void termstatus(Engine *e, JsonOut *w)
+{
+    i64 screens = 0, fed = 0;
+    for (i32 i = 0; e->terms && i < TERM_MAX; i++) {
+        Term *t = &e->terms->slots[i];
+        screens += t->tid && t->screen;
+        fed     += t->tid ? t->fed : 0;
+    }
+    putintkey(w, "screens", screens);
+    putintkey(w, "fed", fed);
+}
 
 static Term *termbytid(Engine *e, i64 tid, i64 peer)
 {
@@ -422,8 +509,225 @@ static i32 termcount(Engine *e, i64 peer)
 
 // Hang up, or with kill sweep the tree. The terminal says nothing more,
 // and its slot goes once the shell's exit and EOF are in.
+// Free a slot, and its screen.
+static void termfree(Engine *e, Term *t)
+{
+    if (t->region) {
+        os_release(e->os, t->region);
+    }
+    *t = {};
+}
+
+// The capacity for a screen's size: room to grow before a move.
+static i32 termscreencap(i32 n, i32 least)
+{
+    i32 r = n + n/2;
+    r = r<least ? least : r;
+    return r<TERM_DIMMAX ? r : TERM_DIMMAX;
+}
+
+// A screen's block, fresh or moved into from the one it had, with room
+// for cols by rows. Returns 0, keeping what it had, if it cannot be had.
+static b32 termscreenblock(Engine *e, Term *t, i32 cols, i32 rows)
+{
+    static char  name[] = "Prospero(" PROSPERO_VERSION ")";
+    ariel_Config c      = {};
+    c.cols      = cols;
+    c.rows      = rows;
+    c.capcols   = termscreencap(cols, 200);
+    c.caprows   = termscreencap(rows, 80);
+    c.histlines = t->hist ? t->hist : -1;  // ariel's 0 is its default
+    c.histbytes = termscrollbytes(t->hist);
+    c.flags     = ARIEL_F_NOREPLY;
+    c.name.data = (u8 *)name;
+    c.name.len  = countof(name) - 1;
+    iz size = ariel_size(&c);
+    if (!size) {
+        return 0;
+    }
+    Region *r = os_reserve(e->os, size + ((iz)1<<16));
+    if (!r) {
+        return 0;
+    }
+    Arena a = newarena(r);
+    allocbytes(&a, -(uz)a.beg & 15);
+    void       *mem = allocbytes(&a, size);
+    ariel_Term *st  = t->screen ? ariel_move(t->screen, mem, size, &c)
+                                : ariel_init(mem, size, &c);
+    if (!st) {
+        os_release(e->os, r);
+        return 0;
+    }
+    if (t->region) {
+        os_release(e->os, t->region);
+    }
+    t->region  = r;
+    t->screen  = st;
+    t->capcols = c.capcols;
+    t->caprows = c.caprows;
+    return 1;
+}
+
+// The screen's text on the cursor's row, left of the cursor, into buf.
+static Str termcursorrow(Term *t, u8 *buf, iz cap)
+{
+    ariel_Cursor cur = ariel_cursor(t->screen);
+    if (cur.y < 0) {
+        return {};
+    }
+    ariel_Cell cells[256];
+    i32        n = ariel_row(t->screen, cur.y, cells, countof(cells));
+    n = n<countof(cells) ? n : countof(cells);
+    n = cur.x<n ? cur.x : n;
+    iz len = 0;
+    for (i32 x = 0; x<n && len+4<=cap; x++) {
+        if (cells[x].width) {
+            len += utf8encode(buf+len, cells[x].cp ? (i32)cells[x].cp : ' ');
+        }
+    }
+    return {buf, len};
+}
+
+static void termfeedbytes(Term *t, Str data)
+{
+    ariel_Str in = {data.data, data.len};
+    for (;;) {
+        ariel_Fed f = ariel_feed(t->screen, in);
+        in = f.rest;
+        if (f.ev.kind == ARIEL_EV_NONE) {
+            return;
+        } else if (f.ev.kind==ARIEL_EV_TITLE && !f.ev.arg) {
+            t->titlelen = termtitle(t->title, {f.ev.data.data, f.ev.data.len});
+        }
+    }
+}
+
+// Output to the screen: its title is the only event kept. While a line
+// typed with echo on is fresh, a password prompt that shows meanwhile,
+// at any line's end or where the output stops, makes it a secret: the
+// program reads a line typed ahead of its prompt at once, too soon for
+// echo off to be seen (termscan).
+static void termfeedscreen(Engine *e, Term *t, Str data)
+{
+    if (!t->candlen || os_ticks(e->os)-t->candat>(i64)TERM_TYPEAHEAD*SEC) {
+        termfeedbytes(t, data);
+        return;
+    }
+    u8 row[1024];
+    for (iz i = 0; t->candlen;) {
+        iz j = i;
+        for (; j<data.len && data[j]!='\r' && data[j]!='\n'; j++) {}
+        termfeedbytes(t, Str{data.data+i, j-i});
+        if (termprompt(termcursorrow(t, row, countof(row)))) {
+            termsecretadd(&e->terms->secrets, {t->cand, t->candlen}, 2);
+            t->candlen = 0;
+        }
+        if (j == data.len) {
+            return;
+        }
+        termfeedbytes(t, Str{data.data+j, 1});
+        i = j + 1;
+        if (i == data.len) {
+            return;
+        }
+        if (!t->candlen) {
+            termfeedbytes(t, cuthead(data, i));
+            return;
+        }
+    }
+}
+
+// Feed the screen what the ring holds past what it was fed, and look at
+// how the terminal reads typing: echo going off soon after a line was
+// typed with echo on makes that line a secret, typed ahead of the
+// prompt (sudo keeps such a line, and reads it).
+static void termscan(Engine *e, Term *t)
+{
+    if (!t->screen || !t->proc) {
+        return;
+    }
+    for (;;) {
+        Str s = os_ptypeek(e->os, t->proc, (iz)(t->fed - t->acked));
+        if (!s.len) {
+            break;
+        }
+        termfeedscreen(e, t, s);
+        t->fed += s.len;
+    }
+    i32 mode = os_ptymode(e->os, t->proc);
+    if (mode != t->mode) {
+        i64 now = os_ticks(e->os);
+        if (mode==PTY_SECRET && t->candlen && now-t->candat<=(i64)TERM_TYPEAHEAD*SEC) {
+            termsecretadd(&e->terms->secrets, {t->cand, t->candlen}, 2);
+        }
+        if (mode == PTY_SECRET) {
+            t->candlen = 0;
+        }
+        t->mode = mode;
+    }
+}
+
+// Typed input, before it is written: the line it continues, and the
+// secrets that line teaches once entered.
+static void termtyped(Engine *e, Arena scratch, Term *t, Str data)
+{
+    if (!t->screen) {
+        return;
+    }
+    termscan(e, t);
+    i32 kind = TL_SKIP;  // of a line begun in this input
+    u8 row[1024];
+    if (t->mode==PTY_SECRET || termprompt(termcursorrow(t, row, countof(row)))) {
+        kind = TL_SECRET;
+    } else if (t->mode == PTY_ECHO) {
+        kind = TL_CAND;
+    }
+    Slice<TermCommit> m = termlinefeed(&scratch, &t->line, data, kind);
+    for (iz i = 0; i < m.len; i++) {
+        if (m[i].kind == TL_SECRET) {
+            termsecretadd(&e->terms->secrets, m[i].text, t->mode==PTY_SECRET ? 2 : 1);
+        } else {
+            t->candlen = (i32)m[i].text.len;
+            t->candat  = os_ticks(e->os);
+            copybytes(t->cand, m[i].text.data, m[i].text.len);
+        }
+    }
+}
+
+// The values of secret settings, as secrets to hide: each definition
+// of any section of any file loaded, an env:NAME read from env (the
+// terminal's) or else the engine's own, a file:PATH read. Short ones,
+// which common words would match, are left out.
+static void termconfsecrets(Engine *e, Arena scratch, Slice<Str> env, b32 win)
+{
+    for (IniSection *sec = e->cfg->ini->sections; sec; sec = sec->next) {
+        for (IniEntry *k = sec->keys; k; k = k->next) {
+            CfgKey *key = cfgkey(sec->kind, k->key);
+            if (!key || key->type!=CFG_SECRET) {
+                continue;
+            }
+            for (IniEntry *d = k; d; d = d->older) {
+                Arena a = scratch;
+                Str   v = trim(d->value);
+                if (startswith(v, "env:")) {
+                    Str name = trim(cuthead(v, 4));
+                    Str got  = envget(env, name, win);
+                    v = got.len ? got : envget(e->env, name, win);
+                } else if (startswith(v, "file:")) {
+                    Str path = cfgsecretfile(e->os, &a, v);
+                    v = path.len ? cfgreadsecret(e->os, &a, path) : Str{};
+                }
+                if (v.len >= 8) {
+                    termsecretadd(&e->terms->secrets, v, 1);
+                }
+            }
+        }
+    }
+}
+
 static void termhangup(Engine *e, Term *t, b32 kill)
 {
+    termscan(e, t);  // before the ring goes
     if (!t->closed) {
         t->closed = 1;
         if (kill) {
@@ -435,7 +739,7 @@ static void termhangup(Engine *e, Term *t, b32 kill)
         t->proc = 0;
     }
     if (t->exited && t->eof) {
-        *t = {};
+        termfree(e, t);
     }
 }
 
@@ -469,6 +773,7 @@ static void termpump(Engine *e, Arena scratch, Term *t)
     if (t->closed || !t->proc) {
         return;
     }
+    termscan(e, t);  // what goes out is on the screen first
     while (!e->terms->held) {
         iz can = termcan(t->sent, t->acked, TERM_WINDOW, TERM_LINE);
         Str s  = can ? os_ptypeek(e->os, t->proc, (iz)(t->sent - t->acked)) : Str{};
@@ -770,6 +1075,20 @@ static Str termstart(Engine *e, Arena scratch, i64 id, Json *j, Session *s, Str 
     copybytes(t->sid, sid.data, sid.len);
     t->proc   = p;
     t->procid = sp.id;
+    t->used   = os_ticks(e->os);
+    Str label = ed.on && editor.len ? editor : sh.name;
+    t->shelllen = label.len<TERM_SHELLCAP ? label.len : 0;
+    copybytes(t->shell, label.data, t->shelllen);
+    t->cwdlen = cwd.len<TERM_CWDCAP ? cwd.len : 0;
+    copybytes(t->cwd, cwd.data, t->cwdlen);
+    if (termagent(e)) {
+        termconfsecrets(e, scratch, env, win);
+        // As much history as the frontend keeps, within TERM_HIST
+        PtySize z  = termsize(j);
+        i64     sb = jsonint(jsonget(j, "scrollback"), 1000);
+        t->hist = (i32)(sb<0 ? 0 : sb>TERM_HIST ? (i64)TERM_HIST : sb);
+        termscreenblock(e, t, z.cols, z.rows);  // else no screen, no reads
+    }
 
     Buf   b(&scratch, 1024);
     EvOut w = evbegin(&b, sid, 0, os_time(e->os), EV_REPLY);
@@ -840,12 +1159,23 @@ static void termcmd(Engine *e, Arena scratch, i32 cmd, Json *j)
     case CMD_TERMINPUT: {
         Unbase64 u = unbase64(&scratch, jsonstr(jsonget(j, "data")));
         if (u.ok && u.data.len && u.data.len<=TERM_INPUT) {
+            termtyped(e, scratch, t, u.data);
+            t->used = os_ticks(e->os);
             os_procwrite(e->os, t->proc, u.data);
         }
     } break;
-    case CMD_TERMRESIZE:
-        os_ptyresize(e->os, t->proc, termsize(j));
-        break;
+    case CMD_TERMRESIZE: {
+        // The screen takes the output written at the old size first
+        PtySize z = termsize(j);
+        if (t->screen) {
+            termscan(e, t);
+            if (z.cols>t->capcols || z.rows>t->caprows) {
+                termscreenblock(e, t, z.cols, z.rows);
+            }
+            ariel_resize(t->screen, z.cols, z.rows, z.xpx/z.cols, z.ypx/z.rows);
+        }
+        os_ptyresize(e->os, t->proc, z);
+    } break;
     case CMD_TERMACK: {
         i64     off = jsonint(jsonget(j, "off"), -1);
         TermAck k   = termack(t->sent, t->acked, off, jsonflag(jsonget(j, "resend"), 0));
@@ -986,4 +1316,208 @@ static void termhangupall(Engine *e, i64 peer, Str sid)
             termhangup(e, t, 0);
         }
     }
+}
+
+
+// read_terminal: the agent reads the user's terminals
+
+enum : i32 {
+    TERM_READBYTES = 50 << 10,  // of a terminal's text shown at once
+    TERM_READLINES = 100,       // lines shown by default
+};
+
+// A session as termrootwalk sees it: from memory, else from the first
+// record of its log.
+static TermNode termlookup(void *ctx, Arena *a, Str sid)
+{
+    Engine  *e = (Engine *)ctx;
+    TermNode n = {};
+    Session *s = findsession(e, sid);
+    if (s) {
+        n.found    = 1;
+        n.parent   = s->psid;
+        n.sideof   = s->wt.from;
+        n.worktree = s->wt.name.len > 0;
+        n.cwd      = s->cwd;
+        return n;
+    } else if (!validsid(sid)) {
+        return n;
+    }
+    Str   path = join(a, join(a, join(a, e->statedir, "sessions"), sid), "events.jsonl");
+    Read  rd   = os_readat(e->os, a, path, 0, 4096);
+    Cut   line = cut(rd.data, '\n');
+    EvRec rec  = evparse(a, line.head);
+    if (!line.ok || rec.ev!=EV_SESSION) {
+        return n;
+    }
+    n.found    = 1;
+    n.parent   = jsonint(jsonget(rec.root, "remote"), 0)==1 ? Str{}
+                                                             : jsonstr(jsonget(rec.root, "parent"));
+    n.sideof   = jsonstr(jsonget(rec.root, "side_of"));
+    n.worktree = wtfrom(a, jsonget(rec.root, "worktree")).name.len > 0;
+    n.cwd      = jsonstr(jsonget(rec.root, "cwd"));
+    return n;
+}
+
+// A terminal's line in the list: its number, label, state and folder.
+static void termlistline(Buf *b, Arena *a, Term *t, TermSecrets *ss, iz *hidden)
+{
+    iz  h     = 0;
+    Str label = t->titlelen ? termmask(a, {t->title, t->titlelen}, ss, &h)
+                            : Str{t->shell, t->shelllen};
+    *hidden += h;
+    print(b, "terminal ");
+    print(b, t->tid);
+    print(b, ": ");
+    print(b, label.len ? label : Str("shell"));
+    if (t->exited && t->signal) {
+        print(b, ", killed by signal ");
+        print(b, (i64)t->signal);
+    } else if (t->exited) {
+        print(b, ", exited with code ");
+        print(b, (i64)t->code);
+    } else if (t->busy) {
+        print(b, ", a program is running");
+    } else {
+        print(b, ", at its prompt");
+    }
+    if (t->cwdlen) {
+        print(b, ", in ");
+        print(b, Str{t->cwd, t->cwdlen});
+    }
+    if (!t->screen) {
+        print(b, " (not readable: it opened while [terminal] agent was off)");
+    }
+    putbyte(b, '\n');
+}
+
+// The last n lines of text, each cut at READ_LINEMAX bytes, and no more
+// of them than fit in max bytes, the newest kept. *more says lines were
+// left out before them.
+static Str termlast(Arena *a, Str text, i64 n, iz max, b32 *more)
+{
+    Slice<Str> lines = {};
+    for (Cut c = {{}, text, text.len>0}; c.ok;) {
+        c     = cut(c.tail, '\n');
+        lines = push(a, lines, c.head.len>READ_LINEMAX ? utf8head(c.head, READ_LINEMAX)
+                                                       : c.head);
+    }
+    iz first = lines.len>n ? lines.len-(iz)n : 0;
+    iz total = 0;
+    iz from  = lines.len;
+    while (from > first && total+lines[from-1].len+1 <= max) {
+        total += lines[--from].len + 1;
+    }
+    *more = from > 0;
+    Buf b(a, total + 1);
+    for (iz i = from; i < lines.len; i++) {
+        print(&b, lines[i]);
+        putbyte(&b, '\n');
+    }
+    return finish(&b);
+}
+
+static void toolreadterm(Session *s, Arena scratch, Args *args)
+{
+    Engine *e = s->e;
+    if (!termagent(e)) {
+        toolend(s, scratch, "error", "Reading terminals is turned off ([terminal] "
+                "agent), so nothing was read.", 0, 0, {}, 0);
+        return;
+    }
+
+    // The session's terminals, as the frontend files them, newest first
+    Str   root = termrootwalk(&scratch, s->sid, termlookup, e);
+    Term *list[TERM_MAX];
+    i32   n = 0;
+    for (i32 i = 0; i < TERM_MAX; i++) {
+        Term *t = &e->terms->slots[i];
+        if (t->tid && !t->closed && Str{t->sid, t->sidlen}==root) {
+            i32 k = n++;
+            for (; k>0 && list[k-1]->tid<t->tid; k--) {
+                list[k] = list[k-1];
+            }
+            list[k] = t;
+        }
+    }
+    if (!n) {
+        toolend(s, scratch, "ok", "The user has no Terminal tabs open for this "
+                "session.", 0, 0, {}, 0);
+        s->termseen = 0;
+        return;
+    }
+
+    // The one asked for, else the one opened or typed into last
+    Term *pick = 0;
+    for (i32 i = 0; i < n; i++) {
+        if (args->tab ? list[i]->tid==args->tab : !pick || list[i]->used>pick->used) {
+            pick = list[i];
+        }
+    }
+
+    TermSecrets *ss     = &e->terms->secrets;
+    iz           hidden = 0;
+    Buf          b(&scratch, 1024);
+    print(&b, n==1 ? Str("The session's terminal:\n") : Str("The session's terminals, newest first:\n"));
+    for (i32 i = 0; i < n; i++) {
+        termlistline(&b, &scratch, list[i], ss, &hidden);
+    }
+    if (!pick) {
+        print(&b, "\nNo terminal ");
+        print(&b, args->tab);
+        print(&b, " is among them.");
+        Str text = finish(&b);
+        toolend(s, scratch, "error", text, 0, 0, {}, 0);
+        return;
+    }
+
+    putbyte(&b, '\n');
+    if (!pick->screen) {
+        print(&b, "Terminal ");
+        print(&b, pick->tid);
+        print(&b, " cannot be read: it opened while [terminal] agent was off.\n");
+    } else {
+        // Catch up, take the whole text, wrapped rows joined, then hide
+        // the secrets before it is cut, so that none is cut in two
+        termscan(e, pick);
+        ariel_select(pick->screen, ARIEL_SEL_ALL, 0, 0);
+        iz  len  = ariel_copy(pick->screen, 0, 0);
+        u8 *raw  = len>0 ? alloc<u8>(&scratch, len) : 0;
+        len      = len>0 ? ariel_copy(pick->screen, raw, len) : 0;
+        ariel_select(pick->screen, ARIEL_SEL_CLEAR, 0, 0);
+        iz  h    = 0;
+        Str text = termmask(&scratch, trimright(Str{raw, len}), ss, &h);
+        hidden  += h;
+        b32 more = 0;
+        Str last = termlast(&scratch, text, args->lines ? args->lines : (i64)TERM_READLINES,
+                            TERM_READBYTES, &more);
+        b32 alt  = ariel_modes(pick->screen).altscreen;
+        print(&b, "Terminal ");
+        print(&b, pick->tid);
+        if (!text.len) {
+            print(&b, " shows nothing yet.\n");
+        } else {
+            print(&b, more ? Str(", its last lines:\n") : Str(", all of it:\n"));
+            print(&b, last);
+        }
+        if (alt) {
+            print(&b, "[a full-screen program has the terminal: this is its "
+                      "screen, without the history above it]\n");
+        }
+        if (pick->readfed && pick->fed==pick->readfed) {
+            print(&b, "[no new output since you last read it]\n");
+        }
+        pick->readfed = pick->fed;
+    }
+    if (hidden) {
+        print(&b, "[");
+        print(&b, (i64)hidden);
+        print(&b, hidden==1 ? Str(" secret is") : Str(" secrets are"));
+        print(&b, " hidden as [hidden]: typed at password prompts, or "
+                  "settings' secret values]\n");
+    }
+    Str text = finish(&b);
+    e->terms->lastread = pick->tid;
+    s->termseen = hash(text);
+    toolend(s, scratch, "ok", text, 0, 0, {}, 0);
 }

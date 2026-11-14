@@ -2681,6 +2681,12 @@ static b32 os_ptyresize(Os *os, Proc *p, PtySize z)
 // such as w64devkit's sh.exe, or Git's bash.exe, starts the real shell
 // as its child and waits. That comes within moments of the root, and
 // nothing typed at the shell's prompt comes so soon.
+// ConPTY keeps the console's modes to itself
+static i32 os_ptymode(Os *, Proc *)
+{
+    return PTY_UNKNOWN;
+}
+
 static b32 os_ptybusy(Os *, Proc *p)
 {
     enum { SHELLTIME = 200*10000 };  // 200 ms
@@ -4395,8 +4401,9 @@ static uz probenap(Os *os, Arena scratch, i64 ms, b32 detach)
     SetConsoleMode(out, PROBE_OUTMODE);
     probeline(os, a, "probe ready");
 
-    u8 line[4096];
-    iz len = 0;
+    u8  line[4096];
+    iz  len  = 0;
+    b32 pass = 0;  // the next line answers "Password: "
     for (;;) {
         iz nl = 0;
         for (; nl<len && line[nl]!='\n' && line[nl]!='\r'; nl++) {}
@@ -4426,7 +4433,31 @@ static uz probenap(Os *os, Arena scratch, i64 ms, b32 detach)
         Cut c   = cut(cmd, ' ');
         Str arg = c.tail;
         Int n   = parseint(arg);
-        if (c.head == "size") {
+        if (pass) {
+            // The console never echoes key events read this way, so the
+            // password shows only as the program's slip
+            pass = 0;
+            Str say = concat(&scratch, "pass got ", cmd);
+            probeline(os, scratch, "");
+            probeline(os, scratch, say);
+        } else if (c.head=="pass" && (!arg.len || n.ok)) {
+            Sleep(arg.len ? (i32)n.val : 0);
+            writeall(out, "Password: ");
+            pass = 1;
+        } else if (cmd=="cooked" || cmd=="raw") {
+            probeline(os, scratch, cmd);  // a console's modes don't show
+        } else if (c.head == "say") {
+            probeline(os, scratch, arg);
+        } else if (c.head=="lines" && n.ok) {
+            for (i64 i = 1; i <= n.val; i++) {
+                Buf b(&scratch, 32);
+                print(&b, "line ");
+                print(&b, i);
+                probeline(os, scratch, finish(&b));
+            }
+        } else if (c.head == "title") {
+            writeall(out, concat(&scratch, concat(&scratch, "\x1b]2;", arg), "\x07"));
+        } else if (c.head == "size") {
             probesize(os, scratch, "size ", 1);
         } else if (c.head == "echo") {
             probeline(os, scratch, arg);
