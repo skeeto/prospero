@@ -21,8 +21,9 @@ window of its own for the configuration file, drafts and plans; the
 Files pane's Open in editor runs one that runs in a terminal (`vim`,
 `nano`, `emacs -nw`) in a Terminal tab instead, on Linux and macOS
 through the login shell (on Windows, found on PATH and run by cmd.exe),
-where a profile can test `PROSPERO_EDIT_FILE` to skip what
-would keep the editor from starting, such as `exec tmux`.
+where a profile can test `PROSPERO_TAB` (`edit` there, `run` in a tab
+running a command) to skip what would keep the editor or command from
+starting, such as `exec tmux`.
 
 The agent can change the file too, through Prospero's own skill (see
 Skills). A write or edit of the file, or of a local file it includes,

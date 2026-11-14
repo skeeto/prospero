@@ -4265,57 +4265,218 @@ static i32 edfound(void *ctx, Arena *a, Str prog)
     edfail(concat(&a, "cannot run /bin/sh: ", os_lasterr(&os, &a)));
 }
 
-// Phase one: the login shell ($SHELL if a full path, else the account's,
-// else /bin/sh), which runs phase two; /bin/sh's if it will not start.
-// Where this program's path is not one every shell kind reads alike
-// (editshellsafe), phase two runs in place, without the profile.
+// The login shell: $SHELL if a full path, else the account's, else
+// /bin/sh.
+static Str edshell(Arena *a)
+{
+    Str shell = edenv("SHELL");
+    if (!shell.len || shell[0]!='/') {
+        struct passwd *pw = getpwuid(getuid());
+        shell = pw ? clone(a, edstr(pw->pw_shell)) : Str{};
+        shell = shell.len && shell[0]=='/' ? shell : Str("/bin/sh");
+    }
+    return shell;
+}
+
+// This program's path, for phase two: not os_exepath on Linux, which
+// names a rebuild's replacement, another program, which phase two must
+// not be; what, refused, if it was replaced on disk.
+static Str edself(Os *os, Arena *a, Str what)
+{
+    #ifdef __linux__
+    Str self = {};
+    iz    cap = 4096;
+    char *buf = (char *)allocbytes(a, cap);
+    iz    len = readlink("/proc/self/exe", buf, (uz)cap-1);
+    if (len > 0) {
+        buf[len] = 0;
+        self = {(u8 *)buf, len};
+        struct stat st;
+        if (endswith(self, " (deleted)") && stat(buf, &st)) {
+            edfail(concat(a, what, ": this program was replaced on disk since its "
+                          "engine started, which must start again first"));
+        }
+    }
+    (void)os;
+    return self;
+    #else
+    (void)what;
+    return os_exepath(os, a);
+    #endif
+}
+
+// Become shell with editshell's flags, running "exec 'SELF' FLAG", else
+// /bin/sh so; returns only where neither starts, or where this
+// program's path is not one every shell kind reads alike
+// (editshellsafe), for phase two to run in place, without the profile.
+static void edphase(Arena *a, Str shell, Str self, Str flag, b32 login)
+{
+    if (!editshellsafe(self)) {
+        return;
+    }
+    Str cmd = concat(a, concat(a, concat(a, "'", self), "' "), flag);
+    Str shells[] = {shell, "/bin/sh"};
+    for (iz k = 0; k < countof(shells); k++) {
+        Slice<Str> argv = editshell(a, shells[k], cmd, login);
+        char     **av   = alloc<char *>(a, argv.len+1);
+        for (iz i = 0; i < argv.len; i++) {
+            av[i] = cstr(a, argv[i]);
+        }
+        execve(av[0], av, environ);
+    }
+}
+
+// Phase one: the login shell, which runs phase two.
 [[noreturn]] static void ttyedit()
 {
     Os    os    = {};
     Arena a     = edarena(&os);
-    Str   shell = edenv("SHELL");
-    if (!shell.len || shell[0]!='/') {
-        struct passwd *pw = getpwuid(getuid());
-        shell = pw ? clone(&a, edstr(pw->pw_shell)) : Str{};
-        shell = shell.len && shell[0]=='/' ? shell : Str("/bin/sh");
-    }
-    b32 login = !(edenv("PROSPERO_EDIT_LOGIN") == "0");
-
-    #ifdef __linux__
-    // Not os_exepath, which names a rebuild's replacement: that would be
-    // another program, which phase two must not be
-    Str self = {};
-    {
-        iz    cap = 4096;
-        char *buf = (char *)allocbytes(&a, cap);
-        iz    len = readlink("/proc/self/exe", buf, (uz)cap-1);
-        if (len > 0) {
-            buf[len] = 0;
-            self = {(u8 *)buf, len};
-            struct stat st;
-            if (endswith(self, " (deleted)") && stat(buf, &st)) {
-                edfail("cannot start the editor: this program was replaced on disk "
-                       "since its engine started, which must start again first");
-            }
-        }
-    }
-    #else
-    Str self = os_exepath(&os, &a);
-    #endif
-
-    if (editshellsafe(self)) {
-        Str cmd = concat(&a, concat(&a, "'", self), "' --tty-edit-in");
-        Str shells[] = {shell, "/bin/sh"};
-        for (iz k = 0; k < countof(shells); k++) {
-            Slice<Str> argv = editshell(&a, shells[k], cmd, login);
-            char     **av   = alloc<char *>(&a, argv.len+1);
-            for (iz i = 0; i < argv.len; i++) {
-                av[i] = cstr(&a, argv[i]);
-            }
-            execve(av[0], av, environ);
-        }
-    }
+    Str   shell = edshell(&a);
+    b32   login = !(edenv("PROSPERO_EDIT_LOGIN") == "0");
+    Str   self  = edself(&os, &a, "cannot start the editor");
+    edphase(&a, shell, self, "--tty-edit-in", login);
     ttyeditin();
+}
+
+
+// prospero --tty-run: a code block of the agent's, run in a terminal
+// as term.open's run starts it (ptyhost.cpp), with the request in
+// PROSPERO_RUN_TEXT, _LANG, _SHELL (the terminal's shell) and _LOGIN.
+// It shows the command, dimmed, then becomes its shell: a POSIX sh's
+// interactive, so that its rc files define what a pasted command would
+// find (nvm, conda), running the text by -c; for another (fish, csh)
+// the login shell runs phase two, "--tty-run-in", which runs the text
+// in the block's own shell if this machine has it (bash, zsh, ksh),
+// else /bin/sh. PowerShell's runs in pwsh, by psrunboot. The command's
+// exit is the terminal's.
+
+static char const *const runnames[] = {
+    "PROSPERO_RUN_TEXT", "PROSPERO_RUN_LANG", "PROSPERO_RUN_SHELL", "PROSPERO_RUN_LOGIN",
+};
+
+// A program on PATH, by its full-path entries alone, as phase two of an
+// edit finds its editor: else null.
+static Str runfind(Os *os, Arena *a, Str prog)
+{
+    Str path = edenv("PATH");
+    Buf pb(a, path.len+1);
+    for (Str rest = path; rest.len;) {
+        Cut c = cut(rest, ':');
+        rest = c.tail;
+        if (c.head.len && c.head[0]=='/') {
+            if (pb.len) {
+                putbyte(&pb, ':');
+            }
+            print(&pb, c.head);
+        }
+    }
+    Str clean = finish(&pb);
+    Arena tmp = carve(a, 1<<20);
+    Str   exe = clean.len ? findprog(os, a, tmp, clean, prog, {}, 0) : Str{};
+    return exe.len && !hasnul(exe) && !access(cstr(a, exe), X_OK) ? exe : Str{};
+}
+
+// sh -c's text: options may follow -c, so text that would read as one
+// goes after a newline.
+static char *runarg(Arena *a, Str text)
+{
+    b32 opt = text.len && (text[0]=='-' || text[0]=='+');
+    return cstr(a, opt ? concat(a, "\n", text) : text);
+}
+
+// Phase two: the block's shell, else /bin/sh, in place of this process.
+[[noreturn]] static void ttyrunin()
+{
+    Os    os   = {};
+    Arena a    = edarena(&os);
+    Str   text = clone(&a, edenv("PROSPERO_RUN_TEXT"));
+    Str   lang = clone(&a, edenv("PROSPERO_RUN_LANG"));
+    if (!text.len) {
+        edfail("nothing to run");
+    }
+    for (iz i = 0; i < countof(runnames); i++) {
+        unsetenv(runnames[i]);
+    }
+    Str exe = {};
+    Str want[] = {"bash", "zsh", "ksh"};
+    for (iz i = 0; !exe.len && i < countof(want); i++) {
+        exe = equalfold(trim(lang), want[i]) ? runfind(&os, &a, want[i]) : Str{};
+    }
+    exe = exe.len ? exe : Str("/bin/sh");
+    char *av[] = {cstr(&a, exe), (char *)"-c", runarg(&a, text), 0};
+    execve(av[0], av, environ);
+    edfail(concat(&a, concat(&a, concat(&a, "cannot run ", exe), ": "), os_lasterr(&os, &a)));
+}
+
+// Phase one: the header, then the shell.
+[[noreturn]] static void ttyrun()
+{
+    Os    os    = {};
+    Arena a     = edarena(&os);
+    Str   text  = clone(&a, edenv("PROSPERO_RUN_TEXT"));
+    Str   lang  = clone(&a, edenv("PROSPERO_RUN_LANG"));
+    Str   shell = clone(&a, edenv("PROSPERO_RUN_SHELL"));
+    b32   login = !(edenv("PROSPERO_RUN_LOGIN") == "0");
+    if (!text.len) {
+        edfail("nothing to run");
+    }
+
+    // What runs, dimmed, so that the scrollback and the agent see it
+    Buf b(&a, text.len + 16);
+    print(&b, "\x1b[2m");
+    print(&b, text);
+    print(&b, "\x1b[0m\n");
+    writeall(1, finish(&b));
+
+    if (termrunlang(lang) == RUN_PS) {
+        Str pwsh = runfind(&os, &a, "pwsh");
+        if (!pwsh.len) {
+            edfail("PowerShell blocks run in pwsh, which is not on PATH");
+        }
+        for (iz i = 1; i < countof(runnames); i++) {
+            unsetenv(runnames[i]);  // the text stays, for psrunboot
+        }
+        char *av[6] = {};
+        i32   n     = 0;
+        av[n++] = cstr(&a, pwsh);
+        if (login) {
+            av[n++] = (char *)"-Login";  // it must come first
+        }
+        av[n++] = (char *)"-NoLogo";
+        av[n++] = (char *)"-Command";
+        av[n++] = (char *)psrunboot;
+        execve(av[0], av, environ);
+        edfail(concat(&a, "cannot run pwsh: ", os_lasterr(&os, &a)));
+    }
+
+    shell = shell.len && shell[0]=='/' ? shell : edshell(&a);
+    Str  name    = basename(shell);
+    Str  posix[] = {"sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "yash"};
+    b32  sh      = 0;
+    for (iz i = 0; !sh && i < countof(posix); i++) {
+        sh = name == posix[i];
+    }
+    if (sh) {
+        for (iz i = 0; i < countof(runnames); i++) {
+            unsetenv(runnames[i]);
+        }
+        char *av[6] = {};
+        i32   n     = 0;
+        av[n++] = cstr(&a, shell);
+        if (login) {
+            av[n++] = (char *)"-l";
+        }
+        av[n++] = (char *)"-i";
+        av[n++] = (char *)"-c";
+        av[n++] = runarg(&a, text);
+        execve(av[0], av, environ);
+        setenv(runnames[0], cstr(&a, text), 1);  // for phase two after all
+        setenv(runnames[1], cstr(&a, lang), 1);
+    }
+    unsetenv("PROSPERO_RUN_SHELL");
+    unsetenv("PROSPERO_RUN_LOGIN");
+    edphase(&a, shell, edself(&os, &a, "cannot run the command"), "--tty-run-in", login);
+    ttyrunin();
 }
 
 
@@ -4650,6 +4811,10 @@ int main(int argc, char **argv)
         ttyedit();
     } else if (argc>1 && !__builtin_strcmp(argv[1], "--tty-edit-in")) {
         ttyeditin();
+    } else if (argc>1 && !__builtin_strcmp(argv[1], "--tty-run")) {
+        ttyrun();
+    } else if (argc>1 && !__builtin_strcmp(argv[1], "--tty-run-in")) {
+        ttyrunin();
     }
     #if PROSPERO_DESKTOP
     if (argc>1 && !__builtin_strcmp(argv[1], "desktop")) {

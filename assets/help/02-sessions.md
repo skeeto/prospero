@@ -477,7 +477,8 @@ The agent can read the session's Terminal pane tabs with its
 number (the tab's tooltip shows it, as "Terminal 7"), and a tab's last
 lines as its screen and history show them, up to as many as the tab
 keeps, at most 2000. It reads the tab you used last unless it names
-one. It cannot type, and runs nothing. A subagent reads its session's
+one. A tab whose shell ended stays readable until you close it. It
+cannot type, and runs nothing. A subagent reads its session's
 tabs, and a side chat in the same folder its original's. The tool is
 offered to sessions you open while `[terminal] agent` is on (the
 default), and refuses once you turn it off.

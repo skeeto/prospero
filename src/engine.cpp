@@ -278,7 +278,7 @@ static i32 modefind(Str name)
 // in the background.
 struct Notice {
     Str kind;    // "job", "rewind", "instructions", "skills", "budget",
-                 // "mode", "message", "task", "shell"
+                 // "mode", "message", "task", "shell", "terminal"
     Str text;
     i64 job;     // for "job"
     i32 mode;    // for "mode": MODE_*, the one it tells
@@ -289,6 +289,10 @@ struct Notice {
     Str host;    // and for "task", its host, if another
     i32 hop;     // and its hop count (see "Messages")
     Slice<Str> urls;  // for "task": its report's URLs the subagent saw
+    i64 tid;     // for "terminal": the terminal a Run ran in, its exit
+    i32 code;    // (-1 for its tab closed while it ran, 128+N for
+    i64 ms;      // signal N), how long it ran, and its text's hash, by
+    u64 key;     // which a newer one replaces it
 };
 
 enum : i32 {
@@ -1833,6 +1837,11 @@ static void deliver(Session *s, Arena scratch)
         }
         if (n->kind == "mode") {
             putstrkey(&w.json, "mode", modenames[n->mode]);
+        }
+        if (n->kind == "terminal") {
+            putintkey(&w.json, "tid", n->tid);
+            putintkey(&w.json, "code", n->code);
+            putintkey(&w.json, "ms", n->ms);
         }
         if (n->kind == "shell") {
             putstrkey(&w.json, "shell", n->shell.name);
@@ -8625,7 +8634,8 @@ static void webnoteuser(Session *s, Arena scratch, Str via, Str text, Slice<Str>
 // background subagent's report the URLs it vouched for.
 static void webnotenotice(Session *s, Arena scratch, Str kind, Str text, Slice<Str> urls)
 {
-    if (kind=="instructions" || kind=="skills" || kind=="job" || kind=="mcp") {
+    if (kind=="instructions" || kind=="skills" || kind=="job" || kind=="mcp" ||
+        kind=="terminal") {
         webnote(s, scratch, text, 0);
     }
     webnoteurls(s, urls);

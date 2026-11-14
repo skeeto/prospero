@@ -680,7 +680,7 @@ static void test_events(Test *t)
                "\"git\",\"answer.trust\",\"web\",\"question\",\"files\",\"worktree\",\"worktree.side\","
                "\"trash\",\"relay\",\"question.deadline\",\"ask.deadline\",\"ask.hold\",\"shell.env\",\"call.stop\","
                "\"cut\",\"approve\",\"files.path\",\"sessions.mention\",\"fork.cwd\",\"endpoint.auth\",\"endpoint.copilot\","
-               "\"term\",\"term.host\",\"pdf\",\"fs\",\"pause\",\"skill.fetch\",\"term.edit\"]}");
+               "\"term\",\"term.host\",\"pdf\",\"fs\",\"pause\",\"skill.fetch\",\"term.edit\",\"term.run\"]}");
         b.len = 0;
         w = {&b};
         putobject(&w);

@@ -821,6 +821,7 @@ int main()
     test_relay(&t);
     test_term(&t);
     test_termsecret(&t);
+    test_termrun(&t);
     test_termset(&t);
     test_dbus(&t);
     test_door(&t);

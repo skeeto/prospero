@@ -6599,6 +6599,18 @@ def sc_read_terminal_off(model, n, req):
 sc_read_terminal_replay = sc_read_terminal_off
 
 
+def sc_term_run(model, n, req):
+    # Each turn reads the terminal once, then says what it was told
+    if since_user(req) == 0:
+        yield from tool(model, n, "read_terminal", {})
+    else:
+        yield from answer(model, "Heard: " + user_text_all(req)[-1500:])
+
+
+sc_term_run_windows = sc_term_run
+sc_term_run_parked = sc_term_run
+
+
 SCENARIOS = {name[3:]: fn for name, fn in globals().items()
              if name.startswith("sc_")}
 

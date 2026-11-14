@@ -287,8 +287,10 @@ fails with a link to sign up for Copilot Free.
   `emacs -nw`) in a Terminal tab of the file's session
   ([Files](help:sessions#files)), on Linux and macOS through your login
   shell, so `$PATH` and the rest of your profile apply; a profile that
-  starts something interactive, such as `exec tmux`, can skip it while
-  `PROSPERO_EDIT_FILE` is set. On Windows, which has no login shell, it
+  starts something interactive, such as `exec tmux`, can skip it where
+  `PROSPERO_TAB` is set: to `edit` there, and to `run` in a tab that
+  runs a command for you (`PROSPERO_EDIT_FILE` works too, in an editor's
+  tab). On Windows, which has no login shell, it
   is found on PATH and runs through cmd.exe. Another host's file (over
   ssh, in WSL or in a container) opens in a Terminal tab there
   ([Hosts](help:hosts#sessions-on-a-remote)), with this editor only if

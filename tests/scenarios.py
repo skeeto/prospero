@@ -4121,7 +4121,7 @@ def hello_caps(t):
                  "mcp", "mcp.auth", "task.remote", "task.host", "memory", "shell",
                  "git", "answer.trust", "trash", "cut", "endpoint.auth",
                  "endpoint.copilot", "term", "ask.hold", "fs", "pause", "skill.fetch",
-                 "term.edit"} <= set(caps)
+                 "term.edit", "term.run"} <= set(caps)
                 and "host" not in caps,
                 f"caps: {caps}")
         want = 0 if isinstance(t.host, XpHost) else 1  # ConPTY, from 10 1809
@@ -18599,6 +18599,272 @@ def read_terminal_replay(t):
             t.check("Tools: " in said and
                     ("read_terminal" in said.split("Tools: ")[-1]) == want,
                     f"offered {want}: {said!r}")
+    finally:
+        h.close()
+
+
+def waitstatus(t, h, key, want, within=5):
+    """status's key once it is want, else a failed check."""
+    deadline = time.monotonic() + within
+    while True:
+        got = h.call("status").get(key)
+        if got == want or time.monotonic() >= deadline:
+            t.check(got == want, f"status {key} {got}, wanted {want}")
+            return got
+        time.sleep(0.05)
+
+
+def sessevs(h, sid):
+    with h.cond:
+        return [e for e in h.events if e.get("sid") == sid]
+
+
+@scenario(bound=60)
+def term_kept(t):
+    """An ended terminal's screen is kept for read_terminal: term.close
+    frees it, as does a hang-up of all; when every slot is taken, a new
+    terminal takes the kept one unused longest. One closed while it ran
+    keeps nothing."""
+    ttyprobe(t)
+    h = t.headless()
+    try:
+        sid = termsession(t, h)
+        tt = Tty(t, h, sid)
+        tt.line("probe ready")
+        tt.type("exit 0\n")
+        tt.ended()
+        waitstatus(t, h, "kept", 1)
+        h.send("term.close", tid=tt.tid)
+        waitstatus(t, h, "kept", 0)
+
+        tt = Tty(t, h, sid)
+        tt.line("probe ready")
+        h.send("term.close", tid=tt.tid)  # while it runs
+        time.sleep(0.5)
+        waitstatus(t, h, "kept", 0)
+        waitstatus(t, h, "terms", 0)
+
+        # More ended terminals than slots (32)
+        first = None
+        for i in range(34):
+            tt = Tty(t, h, sid)
+            first = first or tt.tid
+            tt.line("probe ready")
+            tt.type("exit 0\n")
+            tt.ended()
+            waitstatus(t, h, "kept", min(i + 1, 32))
+        st = h.call("status")
+        t.check(st.get("kept") == 32 and st.get("screens") == 32, f"status {st}")
+        h.send("term.close", tid=first)  # evicted already: nothing
+        h.send("term.close", tid=first + 2)
+        waitstatus(t, h, "kept", 31)
+        h.send("term.close", all=True)
+        waitstatus(t, h, "kept", 0)
+    finally:
+        h.close()
+
+
+@scenario(bound=60, posix=True)
+def term_run(t):
+    """term.open's run shows a code block of the agent's, dimmed, then runs
+    it in the terminal's shell, interactive, so that ~/.bashrc's functions
+    work; with PROSPERO_TAB=run and no PROSPERO_RUN_*. Its exit is the
+    terminal's, its screen is kept after, and the agent hears how it
+    ended at its next request, without a turn of its own."""
+    if not os.path.exists("/bin/bash"):
+        raise Skip("no /bin/bash")
+    t.host.write(t.host.join(t.home, ".bashrc"),
+                 "case $- in *i*) ;; *) return;; esac\n"
+                 "runfn() { echo \"fn-$1\"; }\n")
+    t.host.write(t.host.join(t.home, ".bash_profile"), ". ~/.bashrc\n")
+    h = t.headless(env={"SHELL": "/bin/bash", "BASH_SILENCE_DEPRECATION_WARNING": "1",
+                        "PROSPERO_TAB": "inherited", "PROSPERO_RUN_TEXT": "inherited"})
+    try:
+        sid = readsession(t, h)
+        text = ("runfn ok\n"
+                "echo \"tab=$PROSPERO_TAB run=${PROSPERO_RUN_TEXT-unset}\"\n"
+                "exit 3")
+        tt = Tty(t, h, sid, run={"text": text + "\r\n", "lang": "bash", "from": sid})
+        argv = tt.reply.get("argv")
+        t.check(argv and argv[-1] == "--tty-run", f"argv {argv}")
+        t.check(samedir(t, tt.reply.get("cwd"), t.work), f"cwd {tt.reply.get('cwd')}")
+        tt.line("fn-ok")
+        got = tt.line("tab=")
+        t.check(got.strip() == "tab=run run=unset", repr(got))
+        end = tt.ended()
+        t.check(end.get("code") == 3, f"term.end {end}")
+        t.check(b"\x1b[2mrunfn ok" in tt.data, f"the dimmed header: {bytes(tt.data[:200])!r}")
+        waitstatus(t, h, "kept", 1)
+        time.sleep(0.3)
+        kinds = [e.get("ev") for e in sessevs(h, sid)]
+        t.check("turn" not in kinds and "notice" not in kinds,
+                f"no turn, no notice yet: {kinds}")
+
+        evs = turnof(h, sid)
+        notices = [e for e in evs if e.get("ev") == "notice" and e.get("kind") == "terminal"]
+        t.check(len(notices) == 1 and notices[0].get("tid") == tt.tid and
+                notices[0].get("code") == 3 and notices[0].get("ms", -1) >= 0,
+                f"one notice: {notices}")
+        note = notices[0].get("text", "") if notices else ""
+        t.check(note.startswith("The user ran `runfn ok`... (3 lines) from your message, "
+                                f"in terminal {tt.tid}") and
+                "It exited with code 3" in note and "fn-ok" in note,
+                f"notice {note!r}")
+        ends = toolends(evs)
+        read = ends[0].get("text", "") if ends else ""
+        t.check(f"terminal {tt.tid}: `runfn ok`... (the user ran it from your message), "
+                "exited with code 3" in read and "fn-ok" in read and
+                "tab=run" in read, f"read after its end: {read!r}")
+        said = saidin(evs)
+        t.check("It exited with code 3" in said, f"the request had it: {said[-300:]!r}")
+
+        # Read while it runs: told not to poll; a second turn has no notice
+        tt = Tty(t, h, sid, run={"text": "echo started; sleep 30", "lang": "sh",
+                                 "from": sid})
+        tt.line("started")
+        evs = turnof(h, sid)
+        ends = toolends(evs)
+        read = ends[0].get("text", "") if ends else ""
+        t.check("do not poll" in read and ", running" in read, f"read: {read!r}")
+        t.check(not [e for e in evs if e.get("ev") == "notice"], "no notice while it runs")
+        h.send("term.close", tid=tt.tid)
+        deadline = time.monotonic() + 5
+        while not [e for e in sessevs(h, sid) if e.get("ev") == "notice"] and \
+                time.monotonic() < deadline:
+            time.sleep(0.1)
+        evs = turnof(h, sid)
+        notices = [e for e in evs if e.get("ev") == "notice" and e.get("kind") == "terminal"]
+        t.check(len(notices) == 1 and "closed while it ran" in notices[0].get("text", ""),
+                f"closed: {notices}")
+        waitstatus(t, h, "kept", 1)  # the first one's, not this one's
+    finally:
+        h.close()
+
+
+@scenario(bound=60)
+def term_run_parked(t):
+    """A Run's notice reaches its session though it was closed (parked)
+    while the command ran, and goes with its next request after it is
+    opened again; one for a session in the Trash goes nowhere."""
+    ttyprobe(t)
+    h = t.headless()
+    try:
+        sid = readsession(t, h)
+        gone = readsession(t, h)
+        lang = "powershell" if t.host.windows else "sh"
+        a = Tty(t, h, sid, cols=200, run={"text": "Start-Sleep 1; exit 2" if t.host.windows
+                                          else "sleep 1; exit 2", "lang": lang, "from": sid})
+        b = Tty(t, h, sid, cols=200, run={"text": "Start-Sleep 1; exit 6" if t.host.windows
+                                          else "sleep 1; exit 6", "lang": lang, "from": gone})
+        t.check(h.call("close", sid=sid).get("ok") == 1, "closed")
+        t.check(h.call("trash", sid=gone).get("ok") == 1, "trashed")
+        t.check(a.ended(30).get("code") == 2, "exit 2")
+        t.check(b.ended(30).get("code") == 6, "exit 6")
+        time.sleep(0.3)
+        t.check(h.call("open", sid=sid).get("ok") == 1, "reopened")
+        evs = turnof(h, sid)
+        notices = [e for e in evs if e.get("ev") == "notice" and e.get("kind") == "terminal"]
+        t.check([n.get("code") for n in notices] == [2], f"notices {notices}")
+    finally:
+        h.close()
+
+
+@scenario(bound=60, posix=True)
+def term_run_fish(t):
+    """A shell not of sh's family (here a link named fish) runs a Run in
+    two phases: it runs this program again, which runs the block in its
+    own shell (bash) where there is one. Text that starts with - is no
+    option of sh's."""
+    if not os.path.exists("/bin/bash"):
+        raise Skip("no /bin/bash")
+    bindir = t.host.join(t.base, "bin")
+    os.makedirs(bindir, exist_ok=True)
+    fish = os.path.join(bindir, "fish")
+    os.symlink("/bin/sh", fish)
+    h = t.headless(env={"SHELL": fish})
+    try:
+        sid = readsession(t, h)
+        tt = Tty(t, h, sid, run={"text": "echo \"in=${BASH_VERSION:+bash}\"", "lang": "bash",
+                                 "from": sid})
+        got = tt.line("in=")
+        t.check(got.strip() == "in=bash", repr(got))
+        t.check(tt.ended().get("code") == 0, "exit 0")
+        tt = Tty(t, h, sid, run={"text": "-x 2>/dev/null; echo dash-ok", "lang": "sh"})
+        tt.line("dash-ok")
+        tt.ended()
+    finally:
+        h.close()
+
+
+@scenario(bound=30)
+def term_run_refused(t):
+    """term.open refuses a run that may not run: with edit, a language no
+    shell here runs, cmd's off Windows, an invisible character, too long."""
+    h = t.headless()
+    try:
+        sid = termsession(t, h)
+        cases = [
+            ({"text": "ls", "lang": "sh"}, {"path": "/a"}, "run or edit, not both"),
+            ({"text": "ls", "lang": "python"}, None, "names no shell"),
+            ({"text": "rm -rf \u202e/", "lang": "sh"}, None, "invisible character"),
+            ({"text": "a" * (16 << 10) + "a", "lang": "sh"}, None, "over 16 KiB"),
+            ({"text": "\n", "lang": "sh"}, None, "empty"),
+            ({"text": "ls", "lang": "sh", "from": "../x"}, None, "session id"),
+            ("ls", None, "must be an object"),
+        ]
+        if not t.host.windows:
+            cases.append(({"text": "dir", "lang": "cmd"}, None, "only on Windows"))
+        else:
+            cases.append(({"text": "dir\ncd ..", "lang": "cmd"}, None, "one line"))
+        for run, edit, want in cases:
+            kw = {"run": run}
+            if edit:
+                kw["edit"] = edit
+            r = h.call("term.open", sid=sid, cols=80, rows=24, **kw)
+            t.check(not r.get("ok") and want in (r.get("err") or ""), f"{run!r}: {r}")
+        t.check(h.call("status").get("terms") == 0, "none started")
+    finally:
+        h.close()
+
+
+@scenario(bound=90)
+def term_run_windows(t):
+    """On Windows a cmd block runs by cmd.exe /s /c, %VAR% expanded, its
+    exit the terminal's, and a program the agent left in the folder
+    never runs by its bare name; a PowerShell block runs with its
+    native exit code, shown first, and Read-Host reads what is typed."""
+    if not t.host.windows:
+        raise Skip("Windows only (term_run on POSIX)")
+    t.host.write(t.host.join(t.work, "planted.cmd"), "@echo PLANTED-RAN\r\n")
+    h = t.headless(env={"RUNVAR": "val"})
+    try:
+        sid = readsession(t, h)
+        tt = Tty(t, h, sid, cols=400, run={"text": "echo %RUNVAR%-ok& echo tab=%PROSPERO_TAB%"
+                                                   "& planted& exit /b 4",
+                                           "lang": "cmd", "from": sid})
+        t.check(tt.reply.get("argv", [""])[0].lower().endswith("cmd.exe"),
+                f"argv {tt.reply.get('argv')}")
+        tt.line("val-ok")
+        got = tt.line("tab=")
+        t.check(got.strip() == "tab=run", repr(got))
+        end = tt.ended()
+        t.check(end.get("code") == 4, f"term.end {end}")
+        t.check(b"PLANTED-RAN" not in bytes(tt.text), f"output {bytes(tt.text)[-300:]!r}")
+
+        text = "$x = Read-Host 'Name'\nWrite-Output \"got-$x-$env:RUNVAR\"\nexit 5"
+        tt = Tty(t, h, sid, cols=400, run={"text": text, "lang": "powershell", "from": sid})
+        tt.pump(lambda x: b"Name:" in x.text, 30, "the Read-Host prompt")
+        tt.type("zed\r")
+        got = tt.line("got-")
+        t.check(got.strip() == "got-zed-val", repr(got))
+        end = tt.ended(30)
+        t.check(end.get("code") == 5, f"term.end {end}")
+        t.check(b"Write-Output" in bytes(tt.text), f"shown first: {bytes(tt.text)[:300]!r}")
+        waitstatus(t, h, "kept", 2)
+        evs = turnof(h, sid)
+        notices = [e for e in evs if e.get("ev") == "notice" and e.get("kind") == "terminal"]
+        codes = sorted(n.get("code") for n in notices)
+        t.check(codes == [4, 5], f"notices {notices}")
     finally:
         h.close()
 

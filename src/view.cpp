@@ -3022,6 +3022,12 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
             print(&b, job);
             print(&b, " ended");
             m->label = finish(&b);
+        } else if (kind == "terminal") {
+            Buf b(&v->aux, 48);
+            print(&b, "To the agent: terminal ");
+            print(&b, jsonint(jsonget(j, "tid"), 0));
+            print(&b, " ended");
+            m->label = finish(&b);
         } else if (kind == "message") {
             // From another session: open, and named as the sender was
             Str from  = jsonstr(jsonget(j, "from"));
