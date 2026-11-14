@@ -135,7 +135,8 @@ static Str const shellkinds[] = {"sh", "busybox", "cmd", "pwsh", "powershell", "
 // differs.
 enum : i32 {
     FLAVOR_NONE,
-    FLAVOR_BUSYBOX,  // busybox-w32's ash: w64devkit's sh.exe, or busybox.exe
+    FLAVOR_BUSYBOX,  // busybox.exe, busybox-w32's ash, or w64devkit's sh.exe
+                     // beside it (ash until 2.12, then a bash port)
     FLAVOR_MSYS,     // MSYS2's, Git Bash's among them: drives as /c/x
     FLAVOR_CYGWIN,   // Cygwin's: drives as /cygdrive/c/x
     FLAVOR_BASH3,    // macOS's /bin/bash, bash 3.2 for good (GPLv2)
@@ -317,11 +318,17 @@ static void shellintro(Buf *b, Shell *sh)
         print(b, sh->kind==SHELL_BUSYBOX ? Str(" sh -c") : Str(" -c"));
         switch (sh->flavor) {
         case FLAVOR_BUSYBOX:
-            print(b, ", busybox-w32's ash with the usual Unix tools built "
-                     "in. It is not bash: write POSIX sh ([ ] not [[ ]], no "
-                     "arrays or {1..3}). Paths are Windows paths, C:/x or "
-                     "relative ones; /c/x and /cygdrive/c/x do not exist "
-                     "here.");
+            // w64devkit's sh.exe was busybox-w32's ash and becomes a port
+            // of bash, so it is described by whose it is, and POSIX sh
+            // suits either
+            print(b, sh->kind==SHELL_BUSYBOX
+                         ? Str(", busybox-w32's ash with the usual Unix tools "
+                               "built in. It is not bash: write")
+                         : Str(", w64devkit's shell, with the usual Unix "
+                               "tools. Write"));
+            print(b, " POSIX sh ([ ] not [[ ]], no arrays or {1..3}). Paths "
+                     "are Windows paths, C:/x or relative ones; /c/x and "
+                     "/cygdrive/c/x do not exist here.");
             break;
         case FLAVOR_MSYS:
             print(b, ", an MSYS2 shell, as Git Bash is. It names drives as "

@@ -747,7 +747,7 @@ static void test_tools(Test *t)
         struct { Str path; i32 flavor; Str has; Str hasnt; } sh[] = {
             {"/bin/sh",                        FLAVOR_NONE,    "/bin/sh -c (a POSIX shell). Each", "busybox"},
             {"/usr/bin/zsh",                   FLAVOR_NONE,    "/usr/bin/zsh -c. Each", "POSIX shell"},
-            {"C:\\w64devkit\\bin\\sh.exe",     FLAVOR_BUSYBOX, "It is not bash", "cygpath"},
+            {"C:\\w64devkit\\bin\\sh.exe",     FLAVOR_BUSYBOX, "sh.exe -c, w64devkit's shell, with the usual Unix tools. Write POSIX sh", "not bash"},
             {"C:\\w64devkit\\bin\\sh.exe",     FLAVOR_BUSYBOX, "/c/x and /cygdrive/c/x do not exist", "(a POSIX"},
             {"C:\\msys64\\usr\\bin\\bash.exe", FLAVOR_MSYS,    "an MSYS2 shell", "do not exist"},
             {"C:\\msys64\\usr\\bin\\bash.exe", FLAVOR_MSYS,    "cygpath -m prints", "/cygdrive/c/x"},
@@ -774,7 +774,8 @@ static void test_tools(Test *t)
         te.shell.kind   = SHELL_BUSYBOX;
         te.shell.flavor = FLAVOR_BUSYBOX;
         expect(t, "busybox description", istr(a, find(shelldesc(a, &te),
-               "busybox.exe sh -c, busybox-w32's ash")>0), "1");
+               "busybox.exe sh -c, busybox-w32's ash with the usual Unix tools "
+               "built in. It is not bash: write POSIX sh")>0), "1");
 
         // A login shell, and a description from its section
         te.shell.login = 1;
