@@ -17825,6 +17825,9 @@ def term_basic(t):
         got = tt.line("winch ")
         t.check(got == "winch 120x40", got)
 
+        # Windows takes a process born within 200 ms of the shell as part
+        # of it (a launcher's), and a fast host gets this far sooner
+        time.sleep(0.3)
         tt.type("busy 2500\n")
         tt.pump(lambda x: 1 in x.busy, 10, "term.busy 1")
         tt.line("busy done", 10)
