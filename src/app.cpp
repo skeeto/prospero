@@ -21527,6 +21527,17 @@ static DriveOp launchops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 1000, ""},
     {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    // Opened again, the dialog is in front of its dropdown's window as
+    // ImGui orders them: a click on a row still reaches the row (#56)
+    {OP_TEXTCWD, 0, 0, 0, 500, "/pick/al"},
+    {OP_WAIT, W_FSIDLE, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_PATHPICK, 2, 0, 0, "alpha"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "path pick"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_NEWCWD, 0, 0, 0, "/pick/alpha/"},
+    {OP_CHECK, CHK_PATHPICK, 0, 0, 0, ""},
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
     {OP_MOVE, T_NEWMODEL, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 800, ""},

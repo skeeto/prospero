@@ -11430,6 +11430,12 @@ static void pathafter(Gui *g, PathField *f, char *buf)
                           ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav |
                           ImGuiWindowFlags_NoDocking;
     if (ImGui::Begin("##pathpick", 0, fl)) {
+        // In front of its dialog for the mouse as it is to the eye: a
+        // tooltip is drawn over every window, but ImGui finds the one
+        // under the mouse by their order, where a dialog opened again
+        // goes in front of this one, and then a click on a row was the
+        // dialog's, its Open button's say (#56)
+        ImGui::BringWindowToDisplayFront(ImGui::GetCurrentWindow());
         Arena       a    = f->cb.scratch;
         DirList    *l    = f->list;
         ImDrawList *dl   = ImGui::GetWindowDrawList();
