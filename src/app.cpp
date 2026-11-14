@@ -2246,6 +2246,9 @@ struct Gui {
     i32                drivefails;
     i64                driveframes;  // total.frames when a wait began
     f32                splitx;       // dock splitter before the drag
+    i32                pressop[8];   // T_PRESSED moves until OP_UP,
+    ImVec2             pressat[8];   // and their items' places at OP_DOWN
+    i32                npress;
     Rect               rects[RECT_COUNT];
     Named              named[NAMED_MAX];
     i32                nnamed;
@@ -14225,6 +14228,7 @@ enum : i32 {
     T_TOOLHEAD,    // and its header, left of the path
     T_FILESPANE,   // the middle of the Files pane
     T_OUTCLOSE,    // the Output window's title bar X
+    T_PRESSED,     // T_NAMED's item, where it was at the drag's OP_DOWN
 };
 
 enum : i32 {
@@ -20685,9 +20689,9 @@ static DriveOp termops[] = {
     {OP_SHOT, 0, 0, 0, 300, "terminal-tabs"},
     {OP_MOVE, T_NAMED, 0, 0, 100, "term tab 2"},
     {OP_DOWN, 0, 0, 0, 100, ""},
-    {OP_MOVE, T_NAMED, -6, 0, 100, "term tab 2"},
-    {OP_MOVE, T_NAMED, -20, 0, 100, "term tab 1"},
-    {OP_MOVE, T_NAMED, -30, 0, 300, "term tab 1"},
+    {OP_MOVE, T_PRESSED, -6, 0, 100, "term tab 2"},
+    {OP_MOVE, T_PRESSED, -20, 0, 100, "term tab 1"},
+    {OP_MOVE, T_PRESSED, -30, 0, 300, "term tab 1"},
     {OP_UP, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*two|onetwo"},
     {OP_MOVE, T_NAMED, 0, 0, 100, "term tab 2"},
@@ -22428,6 +22432,18 @@ static ImGuiDockNode *rootsplit(Gui *g)
     return n && n->ChildNodes[0] ? n : 0;
 }
 
+// The center of the item whose name (itemnamed) starts with text.
+static ImVec2 namedpos(Gui *g, Str text)
+{
+    for (i32 i = 0; i < g->nnamed; i++) {
+        Named *n = &g->named[i];
+        if (startswith(Str{n->name, n->len}, text)) {
+            return rectcenter(n->r);
+        }
+    }
+    return v2(-1, -1);
+}
+
 static ImVec2 targetpos(Gui *g, i32 t)
 {
     switch (t) {
@@ -22581,16 +22597,15 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_MODEL0:        return rectcenter(g->rects[RECT_MODEL0]);
     case T_NEWMODEL:      return rectcenter(g->rects[RECT_NEWMODEL]);
     case T_NEWPICK:       return rectcenter(g->rects[RECT_NEWPICK]);
-    case T_NAMED: {
-        Str text = g->ops[g->drivepc-1].text;
-        for (i32 i = 0; i < g->nnamed; i++) {
-            Named *n = &g->named[i];
-            if (startswith(Str{n->name, n->len}, text)) {
-                return rectcenter(n->r);
+    case T_NAMED:
+        return namedpos(g, g->ops[g->drivepc-1].text);
+    case T_PRESSED:
+        for (i32 i = 0; i < g->npress; i++) {
+            if (g->pressop[i] == g->drivepc-1) {
+                return g->pressat[i];
             }
         }
         return v2(-1, -1);
-    }
     case T_PANEITEM:
         for (i32 i = 0; i < PANE_COUNT; i++) {
             if (g->ops[g->drivepc-1].text == inistr(panenames[i])) {
@@ -26840,6 +26855,21 @@ static void drivestep(Gui *g)
         e.button = op->op==OP_RDOWN || op->op==OP_RUP ? 1
                  : op->op==OP_MDOWN || op->op==OP_MUP ? 2 : 0;
         e.down   = op->op==OP_DOWN || op->op==OP_RDOWN || op->op==OP_MDOWN;
+        if (op->op == OP_DOWN) {
+            // A drag's T_PRESSED moves go where their items are now: a
+            // reorder moves items under the drag, and a frame between
+            // its moves would place their names there
+            g->npress = 0;
+            // (past 8, a move goes nowhere and its step fails)
+            for (i32 k = g->drivepc; k < g->nops && g->ops[k].op!=OP_UP; k++) {
+                if (g->ops[k].op==OP_MOVE && g->ops[k].target==T_PRESSED &&
+                    g->npress < countof(g->pressop)) {
+                    g->pressop[g->npress] = k;
+                    g->pressat[g->npress] = namedpos(g, g->ops[k].text);
+                    g->npress++;
+                }
+            }
+        }
         os_guiinject(g->os, &e);
         if (e.down && g->tracedrive) {
             // What the press lands on, as of the last frame
