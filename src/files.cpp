@@ -26,11 +26,13 @@
 // checks, Open file's check and inline code's links go to the workers
 // here as to fs.stat there, each answered in a later frame; a job the
 // pool refuses (its path's file system not responding, the pool busy)
-// is answered at once, by its caller. On the window's thread still:
-// one-off actions on a path picked in a dialog or dropped (drops,
-// attachments, import, Browse, the typed-path dialog's OK), Open file's
-// and the new session's folder listings, the '@' index, and the
-// editor's look-up on PATH.
+// is answered at once, by its caller. So do the folders listed for a
+// path typed (dirget's GFS_LIST): Open file's Tab completion, the new
+// session's folder field and the '@' list's folders, "Listing..." once
+// one has taken FILES_NOTEDELAY. On the window's thread still: one-off
+// actions on a path picked in a dialog or dropped (drops, attachments,
+// import's folder, Browse, the typed-path dialog's OK, a container's
+// folder), the '@' index, and the editor's look-up on PATH.
 //
 // A file opens from Open file, or from a link to it (filelinkopen) in
 // the transcript, the plan or a Markdown file shown here.
@@ -475,11 +477,20 @@ enum : i32 {  // the window's file jobs (FsPut.kind)
     GFS_FILE = 1,  // the fetch's read (filereadall), into its Region's buffer
     GFS_STAT,      // a path's stat: a tab's check (filewatch), or Open file's
     GFS_LINKS,     // inline code's paths, each with its rootlen (codelinksflush)
+    GFS_LIST,      // a folder's entries, for a path typed (dirget)
 };
 
-// A worker's job: c->arg the path (GFS_FILE, GFS_STAT), else (GFS_LINKS)
-// each path's rootlen, in order, its paths c->paths; its answer in
-// c->res, from its own arena, or c->err for a path under a mark.
+// A listing's answer (GFS_LIST): the entries, else why not, as dirget
+// says it.
+struct GfsList {
+    Listing ls;
+    Str     err;
+};
+
+// A worker's job: c->arg the path (GFS_FILE, GFS_STAT); or (GFS_LIST)
+// 'f' with files, else 'd', then the folder; else (GFS_LINKS) each
+// path's rootlen, in order, its paths c->paths; its answer in c->res,
+// from its own arena, or c->err for a path under a mark.
 static void guifsrun(FsCall *c)
 {
     Arena *a = c->mem;
@@ -516,6 +527,24 @@ static void guifsrun(FsCall *c)
             found[i] = ln ? 2 : filestat(c->os, *a, path).type==STAT_FILE;
         }
         c->res = found;
+    } break;
+    case GFS_LIST: {
+        // os_listall beats per entry, a listing that stalls on one of
+        // them marking only its folder (exact)
+        b32      files = c->arg.len && c->arg[0]=='f';
+        Str      dir   = cuthead(c->arg, 1);
+        GfsList *l     = alloc<GfsList>(a);
+        c->res = l;
+        if (!fsat(c, c->paths[0], 1)) {
+            c->err = fsstuck;
+            break;
+        }
+        l->ls = os_listall(c->os, a, dir, !files, files ? DIRLIST_FILES : DIRLIST_MAX,
+                           fsbeat, c);
+        if (!l->ls.ok) {
+            l->err = os_stat(c->os, *a, dir).type==STAT_MISSING ? Str("no such folder") :
+                     Str("cannot list this folder");
+        }
     } break;
     }
 }
@@ -566,6 +595,53 @@ static FsPut guifsjob(Gui *g, i32 kind, Str *path)
     put.arg   = *path;
     put.paths = {path, 1, 1};
     return put;
+}
+
+// dirget's listing of a folder here, its path as tildepath made it: on
+// the window's pool, its answer in a later frame (dirlocal), or one the
+// pool refuses (its folder's file system not responding, the pool busy)
+// at once, as the listing's error. A busy pool's refusal is shown but not
+// kept: the next frame that wants the folder asks again.
+static void dirlistlocal(Gui *g, DirList *l, Str path, Arena scratch)
+{
+    Str   norm = normpath(&scratch, path, ".", HOST_WINDOWS);
+    FsPut put  = {};
+    put.id    = ++g->nextid;
+    put.kind  = GFS_LIST;
+    put.run   = guifsrun;
+    put.arg   = concat(&scratch, l->files ? Str("f") : Str("d"), path);
+    put.paths = {&norm, 1, 1};
+    put.exact = 1;
+    l->id     = put.id;  // first: an inline job is answered in guifsput
+    Str why   = {};
+    if (!guifsput(g, &put, &why)) {
+        dirput(&g->pc, l, {}, 0, why);
+        if (why == fsbusy) {
+            l->at = g->sched.now - DIRLIST_TTL;  // asked again when wanted
+        }
+    }
+}
+
+// The window's pool's answer to a listing here (GFS_LIST), for the list
+// that asked, if still kept: one given up says why, as an error does.
+static void dirlocal(Gui *g, FsJob *job, b32 back, Str err)
+{
+    PathComp *pc = &g->pc;
+    DirList  *l  = 0;
+    for (i32 i = 0; i < DIRLISTS; i++) {
+        l = pc->lists[i].id==job->put.id ? &pc->lists[i] : l;
+    }
+    if (!l) {
+        return;
+    }
+    Arena            a = g->fsmem;
+    GfsList         *r = back && !err.len ? (GfsList *)job->res : 0;
+    Slice<PathEntry> e = {};
+    for (Dirent *d = r ? r->ls.head : 0; d; d = d->next) {
+        e = push(&a, e, PathEntry{d->name, d->isdir});
+    }
+    dirput(pc, l, e, r && r->ls.more, r ? r->err : err);
+    scheddirty(&g->sched);
 }
 
 // Each time the mail is drained, and twice a frame: workers gone silent
@@ -2312,6 +2388,9 @@ static void guifsdone(void *owner, FsJob *job, Arena scratch)
         break;
     case GFS_LINKS:
         codelinklocal(g, job, back, err);
+        break;
+    case GFS_LIST:
+        dirlocal(g, job, back, err);
         break;
     }
     g->fsmem = keep;

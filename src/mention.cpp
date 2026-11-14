@@ -452,7 +452,7 @@ static void mentionfillsrc(Arena *a, Gui *g, GuiSession *s, Str query, MentionSr
     Str      dir = join(a, root, q.dir);
     DirList *l   = dirget(g, *a, s->host, dir, 1);  // files too
     src->kind    = MENTION_LIST;
-    if (!l->got) {  // a remote's answer comes in later, through ondir
+    if (!l->got) {  // the answer comes in later, through dirlocal or ondir
         src->status = "listing...";
         return;
     } else if (l->err.len) {

@@ -732,8 +732,8 @@ struct OutFile {
 };
 
 // A folder listed for a path field's completion (pathpick.cpp): on this
-// machine, by the GUI itself, else by the host's engine (dir), on its way
-// meanwhile. Each is kept a little while (DIRLIST_TTL), then listed again
+// machine, by the window's file workers (files.cpp's GFS_LIST), else by
+// the host's engine (dir), on its way meanwhile. Each is kept a little while (DIRLIST_TTL), then listed again
 // when wanted, its entries shown until the new ones come.
 struct DirList {
     u64              host;  // its host's uid, 0 for a free slot
@@ -741,7 +741,7 @@ struct DirList {
     Slice<PathEntry> ents;
     Str              err;   // why it could not be listed
     i64              at;    // when asked, µs (sched)
-    i64              id;    // its dir command in flight, 0 if none
+    i64              id;    // its dir command or job in flight, 0 if none
     b32              got;   // ents and err are an answer
     b32              more;  // there were more entries than these
     b32              files; // files listed too, for the '@' picker: a listing
@@ -773,6 +773,8 @@ struct PathComp {
     b32      shown;    // typed in since the last accept, or Up or Down
     b32      refocus;  // the field to have the keyboard again, its caret
                        // at the end: after a click on a row
+    b32      tabwait;  // Tab pressed while the folder was being listed:
+                       // it completes once the listing comes
     // For the checklist: the dropdown as drawn last
     i32      rows;     // its picks, 0 if it was not drawn
     char     first[64];
@@ -7779,7 +7781,8 @@ static DirList *dirslot(Gui *g, GuiHost *h, Str dir, b32 files)
     return free;
 }
 
-// A folder's listing, from the GUI's own or a dir command's reply.
+// A folder's listing, from the window's file workers or a dir command's
+// reply, or why it is not.
 static void dirput(PathComp *pc, DirList *l, Slice<PathEntry> ents, b32 more, Str err)
 {
     l->ents = {};
@@ -7793,9 +7796,12 @@ static void dirput(PathComp *pc, DirList *l, Slice<PathEntry> ents, b32 more, St
     l->id   = 0;
 }
 
+static void dirlistlocal(Gui *, DirList *, Str, Arena);
+
 // The folders in a folder typed on a host, or with files its files too,
 // as listed so far, which is listed if it is not, or was a while ago:
-// here at once, or by the host's engine (dir), its answer later (ondir).
+// here by the window's file workers (dirlistlocal), there by the host's
+// engine (dir), its answer later either way (dirlocal, ondir).
 static DirList *dirget(Gui *g, Arena scratch, GuiHost *h, Str dir, b32 files = 0)
 {
     DirList *l = dirslot(g, h, dir, files);
@@ -7804,22 +7810,15 @@ static DirList *dirget(Gui *g, Arena scratch, GuiHost *h, Str dir, b32 files = 0
     }
     l->at = g->sched.now;
     if (h->kind != GH_REMOTE) {
-        Arena            a  = scratch;
         // The slot's own copy of the directory, not the caller's: the
-        // listing's arena starts where the caller's string may lie, so
-        // cstr's NUL-terminated copy of it would overwrite it as it is made
-        HomePath         hp = tildepath(&a, l->dir, h->home, HOST_WINDOWS);
-        Listing          ls = hp.err.len ? Listing{} :
-                              os_listall(g->os, &a, hp.path, !files,
-                                         files ? DIRLIST_FILES : DIRLIST_MAX);
-        Slice<PathEntry> e  = {};
-        for (Dirent *d = ls.head; d; d = d->next) {
-            e = push(&a, e, PathEntry{d->name, d->isdir});
+        // job's arena starts where the caller's string may lie
+        Arena    a  = scratch;
+        HomePath hp = tildepath(&a, l->dir, h->home, HOST_WINDOWS);
+        if (hp.err.len) {
+            dirput(&g->pc, l, {}, 0, hp.err);
+        } else {
+            dirlistlocal(g, l, hp.path, a);
         }
-        Str err = hp.err.len ? hp.err : ls.ok ? Str{} :
-                  os_stat(g->os, a, hp.path).type==STAT_MISSING ? Str("no such folder") :
-                  Str("cannot list this folder");
-        dirput(&g->pc, l, e, ls.more, err);
         return l;
     }
     Arena a = newarena(g->cmdr);
@@ -16833,13 +16832,15 @@ static DriveOp m3ops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 500, ""},
     // The Files pane (gui.py's files in work/files). Open file, with the
-    // pane hidden: Ctrl/Cmd+O, a path Tab completes, a line after it,
-    // and the pane docks, its text jumped to the line, centered
+    // pane hidden: Ctrl/Cmd+O, a path Tab completes once its folder is
+    // listed (on the window's file workers), a line after it, and the
+    // pane docks, its text jumped to the line, centered
     {OP_MAIN, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_FILESHOWN, 0, 0, 0, ""},
     CMDKEY(GKEY_O, 500),
     {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
     {OP_TEXTCWD, 0, 0, 0, 300, "/files/line"},
+    {OP_WAIT, W_FSIDLE, 0, 0, 5000, ""},
     {OP_KEYDOWN, 0, GKEY_TAB, 0, 50, ""},
     {OP_KEYUP, 0, GKEY_TAB, 0, 300, ""},
     {OP_TEXT, 0, 0, 0, 300, ":1200"},
@@ -21280,7 +21281,8 @@ static DriveOp launchops[] = {
     // typed in part lists the folders it picks, not dot folders nor
     // files; Tab completes the first; Esc closes the list, not the
     // dialog; Down twice picks the second, which Enter completes; a
-    // click on a row completes it; and Enter then creates the session
+    // click on a row completes it; and Enter then creates the session.
+    // Each folder is listed on the window's file workers, waited for
     {OP_MOVE, T_SESSMENU, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 500, ""},
@@ -21290,6 +21292,7 @@ static DriveOp launchops[] = {
     {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
     // The field has the keyboard, its text all selected, to type over
     {OP_TEXTCWD, 0, 0, 0, 500, "/pick/al"},
+    {OP_WAIT, W_FSIDLE, 0, 0, 5000, ""},
     {OP_CHECK, CHK_PATHPICK, 2, 0, 0, "alpha"},
     {OP_SHOT, 0, 0, 0, 300, "launch-5-pathpick"},
     {OP_KEYDOWN, 0, GKEY_TAB, 0, 50, ""},
@@ -21297,6 +21300,7 @@ static DriveOp launchops[] = {
     {OP_CHECK, CHK_NEWCWD, 0, 0, 0, "/pick/alpha/"},
     {OP_CHECK, CHK_PATHPICK, 0, 0, 0, ""},
     {OP_TEXT, 0, 0, 0, 500, "t"},
+    {OP_WAIT, W_FSIDLE, 0, 0, 5000, ""},
     {OP_CHECK, CHK_PATHPICK, 2, 0, 0, "three"},
     {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
     {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
@@ -21313,6 +21317,7 @@ static DriveOp launchops[] = {
     {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
     // A click on a row accepts it too, the field keeping the keyboard
     {OP_TEXT, 0, 0, 0, 500, "d"},
+    {OP_WAIT, W_FSIDLE, 0, 0, 5000, ""},
     {OP_CHECK, CHK_PATHPICK, 1, 0, 0, "deep"},
     {OP_MOVE, T_NAMED, 0, 0, 100, "path pick"},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -21991,6 +21996,7 @@ static DriveOp composeops[] = {
     {OP_MENTIONHOLD, 0, 1, 0, 300, ""},
     CLICK(T_PROMPT, "", 300),
     TYPE1("@"),
+    {OP_WAIT, W_FSIDLE, 0, 0, 5000, ""},  // the folder's listing
     {OP_CHECK, CHK_MENTIONKIND, 0, 0, 0, "list"},
     {OP_CHECK, CHK_MENTION, 0, 0, 0, ""},  // dx 0: one row or more
     TYPE1("m"), TYPE1("e"), TYPE1("n"), TYPE1("t"), TYPE1("i"), TYPE1("o"),
@@ -22002,6 +22008,7 @@ static DriveOp composeops[] = {
     {OP_CHECK, CHK_ATTACHED, 1, 0, 0, ""},
     TYPE1("@"), TYPE1("."), TYPE1("c"), TYPE1("l"), TYPE1("a"), TYPE1("u"),
     TYPE1("d"), TYPE1("e"), TYPE1("/"),
+    {OP_WAIT, W_FSIDLE, 0, 0, 5000, ""},  // .claude's listing
     {OP_CHECK, CHK_MENTIONKIND, 0, 0, 0, "list"},
     {OP_CHECK, CHK_MENTIONSEL, 0, 0, 0, ".claude/skills"},
     {OP_SHOT, 0, 0, 0, 300, "compose-mention-list"},

@@ -338,7 +338,11 @@ that takes more than a moment, and Open file says "Checking..." while
 it looks for the path. A file on a share or mount that stops answering
 says "The file system is not responding" after ten seconds; other
 files still open, and that file, or the rest of its network share, is
-refused at once until it answers again, when Retry reads it.
+refused at once until it answers again, when Retry reads it. Folders
+are listed off to the side as well, for Open file's Tab, the new
+session's folder field and the folders of an '@' mention: "Listing..."
+shows if that takes more than a moment, and a Tab pressed meanwhile
+completes once the listing comes.
 
 An editor that runs in a terminal (`vim`, `nvim`, `nano`, `hx`,
 `emacs -nw`), as `[ui] editor`, `$VISUAL` or `$EDITOR` names it, opens

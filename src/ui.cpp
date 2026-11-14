@@ -11055,9 +11055,11 @@ static void importfill(Gui *g, GuiHost *h)
 // field. It shows once the text is typed in, or Up or Down pressed, and
 // hides on accepting a pick, on Esc, and as the field loses the keyboard.
 // Up and Down pick; Tab accepts the pick, or the first, and Enter one
-// picked, else Enter is the dialog's; a click on a row accepts it. An
-// accepted folder is the text's, with a separator: its own folders are
-// then listed, as soon as the text changes again.
+// picked, else Enter is the dialog's; Tab while the folder is being
+// listed stays with the field, and completes once the listing comes; a
+// click on a row accepts it. An accepted folder is the text's, with a
+// separator: its own folders are then listed, as soon as the text
+// changes again.
 struct PathCb {
     Gui            *g;
     PathQuery       q;
@@ -11095,6 +11097,8 @@ static i32 pathcb(ImGuiInputTextCallbackData *d)
             d->InsertChars(0, t.cdata, t.cdata+t.len);
             c->accepted = 1;
         }
+    } else if (d->EventFlag == ImGuiInputTextFlags_CallbackCompletion) {
+        pc->tabwait = 1;  // the folder still being listed: once it comes
     } else if (d->EventFlag == ImGuiInputTextFlags_CallbackEdit) {
         byte  mem[FIELD_MAX+8];
         Arena a = {mem, mem+sizeof(mem)};
@@ -11109,6 +11113,19 @@ static i32 pathcb(ImGuiInputTextCallbackData *d)
         }
     }
     return 0;
+}
+
+// Put an accepted pick in the field, from outside it.
+static void pathput(PathField *f, char *buf, PathPick p, Arena scratch)
+{
+    Str t = pathaccept(&scratch, f->cb.q, p);
+    if (t.len < FIELD_MAX) {
+        fieldput(buf, t);
+        ImGuiInputTextState *st = ImGui::GetInputTextState(f->id);
+        if (st && ImGui::GetActiveID()==f->id) {
+            st->ReloadUserBufAndMoveToEnd();
+        }
+    }
 }
 
 // Before the field: what it picks, from its text as it stands, and the
@@ -11128,8 +11145,9 @@ static PathField pathbefore(Gui *g, GuiHost *h, char *buf, b32 *enter, b32 off,
     }
     b32 active = ImGui::GetActiveID() == f.id;
     if (!active && !pc->refocus) {
-        pc->shown = 0;
-        pc->sel   = -1;
+        pc->shown   = 0;
+        pc->sel     = -1;
+        pc->tabwait = 0;
     }
     if (pc->refocus && active) {
         // Back after a click on a row: the caret at the end, not all
@@ -11168,22 +11186,33 @@ static PathField pathbefore(Gui *g, GuiHost *h, char *buf, b32 *enter, b32 off,
     f.cb.scratch = *a;
     i32 n      = (i32)f.cb.picks.len;
     pc->sel    = pc->sel<n ? pc->sel : -1;
+    if (pc->tabwait && f.list->got) {
+        // Tab came before the listing, which is here now: it completes
+        pc->tabwait = 0;
+        if (n) {
+            pathput(&f, buf, f.cb.picks[pc->sel>=0 ? pc->sel : 0], f.cb.scratch);
+            f.cb.accepted = 1;
+            return f;
+        }
+    }
     // "Listing..." once the listing has taken a moment, else not at all
     i64 noteat = f.list->at + FILES_NOTEDELAY;
     b32 noted  = !f.list->got && g->sched.now>=noteat;
     if (pc->shown && !f.list->got && !noted) {
         schedat(&g->sched, noteat, DUE_APP);
     }
+    if (pc->shown && (n || !f.list->got)) {
+        // Tab, kept from nav, also while the listing is on its way
+        f.flags |= ImGuiInputTextFlags_CallbackCompletion;
+    }
     f.visible  = pc->shown && (n || f.list->err.len || noted);
     if (!f.visible) {
         return f;
     }
-    if (n) {
-        f.flags |= ImGuiInputTextFlags_CallbackCompletion;  // Tab, kept from nav
-    }
     // Esc closes the dropdown, not the dialog, nor reverts the field
     if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
-        pc->shown = 0;
+        pc->shown   = 0;
+        pc->tabwait = 0;  // a Tab waiting on the listing goes with it
         ImGui::SetKeyOwner(ImGuiKey_Escape, ImGui::GetID("##pathkeys"),
                            ImGuiInputFlags_LockThisFrame);
     }
@@ -11199,19 +11228,6 @@ static PathField pathbefore(Gui *g, GuiHost *h, char *buf, b32 *enter, b32 off,
     return f;
 }
 
-// Put an accepted pick in the field, from outside it.
-static void pathput(PathField *f, char *buf, PathPick p, Arena scratch)
-{
-    Str t = pathaccept(&scratch, f->cb.q, p);
-    if (t.len < FIELD_MAX) {
-        fieldput(buf, t);
-        ImGuiInputTextState *st = ImGui::GetInputTextState(f->id);
-        if (st && ImGui::GetActiveID()==f->id) {
-            st->ReloadUserBufAndMoveToEnd();
-        }
-    }
-}
-
 // After the field: an accepted pick, then the dropdown under the field.
 static void pathafter(Gui *g, PathField *f, char *buf)
 {
@@ -11221,9 +11237,10 @@ static void pathafter(Gui *g, PathField *f, char *buf)
         pc->sel   = -1;
         pc->accepts++;
     } else if (ImGui::IsItemEdited()) {
-        pc->shown = 1;
-        pc->sel   = -1;
-        pc->top   = 0;
+        pc->shown   = 1;
+        pc->sel     = -1;
+        pc->top     = 0;
+        pc->tabwait = 0;  // typed over: a Tab before it is forgotten
     }
     Slice<PathPick> picks = f->cb.picks;
     i32             n     = (i32)picks.len;
@@ -11235,9 +11252,13 @@ static void pathafter(Gui *g, PathField *f, char *buf)
     }
     pc->rows = 0;
     if (!f->visible || f->cb.accepted || f->enter) {
+        // Up or Down showed it: drawn next frame, or a listing still on
+        // its way once "Listing..." is due
         DirList *l = f->list;
-        if (pc->shown && l && (n || l->err.len || !l->got)) {
-            scheddirty(&g->sched);  // Up or Down showed it: drawn next frame
+        if (pc->shown && l && (n || l->err.len)) {
+            scheddirty(&g->sched);
+        } else if (pc->shown && l && !l->got) {
+            schedat(&g->sched, l->at+FILES_NOTEDELAY, DUE_APP);
         }
         return;
     }
