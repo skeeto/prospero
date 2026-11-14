@@ -933,6 +933,27 @@ static f32 msgy(Doc *d, MsgLayout *ml, i32 off)
     return msgrowat(0, d, ml, off).y;
 }
 
+// The first offset in [off, end) that a row of a message laid out by
+// layoutmsg begins at, else off: a source line's first character shown,
+// past markup that is not (a heading's "## "), which msgrowat would put
+// on the row before.
+static i32 msgrowfrom(Doc *d, MsgLayout *ml, i32 off, i32 end)
+{
+    i32 best = end;
+    for (iz k = 0; k < ml->blocks.len; k++) {
+        Placed      *p      = &ml->blocks[k];
+        BlockLayout *bl     = p->bl;
+        DocBlock    *blk    = &d->blocks[p->block];
+        Piece       *pieces = d->pieces.data + blk->piece0;
+        for (iz i = 0; i < bl->lines.len; i++) {
+            Line *l = &bl->lines[i];
+            i32   b = l->nrun ? runbeg(pieces, &bl->runs[l->run0]) : -1;
+            best = b>=off && b<best ? b : best;
+        }
+    }
+    return best<end ? best : off;
+}
+
 // The source offset nearest to (x, y) in a message laid out by
 // layoutmsg, at y relative to the message's top.
 static i32 msghit(Measure *m, Doc *d, MsgLayout *ml, f32 x, f32 y)

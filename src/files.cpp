@@ -208,11 +208,24 @@ static void filedrop(Gui *g, FileTab *ft)
     g->filespare = ft;
 }
 
-// Close tab i of a root's set.
+// The layout file is to be saved, the tabs having changed as the user
+// asked: opened, closed, picked, reordered, or shown another way. Not
+// as they scroll: their places go out with the next save, at shedding
+// or at exit. ui.cpp schedules the save's frame.
+static void filesdirty(Gui *)
+{
+    if (ImGui::GetCurrentContext()) {
+        ImGui::MarkIniSettingsDirty();
+    }
+}
+
+// Close tab i of a root's set: from its menu, its middle click or its
+// close button, Ctrl+W, or as its session goes (filesweep).
 static void fileclose(Gui *g, FileSet *set, i32 i)
 {
     filedrop(g, filesetdrop(set, i));
     scheddirty(&g->sched);
+    filesdirty(g);
 }
 
 // Close the shown root's front tab, if any (Ctrl+W).
@@ -1272,6 +1285,39 @@ static void filesrelease(Gui *g)
     g->fshowing = 0;
 }
 
+// A new tab, not yet in a set, for path on the host of uid host (win:
+// that host compares without case): a spare's, its path's room used
+// again where it fits, or a new one; wrapped as the last choice was,
+// fitted, Markdown by its name, and unread.
+static FileTab *filetabnew(Gui *g, u64 host, Str path, b32 win)
+{
+    FileTab *ft = g->filespare;
+    if (ft) {
+        g->filespare = ft->next;
+    } else {
+        ft = alloc<FileTab>(&g->perm);
+    }
+    // A spare's path buffer is used again where it has room
+    Str was = ft->path;
+    iz  cap = ft->pathcap;
+    *ft = {};
+    if (cap >= path.len) {
+        copybytes(was.data, path.data, path.len);
+        ft->path    = {was.data, path.len};
+        ft->pathcap = cap;
+    } else {
+        ft->path    = clone(&g->perm, path);
+        ft->pathcap = path.len;
+    }
+    ft->serial = ++g->fileserial;
+    ft->host   = host;
+    ft->win    = win;
+    ft->wrap   = g->filewrap;
+    ft->fit    = 1;
+    ft->mode   = filemdname(path) ? FMODE_MARKDOWN : FMODE_TEXT;
+    return ft;
+}
+
 // Show a file in the Files pane, in the tab set of session s's root, or
 // the window's own with s null: its tab, made if it has none, in front;
 // at lines line0 to line1 (1-based; 0 for none), banded and scrolled
@@ -1291,30 +1337,7 @@ static FileTab *filesopen(Gui *g, GuiSession *s, u64 host, Str path, i32 line0, 
         ft = set->tabs[i];
         filesetshow(set, i);
     } else {
-        ft = g->filespare;
-        if (ft) {
-            g->filespare = ft->next;
-        } else {
-            ft = alloc<FileTab>(&g->perm);
-        }
-        // A spare's path buffer is used again where it has room
-        Str was = ft->path;
-        iz  cap = ft->pathcap;
-        *ft = {};
-        if (cap >= path.len) {
-            copybytes(was.data, path.data, path.len);
-            ft->path    = {was.data, path.len};
-            ft->pathcap = cap;
-        } else {
-            ft->path    = clone(&g->perm, path);
-            ft->pathcap = path.len;
-        }
-        ft->serial = ++g->fileserial;
-        ft->host   = host;
-        ft->win    = win;
-        ft->wrap   = g->filewrap;
-        ft->fit    = 1;
-        ft->mode   = filemdname(path) ? FMODE_MARKDOWN : FMODE_TEXT;
+        ft = filetabnew(g, host, path, win);
         FileTab *gone = filesetadd(set, ft);
         if (gone) {
             filedrop(g, gone);
@@ -1342,7 +1365,126 @@ static FileTab *filesopen(Gui *g, GuiSession *s, u64 host, Str path, i32 line0, 
     }
     setpane(g, PANE_FILES, 1);
     scheddirty(&g->sched);
+    filesdirty(g);
     return ft;
+}
+
+// Tabs that last: each root's tabs are kept in the layout file's
+// [Prospero][Files] section (fileset.cpp's filekeep*), read before any
+// session is known into g->fkeep, a record for each root, until its
+// root is found (filesrestore). The window's own set is found at once,
+// a session of this state directory once its engine lists it; a remote
+// session's records wait, written back as read. Restored tabs are
+// unread, each read once shown (drawfiles), so a launch reads only the
+// shown front file, on the window's file workers as any other.
+
+// A record's tabs into root's set (filesetrestore), each made as
+// opening would (filetabnew), then shown as kept (filekeeptab): those
+// on its remote host only with far, that host's uid, else passed over.
+// Markdown only for a Markdown file's name. Nothing is read, stated or
+// shown here.
+static void filesattach(Gui *g, GuiSession *root, FileKeep *k, u64 far)
+{
+    FileTab *made[FILES_TABS];
+    i32      n     = 0;
+    i32      front = -1;
+    for (i32 i = 0; i < k->n; i++) {
+        FileKeepTab *kt    = &k->tabs[i];
+        b32          there = !!(kt->flags & FKT_FAR);
+        if (there && !far) {
+            continue;
+        }
+        b32      win = there ? !!(kt->flags & FKT_WIN) : (b32)HOST_WINDOWS;
+        FileTab *ft  = filetabnew(g, there ? far : 0, kt->path, win);
+        filekeeptab(ft, kt);
+        if (ft->mode==FMODE_MARKDOWN && !filemdname(ft->path)) {
+            ft->mode = FMODE_TEXT;
+        }
+        front     = kt->flags&FKT_FRONT ? n : front;
+        made[n++] = ft;
+    }
+    i32 took = filesetrestore(&root->files, made, n, front);
+    for (i32 i = took; i < n; i++) {
+        filedrop(g, made[i]);  // the set had it, or was full
+    }
+    k->done = 1;
+}
+
+// The records still waiting whose roots are now known: the window's
+// own set's at once; a session of this state directory's once found,
+// dropped if it is deleted or in the Trash, or if listed's sessions
+// (this state directory's engine, or this window's own background
+// host), which cover the whole state directory, the Trash too, lack
+// it. A remote session's wait for its host. At startup, with listed
+// null, and as each host lists its sessions, before --session shows
+// one.
+static void filesrestore(Gui *g, GuiHost *listed)
+{
+    FileKeeps *ks    = &g->fkeep;
+    b32        whole = listed && (listed->kind==GH_ENGINE ||
+                                  (listed->kind==GH_LOCAL && listed->own));
+    for (i32 i = 0; i < ks->n; i++) {
+        FileKeep *k = &ks->keeps[i];
+        if (k->done) {
+            continue;
+        } else if (k->kind == FKEEP_NONE) {
+            filesattach(g, &g->nosession, k, 0);
+        } else if (k->kind == FKEEP_HERE) {
+            GuiSession *s = findlocal(g, k->sid);
+            if (s && (s->gone || s->trashed)) {
+                k->done = 1;
+            } else if (s) {
+                filesattach(g, termroot(g, s), k, 0);
+            } else if (whole) {
+                k->done = 1;
+            }
+        }
+    }
+}
+
+// The layout file's Files section (filekeeptext), in a: the live roots,
+// each written as last known alive now, the window's own and those of
+// this state directory's sessions with tabs, not deleted nor in the
+// Trash; then the records still waiting, unless a live root has the
+// same key, as it wins.
+static Str filekeepsection(Gui *g, Arena *a)
+{
+    i64 now = os_time(g->os);
+    i32 cap = 1 + g->fkeep.n;
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        cap += s->files.n > 0;
+    }
+    FileKeep  **list  = alloc<FileKeep *>(a, cap);
+    i32         n     = 0;
+    GuiSession *roots[] = {&g->nosession, g->sessions};
+    for (i32 r = 0; r < countof(roots); r++) {
+        for (GuiSession *s = roots[r]; s; s = r ? s->next : 0) {
+            if (r && (!s->files.n || s->gone || s->trashed ||
+                      (s->host->kind!=GH_ENGINE && s->host->kind!=GH_LOCAL))) {
+                continue;
+            }
+            FileKeep *k = alloc<FileKeep>(a);
+            filesetkeep(&s->files, 0, g->fonts.size, k);
+            k->kind = r ? FKEEP_HERE : FKEEP_NONE;
+            k->sid  = r ? s->sid : Str{};
+            k->seen = now;
+            k->live = 1;
+            list[n++] = k;
+        }
+    }
+    i32 nlive = n;
+    for (i32 i = 0; i < g->fkeep.n; i++) {
+        FileKeep *k    = &g->fkeep.keeps[i];
+        b32       live = 0;
+        for (i32 j = 0; !k->done && j < nlive; j++) {
+            FileKeep *o = list[j];
+            live |= o->kind==k->kind && o->sid==k->sid && o->host==k->host;
+        }
+        if (!k->done && !live) {
+            list[n++] = k;
+        }
+    }
+    return filekeeptext(a, list, n, !g->filewrap, now);
 }
 
 
@@ -2668,8 +2810,11 @@ static FileBar filetabs(Gui *g, GuiSession *root)
             }
         }
         scheddirty(&g->sched);
+        filesdirty(g);
     }
-    filesetorder(set, order, norder);
+    if (filesetorder(set, order, norder)) {
+        filesdirty(g);  // dragged into another order
+    }
     ImGui::EndTabBar();
     return r;
 }
@@ -2753,14 +2898,17 @@ static void filemdgo(Gui *g, FileBody *b, i32 line, f32 dy)
     for (i32 n = 0; n<line && off<b->body.len; off++) {
         n += b->body[off] == '\n';
     }
+    i32 end = off;
+    for (; end<b->body.len && b->body[end]!='\n'; end++) {}
     FontMetrics fm    = fontmetrics(&g->fonts, 0);
     f32         charw = fontadvance(&g->fonts, 0, 'n');
     if (width != v->lastw) {
         v->topsdirty = 1;
         v->lastw     = width;
     }
-    msglayout(v, 0, &g->measure, width, sc);
+    MsgLayout *ml = msglayout(v, 0, &g->measure, width, sc);
     viewtops(v, width, charw, fm.lineh);
+    off = msgrowfrom(msgdoc(v, 0), ml, off, end);  // as filemdtop reads it back
     Anchor an = {0, off, dy};
     d->scrollto = anchory(v, an, &g->measure, width, sc, pad);
 }
@@ -2891,6 +3039,7 @@ static void filegoto(Gui *g, FileTab *ft, FrefLines l)
     ft->jump   = l.line0;
     ft->jumped = 0;
     scheddirty(&g->sched);
+    filesdirty(g);
 }
 
 // Open in editor goes where the current hit begins, its line and column.
@@ -3311,6 +3460,7 @@ static void drawfiles(Gui *g)
             // The line at the top stays there, at its top
             ft->mode = on ? FMODE_MARKDOWN : FMODE_TEXT;
             ft->dy   = 0;
+            filesdirty(g);
         }
         ImGui::EndDisabled();
         itemnamed(g, "file markdown");
@@ -3320,6 +3470,7 @@ static void drawfiles(Gui *g)
     if (b && b->kind==FBODY_TEXT && ft->mode==FMODE_TEXT) {
         if (checkbox("Wrap", &ft->wrap)) {
             g->filewrap = ft->wrap;  // new tabs take it
+            filesdirty(g);
         }
         itemnamed(g, "file wrap");
         itemtip("Wrap long lines at the pane's width");
@@ -3428,8 +3579,12 @@ static void drawfiles(Gui *g)
         putbyte(&nb, 'x');
         print(&nb, (i64)b->h);
         print(&nb, " pixels");
-        ImgDrawn d = drawimage(g, b->tex, b->w, b->h, &ft->fit, finish(&nb),
-                               "Scale it to fit the pane");
+        b32      fit = ft->fit;
+        ImgDrawn d   = drawimage(g, b->tex, b->w, b->h, &ft->fit, finish(&nb),
+                                 "Scale it to fit the pane");
+        if (ft->fit != fit) {
+            filesdirty(g);
+        }
         g->fimgshown = d.shown;
         g->fimgsize  = d.size;
         g->fimgroom  = d.room;
@@ -3447,6 +3602,7 @@ static void drawfiles(Gui *g)
             filefree(g, ft);
             ft->state = FTAB_UNREAD;
             scheddirty(&g->sched);
+            filesdirty(g);
         }
         itemnamed(g, "file astext");
         g->fshowing = 0;
@@ -3482,6 +3638,13 @@ static void drawfiles(Gui *g)
         g->fshowingserial = ft->serial;
         g->fshowingmode   = ft->mode;
         g->fshowingbody   = b;
+        if (ft->ems) {
+            // Restored from the layout file, its place in ems, now that
+            // the font's size is final
+            ft->dy      *= g->fonts.size;
+            ft->scrollx *= g->fonts.size;
+            ft->ems      = 0;
+        }
         dl->restore = 1;
         dl->top     = ft->top;
         dl->dy      = ft->dy;

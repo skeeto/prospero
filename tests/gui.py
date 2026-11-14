@@ -48,9 +48,12 @@ goes on. The enginestop
 mode kills the engine process mid-turn and mid-ask: the GUI must stop
 counting either, and quit at once when closed. The compose mode runs
 the compose box's checklist, with [ui] editor a test script (an editor
-that appends a line, one that exits 1, and one cancelled), then the GUI
-again, to find each session's draft back from its engine; no draft file
-for the editor may be left over. The plan mode makes a session in plan
+that appends a line, one that exits 1, and one cancelled), and leaves
+Files tabs in a session and with none, then the GUI again, to find each
+session's draft back from its engine and the tabs back as they were,
+only the shown one read, beside Files records appended to the layout
+file in between (a session gone, a remote's, a duplicate); no draft
+file for the editor may be left over. The plan mode makes a session in plan
 mode from the new session dialog, its agent refused a change, then
 asking to approve its plan: kept planning with a note, revised by hand
 with Edit plan ([ui] editor a test script, here only), then approved;
@@ -379,10 +382,12 @@ BADPNG = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00"
 def filesfixtures(host):
     """The Files pane's files, in work/files: numbered lines, with a blank
     one each 50 (lines 6, 56, ..., 256 among them, at a chunk's end); a
-    400-column line among short ones; two files of one name; Markdown; a
-    BOM and CRLF; a binary file; and more lines than are kept; an image
-    (CHK_FILEIMAGE's 40 by 30) and a PNG cut short; and two the window's
-    file workers stall (FSSTALL), a slow one and a dead one."""
+    400-column line among short ones (long.txt, and wide.txt the same);
+    two files of one name; Markdown, guide.md and manual.md with "##
+    Middle" at line 203; a BOM and CRLF; a binary file; and more lines
+    than are kept; an image (CHK_FILEIMAGE's 40 by 30) and a PNG cut
+    short; and two the window's file workers stall (FSSTALL), a slow one
+    and a dead one."""
     d = lambda *p: host.path("work", "files", *p)
     for sub in ("a", "b"):
         host.mkdir(d(sub))
@@ -395,6 +400,12 @@ def filesfixtures(host):
     host.write(d("notes.md"), "# Notes\n\nSee [the lines](lines.txt).\n\n" +
                "".join(f"Paragraph {n}.\n\n" for n in range(1, 151)))
     host.write(d("blob.bin"), "\x7fELF\x00\x01\x02binary\n")
+    middle = ("# Guide\n\n" + "".join(f"Paragraph {n}.\n\n" for n in range(1, 101)) +
+              "## Middle\n\n" + "".join(f"More {n}.\n\n" for n in range(1, 101)))
+    host.write(d("guide.md"), middle)
+    host.write(d("manual.md"), middle)
+    host.write(d("wide.txt"), "".join(
+        ("long" + " abcdefghi"*40 if n == 100 else f"short {n}") + "\n" for n in range(1, 301)))
     if isinstance(host, Remote):
         host.h.sh(
             f"awk 'BEGIN {{ for (n = 1; n <= 3000; n++) print n%50==6 ? \"\" : \"line \" n }}'"
@@ -2044,6 +2055,7 @@ def main():
                    "---\ndescription: A skill of the checklist's\n---\nCheck.\n")
         # A binary file for a mention whose contents cannot come
         host.write(host.path("work", "zbinary.dat"), "\x7fELF\x00\x01binary\n")
+        filesfixtures(host)  # for the Files tabs kept across the restart
         before = config(curl, model, extra=composeconfig(editor, nonce))
     elif args.mode == "plan":
         # The agent plans (fake_provider's sc_plan); a model to switch to
@@ -2282,6 +2294,19 @@ def main():
         problems += summaryproblems(status, lines, "the window")
         status = 0
         if not problems:
+            # Files records the second run must deal with: a session of
+            # this state directory gone (dropped once listed), a remote's
+            # (kept, its host unknown), and the window's own again (the
+            # first, the first run's, wins), in a second section
+            ms = int(time.time()*1000)
+            with open(host.path("state", "imgui.ini"), "ab") as f:
+                f.write((f"\n[Prospero][Files]\n"
+                         f"Root=here,u{ms},s20200101-000000-dead\n"
+                         f"Tab=*,o0,p/nowhere/gone.txt\n"
+                         f"Root=remote,u{ms},s20200101-000000-beef,hnowhere\n"
+                         f"Tab=*,r,o0,p/nowhere/far.txt\n"
+                         f"Root=none,u{ms}\n"
+                         f"Tab=*,o0,p/nowhere/dup.txt\n\n").encode())
             again = ["--compose-again" if a == "--compose" else a for a in guiargs]
             st, more = host.run(again, args.timeout, guicwd, tag="again: ")
             problems += summaryproblems(st, more, "the window again")
@@ -2292,7 +2317,7 @@ def main():
         if args.shots:
             for name in ("history", "menu", "editing", "editfailed", "slash", "models",
                          "drafts", "attached", "images", "compacted", "paused", "continue",
-                         "restored", "dragrefused"):
+                         "restored", "dragrefused", "files"):
                 if not os.path.exists(os.path.join(args.shots, f"compose-{name}.png")):
                     problems.append(f"no compose-{name}.png")
     else:

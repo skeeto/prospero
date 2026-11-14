@@ -2097,6 +2097,8 @@ struct Gui {
     GuiSession        *filebarroot;  // whose tabs the bar showed last
     u32                fileserial;   // the last tab's serial
     b32                filewrap;     // new tabs wrap: the last choice made
+    FileKeeps          fkeep;        // tabs kept in the layout file, until
+                                     // their roots are found (filesrestore)
     FileAsk            fask;         // Open file's modal
     FileFetch          ffetch;       // a file on another host, coming
     DocLines           flines;       // the text view's state, as drawn
@@ -5385,6 +5387,7 @@ static void movesess(Gui *g, GuiSession *s, GuiHost *to)
 
 static GuiCtr *ctrofhost(Gui *, GuiHost *);
 static void    ctrkeep(Gui *, GuiCtr *);
+static void    filesrestore(Gui *, GuiHost *);
 
 // The sessions a host lists. A background host of another process lists
 // every session of the state directory it shares with the engine here,
@@ -5476,6 +5479,7 @@ static void onsessions(Gui *g, GuiHost *h, Json *j)
             guilist(g, g->hosts);
         }
     }
+    filesrestore(g, h);  // its sessions' Files tabs, before one is shown
     GuiSession *want = g->opensid.len ? findlocal(g, g->opensid) : 0;
     if (want) {
         g->opensid = {};
@@ -12977,6 +12981,11 @@ static void saveini(Gui *g, b32 last)
 //   Opened=a
 //   [Prospero][Help]
 //   Page=plan
+//   [Prospero][Files]
+//   Wrap=0
+//   Root=here,u1763100000000,s20261114-101500-ab12
+//   Tab=m,o0,t202,y0.51,p/home/me/src/notes.md
+//   Tab=*,u,o1,t1499,b1500-1504,p/home/me/src/main.c
 //   [Prospero][Layout Review]
 //   Shown=Sessions,Transcript,Prompt
 //   Split=X,0.22
@@ -12990,7 +12999,13 @@ static void saveini(Gui *g, b32 last)
 // sidebar keeps its groups' order, empty ones included, and each fold
 // the user chose by its key (sidebar.cpp), folded or opened, and its
 // order, written only when not the default, recent activity. Help keeps
-// its topic by name (help.cpp), an unknown one the first. Each layout
+// its topic by name (help.cpp), an unknown one the first. Files keeps
+// each root's tabs (fileset.cpp's filekeepline): a Root line, the
+// window's own (none), a session's here or a remote's by sid, when
+// last known alive, then its tabs in the bar's order, each its flags,
+// opened rank, place (in ems) and band, its path last, %-escaped; a
+// line that cannot be read is dropped and counted, the rest kept, and
+// Wrap is Wrap's last choice when off. Each layout
 // the user saved has a section, in the order saved (dock.cpp); one
 // that cannot be read, or named as one before it, is dropped (iniapply).
 
@@ -13009,6 +13024,9 @@ static void *iniopen(ImGuiContext *, ImGuiSettingsHandler *h, char const *name)
         g->layouts    = push(&g->perm, g->layouts, l);
         g->readlayout = &g->layouts[g->layouts.len-1];  // until the next push
         return (void *)5;
+    } else if (n == "Files") {
+        g->fkeep.at = 0;  // its lines to no record yet
+        return (void *)6;
     }
     return n=="Panes"   ? (void *)1 : n=="Window" ? (void *)2 :
            n=="Sidebar" ? (void *)3 : n=="Help"   ? (void *)4 : 0;
@@ -13022,6 +13040,11 @@ static void iniline(ImGuiContext *, ImGuiSettingsHandler *h, void *entry, char c
         return;
     } else if (entry == (void *)5) {
         dockline(g->readlayout, kv.head, kv.tail);
+        return;
+    } else if (entry == (void *)6) {
+        if (!filekeepline(&g->fkeep, &g->perm, kv.head, kv.tail)) {
+            g->fkeep.bad++;
+        }
         return;
     }
     Int v = parseint(kv.tail);
@@ -13121,7 +13144,11 @@ static void iniwrite(ImGuiContext *, ImGuiSettingsHandler *h, ImGuiTextBuffer *o
         Str page = helpnames[g->helppage];
         out->appendf("[Prospero][Help]\nPage=%.*s\n\n", (int)page.len, page.cdata);
     }
-    Arena a = g->frame;
+    Arena a  = g->frame;
+    Str   fk = filekeepsection(g, &a);
+    if (fk.len) {  // a null end would be taken for a C string's
+        out->append((char *)fk.data, (char *)fk.data + fk.len);
+    }
     for (iz i = 0; i < g->layouts.len; i++) {
         DockLayout *l = &g->layouts[i];
         Buf         b(&a, 1024);
@@ -13135,7 +13162,7 @@ static void iniwrite(ImGuiContext *, ImGuiSettingsHandler *h, ImGuiTextBuffer *o
 }
 
 // After the layout file is read: the saved layouts that can be had, the
-// first of each name.
+// first of each name, and the Files tabs kept.
 static void iniapply(ImGuiContext *, ImGuiSettingsHandler *h)
 {
     Gui *g = (Gui *)h->UserData;
@@ -13163,6 +13190,21 @@ static void iniapply(ImGuiContext *, ImGuiSettingsHandler *h)
     }
     g->layouts.len = n;
     g->readlayout  = 0;
+
+    // The Files tabs kept, each record waiting for its root
+    filekeepdone(&g->fkeep);
+    if (g->fkeep.nowrap) {
+        g->filewrap = 0;
+    }
+    if (g->fkeep.bad) {
+        Arena a = g->frame;
+        Buf   b(&a, 128);
+        print(&b, "the layout file's Files lines: ");
+        print(&b, (i64)g->fkeep.bad);
+        print(&b, g->fkeep.bad==1 ? Str(" could not be read, and is dropped")
+                                  : Str(" could not be read, and are dropped"));
+        guilog(g, finish(&b));
+    }
 }
 
 // Read and write the window's settings with the layout file's.
@@ -14048,6 +14090,9 @@ enum : i32 {
     OP_IFFSSTALL, // unless file work stalls paths for the checklist, here
                   // and on the remote host (PROSPERO_TEST_FSSTALL), skip
                   // dx ops
+    OP_NOSESS,    // show no session: the empty view, whose Files tabs are
+                  // the window's own
+    OP_SHOWFILES, // Files in front, as opening a file puts it
 };
 // OP_TEXTCWD with text types the --cwd directory and text after it, on
 // Windows with backslashes, as a Windows user types a path.
@@ -14552,7 +14597,8 @@ enum : i32 {
                       // with dx 1, they do not have text
     CHK_FILEASKERR,   // Open file is up, saying text
     CHK_FILESHOWN,    // Files is hidden (dx 0), shown (1), or shown central (2)
-    CHK_FILEBODIES,   // the bodies fit the budget, dx files read at least
+    CHK_FILEBODIES,   // the bodies fit the budget, dx files read at least,
+                      // and dy at most if dy > 0
     CHK_FILEQUIET,    // no frames while idle, a file shown
     CHK_LINKTIP,      // the last link's tooltip was text, or began so (dx 1)
     CHK_FILEPATH,     // the front file's path ends with text ('/' either way)
@@ -17666,7 +17712,8 @@ static DriveOp m3ops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_CHECK, CHK_FILEFIND, 2, 0, 0, ""},
-    {OP_MOVE, T_EMPTY, 0, 0, 4500, ""},
+    // 6 s: the last file opened saves the layout up to 5 s later
+    {OP_MOVE, T_EMPTY, 0, 0, 6000, ""},
     {OP_MARK, 0, 0, 0, 3000, ""},
     {OP_CHECK, CHK_FILEQUIET, 0, 0, 0, ""},
     // Files dragged over the window: over Files, the pane outlined with a
@@ -22126,6 +22173,40 @@ static DriveOp composeops[] = {
     {OP_CHECK, CHK_COMPACTED, 0, 0, 0, "keep the API"},
     {OP_CHECK, CHK_WRAPBLANK, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "compose-compacted"},
+    // C's Files tabs, kept in the layout file for the restart: Markdown
+    // at a heading, Markdown turned off there, unwrapped (Wrap's last
+    // choice, then, for new tabs), and banded lines in front; then the
+    // window's own, with no session shown
+    {OP_OPENFILE, 0, 0, 0, 300, "files/guide.md#middle"},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEMODE, FMODE_MARKDOWN, 0, 0, ""},
+    {OP_CHECK, CHK_FILETOP, 203, 0, 0, ""},
+    {OP_OPENFILE, 0, 0, 0, 300, "files/manual.md#middle"},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    CLICK(T_NAMED, "file markdown", 800),
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEMODE, FMODE_TEXT, 0, 0, ""},
+    {OP_CHECK, CHK_FILETOP, 203, 0, 0, ""},
+    {OP_OPENFILE, 0, 0, 0, 300, "files/long.txt:150"},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    CLICK(T_NAMED, "file wrap", 800),
+    {OP_CHECK, CHK_FILEROWS, 100, 1, 0, "hbar"},
+    {OP_OPENFILE, 0, 0, 0, 300, "files/lines.txt:1500-1504"},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILELINE, 1500, 1504, 0, "centered"},
+    {OP_CHECK, CHK_FILETABS, 0, 0, 0, "guide.md|manual.md|long.txt|*lines.txt"},
+    {OP_CHECK, CHK_SIDEINI, 0, 0, 0, "[Prospero][Files]\nWrap=0\n"},
+    {OP_CHECK, CHK_SIDEINI, 0, 0, 0, "Root=here,u"},
+    {OP_CHECK, CHK_SIDEINI, 0, 0, 0, "Tab=m,o0,t"},
+    {OP_CHECK, CHK_SIDEINI, 0, 0, 0, ",b1500-1504,p"},
+    {OP_NOSESS, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_FILETABS, 0, 0, 0, ""},
+    {OP_OPENFILE, 0, 0, 0, 300, "hello.txt"},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILETABS, 0, 0, 0, "*hello.txt"},
+    {OP_CHECK, CHK_SIDEINI, 0, 0, 0, "Root=none,u"},
+    CLICK(T_SESSTITLE, "Answer at length.", 300),
+    {OP_WAIT, W_OPENED, 0, 0, 10000, ""},
     // Quitting keeps a draft typed just before
     CLICK(T_PROMPT, "", 200),
     {OP_TEXT, 0, 0, 0, 100, "Draft for C"},
@@ -22140,11 +22221,44 @@ static DriveOp composeops[] = {
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
 
-// After a restart: each draft back from its engine, as typed.
+// After a restart: the Files tabs back, each read only once shown, as
+// they were (gui.py appended records of a session deleted, of a remote
+// not known here, and a second of the window's own, which the first
+// wins over); and each draft back from its engine, as typed.
 static DriveOp compose2ops[] = {
     {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
     {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
     {OP_CHECK, CHK_MAXIMIZED, 0, 0, 0, ""},
+    {OP_CHECK, CHK_FILESHOWN, 1, 0, 0, ""},
+    {OP_SHOWFILES, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILETABS, 0, 0, 0, "*hello.txt"},
+    {OP_CHECK, CHK_FILEBODIES, 1, 1, 0, ""},  // the one shown, alone
+    CLICK(T_SESSTITLE, "Answer at length.", 300),
+    {OP_WAIT, W_OPENED, 0, 0, 10000, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILETABS, 0, 0, 0, "guide.md|manual.md|long.txt|*lines.txt"},
+    {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "1500-1504"},
+    {OP_CHECK, CHK_FILELINE, 1500, 1504, 0, ""},
+    {OP_CHECK, CHK_FILEBODIES, 2, 2, 0, ""},
+    {OP_CHECK, CHK_NOINI, 0, 0, 0, "s20200101-000000-dead"},  // dropped once listed
+    {OP_CHECK, CHK_SIDEINI, 0, 0, 0, ",hnowhere\n"},  // kept for its host
+    CLICK(T_NAMED, "file tab 1", 300),
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEMODE, FMODE_MARKDOWN, 0, 0, ""},
+    {OP_CHECK, CHK_FILETOP, 203, 0, 0, ""},
+    CLICK(T_NAMED, "file tab 2", 300),
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEMODE, FMODE_TEXT, 0, 0, ""},
+    {OP_CHECK, CHK_FILETOP, 203, 0, 0, ""},
+    CLICK(T_NAMED, "file tab 3", 300),
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEROWS, 100, 1, 0, "hbar"},
+    {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "150-150"},
+    {OP_OPENFILE, 0, 0, 0, 300, "files/wide.txt:150"},  // new tabs unwrapped
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEROWS, 100, 1, 0, "hbar"},
+    {OP_SHOT, 0, 0, 0, 300, "compose-files"},
     {OP_MOVE, T_EMPTY, 0, 0, 1000, ""},
     CLICK(T_SESSTITLE, "Session A", 300),
     {OP_WAIT, W_OPENED, 0, 0, 10000, ""},
@@ -23264,9 +23378,9 @@ static b32 drivefilecheck(Gui *g, i32 chk)
              g->panes[PANE_FILES] && n && n->IsCentralNode();
     } break;
     case CHK_FILEBODIES: {
-        // Within the budget, dx at least read since the start: counted
-        // once per read, as its result is made a body (fetchmade), here
-        // and on other hosts alike
+        // Within the budget, dx at least read since the start, and dy
+        // at most if dy > 0: counted once per read, as its result is
+        // made a body (fetchmade), here and on other hosts alike
         i32 n     = 0;
         iz  bytes = filebytes(g, &n);
         print(&b, "drive: file bodies ");
@@ -23275,7 +23389,8 @@ static b32 drivefilecheck(Gui *g, i32 chk)
         print(&b, (i64)(bytes>>10));
         print(&b, " KiB; read ");
         print(&b, g->fileloads);
-        ok = bytes<=FILES_BUDGET && n>0 && g->fileloads>=(i64)op->dx;
+        ok = bytes<=FILES_BUDGET && n>0 && g->fileloads>=(i64)op->dx &&
+             (op->dy<=0 || g->fileloads<=(i64)op->dy);
     } break;
     case CHK_FILEQUIET:
         return g->panes[PANE_FILES] && drivequiet(g, "idle with a file shown", 2);
@@ -24666,8 +24781,10 @@ static b32 drivecheck(Gui *g, i32 chk)
         b32 found = find(in, text) >= 0;
         b32 absent = chk==CHK_NOSIDE || chk==CHK_NOINI;
         if (absent == found) {
-            Arena a = g->frame;
-            guilog(g, concat(&a, "drive: the sidebar:\n", Str{g->sidedump, g->sidelen}));
+            Arena a  = g->frame;
+            b32   fi = chk==CHK_SIDEINI || chk==CHK_NOINI;
+            guilog(g, fi ? concat(&a, "drive: the layout file:\n", in)
+                         : concat(&a, "drive: the sidebar:\n", Str{g->sidedump, g->sidelen}));
             guilog(g, concat(&a, "drive: the latest error: ", g->lasterr));
         }
         return absent != found;
@@ -25805,7 +25922,11 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_FILESPOT:
         return drivefilecheck(g, chk);
     case CHK_TERMQUIET:
-        return g->panes[PANE_TERMINAL] && drivequiet(g, "idle with the terminal shown", 2);
+        // A file opened before (an editor's) saves the layout up to 5 s
+        // later: a save's frame, and a probe after
+        return g->panes[PANE_TERMINAL] &&
+               drivequiet(g, "idle with the terminal shown",
+                          2 + 3*(g->saves - g->marksaves));
     case CHK_TERMFORCE: {
         DriveOp *op = &g->ops[g->drivepc-1];
         g->termforcecols = (i32)op->dx;
@@ -27367,6 +27488,13 @@ static void drivestep(Gui *g)
     case OP_NODIALOG:
         g->nodialog = 1;
         break;
+    case OP_NOSESS:
+        setcur(g, 0);
+        scheddirty(&g->sched);
+        break;
+    case OP_SHOWFILES:
+        setpane(g, PANE_FILES, 1);
+        break;
     case OP_OPENFILE: {
         Arena    a   = g->frame;
         FileRef  ref = fileref(&a, op->text);
@@ -28342,6 +28470,9 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
             os_guiwslwatch(os, &g->perm, g->tasks, TASK_WSLCHANGED);
         }
     }
+    // The Files tabs kept: the window's own, and the fake's session's;
+    // the others as their hosts list them (onsessions)
+    filesrestore(g, 0);
     if (history) {
         g->histreq = os_ticks(os);
         fakeint(g, FAKE_HISTORY, history);

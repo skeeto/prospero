@@ -332,6 +332,15 @@ when the editor has a window of its own. A binary file says
 so, with Show as text anyway; past 4 MiB or 100,000 lines only the
 start shows.
 
+The tabs of files on this computer last across a restart, kept with
+the window's layout: each session's on this computer, in their order,
+with the one in front, and the window's own, shown when no session is.
+A session on another host does not keep its tabs yet. Each keeps its
+place in the file and its band, Markdown or text, Wrap, Fit and Show
+as text anyway, and Wrap's last choice holds for new tabs. A tab is read again only once shown, so
+a restart reads just the file in front. A session deleted or put in the
+Trash takes its tabs with it.
+
 A file on this computer is read off to the side, as one on another
 host is, so the window carries on meanwhile: "Reading..." shows if
 that takes more than a moment, and Open file says "Checking..." while
