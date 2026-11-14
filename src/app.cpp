@@ -259,6 +259,7 @@ enum : i32 {
     RECT_REFRESHINC, // the settings window's Refresh includes
     RECT_CODEBLOCK,  // the code block aimed at (selectcode), else the latest
     RECT_CODECOPY,   // and its Copy button, while shown
+    RECT_CODERUN,    // and its Run button, while shown
     RECT_SHELLBTN,   // the session bar's toggles
     RECT_TOOLSBTN,
     RECT_THINKBTN,
@@ -1723,6 +1724,7 @@ struct Gui {
     f64                scrollto;   // -1 if none
     b32                dragging;
     i32                menumsg;    // the message the context menu is for
+    i32                menuoff;    //   and where in its text, else -1
     View              *copiedview; // a code block's Copy, clicked then
     i32                copiedmsg;
     i32                copiedblk;
@@ -6399,6 +6401,11 @@ static Str  termwhy(Gui *, GuiSession *);
 static void termgo(Gui *);
 static i32  termbusy(Gui *);
 static i32  termedits(Gui *);
+struct TermTab;
+static u64  termrunkey(Str, i64, i32);
+static Str  termrunfolder(Gui *, GuiSession *);
+static Str  termrunwhy(Gui *, GuiSession *, i32, u64);
+static TermTab *termrun(Gui *, GuiSession *, Str, Str, u64);
 static void termadd(Gui *, GuiSession *);
 static void termgrab(Gui *);
 static Str  termscreen(Gui *, Arena *);
@@ -13898,6 +13905,8 @@ enum : i32 {
     OP_IDLE,      // log frames since the last OP_MARK
     OP_MARK,
     OP_SELCODE,   // select the first code block in the transcript
+    OP_SELRUN,    // aim at the latest message's first block the Run
+                  // button runs (coderun), without selecting it
     OP_MODALSIZE, // Win32: a modal resize loop, dx steps wider
     OP_DPI,       // Win32: a DPI change to dx
     OP_STREAM,    // the fake agent streams continuously at dx tok/s
@@ -14064,6 +14073,7 @@ enum : i32 {
     T_RAIL,        // the latest fold rail drawn
     T_CODEBLOCK,   // the code block selectcode chose, as drawn
     T_CODECOPY,    // and its Copy button
+    T_CODERUN,     // and its Run button
     T_SHELLBTN,    // the session bar's toggles
     T_TOOLSBTN,
     T_THINKBTN,
@@ -14240,6 +14250,7 @@ enum : i32 {
     CHK_THINKSTAYS,
     CHK_THINKREFOLD,
     CHK_COPYBTN,
+    CHK_RUNBTN,       // the aimed code block's Run button shows, enabled
     CHK_CODECOPIED,
     CHK_COPYQUIET,
     CHK_REFLOW,
@@ -14647,6 +14658,7 @@ static Str chknames[] = {
     "open: the committed reasoning stays open",
     "fold again: reasoning folded, but for what the user opened",
     "a code block shows its Copy button while the mouse is over it",
+    "a shell's code block shows its Run button, enabled, while the mouse is over it",
     "its Copy put its code on the clipboard byte for byte, and said so",
     "Copied went back to Copy on its deadline, and little else drew",
     "a new width kept the line at the top edge there",
@@ -14949,6 +14961,7 @@ enum : i32 {
     W_CTR,        // the container runtime, or the first container, is as
                   // text says (ctrwait)
     W_TERM,       // the shown session's terminal shows text
+    W_TERMBANNER, // the front terminal tab ended or failed, its banner up
     W_TERMBUSY,   // its front tab runs a program, or not with "idle"
     W_TERMCOUNT,  // dx terminals are open, in every session
     W_FILEREADY,  // the front file is read and drawn, jumped or restored
@@ -14981,7 +14994,7 @@ static Str waitnames[] = {
     "the subagent on far", "the subagent on far shown", "a toast",
     "the changes", "the folder's probe", "the worktree's branch",
     "the thin remote", "a relayed stream", "the thin remote's skill", "the container",
-    "the terminal's text", "the terminal's program", "the terminals' count",
+    "the terminal's text", "the terminal's banner", "the terminal's program", "the terminals' count",
     "the file", "the file checked", "the file's find", "the pause",
 };
 static_assert(countof(waitnames) == W_PAUSED+1);
@@ -20823,6 +20836,49 @@ static DriveOp termops[] = {
     {OP_WAIT, W_TERMCOUNT, 2, 0, 5000, ""},
     {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*" TERMSH},
     {OP_CHECK, CHK_FILEFOCUS, 0, 0, 0, ""},
+    // The Run button on a block of the agent's tagged with its shell
+    // (the fake provider's: sh, or powershell on Windows), shown while
+    // the mouse is over it: a Terminal tab runs it, labeled by its first
+    // line, with the keyboard; its exit, 3, leaves a banner whose Enter
+    // does nothing for a moment, then runs it again in the same tab;
+    // the button runs it again too, in that tab; the agent hears how it
+    // ended at its next request; the banner's Close closes it
+    {OP_PROMPT, 0, 0, 0, 0, "Give me commands to run."},
+    {OP_WAIT, W_SAID, 0, 0, 20000, "Run this:"},
+    {OP_SELRUN, 0, 0, 0, 0, ""},
+    {OP_SHOWCODE, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_CODEBLOCK, 0, 0, 400, ""},
+    {OP_CHECK, CHK_RUNBTN, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "terminal-runbutton"},
+    {OP_MOVE, T_CODERUN, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_TERM, 0, 0, 20000, "run-1"},
+    {OP_WAIT, W_TERMBANNER, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMCOUNT, 3, 0, 0, ""},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, TERMSH "|*echo run-start..."},
+    TERMKEY(GKEY_ENTER, 300),  // too soon: ignored
+    {OP_CHECK, CHK_TERMBANNER, 0, 0, 1200, "`echo run-start...` exited with code 3"},
+    {OP_SHOT, 0, 0, 0, 300, "terminal-run"},
+    TERMKEY(GKEY_ENTER, 300),
+    {OP_WAIT, W_TERM, 0, 0, 20000, "run-2"},
+    {OP_WAIT, W_TERMBANNER, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_TERMCOUNT, 3, 0, 0, ""},
+    {OP_SHOWCODE, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_CODEBLOCK, 0, 0, 400, ""},
+    {OP_MOVE, T_CODERUN, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_TERM, 0, 0, 20000, "run-3"},
+    {OP_WAIT, W_TERMBANNER, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_TERMCOUNT, 3, 0, 0, ""},
+    {OP_PROMPT, 0, 0, 0, 0, "Tell me how it ran."},
+    {OP_WAIT, W_SAID, 0, 0, 20000, "Heard: exited with code 3"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "term banner close"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_TERMCOUNT, 2, 0, 5000, ""},
     // A session on a remote host (tests/gui.py's fake ssh, --rcwd its
     // folder) has its own tabs there, its shell run by that host's
     // engine: busy comes back through the host, a dropped link shows
@@ -22151,6 +22207,7 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_SIDELINK:      return rectcenter(g->rects[RECT_SIDELINK]);
     case T_CODEBLOCK:     return rectcenter(g->rects[RECT_CODEBLOCK]);
     case T_CODECOPY:      return rectcenter(g->rects[RECT_CODECOPY]);
+    case T_CODERUN:       return rectcenter(g->rects[RECT_CODERUN]);
     case T_SHELLBTN:      return rectcenter(g->rects[RECT_SHELLBTN]);
     case T_TOOLSBTN:      return rectcenter(g->rects[RECT_TOOLSBTN]);
     case T_THINKBTN:      return rectcenter(g->rects[RECT_THINKBTN]);
@@ -23448,6 +23505,10 @@ static b32 drivewaitdone(Gui *g)
         Arena a = g->frame;
         return find(termscreen(g, &a), g->ops[g->drivepc-1].text) >= 0;
     }
+    case W_TERMBANNER: {
+        TermTab *tt = termfront(g);
+        return tt && (tt->state==TT_ENDED || tt->state==TT_FAILED);
+    }
     case W_TERMBUSY: {
         TermTab *tt   = termfront(g);
         b32      idle = g->ops[g->drivepc-1].text == Str("idle");
@@ -24142,6 +24203,17 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_COPYBTN:
         return g->rects[RECT_CODECOPY].x1 > g->rects[RECT_CODECOPY].x0;
+    case CHK_RUNBTN: {
+        b32 shown = g->rects[RECT_CODERUN].x1 > g->rects[RECT_CODERUN].x0;
+        if (!shown || g->drivecodemsg<0) {
+            guilog(g, "drive: no Run button");
+            return 0;
+        }
+        Arena   a  = g->frame;
+        CodeRun cr = coderun(g, g->view, &a, g->drivecodemsg, g->drivecodeblk);
+        guilog(g, concat(&a, "drive: Run's why: ", cr.why.len ? cr.why : Str("none")));
+        return cr.kind && !cr.why.len;
+    }
     case CHK_CODECOPIED: {
         // The code without its last newline, as a triple click copies it
         Str want = g->drivecode;
@@ -26847,6 +26919,26 @@ static void drivestep(Gui *g)
         selectcode(g);
         scheddirty(&g->sched);
         break;
+    case OP_SELRUN: {
+        View *v = g->view;
+        Arena a = g->frame;
+        g->drivecodemsg = -1;
+        for (i32 i = (i32)v->msgs.len-1; i>=0 && g->drivecodemsg<0; i--) {
+            if (v->msgs[i].role != VIEW_ASSISTANT) {
+                continue;
+            }
+            Doc *d = msgdoc(v, i);
+            for (i32 k = 0; k<d->blocks.len && g->drivecodemsg<0; k++) {
+                if (coderun(g, v, &a, i, k).kind) {
+                    g->drivecodemsg = i;
+                    g->drivecodeblk = k;
+                }
+            }
+        }
+        guilog(g, g->drivecodemsg<0 ? Str("drive: no block to run")
+                                    : Str("drive: aiming at a block to run"));
+        scheddirty(&g->sched);
+    } break;
     case OP_SUMMARY:
         drivesummary(g);
         break;

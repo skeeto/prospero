@@ -28,7 +28,11 @@ Shell output button (the Bash logo) folds every shell command's output,
 short ones too, and its Tool output and Reasoning buttons (a wrench and
 screwdriver, a light bulb) open everything, each for that session alone. Cmd/Ctrl+F finds text
 in what the transcript shows, as shown rather than its Markdown, not in folded rows, and a code block's Copy button
-copies its code exactly. A bar above the transcript shows how full the
+copies its code exactly. A block of the agent's tagged with a shell (`sh`,
+`bash`, `zsh`, `powershell`, or `cmd` on Windows) also has a Run button,
+which runs it in a Terminal tab of the session, in its folder; the tab
+keeps its output after it ends, Enter runs it again, and the agent hears
+how it ended at its next request. A bar above the transcript shows how full the
 context is. A file tool that goes outside the session's working directory,
 or the roots the configuration adds, asks first, and an answer not given
 in time denies it. The settings window edits the configuration file in

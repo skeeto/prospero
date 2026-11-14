@@ -105,7 +105,10 @@ The transcript, the Plan pane and these Help pages select alike:
   the selection in the side chat's box).
 
 A code block's Copy button, at its corner while the mouse is over it,
-copies its code exactly, and shows a check mark for a moment. A click on a tool row's or reasoning's header
+copies its code exactly, and shows a check mark for a moment. Beside
+it, a shell's block has a Run button
+([The agent and your terminals](help:sessions#the-agent-and-your-terminals)),
+as does Run in Terminal on the right-click menu. A click on a tool row's or reasoning's header
 opens or folds it. So does a click on the bar at its left (a tool
 row's colored bar, reasoning's gray one), from anywhere along it,
 which, folding, scrolls back to its header if that was above the view.

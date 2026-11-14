@@ -3738,13 +3738,78 @@ static Marks msgmarks(Gui *g, View *v, i32 msg)
     return hitmarks(s->hits, s->cur, msg);
 }
 
+static b32 menutip(Gui *, Arena *, Str, Str, Str, char const *);
+
+// A code block of the shown session's transcript that the Run button
+// runs (termrunblock), and why it cannot now, if so.
+struct CodeRun {
+    i32 kind;   // RUN_NONE: no Run
+    Str lang;
+    Str text;
+    Str why;
+    u64 key;    // its tab's (termrunkey)
+};
+
+// Message msg's block as a Run: one of the agent's, committed, in the
+// shown session's transcript, a fenced block whose closing fence came,
+// of a shell's language, in a session that may change (not read-only,
+// archived or in the Trash).
+static CodeRun coderun(Gui *g, View *v, Arena *a, i32 msg, i32 block)
+{
+    CodeRun     r = {};
+    GuiSession *s = g->sess;
+    ViewMsg    *m = &v->msgs[msg];
+    if (!s || s->view!=v || m->role!=VIEW_ASSISTANT || m->prov || m->lines || !m->seq) {
+        return r;
+    } else if (s->readonly || s->trashed || s->gone || sessroot(g, s)->archived) {
+        return r;
+    }
+    Doc *d = msgdoc(v, msg);
+    if (block<0 || block>=d->blocks.len) {
+        return r;
+    }
+    DocBlock *k = &d->blocks[block];
+    if (k->type!=DOC_CODE || !k->fence || !termrunlang(k->lang)) {
+        return r;
+    } else if (blocklines(d, block).end <= lineend(d->src, k->off1)) {
+        return r;  // its fence not closed yet
+    }
+    TermRunBlock b = termrunblock(a, k->lang, copyblock(v, a, msg, block));
+    if (!b.kind) {
+        return r;
+    }
+    r.kind = b.kind;
+    r.lang = trim(k->lang);
+    r.text = b.text;
+    r.key  = termrunkey(s->sid, m->seq, block);
+    r.why  = b.why.len ? b.why : termrunwhy(g, s, b.kind, r.key);
+    return r;
+}
+
+// Run's tooltip: what runs it, and where.
+static Str coderuntip(Gui *g, Arena *a, CodeRun *cr)
+{
+    if (cr->why.len) {
+        return concat(a, "Can't run it: ", cr->why);
+    }
+    Buf b(a, 256);
+    print(&b, "Run in a Terminal tab (");
+    print(&b, cr->kind==RUN_PS ? Str("PowerShell") : cr->kind==RUN_CMD ? Str("cmd.exe")
+                               : cr->lang);
+    print(&b, "), in ");
+    print(&b, termrunfolder(g, g->sess));
+    print(&b, ". The agent hears how it ended at its next request.");
+    return finish(&b);
+}
+
 // A code block's Copy button, at its top right while the mouse is over
 // the block, which it overlaps as the headers' toggles overlap the text:
 // the code byte for byte, as selecting the block whole copies it. It
 // shows a check mark for a moment after, until a deadline. With aim, the
-// one the checklist chose is where it can find it.
+// one the checklist chose is where it can find it. Beside it, in the
+// transcript (runs), a block coderun takes has a Run button.
 static void drawcodecopy(Gui *g, View *v, i32 msg, Placed *pl, ImVec2 origin, f32 top,
-                         b32 dragging, b32 aim)
+                         b32 dragging, b32 aim, b32 runs)
 {
     BlockLayout *bl = pl->bl;
     Deco        *bg = 0;
@@ -3799,6 +3864,28 @@ static void drawcodecopy(Gui *g, View *v, i32 msg, Placed *pl, ImVec2 origin, f3
         g->copiedmsg  = msg;
         g->copiedblk  = pl->block;
         g->copiedat   = g->sched.now;
+    }
+
+    Arena   t  = g->frame;
+    CodeRun cr = runs ? coderun(g, v, &t, msg, pl->block) : CodeRun{};
+    if (!cr.kind) {
+        return;
+    }
+    ImGui::SetCursorScreenPos(v2(z.x - 2*bw - 8*sc, by));
+    ImGui::PushID(pl->block);
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, v2(st.FramePadding.x, 0));
+    ImGui::BeginDisabled(cr.why.len > 0);
+    b32 run = ImGui::Button(ICON_PLAY "###run", v2(bw, 0));
+    ImGui::EndDisabled();
+    ImGui::PopStyleVar();
+    ImGui::PopID();
+    itemtip("%s", cstr0(&t, coderuntip(g, &t, &cr)));
+    itemnamed(g, "code run");
+    if (aimed) {
+        itemrect(g, RECT_CODERUN);
+    }
+    if (run) {
+        termrun(g, g->sess, cr.lang, cr.text, cr.key);
     }
 }
 
@@ -4026,7 +4113,7 @@ static void drawmsgtext(Gui *g, ImDrawList *dl, ImDrawListSplitter *sp, TextArea
                 origin.y+pl->y+pl->bl->h < top) {
             continue;
         }
-        drawcodecopy(g, v, i, pl, origin, top, *ta->dragging, aim);
+        drawcodecopy(g, v, i, pl, origin, top, *ta->dragging, aim, ta->permsg);
     }
     ImGui::PopID();
 }
@@ -5611,11 +5698,28 @@ static void drawtranscript(Gui *g)
     }
     if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
         g->menumsg = hit.hit ? hit.at.msg : -1;  // the popup takes the hover from here on
+        g->menuoff = hit.hit ? hit.at.off : -1;
     }
     if (begintextmenu(g, v, RECT_COPYITEM)) {
         b32 onmsg = g->menumsg>=0 && g->menumsg<v->msgs.len;
         if (ImGui::MenuItem("Copy Message", 0, false, onmsg)) {
             copymessage(g, g->menumsg);
+        }
+        // A right-click inside a code block the Run button runs
+        Arena   t  = g->frame;
+        CodeRun cr = {};
+        if (onmsg && g->menuoff>=0 && !v->msgs[g->menumsg].lines) {
+            Doc *d = msgdoc(v, g->menumsg);
+            i32  b = blockat(d, g->menuoff);
+            if (b>=0 && g->menuoff>=d->blocks[b].off0 && g->menuoff<=d->blocks[b].off1) {
+                cr = coderun(g, v, &t, g->menumsg, b);
+            }
+        }
+        if (cr.kind) {
+            if (menutip(g, &t, "Run in Terminal", cr.why, coderuntip(g, &t, &cr), 0)) {
+                termrun(g, g->sess, cr.lang, cr.text, cr.key);
+            }
+            itemnamed(g, "text run");
         }
         b32 forked = forkitem(g, onmsg ? &v->msgs[g->menumsg] : 0);
         sideitem(g, v, !forked);
@@ -5648,6 +5752,7 @@ static void drawtranscript(Gui *g)
     g->rects[RECT_MSGLINK]   = {};
     g->rects[RECT_CODEBLOCK] = {};
     g->rects[RECT_CODECOPY]  = {};
+    g->rects[RECT_CODERUN]   = {};
     g->copiedshown = 0;
     g->clockshown  = 0;
     g->railseen    = 0;

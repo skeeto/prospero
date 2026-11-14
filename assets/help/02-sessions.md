@@ -494,6 +494,28 @@ prints of secrets Prospero does not know (`env`, `cat .env`). In a
 shell without a line editor, such as dash, a command typed just
 before a password prompt may be hidden too.
 
+### Running the agent's commands
+
+A code block in the agent's reply tagged with a shell (`sh`, `bash`,
+`zsh`, `ksh`, `powershell`, `pwsh`, or on Windows `cmd`) has a Run
+button beside Copy while the mouse is over it, and Run in Terminal on
+the right-click menu. It runs the block in a Terminal tab of the
+session, in its folder, labeled by its first line: in your shell, as
+you would paste it (a POSIX shell reads its interactive startup files;
+another, such as fish, runs the block in its own shell, else sh), in
+PowerShell, or cmd.exe with one line. The command shows first, dimmed.
+A block whose lines are prompts and output, or that holds characters
+that would not show, has none. It gets your terminal's environment
+less the variables secret settings name, with `PROSPERO_TAB=run`.
+
+The tab keeps its output when the command ends, under a banner with
+its exit code: Run again (Enter, after a moment) runs it in the same
+tab, as does the button again, and Close closes it. The agent hears
+how it ended, with its last lines (secrets hidden), with its next
+request; it is not woken for it. The agent is asked to put commands
+that only you can run, such as one that asks for your password, in
+such blocks.
+
 ## Side chats
 
 A side chat asks about a session without disturbing it, even while its

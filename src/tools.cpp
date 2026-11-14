@@ -1098,7 +1098,9 @@ static Str tooljson(Arena *a, ToolEnv *te)
 // The system prompt's start. A session in a folder of its own (nofolder)
 // is told that its working directory is no project. One whose replies a
 // frontend shows (filelinks) is asked to link the files it mentions,
-// which the GUI opens in its Files pane (fileref).
+// which the GUI opens in its Files pane (fileref), and, offered
+// read_terminal, to put commands the user must run in blocks its Run
+// button runs (term.run).
 static Str systemprompt(Arena *a, Str cwd, ToolEnv *te, b32 nofolder = 0,
                         b32 filelinks = 0)
 {
@@ -1159,6 +1161,18 @@ static Str systemprompt(Arena *a, Str cwd, ToolEnv *te, b32 nofolder = 0,
             "[:88](src/engine.cpp:88). Use an absolute path outside the "
             "working directory, / between folders, and <...> around a path "
             "with spaces.\n");
+    }
+    if (filelinks && tooloffered(te, TOOL_READTERM)) {
+        // The GUI's Run button, on a code block tagged with its shell
+        print(&b, "- When the user must run a command themselves (it needs "
+                  "their password, a terminal, their credentials, or runs "
+                  "long), put it alone in a fenced code block tagged with its "
+                  "shell (");
+        print(&b, te->windows ? Str("powershell, cmd, or sh") : Str("sh, bash, or zsh"));
+        print(&b, "), with no prompt and no output. They can run it with one "
+                  "click; you hear how it ended at your next request, and "
+                  "read_terminal shows its output. Run everything else "
+                  "yourself.\n");
     }
     print(&b, "\nWorking directory: ");
     print(&b, cwd);

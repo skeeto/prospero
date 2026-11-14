@@ -2219,7 +2219,9 @@ def file_links(t):
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")
-    t.check(bullet in shown and "around a path with spaces.\n\nWorking directory: " in shown,
+    # Then the Run blocks' bullet, read_terminal being offered
+    t.check(bullet in shown and "around a path with spaces.\n- When the user must run" in shown
+            and "Run everything else yourself.\n\nWorking directory: " in shown,
             f"attended: {shown[:1200]!r}")
     kid = fake_provider.system_of(t.requests(t.model2)[0]["body"])
     t.check(bullet in kid, f"its subagent: {kid[:1200]!r}")

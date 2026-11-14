@@ -3070,6 +3070,7 @@ GUI_PROMPTS = ("Stream slowly", "Run the tools", "be allowed", "wait for nobody"
                "Edit the lines", "Edit the far file", "Remove the lines",
                "Restore the lines",
                "Run a command to stop", "Read a long prompt",
+               "Give me commands to run", "Tell me how it ran",
                "Start a subagent in a container", "Sleep in a container as a subagent")
 
 GUI_TODO = ["Read the greeting", "Change it", "Check the result"]
@@ -3175,6 +3176,26 @@ def sc_gui(model, n, req):
     elif "Describe the files" in prompt:
         # Attached as text: its numbered lines, as read shows them
         yield from sc_attach_text(model, n, req)
+    elif "Give me commands to run" in prompt:
+        # A block the Run button runs, counting its runs in a file, and a
+        # transcript, which has none
+        if "Platform: Windows" in system_of(req):
+            block = ("```powershell\necho run-start\n"
+                     "$n = [int](Get-Content runs -EA 0) + 1; Set-Content runs $n; "
+                     "\"run-$n\"; exit 3\n```")
+        else:
+            block = ("```sh\necho run-start\n"
+                     "n=$(cat runs 2>/dev/null || echo 0); n=$((n+1)); echo $n >runs; "
+                     "echo run-$n; exit 3\n```")
+        yield from answer(model, "Run this:\n\n" + block +
+                          "\n\nIt prints:\n\n```console\n$ ls\nruns\n```\n")
+    elif "Tell me how it ran" in prompt:
+        # Whether the notice told its exit, first, for W_SAID's prefix
+        said = user_text_all(req)
+        at   = said.rfind("The user ran")
+        note = said[at:at+600] if at >= 0 else ""
+        head = "exited with code 3" if "exited with code 3" in note else "no exit code"
+        yield from answer(model, "Heard: " + head + "\n\n" + (note or "nothing"))
     elif "Answer with links" in prompt:
         # Each kind of link the window follows, one a line, at its start
         yield from answer(model, "Links:\n\n"
