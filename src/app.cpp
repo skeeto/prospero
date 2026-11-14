@@ -488,6 +488,7 @@ struct GuiHost {
     Str        version;
     Slice<Str> cmds;    // the commands it takes
     Slice<Str> caps;    // and its features (putcaps)
+    b32        nopty;   // its hello says it has no pseudoconsoles (XP)
     Str        home;    // its home directory, ~ there (homeshow), if known
     b32        relist;  // a command changed its list: ask again (drainmail)
     i32        trashdays; // its Trash keeps sessions this long, as its list
@@ -1859,6 +1860,9 @@ struct Gui {
     Str                edfound;    //   path it found (in perm), null if none
     u8                 fjumpwhy[160]; // why the Files toolbar's Open in editor
     i32                fjumpwhylen;   //   is disabled, as last drawn
+    i32                fedithow;      // and how it would open the file (FE_*),
+    u8                 fedittip[256]; //   with its tooltip, for the drive
+    i32                fedittiplen;
     Str                fontsset;   // [ui] fonts, at startup
     Slice<FontFile>    sysfonts;   // found, merged before the next frame
     Str                terminal;   // [ui] terminal
@@ -2027,6 +2031,8 @@ struct Gui {
     u32                termserial;   // the last tab's serial
     b32                termfocus;    // focus the terminal when next drawn
     GuiSession        *termaddto;    // root wanting a new tab once sized
+    b32                termletgo;    // the grid lets go of the keyboard: an
+                                     //   editor's tab closed, back to Files
     i32                closeterms;   // busy tabs the quit dialog counted
     i32                closejobs;    // sessions with jobs it counted
     i32                termscroll;   // [terminal] scrollback, for new tabs
@@ -6393,6 +6399,7 @@ static Str  termaddwhy(Gui *, GuiSession *);
 static Str  termwhy(Gui *, GuiSession *);
 static void termgo(Gui *);
 static i32  termbusy(Gui *);
+static i32  termedits(Gui *);
 static void termadd(Gui *, GuiSession *);
 static void termgrab(Gui *);
 static Str  termscreen(Gui *, Arena *);
@@ -6890,6 +6897,7 @@ static void hostcaps(Gui *g, GuiHost *h, Json *j)
     h->version = h->version==version ? h->version : clone(&g->perm, version);
     hostnames(g, &h->cmds, jsonget(j, "cmds"));
     hostnames(g, &h->caps, jsonget(j, "caps"));
+    h->nopty = !jsonint(jsonget(j, "pty"), 1);  // a remote's "up" has none
     Str home = jsonstr(jsonget(j, "home"));
     h->home = h->home==home ? h->home : clone(&g->perm, home);
 }
@@ -7105,19 +7113,76 @@ static Slice<Str> guienv(Gui *g, Arena *a)
     return envsetpath(a, os_environ(g->os, a), guipath(g, a), HOST_WINDOWS);
 }
 
-static Str editorcmd(Gui *g, Arena *a)
+// The editor set: [ui] editor, else $VISUAL, else $EDITOR, else null.
+static Str editorset(Gui *g, Arena *a)
 {
     Str cmd = editorpick(g->editor, os_getenv(g->os, a, "VISUAL"),
-                         os_getenv(g->os, a, "EDITOR"), g->mac);
+                         os_getenv(g->os, a, "EDITOR"), 0);
     return HOST_WINDOWS ? cmdhome(a, cmd, userhome(g->os, a)) : cmd;
+}
+
+// The editor's command (editorpick): the one set, else on macOS the
+// default text editor.
+static Str editorcmd(Gui *g, Arena *a)
+{
+    Str cmd = editorset(g, a);
+    return cmd.len || !g->mac ? cmd : Str("open -W -n -t");
+}
+
+// The editor for a draft, a plan or the configuration file, which the
+// window runs with no terminal and waits for: editorcmd's, except that
+// on macOS a terminal editor named only by $VISUAL or $EDITOR (a Dock
+// launch takes them from the login shell) gives way to the default text
+// editor, so Ctrl+G still works. A terminal [ui] editor stays, refused
+// (editorwhy).
+static Str editordraft(Gui *g, Arena *a)
+{
+    Str cmd = editorcmd(g, a);
+    if (g->mac && !trim(g->editor).len && editorterm(cmd)) {
+        cmd = "open -W -n -t";
+    }
+    return cmd;
+}
+
+// What Open in editor sends with a file of this computer to open in a
+// Terminal tab (term.open's edit): [ui] editor_line if its program runs
+// in a terminal, else the editor set (editorset) if its does, by its
+// name (without .exe and the like, as the reply's); term 0 for an editor with a window of its own, or none.
+struct EditAsk {
+    Str editor;  // the editor's command, else null
+    Str tmpl;    // or its template
+    Str name;    // its program's file name
+    b32 term;    // one of them runs in a terminal
+};
+
+static EditAsk editask(Gui *g, Arena *a)
+{
+    EditAsk r    = {};
+    Str     cmd  = trim(editorset(g, a));
+    Str     tmpl = trim(g->edjumpfmt);
+    Str     use  = tmpl.len ? tmpl : cmd;
+    if (use.len && editorterm(use)) {
+        r.term   = 1;
+        r.name   = termeditname(cmdprog(use, 0));  // as the reply has it
+        r.tmpl   = tmpl.len ? tmpl : Str{};
+        r.editor = tmpl.len ? Str{} : cmd;
+    }
+    return r;
 }
 
 // Why no file can go out to the editor now, for session s (null for the
 // configuration), or null if one can.
 static Str editorwhy(Gui *g, GuiSession *s, Arena *a)
 {
-    if (!editorcmd(g, a).len) {
+    Str cmd = editordraft(g, a);
+    if (!cmd.len) {
         return "no editor: set [ui] editor in the settings (or $VISUAL or $EDITOR)";
+    } else if (editorterm(cmd)) {
+        Buf b(a, 160);
+        print(&b, termeditname(cmdprog(cmd, 0)));
+        print(&b, " runs in a terminal: drafts, plans and the configuration file "
+                  "need [ui] editor to open a window of its own");
+        return finish(&b);
     } else if (g->edcfg) {
         return "the editor has the configuration file open";
     } else if (g->edproc && g->edplan) {
@@ -7279,7 +7344,7 @@ static void editstart(Gui *g, Arena a, GuiSession *s)
         setnote(g, s, why, 1);
         return;
     }
-    Str cmd  = editorcmd(g, &a);
+    Str cmd  = editordraft(g, &a);
     Str dir  = join(&a, g->statedir, "edit");
     Str base = concat(&a, "draft-", s->sid.len ? s->sid : Str("new"));
     Str path = join(&a, dir, concat(&a, base, ".md"));
@@ -7329,7 +7394,7 @@ static void planedit(Gui *g, Arena a, GuiSession *s, Str path, Str req)
         setnote(g, s, why, 1);
         return;
     }
-    Str cmd = editorcmd(g, &a);
+    Str cmd = editordraft(g, &a);
     Str dir = join(&a, g->statedir, "edit");
     Str log = join(&a, dir, concat(&a, concat(&a, "plan-", s->sid), ".log"));
     Str   err = {};
@@ -7362,7 +7427,7 @@ static void cfgeditrun(Gui *g, Arena a, Str path)
     Str   why = editorwhy(g, 0, &a);
     Str   err = {};
     Proc *p   = 0;
-    Str   cmd = editorcmd(g, &a);
+    Str   cmd = editordraft(g, &a);
     Str   dir = join(&a, g->statedir, "edit");
     Str   log = join(&a, dir, "config.log");
     if (why.len) {
@@ -14446,6 +14511,11 @@ enum : i32 {
                       // New session's folder field (RECT_NEWCWD)
     CHK_DRAGQUIET,    // no frames since the mark with a drag resting over
                       // the window (dx 0), or after it ended (dx 1)
+    CHK_FILEFOCUS,    // the Files pane has the focus
+    CHK_TERMBANNER,   // the front terminal tab's banner begins with text
+    CHK_EDITROUTE,    // the Files toolbar's Open in editor would open a
+                      // Terminal tab (dx 1) or a window (dx 0), its
+                      // tooltip holding text
     CHK_COUNT,
 };
 
@@ -14771,6 +14841,9 @@ static Str chknames[] = {
     "a turn began by Continue, and nothing is paused",
     "where a drag would drop, and what its card says",
     "no frames with a drag resting, or after it",
+    "the Files pane has the focus",
+    "the terminal's banner says what it should",
+    "Open in editor opens a tab or a window, as said",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -17334,7 +17407,8 @@ static DriveOp m3ops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_CHECK, CHK_REVEALED, 0, 0, 0, "/files/lines.txt"},
-    {OP_IFEDITOR, 0, 5, 0, 0, ""},
+    {OP_IFEDITOR, 0, 6, 0, 0, ""},
+    {OP_CHECK, CHK_EDITROUTE, 0, 0, 0, "Open the file in your editor: "},
     {OP_MOVE, T_NAMED, 0, 0, 300, "file editor"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
@@ -20615,6 +20689,88 @@ static DriveOp termops[] = {
     {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
     CTRLKEY(GKEY_C, 300),
     {OP_WAIT, W_TERMBUSY, 0, 0, 5000, "idle"},
+    // Open in editor, [ui] editor a terminal editor (gui.py's fake mg,
+    // which prints its arguments, then takes 'w TEXT' or 'q N'): a
+    // Terminal tab of the file's session runs it, named by it, with the
+    // keyboard, and draws nothing while it waits. The keyboard is first
+    // taken from the terminal, whose Ctrl+O is the shell's on Linux and
+    // Windows.
+    {OP_MOVE, T_TRANSCRIPT, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    CMDKEY(GKEY_O, 500),
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 300, "edit.txt:12"},
+    TERMKEY(GKEY_ENTER, 300),
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_EDITROUTE, 1, 0, 0, "in mg, in a Terminal tab"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file editor"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_WAIT, W_TERM, 0, 0, 10000, "fake mg [+12]"},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, TERMSH "|*mg edit.txt"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMCOUNT, 3, 0, 0, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 4500, ""},
+    {OP_MARK, 0, 0, 0, 3000, ""},
+    {OP_CHECK, CHK_TERMQUIET, 0, 0, 0, ""},
+    // Again from Files, in front of the Terminal pane in their shared
+    // node: its tab is shown, not another opened
+    {OP_MOVE, T_TRANSCRIPT, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    CMDKEY(GKEY_O, 500),
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 300, "edit.txt"},
+    TERMKEY(GKEY_ENTER, 300),
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_EDITROUTE, 1, 0, 0, "Show its Terminal tab, where mg has it open"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file editor"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMCOUNT, 3, 0, 0, ""},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, TERMSH "|*mg edit.txt"},
+    // Saved, the editor exits: its tab closes, and Files has the file,
+    // read again, with the focus
+    {OP_TEXT, 0, 0, 0, 100, "w edited by mg"},
+    TERMKEY(GKEY_ENTER, 300),
+    {OP_WAIT, W_TERMCOUNT, 2, 0, 5000, ""},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*" TERMSH},
+    {OP_CHECK, CHK_FILEFOCUS, 0, 0, 0, ""},
+    {OP_WAIT, W_FILEFRESH, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILETEXT, 0, 0, 0, "edited by mg"},
+    // A failing exit leaves its banner, naming it, and Enter (Restart)
+    // runs it again; quitting asks, counting it, and a clean exit closes
+    // it
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file editor"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_WAIT, W_TERM, 0, 0, 10000, "fake mg ["},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 100, "q 3"},
+    TERMKEY(GKEY_ENTER, 1000),
+    {OP_CHECK, CHK_TERMBANNER, 0, 0, 0, "mg exited with code 3"},
+    {OP_SHOT, 0, 0, 0, 300, "terminal-editor"},
+    TERMKEY(GKEY_ENTER, 500),
+    {OP_WAIT, W_TERM, 0, 0, 10000, "fake mg ["},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, TERMSH "|*mg edit.txt"},
+    {OP_CLOSE, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_CLOSEMODAL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMCLOSE, 1, 0, 0, ""},
+    {OP_MOVE, T_CLOSECANCEL, 0, 0, 200, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    CTRLKEY(GKEY_GRAVE, 500),  // the dialog took the keyboard
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 100, "q 0"},
+    TERMKEY(GKEY_ENTER, 300),
+    {OP_WAIT, W_TERMCOUNT, 2, 0, 5000, ""},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*" TERMSH},
+    {OP_CHECK, CHK_FILEFOCUS, 0, 0, 0, ""},
     // A session on a remote host (tests/gui.py's fake ssh, --rcwd its
     // folder) has its own tabs there, its shell run by that host's
     // engine: busy comes back through the host, a dropped link shows
@@ -23785,6 +23941,31 @@ static b32 drivecheck(Gui *g, i32 chk)
             return g->drag.on && drivequiet(g, "with a drag resting over the window", 2);
         }
         return !g->drag.on && drivequiet(g, "after a drag", 2);
+    case CHK_FILEFOCUS:
+        return g->panes[PANE_FILES] && g->filesfocus;
+    case CHK_TERMBANNER: {
+        TermTab *tt  = termfront(g);
+        Arena    a   = g->frame;
+        b32      end = tt && (tt->state==TT_ENDED || tt->state==TT_FAILED);
+        Str      got = end ? termbannertext(&a, tt) : Str("no banner");
+        guilog(g, concat(&a, "drive: the terminal's banner: ", got));
+        return end && startswith(got, g->ops[g->drivepc-1].text);
+    }
+    case CHK_EDITROUTE: {
+        DriveOp *op  = &g->ops[g->drivepc-1];
+        Str      tip = {g->fedittip, g->fedittiplen};
+        Arena    a   = g->frame;
+        Buf      b(&a, 128 + tip.len);
+        print(&b, "drive: Open in editor opens ");
+        print(&b, g->fedithow==FE_WINDOW ? Str("a window") :
+                  g->fedithow==FE_WHY    ? Str("nothing") : Str("a tab"));
+        print(&b, ", saying ");
+        print(&b, tip);
+        guilog(g, finish(&b));
+        b32 tab = g->fedithow==FE_TAB || g->fedithow==FE_SHOW;
+        b32 how = op->dx!=0 ? tab : g->fedithow==FE_WINDOW;
+        return filefront(g) && how && find(tip, op->text)>=0;
+    }
     case CHK_SHOTCLOSED: {
         ImGuiWindow *w = ImGui::FindWindowByName("Screenshot");
         return !g->img.view.open && !g->img.view.tex && !g->img.dying && (!w || !w->Active);
@@ -25260,7 +25441,7 @@ static b32 drivecheck(Gui *g, i32 chk)
         for (i32 i = 0; s && i<s->terms.n; i++) {
             print(&b, i ? Str("|") : Str(""));
             print(&b, i==s->terms.front ? Str("*") : Str(""));
-            print(&b, termlabel(s->terms.tabs[i]));
+            termlabel(&b, s->terms.tabs[i]);
         }
         Str got = finish(&b);
         if (!(got == g->ops[g->drivepc-1].text)) {

@@ -33,8 +33,12 @@ the X at the field's end, empties it.
 
 **Open in editor**, beside Reload, opens the file itself in your
 editor (`[ui] editor`, else `$VISUAL` or `$EDITOR`), to edit it by
-hand. A missing file is first created: from the built-in copy, as by
-a first save, or empty for one named by `-c`. Once the editor exits, Settings reads the file again.
+hand, in an editor with a window of its own: a `[ui] editor` that runs
+in a terminal, such as `vim`, is refused here, as for drafts and
+plans, while on macOS one named only by `$VISUAL` or `$EDITOR` gives
+way to the default text editor. A missing file is first created: from
+the built-in copy, as by a first save, or empty for one named by `-c`.
+Once the editor exits, Settings reads the file again.
 Cancel stops the editor and keeps the file as it left it.
 
 The state directory holds the sessions, those in the Trash too, the
@@ -270,16 +274,27 @@ fails with a link to sign up for Copilot Free.
   missing, rather than asking to install them. The branch on the
   session bar needs no git. A remote host's engine uses its own
   configuration's.
-- **[`[ui] editor`](settings:ui#editor)**: the command that opens a draft (Ctrl+G) or a plan
-  in an editor, given the file as one more word. It must wait until
-  you are done and open a window of its own, as `code --wait`,
-  `subl -w` or `gvim -f` do. Empty, it is `$VISUAL`, else `$EDITOR`,
-  else on macOS the default text editor, which you then quit. Started
-  from the Finder or a desktop menu, Prospero has no `$VISUAL` or
-  `$EDITOR`: set this, with a full path if need be. On Windows its
-  program is looked for by its full path or on PATH, and run by the
-  full path found, so a program of that name in the file's folder
-  never runs instead, and a relative path does not work.
+- **[`[ui] editor`](settings:ui#editor)**: the command that opens a draft (Ctrl+G), a plan
+  or the configuration file in an editor, given the file as one more
+  word, and the editor of the Files pane's Open in editor. For a
+  draft, a plan or the configuration file it must wait until you are
+  done and open a window of its own, as `code --wait`, `subl -w` or
+  `gvim -f` do. Empty, it is `$VISUAL`, else `$EDITOR`, else on macOS
+  the default text editor, which you then quit; on macOS a terminal
+  editor named only by `$VISUAL` or `$EDITOR` gives way to that default
+  for drafts, plans and the configuration file. Open in editor runs an
+  editor that runs in a terminal (`vim`, `nvim`, `nano`, `hx`,
+  `emacs -nw`) in a Terminal tab of the file's session
+  ([Files](help:sessions#files)), on Linux and macOS through your login
+  shell, so `$PATH` and the rest of your profile apply; a profile that
+  starts something interactive, such as `exec tmux`, can skip it while
+  `PROSPERO_EDIT_FILE` is set. On Windows, which has no login shell, it
+  is found on PATH and runs through cmd.exe. Started from the Finder or
+  a desktop menu, Prospero has no `$VISUAL` or `$EDITOR`: set this,
+  with a full path if need be. On Windows its program is looked for by
+  its full path or on PATH, and run by the full path found, so a
+  program of that name in the file's folder never runs instead, and a
+  relative path does not work.
 - **[`[ui] editor_line`](settings:ui#editor_line)**: the command that
   the Files pane's Open in editor runs, for an editor whose arguments
   for a line Prospero does not know: `{file}` is the file's path,
@@ -288,9 +303,13 @@ fails with a link to sign up for Copilot Free.
   Empty, it is the editor's command with the arguments its editor
   takes: `code -g`, `cursor`, `windsurf`, `zed`, `subl`, `gvim +N`,
   `emacs`, `gedit`, JetBrains' `--line`, `mate` and `kate`'s `-l`,
-  `notepad++ -n`. Open in editor does not wait, and refuses an editor
-  that runs in a terminal (`vim`, `nano`, `emacs -nw`); one opened by a
-  terminal, as `alacritty -e nvim`, works.
+  `notepad++ -n`. Open in editor does not wait for an editor with a
+  window of its own; one that runs in a terminal (`vim`, `nano`,
+  `emacs -nw`) runs in a Terminal tab of the file's session, as
+  `[ui] editor` says, and one opened by a terminal of its own, as
+  `alacritty -e nvim`, opens as a window would. On Linux with no editor set at all, Open in
+  editor opens a Terminal tab with your login shell's `$VISUAL` or
+  `$EDITOR`, else `vi`.
 - **[`[ui] terminal`](settings:ui#terminal)**: the terminal that Open in external terminal opens: on
   macOS an application's name (`iTerm`, `Ghostty`), elsewhere a program
   (`wt.exe`, `konsole`, `kitty`, `wezterm`), whose options for its

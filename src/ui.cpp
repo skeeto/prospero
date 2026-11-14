@@ -7340,13 +7340,14 @@ static void drawprompt(Gui *g)
         act = ImGui::MenuItem("Select all", cmdkey(g, &a, "A"), false, any) ? CM_SELALL : act;
         itemrect(g, RECT_CMSELALL);
         ImGui::Separator();
-        b32 ed = !g->edproc && editorcmd(g, &a).len;
+        Str edwhy = editorwhy(g, s, &a);
+        b32 ed    = !edwhy.len;
         if (ImGui::MenuItem("Open in editor", "Ctrl+G", false, ed)) {
             editstart(g, a, s);
         }
         itemrect(g, RECT_CMEDITOR);
-        if (!editorcmd(g, &a).len) {
-            itemtip("Set [ui] editor in the settings, or $VISUAL or $EDITOR");
+        if (edwhy.len) {
+            whytip(edwhy);
         }
         g->cmenustate = (undo ? 1 : 0) | (redo ? 2 : 0) | (sel ? 4 : 0) | (clip ? 8 : 0) | (ed ? 16 : 0);
         if (act) {
@@ -12088,6 +12089,7 @@ static void drawclose(Gui *g)
         i32 j = jobbing(g);
         i32 m = elsewhere(g);
         i32 t = termbusy(g);
+        i32 e = termedits(g);  // of those, editors'
         g->closeterms = t;
         g->closejobs  = j;
         Buf b(&a, 128);
@@ -12112,13 +12114,22 @@ static void drawclose(Gui *g)
         if (!n && !j && !t) {
             ImGui::TextUnformatted("Nothing is running here any more.");
         }
-        if (t) {
-            Buf e(&a, 128);
-            print(&e, (i64)t);
-            print(&e, t==1 ? Str(" terminal tab is running a program")
-                           : Str(" terminal tabs are running programs"));
-            print(&e, ", which quitting hangs up.");
-            ImGui::TextUnformatted(cstr0(&a, finish(&e)));
+        if (t > e) {
+            Buf w(&a, 128);
+            print(&w, (i64)(t - e));
+            print(&w, t-e==1 ? Str(" terminal tab is running a program")
+                             : Str(" terminal tabs are running programs"));
+            print(&w, ", which quitting hangs up.");
+            ImGui::TextUnformatted(cstr0(&a, finish(&w)));
+        }
+        if (e) {
+            Buf w(&a, 128);
+            print(&w, (i64)e);
+            print(&w, e==1 ? Str(" editor tab has a file open, which quitting hangs up, "
+                                 "losing what it has not saved.")
+                           : Str(" editor tabs have files open, which quitting hangs up, "
+                                 "losing what they have not saved."));
+            ImGui::TextUnformatted(cstr0(&a, finish(&w)));
         }
         if (m) {
             Buf e(&a, 128);
@@ -12142,6 +12153,11 @@ static void drawclose(Gui *g)
             itemrect(g, RECT_CLOSEBG);
             if (g->whynobg.len) {
                 itemtip("Not here: %s", cstr0(&a, g->whynobg));
+            } else if (e) {
+                itemtip("Close the window and its terminal tabs, and keep this "
+                        "process running its sessions, unattended, with a tray icon "
+                        "to bring it back. Its editor tabs lose what they have not "
+                        "saved");
             } else {
                 itemtip("Close the window and its terminal tabs, and keep this "
                         "process running its sessions, unattended, with a tray icon "

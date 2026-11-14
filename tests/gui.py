@@ -194,6 +194,25 @@ printf '\\n# Added in the editor\\n[model edited-by-hand]\\ntemperature = 0.3\\n
 """
 
 
+# The terminal mode's fake terminal editor, mg by name (a terminal editor
+# Prospero knows, which no system ships): it prints its arguments, then
+# takes a line, 'w TEXT' to write TEXT as its file (its last argument)
+# and exit 0, or 'q N' to exit N
+MG_EDITOR = """#!/bin/sh
+printf 'fake mg'
+for a in "$@"; do printf ' [%s]' "$a"; done
+printf '\\n'
+for f in "$@"; do :; done
+while IFS= read -r line; do
+    case $line in
+    "w "*) printf '%s\\n' "${line#w }" >"$f"; exit 0;;
+    "q "*) exit "${line#q }";;
+    esac
+done
+exit 1
+"""
+
+
 def composeconfig(editor, nonce):
     """The compose mode's: the test editor, by its name alone, found in
     a directory of [tools] path_prepend as a desktop-started GUI finds
@@ -1881,6 +1900,9 @@ def main():
         os.environ.setdefault("PROSPERO_TEST_HANDSOFF", "1")
     if args.mode == "signals":
         return signals(args)
+    # The window's editor comes from its configuration alone
+    for k in ("VISUAL", "EDITOR"):
+        os.environ.pop(k, None)
 
     if args.mode in ("hosttask", "thin") and (args.host or args.ssh):
         ap.error(f"--mode {args.mode} runs only here, through the fake ssh")
@@ -2038,6 +2060,24 @@ def main():
         before = config(curl, model) + termcfg
         os.environ["PS1"] = "tty$ "
         os.environ["HISTFILE"] = ""  # not the user's history
+        if args.mode == "terminal":
+            # Open in editor's terminal editor, the fake mg, by its full
+            # path, which no profile's PATH shadows, on a file of
+            # numbered lines; the login shell an editor's tab starts
+            # through, plain sh
+            mg = host.path("mg")
+            host.write(mg, MG_EDITOR)
+            if os.name == "nt" or args.host:  # a Windows host's
+                sh = shutil.which("sh").replace("\\", "/") if not args.host else "sh"
+                host.write(host.path("mg.cmd"),
+                           f'@"{sh}" "%~dp0mg" %*\r\n@exit /b %errorlevel%\r\n')
+                mg = host.path("mg.cmd")
+            else:
+                os.chmod(mg, 0o755)
+                os.environ["SHELL"] = "/bin/sh"
+            host.write(host.path("work", "edit.txt"),
+                       "".join(f"line {i}\n" for i in range(1, 31)))
+            before += f"\n# Open in editor's, a fake terminal editor\n[ui]\neditor = {shword(mg)}\n"
     elif args.mode == "drive" and not args.fake:
         before = config(curl, model, extra=m4config(curl, nonce))
         if not args.host:

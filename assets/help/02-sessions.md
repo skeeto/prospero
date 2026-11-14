@@ -327,6 +327,23 @@ container's folder mounted here, or, on Windows, in a WSL distro;
 for another host's they say why not. A binary file says so, with Show
 as text anyway; past 4 MiB or 100,000 lines only the start shows.
 
+An editor that runs in a terminal (`vim`, `nvim`, `nano`, `hx`,
+`emacs -nw`), as `[ui] editor`, `$VISUAL` or `$EDITOR` names it, opens
+a file of this computer in a Terminal tab of its session instead, at
+the same line and column, with the keyboard. On Linux and macOS your
+login shell starts it, so your profile's `$PATH` applies
+([Settings](help:config)); on Windows it is found on PATH and runs
+through cmd.exe. On
+Linux with no editor set at all, the tab runs the login shell's
+`$VISUAL` or `$EDITOR`, else `vi`. The tab is named for the editor and
+the file, as `vim notes.txt`. When the editor exits with status 0, as
+after `:wq`, its tab closes and Files shows the file again, read
+again, with the focus. Any other exit (`:cq`) leaves the tab with a
+banner saying how it ended, and its Restart (or Enter) runs the editor
+on the file again. Open in editor on a file already open in a tab
+shows that tab. Drafts, plans and the configuration file still need an
+editor with a window of its own.
+
 An image file (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp` or `.bmp`)
 shows as the image, up to 32 MiB and 16 million pixels, its size in
 pixels above it. Fit, on in each new tab, scales it to the pane, larger
@@ -431,7 +448,12 @@ Right-click a session in the sidebar, or open the Session menu, for:
   console) on Windows, and elsewhere `$TERMINAL` or the first of the
   usual ones found.
 - **New terminal tab** (Ctrl+Shift+`): another shell in its folder, in
-  a tab of the Terminal pane.
+  a tab of the Terminal pane. A session has at most 8 tabs, and a host
+  16 open, an editor's tab from Files' Open in editor among them. An
+  editor's tab has a file open: quitting asks first, as for a tab
+  running a program, and says that its unsaved changes would be lost;
+  its menu's Close and Kill hang the editor up, and Restart runs it on
+  the file again.
 - **Close**: stop its background jobs and subagents, deny what it asks
   from then on, and let it go from memory in this window. Opening it
   again reads it back.

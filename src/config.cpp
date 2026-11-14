@@ -644,11 +644,17 @@ static CfgKey cfgschema[] = {
      "(NotoSansCJK.ttc#2); none for none. Read at startup"},
     {"ui", "editor", CFG_STRING, "", {}, {}, "ui",
      "The command that opens a draft in an editor (Ctrl+G, or the compose "
-     "box's menu), given the file as one more word; it must wait until the "
-     "editing is done, as code --wait, subl -w or gvim -f do, and run a "
-     "window of its own, since there is no terminal. Empty: $VISUAL, else "
-     "$EDITOR, else on macOS the default text editor (open -W -n -t), "
-     "which must be quit. A GUI started from the Finder or a desktop menu "
+     "box's menu), a plan or the configuration file, given the file as one "
+     "more word; for those it must wait until the editing is done, as code "
+     "--wait, subl -w or gvim -f do, and run a window of its own, since "
+     "there is no terminal. Empty: $VISUAL, else $EDITOR, else on macOS the "
+     "default text editor (open -W -n -t), which must be quit; on macOS a "
+     "terminal editor named only by $VISUAL or $EDITOR gives way to it for "
+     "those. Files' Open in editor runs a terminal editor (vim, nvim, nano, "
+     "hx, emacs -nw) in a Terminal tab of the file's session, on Linux and "
+     "macOS through the login shell, which can test PROSPERO_EDIT_FILE to "
+     "skip an exec tmux (on Windows found on PATH, run by cmd.exe). "
+     "A GUI started from the Finder or a desktop menu "
      "has no shell environment: no $VISUAL, no $EDITOR, and its PATH may "
      "lack the editor, so name it in full here, or add its directory to "
      "[tools] path_prepend. On Windows its program is looked for here, by "
@@ -662,7 +668,10 @@ static CfgKey cfgschema[] = {
      "myedit --goto {file}:{line}; with no {file}, the path goes last. "
      "Empty: [ui] editor's command, with the arguments its editor takes "
      "(code -g, zed, subl, gvim +N, emacs, JetBrains --line and others). "
-     "It must open a window of its own, and it is not waited for"},
+     "An editor with a window of its own is not waited for; one that runs "
+     "in a terminal runs in a Terminal tab, as for [ui] editor. On Linux "
+     "with no editor set at all, the tab runs the login shell's $VISUAL or "
+     "$EDITOR, else vi"},
     {"ui", "terminal", CFG_STRING, "", {}, {}, "ui",
      "The terminal that a session's Open in external terminal opens in its folder: "
      "on macOS an application's name (Terminal, iTerm, Ghostty), elsewhere "

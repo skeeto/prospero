@@ -65,7 +65,13 @@ Windows it knows what the drag holds, counting the files, sending a
 folder to New session and refusing text, and a drop that would be
 refused springs back (on Linux, and on Windows for a drag with paths on
 a network drive or a disc, which are not looked at, it shows only the
-place). The
+place). Its Open in editor opens the file at its line in `[ui] editor`
+(else `$VISUAL` or `$EDITOR`); one that runs in a terminal, such as
+`vim`, `nano` or `hx`, runs in a Terminal tab of the session, started
+by the login shell (on Windows, found on PATH and run by cmd.exe),
+and once it exits with status 0 the tab closes and Files shows the
+file again, read again (on Linux, with no editor set,
+the login shell's `$VISUAL` or `$EDITOR`, else `vi`). The
 window opens where it was last, fitted to the displays there are; the
 first time, 1700 by 900 at the display's scale, or maximized on a display
 too small for that. The first run shows Help in front, with Settings and
@@ -145,7 +151,9 @@ started from a session begins fresh, nested under it, and reports its
 branch back to it with `send_message` when asked. The prompt box keeps a draft
 per session, with the engine, has the session's earlier prompts on Up
 and Down, opens the draft in an editor with Ctrl+G (`[ui] editor`,
-else `$VISUAL` or `$EDITOR`), and takes `/compact`, `/model`,
+else `$VISUAL` or `$EDITOR`, one with a window of its own: a terminal
+editor is refused, or on macOS, named only by `$VISUAL` or `$EDITOR`,
+gives way to the default text editor), and takes `/compact`, `/model`,
 `/rename`, `/fork`, `/side`, `/worktree`, `/export`, `/plan`, `/background` and a skill's
 `/NAME`. Run in background (Ctrl+B, Cmd+B on macOS) moves a running
 command to a job, or a subagent at work on by itself, so that the

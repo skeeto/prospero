@@ -80,8 +80,12 @@ there too.
   plain **Enter** puts the pick in the message without sending it,
   **Up** and **Down** move the pick, and **Esc** closes the list before
   it reaches the turn.
-- **Ctrl+G** opens the draft in your editor (`[ui] editor`); the draft
-  becomes what you save, once the editor exits.
+- **Ctrl+G** opens the draft in your editor (`[ui] editor`), which
+  must open a window of its own; the draft becomes what you save, once
+  the editor exits. A terminal `[ui] editor`, such as `vim`, is
+  refused here, though the Files pane's Open in editor runs one in a
+  Terminal tab; on macOS one named only by `$VISUAL` or `$EDITOR` gives
+  way to the default text editor.
 - **Ctrl+V** pastes text, or attaches a copied image. **Ctrl+Shift+V**
   does the same.
 - Right-click for Undo, Redo, Cut, Copy, Paste, Select all and Open in

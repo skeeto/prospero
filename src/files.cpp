@@ -1353,6 +1353,158 @@ static Str filejumptip(Arena *a, EditJump *j)
     return tip;
 }
 
+// How Open in editor opens a file
+enum : i32 {
+    FE_WHY,     // it cannot: why
+    FE_WINDOW,  // in an editor with a window of its own (editorjumprun)
+    FE_TAB,     // in a Terminal tab of its root, on its host (termedit)
+    FE_SHOW,    // the tab that has it open already, shown
+};
+
+struct FileEdit {
+    i32         how;   // FE_*
+    EditJump    j;     // FE_WINDOW's command
+    GuiSession *root;  // FE_TAB's and FE_SHOW's
+    TermTab    *tt;    // FE_SHOW's tab
+    Str         name;  // the editor sent (editask), null for the host's own
+    Str         why;   // FE_WHY's
+};
+
+// How Open in editor would open a file of a host (uid, 0 for this
+// computer) at a line and column (0 for none), from root (the window's
+// nosession for none). This computer's file opens in a Terminal tab of
+// root when the editor runs in a terminal (editask), and on Linux when
+// no editor is set at all, the login shell's $VISUAL or $EDITOR then,
+// else vi; an editor with a window of its own opens as C10 has it, as
+// does no editor on macOS (TextEdit) or Windows (a why). Another host's
+// file goes to C10's mapping, its whys kept.
+static FileEdit fileedit(Gui *g, Arena *a, GuiSession *root, u64 host, Str path, i32 line,
+                         i32 col)
+{
+    FileEdit r = {};
+    r.root = root;
+    EditAsk ask  = host ? EditAsk{} : editask(g, a);
+    b32     none = !editorset(g, a).len && !trim(g->edjumpfmt).len;
+    b32     own  = !host && none && !g->mac && !HOST_WINDOWS;
+    if (!ask.term && !own) {
+        r.j   = filejump(g, a, host, path, line, col);
+        r.how = r.j.why.len ? FE_WHY : FE_WINDOW;
+        r.why = r.j.why;
+        return r;
+    }
+    r.name  = ask.name;
+    r.how   = FE_WHY;
+    if (root == &g->nosession) {
+        // No host, no session: termwhy must never see it
+        Str who = r.name.len ? r.name : Str("the editor");
+        r.why = concat(a, concat(a, "No session is open: ", who),
+                       " runs in a session's Terminal tab");
+        return r;
+    }
+    u64 at = fileuid(root->host);
+    if (at != host) {
+        Buf b(a, 128);
+        print(&b, "Its file is on ");
+        print(&b, filehostname(g, a, host));
+        print(&b, ", its session on ");
+        print(&b, filehostname(g, a, at));
+        r.why = finish(&b);
+        return r;
+    }
+    r.why = termwhy(g, root);
+    r.why = r.why.len ? r.why : hostwhy(g, root, "term.edit");
+    if (!r.why.len && root->host->nopty) {
+        r.why = "Terminals need Windows 10 version 1809 or later";
+    }
+    if (r.why.len) {
+        return r;
+    }
+    TermTab *tt = termeditof(root, path);
+    if (tt && tt->state!=TT_ENDED && tt->state!=TT_FAILED) {
+        r.how = FE_SHOW;
+        r.tt  = tt;
+        return r;
+    }
+    r.why = tt ? Str{} : termfull(g, root);
+    r.how = r.why.len ? FE_WHY : FE_TAB;
+    return r;
+}
+
+// Open in editor, launched as fileedit says.
+static void fileeditrun(Gui *g, Arena a, GuiSession *root, u64 host, Str path, i32 line,
+                        i32 col)
+{
+    FileEdit e = fileedit(g, &a, root, host, path, line, col);
+    switch (e.how) {
+    case FE_WHY:
+        g->lasterr = clone(&g->perm, e.why);
+        break;
+    case FE_WINDOW:
+        filejumprun(g, a, host, path, line, col);
+        break;
+    case FE_TAB:
+    case FE_SHOW:
+        termedit(g, e.root, path, line, col);
+        break;
+    }
+}
+
+// Open in editor's tooltip while it can, as fileedit has it.
+static Str fileedittip(Arena *a, FileEdit *e)
+{
+    switch (e->how) {
+    case FE_WINDOW:
+        return filejumptip(a, &e->j);
+    case FE_SHOW: {
+        Str name = termeditname(e->tt);
+        name = name.len ? name : e->name.len ? e->name : Str("the editor");
+        return concat(a, concat(a, "Show its Terminal tab, where ", name), " has it open");
+    }
+    case FE_TAB:
+        if (e->name.len) {
+            return concat(a, concat(a, "Open the file in ", e->name), ", in a Terminal tab");
+        }
+        return "Open the file in a Terminal tab, in the editor $VISUAL or $EDITOR names "
+               "there, else vi";
+    }
+    return {};
+}
+
+// An editor tab's file, on its host, in root's tabs: marked to be
+// checked once shown, as the editor may have changed it.
+static void termeditstale(Gui *g, GuiSession *root, TermTab *tt)
+{
+    u64      uid = fileuid(tt->host);
+    GuiHost *h   = filehost(g, uid);
+    i32      i   = filesetfind(&root->files, uid, tt->edpath, h ? hostwin(h) : (b32)HOST_WINDOWS);
+    if (i >= 0) {
+        filetabstale(g, root->files.tabs[i]);
+    }
+}
+
+// An editor's tab in root closed as the editor exited with status 0:
+// its file, of host h, on path, shown again in Files, read again, with
+// the focus, as the root is shown; the Terminal pane hidden again if it
+// was as the editor opened (hide) and has no tab left. A root not shown
+// only has the file marked.
+static void editdone(Gui *g, GuiSession *root, GuiHost *h, Str path, b32 hide)
+{
+    u64      uid = fileuid(h);
+    GuiHost *fh  = filehost(g, uid);
+    i32      i   = filesetfind(&root->files, uid, path, fh ? hostwin(fh) : (b32)HOST_WINDOWS);
+    if (i >= 0) {
+        filetabstale(g, root->files.tabs[i]);
+    }
+    if (!g->sess || termroot(g, g->sess)!=root) {
+        return;
+    }
+    g->termletgo = 1;
+    filesopen(g, root, uid, path, 0, 0, {});
+    if (hide && !root->terms.n) {
+        setpane(g, PANE_TERMINAL, 0);
+    }
+}
+
 // Reveal's tooltip, by the platform's file manager.
 static Str filerevealtip()
 {
@@ -1386,16 +1538,20 @@ static void filelinkitems(Gui *g)
     } else {
         itemtip("Show the file in the Files pane");
     }
-    EditJump j = path.len ? filejump(g, &a, m->host, path, m->line0, m->col) : EditJump{};
-    Str jwhy = !path.len ? why : j.why;
+    GuiSession *root = m->s ? termroot(g, m->s) : &g->nosession;
+    FileEdit    e    = {};
+    if (path.len) {
+        e = fileedit(g, &a, root, m->host, path, m->line0, m->col);
+    }
+    Str jwhy = !path.len ? why : e.how==FE_WHY ? e.why : Str{};
     if (ImGui::MenuItem("Open in editor", 0, false, !jwhy.len)) {
-        filejumprun(g, a, m->host, path, m->line0, m->col);
+        fileeditrun(g, a, root, m->host, path, m->line0, m->col);
     }
     itemnamed(g, "linkmenu editor");
     if (jwhy.len) {
         whytip(jwhy);
     } else {
-        itemtip("%s", cstr0(&a, filejumptip(&a, &j)));
+        itemtip("%s", cstr0(&a, fileedittip(&a, &e)));
     }
     if (ImGui::MenuItem("Copy path", 0, false, path.len>0)) {
         ImGui::SetClipboardText(cstr0(&a, path));
@@ -2069,10 +2225,11 @@ static FileBar filetabs(Gui *g, GuiSession *root)
             }
             i32      col  = 0;
             i32      line = filetabline(ft, &col);
-            EditJump j    = filejump(g, &a, ft->host, ft->path, line, col);
-            Str      tip  = j.why.len ? Str{} : filejumptip(&a, &j);
-            if (menutip(g, &a, "Open in editor", j.why, tip)) {
-                filejumprun(g, a, ft->host, ft->path, line, col);
+            FileEdit e    = fileedit(g, &a, root, ft->host, ft->path, line, col);
+            Str      ewhy = e.how==FE_WHY ? e.why : Str{};
+            Str      tip  = ewhy.len ? Str{} : fileedittip(&a, &e);
+            if (menutip(g, &a, "Open in editor", ewhy, tip)) {
+                fileeditrun(g, a, root, ft->host, ft->path, line, col);
             }
             ImGui::EndPopup();
         }
@@ -2811,19 +2968,26 @@ static void drawfiles(Gui *g)
         whytip(rwhy.len ? rwhy : filerevealtip());
         ImGui::SameLine();
 
-        i32      col  = 0;
-        i32      line = filetabline(ft, &col);
-        EditJump j    = filejump(g, &a, ft->host, ft->path, line, col);
-        ImGui::BeginDisabled(j.why.len > 0);
+        i32         col  = 0;
+        i32         line = filetabline(ft, &col);
+        GuiSession *root = filesroot(g);
+        FileEdit    e    = fileedit(g, &a, root, ft->host, ft->path, line, col);
+        Str         ewhy = e.how==FE_WHY ? e.why : Str{};
+        ImGui::BeginDisabled(ewhy.len > 0);
         if (ImGui::Button("Open in editor")) {
-            filejumprun(g, a, ft->host, ft->path, line, col);
+            fileeditrun(g, a, root, ft->host, ft->path, line, col);
         }
         ImGui::EndDisabled();
         itemnamed(g, "file editor");
-        whytip(j.why.len ? j.why : filejumptip(&a, &j));
-        iz n = j.why.len<(iz)sizeof(g->fjumpwhy) ? j.why.len : (iz)sizeof(g->fjumpwhy);
-        copybytes(g->fjumpwhy, j.why.data, n);
+        Str tip = ewhy.len ? ewhy : fileedittip(&a, &e);
+        whytip(tip);
+        iz n = ewhy.len<(iz)sizeof(g->fjumpwhy) ? ewhy.len : (iz)sizeof(g->fjumpwhy);
+        copybytes(g->fjumpwhy, ewhy.data, n);
         g->fjumpwhylen = (i32)n;
+        iz t = tip.len<(iz)sizeof(g->fedittip) ? tip.len : (iz)sizeof(g->fedittip);
+        copybytes(g->fedittip, tip.data, t);
+        g->fedittiplen = (i32)t;
+        g->fedithow    = e.how;
         ImGui::SameLine();
     }
     {
