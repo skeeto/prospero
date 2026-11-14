@@ -64,14 +64,18 @@ without a terminal, and takes under five seconds. Add directories with
 full path if need be. See [Configuration](help:config).
 
 **"The file system is not responding" or "The file system is busy:
-try again".** A file, folder or completion on another host's share or
-mount took over ten seconds without an answer, so the engine gave up
-on it; paths under it are refused at once until it answers again.
-When it is on a network share or mount, the whole share is refused
-that way, so other files there fail at once instead of each waiting.
-Busy means the engine's file readers were all occupied, usually
-waiting on such a path, so the request was not started in time. Check the share or network drive there, then try again. A reader
-stuck that way can also make that engine slow to exit.
+try again".** A file, folder or completion on a share or mount took
+over ten seconds without an answer, so Prospero gave up on it: on
+another host its engine, and for a file on this computer shown in
+Files, or checked by Open file, the window's own file readers, which
+keep the window drawing meanwhile. Paths under it are refused at once
+until it answers again. When it is on a network share or mount, the
+whole share is refused that way, so other files there fail at once
+instead of each waiting. Busy means the file readers were all
+occupied, usually waiting on such a path, so the request was not
+started in time. Check the share or network drive, then try again
+(Retry, in Files). A reader stuck that way can also make that engine
+slow to exit.
 
 **An ask was denied before you answered.** Asks are denied when their
 time runs out (`[guard] ask_timeout`, 60 s; 0 for no limit), and at

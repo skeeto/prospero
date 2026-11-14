@@ -198,6 +198,8 @@ enum : u32 {
     TASK_FONTS,         // the system's fonts picked (findfonts): a line each
     TASK_OPENFILE,      // Open file's path (fileanswerput): LINE0 LINE1 PATH, then
                         // a line with its section
+    TASK_FS,            // a file worker's answer, or beat after holding (guifs):
+                        // fsdone's, making no frame of its own
 };
 
 // Item rectangles the scripted checklist aims at
@@ -834,15 +836,15 @@ struct LinkMenu {
 };
 
 // Inline code naming a file (doc.cpp's DocCand) is drawn as a link once
-// the file is found: on this computer by filestat, on another host by
-// fs.stat there. Asked only of what is drawn, and remembered by host
+// the file is found: on this computer by filestat on the window's file
+// workers, on another host by fs.stat there. Asked only of what is
+// drawn, and remembered by host
 // and resolved path (codelinks, files.cpp). Each path is a CodeLink in
 // a hash trie in the cache's own Region, CODELINK_REGION reserved: the
 // whole cache is forgotten at once when CODELINK_MAX paths are held or
 // the next one would not fit, so it never holds more than that.
 enum : i32 {
-    CODELINK_BATCH = 16,         // stats here a frame, or paths in one fs.stat
-    CODELINK_US    = 2000,       // and at most this long a frame stat'ing here
+    CODELINK_BATCH = 16,         // paths in one batch, here or there
     CODELINK_AGAIN = 15000000,   // a miss is asked again once drawn this much later
     CODELINK_MAX   = 16384,      // paths held, then all forgotten
     CODELINK_HOSTS = 8,          // hosts asked at once, a batch each
@@ -865,12 +867,15 @@ struct CodeLink {
     u64       host;   // uid, 0 for this computer
     Str       path;   // resolved
     i64       asked;  // ticks of the answer, a miss's
+    iz        rootlen;// here, its folder's bytes as last asked: only links
+                      // below it are refused (os_haslink)
     u8        state;  // CODE_*
     u8        linked; // a miss for a link on its way, never stat'ed
 };
 
-// One host's fs.stat batch: built as its paths are drawn, sent at the
-// frame's end, one in flight per host.
+// One host's batch, fs.stat there, or the window's pool here (GFS_LINKS):
+// built as its paths are drawn, sent at the frame's end, one in flight
+// per host.
 struct CodeAsk {
     u64       host;  // uid, 0 for a free slot
     i64       id;    // the request in flight, 0 while built
@@ -885,9 +890,9 @@ struct CodeLinks {
     byte     *base;   // mem's beginning, to forget everything
     CodeLink *root;
     i32       count;
-    i32       stats;  // made here this frame
-    i64       spent;  // ticks they took
-    b32       more;   // drawn and unasked, for the frame's budget
+    b32       waiting;  // a span turned away by a batch in flight or full:
+                        // the next answer draws again
+    CodeAsk   local;    // this computer's, its host 0
     CodeAsk   asks[CODELINK_HOSTS];
 };
 
@@ -1228,27 +1233,47 @@ struct FileAsk {
     PathAsk p;
     u64     host;     // whose path it is, 0 for this computer
     u8      err[96];  // p.err's bytes, made from filepath's
-    // On another host, the path is checked there (fs.stat) before the
-    // modal closes, "Checking..." meanwhile
-    i64     statid;   // the fs.stat in flight, else 0
+    // The path is checked, here on the window's pool, on another host
+    // there (fs.stat), before the modal closes, "Checking..." meanwhile
+    // once it has taken FILES_NOTEDELAY
+    i64     statid;   // the check in flight, else 0
+    i64     statat;   // when it was asked, ticks
     b32     close;    // its answer came and was posted: the modal closes
+    b32     opening;  // posted, not yet taken (TASK_OPENFILE), for the checklist
     u8      answer[FIELD_MAX + 64];  // posted when it says a file
     iz      answerlen;
     b32     stated;   // an answer came from there, for the checklist
     b32     dropped;  // a file dropped filled the field: its state to reload
 };
 
-// A file on another host read into a tab, through its engine (fs.read),
-// a part (FILES_PART) at a time, for the front tab shown only. What came
-// is in r, at most FILES_MAX bytes, the rest of r the scratch that makes
-// it a body. Asked again for after a reconnect, a request slot evicted
-// (REQ_MAX), or a reply lost on the way, up to three times.
+enum : i64 {
+    FILES_NOTEDELAY = 250000,  // ticks a read or check takes before it says so
+};
+
+// A read on the window's pool (files.cpp's GFS_FILE): where its worker
+// writes, at the start of its fetch's Region, set before the job is put
+// and never changed after.
+struct GfsFile {
+    u8 *buf;
+    iz  max;
+    b32 image;  // read whole, or not at all past max
+};
+
+// A file read into a tab, for the front tab shown only: here on the
+// window's pool, by a worker, whole or to its cap, into r's buffer; on
+// another host through its engine (fs.read), a part (FILES_PART) at a
+// time. What came is in r, at most FILES_MAX bytes, the rest of r the
+// scratch that makes it a body. There, asked again for after a
+// reconnect, a request slot evicted (REQ_MAX), or a reply lost on the
+// way, up to three times.
 struct FileFetch {
     FileTab *ft;       // the tab it reads for, else null for none
     u32      serial;   // and its serial then
     u64      host;     // its host's uid
-    i64      id;       // the part asked for, else 0
-    Region  *r;
+    i64      id;       // the part asked for, or the job here, else 0
+    i64      askedat;  // ticks when the read began, for "Reading..."
+    Region  *r;        // the pool's, once given up while its worker runs
+    GfsFile *head;     // at r's start
     Arena    mem;      // r past buf
     u8      *buf;
     iz       max;      // its room: the bytes read at most
@@ -2077,7 +2102,11 @@ struct Gui {
     b32                filesdrawn;   // the pane was drawn this frame
     ImGuiWindow       *fileswindow;  // its window, as last drawn, else null
     b32                closekey;     // macOS's Window → Close (Cmd+W), for menukeys
-    i64                fileloads;    // files read, for the checklist
+    i64                fileloads;    // files read, once each as made a body,
+                                     // for the checklist
+    FsPool            *fs;           // this computer's file workers (guifs)
+    Arena              fsmem;        // their scratch, apart from the frame's
+    b32                fsclosing;    // their jobs ended (fsquit): no answers
     b32                fileswin;     // the window had the focus, as last drawn
     b32                filesfocus;   // and the pane
     b32                fimgshown;    // an image tab drew its image
@@ -10504,6 +10533,7 @@ static void ontask(Gui *g, Record r)
         return;
     case TASK_OPENFILE:
         if (r.id == g->fask.p.id) {
+            g->fask.opening = 0;
             fileanswer(g, r.data);
         }
         return;
@@ -12583,10 +12613,17 @@ static void drainmail(Gui *g, i64 now)
         }
     }
 
-    // Other threads' outcomes, while hosting too
+    // Other threads' outcomes, while hosting too. A file worker's makes
+    // no frame of its own: what it changes asks for one (guifsdone)
     {
         Mail m = mailtake(g->tasks);
         for (Record r = mailnext(&m); r.ok; r = mailnext(&m)) {
+            if (r.type == TASK_FS) {
+                if (g->fs) {
+                    fsdone(g->fs, r, g->fsmem);
+                }
+                continue;
+            }
             ontask(g, r);
             other = 1;
         }
@@ -12651,6 +12688,7 @@ static void drainmail(Gui *g, i64 now)
             schedat(s, g->lastjobs+JOBS_PERIOD, DUE_STREAM);
         }
     }
+    guifstick(g);  // the file workers' next deadline, if any
 }
 
 // The wake flag was cleared: drain the mail, timed, since its work
@@ -13349,6 +13387,7 @@ static void gui_frame(Gui *g)
     }
     cachereset(g->vcache, 0);
     filesframe(g);
+    guifstick(g);  // its deadline consumed by schedbegin
     if (g->held && s->now>=g->holduntil) {
         gui_wake(g);  // the hold is over: take what piled up
     }
@@ -13405,7 +13444,8 @@ static void gui_frame(Gui *g)
     i64 t1 = os_ticks(g->os);
     dockwindows(g);
     drawdragover(g);  // over all of it, its places drawn now (dragplace)
-    codelinksflush(g);  // what inline code drawn asks of other hosts
+    codelinksflush(g);  // what inline code drawn asks, here and of other hosts
+    guifstick(g);       // and the deadlines of jobs put while drawing
     i64 t2 = os_ticks(g->os);
     ImGui::Render();
     i64 t3 = os_ticks(g->os);
@@ -13995,8 +14035,9 @@ enum : i32 {
                   // drop (no GUI_NODRAGLOAD), skip dx ops
     OP_IFFARMG,   // unless the remote host's login shell has gui.py's fake
                   // mg as $VISUAL (PROSPERO_TEST_FARMG), skip dx ops
-    OP_IFFSSTALL, // unless the remote host's engine stalls fs paths for
-                  // the checklist (PROSPERO_TEST_FSSTALL), skip dx ops
+    OP_IFFSSTALL, // unless file work stalls paths for the checklist, here
+                  // and on the remote host (PROSPERO_TEST_FSSTALL), skip
+                  // dx ops
 };
 // OP_TEXTCWD with text types the --cwd directory and text after it, on
 // Windows with backslashes, as a Windows user types a path.
@@ -14971,7 +15012,10 @@ enum : i32 {
     W_FILEFOUND,  // the Files find bar drew over the front file, searched
                   // it, and brought the match it went to into view
     W_PAUSED,     // the session shown waits, paused, before a request
-    W_FILEASKED,  // Open file's check there answered: closed, or an error
+    W_FILEASKED,  // Open file's check answered: closed, or an error
+    W_FSIDLE,     // no file work out: no job on the window's file workers,
+                  // no folder listing asked, no inline code's batch here or
+                  // elsewhere, and none turned away
 };
 
 static Str waitnames[] = {
@@ -14999,9 +15043,9 @@ static Str waitnames[] = {
     "the thin remote", "a relayed stream", "the thin remote's skill", "the container",
     "the terminal's text", "the terminal's banner", "the terminal's program", "the terminals' count",
     "the file", "the file checked", "the file's find", "the pause",
-    "Open file's check",
+    "Open file's check", "the file work",
 };
-static_assert(countof(waitnames) == W_FILEASKED+1);
+static_assert(countof(waitnames) == W_FSIDLE+1);
 
 enum : i32 {
     KEY_CTRL  = 1,
@@ -17389,8 +17433,10 @@ static DriveOp m3ops[] = {
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
     {OP_CHECK, CHK_FILEPATH, 0, 0, 0, "/cite/hello.c"},
-    // Inline code naming a file is a link once the file is found, at
-    // its line; one naming no file is no link, and has no rect
+    // Inline code naming a file is a link once the file is found (on
+    // the window's file workers), at its line; one naming no file is no
+    // link, and has no rect
+    {OP_WAIT, W_FSIDLE, 0, 0, 5000, ""},
     {OP_CHECK, CHK_FILELINK, 1, 0, 0, "cite/hello.c:7"},
     {OP_CHECK, CHK_FILELINK, 0, 0, 0, "cite/nothere.c:2"},
     // ... and through a symlink below the folder, out of it or not,
@@ -17525,6 +17571,36 @@ static DriveOp m3ops[] = {
     {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
     {OP_CHECK, CHK_FILENOTE, 0, 0, 0, "Not an image it can show: "},
     {OP_SHOT, 0, 0, 0, 300, "files-badimage"},
+    // A file here on a file system that stops responding (a test hook
+    // stalls its path on the window's file workers): a slow one says
+    // "Reading..." and opens; a dead one says so once its worker is
+    // stuck, then at once on Retry and in Open file, while other files
+    // still read (fswork.cpp). Open file is closed after, for the drop
+    {OP_IFFSSTALL, 0, 27, 0, 0, ""},
+    {OP_OPENFILE, 0, 0, 0, 800, "files/stallslow.txt"},
+    {OP_CHECK, CHK_FILENOTE, 0, 0, 0, "Reading..."},
+    {OP_WAIT, W_FILEREADY, 0, 0, 8000, ""},
+    {OP_CHECK, CHK_FILETEXT, 0, 0, 0, "slow\n"},
+    {OP_OPENFILE, 0, 0, 0, 300, "files/stalldead.txt"},
+    {OP_WAIT, W_FILEREADY, 0, 0, 12000, ""},
+    {OP_CHECK, CHK_FILENOTE, 0, 0, 0, "The file system is not responding"},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "file retry"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 2000, ""},
+    {OP_CHECK, CHK_FILENOTE, 0, 0, 0, "The file system is not responding"},
+    {OP_OPENFILE, 0, 0, 0, 300, "files/pixels.png"},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILENOTE, 0, 0, 0, ""},
+    CMDKEY(GKEY_O, 500),
+    {OP_TEXTCWD, 0, 0, 0, 300, "/files/stalldead.txt"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_FILEASKED, 0, 0, 2000, ""},
+    {OP_CHECK, CHK_FILEASKERR, 0, 0, 0, "The file system is not responding"},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 500, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
     // A file dropped on the pane opens in a tab, attached to nothing;
     // dropped while Open file is up, it fills the field, a line typed
     // after it
@@ -19418,6 +19494,7 @@ static DriveOp remoteops[] = {
     {OP_CHECK, CHK_FILETEXT, 0, 0, 0, "hello by mg"},
     // Inline code naming the file there: a link once fs.stat there
     // found it
+    {OP_WAIT, W_FSIDLE, 0, 0, 5000, ""},
     {OP_CHECK, CHK_FILELINK, 1, 0, 0, "hello.txt"},
     {OP_MOVE, T_NAMED, 0, 0, 800, "codelink hello.txt"},
     {OP_CHECK, CHK_LINKTIP, 1, 0, 0, "Files \xe2\x86\x92 hello.txt, on "},
@@ -22979,11 +23056,22 @@ static i64 drivetermcount(Gui *g)
 }
 
 // The Files pane, for the checklist: the front tab read and drawn, at
-// its cited lines if any, else at its place restored.
+// its cited lines if any, else at its place restored, and no check of it
+// in flight or due, where its check can go (filewatch): here, or on a
+// host that is up. A check answers in a later frame than it is asked.
 static b32 drivefileready(Gui *g)
 {
+    // Not while Open file's check, or the file it found, is on its way:
+    // the front tab is still the one before
     FileTab *ft = filefront(g);
-    if (!ft || !g->filesdrawn || ft->state==FTAB_UNREAD || ft->state==FTAB_READING) {
+    if (g->fask.statid || g->fask.opening) {
+        return 0;
+    } else if (!ft || !g->filesdrawn || ft->state==FTAB_UNREAD || ft->state==FTAB_READING) {
+        return 0;
+    }
+    FileWatch *w    = &ft->watch;
+    b32        acts = !ft->host || !filehostwhy(filehost(g, ft->host)).len;
+    if (w->id || (ft->state==FTAB_READ && (w->stale || w->force) && acts)) {
         return 0;
     }
     return ft->state==FTAB_FAILED || g->fshowing!=ft ||
@@ -23153,7 +23241,9 @@ static b32 drivefilecheck(Gui *g, i32 chk)
              g->panes[PANE_FILES] && n && n->IsCentralNode();
     } break;
     case CHK_FILEBODIES: {
-        // Within the budget, dx at least read since the start
+        // Within the budget, dx at least read since the start: counted
+        // once per read, as its result is made a body (fetchmade), here
+        // and on other hosts alike
         i32 n     = 0;
         iz  bytes = filebytes(g, &n);
         print(&b, "drive: file bodies ");
@@ -23406,6 +23496,18 @@ static b32 drivewaitdone(Gui *g)
         return g->sess && v->busy && v->paused && v->state==LIVE_PAUSED;
     case W_FILEASKED:
         return !g->fask.statid && (!g->fask.p.shown || g->fask.p.err.len);
+    case W_FSIDLE: {
+        CodeLinks *c    = &g->codelinks;
+        b32        idle = !(g->fs && fspending(g->fs)) && !c->local.n && !c->local.id &&
+                          !c->waiting;
+        for (i32 i = 0; i < CODELINK_HOSTS; i++) {
+            idle &= !c->asks[i].host;
+        }
+        for (i32 i = 0; i < DIRLISTS; i++) {
+            idle &= !g->pc.lists[i].id;
+        }
+        return idle;
+    }
     case W_THINKING:
         return g->sess && thinking(v) && (v->thinking==THINK_HIDE || g->thinkcount>0);
     case W_THINKSTALL:
@@ -27193,7 +27295,7 @@ static void drivestep(Gui *g)
     case OP_IFFSSTALL:
         // gui.py sets it here, and passes it to a remote host it starts
         if (!os_getenv(g->os, &g->frame, "PROSPERO_TEST_FSSTALL").len) {
-            guilog(g, "drive: skip, with no stalled paths on the remote host");
+            guilog(g, "drive: skip, with no stalled paths (PROSPERO_TEST_FSSTALL)");
             g->drivepc += (i32)op->dx;
         }
         break;
@@ -27971,8 +28073,11 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->cfgbase   = g->cfgmem.beg;
     g->pendmem   = newarena(os_reserve(os, 256*mb));
     g->pendbase  = g->pendmem.beg;
+    // The file workers' (guifs): fstick's, and the far mount table read
+    // into it on Linux, 1 MiB
+    g->fsmem     = newarena(os_reserve(os, 64*mb));
     if (!g->perm.beg || !g->frame.beg || !g->vcache->arena.beg || !g->replayr ||
-            !g->cmdr || !g->cfgmem.beg || !g->pendmem.beg) {
+            !g->cmdr || !g->cfgmem.beg || !g->pendmem.beg || !g->fsmem.beg) {
         os_print(os, 2, "prospero: out of memory\n");
         return 2;
     }
@@ -28222,6 +28327,12 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->bench = bench;
 
     gui_run(g);
+    if (g->fs) {
+        // Jobs still out end, answering nothing; a worker in a call that
+        // never returns is left to it, detached, as the process ends
+        g->fsclosing = 1;
+        fsquit(g->fs, "Prospero is closing", g->fsmem);
+    }
 
     saveini(g, 1);
     if (!g->quitting && !g->enginegone) {

@@ -332,6 +332,14 @@ when the editor has a window of its own. A binary file says
 so, with Show as text anyway; past 4 MiB or 100,000 lines only the
 start shows.
 
+A file on this computer is read off to the side, as one on another
+host is, so the window carries on meanwhile: "Reading..." shows if
+that takes more than a moment, and Open file says "Checking..." while
+it looks for the path. A file on a share or mount that stops answering
+says "The file system is not responding" after ten seconds; other
+files still open, and that file, or the rest of its network share, is
+refused at once until it answers again, when Retry reads it.
+
 An editor that runs in a terminal (`vim`, `nvim`, `nano`, `hx`,
 `emacs -nw`), as `[ui] editor`, `$VISUAL` or `$EDITOR` names it, opens
 a file of this computer in a Terminal tab of its session instead, at
@@ -378,7 +386,8 @@ link too, but only once Prospero finds that file: on its host, within
 the folder its relative links are from, and never by a network path,
 since nobody asked for that file to be looked at. It looks only at
 what is on screen, and a file not found then is looked for again only
-when shown 15 seconds later or more. Code inside a link stays part of
+when shown 15 seconds later or more, and one on a share that stops
+answering just stays plain text. Code inside a link stays part of
 that link.
 
 ## The session's menu

@@ -15,11 +15,22 @@
 // first, at frame start, never the one shown, its tab kept to be read
 // again when shown.
 //
-// Files on this computer are read here, by the GUI, through filestat
-// and fileread, which refuse device and network paths before anything
-// touches them. Files on other hosts (remotes, containers, WSL) come
-// through their engines, fs.read a part at a time (FileFetch), the
-// front tab's only, and Open file checks a path there with fs.stat.
+// Files on this computer are read by the window's own file workers
+// (fswork.cpp's FsPool, guifs), never on its thread, so that a file on
+// a share that stops answering never stops the window: filereadall and
+// filestat (fileset.cpp) refuse device and network paths before
+// anything touches them. Files on other hosts (remotes, containers,
+// WSL) come through their engines, fs.read a part at a time. Either
+// way one read is in flight (FileFetch), the front tab's only, and
+// "Reading..." shows once it has taken FILES_NOTEDELAY. The watch's
+// checks, Open file's check and inline code's links go to the workers
+// here as to fs.stat there, each answered in a later frame; a job the
+// pool refuses (its path's file system not responding, the pool busy)
+// is answered at once, by its caller. On the window's thread still:
+// one-off actions on a path picked in a dialog or dropped (drops,
+// attachments, import, Browse, the typed-path dialog's OK), Open file's
+// and the new session's folder listings, the '@' index, and the
+// editor's look-up on PATH.
 //
 // A file opens from Open file, or from a link to it (filelinkopen) in
 // the transcript, the plan or a Markdown file shown here.
@@ -151,37 +162,6 @@ static void filefail(Gui *g, FileTab *ft, Str why)
 static GuiSession *filesroot(Gui *g)
 {
     return g->sess ? termroot(g, g->sess) : &g->nosession;
-}
-
-// A path's type on this computer, a device or a network path refused
-// (STAT_OTHER) before anything touches it: on Windows os_stat opens
-// the path, and opening a device can do things.
-static Stat filestat(Gui *g, Arena scratch, Str path)
-{
-    if (devicepath(path, HOST_WINDOWS) || netpath(path, HOST_WINDOWS)) {
-        return {0, 0, STAT_OTHER};
-    }
-    return os_stat(g->os, scratch, path);
-}
-
-// At most max bytes of a file on this computer, refused likewise.
-static Read fileread(Gui *g, Arena *a, Str path, iz max)
-{
-    if (devicepath(path, HOST_WINDOWS) || netpath(path, HOST_WINDOWS)) {
-        return {{}, 0, READ_NOTFILE};
-    }
-    return os_readat(g->os, a, path, 0, max);
-}
-
-// Why a stat's type is not a file to read, else empty.
-static Str filestatwhy(i32 type)
-{
-    switch (type) {
-    case STAT_MISSING: return "No such file";
-    case STAT_DIR:     return "That is a folder";
-    case STAT_OTHER:   return "Not a regular file";
-    }
-    return {};
 }
 
 // Let a body go: its Region, and whatever names its views.
@@ -489,52 +469,121 @@ static void filesfit(Gui *g, FileTab *keep, iz extra)
     }
 }
 
-// A tab's file, on this computer, read into a new body, else null,
-// saying why, the tab left as it is.
-static FileBody *filebody(Gui *g, FileTab *ft, Str *why)
+// Files on this computer, through the window's own file workers
+
+enum : i32 {  // the window's file jobs (FsPut.kind)
+    GFS_FILE = 1,  // the fetch's read (filereadall), into its Region's buffer
+    GFS_STAT,      // a path's stat: a tab's check (filewatch), or Open file's
+    GFS_LINKS,     // inline code's paths, each with its rootlen (codelinksflush)
+};
+
+// A worker's job: c->arg the path (GFS_FILE, GFS_STAT), else (GFS_LINKS)
+// each path's rootlen, in order, its paths c->paths; its answer in
+// c->res, from its own arena, or c->err for a path under a mark.
+static void guifsrun(FsCall *c)
 {
-    Region *sr = os_reserve(g->os, filescratch(ft));
-    if (!sr) {
-        *why = "There is no memory to show it";
-        return 0;
+    Arena *a = c->mem;
+    switch (c->kind) {
+    case GFS_FILE: {
+        GfsFile  *h = (GfsFile *)c->ctx;
+        FileRead *r = alloc<FileRead>(a);
+        *r = filereadall(c, c->os, *a, c->arg, h->buf, h->max, h->image);
+        c->res = r;
+    } break;
+    case GFS_STAT: {
+        Stat *st = alloc<Stat>(a);
+        if (!fsat(c, c->arg, 1)) {
+            c->err = fsstuck;
+        } else {
+            *st = filestat(c->os, *a, c->arg);
+        }
+        c->res = st;
+    } break;
+    case GFS_LINKS: {
+        // Each path a file (1), a miss (0), or a miss for a link on its
+        // way, never stat'ed (2), as codelinkdrawn once did here
+        u8 *found = alloc<u8>(a, c->paths.len);
+        Str rest  = c->arg;
+        for (iz i = 0; i<c->paths.len && !fsgone(c); i++) {
+            Cut n = cut(rest, ' ');
+            rest = n.tail;
+            Int rootlen = parseint(n.head);
+            Str path    = c->paths[i];
+            if (!rootlen.ok || rootlen.val<0 || !fsat(c, path, 1)) {
+                continue;
+            }
+            b32 ln = os_haslink(c->os, *a, path, (iz)rootlen.val+1);
+            found[i] = ln ? 2 : filestat(c->os, *a, path).type==STAT_FILE;
+        }
+        c->res = found;
+    } break;
     }
-    Arena s  = newarena(sr);
-    Stat  st = filestat(g, s, ft->path);
-    Read  rd = {};
-    *why = filestatwhy(st.type);
-    if (!why->len && fileimgname(ft->path) && st.size>IMG_FILEMAX) {
-        *why = filebigwhy();
-    } else if (!why->len) {
-        rd   = fileread(g, &s, ft->path, filecap(ft));
-        *why = rd.err==READ_OK       ? Str{} :
-               rd.err==READ_NOTFOUND ? Str("No such file") :
-               rd.err==READ_NOTFILE  ? Str("Not a regular file") :
-               Str("It could not be read");
-    }
-    if (why->len) {
-        os_release(g->os, sr);
-        return 0;
-    }
-    return filemake(g, ft, sr, s, rd.data, rd.size, st.mtime, 0, why);
 }
 
-// Read a tab's file, on this computer, into a body of its own, else say
-// why not in the tab. One read already stays shown until the new one is
-// made, room for it made first.
-static void fileload(Gui *g, FileTab *ft)
+// What a GFS_FILE job holds, its fetch's Region, let go by the pool
+// once its worker is done with it, the fetch having given it up.
+static void guifsdrop(Os *os, void *own)
 {
-    g->fileloads++;
-    if (ft->body) {
-        filesfit(g, ft, filebodybytes(ft->body));
-    } else {
-        ft->err = {};
+    os_release(os, (Region *)own);
+}
+
+static void guifsdone(void *, FsJob *, Arena);
+
+// The window's pool, made as first needed: its answers come to g->tasks
+// as TASK_FS records (drainmail), which make no frame of their own.
+static FsPool *guifs(Gui *g)
+{
+    if (!g->fs) {
+        g->fs = fsnew(g->os, &g->perm, g->tasks, TASK_FS, g, guifsdone);
     }
-    ft->watch.stale  = 0;
-    ft->watch.readat = os_time(g->os);
-    Str       why = {};
-    FileBody *nb  = filebody(g, ft, &why);
-    if (fileswap(g, ft, nb, why)) {
-        scheddirty(&g->sched);
+    return g->fs;
+}
+
+// Put a job on the window's pool, else (0) why not: its scratch is the
+// pool's own (g->fsmem), apart from the frame's, which a job finished at
+// once (inline, refused) may use.
+static b32 guifsput(Gui *g, FsPut *put, Str *why)
+{
+    return fsput(guifs(g), put, why, g->fsmem);
+}
+
+// Whether the answer to id is still awaited: from this computer's pool
+// (host 0), else in the request table, which REQ_MAX may evict it from.
+static b32 reqheld(Gui *, i64);
+
+static b32 idheld(Gui *g, u64 host, i64 id)
+{
+    return host ? reqheld(g, id) : g->fs && fsheld(g->fs, id);
+}
+
+// A pool job for a path on this computer, of kind GFS_STAT or GFS_FILE.
+static FsPut guifsjob(Gui *g, i32 kind, Str *path)
+{
+    FsPut put = {};
+    put.id    = ++g->nextid;
+    put.kind  = kind;
+    put.run   = guifsrun;
+    put.arg   = *path;
+    put.paths = {path, 1, 1};
+    return put;
+}
+
+// Each time the mail is drained, and twice a frame: workers gone silent
+// held or given up (fstick), and a frame asked for at the next such
+// deadline, only while one is pending, so idle stays at zero frames.
+static void guifstick(Gui *g)
+{
+    FsPool *p = g->fs;
+    if (!p) {
+        return;
+    }
+    i64 now = os_ticks(g->os);
+    if (fsnext(p) <= now) {
+        fstick(p, g->fsmem, now);
+    }
+    i64 next = fsnext(p);
+    if (next < I64MAX) {
+        schedat(&g->sched, next, DUE_APP);
     }
 }
 
@@ -563,11 +612,29 @@ static b32 reqheld(Gui *g, i64 id)
     return 0;
 }
 
-// Ask for the fetch's next part.
+// An answer's reason, as a tab says it: the engine's, or the pool's.
+static Str  fswhy(Str err);
+static void fetchfail(Gui *, Str);
+
+// Ask for the fetch's next part, or here its whole read: a read the
+// pool refuses (its file system not responding, the pool busy) fails.
 static void fsrequest(Gui *g)
 {
     FileFetch *f = &g->ffetch;
-    GuiHost   *h = filehost(g, f->host);
+    if (!f->host) {
+        FsPut put = guifsjob(g, GFS_FILE, &f->ft->path);
+        put.ctx  = f->head;
+        put.own  = f->r;
+        put.drop = guifsdrop;
+        f->id    = put.id;  // first: an inline job is answered in guifsput
+        Str why  = {};
+        if (!guifsput(g, &put, &why)) {
+            f->id = 0;
+            fetchfail(g, fswhy(why));
+        }
+        return;
+    }
+    GuiHost *h = filehost(g, f->host);
     if (!h) {
         return;
     }
@@ -585,10 +652,15 @@ static void fsrequest(Gui *g)
     cmdsend(g, &w, a);
 }
 
-// The fetch let go, its tab as it is: one read again checked again.
+// The fetch let go, its tab as it is: one read again checked again. A
+// read here given up while its worker runs leaves its Region to the
+// pool, which lets it go once the worker is done with it.
 static void fetchend(Gui *g)
 {
     FileFetch *f = &g->ffetch;
+    if (!f->host && f->id && g->fs && fsabandon(g->fs, f->id)) {
+        f->r = 0;
+    }
     if (f->reload && f->ft && f->ft->serial==f->serial) {
         f->ft->watch.id = 0;
         if (f->ft->watch.stale || f->ft->watch.force) {
@@ -633,15 +705,15 @@ static void fetchfail(Gui *g, Str why)
     scheddirty(&g->sched);
 }
 
-// Start reading a tab's file on another host, as its tab shows: one
-// fetch at a time, the last given up. With its host down, the tab waits
-// (filesnote says so); with an engine there too old, it fails. A tab
-// read already is read again (reload) into a new body, the old shown
-// until it is made.
+// Start reading a tab's file, as its tab shows: one fetch at a time,
+// the last given up, here on the window's pool, on another host through
+// its engine. With its host down, the tab waits (filesnote says so);
+// with an engine there too old, it fails. A tab read already is read
+// again (reload) into a new body, the old shown until it is made.
 static void filefetch(Gui *g, FileTab *ft, b32 reload)
 {
     GuiHost *h   = filehost(g, ft->host);
-    Str      why = filehostwhy(h);
+    Str      why = ft->host ? filehostwhy(h) : Str{};
     if (why.len && h && h->r && !h->closing && h->up && !reload) {
         filefail(g, ft, why);  // too old, until updated
         return;
@@ -657,11 +729,17 @@ static void filefetch(Gui *g, FileTab *ft, b32 reload)
         return;
     }
     // The buffer is the region's, not f->mem's: f->mem is let go (fetchend)
-    // before the body is made from what came, which must stay readable
+    // before the body is made from what came, which must stay readable.
+    // A worker here reads into it, as the header before it says
     Arena m = newarena(f->r);
+    f->head   = alloc<GfsFile>(&m);
     f->max    = filecap(ft);
     f->buf    = allocbytes(&m, f->max);
     f->mem    = m;
+    f->head->buf   = f->buf;
+    f->head->max   = f->max;
+    f->head->image = fileimgname(ft->path);
+    f->askedat = os_ticks(g->os);
     f->ft     = ft;
     f->serial = ft->serial;
     f->host   = ft->host;
@@ -686,7 +764,7 @@ static void fetchtick(Gui *g, FileTab *ft)
     FileFetch *f = &g->ffetch;
     if (f->ft && (f->ft!=ft || !fetchwanted(f))) {
         fetchdrop(g);
-    } else if (f->ft && f->id && !reqheld(g, f->id)) {
+    } else if (f->ft && f->id && !idheld(g, f->host, f->id)) {
         fsrequest(g);
     }
 }
@@ -784,6 +862,37 @@ static Str fswhy(Str err)
                                        Str("It could not be read");
 }
 
+// The fetch all here, raw at the start of its buffer, of a file of size
+// bytes and mtime, read as of readat on its host's clock (twice: it
+// changed again while read, what came kept): its body made from the
+// scratch past what came, room made first for it beside one read
+// already, and shown. Each read that came whole counts once, here,
+// whether here or there (fileloads, CHK_FILEBODIES).
+static void fetchmade(Gui *g, Str raw, i64 size, i64 mtime, b32 twice, i64 readat)
+{
+    FileFetch *f       = &g->ffetch;
+    FileTab   *ft      = f->ft;
+    Region    *r       = f->r;
+    Arena      s       = f->mem;
+    b32        fetched = f->host != 0;
+    ft->watch.readat = readat;
+    f->r = 0;
+    fetchend(g);
+    g->fileloads++;
+    if (ft->body) {
+        filesfit(g, ft, filebodybytes(ft->body));
+    }
+    Str       why = {};
+    FileBody *nb  = filemake(g, ft, r, s, raw, size>raw.len ? size : raw.len, mtime, twice,
+                             &why);
+    if (nb) {
+        nb->fetched = fetched;
+    }
+    if (fileswap(g, ft, nb, why)) {
+        scheddirty(&g->sched);
+    }
+}
+
 // A part of the fetch's file came: the next asked for, or once all is
 // here (or its cap, FILES_MAX for text), made into a body; an image too
 // big to read whole fails at once. A size or mtime changed reads
@@ -846,37 +955,49 @@ static void onfsread(Gui *g, Arena scratch, Json *j, b32 ok, Str err, i64 ts)
         return;
     }
 
-    // All here: its body, from the scratch past what came, room made
-    // first for it beside one read already
-    Region *r = f->r;
-    Arena   s = f->mem;
-    Str     raw = {f->buf, (iz)f->off};
-    i64     total = f->changed ? f->off : f->size;
-    b32     twice = f->changed;
-    i64     when  = f->mtime;
-    ft->watch.readat = f->ts;
-    f->r = 0;
-    fetchend(g);
-    g->fileloads++;
-    if (ft->body) {
-        filesfit(g, ft, filebodybytes(ft->body));
+    fetchmade(g, {f->buf, (iz)f->off}, f->changed ? f->off : f->size, f->mtime, f->changed,
+              f->ts);
+}
+
+// The fetch's read here answered (GFS_FILE), back its worker's own
+// answer, else the pool's, err, its Region the pool's then: a body made
+// of what came, else the tab fails, saying why. An answer for a fetch
+// given up is let go.
+static void fetchlocal(Gui *g, FsJob *job, b32 back, Str err)
+{
+    FileFetch *f = &g->ffetch;
+    if (!f->ft || f->host || f->id!=job->put.id) {
+        if (back) {
+            os_release(g->os, (Region *)job->put.own);
+        }
+        return;
     }
-    Str       why = {};
-    FileBody *nb  = filemake(g, ft, r, s, raw, total>raw.len ? total : raw.len, when, twice,
-                             &why);
-    if (nb) {
-        nb->fetched = 1;
+    f->id = 0;
+    if (!back) {
+        f->r = 0;  // its worker may be in it still
     }
-    if (fileswap(g, ft, nb, why)) {
-        scheddirty(&g->sched);
+    FileRead *rd = back && !err.len ? (FileRead *)job->res : 0;
+    if (!fetchwanted(f)) {
+        fetchend(g);
+    } else if (!rd) {
+        fetchfail(g, fswhy(err.len ? err : fsstuck));
+    } else if (rd->toobig) {
+        fetchfail(g, filebigwhy());
+    } else if (rd->err.len) {
+        fetchfail(g, rd->err);
+    } else {
+        fetchmade(g, {f->buf, rd->len}, rd->size, rd->mtime, rd->changed, rd->readat);
     }
 }
 
+static void fileswatched(Gui *, FileTab *, b32, Str, i64, i64);
+
 // Each frame the pane is drawn, for its front tab ft, read: its file
 // checked, as filenext says, once marked as it may have changed (stale),
-// here by its stat, on another host by fs.stat there, and read again
-// into a new body, the old shown meanwhile, when its stat says so
-// (filechanged), or at once for Reload. Nothing while its host is down.
+// here by its stat on the window's pool, on another host by fs.stat
+// there, and read again into a new body, the old shown meanwhile, when
+// its stat says so (filechanged), or at once for Reload. Nothing while
+// its host is down.
 static void filewatch(Gui *g, FileTab *ft)
 {
     FileWatch *w = &ft->watch;
@@ -884,7 +1005,7 @@ static void filewatch(Gui *g, FileTab *ft)
     if (ft->state!=FTAB_READ || !ft->body || (ft->host && filehostwhy(h).len)) {
         return;
     }
-    if (w->id>0 && !reqheld(g, w->id)) {
+    if (w->id>0 && !idheld(g, ft->host, w->id)) {
         w->id    = 0;  // its request slot went (REQ_MAX)
         w->stale = 1;
     } else if (w->id<0 && !(g->ffetch.ft==ft && fetchwanted(&g->ffetch))) {
@@ -902,7 +1023,7 @@ static void filewatch(Gui *g, FileTab *ft)
     w->stale = 0;
     w->force = 0;
     w->sent  = now;
-    if (ft->host && force) {
+    if (force) {
         filefetch(g, ft, 1);
     } else if (ft->host) {
         Arena a = newarena(g->cmdr);
@@ -915,58 +1036,54 @@ static void filewatch(Gui *g, FileTab *ft)
         w->id = g->nextid;
         cmdsend(g, &o, a);
     } else {
-        FileBody *b  = ft->body;
-        Stat      st = filestat(g, g->frame, ft->path);
-        b32       go = force || st.type!=STAT_FILE ||
-                       filechanged(b->size, b->mtime, w->readat, st.size, st.mtime);
-        if (go) {
-            fileload(g, ft);
+        FsPut put = guifsjob(g, GFS_STAT, &ft->path);
+        w->id = put.id;  // first: an inline job is answered in guifsput
+        Str why = {};
+        if (!guifsput(g, &put, &why)) {
+            fileswatched(g, ft, 0, {}, 0, 0);
         }
     }
 }
 
-// A host's answer to a tab's check (filewatch), the reply to id: read
-// again if its stat says so, else as it is. A file gone fails the tab.
-static void onfswatch(Gui *g, i64 id, Json *j, b32 ok, Str err)
+// The tab whose check (filewatch) is id, else null.
+static FileTab *filewatching(Gui *g, i64 id)
 {
     GuiSession *roots[] = {&g->nosession, g->sessions};
-    FileTab    *ft      = 0;
-    for (i32 k = 0; k<countof(roots) && !ft; k++) {
-        for (GuiSession *s = roots[k]; s && !ft; s = k ? s->next : 0) {
+    for (i32 k = 0; k < countof(roots); k++) {
+        for (GuiSession *s = roots[k]; s; s = k ? s->next : 0) {
             for (i32 i = 0; i < s->files.n; i++) {
-                ft = s->files.tabs[i]->watch.id==id ? s->files.tabs[i] : ft;
+                if (s->files.tabs[i]->watch.id == id) {
+                    return s->files.tabs[i];
+                }
             }
         }
     }
-    if (!ft) {
-        return;
-    }
+    return 0;
+}
+
+// The answer to a tab's check (filewatch), ok, else failed: its file
+// of size and mtime, else why it is no file to show (why), read again if
+// its stat says so, else left as it is. A file gone fails the tab.
+static void fileswatched(Gui *g, FileTab *ft, b32 ok, Str why, i64 size, i64 mtime)
+{
     FileWatch *w = &ft->watch;
     w->id = 0;
     if (ft->state!=FTAB_READ || !ft->body) {
         return;
     } else if (!ok) {
-        // Not sent, lost, refused, or its host went: the mark kept, so
-        // checked again a few times (else at the next mark), or once
-        // its host is back
+        // Not sent, lost, refused, stuck, or its host went: the mark
+        // kept, so checked again a few times (else at the next mark), or
+        // once its host is back. One here keeps what it shows
         w->fails++;
-        if (w->fails<=FILES_TRIES || filehostwhy(filehost(g, ft->host)).len) {
+        if (w->fails<=FILES_TRIES || (ft->host && filehostwhy(filehost(g, ft->host)).len)) {
             w->stale = 1;
             scheddirty(&g->sched);
         }
         return;
     }
     w->fails = 0;
-    FileBody *b     = ft->body;
-    Json     *st    = jsonat(jsonget(j, "stats"), 0);
-    Str       type  = jsonstr(jsonget(st, "type"));
-    i64       size  = jsonint(jsonget(st, "size"), -1);
-    i64       mtime = jsonint(jsonget(st, "mtime"), 0);
-    if (type != "file") {
-        Str why = type=="dir"     ? Str("That is a folder") :
-                  type=="missing" ? Str("No such file") :
-                  type=="bad"     ? Str("It cannot be shown") :
-                                    Str("Not a regular file");
+    FileBody *b = ft->body;
+    if (why.len) {
         fileswap(g, ft, 0, why);
         scheddirty(&g->sched);
     } else if (filechanged(b->size, b->mtime, w->readat, size, mtime)) {
@@ -976,6 +1093,42 @@ static void onfswatch(Gui *g, i64 id, Json *j, b32 ok, Str err)
             w->stale = 1;  // no longer shown: checked again once it is
         }
     }
+}
+
+// A host's answer to a tab's check (filewatch), the reply to id.
+static void onfswatch(Gui *g, i64 id, Json *j, b32 ok, Str)
+{
+    FileTab *ft = filewatching(g, id);
+    if (!ft) {
+        return;
+    } else if (!ok) {
+        fileswatched(g, ft, 0, {}, 0, 0);
+        return;
+    }
+    Json *st    = jsonat(jsonget(j, "stats"), 0);
+    Str   type  = jsonstr(jsonget(st, "type"));
+    i64   size  = jsonint(jsonget(st, "size"), -1);
+    i64   mtime = jsonint(jsonget(st, "mtime"), 0);
+    Str   why   = type=="file"    ? Str{} :
+                  type=="dir"     ? Str("That is a folder") :
+                  type=="missing" ? Str("No such file") :
+                  type=="bad"     ? Str("It cannot be shown") :
+                                    Str("Not a regular file");
+    fileswatched(g, ft, 1, why, size, mtime);
+}
+
+// The window's pool's answer to a tab's check here (GFS_STAT).
+static void filewatchlocal(Gui *g, FsJob *job, b32 back, Str err)
+{
+    FileTab *ft = filewatching(g, job->put.id);
+    Stat    *st = back && !err.len ? (Stat *)job->res : 0;
+    if (!ft || ft->host) {
+        return;
+    } else if (!st) {
+        fileswatched(g, ft, 0, {}, 0, 0);
+        return;
+    }
+    fileswatched(g, ft, 1, filestatwhy(st->type), st->size, st->mtime);
 }
 
 // Each frame, at its start: the bodies' caches reset when past their
@@ -1613,12 +1766,15 @@ static void filelinkitems(Gui *g)
 // symlink or junction below the folder (os_haslink, told without
 // following it) is a miss, never stat'ed, wherever the link leads, as
 // a link inside a cloned repository may name a share or an automount.
-// Else filestat answers, at most CODELINK_BATCH paths
-// or CODELINK_US a frame; on another host fs.stat does, in batches of
-// CODELINK_BATCH, one in flight per host. A miss is asked again only
-// when drawn CODELINK_AGAIN later: no timers, no idle frames. A batch
-// whose reply is lost (its host gone, its request slot taken, or
-// FILES_LOST passed) lets its paths be asked again.
+// Else filestat answers. Both run on the window's pool (GFS_LINKS),
+// each path with the bound of its own folder (rootlen), as fs.stat
+// does on another host, in batches of CODELINK_BATCH, one in flight per
+// host. A span drawn while its host's batch is in flight, or full, is
+// turned away (waiting), and the answer to any batch, or its loss,
+// draws again, for it to be asked. A miss is asked again only when
+// drawn CODELINK_AGAIN later: no timers, no idle frames. A batch whose reply is lost (its
+// host gone, its request slot taken, or FILES_LOST passed) lets its
+// paths be asked again; one the pool refuses or gives up is misses.
 
 // The cache's entry for a span's file from where it is, made if new;
 // null if it names none it may check, or there is no room. It is
@@ -1670,6 +1826,14 @@ static CodeLink *codelinkget(Gui *g, Arena scratch, LinkFrom *from, Str span)
         for (i32 i = 0; i < CODELINK_HOSTS; i++) {
             c->asks[i] = {};
         }
+        if (c->local.id && g->fs) {
+            fsabandon(g->fs, c->local.id);
+        }
+        c->local = {};
+        if (c->waiting) {
+            scheddirty(&g->sched);  // the spans turned away, asked anew
+        }
+        c->waiting = 0;
         m = &c->root;
     }
     CodeLink *e = alloc<CodeLink>(&c->mem);
@@ -1704,27 +1868,19 @@ static b32 codelinkdrawn(Gui *g, Arena scratch, LinkFrom *from, Str span)
     }
 
     if (!e->host) {
-        if (c->stats>=CODELINK_BATCH || c->spent>=CODELINK_US) {
-            c->more = 1;  // the next frame's
+        CodeAsk *q = &c->local;
+        if (q->id || q->n==CODELINK_BATCH) {
+            c->waiting = 1;  // asked once the batch in flight answers
             return 0;
         }
         // Below the folder, by its parts' bytes: its own path, and
         // what leads to it, are the user's choice
         Str root = normpath(&scratch, from->base, ".", from->win);
         for (; root.len && issep(root[root.len-1], from->win); root.len--) {}
-        i64  t0 = os_ticks(g->os);
-        b32  ln = os_haslink(g->os, scratch, e->path, root.len+1);
-        Stat st = ln ? Stat{0, 0, STAT_OTHER} : filestat(g, scratch, e->path);
-        i64  t1 = os_ticks(g->os);
-        e->linked = (u8)ln;
-        c->stats++;
-        c->spent += t1 - t0;
-        e->asked  = t1;
-        e->state  = st.type==STAT_FILE ? CODE_FILE : CODE_MISS;
-        if (e->state == CODE_FILE) {
-            scheddirty(&g->sched);
-        }
-        return e->state == CODE_FILE;
+        e->rootlen = root.len;
+        q->paths[q->n++] = e;
+        e->state = CODE_ASKING;
+        return 0;
     }
 
     GuiHost *h = filehost(g, e->host);
@@ -1739,7 +1895,8 @@ static b32 codelinkdrawn(Gui *g, Arena scratch, LinkFrom *from, Str span)
         q = !c->asks[i].host ? &c->asks[i] : 0;
     }
     if (!q || q->id || q->n==CODELINK_BATCH) {
-        return 0;  // after the batch in flight, whose answer draws again
+        c->waiting = 1;  // after the batch in flight, whose answer draws again
+        return 0;
     }
     q->host = e->host;
     q->paths[q->n++] = e;
@@ -1768,23 +1925,85 @@ static Str codelinkat(Gui *g, Arena scratch, View *v, TextHit hit, LinkFrom *fro
     return {};
 }
 
-// A batch's paths, its answer lost, to be asked again as drawn.
-static void codeaskdrop(CodeAsk *q)
+// A batch's paths, its answer lost, to be asked again as drawn. Drawn
+// again if a span was turned away meanwhile: no answer is coming to
+// draw it, and one turned away again sets waiting again.
+static void codeaskdrop(Gui *g, CodeAsk *q)
 {
+    CodeLinks *c = &g->codelinks;
     for (i32 i = 0; i < q->n; i++) {
         if (q->paths[i]->state == CODE_ASKING) {
             q->paths[i]->state = CODE_NEW;
         }
     }
     *q = {};
+    if (c->waiting) {
+        scheddirty(&g->sched);
+    }
+    c->waiting = 0;
 }
 
-// At the end of a frame's drawing: the batches built sent, those lost
-// let go, and another frame if paths drawn here were left unasked.
+// A batch answered, each path a file (found[i] 1), a miss (0), or a
+// miss for a link on its way (2); all misses with found null. Drawn
+// again if it found a file, or a span was turned away meanwhile.
+static void codelinkanswered(Gui *g, CodeAsk *q, u8 *found)
+{
+    CodeLinks *c   = &g->codelinks;
+    i64        now = os_ticks(g->os);
+    b32        any = 0;
+    for (i32 i = 0; i < q->n; i++) {
+        CodeLink *e = q->paths[i];
+        u8        k = found ? found[i] : 0;
+        e->state  = k==1 ? CODE_FILE : CODE_MISS;
+        e->linked = k == 2;
+        e->asked  = now;
+        any      |= k == 1;
+    }
+    *q = {};
+    if (any || c->waiting) {
+        scheddirty(&g->sched);
+    }
+    c->waiting = 0;
+}
+
+// The window's pool's answer to the batch here (GFS_LINKS).
+static void codelinklocal(Gui *g, FsJob *job, b32 back, Str err)
+{
+    CodeAsk *q = &g->codelinks.local;
+    if (q->id && q->id==job->put.id) {
+        codelinkanswered(g, q, back && !err.len ? (u8 *)job->res : 0);
+    }
+}
+
+// At the end of a frame's drawing: the batches built sent, here to the
+// window's pool, and those lost let go.
 static void codelinksflush(Gui *g)
 {
     CodeLinks *c   = &g->codelinks;
     i64        now = g->sched.now;
+    CodeAsk   *lq  = &c->local;
+    if (lq->n && !lq->id) {
+        Arena      a = g->frame;
+        Buf        b(&a, 24*(iz)lq->n);
+        Slice<Str> paths = {alloc<Str>(&a, lq->n), lq->n, lq->n};
+        for (i32 k = 0; k < lq->n; k++) {
+            print(&b, (i64)lq->paths[k]->rootlen);
+            putbyte(&b, ' ');
+            paths[k] = lq->paths[k]->path;
+        }
+        FsPut put = {};
+        put.id    = ++g->nextid;
+        put.kind  = GFS_LINKS;
+        put.run   = guifsrun;
+        put.arg   = finish(&b);
+        put.paths = paths;
+        lq->id    = put.id;  // first: an inline job is answered in guifsput
+        lq->sent  = now;
+        Str why   = {};
+        if (!guifsput(g, &put, &why)) {
+            codelinkanswered(g, lq, 0);  // misses, asked again later
+        }
+    }
     for (i32 i = 0; i < CODELINK_HOSTS; i++) {
         CodeAsk *q = &c->asks[i];
         if (!q->host) {
@@ -1794,11 +2013,11 @@ static void codelinksflush(Gui *g)
         if (q->id) {
             if (filehostwhy(h).len || !reqheld(g, q->id) ||
                     now-q->sent > (i64)FILES_LOST*1000) {
-                codeaskdrop(q);
+                codeaskdrop(g, q);
             }
             continue;
         } else if (filehostwhy(h).len) {
-            codeaskdrop(q);
+            codeaskdrop(g, q);
             continue;
         }
         iz    len = 0;
@@ -1818,12 +2037,6 @@ static void codelinksflush(Gui *g)
         q->sent = now;
         cmdsend(g, &o, a);
     }
-    if (c->more) {
-        scheddirty(&g->sched);
-    }
-    c->stats = 0;
-    c->spent = 0;
-    c->more  = 0;
 }
 
 // A host's answer to a batch, if id is one's: each path a file or a
@@ -1849,9 +2062,10 @@ static b32 codelinkreply(Gui *g, i64 id, Json *j, b32 ok)
         found   |= e->state == CODE_FILE;
     }
     *q = {};
-    if (found) {
+    if (found || c->waiting) {
         scheddirty(&g->sched);
     }
+    c->waiting = 0;
     return 1;
 }
 
@@ -1860,15 +2074,16 @@ static void codelinkhostend(Gui *g, u64 host)
 {
     for (i32 i = 0; i < CODELINK_HOSTS; i++) {
         if (g->codelinks.asks[i].host == host) {
-            codeaskdrop(&g->codelinks.asks[i]);
+            codeaskdrop(g, &g->codelinks.asks[i]);
         }
     }
 }
 
 
 // Open file...: a path typed in a modal of its own (drawpathask), on
-// the shown session's host, its answer TASK_OPENFILE. On another host
-// the path is checked there (fs.stat) first.
+// the shown session's host, its answer TASK_OPENFILE once the path is
+// checked: here on the window's pool (GFS_STAT), on another host there
+// (fs.stat), "Checking..." shown if that takes FILES_NOTEDELAY.
 
 // The host Open file opens files on: the shown session's, else this
 // computer (null).
@@ -1913,8 +2128,9 @@ static void fileaskopen(Gui *g)
     GuiHost *h = fileaskhost(g);
     g->fask.host   = h ? h->uid : 0;
     g->fask.statid = 0;
-    g->fask.stated = 0;
-    g->fask.close  = 0;
+    g->fask.stated  = 0;
+    g->fask.close   = 0;
+    g->fask.opening = 0;
     scheddirty(&g->sched);
 }
 
@@ -1937,16 +2153,8 @@ static FilePath fileasked(Gui *g, Arena *a, Str text, FileRef *ref)
         copybytes(g->fask.err, p.err.data, n);
         g->fask.err[0] = (u8)(p.err[0]>='a' && p.err[0]<='z' ? p.err[0]-0x20 : p.err[0]);
         p.err = {g->fask.err, n};  // kept past the frame, for the modal
-        return p;
-    } else if (g->fask.host) {
-        return p;  // checked there (fileaskok)
     }
-    Str why = filestatwhy(filestat(g, *a, p.path).type);
-    if (why.len) {
-        p.err  = why;
-        p.path = {};
-    }
-    return p;
+    return p;  // else checked (fileaskok)
 }
 
 // Open file's answer, as drawpathask posted it: "LINE0 LINE1 PATH",
@@ -1964,20 +2172,33 @@ static Str fileanswerput(Arena *a, FilePath p, FileRef ref)
     return finish(&b);
 }
 
-// Ask the host whether Open file's path, kept as its answer, is a file.
+static void fileaskanswered(Gui *, Str);
+
+// Ask whether Open file's path, kept as its answer, is a file: here the
+// window's pool, else its host.
 static void fileaskstat(Gui *g)
 {
-    FileAsk *f = &g->fask;
-    GuiHost *h = filehost(g, f->host);
+    FileAsk *f      = &g->fask;
+    Str      answer = {f->answer, f->answerlen};
+    Cut      pl     = cut(cut(cut(answer, ' ').tail, ' ').tail, '\n');
+    f->statat = os_ticks(g->os);
+    if (!f->host) {
+        FsPut put = guifsjob(g, GFS_STAT, &pl.head);
+        f->statid = put.id;  // first: an inline job is answered in guifsput
+        Str why   = {};
+        if (!guifsput(g, &put, &why)) {
+            fileaskanswered(g, fswhy(why));
+        }
+        return;
+    }
+    GuiHost *h   = filehost(g, f->host);
     Str      why = filehostwhy(h);
     if (why.len) {
         f->statid = 0;
         f->p.err  = why;
         return;
     }
-    Str   answer = {f->answer, f->answerlen};
-    Cut   pl     = cut(cut(cut(answer, ' ').tail, ' ').tail, '\n');
-    Arena a      = newarena(g->cmdr);
+    Arena a = newarena(g->cmdr);
     Buf   b(&a, 256 + 6*pl.head.len);
     EvOut w = cmdopen(g, &b, CMD_FSSTAT, 0, h);
     putkey(&w.json, "paths");
@@ -1988,9 +2209,9 @@ static void fileaskstat(Gui *g)
     cmdsend(g, &w, a);
 }
 
-// Open file's OK: the path typed, its answer posted, else why not. On
-// another host, its answer waits for the check there, the modal open,
-// saying "Checking...".
+// Open file's OK: the path typed, its answer posted once the check
+// says it is a file, else why not. The modal stays open meanwhile,
+// saying "Checking..." if that takes a while.
 static Str fileaskok(Gui *g, Str text)
 {
     Arena    a   = g->frame;
@@ -2000,44 +2221,36 @@ static Str fileaskok(Gui *g, Str text)
         return p.err;
     }
     Str answer = fileanswerput(&a, p, ref);
-    if (!g->fask.host) {
-        mailpost(g->tasks, TASK_OPENFILE, g->fask.p.id, answer, 1);
-        return {};
-    } else if (answer.len > countof(g->fask.answer)) {
+    if (answer.len > countof(g->fask.answer)) {
         return "Its path is too long";
     }
     copybytes(g->fask.answer, answer.data, answer.len);
     g->fask.answerlen = answer.len;
+    g->fask.close     = 0;
     fileaskstat(g);
-    return g->fask.statid ? Str{} : g->fask.p.err;
+    return g->fask.statid || g->fask.close ? Str{} : g->fask.p.err;
 }
 
 // Each frame Open file is up: its check asked again where its request
 // slot went (REQ_MAX).
 static void fileaskcheck(Gui *g)
 {
-    if (g->fask.statid && !reqheld(g, g->fask.statid)) {
+    if (g->fask.statid && !idheld(g, g->fask.host, g->fask.statid)) {
         fileaskstat(g);
     }
 }
 
-// The host's answer to Open file's check: a file opens, else the modal
-// says why not.
-static void onfsstat(Gui *g, Arena, Json *j, b32 ok, Str err)
+// The answer to Open file's check, why its path is no file to open,
+// else (empty) its answer posted, a file: the modal closes, else says
+// why.
+static void fileaskanswered(Gui *g, Str why)
 {
     FileAsk *f = &g->fask;
     f->statid = 0;
-    f->stated = 1;
-    Str type = jsonstr(jsonget(jsonat(jsonget(j, "stats"), 0), "type"));
-    Str why  = !ok              ? err :
-               type == "file"   ? Str{} :
-               type == "dir"    ? Str("That is a folder") :
-               type == "missing" ? Str("No such file") :
-               type == "bad"    ? Str("It cannot be shown") :
-                                  Str("Not a regular file");
     if (!why.len) {
         mailpost(g->tasks, TASK_OPENFILE, f->p.id, {f->answer, f->answerlen}, 1);
-        f->close = 1;
+        f->close   = 1;
+        f->opening = 1;
     } else {
         iz n = why.len<countof(f->err) ? why.len : countof(f->err);
         copybytes(f->err, why.data, n);
@@ -2045,6 +2258,63 @@ static void onfsstat(Gui *g, Arena, Json *j, b32 ok, Str err)
         f->p.err  = {f->err, n};
     }
     scheddirty(&g->sched);
+}
+
+// The host's answer to Open file's check.
+static void onfsstat(Gui *g, Arena, Json *j, b32 ok, Str err)
+{
+    g->fask.stated = 1;
+    Str type = jsonstr(jsonget(jsonat(jsonget(j, "stats"), 0), "type"));
+    Str why  = !ok              ? err :
+               type == "file"   ? Str{} :
+               type == "dir"    ? Str("That is a folder") :
+               type == "missing" ? Str("No such file") :
+               type == "bad"    ? Str("It cannot be shown") :
+                                  Str("Not a regular file");
+    fileaskanswered(g, why);
+}
+
+// The window's pool's answer to Open file's check here (GFS_STAT).
+static void fileasklocal(Gui *g, FsJob *job, b32 back, Str err)
+{
+    Stat *st = back && !err.len ? (Stat *)job->res : 0;
+    fileaskanswered(g, st ? filestatwhy(st->type) : fswhy(err.len ? err : fsstuck));
+}
+
+// A job of the window's pool finished: on the window's thread, from
+// fsdone as its worker answers (back), else from fstick, fsrunqueue or
+// fsquit (given up, refused, or closing), when the pool keeps what it
+// holds, to drop once its worker is done, and err says why. Calls into
+// the pool from here take the scratch past what the pool still holds.
+static void guifsdone(void *owner, FsJob *job, Arena scratch)
+{
+    Gui *g    = (Gui *)owner;
+    b32  back = !fsabandon(g->fs, job->put.id);
+    Str  err  = back || job->err.len ? job->err : fsstuck;
+    if (g->fsclosing) {
+        if (back && job->put.own) {
+            job->put.drop(g->os, job->put.own);
+        }
+        return;
+    }
+    Arena keep = g->fsmem;
+    g->fsmem = scratch;
+    switch (job->put.kind) {
+    case GFS_FILE:
+        fetchlocal(g, job, back, err);
+        break;
+    case GFS_STAT:
+        if (!g->fask.host && g->fask.statid && g->fask.statid==job->put.id) {
+            fileasklocal(g, job, back, err);
+        } else {
+            filewatchlocal(g, job, back, err);
+        }
+        break;
+    case GFS_LINKS:
+        codelinklocal(g, job, back, err);
+        break;
+    }
+    g->fsmem = keep;
 }
 
 static void fileanswer(Gui *g, Str data)
@@ -2945,10 +3215,8 @@ static void drawfiles(Gui *g)
             ft->state       = FTAB_UNREAD;
         }
     }
-    if (ft->state==FTAB_UNREAD && ft->host) {
+    if (ft->state == FTAB_UNREAD) {
         filefetch(g, ft, 0);
-    } else if (ft->state == FTAB_UNREAD) {
-        fileload(g, ft);
     } else {
         filewatch(g, ft);  // changed, maybe, since it was read
     }
@@ -3052,9 +3320,14 @@ static void drawfiles(Gui *g)
         g->fshowing = 0;
         return;
     } else if (!b) {
-        // Coming from its host, or waiting for it to connect
-        if (ft->state == FTAB_READING) {
+        // Being read, said once it has taken a moment, else waiting for
+        // its host to connect
+        FileFetch *f  = &g->ffetch;
+        i64        at = f->ft==ft ? f->askedat+FILES_NOTEDELAY : 0;
+        if (ft->state==FTAB_READING && g->sched.now>=at) {
             filenote(g, "Reading...", 0);
+        } else if (ft->state == FTAB_READING) {
+            schedat(&g->sched, at, DUE_APP);
         } else if (farwhy.len) {
             filenote(g, farwhy, 1);
             if (fh && fh->r && !fh->closing && !fh->up) {

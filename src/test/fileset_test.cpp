@@ -646,3 +646,83 @@ static void test_filefind(Test *t)
     expect(t, "filegoto.bad", filegotostr(&a, "::12"), "no");
     expect(t, "filegoto.bad", filegotostr(&a, "123456789012345678901234567890123"), "no");
 }
+
+// A FileRead as "len size changed toobig err", and whether buf holds the
+// file's first len bytes ("same", else "differs").
+static Str filereadstr(Arena *a, FileRead r, u8 *buf, Str file)
+{
+    Buf b(a, 128);
+    print(&b, (i64)r.len);
+    putbyte(&b, ' ');
+    print(&b, r.size);
+    print(&b, r.changed ? Str(" changed") : Str(""));
+    print(&b, r.toobig ? Str(" toobig") : Str(""));
+    if (r.err.len) {
+        putbyte(&b, ' ');
+        print(&b, r.err);
+    }
+    b32 same = r.len<=file.len && Str{buf, r.len}==takehead(file, r.len);
+    print(&b, same ? Str(" same") : Str(" differs"));
+    return finish(&b);
+}
+
+static void test_filereadall(Test *t)
+{
+    Arena a  = t->perm;
+    Os   *os = newos(&a, (iz)32<<20);
+    Arena s  = carve(&a, (iz)16<<20);
+    iz    max  = 4*(iz)FILES_PART;
+    u8   *buf  = allocbytes(&a, max);
+    Str   path = "/f/data.txt";
+
+    // Across FILES_PART pieces, whole, and cut at max
+    iz  n    = 2*(iz)FILES_PART + 10;
+    Str file = {allocbytes(&a, n), n};
+    for (iz i = 0; i < n; i++) {
+        file.data[i] = (u8)('a' + i%26);
+    }
+    os_write(os, s, path, file);
+    Str      want = concat(&a, concat(&a, istr(&a, (i64)n), " "), istr(&a, (i64)n));
+    FileRead r    = filereadall(0, os, s, path, buf, max, 0);
+    expect(t, "filereadall.whole", filereadstr(&a, r, buf, file), concat(&a, want, " same"));
+    expect(t, "filereadall.mtime", istr(&a, r.mtime), istr(&a, os_time(os)));
+    expect(t, "filereadall.readat", r.readat<=os_time(os) ? Str("before") : Str("after"),
+           "before");
+    r = filereadall(0, os, s, path, buf, FILES_PART, 0);
+    expect(t, "filereadall.cut", filereadstr(&a, r, buf, file),
+           concat(&a, concat(&a, istr(&a, (i64)FILES_PART), " "),
+                  concat(&a, istr(&a, (i64)n), " same")));
+
+    // An image past max is not read; under it, read whole
+    r = filereadall(0, os, s, path, buf, FILES_PART, 1);
+    expect(t, "filereadall.imagebig", filereadstr(&a, r, buf, file), "0 0 toobig same");
+    r = filereadall(0, os, s, path, buf, max, 1);
+    expect(t, "filereadall.image", filereadstr(&a, r, buf, file), concat(&a, want, " same"));
+
+    // Missing, a folder
+    r = filereadall(0, os, s, "/f/none.txt", buf, max, 0);
+    expect(t, "filereadall.missing", r.err, "No such file");
+    os_mkdirs(os, s, "/f/dir");
+    r = filereadall(0, os, s, "/f/dir", buf, max, 0);
+    expect(t, "filereadall.folder", r.err, "That is a folder");
+
+    // Grown once while read: read again from the start, whole
+    os->growpath  = path;
+    os->growby    = "xyz";
+    os->growevery = 1;
+    os->growtimes = 1;
+    os->growreads = 0;
+    r = filereadall(0, os, s, path, buf, max, 0);
+    Str grown = concat(&a, file, "xyz");
+    Str gwant = concat(&a, concat(&a, istr(&a, (i64)grown.len), " "),
+                       istr(&a, (i64)grown.len));
+    expect(t, "filereadall.again", filereadstr(&a, r, buf, grown), concat(&a, gwant, " same"));
+
+    // Growing as it is read again too: what came is kept, its size
+    os->growtimes = 1000;
+    os->growreads = 0;
+    r = filereadall(0, os, s, path, buf, max, 0);
+    expect(t, "filereadall.changed", r.changed ? Str("changed") : Str("unchanged"), "changed");
+    expect(t, "filereadall.changedsize", istr(&a, r.size), istr(&a, (i64)r.len));
+    os->growtimes = 0;
+}

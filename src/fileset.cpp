@@ -93,6 +93,101 @@ static b32 filechanged(i64 size, i64 mtime, i64 readat, i64 size1, i64 mtime1)
     return size!=size1 || mtime!=mtime1 || (near<FILES_COARSE && near>-FILES_COARSE);
 }
 
+// A path's type on this computer, a device or a network path refused
+// (STAT_OTHER) before anything touches it: on Windows os_stat opens
+// the path, and opening a device can do things. On the window's file
+// workers (files.cpp), never on its own thread.
+static Stat filestat(Os *os, Arena scratch, Str path)
+{
+    if (devicepath(path, HOST_WINDOWS) || netpath(path, HOST_WINDOWS)) {
+        return {0, 0, STAT_OTHER};
+    }
+    return os_stat(os, scratch, path);
+}
+
+// Why a stat's type is not a file to read, else empty.
+static Str filestatwhy(i32 type)
+{
+    switch (type) {
+    case STAT_MISSING: return "No such file";
+    case STAT_DIR:     return "That is a folder";
+    case STAT_OTHER:   return "Not a regular file";
+    }
+    return {};
+}
+
+// A file on this computer as filereadall read it into its buffer.
+struct FileRead {
+    i64 size;     // the file's, as its stat said; what came, if it changed twice
+    i64 mtime;
+    i64 readat;   // epoch ms, taken before the stat
+    iz  len;      // bytes in the buffer
+    b32 changed;  // it changed while it was read, twice: what came is kept
+    b32 toobig;   // an image past max, not read
+    Str err;      // why it was not read, as a tab says it, else null
+};
+
+// A file on this computer, at most max bytes from its start, into buf,
+// for a Files tab, on a worker (c, else null as in tests) with a
+// heartbeat before the stat and between pieces of FILES_PART: stat'ed
+// first, so a folder, a device or a network path is refused as filestat
+// refuses it, and an image (image) past max is not read at all. A size
+// changed by the end reads it again from the start, once; changed again,
+// what came is kept (changed), as fs.read's parts are (onfsread).
+static FileRead filereadall(FsCall *c, Os *os, Arena scratch, Str path, u8 *buf, iz max,
+                            b32 image)
+{
+    FileRead r = {};
+    for (i32 again = 0;; again++) {
+        if (c && !fsat(c, path, again==0)) {
+            r.err = "The file system is not responding";
+            return r;
+        }
+        r.readat = os_time(os);
+        Stat st = filestat(os, scratch, path);
+        r.err = filestatwhy(st.type);
+        if (r.err.len) {
+            return r;
+        } else if (image && st.size>max) {
+            r.toobig = 1;
+            return r;
+        }
+        r.size  = st.size;
+        r.mtime = st.mtime;
+        r.len   = 0;
+        b32 changed = 0;
+        while (r.len < max) {
+            if (c && (fsgone(c) || (r.len && !fsat(c, path)))) {
+                r.err = "The file system is not responding";
+                return r;
+            }
+            Arena t    = scratch;  // for the piece, copied into buf
+            iz    want = max - r.len;
+            want = want<(iz)FILES_PART ? want : (iz)FILES_PART;
+            Read  rd   = os_readat(os, &t, path, r.len, want);
+            if (rd.err != READ_OK) {
+                r.err = rd.err==READ_NOTFOUND ? Str("No such file") :
+                        rd.err==READ_NOTFILE  ? Str("Not a regular file") :
+                                                Str("It could not be read");
+                return r;
+            }
+            copybytes(buf+r.len, rd.data.data, rd.data.len);
+            r.len   += rd.data.len;
+            changed |= rd.size != st.size;
+            if (rd.data.len < want) {
+                break;
+            }
+        }
+        if (!changed) {
+            return r;
+        } else if (again) {
+            r.changed = 1;
+            r.size    = r.len;
+            return r;
+        }
+    }
+}
+
 enum : i32 {  // FileTab.state
     FTAB_UNREAD,   // not read, or its body freed: read when shown
     FTAB_READING,  // a read in flight

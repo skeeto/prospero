@@ -11168,7 +11168,13 @@ static PathField pathbefore(Gui *g, GuiHost *h, char *buf, b32 *enter, b32 off,
     f.cb.scratch = *a;
     i32 n      = (i32)f.cb.picks.len;
     pc->sel    = pc->sel<n ? pc->sel : -1;
-    f.visible  = pc->shown && (n || f.list->err.len || !f.list->got);
+    // "Listing..." once the listing has taken a moment, else not at all
+    i64 noteat = f.list->at + FILES_NOTEDELAY;
+    b32 noted  = !f.list->got && g->sched.now>=noteat;
+    if (pc->shown && !f.list->got && !noted) {
+        schedat(&g->sched, noteat, DUE_APP);
+    }
+    f.visible  = pc->shown && (n || f.list->err.len || noted);
     if (!f.visible) {
         return f;
     }
@@ -11377,9 +11383,13 @@ static void drawpathask(Gui *g, PathAsk *pa, char const *pid, char const *name, 
             dragplace(g, DROPTO_FIELD);
         }
         pathafter(g, &pf, pa->buf);
+        // Said once the check has taken a moment, else not at all
         b32 checking = openfile && g->fask.statid;
-        if (checking) {
+        i64 noteat   = g->fask.statat + FILES_NOTEDELAY;
+        if (checking && g->sched.now>=noteat) {
             ImGui::TextDisabled("Checking...");
+        } else if (checking) {
+            schedat(&g->sched, noteat, DUE_APP);
         } else if (pa->err.len) {
             ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
             ImGui::TextWrapped("%s", cstr0(&a, pa->err));

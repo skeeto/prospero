@@ -4,7 +4,8 @@
 // stopped mapped drive) waits in the kernel for as long as the mount
 // says, which may be forever. The engine's fs.read, fs.stat and dir run
 // here, so that one dead path never stops its thread, and from it every
-// session; the window's own reads follow.
+// session; so do the window's own reads and stats of this computer's
+// files (files.cpp), each owner with a pool of its own.
 //
 // Threads. Up to FS_THREADS detached workers, started as they are
 // needed: a queued job that is not held starts one when no worker is
@@ -1004,6 +1005,20 @@ static b32 fsheld(FsPool *p, i64 id)
     for (i32 i = 0; i < FS_JOBS; i++) {
         FsJob *j = &p->jobs[i];
         r |= j->state!=FSJ_FREE && j->put.id==id && !j->finished;
+    }
+    os_unlock(&p->lock);
+    return r;
+}
+
+// Whether any job is outstanding, as fsheld counts them: for a
+// checklist's wait.
+static b32 fspending(FsPool *p)
+{
+    b32 r = 0;
+    os_lock(&p->lock);
+    for (i32 i = 0; i < FS_JOBS; i++) {
+        FsJob *j = &p->jobs[i];
+        r |= j->state!=FSJ_FREE && !j->finished && !j->abandoned;
     }
     os_unlock(&p->lock);
     return r;

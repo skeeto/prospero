@@ -381,11 +381,14 @@ def filesfixtures(host):
     one each 50 (lines 6, 56, ..., 256 among them, at a chunk's end); a
     400-column line among short ones; two files of one name; Markdown; a
     BOM and CRLF; a binary file; and more lines than are kept; an image
-    (CHK_FILEIMAGE's 40 by 30) and a PNG cut short."""
+    (CHK_FILEIMAGE's 40 by 30) and a PNG cut short; and two the window's
+    file workers stall (FSSTALL), a slow one and a dead one."""
     d = lambda *p: host.path("work", "files", *p)
     for sub in ("a", "b"):
         host.mkdir(d(sub))
     host.write(d("pixels.png"), pngfixture(40, 30))
+    host.write(d("stallslow.txt"), "slow\n")
+    host.write(d("stalldead.txt"), "dead\n")
     host.write(d("corrupt.png"), BADPNG)
     host.write(d("a", "x.c"), "int a(void) { return 1; }\n")
     host.write(d("b", "x.c"), "int b(void) { return 2; }\n")
@@ -1561,7 +1564,8 @@ fake_provider.SCENARIOS["hosttask_b"] = sc_hosttask_b
 
 
 # The remote mode's stalled paths there, when far is this machine (or
-# the Windows host's own): a slow one, and one that never answers
+# the Windows host's own): a slow one, and one that never answers; and
+# the drive mode's, files/stall*.txt, in the window's own file workers
 FSSTALL = {"PROSPERO_TEST_FSSTALL": "stallslow=2500;stalldead=600000",
            "PROSPERO_TEST_FSSTUCK_MS": "5000"}
 
@@ -2141,6 +2145,11 @@ def main():
     elif args.mode == "drive" and not args.fake:
         before = config(curl, model, extra=m4config(curl, nonce))
         if not args.host:
+            # The window's file workers stall files/stall*.txt, and give
+            # up on a worker after 5 s (fswork.cpp); a --host gets these
+            # through host.run's env
+            os.environ.update(FSSTALL)
+        if not args.host:
             # Open in editor's editor, a sh script (the checklist skips it
             # without one)
             editor = host.path("config-edit.sh")
@@ -2287,8 +2296,10 @@ def main():
                 if not os.path.exists(os.path.join(args.shots, f"compose-{name}.png")):
                     problems.append(f"no compose-{name}.png")
     else:
-        status, lines = host.run(guiargs, args.timeout, guicwd,
-                                 env=far.env() if far else None)
+        env = far.env() if far else None
+        if args.mode == "drive" and args.host and not args.fake:
+            env = FSSTALL
+        status, lines = host.run(guiargs, args.timeout, guicwd, env=env)
     dt = time.monotonic() - t0
 
     if status is None:

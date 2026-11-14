@@ -57,6 +57,11 @@ struct Os {
     b32        failwrites;
     b32        failtrunc;
     b32        failsync;
+    Str        growpath;  // os_readat of it appends growby after every
+    Str        growby;    //   growevery-th read, growtimes times
+    i32        growevery;
+    i32        growtimes;
+    i32        growreads;
 };
 
 static VFile *vfind(Os *os, Str path, b32 create)
@@ -427,6 +432,12 @@ static Read os_readat(Os *os, Arena *a, Str path, i64 off, iz max)
         Str d = r.data;
         d = off<d.len ? cuthead(d, (iz)off) : cuthead(d, d.len);
         r.data = d.len>max ? takehead(d, max) : d;
+    }
+    // A file growing as it is read: after this read, for the next
+    if (os->growtimes>0 && path==os->growpath && ++os->growreads%os->growevery==0) {
+        VFile *f = vfind(os, path, 0);
+        f->data = concat(&os->mem, f->data, os->growby);
+        os->growtimes--;
     }
     return r;
 }
@@ -868,6 +879,7 @@ int main()
     test_sidebar(&t);
     test_dock(&t);
     test_fileset(&t);
+    test_filereadall(&t);
     test_filefind(&t);
     test_palette(&t);
     test_dropto(&t);
