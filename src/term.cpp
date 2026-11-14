@@ -2192,7 +2192,7 @@ static TermBar termtabs(Gui *g, GuiSession *s)
     if (why.len) {
         itemtip("%s", cstr0(&a, why));
     } else {
-        itemtip("New terminal tab (Ctrl+Shift+`)");
+        itemtip("New terminal tab (%s)", cstr0(&a, termkey(g, &a, 1)));
     }
     itemnamed(g, "term tab +");
 
@@ -2355,7 +2355,8 @@ static void drawterm(Gui *g)
                 return;
             }
         } else {
-            ImGui::TextDisabled("Ctrl+` starts one, and comes back to it");
+            ImGui::TextDisabled("%s starts one, and comes back to it",
+                                cstr0(&a, termkey(g, &a, 0)));
             return;
         }
     }

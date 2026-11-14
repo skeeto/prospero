@@ -1826,6 +1826,7 @@ struct MsgAction {
 
 static char const bglabel[] = "Run in background";
 static char const *cmdkey(Gui *, Arena *, Str);
+static Str termkey(Gui *, Arena *, b32);
 static void itemnamed(Gui *, Str);
 static b32  hostlive(Gui *, GuiSession *);
 
@@ -7572,7 +7573,8 @@ static void drawprompt(Gui *g)
         whytip(why.len ? why :
                fake ? Str("Open in external terminal: its shell in its folder, as the "
                           "fake agent has no terminal tabs")
-                    : Str("Terminal: its shell in its folder, in the Terminal pane (Ctrl+`)"));
+                    : concat(&a, concat(&a, Str("Terminal: its shell in its folder, in the "
+                                                "Terminal pane ("), termkey(g, &a, 0)), Str(")")));
     }
     if (s->hist) {
         // Which of the session's messages the box holds: oldest is 1
@@ -8473,7 +8475,7 @@ static void sessitems(Gui *g, Arena a, GuiSession *s)
     }
     if (menutip(g, &a, "New terminal tab", termaddwhy(g, s),
                 "A shell in its folder, in a tab of the Terminal pane",
-                "Ctrl+Shift+`")) {
+                cstr0(&a, termkey(g, &a, 1)))) {
         termadd(g, s);
     }
     Str close = !s->view ? Str("It is not open here") :
@@ -15132,6 +15134,19 @@ static char const *cmdkey(Gui *g, Arena *a, Str key)
     return cstr0(a, concat(a, g->mac ? Str("Cmd+") : Str("Ctrl+"), key));
 }
 
+// The Terminal's chord, Ctrl+` or with Shift, as the menus show it. It is
+// the key left of 1 by position (physical Ctrl on macOS too), named by
+// what that key types under the layout: Ctrl+^ on German, Ctrl+| on
+// Norwegian, and ` where the layout gives no character.
+static Str termkey(Gui *g, Arena *a, b32 shift)
+{
+    u32 cp = os_guikeycp(g->os, ImGuiKey_GraveAccent, 0);
+    cp     = !cp ? '`' : cp>='a' && cp<='z' ? cp - 0x20 : cp;
+    u8  buf[4];
+    Str key = {buf, utf8encode(buf, (i32)cp)};  // concat copies it
+    return concat(a, shift ? Str("Ctrl+Shift+") : Str("Ctrl+"), key);
+}
+
 // Whether a new session can start now.
 static b32 cannew(Gui *g)
 {
@@ -16314,7 +16329,7 @@ static void drawmenubar(Gui *g)
             ImGui::MenuItem("Move to Trash");
             ImGui::Separator();
             ImGui::MenuItem("Open in external terminal");
-            ImGui::MenuItem("New terminal tab", "Ctrl+Shift+`");
+            ImGui::MenuItem("New terminal tab", cstr0(&a, termkey(g, &a, 1)));
             ImGui::MenuItem("Close");
             ImGui::EndDisabled();
         }
