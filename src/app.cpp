@@ -14342,7 +14342,8 @@ enum : i32 {
     CHK_PLANEDITED,   // the plan's ask shows the file as edited, with text
     CHK_PLANREVEAL,   // Reveal showed the plan file, once
     CHK_TERMRAN,      // dx terminals opened, the latest's launch with text,
-                      // with dy in its shell's environment (shell.env)
+                      // with dy in its shell's environment (shell.env);
+                      // text POSIX|WINDOWS is the half for the session's host
     CHK_PLANPLAIN,    // the plan is out in the editor, no plan waiting
     CHK_PLANQUIET,    // the session is idle, asking nothing
     CHK_PLANREVISED,  // the agent heard the plan approved was revised by hand
@@ -19263,7 +19264,7 @@ static DriveOp remoteops[] = {
     {OP_MOVE, T_NAMED, 0, 0, 100, "Open in external terminal"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
-    {OP_CHECK, CHK_TERMRAN, 1, 0, 0, "ssh -t -- here cd "},
+    {OP_CHECK, CHK_TERMRAN, 1, 0, 0, "ssh -t -- here cd |ssh -t -- here cmd /k cd /d "},
     {OP_SHOT, 0, 0, 0, 300, "remote-terminal"},
     // Its model picker lists the models of the host's own configuration
     {OP_MOVE, T_NAMED, 0, 0, 100, "model picker"},
@@ -25652,10 +25653,12 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_NOTIFY:
         return g->notify == (u32)g->ops[g->drivepc-1].dx;
     case CHK_TERMRAN: {
-        DriveOp *op = &g->ops[g->drivepc-1];
-        Arena    a  = g->frame;
+        DriveOp *op   = &g->ops[g->drivepc-1];
+        Arena    a    = g->frame;
+        Cut      alts = cut(op->text, '|');  // a Windows host's launch differs
+        Str      want = alts.ok && g->sess && hostwin(g->sess->host) ? alts.tail : alts.head;
         guilog(g, concat(&a, "drive: terminal: ", g->termline));
-        return g->terms==(i32)op->dx && g->termline.len && find(g->termline, op->text)>=0 &&
+        return g->terms==(i32)op->dx && g->termline.len && find(g->termline, want)>=0 &&
                (op->dy==0 || g->termenv);
     }
     case CHK_PLANREVEAL: {
