@@ -654,6 +654,12 @@ static CfgKey cfgschema[] = {
      "hx, emacs -nw) in a Terminal tab of the file's session, on Linux and "
      "macOS through the login shell, which can test PROSPERO_EDIT_FILE to "
      "skip an exec tmux (on Windows found on PATH, run by cmd.exe). "
+     "Another host's file (ssh, WSL, a container) opens in a Terminal tab "
+     "there, with this editor only if it runs in a terminal: as written on "
+     "a host of the same OS family, else by its name alone (nvim); "
+     "otherwise that host's own $VISUAL or $EDITOR runs, else vi, never "
+     "this computer's. An editor with a window of its own still opens a "
+     "container's mounted folder or a WSL distro's file here. "
      "A GUI started from the Finder or a desktop menu "
      "has no shell environment: no $VISUAL, no $EDITOR, and its PATH may "
      "lack the editor, so name it in full here, or add its directory to "
@@ -671,7 +677,9 @@ static CfgKey cfgschema[] = {
      "An editor with a window of its own is not waited for; one that runs "
      "in a terminal runs in a Terminal tab, as for [ui] editor. On Linux "
      "with no editor set at all, the tab runs the login shell's $VISUAL or "
-     "$EDITOR, else vi"},
+     "$EDITOR, else vi. Another host's file gets it only on a host of the "
+     "same OS family, and only when it runs in a terminal; else as [ui] "
+     "editor says"},
     {"ui", "terminal", CFG_STRING, "", {}, {}, "ui",
      "The terminal that a session's Open in external terminal opens in its folder: "
      "on macOS an application's name (Terminal, iTerm, Ghostty), elsewhere "

@@ -785,8 +785,8 @@ class Remote:
                 break
         return status, [l for l in lines if not l.startswith("done ")]
 
-    def popen(self, args, stdin=False):
-        return self.h.popen(args, self.path("work"), stdin=stdin)
+    def popen(self, args, stdin=False, env=None):
+        return self.h.popen(args, self.path("work"), stdin=stdin, env=env)
 
     def listdir(self, path):
         out = self.h.sh(f"ls {path} 2>/dev/null || true", check=False)
@@ -1597,17 +1597,46 @@ class Far:
                 self.wsl = os.path.join(host.root, "fakewsl")
                 host.write(self.wsl, fakewsl(home))
                 os.chmod(self.wsl, 0o755)
+            # The remote mode's Open in editor on a file there runs the
+            # editor far's login shell names: the fake mg, as $VISUAL. On
+            # POSIX its own home's .profile sets it for plain sh, which
+            # no profile of the user's touches; on Windows, with no login
+            # shell, its environment does, mg.cmd calling w64devkit's sh by
+            # its full path: far's server, started over ssh through
+            # cmd.exe, may have no w64devkit on PATH (biron's does not)
+            env = None
+            if args.mode == "remote":
+                mg = self.root + "/mg"
+                host.write(mg, MG_EDITOR)
+                if self.windows or os.name == "nt":
+                    if self.windows:
+                        # w64devkit's own sh.exe: a newer w64devkit's
+                        # busybox.exe, the one copied to the root, has
+                        # no shell applet
+                        bin_ = host.h.sh('cd "$HOME/w64devkit/bin" && pwd -W').strip()
+                        sh = '"' + bin_.replace("/", "\\") + '\\sh.exe"'
+                    else:
+                        sh = '"' + shutil.which("sh").replace("\\", "/") + '"'
+                    host.write(self.root + "/mg.cmd",
+                               f'@{sh} "%~dp0mg" %*\r\n@exit /b %errorlevel%\r\n')
+                    visual = (self.root + "/mg.cmd").replace("/", "\\")
+                    env = {"VISUAL": visual} if self.windows else dict(os.environ, VISUAL=visual)
+                else:
+                    os.chmod(mg, 0o755)
+                    host.write(os.path.join(home, ".profile"),
+                               f"VISUAL={shword(mg)}; export VISUAL\n")
+                    env = dict(os.environ, HOME=home, SHELL="/bin/sh")
             # The host first, here: started through the fake ssh, it would
             # descend from the GUI's reaper (Linux: a subreaper), or stay
             # in its job (Windows), and go with the stream dropped
             serve = ["serve", "--state", self.state, "-c", self.config, "--idle", "600"]
             if self.windows:
-                self.server = host.popen(serve)
+                self.server = host.popen(serve, env=env)
             else:
                 self.server = subprocess.Popen(
                     [self.prospero] + serve, stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    start_new_session=True)
+                    start_new_session=True, env=env)
         else:
             png = base64.b64encode(pngfixture(40, 30)).decode()
             self.sh(f"mkdir -p {self.work}/nested {self.state} && "
@@ -1654,11 +1683,13 @@ class Far:
         elif self.args.mode in ("hosttask", "thin", "terminal"):
             return {"PROSPERO_TEST_SSH": self.ssh, "PROSPERO_TEST_SCP": self.scp}
         elif self.windows:
-            return {"PROSPERO_TEST_SSH": self.ssh}
+            return {"PROSPERO_TEST_SSH": self.ssh, "PROSPERO_TEST_FARMG": "1"}
         # Engines started through the fake ssh leave out a cap, as an
-        # older one would; this one's host, started here, does not
+        # older one would; this one's host, started here, does not. Its
+        # login shell has the fake mg as $VISUAL
         return {"PROSPERO_TEST_SSH": self.ssh, "PROSPERO_TEST_WSL": self.wsl,
-                "PROSPERO_TEST_SCP": self.scp, "PROSPERO_TEST_DROPCAP": "bypass"}
+                "PROSPERO_TEST_SCP": self.scp, "PROSPERO_TEST_DROPCAP": "bypass",
+                "PROSPERO_TEST_FARMG": "1"}
 
     def hosts(self):
         """The hosts running for its state directory, as JSONL lines."""

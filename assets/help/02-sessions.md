@@ -322,10 +322,15 @@ editor (`[ui] editor`, or
 [`[ui] editor_line`](settings:ui#editor_line) for one Prospero doesn't
 know) at the line last gone to (a link's first, Go to line's, or the
 current find match's, with its column), else the band's first line,
-else the line at the top, without waiting for it. Both work for a file on this computer, in a
-container's folder mounted here, or, on Windows, in a WSL distro;
-for another host's they say why not. A binary file says so, with Show
-as text anyway; past 4 MiB or 100,000 lines only the start shows.
+else the line at the top, without waiting for it. Reveal works for a
+file on this computer, in a container's folder mounted here, or, on
+Windows, in a WSL distro; for another host's it says why not. Open in
+editor opens another host's file in a Terminal tab there, in that
+host's editor ([Hosts](help:hosts#sessions-on-a-remote)); a file in a
+container's folder mounted here, or in a WSL distro, still opens here
+when the editor has a window of its own. A binary file says
+so, with Show as text anyway; past 4 MiB or 100,000 lines only the
+start shows.
 
 An editor that runs in a terminal (`vim`, `nvim`, `nano`, `hx`,
 `emacs -nw`), as `[ui] editor`, `$VISUAL` or `$EDITOR` names it, opens

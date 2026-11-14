@@ -289,8 +289,15 @@ fails with a link to sign up for Copilot Free.
   shell, so `$PATH` and the rest of your profile apply; a profile that
   starts something interactive, such as `exec tmux`, can skip it while
   `PROSPERO_EDIT_FILE` is set. On Windows, which has no login shell, it
-  is found on PATH and runs through cmd.exe. Started from the Finder or
-  a desktop menu, Prospero has no `$VISUAL` or `$EDITOR`: set this,
+  is found on PATH and runs through cmd.exe. Another host's file (over
+  ssh, in WSL or in a container) opens in a Terminal tab there
+  ([Hosts](help:hosts#sessions-on-a-remote)), with this editor only if
+  it runs in a terminal: as written on a host of the same OS family
+  (Windows, or not), else by its name alone, as `nvim`; otherwise that
+  host's own `$VISUAL` or `$EDITOR` runs there, else `vi`, never this
+  computer's. An editor with a window of its own still opens a file in
+  a container's folder mounted here, or in a WSL distro, here. Started
+  from the Finder or a desktop menu, Prospero has no `$VISUAL` or `$EDITOR`: set this,
   with a full path if need be. On Windows its program is looked for by
   its full path or on PATH, and run by the full path found, so a
   program of that name in the file's folder never runs instead, and a
@@ -309,7 +316,9 @@ fails with a link to sign up for Copilot Free.
   `[ui] editor` says, and one opened by a terminal of its own, as
   `alacritty -e nvim`, opens as a window would. On Linux with no editor set at all, Open in
   editor opens a Terminal tab with your login shell's `$VISUAL` or
-  `$EDITOR`, else `vi`.
+  `$EDITOR`, else `vi`. Another host's file gets it only on a host of
+  the same OS family, and only when it runs in a terminal; otherwise
+  as `[ui] editor` says.
 - **[`[ui] terminal`](settings:ui#terminal)**: the terminal that Open in external terminal opens: on
   macOS an application's name (`iTerm`, `Ghostty`), elsewhere a program
   (`wt.exe`, `konsole`, `kitty`, `wezterm`), whose options for its

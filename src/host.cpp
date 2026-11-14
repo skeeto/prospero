@@ -811,6 +811,7 @@ static void hosthello(Host *h, HostClient *c, Arena scratch, i64 id, Json *j)
         putstrkey(&w.json, "home", home);
     }
     putintkey(&w.json, "pid", (i64)os_pid(h->os));
+    putintkey(&w.json, "pty", os_ptyable(h->os));  // whether term.open can work
     Str line = evend(&w);
     hostmust(h, c, scratch, line);
     if (c->gone) {

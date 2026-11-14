@@ -664,6 +664,8 @@ def attach_reconnect(t):
     t.check(h.get("proto") == 0 and "host" in h.get("caps", []), f"hello: {h}")
     t.check({"list", "open", "file", "draft"} <= set(h.get("cmds", [])) and
             "subagents" in h.get("caps", []), f"hello names its commands: {h}")
+    # and whether it has pseudoconsoles, for Terminal tabs (XP has none)
+    t.check(h.get("pty") == 1, f"hello's pty: {h}")
     pids = t.hostpids()
     t.check(len(pids) == 1, f"one host registered: {pids}")
     r = c.call("new", cwd=t.work, prompt="go", attended=1)
@@ -1228,6 +1230,8 @@ def checkup(t, c, up):
     # and its home, by which the GUI knows a Windows host and shows ~
     home = up.get("home", "")
     t.check(home and os.path.samefile(home, os.path.expanduser("~")), f"up's home: {up}")
+    # and no pty, which it passes on only as 0, a host with none
+    t.check("pty" not in up, f"up's pty: {up}")
 
 
 @scenario

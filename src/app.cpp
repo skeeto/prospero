@@ -6897,7 +6897,7 @@ static void hostcaps(Gui *g, GuiHost *h, Json *j)
     h->version = h->version==version ? h->version : clone(&g->perm, version);
     hostnames(g, &h->cmds, jsonget(j, "cmds"));
     hostnames(g, &h->caps, jsonget(j, "caps"));
-    h->nopty = !jsonint(jsonget(j, "pty"), 1);  // a remote's "up" has none
+    h->nopty = !jsonint(jsonget(j, "pty"), 1);  // a remote's "up" has it only as 0
     Str home = jsonstr(jsonget(j, "home"));
     h->home = h->home==home ? h->home : clone(&g->perm, home);
 }
@@ -7144,23 +7144,41 @@ static Str editordraft(Gui *g, Arena *a)
     return cmd;
 }
 
-// What Open in editor sends with a file of this computer to open in a
-// Terminal tab (term.open's edit): [ui] editor_line if its program runs
-// in a terminal, else the editor set (editorset) if its does, by its
-// name (without .exe and the like, as the reply's); term 0 for an editor with a window of its own, or none.
+// What Open in editor sends with a file to open in a Terminal tab of
+// host h (term.open's edit), h null or not a remote for this computer.
+// For this computer's file: [ui] editor_line if its program runs in a
+// terminal, else the editor set (editorset) if it does. For a remote's
+// (ssh, WSL, a container): the settings alone, never this window's
+// $VISUAL or $EDITOR, and only an editor that runs in a terminal: to a
+// host of the same OS family [ui] editor_line, else [ui] editor, as
+// written; to another family [ui] editor by its known name alone
+// (editorbare), since its path and arguments may mean nothing there.
+// Nothing (term 0) has the host's own editor run there: its login
+// shell's $VISUAL or $EDITOR, else vi. The name is its program's file
+// name, without .exe and the like, as the reply's.
 struct EditAsk {
     Str editor;  // the editor's command, else null
     Str tmpl;    // or its template
     Str name;    // its program's file name
-    b32 term;    // one of them runs in a terminal
+    b32 term;    // one of them is sent, an editor that runs in a terminal
 };
 
-static EditAsk editask(Gui *g, Arena *a)
+static b32 hostwin(GuiHost *);
+
+static EditAsk editask(Gui *g, Arena *a, GuiHost *h)
 {
-    EditAsk r    = {};
-    Str     cmd  = trim(editorset(g, a));
-    Str     tmpl = trim(g->edjumpfmt);
-    Str     use  = tmpl.len ? tmpl : cmd;
+    EditAsk r      = {};
+    b32     remote = h && h->kind==GH_REMOTE;
+    Str     cmd    = trim(remote ? g->editor : editorset(g, a));
+    Str     tmpl   = trim(g->edjumpfmt);
+    if (remote && hostwin(h)!=(b32)HOST_WINDOWS) {
+        cmd  = editorbare(cmd);
+        tmpl = {};
+    } else if (remote) {
+        cmd  = editorterm(cmd) ? cmd : Str{};
+        tmpl = editorterm(tmpl) ? tmpl : Str{};
+    }
+    Str use = tmpl.len ? tmpl : cmd;
     if (use.len && editorterm(use)) {
         r.term   = 1;
         r.name   = termeditname(cmdprog(use, 0));  // as the reply has it
@@ -13967,6 +13985,8 @@ enum : i32 {
                   // drivedragfx (GEV_DRAG)
     OP_IFDRAGLOAD,// unless the platform says what a drag holds before its
                   // drop (no GUI_NODRAGLOAD), skip dx ops
+    OP_IFFARMG,   // unless the remote host's login shell has gui.py's fake
+                  // mg as $VISUAL (PROSPERO_TEST_FARMG), skip dx ops
 };
 // OP_TEXTCWD with text types the --cwd directory and text after it, on
 // Windows with backslashes, as a Windows user types a path.
@@ -19360,7 +19380,24 @@ static DriveOp remoteops[] = {
     // refused; a link to a file there, and to one not there
     REMOTEFILES(OP_TEXTRCWD, "", "/hello.txt", "/nope.txt"),
     {OP_SHOT, 0, 0, 0, 300, "remote-files"},
-    {OP_CHECK, CHK_EDITWHY, 0, 0, 0, "Its file is on another computer"},
+    // Open in editor there: a Terminal tab of its session, where its
+    // engine runs the editor its login shell's $VISUAL names (gui.py's
+    // fake mg, which far's own .profile sets, here only); once it saves
+    // and exits, Files has the file, read again there, with the focus
+    {OP_IFFARMG, 0, 14, 0, 0, ""},
+    {OP_CHECK, CHK_EDITROUTE, 1, 0, 0, "in a Terminal tab on r (here), in the editor $VISUAL or $EDITOR names there"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file editor"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_WAIT, W_TERM, 0, 0, 15000, "fake mg [+1]"},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*mg hello.txt"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 100, "w hello by mg"},
+    TERMKEY(GKEY_ENTER, 300),
+    {OP_WAIT, W_TERMCOUNT, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_FILEFOCUS, 0, 0, 0, ""},
+    {OP_WAIT, W_FILEFRESH, 0, 0, 20000, ""},
+    {OP_CHECK, CHK_FILETEXT, 0, 0, 0, "hello by mg"},
     // Inline code naming the file there: a link once fs.stat there
     // found it
     {OP_CHECK, CHK_FILELINK, 1, 0, 0, "hello.txt"},
@@ -19641,6 +19678,21 @@ static DriveOp ctrops[] = {
     {OP_UP, 0, 0, 0, 300, ""},
     REMOTEFILES(OP_TEXT, "/work", "/hello.txt", "/nope.txt"),
     {OP_SHOT, 0, 0, 0, 300, "containers-files"},
+    // Open in editor on its file, only in the container: a Terminal tab
+    // there runs its own editor, with no editor set for it, busybox's
+    // vi, which quits with 0, and Files has the focus again
+    {OP_CHECK, CHK_EDITROUTE, 1, 0, 0, ", in the editor $VISUAL or $EDITOR names there, else vi"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file editor"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_WAIT, W_TERM, 0, 0, 20000, "hello world"},
+    {OP_CHECK, CHK_TERMCOUNT, 2, 0, 0, ""},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "containers-editor"},
+    {OP_TEXT, 0, 0, 0, 100, ":q"},
+    TERMKEY(GKEY_ENTER, 300),
+    {OP_WAIT, W_TERMCOUNT, 1, 0, 10000, ""},
+    {OP_CHECK, CHK_FILEFOCUS, 0, 0, 0, ""},
     {OP_MOVE, T_SESSTITLE, 0, 0, 100, ""},  // untitled, the only one
     {OP_RDOWN, 0, 0, 0, 60, ""},
     {OP_RUP, 0, 0, 0, 500, ""},
@@ -20826,6 +20878,34 @@ static DriveOp termops[] = {
     {OP_WAIT, W_REMOTEUP, 0, 0, 60000, ""},
     {OP_WAIT, W_TERM, 0, 0, 10000, "\nlate\ntty$"},
     {OP_CHECK, CHK_TERMWAIT, 0, 0, 0, ""},
+    // Open in editor on its file: a tab there runs [ui] editor as
+    // written, a host of the same OS family; it exits at once, and Files
+    // has the focus, the shell's tab the front one again
+    {OP_MOVE, T_TRANSCRIPT, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    CMDKEY(GKEY_O, 800),
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_TEXTRCWD, 0, 0, 0, 100, ""},
+    {OP_TEXT, 0, 0, 0, 300, "/hello.txt"},
+    TERMKEY(GKEY_ENTER, 300),
+    {OP_WAIT, W_FILEREADY, 0, 0, 20000, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_EDITROUTE, 1, 0, 0, "Open the file in mg, in a Terminal tab on r"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file editor"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_WAIT, W_TERM, 0, 0, 15000, "fake mg [+1]"},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, TERMSH "|*mg hello.txt"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMCOUNT, 4, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 100, "q 0"},
+    TERMKEY(GKEY_ENTER, 300),
+    {OP_WAIT, W_TERMCOUNT, 3, 0, 10000, ""},
+    {OP_CHECK, CHK_FILEFOCUS, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*" TERMSH},
+    CTRLKEY(GKEY_GRAVE, 500),
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
     {OP_TEXT, 0, 0, 0, 100, "echo $$ >remote.pid; trap 'echo hup >hup-remote.txt; exit' HUP EXIT"},
     TERMKEY(GKEY_ENTER, 100),
     {OP_WAIT, W_TERM, 0, 0, 5000, "EXIT\ntty$"},
@@ -26957,6 +27037,12 @@ static void drivestep(Gui *g)
     case OP_IFSCP:
         if (!os_getenv(g->os, &g->frame, "PROSPERO_TEST_SCP").len) {
             guilog(g, "drive: skip, with no stand-in for scp");
+            g->drivepc += (i32)op->dx;
+        }
+        break;
+    case OP_IFFARMG:
+        if (!os_getenv(g->os, &g->frame, "PROSPERO_TEST_FARMG").len) {
+            guilog(g, "drive: skip, with no fake mg on the remote host");
             g->drivepc += (i32)op->dx;
         }
         break;

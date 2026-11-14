@@ -32,6 +32,24 @@ container", "is not running" or "executable file not found". A window
 on a state directory that `prospero serve` hosts lists the sessions the
 host holds and attaches to them.
 
+A remote's `up` record carries its host's hello: `version`, `home`,
+`cmds`, `caps`, and `pty: 0` when that host has no pseudoconsoles
+(Windows before 10 version 1809), so that the window says why a
+Terminal tab there cannot open before it tries. Open in editor on a
+remote's file (ssh, WSL or a container) opens a Terminal tab of its
+session there, through term.open's `edit` (cap `term.edit`, which an
+older engine lacks: the window says to update it). The window sends
+only its own settings, never its `$VISUAL` or `$EDITOR`, and only an
+editor that runs in a terminal (`editorterm`): to a host of the same OS
+family, as `hostwin` tells by its home, `[ui] editor_line`, else `[ui]
+editor`, as written; to the other family `[ui] editor` by its known
+name alone (`editorbare`: `nvim`, `emacs -nw`). With nothing sent the
+engine there picks its own: its login shell's `$VISUAL` or `$EDITOR`,
+else `vi` (Windows: `%VISUAL%`, `%EDITOR%`, `vi` on PATH). A window
+editor on a file C10 maps here (a container's mount, a WSL distro's
+share on Windows) still runs here (`filelocal`, `editorjumpfor`), and
+Reveal still says "Its file is on another computer" for the rest.
+
 The window also makes containers for sessions (src/container.cpp),
 with Docker or Podman, found on PATH or where their macOS installers
 put them, and asked `version` at start: no configuration is needed.

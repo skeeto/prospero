@@ -1367,6 +1367,7 @@ struct FileEdit {
     GuiSession *root;  // FE_TAB's and FE_SHOW's
     TermTab    *tt;    // FE_SHOW's tab
     Str         name;  // the editor sent (editask), null for the host's own
+    Str         on;    // FE_TAB's host by name, for another host's file
     Str         why;   // FE_WHY's
 };
 
@@ -1377,22 +1378,36 @@ struct FileEdit {
 // no editor is set at all, the login shell's $VISUAL or $EDITOR then,
 // else vi; an editor with a window of its own opens as C10 has it, as
 // does no editor on macOS (TextEdit) or Windows (a why). Another host's
-// file goes to C10's mapping, its whys kept.
+// file opens here only in an editor with a window of its own, where
+// C10 maps it (a container's mount, WSL's share); else in a Terminal
+// tab of root there, with the editor editask sends, or none, the
+// host's own.
 static FileEdit fileedit(Gui *g, Arena *a, GuiSession *root, u64 host, Str path, i32 line,
                          i32 col)
 {
     FileEdit r = {};
     r.root = root;
-    EditAsk ask  = host ? EditAsk{} : editask(g, a);
-    b32     none = !editorset(g, a).len && !trim(g->edjumpfmt).len;
-    b32     own  = !host && none && !g->mac && !HOST_WINDOWS;
-    if (!ask.term && !own) {
+    GuiHost *fh   = filehost(g, host);
+    EditAsk  ask  = editask(g, a, host ? fh : 0);
+    b32      none = !editorset(g, a).len && !trim(g->edjumpfmt).len;
+    b32      own  = !host && none && !g->mac && !HOST_WINDOWS;
+    b32      here = !host && !ask.term && !own;
+    if (host) {
+        // Judged by what would run here: the template, else the editor
+        Str tmpl = trim(g->edjumpfmt);
+        Str use  = tmpl.len ? tmpl : trim(editorcmd(g, a));
+        Str why  = {};
+        here = use.len && !editorterm(use) && filelocal(g, a, host, path, &why).len &&
+               !why.len;
+    }
+    if (here) {
         r.j   = filejump(g, a, host, path, line, col);
         r.how = r.j.why.len ? FE_WHY : FE_WINDOW;
         r.why = r.j.why;
         return r;
     }
     r.name  = ask.name;
+    r.on    = host ? filehostname(g, a, host) : Str{};
     r.how   = FE_WHY;
     if (root == &g->nosession) {
         // No host, no session: termwhy must never see it
@@ -1409,6 +1424,15 @@ static FileEdit fileedit(Gui *g, Arena *a, GuiSession *root, u64 host, Str path,
         print(&b, ", its session on ");
         print(&b, filehostname(g, a, at));
         r.why = finish(&b);
+        return r;
+    }
+    // The engine there refuses as C10 does: said before anything opens
+    switch (hostwin(root->host) ? cmdwordok(path) : (i32)CMDWORD_OK) {
+    case CMDWORD_CMD:
+        r.why = "Its path holds %, \" or a control character, which cmd.exe cannot pass on";
+        return r;
+    case CMDWORD_BESTFIT:
+        r.why = "Its path holds a character Windows may pass to the editor as \" or \\";
         return r;
     }
     r.why = termwhy(g, root);
@@ -1460,12 +1484,24 @@ static Str fileedittip(Arena *a, FileEdit *e)
         name = name.len ? name : e->name.len ? e->name : Str("the editor");
         return concat(a, concat(a, "Show its Terminal tab, where ", name), " has it open");
     }
-    case FE_TAB:
+    case FE_TAB: {
+        Buf b(a, 160);
         if (e->name.len) {
-            return concat(a, concat(a, "Open the file in ", e->name), ", in a Terminal tab");
+            print(&b, "Open the file in ");
+            print(&b, e->name);
+            print(&b, ", in a Terminal tab");
+        } else {
+            print(&b, "Open the file in a Terminal tab");
         }
-        return "Open the file in a Terminal tab, in the editor $VISUAL or $EDITOR names "
-               "there, else vi";
+        if (e->on.len) {
+            print(&b, " on ");
+            print(&b, e->on);
+        }
+        if (!e->name.len) {
+            print(&b, ", in the editor $VISUAL or $EDITOR names there, else vi");
+        }
+        return finish(&b);
+    }
     }
     return {};
 }

@@ -176,6 +176,30 @@ when it changes, as a file on this computer is ([Files](help:sessions#files)).
 An engine older than this window says it is
 too old to show its files: update it (below).
 
+Open in editor on such a file opens a Terminal tab of its session
+there, where that host's engine runs the editor on it, at the line in
+view, as on this computer ([Files](help:sessions#files)): the tab
+closes when the editor exits with 0, and Files reads the file again
+there. The editor is `[ui] editor` when it runs in a terminal (`vim`,
+`nvim`, `nano`, `hx`, `emacs -nw`): as written on a host of the same
+kind as this computer (Windows, or not), and on the other kind by its
+name alone, as `nvim` for `C:\Tools\nvim.exe`; `[ui] editor_line`
+goes only to a host of the same kind. Otherwise, and never from this
+computer's own `$VISUAL` or `$EDITOR`, the host's own editor runs: on
+Linux and macOS the one its login shell's `$VISUAL` or `$EDITOR`
+names, else `vi` (busybox's `vi`, as in Alpine, at the top, without
+the line); on Windows `%VISUAL%` or `%EDITOR%`, else `vi`, found on its
+PATH. An image with no editor at all ends the tab with code 127, saying
+so. A file in a container's folder mounted here, or on Windows in a WSL
+distro, still opens here when the editor has a window of its own (VS
+Code, Notepad++), through this computer's path to it. A Windows host
+refuses a path holding `%`, `"` or a control character, as on Windows
+here. An engine older than this window says to update it (below), and
+a Windows host before Windows 10 version 1809 has no terminals.
+Closing the window, or running it in the background, hangs the editor
+up and loses its unsaved edits; a broken connection only shows
+Reconnecting, the editor running on.
+
 ## A remote with no models of its own
 
 A remote needs no configuration. One whose configuration has no

@@ -636,7 +636,7 @@ static void termlaunch(Gui *g, GuiSession *s, TermTab *tt, i32 cols, i32 rows)
     putintkey(&w.json, "rows", rows);
     if (tt->edit) {
         // The editor as the settings are now, a Restart's too
-        EditAsk ask = editask(g, &a);
+        EditAsk ask = editask(g, &a, s->host);
         putkey(&w.json, "edit");
         putobject(&w.json);
         putstrkey(&w.json, "path", tt->edpath);
