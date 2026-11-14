@@ -444,7 +444,8 @@ static Dirent *os_list(Os *, Arena *a, Str path)
     return head;
 }
 
-static Listing os_listall(Os *, Arena *a, Str path, b32 dirs, iz max)
+static Listing os_listall(Os *, Arena *a, Str path, b32 dirs, iz max,
+                          void (*beat)(void *), void *ctx)
 {
     Listing r = {};
     if (hasnul(path)) {
@@ -462,6 +463,9 @@ static Listing os_listall(Os *, Arena *a, Str path, b32 dirs, iz max)
     }
     r.ok = 1;
     for (struct dirent *e; (e = readdir(dir));) {
+        if (beat) {
+            beat(ctx);
+        }
         Str name = {(u8 *)e->d_name, 0};
         while (name.data[name.len]) name.len++;
         if (name == "." || name == ".." || (dirs && e->d_type==DT_REG)) {

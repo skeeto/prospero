@@ -13995,6 +13995,8 @@ enum : i32 {
                   // drop (no GUI_NODRAGLOAD), skip dx ops
     OP_IFFARMG,   // unless the remote host's login shell has gui.py's fake
                   // mg as $VISUAL (PROSPERO_TEST_FARMG), skip dx ops
+    OP_IFFSSTALL, // unless the remote host's engine stalls fs paths for
+                  // the checklist (PROSPERO_TEST_FSSTALL), skip dx ops
 };
 // OP_TEXTCWD with text types the --cwd directory and text after it, on
 // Windows with backslashes, as a Windows user types a path.
@@ -14969,6 +14971,7 @@ enum : i32 {
     W_FILEFOUND,  // the Files find bar drew over the front file, searched
                   // it, and brought the match it went to into view
     W_PAUSED,     // the session shown waits, paused, before a request
+    W_FILEASKED,  // Open file's check there answered: closed, or an error
 };
 
 static Str waitnames[] = {
@@ -14996,8 +14999,9 @@ static Str waitnames[] = {
     "the thin remote", "a relayed stream", "the thin remote's skill", "the container",
     "the terminal's text", "the terminal's banner", "the terminal's program", "the terminals' count",
     "the file", "the file checked", "the file's find", "the pause",
+    "Open file's check",
 };
-static_assert(countof(waitnames) == W_PAUSED+1);
+static_assert(countof(waitnames) == W_FILEASKED+1);
 
 enum : i32 {
     KEY_CTRL  = 1,
@@ -15073,7 +15077,8 @@ struct DriveOp {
     {op, 0, 0, 0, 100, dir}, \
     {OP_TEXT, 0, 0, 0, 300, missing}, \
     {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""}, \
-    {OP_KEYUP, 0, GKEY_ENTER, 0, 2000, ""}, \
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""}, \
+    {OP_WAIT, W_FILEASKED, 0, 0, 5000, ""}, \
     {OP_CHECK, CHK_FILEASKERR, 0, 0, 0, "No such file"}, \
     {OP_CHECK, CHK_FILEHOST, 2, 0, 0, ""}, \
     {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""}, \
@@ -19423,6 +19428,43 @@ static DriveOp remoteops[] = {
     {OP_WAIT, W_FILEFRESH, 0, 0, 20000, ""},
     {OP_CHECK, CHK_FILETEXT, 0, 0, 0, "hullo "},
     {OP_CHECK, CHK_FILEHOST, 1, 0, 0, ""},
+    // A file there on a file system that stops responding (a test hook
+    // stalls its path there): Open file says so once its worker is
+    // stuck, then at once; a slow one opens all the same, and nothing
+    // else waited on either (fswork.cpp)
+    {OP_IFFSSTALL, 0, 41, 0, 0, ""},
+    CMDKEY(GKEY_O, 800),
+    {OP_TEXTRCWD, 0, 0, 0, 100, ""},
+    {OP_TEXT, 0, 0, 0, 300, "/stalldead.txt"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_FILEASKED, 0, 0, 12000, ""},
+    {OP_CHECK, CHK_FILEASKERR, 0, 0, 0, "The file system is not responding"},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 500, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    CMDKEY(GKEY_O, 800),
+    {OP_TEXTRCWD, 0, 0, 0, 100, ""},
+    {OP_TEXT, 0, 0, 0, 300, "/stalldead.txt"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_FILEASKED, 0, 0, 2000, ""},
+    {OP_CHECK, CHK_FILEASKERR, 0, 0, 0, "The file system is not responding"},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 500, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    CMDKEY(GKEY_O, 800),
+    {OP_TEXTRCWD, 0, 0, 0, 100, ""},
+    {OP_TEXT, 0, 0, 0, 300, "/stallslow.txt"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_FILEASKED, 0, 0, 8000, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 8000, ""},
+    {OP_CHECK, CHK_FILETEXT, 0, 0, 0, "slow\n"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file tab 3"},
+    {OP_MDOWN, 0, 0, 0, 60, ""},
+    {OP_MUP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_FILETABS, 0, 0, 0, "hello.txt|*nope.txt"},
     // An image file there, read there whole, in parts
     CMDKEY(GKEY_O, 800),
     {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
@@ -23362,6 +23404,8 @@ static b32 drivewaitdone(Gui *g)
         return g->sess && v->state==LIVE_STREAMING && v->deltas>0;
     case W_PAUSED:
         return g->sess && v->busy && v->paused && v->state==LIVE_PAUSED;
+    case W_FILEASKED:
+        return !g->fask.statid && (!g->fask.p.shown || g->fask.p.err.len);
     case W_THINKING:
         return g->sess && thinking(v) && (v->thinking==THINK_HIDE || g->thinkcount>0);
     case W_THINKSTALL:
@@ -27143,6 +27187,13 @@ static void drivestep(Gui *g)
     case OP_IFFARMG:
         if (!os_getenv(g->os, &g->frame, "PROSPERO_TEST_FARMG").len) {
             guilog(g, "drive: skip, with no fake mg on the remote host");
+            g->drivepc += (i32)op->dx;
+        }
+        break;
+    case OP_IFFSSTALL:
+        // gui.py sets it here, and passes it to a remote host it starts
+        if (!os_getenv(g->os, &g->frame, "PROSPERO_TEST_FSSTALL").len) {
+            guilog(g, "drive: skip, with no stalled paths on the remote host");
             g->drivepc += (i32)op->dx;
         }
         break;

@@ -63,6 +63,14 @@ without a terminal, and takes under five seconds. Add directories with
 `[tools] path_prepend` or `path_append`, and set `[ui] editor`, with a
 full path if need be. See [Configuration](help:config).
 
+**"The file system is not responding" or "The file system is busy:
+try again".** A file, folder or completion on another host's share or
+mount took over ten seconds without an answer, so the engine gave up
+on it; paths under it are refused at once until it answers again.
+Busy means the engine's file readers were all occupied, usually
+waiting on such a path, so the request was not started in time. Check the share or network drive there, then try again. A reader
+stuck that way can also make that engine slow to exit.
+
 **An ask was denied before you answered.** Asks are denied when their
 time runs out (`[guard] ask_timeout`, 60 s; 0 for no limit), and at
 once in a session nobody is watching. See [Permissions and asks](help:permissions).

@@ -874,7 +874,8 @@ static Dirent *os_list(Os *, Arena *a, Str path)
     return head;
 }
 
-static Listing os_listall(Os *, Arena *a, Str path, b32 dirs, iz max)
+static Listing os_listall(Os *, Arena *a, Str path, b32 dirs, iz max,
+                          void (*beat)(void *), void *ctx)
 {
     Listing r = {};
     if (!path.len || hasnul(path)) {
@@ -908,6 +909,9 @@ static Listing os_listall(Os *, Arena *a, Str path, b32 dirs, iz max)
     }
     r.ok = 1;
     do {
+        if (beat) {
+            beat(ctx);
+        }
         c16 *name = fd.name;
         if (name[0]=='.' && (!name[1] || (name[1]=='.' && !name[2]))) {
             continue;

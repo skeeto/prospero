@@ -136,8 +136,10 @@ static Dirent *os_list(Os *, Arena *, Str path);
 // List a directory for a person to pick from (path completion): as
 // os_list, but symlinks are what they name, a link to a directory one
 // too, only directories with dirs, and at most max entries, in no
-// particular order. Broken links are left out.
-static Listing os_listall(Os *, Arena *, Str path, b32 dirs, iz max);
+// particular order. Broken links are left out. beat, if any, is called
+// with ctx for each entry read, a heartbeat for a slow folder (fsbeat).
+static Listing os_listall(Os *, Arena *, Str path, b32 dirs, iz max,
+                          void (*beat)(void *) = 0, void *ctx = 0);
 // Type, size, and modification time of a path, following symlinks.
 static Stat    os_stat(Os *, Arena, Str path);
 // Rename a file, replacing any existing target.
@@ -810,6 +812,7 @@ static u32     os_guilimits(Os *);
 #include "desktop.cpp"
 #include "tools.cpp"
 #include "guard.cpp"
+#include "fswork.cpp"    // after guard.cpp and mailbox.cpp: normpath, mailpost
 #include "editjump.cpp"  // after tools.cpp and guard.cpp: basename, pathroot
 #include "search.cpp"
 #include "instructions.cpp"

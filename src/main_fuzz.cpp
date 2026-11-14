@@ -189,7 +189,7 @@ static b32     os_write(Os *, Arena, Str, Str) { return 0; }
 static b32     os_writemode(Os *, Arena, Str, Str, i32) { return 0; }
 static b32     os_mkdirs(Os *, Arena, Str) { return 0; }
 static Dirent *os_list(Os *, Arena *, Str) { return 0; }
-static Listing os_listall(Os *, Arena *, Str, b32, iz) { return {}; }
+static Listing os_listall(Os *, Arena *, Str, b32, iz, void (*)(void *), void *) { return {}; }
 static Stat    os_stat(Os *, Arena, Str) { return {}; }
 static b32     os_rename(Os *, Arena, Str, Str) { return 0; }
 static b32     os_remove(Os *, Arena, Str) { return 0; }

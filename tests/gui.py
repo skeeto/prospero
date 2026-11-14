@@ -1560,6 +1560,12 @@ fake_provider.SCENARIOS["hosttask"] = sc_hosttask
 fake_provider.SCENARIOS["hosttask_b"] = sc_hosttask_b
 
 
+# The remote mode's stalled paths there, when far is this machine (or
+# the Windows host's own): a slow one, and one that never answers
+FSSTALL = {"PROSPERO_TEST_FSSTALL": "stallslow=2500;stalldead=600000",
+           "PROSPERO_TEST_FSSTUCK_MS": "5000"}
+
+
 class Far:
     """The remote host of --mode remote: over real ssh (--ssh), with the
     harness built there, or this machine itself through a fake ssh, its
@@ -1594,6 +1600,8 @@ class Far:
             host.write(self.config, cfg)
             host.write(self.work + "/hello.txt", "hello world\n")
             host.write(self.work + "/pixels.png", pngfixture(40, 30))
+            host.write(self.work + "/stallslow.txt", "slow\n")
+            host.write(self.work + "/stalldead.txt", "dead\n")
             host.mkdir(self.work + "/nested")  # for the directory's completion
             if self.windows:
                 fakehome = host.path("fakehome")
@@ -1638,7 +1646,8 @@ class Far:
                     host.write(self.root + "/mg.cmd",
                                f'@{sh} "%~dp0mg" %*\r\n@exit /b %errorlevel%\r\n')
                     visual = (self.root + "/mg.cmd").replace("/", "\\")
-                    env = {"VISUAL": visual} if self.windows else dict(os.environ, VISUAL=visual)
+                    env = dict(FSSTALL, VISUAL=visual) if self.windows else \
+                          dict(os.environ, VISUAL=visual)
                 else:
                     os.chmod(mg, 0o755)
                     host.write(os.path.join(home, ".profile"),
@@ -1659,6 +1668,8 @@ class Far:
             png = base64.b64encode(pngfixture(40, 30)).decode()
             self.sh(f"mkdir -p {self.work}/nested {self.state} && "
                     f"echo 'hello world' > {self.work}/hello.txt && "
+                    f"echo slow > {self.work}/stallslow.txt && "
+                    f"echo dead > {self.work}/stalldead.txt && "
                     f"echo {png} | base64 -d > {self.work}/pixels.png")
             b = cfg.replace("'", "")
             self.sh(f"cat > {self.config} <<'EOF'\n{b}EOF\n")
@@ -1701,7 +1712,7 @@ class Far:
         elif self.args.mode in ("hosttask", "thin", "terminal"):
             return {"PROSPERO_TEST_SSH": self.ssh, "PROSPERO_TEST_SCP": self.scp}
         elif self.windows:
-            return {"PROSPERO_TEST_SSH": self.ssh, "PROSPERO_TEST_FARMG": "1"}
+            return dict(FSSTALL, PROSPERO_TEST_SSH=self.ssh, PROSPERO_TEST_FARMG="1")
         # Engines started through the fake ssh leave out a cap, as an
         # older one would; this one's host, started here, does not. Its
         # login shell has the fake mg as $VISUAL
@@ -2148,6 +2159,11 @@ def main():
         before = config(curl, model)
     far = None
     if args.mode == "remote":
+        if not args.ssh:
+            # Far's engine, started here, stalls these paths' fs commands
+            # (fswork.cpp), and gives up on a worker after 5 s; the GUI
+            # runs the checklist's steps for them only when it has these
+            os.environ.update(FSSTALL)
         far = Far(args, host, curl, model, nonce)
         # An include by URL, to fetch again from the settings window
         head, _, rest = before.partition("\n")

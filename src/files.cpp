@@ -779,6 +779,8 @@ static Str fswhy(Str err)
     return err=="no such file"       ? Str("No such file") :
            err=="that is a folder"   ? Str("That is a folder") :
            err=="not a regular file" ? Str("Not a regular file") :
+           err==fsstuck              ? Str("The file system is not responding") :
+           err==fsbusy               ? Str("The file system is busy: try again") :
                                        Str("It could not be read");
 }
 

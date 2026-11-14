@@ -31,9 +31,10 @@
 //
 // Several clients may attach at once, and each receives what it asks
 // for. Commands go to the engine with ids of the host's own, and their
-// replies come back, in order (but for models, which answers once its
-// endpoints do, and git once git is done), to whoever asked under the
-// asker's ids;
+// replies come back, in order (but for the late commands: models, which
+// answers once its endpoints do, git once git is done, and fs.read,
+// fs.stat and dir once a worker is, which have ids of their own from
+// HOST_LATEID up), to whoever asked under the asker's ids;
 // records without a session (the sessions list) go to the asker of the
 // command they answer. A terminal's commands (ptyhost.cpp) go stamped
 // with the client's peer, and its records to the client their peer
@@ -88,6 +89,7 @@ enum : i64 {
     HOST_SCRATCH   = HOST_WIDE ? (i64)1<<32 : (i64)1<<26,
     HOST_CLIENTMEM = HOST_KEEPMAX + ((i64)(HOST_WIDE ? 64 : 8) << 20),
     HOST_LOGMAX    = (i64)1 << 20, // run/host.log, before a host starts it over
+    HOST_LATEID    = (i64)1 << 52, // late commands' ids, exact as JSON doubles
 };
 
 // A frame of any size must fit in a client's empty queue, with room to
@@ -97,7 +99,7 @@ static_assert(HOST_KEEPMAX >= FRAME_HEAD + FRAME_MAX + HOST_KEEPMAX/32);
 
 enum : i32 {
     HOST_CMDS = 4096,  // commands awaiting replies, at most
-    HOST_LATE = 64,    // of those, models, whose replies come out of order
+    HOST_LATE = 256,   // of those, the late ones, whose replies come out of order
     HOST_RELAYS = 256, // relayed calls under way each way (relay.cpp)
 };
 
@@ -351,6 +353,8 @@ struct Host {
     i32             cmdlen;
     HostCmd        *late;      // late commands, oldest first, apart
     i32             latelen;   // from the ring, as they reply late
+    i32             latecap;   // HOST_LATE (a test hook lowers it)
+    i64             lateseq;   // their ids, from HOST_LATEID up
     i64             nextid;
     i64             idle;      // ticks of quiet before exiting
     i64             grace;     // ticks a client keeps its place without a stream
@@ -498,22 +502,32 @@ static HostCmd *hostcmdat(Host *h, i32 i)
 
 static void hostreply(Host *, HostClient *, Arena, i64, b32, Str, Str);
 
+// A command whose reply comes late, after those of commands sent after
+// it: models once its endpoints answer, mcp.auth and mcp.code once their
+// servers do, git with status once git is done, config.get with refresh
+// once its includes are fetched, skill.fetch once its skill is, and
+// fs.read, fs.stat and dir once a worker answers (fswork.cpp).
+static b32 hostlate(i32 cmd)
+{
+    return cmd==CMD_MODELS || cmd==CMD_MCPAUTH || cmd==CMD_MCPCODE || cmd==CMD_GIT ||
+           cmd==CMD_EPAUTH || cmd==CMD_CONFIGGET || cmd==CMD_SKILLFETCH ||
+           cmd==CMD_FSREAD || cmd==CMD_FSSTAT || cmd==CMD_DIR;
+}
+
 // Send a command to the engine under a fresh id, the line as a parsed
 // object with id replaced, and with from and attended replaced where
-// given (from < 0 drops it). Null if too many wait already. A models
-// command replies once its endpoints answer, mcp.auth and mcp.code once
-// their servers do, git with status once git is done, config.get with
-// refresh once its includes are fetched, and skill.fetch once its skill
-// is, after those sent later, so each waits apart from the ring, whose
-// replies come in order; a full list of them gives up on the oldest,
-// whose reply must have been lost.
+// given (from < 0 drops it). Null if too many wait already. A late
+// command (hostlate) waits apart from the ring, whose replies come in
+// order, under an id of its own space, from HOST_LATEID up, so that a
+// stray reply never passes for a ring command's; a full list of them
+// gives up on the oldest, whose reply must have been lost.
 static HostCmd *hostforward(Host *h, Arena scratch, Json *j, i32 cmd, i32 kind,
                             i64 from, i32 attended)
 {
-    HostCmd *q = 0;
-    if (cmd==CMD_MODELS || cmd==CMD_MCPAUTH || cmd==CMD_MCPCODE || cmd==CMD_GIT ||
-            cmd==CMD_EPAUTH || cmd==CMD_CONFIGGET || cmd==CMD_SKILLFETCH) {
-        if (h->latelen == HOST_LATE) {
+    HostCmd *q    = 0;
+    b32      late = hostlate(cmd);
+    if (late) {
+        if (h->latelen == h->latecap) {
             HostCmd old = h->late[0];
             if (old.client) {
                 hostreply(h, old.client, scratch, old.cid, 0,
@@ -531,7 +545,7 @@ static HostCmd *hostforward(Host *h, Arena scratch, Json *j, i32 cmd, i32 kind,
         q = hostcmdat(h, h->cmdlen++);
     }
     *q = {};
-    q->id   = ++h->nextid;
+    q->id   = late ? HOST_LATEID + ++h->lateseq : ++h->nextid;
     q->kind = kind;
     q->cmd  = cmd;
 
@@ -1230,6 +1244,9 @@ static void hostreplied(Host *h, Arena scratch, EvRec *r, Str line)
             return;
         }
     }
+    if (id >= HOST_LATEID) {
+        return;  // a late command's, given up on as lost
+    }
     if (!h->cmdlen || id<hostcmdat(h, 0)->id) {
         return;  // not one of the host's
     }
@@ -1927,6 +1944,8 @@ static Host *newhost(Os *os, Arena *perm, Arena scratch, HostConf *hc, Str *err)
     Int proto = parseint(os_getenv(os, &scratch, "PROSPERO_TEST_PROTO"));
     h->dropcap = clone(perm, os_getenv(os, &scratch, "PROSPERO_TEST_DROPCAP"));
     Int keep  = parseint(os_getenv(os, &scratch, "PROSPERO_TEST_KEEPMAX"));
+    Int late  = parseint(os_getenv(os, &scratch, "PROSPERO_TEST_HOSTLATE"));
+    h->latecap = late.ok && late.val>=4 && late.val<=HOST_LATE ? (i32)late.val : HOST_LATE;
     h->proto   = proto.ok ? (i32)proto.val : h->proto;
     h->keepmax = HOST_KEEPMAX;
     if (keep.ok && keep.val>=1<<10 && keep.val<=HOST_KEEPMAX) {
@@ -2060,7 +2079,11 @@ static i32 servemain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
         return 2;
     }
     hc.cfg = cfg;
-    hc.inbox = newmailbox(&perm, HOST_INBOX, 0, 0);
+    // A test hook: a smaller inbox, which a burst of replies overflows
+    Int inbox = parseint(os_getenv(os, &scratch, "PROSPERO_TEST_HOSTINBOX"));
+    iz  cap   = inbox.ok && inbox.val>=256<<10 && inbox.val<=HOST_INBOX ? (iz)inbox.val
+                                                                        : (iz)HOST_INBOX;
+    hc.inbox = newmailbox(&perm, cap, 0, 0);
     // Asked to quit by a signal, it quits as when a client asks, taking
     // its endpoint and registration with it: before any thread starts
     if (hc.inbox && !os_onquit(os, hc.inbox, HOST_QUITALL)) {

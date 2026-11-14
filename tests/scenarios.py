@@ -9896,6 +9896,94 @@ def winfarlinks(t, base):
     return far, local
 
 
+@scenario(bound=60)
+def fs_stall(t):
+    """fs.read, fs.stat and dir run on workers (fswork.cpp), so a stalled
+    path stops nothing else: a slow read answers after a quick one sent
+    later; a dead path answers "not responding" once its worker is stuck,
+    and then is refused at once, while other paths still work; with every
+    worker stuck, new jobs answer busy; quit still exits promptly. The
+    stalls are a test hook (PROSPERO_TEST_FSSTALL), and a worker is stuck
+    after 2 s here (PROSPERO_TEST_FSSTUCK_MS). The stall keys hold letters
+    past f, so that no hex nonce in the base folder's name matches."""
+    base = t.host.join(t.base, "fsstall")
+    t.host.mkdir(t.host.join(base, "zdeaddir"))
+    hello = t.host.join(base, "hello.txt")
+    slow = t.host.join(base, "slowfile.txt")
+    t.host.write(hello, "hello\n")
+    t.host.write(slow, "slow\n")
+    for i in range(1, 9):
+        t.host.write(t.host.join(base, f"zdead{i}.txt"), "dead\n")
+    stuck = "the file system is not responding"
+    busy = "the file system is busy: try again"
+    h = t.headless(env={"PROSPERO_TEST_FSSTALL": "slowfile=1500;zdead=600000",
+                        "PROSPERO_TEST_FSSTUCK_MS": "2000"})
+    try:
+        h.call("hello", proto=0, client="scenarios")
+
+        # Sent together, the quick one answers first
+        a = h.send("fs.read", path=slow)
+        b = h.send("fs.read", path=hello)
+        for i in (a, b):
+            h.wait(lambda e: e.get("ev") == "reply" and e.get("id") == i, 10)
+        got = [e for e in h.events if e.get("ev") == "reply" and e.get("id") in (a, b)]
+        t.check([e["id"] for e in got] == [b, a], f"order: {[e['id'] for e in got]}")
+        t.check(all(e.get("ok") == 1 for e in got), f"slow and quick: {got}")
+
+        # A dead path: not responding once stuck, then at once
+        dead1 = t.host.join(base, "zdead1.txt")
+        t0 = time.monotonic()
+        r = h.call("fs.read", path=dead1, timeout=10)
+        took = time.monotonic() - t0
+        t.check(r.get("ok") == 0 and r.get("err") == stuck and took < 5,
+                f"dead1 in {took:.1f} s: {r}")
+        t0 = time.monotonic()
+        r = h.call("fs.read", path=dead1, timeout=10)
+        took = time.monotonic() - t0
+        t.check(r.get("ok") == 0 and r.get("err") == stuck and took < 1,
+                f"dead1 again in {took:.1f} s: {r}")
+        r = h.call("fs.stat", paths=[dead1, hello], timeout=10)
+        t.check(r.get("ok") == 1 and [s.get("type") for s in r.get("stats", [])] ==
+                ["bad", "file"], f"stat dead1 and hello: {r}")
+
+        # A dead folder: not responding, then refused; its parent lists
+        deaddir = t.host.join(base, "zdeaddir")
+        r = h.call("dir", path=deaddir, timeout=10)
+        t.check(r.get("ok") == 0 and r.get("err") == stuck, f"dir deaddir: {r}")
+        t0 = time.monotonic()
+        r = h.call("dir", path=deaddir, timeout=10)
+        took = time.monotonic() - t0
+        t.check(r.get("ok") == 0 and r.get("err") == stuck and took < 1,
+                f"dir deaddir again in {took:.1f} s: {r}")
+        r = h.call("dir", path=base, timeout=10)
+        names = sorted(e.get("name") for e in r.get("entries", []))
+        t.check(r.get("ok") == 1 and "hello.txt" in names and "zdeaddir" in names,
+                f"dir of the folder: {r}")
+
+        # Every worker stuck: new jobs answer busy
+        ids = [h.send("fs.read", path=t.host.join(base, f"zdead{i}.txt"))
+               for i in range(2, 8)]
+        for i in ids:
+            r = h.wait(lambda e: e.get("ev") == "reply" and e.get("id") == i, 10)
+            t.check(r.get("ok") == 0 and r.get("err") == stuck, f"dead2..7: {r}")
+        t0 = time.monotonic()
+        c = h.send("fs.read", path=t.host.join(base, "zdead8.txt"))
+        d = h.send("fs.read", path=hello)
+        for i in (c, d):
+            r = h.wait(lambda e: e.get("ev") == "reply" and e.get("id") == i, 10)
+            t.check(r.get("ok") == 0 and r.get("err") == busy, f"with all stuck: {r}")
+        took = time.monotonic() - t0
+        t.check(took < 5, f"busy in {took:.1f} s")
+
+        t0 = time.monotonic()
+        h.send("quit")
+        h.exit(timeout=10)
+        took = time.monotonic() - t0
+        t.check(took < 5, f"quit in {took:.1f} s")
+    finally:
+        h.close()
+
+
 @scenario(bound=30)
 def fs_read(t):
     """fs.read {path, off?, max?}: any file on the engine's machine, with no

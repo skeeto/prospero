@@ -1670,6 +1670,102 @@ def fs_busy(t):
 
 
 @scenario
+def fs_late(t):
+    """fs.read, fs.stat and dir are late commands at the host: a slow
+    read's reply comes after those of a quick read and a ring command
+    sent after it; with the late list held to 4 (PROSPERO_TEST_HOSTLATE),
+    six slow reads lose the two oldest, which say so, and the rest and a
+    ring command still answer. The slow read is a test hook
+    (PROSPERO_TEST_FSSTALL)."""
+    env = dict(t.env, PROSPERO_TEST_FSSTALL="slowfile=1500", PROSPERO_TEST_HOSTLATE="4")
+    slow = os.path.join(t.work, "slowfile.txt")
+    hello = os.path.join(t.work, "hello.txt")
+    for path, text in [(slow, "slow\n"), (hello, "hello\n")]:
+        with open(path, "w") as f:
+            f.write(text)
+    c = Client(t)
+    s = c.attach(env=env)
+    t.check(c.call("hello").get("ok") == 1, "hello")
+
+    def send(cmd, **fields):
+        c.nextcmd += 1
+        obj = {"cmd": cmd, "id": c.nextcmd}
+        obj.update(fields)
+        s.command(obj)
+        return c.nextcmd
+
+    def reply(i, timeout=20):
+        return s.wait(lambda r: r.get("ev") == "reply" and r.get("id") == i,
+                      timeout, f"reply {i}")
+
+    a = send("fs.read", path=slow)
+    b = send("fs.read", path=hello)
+    r = send("list")
+    got = [reply(i) for i in (a, b, r)]
+    t.check(all(g.get("ok") == 1 for g in got), f"replies: {got}")
+    order = [x.get("id") for x in s.records if x.get("ev") == "reply" and
+             x.get("id") in (a, b, r)]
+    t.check(order.index(a) == 2, f"slowfile's reply last: {order}")
+
+    ids = [send("fs.read", path=slow) for _ in range(6)]
+    res = [reply(i) for i in ids]
+    lost = [x.get("ok") == 0 and "lost" in x.get("err", "") for x in res]
+    t.check(lost == [True, True, False, False, False, False],
+            f"the two oldest lost: {[(x.get('ok'), x.get('err')) for x in res]}")
+    t.check(all(base64.b64decode(x.get("data", "")) == b"slow\n" for x in res[2:]),
+            "the rest read")
+    t.check(c.call("list").get("ok") == 1, "a ring command after")
+    time.sleep(0.5)
+    n = sum(1 for x in s.records if x.get("ev") == "reply" and x.get("id") in ids)
+    t.check(n == 6, f"each answered once: {n}")
+    s.disconnect()
+
+
+@scenario
+def fs_burst(t):
+    """Sixteen reads of a 4 MiB file at once, each at its own offset,
+    their replies far more than the host's inbox (PROSPERO_TEST_HOSTINBOX,
+    1 MiB) holds: each is answered exactly once, with its own part or
+    lost (the reply was lost: try again, which the engine sends for a
+    reply it could not post), and the host still answers after. Whether
+    the inbox overflows depends on scheduling, so the count is shown."""
+    env = dict(t.env, PROSPERO_TEST_HOSTINBOX=str(1 << 20))
+    blob = os.urandom(4 << 20)
+    path = os.path.join(t.work, "big.bin")
+    with open(path, "wb") as f:
+        f.write(blob)
+    c = Client(t)
+    s = c.attach(env=env)
+    t.check(c.call("hello").get("ok") == 1, "hello")
+    ids = []
+    offs = {}
+    for k in range(16):
+        c.nextcmd += 1
+        offs[c.nextcmd] = k * (256 << 10)
+        s.command({"cmd": "fs.read", "id": c.nextcmd, "path": path, "off": offs[c.nextcmd]})
+        ids.append(c.nextcmd)
+    oks = lost = 0
+    for i in ids:
+        r = s.wait(lambda r: r.get("ev") == "reply" and r.get("id") == i, 60, f"reply {i}")
+        if r.get("ok") == 1:
+            off = offs[i]
+            data = base64.b64decode(r.get("data", ""))
+            t.check(data and data == blob[off:off + len(data)] and r.get("off") == off + len(data),
+                    f"read {i} at {off}: {len(data)} bytes, off {r.get('off')}")
+            oks += 1
+        else:
+            t.check("lost" in r.get("err", ""), f"reply {i}: {r}")
+            lost += 1
+    t.check(c.call("hello").get("ok") == 1, "hello after")
+    time.sleep(0.5)
+    counts = [sum(1 for x in s.records if x.get("ev") == "reply" and x.get("id") == i)
+              for i in ids]
+    t.check(counts == [1] * 16, f"each answered once: {counts}")
+    print(f"  fs_burst: {oks} read, {lost} lost", flush=True)
+    s.disconnect()
+
+
+@scenario
 def stop_cmd(t):
     """The stop command, as the tray's "Stop all": the turn ends, and the
     engine runs on."""

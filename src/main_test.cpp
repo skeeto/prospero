@@ -235,12 +235,16 @@ static Dirent *os_list(Os *os, Arena *a, Str path)
 }
 
 // Links listed as what they name, through os_realpath.
-static Listing os_listall(Os *os, Arena *a, Str path, b32 dirs, iz max)
+static Listing os_listall(Os *os, Arena *a, Str path, b32 dirs, iz max,
+                          void (*beat)(void *), void *ctx)
 {
     Listing r = {};
     VFile  *d = vfind(os, path, 0);
     r.ok = d && d->exists && d->isdir;
     for (Dirent *e = r.ok ? os_list(os, a, path) : 0; e; e = e->next) {
+        if (beat) {
+            beat(ctx);
+        }
         if (dirs && !e->isdir) {
             continue;
         } else if (r.len == max) {
@@ -356,7 +360,8 @@ static b32  os_thread(Os *, void (*)(void *), void *) { return 0; }
 static void os_lockinit(Lock *) {}
 static void os_lock(Lock *) {}
 static void os_unlock(Lock *) {}
-static b32  os_eventinit(Event *e) { e->h[0] = 0; return 1; }
+static b32  testnoevent;  // tests: os_eventinit fails
+static b32  os_eventinit(Event *e) { e->h[0] = 0; return !testnoevent; }
 static void os_signal(Event *e) { e->h[0] = 1; }
 
 static b32 os_wait(Event *e, i32)
@@ -685,6 +690,7 @@ static Str istr(Arena *a, i64 v)
 #include "test/edit_test.cpp"
 #include "test/tools_test.cpp"
 #include "test/guard_test.cpp"
+#include "test/fswork_test.cpp"
 #include "test/editjump_test.cpp"
 #include "test/fileref_test.cpp"
 #include "test/admit_test.cpp"
@@ -771,6 +777,7 @@ int main()
     test_ini(&t);
     test_web(&t);
     test_mailbox(&t);
+    test_fswork(&t);
     test_events(&t);
     test_frame(&t);
     test_remoteask(&t);

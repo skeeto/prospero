@@ -174,7 +174,11 @@ broken, a file not yet read there says its host is not connected, and
 is read once it is back. One shown is checked there, and read again
 when it changes, as a file on this computer is ([Files](help:sessions#files)).
 An engine older than this window says it is
-too old to show its files: update it (below).
+too old to show its files: update it (below). A file on a share or
+mount there that stops answering does not stop the rest: after ten
+to twenty seconds Open file says "The file system is not responding", other
+files there still open, and that file, or anything under it, is
+refused at once until the share answers again; then open it again.
 
 Open in editor on such a file opens a Terminal tab of its session
 there, where that host's engine runs the editor on it, at the line in
