@@ -48,9 +48,17 @@ goes on. The enginestop
 mode kills the engine process mid-turn and mid-ask: the GUI must stop
 counting either, and quit at once when closed. The compose mode runs
 the compose box's checklist, with [ui] editor a test script (an editor
-that appends a line, one that exits 1, and one cancelled), then the GUI
-again, to find each session's draft back from its engine; no draft file
-for the editor may be left over. The plan mode makes a session in plan
+that appends a line, one that exits 1, and one cancelled), and leaves
+Files tabs in a session and with none, then the GUI again, to find each
+session's draft back from its engine and the tabs back as they were,
+only the shown one read, beside Files records appended to the layout
+file in between (a session gone, a remote's, a duplicate); no draft
+file for the editor may be left over. The remote mode connects a remote
+host "r" (this computer through a stand-in for ssh, or --ssh's), makes
+a session there and works in it, its files read there, then runs the
+GUI again (--remote-again): the Files tabs left in that session wait in
+the layout file until r is connected again and lists it, then are back
+as they were, read there. The plan mode makes a session in plan
 mode from the new session dialog, its agent refused a change, then
 asking to approve its plan: kept planning with a note, revised by hand
 with Edit plan ([ui] editor a test script, here only), then approved;
@@ -191,6 +199,25 @@ CONFIG_EDITED = "\n# Added in the editor\n[model edited-by-hand]\ntemperature = 
 CONFIG_EDITOR = """#!/bin/sh
 sleep 1
 printf '\\n# Added in the editor\\n[model edited-by-hand]\\ntemperature = 0.3\\n' >> "$1"
+"""
+
+
+# The terminal mode's fake terminal editor, mg by name (a terminal editor
+# Prospero knows, which no system ships): it prints its arguments, then
+# takes a line, 'w TEXT' to write TEXT as its file (its last argument)
+# and exit 0, or 'q N' to exit N
+MG_EDITOR = """#!/bin/sh
+printf 'fake mg'
+for a in "$@"; do printf ' [%s]' "$a"; done
+printf '\\n'
+for f in "$@"; do :; done
+while IFS= read -r line; do
+    case $line in
+    "w "*) printf '%s\\n' "${line#w }" >"$f"; exit 0;;
+    "q "*) exit "${line#q }";;
+    esac
+done
+exit 1
 """
 
 
@@ -360,19 +387,30 @@ BADPNG = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00"
 def filesfixtures(host):
     """The Files pane's files, in work/files: numbered lines, with a blank
     one each 50 (lines 6, 56, ..., 256 among them, at a chunk's end); a
-    400-column line among short ones; two files of one name; Markdown; a
-    BOM and CRLF; a binary file; and more lines than are kept; an image
-    (CHK_FILEIMAGE's 40 by 30) and a PNG cut short."""
+    400-column line among short ones (long.txt, and wide.txt the same);
+    two files of one name; Markdown, guide.md and manual.md with "##
+    Middle" at line 203; a BOM and CRLF; a binary file; and more lines
+    than are kept; an image (CHK_FILEIMAGE's 40 by 30) and a PNG cut
+    short; and two the window's file workers stall (FSSTALL), a slow one
+    and a dead one."""
     d = lambda *p: host.path("work", "files", *p)
     for sub in ("a", "b"):
         host.mkdir(d(sub))
     host.write(d("pixels.png"), pngfixture(40, 30))
+    host.write(d("stallslow.txt"), "slow\n")
+    host.write(d("stalldead.txt"), "dead\n")
     host.write(d("corrupt.png"), BADPNG)
     host.write(d("a", "x.c"), "int a(void) { return 1; }\n")
     host.write(d("b", "x.c"), "int b(void) { return 2; }\n")
     host.write(d("notes.md"), "# Notes\n\nSee [the lines](lines.txt).\n\n" +
                "".join(f"Paragraph {n}.\n\n" for n in range(1, 151)))
     host.write(d("blob.bin"), "\x7fELF\x00\x01\x02binary\n")
+    middle = ("# Guide\n\n" + "".join(f"Paragraph {n}.\n\n" for n in range(1, 101)) +
+              "## Middle\n\n" + "".join(f"More {n}.\n\n" for n in range(1, 101)))
+    host.write(d("guide.md"), middle)
+    host.write(d("manual.md"), middle)
+    host.write(d("wide.txt"), "".join(
+        ("long" + " abcdefghi"*40 if n == 100 else f"short {n}") + "\n" for n in range(1, 301)))
     if isinstance(host, Remote):
         host.h.sh(
             f"awk 'BEGIN {{ for (n = 1; n <= 3000; n++) print n%50==6 ? \"\" : \"line \" n }}'"
@@ -725,6 +763,8 @@ class Remote:
         q = lambda a: '"' + win(a) + '"' if "/" in a or " " in a else a
         name = "run" + tag.strip(" :[]")
         task = self.task + tag.strip(" :[]")
+        import scenarios
+        env = scenarios.pathenv(self.h.binpath, env)  # a newer w64devkit's sh
         sets = "".join(f"set {k}={win(v)}\r\n" for k, v in (env or {}).items())
         bat = ("@echo off\r\ncd /d \"%~dp0\"\r\n" + sets +
                q(self.h.exe) + (f" {sub} " if sub else " ") + " ".join(q(a) for a in guiargs) +
@@ -766,8 +806,8 @@ class Remote:
                 break
         return status, [l for l in lines if not l.startswith("done ")]
 
-    def popen(self, args, stdin=False):
-        return self.h.popen(args, self.path("work"), stdin=stdin)
+    def popen(self, args, stdin=False, env=None):
+        return self.h.popen(args, self.path("work"), stdin=stdin, env=env)
 
     def listdir(self, path):
         out = self.h.sh(f"ls {path} 2>/dev/null || true", check=False)
@@ -1435,7 +1475,11 @@ def fakescp(home):
             f"exec cp \"$src\" '{home}'/\"${{dst#*:}}\"\n")
 
 # The same for Windows, built there with w64devkit: the remote command
-# is a command line of its own, run as is with standard I/O inherited.
+# is a command line of its own, run as is with standard I/O inherited,
+# from fakessh.exe's own directory, its "home", where nothing else is:
+# CreateProcess looks for a program in its parent's directory and the
+# current one first, which as the run's root holds a prospero.exe. One
+# not found exits 127, as sh's does, and the remote is missing.
 FAKESSH_C = r"""
 #include <windows.h>
 #include <shellapi.h>
@@ -1455,6 +1499,15 @@ int main(void)
     if (i+1 >= argc) {
         return 255;
     }
+    wchar_t home[MAX_PATH];
+    DWORD   len = GetModuleFileNameW(0, home, MAX_PATH);
+    while (len && home[len-1] != L'\\') {
+        len--;
+    }
+    home[len] = 0;
+    if (!len || !SetCurrentDirectoryW(home)) {
+        return 255;
+    }
     STARTUPINFOW        si = {sizeof(si)};
     PROCESS_INFORMATION pi;
     si.dwFlags    = STARTF_USESTDHANDLES;
@@ -1462,7 +1515,8 @@ int main(void)
     si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
     si.hStdError  = GetStdHandle(STD_ERROR_HANDLE);
     if (!CreateProcessW(0, argv[i+1], 0, 0, TRUE, 0, 0, 0, &si, &pi)) {
-        return 255;
+        DWORD err = GetLastError();
+        return err==ERROR_FILE_NOT_FOUND || err==ERROR_PATH_NOT_FOUND ? 127 : 255;
     }
     WaitForSingleObject(pi.hProcess, INFINITE);
     DWORD code = 255;
@@ -1525,6 +1579,13 @@ fake_provider.SCENARIOS["hosttask"] = sc_hosttask
 fake_provider.SCENARIOS["hosttask_b"] = sc_hosttask_b
 
 
+# The remote mode's stalled paths there, when far is this machine (or
+# the Windows host's own): a slow one, and one that never answers; and
+# the drive mode's, files/stall*.txt, in the window's own file workers
+FSSTALL = {"PROSPERO_TEST_FSSTALL": "stallslow=2500;stalldead=600000",
+           "PROSPERO_TEST_FSSTUCK_MS": "5000"}
+
+
 class Far:
     """The remote host of --mode remote: over real ssh (--ssh), with the
     harness built there, or this machine itself through a fake ssh, its
@@ -1559,11 +1620,15 @@ class Far:
             host.write(self.config, cfg)
             host.write(self.work + "/hello.txt", "hello world\n")
             host.write(self.work + "/pixels.png", pngfixture(40, 30))
+            host.write(self.work + "/stallslow.txt", "slow\n")
+            host.write(self.work + "/stalldead.txt", "dead\n")
             host.mkdir(self.work + "/nested")  # for the directory's completion
             if self.windows:
-                self.ssh = host.path("fakessh.exe")
+                fakehome = host.path("fakehome")
+                self.ssh = fakehome + "/fakessh.exe"
+                host.mkdir(fakehome)
                 host.write(host.path("fakessh.c"), FAKESSH_C)
-                host.h.sh(f"cd {host.root} && gcc -O2 -o fakessh.exe fakessh.c -lshell32")
+                host.h.sh(f"cd {host.root} && gcc -O2 -o {self.ssh} fakessh.c -lshell32")
             else:
                 # Its home directory, not this user's: deploying there
                 # writes .prospero
@@ -1578,21 +1643,53 @@ class Far:
                 self.wsl = os.path.join(host.root, "fakewsl")
                 host.write(self.wsl, fakewsl(home))
                 os.chmod(self.wsl, 0o755)
+            # The remote mode's Open in editor on a file there runs the
+            # editor far's login shell names: the fake mg, as $VISUAL. On
+            # POSIX its own home's .profile sets it for plain sh, which
+            # no profile of the user's touches; on Windows, with no login
+            # shell, its environment does, mg.cmd calling w64devkit's sh by
+            # its full path: far's server, started over ssh through
+            # cmd.exe, may have no w64devkit on PATH (biron's does not)
+            env = None
+            if args.mode == "remote":
+                mg = self.root + "/mg"
+                host.write(mg, MG_EDITOR)
+                if self.windows or os.name == "nt":
+                    if self.windows:
+                        # w64devkit's own sh.exe: a newer w64devkit's
+                        # busybox.exe, the one copied to the root, has
+                        # no shell applet
+                        bin_ = host.h.sh('cd "$HOME/w64devkit/bin" && pwd -W').strip()
+                        sh = '"' + bin_.replace("/", "\\") + '\\sh.exe"'
+                    else:
+                        sh = '"' + shutil.which("sh").replace("\\", "/") + '"'
+                    host.write(self.root + "/mg.cmd",
+                               f'@{sh} "%~dp0mg" %*\r\n@exit /b %errorlevel%\r\n')
+                    visual = (self.root + "/mg.cmd").replace("/", "\\")
+                    env = dict(FSSTALL, VISUAL=visual) if self.windows else \
+                          dict(os.environ, VISUAL=visual)
+                else:
+                    os.chmod(mg, 0o755)
+                    host.write(os.path.join(home, ".profile"),
+                               f"VISUAL={shword(mg)}; export VISUAL\n")
+                    env = dict(os.environ, HOME=home, SHELL="/bin/sh")
             # The host first, here: started through the fake ssh, it would
             # descend from the GUI's reaper (Linux: a subreaper), or stay
             # in its job (Windows), and go with the stream dropped
             serve = ["serve", "--state", self.state, "-c", self.config, "--idle", "600"]
             if self.windows:
-                self.server = host.popen(serve)
+                self.server = host.popen(serve, env=env)
             else:
                 self.server = subprocess.Popen(
                     [self.prospero] + serve, stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    start_new_session=True)
+                    start_new_session=True, env=env)
         else:
             png = base64.b64encode(pngfixture(40, 30)).decode()
             self.sh(f"mkdir -p {self.work}/nested {self.state} && "
                     f"echo 'hello world' > {self.work}/hello.txt && "
+                    f"echo slow > {self.work}/stallslow.txt && "
+                    f"echo dead > {self.work}/stalldead.txt && "
                     f"echo {png} | base64 -d > {self.work}/pixels.png")
             b = cfg.replace("'", "")
             self.sh(f"cat > {self.config} <<'EOF'\n{b}EOF\n")
@@ -1635,11 +1732,13 @@ class Far:
         elif self.args.mode in ("hosttask", "thin", "terminal"):
             return {"PROSPERO_TEST_SSH": self.ssh, "PROSPERO_TEST_SCP": self.scp}
         elif self.windows:
-            return {"PROSPERO_TEST_SSH": self.ssh}
+            return dict(FSSTALL, PROSPERO_TEST_SSH=self.ssh, PROSPERO_TEST_FARMG="1")
         # Engines started through the fake ssh leave out a cap, as an
-        # older one would; this one's host, started here, does not
+        # older one would; this one's host, started here, does not. Its
+        # login shell has the fake mg as $VISUAL
         return {"PROSPERO_TEST_SSH": self.ssh, "PROSPERO_TEST_WSL": self.wsl,
-                "PROSPERO_TEST_SCP": self.scp, "PROSPERO_TEST_DROPCAP": "bypass"}
+                "PROSPERO_TEST_SCP": self.scp, "PROSPERO_TEST_DROPCAP": "bypass",
+                "PROSPERO_TEST_FARMG": "1"}
 
     def hosts(self):
         """The hosts running for its state directory, as JSONL lines."""
@@ -1881,6 +1980,9 @@ def main():
         os.environ.setdefault("PROSPERO_TEST_HANDSOFF", "1")
     if args.mode == "signals":
         return signals(args)
+    # The window's editor comes from its configuration alone
+    for k in ("VISUAL", "EDITOR"):
+        os.environ.pop(k, None)
 
     if args.mode in ("hosttask", "thin") and (args.host or args.ssh):
         ap.error(f"--mode {args.mode} runs only here, through the fake ssh")
@@ -1958,6 +2060,7 @@ def main():
                    "---\ndescription: A skill of the checklist's\n---\nCheck.\n")
         # A binary file for a mention whose contents cannot come
         host.write(host.path("work", "zbinary.dat"), "\x7fELF\x00\x01binary\n")
+        filesfixtures(host)  # for the Files tabs kept across the restart
         before = config(curl, model, extra=composeconfig(editor, nonce))
     elif args.mode == "plan":
         # The agent plans (fake_provider's sc_plan); a model to switch to
@@ -2038,8 +2141,31 @@ def main():
         before = config(curl, model) + termcfg
         os.environ["PS1"] = "tty$ "
         os.environ["HISTFILE"] = ""  # not the user's history
+        if args.mode == "terminal":
+            # Open in editor's terminal editor, the fake mg, by its full
+            # path, which no profile's PATH shadows, on a file of
+            # numbered lines; the login shell an editor's tab starts
+            # through, plain sh
+            mg = host.path("mg")
+            host.write(mg, MG_EDITOR)
+            if os.name == "nt" or args.host:  # a Windows host's
+                sh = shutil.which("sh").replace("\\", "/") if not args.host else "sh"
+                host.write(host.path("mg.cmd"),
+                           f'@"{sh}" "%~dp0mg" %*\r\n@exit /b %errorlevel%\r\n')
+                mg = host.path("mg.cmd")
+            else:
+                os.chmod(mg, 0o755)
+                os.environ["SHELL"] = "/bin/sh"
+            host.write(host.path("work", "edit.txt"),
+                       "".join(f"line {i}\n" for i in range(1, 31)))
+            before += f"\n# Open in editor's, a fake terminal editor\n[ui]\neditor = {shword(mg)}\n"
     elif args.mode == "drive" and not args.fake:
         before = config(curl, model, extra=m4config(curl, nonce))
+        if not args.host:
+            # The window's file workers stall files/stall*.txt, and give
+            # up on a worker after 5 s (fswork.cpp); a --host gets these
+            # through host.run's env
+            os.environ.update(FSSTALL)
         if not args.host:
             # Open in editor's editor, a sh script (the checklist skips it
             # without one)
@@ -2059,6 +2185,11 @@ def main():
         before = config(curl, model)
     far = None
     if args.mode == "remote":
+        if not args.ssh:
+            # Far's engine, started here, stalls these paths' fs commands
+            # (fswork.cpp), and gives up on a worker after 5 s; the GUI
+            # runs the checklist's steps for them only when it has these
+            os.environ.update(FSSTALL)
         far = Far(args, host, curl, model, nonce)
         # An include by URL, to fetch again from the settings window
         head, _, rest = before.partition("\n")
@@ -2168,6 +2299,19 @@ def main():
         problems += summaryproblems(status, lines, "the window")
         status = 0
         if not problems:
+            # Files records the second run must deal with: a session of
+            # this state directory gone (dropped once listed), a remote's
+            # (kept, its host unknown), and the window's own again (the
+            # first, the first run's, wins), in a second section
+            ms = int(time.time()*1000)
+            with open(host.path("state", "imgui.ini"), "ab") as f:
+                f.write((f"\n[Prospero][Files]\n"
+                         f"Root=here,u{ms},s20200101-000000-dead\n"
+                         f"Tab=*,o0,p/nowhere/gone.txt\n"
+                         f"Root=remote,u{ms},s20200101-000000-beef,hnowhere\n"
+                         f"Tab=*,r,o0,p/nowhere/far.txt\n"
+                         f"Root=none,u{ms}\n"
+                         f"Tab=*,o0,p/nowhere/dup.txt\n\n").encode())
             again = ["--compose-again" if a == "--compose" else a for a in guiargs]
             st, more = host.run(again, args.timeout, guicwd, tag="again: ")
             problems += summaryproblems(st, more, "the window again")
@@ -2178,12 +2322,26 @@ def main():
         if args.shots:
             for name in ("history", "menu", "editing", "editfailed", "slash", "models",
                          "drafts", "attached", "images", "compacted", "paused", "continue",
-                         "restored"):
+                         "restored", "dragrefused", "files"):
                 if not os.path.exists(os.path.join(args.shots, f"compose-{name}.png")):
                     problems.append(f"no compose-{name}.png")
+    elif args.mode == "remote":
+        # Twice: the second finds the Files tabs the first left on r
+        status, lines = host.run(guiargs, args.timeout, guicwd, env=far.env())
+        problems += summaryproblems(status, lines, "the window")
+        with fake_provider.STATE.lock:
+            fetched = fake_provider.STATE.includes  # the first run's alone
+        status = 0
+        if not problems:
+            again = ["--remote-again" if a == "--remote" else a for a in guiargs]
+            st, more = host.run(again, args.timeout, guicwd, env=far.env(), tag="again: ")
+            problems += summaryproblems(st, more, "the window again")
+            lines += more
     else:
-        status, lines = host.run(guiargs, args.timeout, guicwd,
-                                 env=far.env() if far else None)
+        env = far.env() if far else None
+        if args.mode == "drive" and args.host and not args.fake:
+            env = FSSTALL
+        status, lines = host.run(guiargs, args.timeout, guicwd, env=env)
     dt = time.monotonic() - t0
 
     if status is None:
@@ -2196,13 +2354,12 @@ def main():
     if ctrwatch:
         problems += ctrwatch.close(state)
     if args.mode == "remote":
-        problems += summaryproblems(status, lines, "the window")
         with fake_provider.STATE.lock:
-            fetched = fake_provider.STATE.includes
+            total = fake_provider.STATE.includes
         if fetched < 2:
             problems.append(f"the URL include was fetched {fetched} times, not again")
         else:
-            print(f"the URL include was fetched {fetched} times")
+            print(f"the URL include was fetched {fetched} times ({total} in both runs)")
         problems += far.close(args.keep)
     if args.mode == "mcp":
         mcpsrv.terminate()

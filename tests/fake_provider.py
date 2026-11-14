@@ -3070,6 +3070,7 @@ GUI_PROMPTS = ("Stream slowly", "Run the tools", "be allowed", "wait for nobody"
                "Edit the lines", "Edit the far file", "Remove the lines",
                "Restore the lines", "Plan the viewer test",
                "Run a command to stop", "Read a long prompt",
+               "Give me commands to run", "Tell me how it ran",
                "Start a subagent in a container", "Sleep in a container as a subagent")
 
 GUI_TODO = ["Read the greeting", "Change it", "Check the result"]
@@ -3179,6 +3180,26 @@ def sc_gui(model, n, req):
     elif "Describe the files" in prompt:
         # Attached as text: its numbered lines, as read shows them
         yield from sc_attach_text(model, n, req)
+    elif "Give me commands to run" in prompt:
+        # A block the Run button runs, counting its runs in a file, and a
+        # transcript, which has none
+        if "Platform: Windows" in system_of(req):
+            block = ("```powershell\necho run-start\n"
+                     "1..100; $n = [int](Get-Content runs -EA 0) + 1; Set-Content runs $n; "
+                     "\"run-$n\"; exit 3\n```")
+        else:
+            block = ("```sh\necho run-start\n"
+                     "seq 1 100; n=$(cat runs 2>/dev/null || echo 0); n=$((n+1)); echo $n >runs; "
+                     "echo run-$n; exit 3\n```")
+        yield from answer(model, "Run this:\n\n" + block +
+                          "\n\nIt prints:\n\n```console\n$ ls\nruns\n```\n")
+    elif "Tell me how it ran" in prompt:
+        # Whether the notice told its exit, first, for W_SAID's prefix
+        said = user_text_all(req)
+        at   = said.rfind("The user ran")
+        note = said[at:at+600] if at >= 0 else ""
+        head = "exited with code 3" if "exited with code 3" in note else "no exit code"
+        yield from answer(model, "Heard: " + head + "\n\n" + (note or "nothing"))
     elif "Answer with links" in prompt:
         # Each kind of link the window follows, one a line, at its start
         yield from answer(model, "Links:\n\n"
@@ -6547,6 +6568,72 @@ def sc_rs_reasoning(model, n, req):
         yield from think(model, "It says hello.")
         yield from text(model, "It says hello.", 2)
         yield from finish(model)
+
+
+# read_terminal: the user's Terminal tabs, as the scenario set them up
+# before the prompt
+
+def sc_read_terminal(model, n, req):
+    reads = [{}, {"tab": 2, "lines": 5}, {"tab": 9}, {"tab": 1}]
+    k = step(req)
+    if k < len(reads):
+        yield from tool(model, n, "read_terminal", reads[k])
+    else:
+        yield from answer(model, "Read them.")
+
+
+def sc_read_terminal_secret(model, n, req):
+    if step(req) == 0:
+        yield from tool(model, n, "read_terminal", {"lines": 2000})
+    else:
+        yield from answer(model, "Read it.")
+
+
+def sc_read_terminal_root(model, n, req):
+    if "root" in task_prompt(req) and step(req) == 0:
+        yield from tool(model, n, "task", {"description": "Read the terminal",
+                                           "prompt": "Read the user's terminal.",
+                                           "model": second(model)})
+    elif step(req) == 0:
+        yield from tool(model, n, "read_terminal", {})
+    else:
+        yield from answer(model, "Saw: " + " / ".join(tool_results(req)))
+
+
+def sc_read_terminal_root_b(model, n, req):
+    if step(req) == 0:
+        yield from tool(model, n, "read_terminal", {})
+    else:
+        yield from answer(model, "Subagent saw: " + " / ".join(tool_results(req)))
+
+
+def sc_read_terminal_loop(model, n, req):
+    if step(req) < 7:
+        yield from tool(model, n, "read_terminal", {"tab": 1})
+    else:
+        yield from answer(model, "Done reading.")
+
+
+def sc_read_terminal_off(model, n, req):
+    if step(req) == 0:
+        yield from tool(model, n, "read_terminal", {})
+    else:
+        yield from answer(model, "Tools: " + ",".join(tool_names(req)))
+
+
+sc_read_terminal_replay = sc_read_terminal_off
+
+
+def sc_term_run(model, n, req):
+    # Each turn reads the terminal once, then says what it was told
+    if since_user(req) == 0:
+        yield from tool(model, n, "read_terminal", {})
+    else:
+        yield from answer(model, "Heard: " + user_text_all(req)[-1500:])
+
+
+sc_term_run_windows = sc_term_run
+sc_term_run_parked = sc_term_run
 
 
 SCENARIOS = {name[3:]: fn for name, fn in globals().items()

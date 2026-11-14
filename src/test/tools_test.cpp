@@ -213,11 +213,11 @@ static void test_tools(Test *t)
                ~((u32)1<<TOOL_READ | (u32)1<<TOOL_GREP | (u32)1<<TOOL_GLOB)));
         expect(t, "tooldeny all but desktop", istr(a, tooldeny("read write edit "
                "shell grep glob todo_write jobs job_output job_kill task skill sessions "
-               "send_message memory web_search web_fetch")),
+               "send_message memory web_search web_fetch read_terminal")),
                istr(a, TOOL_OFFMASK|TOOL_PLANMASK|TOOL_ASKMASK));
         expect(t, "tooldeny all", istr(a, tooldeny("read write edit shell grep glob "
                "todo_write jobs job_output job_kill task desktop skill sessions "
-               "send_message memory web_search web_fetch")),
+               "send_message memory web_search web_fetch read_terminal")),
                istr(a, TOOL_PLANMASK|TOOL_ASKMASK));
         expect(t, "tooldeny none", istr(a, tooldeny("")), istr(a, ((u32)1<<TOOL_COUNT) - 1));
         expect(t, "unknown for the role", unknowntool(a, "write", deny),
@@ -747,7 +747,7 @@ static void test_tools(Test *t)
         struct { Str path; i32 flavor; Str has; Str hasnt; } sh[] = {
             {"/bin/sh",                        FLAVOR_NONE,    "/bin/sh -c (a POSIX shell). Each", "busybox"},
             {"/usr/bin/zsh",                   FLAVOR_NONE,    "/usr/bin/zsh -c. Each", "POSIX shell"},
-            {"C:\\w64devkit\\bin\\sh.exe",     FLAVOR_BUSYBOX, "It is not bash", "cygpath"},
+            {"C:\\w64devkit\\bin\\sh.exe",     FLAVOR_BUSYBOX, "sh.exe -c, w64devkit's shell, with the usual Unix tools. Write POSIX sh", "not bash"},
             {"C:\\w64devkit\\bin\\sh.exe",     FLAVOR_BUSYBOX, "/c/x and /cygdrive/c/x do not exist", "(a POSIX"},
             {"C:\\msys64\\usr\\bin\\bash.exe", FLAVOR_MSYS,    "an MSYS2 shell", "do not exist"},
             {"C:\\msys64\\usr\\bin\\bash.exe", FLAVOR_MSYS,    "cygpath -m prints", "/cygdrive/c/x"},
@@ -774,7 +774,8 @@ static void test_tools(Test *t)
         te.shell.kind   = SHELL_BUSYBOX;
         te.shell.flavor = FLAVOR_BUSYBOX;
         expect(t, "busybox description", istr(a, find(shelldesc(a, &te),
-               "busybox.exe sh -c, busybox-w32's ash")>0), "1");
+               "busybox.exe sh -c, busybox-w32's ash with the usual Unix tools "
+               "built in. It is not bash: write POSIX sh")>0), "1");
 
         // A login shell, and a description from its section
         te.shell.login = 1;
@@ -1079,13 +1080,26 @@ static void test_tools(Test *t)
         expect(t, "ask in the system prompt", istr(a, find(with, "ask with ask_user")>=0 &&
                find(without, "cannot answer questions")>=0 && find(without, "ask_user")<0), "1");
 
-        // File links, only where asked for, as the last guideline
-        Str links  = systemprompt(a, "/w", &qe, 0, 1);
+        // File links, only where asked for, as the last guideline but for
+        // the Run button's, which needs read_terminal too
+        ToolEnv re   = qe;
+        re.deny     |= TOOL_TERMMASK;
+        Str links  = systemprompt(a, "/w", &re, 0, 1);
         Str bullet = "- When you mention files in replies, link them in Markdown";
         iz  at     = find(links, bullet);
         expect(t, "file links in the system prompt", istr(a, at>=0 &&
                find(links, "around a path with spaces.\n\nWorking directory: /w\n")>at &&
                find(with, bullet)<0 && find(without, bullet)<0), "1");
+        re.deny &= ~(u32)TOOL_TERMMASK;
+        Str run    = "- When the user must run a command themselves";
+        Str runs   = systemprompt(a, "/w", &re, 0, 1);
+        expect(t, "run blocks in the system prompt",
+               istr(a, find(runs, run)>find(runs, bullet) &&
+                       find(runs, "(sh, bash, or zsh)")>=0 &&
+                       find(systemprompt(a, "/w", &re, 0, 0), run)<0 && find(links, run)<0), "1");
+        re.windows = 1;
+        expect(t, "run blocks on Windows",
+               istr(a, find(systemprompt(a, "/w", &re, 0, 1), "(powershell, cmd, or sh)")>=0), "1");
         expect(t, "ask alias", istr(a, find(unknowntool(a, "AskUserQuestion", TOOL_ASKMASK),
                                             "cannot ask the user")>=0), "1");
         expect(t, "ask in tooljson", istr(a, find(tooljson(a, &qe), "\"ask_user\"")<0), "1");

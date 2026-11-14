@@ -74,9 +74,9 @@
 #include "filewalk.cpp"
 #include "sidebar.cpp"
 #include "dock.cpp"
-#include "termset.cpp"
 #include "fileset.cpp"
 #include "palette.cpp"
+#include "dropto.cpp"
 
 enum : i64 {
     STREAM_PERIOD = 1000000/30,  // µs between frames showing new deltas
@@ -198,6 +198,8 @@ enum : u32 {
     TASK_FONTS,         // the system's fonts picked (findfonts): a line each
     TASK_OPENFILE,      // Open file's path (fileanswerput): LINE0 LINE1 PATH, then
                         // a line with its section
+    TASK_FS,            // a file worker's answer, or beat after holding (guifs):
+                        // fsdone's, making no frame of its own
 };
 
 // Item rectangles the scripted checklist aims at
@@ -259,6 +261,7 @@ enum : i32 {
     RECT_REFRESHINC, // the settings window's Refresh includes
     RECT_CODEBLOCK,  // the code block aimed at (selectcode), else the latest
     RECT_CODECOPY,   // and its Copy button, while shown
+    RECT_CODERUN,    // and its Run button, while shown
     RECT_SHELLBTN,   // the session bar's toggles
     RECT_TOOLSBTN,
     RECT_THINKBTN,
@@ -487,6 +490,7 @@ struct GuiHost {
     Str        version;
     Slice<Str> cmds;    // the commands it takes
     Slice<Str> caps;    // and its features (putcaps)
+    b32        nopty;   // its hello says it has no pseudoconsoles (XP)
     Str        home;    // its home directory, ~ there (homeshow), if known
     b32        relist;  // a command changed its list: ask again (drainmail)
     i32        trashdays; // its Trash keeps sessions this long, as its list
@@ -728,8 +732,8 @@ struct OutFile {
 };
 
 // A folder listed for a path field's completion (pathpick.cpp): on this
-// machine, by the GUI itself, else by the host's engine (dir), on its way
-// meanwhile. Each is kept a little while (DIRLIST_TTL), then listed again
+// machine, by the window's file workers (files.cpp's GFS_LIST), else by
+// the host's engine (dir), on its way meanwhile. Each is kept a little while (DIRLIST_TTL), then listed again
 // when wanted, its entries shown until the new ones come.
 struct DirList {
     u64              host;  // its host's uid, 0 for a free slot
@@ -737,7 +741,7 @@ struct DirList {
     Slice<PathEntry> ents;
     Str              err;   // why it could not be listed
     i64              at;    // when asked, µs (sched)
-    i64              id;    // its dir command in flight, 0 if none
+    i64              id;    // its dir command or job in flight, 0 if none
     b32              got;   // ents and err are an answer
     b32              more;  // there were more entries than these
     b32              files; // files listed too, for the '@' picker: a listing
@@ -769,6 +773,8 @@ struct PathComp {
     b32      shown;    // typed in since the last accept, or Up or Down
     b32      refocus;  // the field to have the keyboard again, its caret
                        // at the end: after a click on a row
+    b32      tabwait;  // Tab pressed while the folder was being listed:
+                       // it completes once the listing comes
     // For the checklist: the dropdown as drawn last
     i32      rows;     // its picks, 0 if it was not drawn
     char     first[64];
@@ -832,15 +838,15 @@ struct LinkMenu {
 };
 
 // Inline code naming a file (doc.cpp's DocCand) is drawn as a link once
-// the file is found: on this computer by filestat, on another host by
-// fs.stat there. Asked only of what is drawn, and remembered by host
+// the file is found: on this computer by filestat on the window's file
+// workers, on another host by fs.stat there. Asked only of what is
+// drawn, and remembered by host
 // and resolved path (codelinks, files.cpp). Each path is a CodeLink in
 // a hash trie in the cache's own Region, CODELINK_REGION reserved: the
 // whole cache is forgotten at once when CODELINK_MAX paths are held or
 // the next one would not fit, so it never holds more than that.
 enum : i32 {
-    CODELINK_BATCH = 16,         // stats here a frame, or paths in one fs.stat
-    CODELINK_US    = 2000,       // and at most this long a frame stat'ing here
+    CODELINK_BATCH = 16,         // paths in one batch, here or there
     CODELINK_AGAIN = 15000000,   // a miss is asked again once drawn this much later
     CODELINK_MAX   = 16384,      // paths held, then all forgotten
     CODELINK_HOSTS = 8,          // hosts asked at once, a batch each
@@ -863,12 +869,15 @@ struct CodeLink {
     u64       host;   // uid, 0 for this computer
     Str       path;   // resolved
     i64       asked;  // ticks of the answer, a miss's
+    iz        rootlen;// here, its folder's bytes as last asked: only links
+                      // below it are refused (os_haslink)
     u8        state;  // CODE_*
     u8        linked; // a miss for a link on its way, never stat'ed
 };
 
-// One host's fs.stat batch: built as its paths are drawn, sent at the
-// frame's end, one in flight per host.
+// One host's batch, fs.stat there, or the window's pool here (GFS_LINKS):
+// built as its paths are drawn, sent at the frame's end, one in flight
+// per host.
 struct CodeAsk {
     u64       host;  // uid, 0 for a free slot
     i64       id;    // the request in flight, 0 while built
@@ -883,9 +892,9 @@ struct CodeLinks {
     byte     *base;   // mem's beginning, to forget everything
     CodeLink *root;
     i32       count;
-    i32       stats;  // made here this frame
-    i64       spent;  // ticks they took
-    b32       more;   // drawn and unasked, for the frame's budget
+    b32       waiting;  // a span turned away by a batch in flight or full:
+                        // the next answer draws again
+    CodeAsk   local;    // this computer's, its host 0
     CodeAsk   asks[CODELINK_HOSTS];
 };
 
@@ -1162,17 +1171,44 @@ enum : i32 {
     EXP_ASKING,   // the dialog is up
 };
 
-// A file dropped at a point of the window, kept for the next frame,
-// which routes it (droproute): ImGui knows only then what is there.
+// A file dropped on the window, kept for the next frame, which routes
+// it (droproute): ImGui knows only then what is there. The files of one
+// drop are consecutive, at one point.
 struct DropAt {
     DropAt *next;
     Str     path;
     f32     x, y;   // in ImGui's units, as its MousePos
+    b32     at;     // x and y are known: else at no point (a title bar)
 };
 
 // Bytes reserved for the files dropped before a frame routes them: what
-// doesn't fit is attached at once, as a drop with no point is.
+// doesn't fit is attached at once.
 enum { DROP_QUEUE = 1<<20 };
+
+// A drag over the window, as the platform tells of it (gui_dragover)
+enum : i32 {
+    DRAG_OVER,   // over the window, at a point or over its title bar
+    DRAG_LEAVE,  // gone: dropped, cancelled, or off the window
+};
+
+// Files dragged over the window, from the platform's first word of it
+// to its leaving, a drop, or pointer input (gui_input), which no
+// platform gives a window while a drag is over it. Each frame names
+// where a drop would go (dragwhere) and outlines that place with a card
+// that says so (drawdragover). Frames come only as it changes.
+struct DragOver {
+    b32      on;
+    f32      x, y;     // where, in ImGui's units, if at
+    b32      at;       // else over the title bar
+    DropLoad load;     // what it holds, as far as the platform knows
+    b32      refused;  // the platform was told a drop here is refused
+    i32      to;       // DROPTO_*, as this frame names it
+    b32      amber;    // the files would not go: why, in detail
+    char     label[FIELD_MAX];
+    char     detail[FIELD_MAX];
+    Rect     place[DROPTO_COUNT];  // the places drawn this frame (dragplace)
+    b32      shown;    // its card drew this frame
+};
 
 // A file dialog asked for (askpath), kept in case the platform has none
 // to show, as Linux without a desktop portal or zenity has not: a field
@@ -1199,27 +1235,55 @@ struct FileAsk {
     PathAsk p;
     u64     host;     // whose path it is, 0 for this computer
     u8      err[96];  // p.err's bytes, made from filepath's
-    // On another host, the path is checked there (fs.stat) before the
-    // modal closes, "Checking..." meanwhile
-    i64     statid;   // the fs.stat in flight, else 0
+    // The path is checked, here on the window's pool, on another host
+    // there (fs.stat), before the modal closes, "Checking..." meanwhile
+    // once it has taken FILES_NOTEDELAY
+    i64     statid;   // the check in flight, else 0
+    i64     statat;   // when it was asked, ticks
     b32     close;    // its answer came and was posted: the modal closes
+    b32     opening;  // posted, not yet taken (TASK_OPENFILE), for the checklist
     u8      answer[FIELD_MAX + 64];  // posted when it says a file
     iz      answerlen;
     b32     stated;   // an answer came from there, for the checklist
     b32     dropped;  // a file dropped filled the field: its state to reload
 };
 
-// A file on another host read into a tab, through its engine (fs.read),
-// a part (FILES_PART) at a time, for the front tab shown only. What came
-// is in r, at most FILES_MAX bytes, the rest of r the scratch that makes
-// it a body. Asked again for after a reconnect, a request slot evicted
-// (REQ_MAX), or a reply lost on the way, up to three times.
+enum : i64 {
+    FILES_NOTEDELAY = 250000,  // ticks a read or check takes before it says so
+};
+
+enum : i32 {  // the window's file jobs (FsPut.kind, files.cpp's guifs)
+    GFS_FILE = 1,  // the fetch's read (filereadall), into its Region's buffer
+    GFS_STAT,      // a path's stat: a tab's check (filewatch), or Open file's
+    GFS_LINKS,     // inline code's paths, each with its rootlen (codelinksflush)
+    GFS_LIST,      // a folder's entries, for a path typed (dirget)
+    GFS_WALK,      // the '@' index's walk (mention.cpp, filewalkrun)
+};
+
+// A read on the window's pool (GFS_FILE): where its worker
+// writes, at the start of its fetch's Region, set before the job is put
+// and never changed after.
+struct GfsFile {
+    u8 *buf;
+    iz  max;
+    b32 image;  // read whole, or not at all past max
+};
+
+// A file read into a tab, for the front tab shown only: here on the
+// window's pool, by a worker, whole or to its cap, into r's buffer; on
+// another host through its engine (fs.read), a part (FILES_PART) at a
+// time. What came is in r, at most FILES_MAX bytes, the rest of r the
+// scratch that makes it a body. There, asked again for after a
+// reconnect, a request slot evicted (REQ_MAX), or a reply lost on the
+// way, up to three times.
 struct FileFetch {
     FileTab *ft;       // the tab it reads for, else null for none
     u32      serial;   // and its serial then
     u64      host;     // its host's uid
-    i64      id;       // the part asked for, else 0
-    Region  *r;
+    i64      id;       // the part asked for, or the job here, else 0
+    i64      askedat;  // ticks when the read began, for "Reading..."
+    Region  *r;        // the pool's, once given up while its worker runs
+    GfsFile *head;     // at r's start
     Arena    mem;      // r past buf
     u8      *buf;
     iz       max;      // its room: the bytes read at most
@@ -1695,6 +1759,7 @@ struct Gui {
     f64                scrollto;   // -1 if none
     b32                dragging;
     i32                menumsg;    // the message the context menu is for
+    i32                menuoff;    //   and where in its text, else -1
     View              *copiedview; // a code block's Copy, clicked then
     i32                copiedmsg;
     i32                copiedblk;
@@ -1827,10 +1892,13 @@ struct Gui {
     Str                editjump;   // Open in editor's latest command, for the
     i64                editjumps;  //   checklist, and how many
     u64                edfoundkey; // editorfound's last answer, by program
-    i64                edfoundat;  //   and PATH, when (µs, os_ticks), and whether it
-    b32                edfound;    //   was found
+    i64                edfoundat;  //   and PATH, when (µs, os_ticks), and the
+    Str                edfound;    //   path it found (in perm), null if none
     u8                 fjumpwhy[160]; // why the Files toolbar's Open in editor
     i32                fjumpwhylen;   //   is disabled, as last drawn
+    i32                fedithow;      // and how it would open the file (FE_*),
+    u8                 fedittip[256]; //   with its tooltip, for the drive
+    i32                fedittiplen;
     Str                fontsset;   // [ui] fonts, at startup
     Slice<FontFile>    sysfonts;   // found, merged before the next frame
     Str                terminal;   // [ui] terminal
@@ -1999,6 +2067,8 @@ struct Gui {
     u32                termserial;   // the last tab's serial
     b32                termfocus;    // focus the terminal when next drawn
     GuiSession        *termaddto;    // root wanting a new tab once sized
+    b32                termletgo;    // the grid lets go of the keyboard: an
+                                     //   editor's tab closed, back to Files
     i32                closeterms;   // busy tabs the quit dialog counted
     i32                closejobs;    // sessions with jobs it counted
     i32                termscroll;   // [terminal] scrollback, for new tabs
@@ -2027,6 +2097,8 @@ struct Gui {
     GuiSession        *filebarroot;  // whose tabs the bar showed last
     u32                fileserial;   // the last tab's serial
     b32                filewrap;     // new tabs wrap: the last choice made
+    FileKeeps          fkeep;        // tabs kept in the layout file, until
+                                     // their roots are found (filesrestore)
     FileAsk            fask;         // Open file's modal
     FileFetch          ffetch;       // a file on another host, coming
     DocLines           flines;       // the text view's state, as drawn
@@ -2042,7 +2114,11 @@ struct Gui {
     b32                filesdrawn;   // the pane was drawn this frame
     ImGuiWindow       *fileswindow;  // its window, as last drawn, else null
     b32                closekey;     // macOS's Window → Close (Cmd+W), for menukeys
-    i64                fileloads;    // files read, for the checklist
+    i64                fileloads;    // files read, once each as made a body,
+                                     // for the checklist
+    FsPool            *fs;           // this computer's file workers (guifs)
+    Arena              fsmem;        // their scratch, apart from the frame's
+    b32                fsclosing;    // their jobs ended (fsquit): no answers
     b32                fileswin;     // the window had the focus, as last drawn
     b32                filesfocus;   // and the pane
     b32                fimgshown;    // an image tab drew its image
@@ -2210,8 +2286,9 @@ struct Gui {
                                      //   from (the enum is not defined yet)
     b32                mentiontrunc; // its list was capped
     b32                mentiontag;   // its pick was drawn marked attached
-    b32                mentionhold;  // the '@' index's walk is held, so the
-                                     //   picker lists a folder (OP_MENTIONHOLD)
+    b32                mentionhold;  // the '@' index's walk is held, not put,
+                                     //   so the picker lists a folder
+                                     //   (OP_MENTIONHOLD)
     b32                cmenushown;   // the compose box's context menu drew
     u32                cmenustate;   // and what it enabled: 1 undo, 2 redo,
                                      // 4 cut and copy, 8 paste, 16 editor
@@ -2230,6 +2307,9 @@ struct Gui {
     Arena              dropa;        // next frame routes them (DROP_QUEUE)
     DropAt            *drophead;
     DropAt            *droptail;
+    DragOver           drag;         // files dragged over the window
+    f32                drivedragfx;  // OP_DRAG's answer: 1 taken, 0
+                                     // refused, -1 the platform says nothing
     u64                attask;       // the attach dialog's latest ask
     GuiSession        *attsess;      // and for which session
     b32                attpend;      // while that dialog is open
@@ -5307,6 +5387,7 @@ static void movesess(Gui *g, GuiSession *s, GuiHost *to)
 
 static GuiCtr *ctrofhost(Gui *, GuiHost *);
 static void    ctrkeep(Gui *, GuiCtr *);
+static void    filesrestore(Gui *, GuiHost *);
 
 // The sessions a host lists. A background host of another process lists
 // every session of the state directory it shares with the engine here,
@@ -5398,6 +5479,7 @@ static void onsessions(Gui *g, GuiHost *h, Json *j)
             guilist(g, g->hosts);
         }
     }
+    filesrestore(g, h);  // its sessions' Files tabs, before one is shown
     GuiSession *want = g->opensid.len ? findlocal(g, g->opensid) : 0;
     if (want) {
         g->opensid = {};
@@ -5447,6 +5529,15 @@ static Str attachwhy(GuiSession *s)
         return "No room for another attachment: remove one";
     }
     return {};
+}
+
+// Attachments the message has room for (dropto.cpp), all of them with
+// no message: the limit's, else its slots', where path-only chips take
+// slots but not the count.
+static i32 attachroom(AttBox *x)
+{
+    return x ? attachroom(ATTACH_MAX, attachcount(x), x->len, (i32)countof(x->imgs))
+             : (i32)ATTACH_MAX;
 }
 
 // An attachment's arena, kept at the start of its own region, so that an
@@ -5969,14 +6060,16 @@ static void dropattach(Gui *g, Str path)
     scheddirty(&g->sched);
 }
 
-// A dropped file, attached to the draft shown, or, dropped at a point
-// (at, x and y in ImGui's units), queued for the next frame to route
-// (droproute): there it may open in the Files pane, or fill Open file's
-// field. A directory has a new session there instead: at once if opened
-// in the application (app: Finder, the Dock, open -a), else through the
-// new session dialog, dropped on the window perhaps only to be
-// attached. The open event macOS makes of prospero DIR's argument is
-// ignored, as the launch has that session already.
+// A dropped file, opened in the application (app: Finder, the Dock,
+// open -a) and attached to the draft shown at once, or dropped on the
+// window and queued for the next frame to route (droproute), with its
+// point (at, x and y in ImGui's units) if the platform knows one: there
+// it may open in the Files pane, fill Open file's field, or be attached
+// with the files dropped with it. A directory has a new session there
+// instead: at once if opened in the application, else through the new
+// session dialog, dropped on the window perhaps only to be attached.
+// The open event macOS makes of prospero DIR's argument is ignored, as
+// the launch has that session already.
 static void gui_drop(Gui *g, Str path, b32 app, f32 x, f32 y, b32 at)
 {
     g->drops++;
@@ -5998,7 +6091,7 @@ static void gui_drop(Gui *g, Str path, b32 app, f32 x, f32 y, b32 at)
         scheddirty(&g->sched);
         return;
     }
-    if (at && !app) {
+    if (!app) {
         // Kept past this frame's scratch, which the next frame resets
         if (!g->dropr) {
             g->dropr = os_reserve(g->os, DROP_QUEUE);
@@ -6009,6 +6102,7 @@ static void gui_drop(Gui *g, Str path, b32 app, f32 x, f32 y, b32 at)
             d->path = clone(&g->dropa, path);
             d->x    = x;
             d->y    = y;
+            d->at   = at;
             if (g->droptail) {
                 g->droptail->next = d;
             } else {
@@ -6020,6 +6114,20 @@ static void gui_drop(Gui *g, Str path, b32 app, f32 x, f32 y, b32 at)
         }
     }
     dropattach(g, path);
+}
+
+// Text dropped on the window, where the platform could not refuse it
+// first (Linux): said where a refused attach is.
+static void gui_droptext(Gui *g)
+{
+    Str why  = dropwhere(&g->frame, {}, {DRAGLOAD_TEXT, 1, 0}).label;
+    Str note = concat(&g->frame, "not attached: ", why);
+    if (g->sess) {
+        setnote(g, g->sess, note, 1);
+    } else {
+        guilog(g, note);
+    }
+    scheddirty(&g->sched);
 }
 
 // Paste: the clipboard's image, or its file, attached, an image or
@@ -6295,6 +6403,7 @@ static void sessgone(Gui *, GuiSession *);
 // The '@' picker's index (mention.cpp), which sessgone lets go: mention.cpp
 // is included with ui.cpp, further down, so its freeing is named here
 static void mentionidxdrop(Gui *, GuiSession *);
+static void mentionidxgo(Gui *, GuiSession *, Arena);
 static void mentionlate(Gui *);
 static b32  trashtoasted(Gui *, GuiSession *);
 static void updatestatus(Gui *, GuiHost *, b32 idle);
@@ -6336,6 +6445,12 @@ static Str  termaddwhy(Gui *, GuiSession *);
 static Str  termwhy(Gui *, GuiSession *);
 static void termgo(Gui *);
 static i32  termbusy(Gui *);
+static i32  termedits(Gui *);
+struct TermTab;
+static u64  termrunkey(Str, i64, i32);
+static Str  termrunfolder(Gui *, GuiSession *);
+static Str  termrunwhy(Gui *, GuiSession *, i32, u64);
+static TermTab *termrun(Gui *, GuiSession *, Str, Str, u64);
 static void termadd(Gui *, GuiSession *);
 static void termgrab(Gui *);
 static Str  termscreen(Gui *, Arena *);
@@ -6833,6 +6948,7 @@ static void hostcaps(Gui *g, GuiHost *h, Json *j)
     h->version = h->version==version ? h->version : clone(&g->perm, version);
     hostnames(g, &h->cmds, jsonget(j, "cmds"));
     hostnames(g, &h->caps, jsonget(j, "caps"));
+    h->nopty = !jsonint(jsonget(j, "pty"), 1);  // a remote's "up" has it only as 0
     Str home = jsonstr(jsonget(j, "home"));
     h->home = h->home==home ? h->home : clone(&g->perm, home);
 }
@@ -7048,19 +7164,94 @@ static Slice<Str> guienv(Gui *g, Arena *a)
     return envsetpath(a, os_environ(g->os, a), guipath(g, a), HOST_WINDOWS);
 }
 
-static Str editorcmd(Gui *g, Arena *a)
+// The editor set: [ui] editor, else $VISUAL, else $EDITOR, else null.
+static Str editorset(Gui *g, Arena *a)
 {
     Str cmd = editorpick(g->editor, os_getenv(g->os, a, "VISUAL"),
-                         os_getenv(g->os, a, "EDITOR"), g->mac);
+                         os_getenv(g->os, a, "EDITOR"), 0);
     return HOST_WINDOWS ? cmdhome(a, cmd, userhome(g->os, a)) : cmd;
+}
+
+// The editor's command (editorpick): the one set, else on macOS the
+// default text editor.
+static Str editorcmd(Gui *g, Arena *a)
+{
+    Str cmd = editorset(g, a);
+    return cmd.len || !g->mac ? cmd : Str("open -W -n -t");
+}
+
+// The editor for a draft, a plan or the configuration file, which the
+// window runs with no terminal and waits for: editorcmd's, except that
+// on macOS a terminal editor named only by $VISUAL or $EDITOR (a Dock
+// launch takes them from the login shell) gives way to the default text
+// editor, so Ctrl+G still works. A terminal [ui] editor stays, refused
+// (editorwhy).
+static Str editordraft(Gui *g, Arena *a)
+{
+    Str cmd = editorcmd(g, a);
+    if (g->mac && !trim(g->editor).len && editorterm(cmd)) {
+        cmd = "open -W -n -t";
+    }
+    return cmd;
+}
+
+// What Open in editor sends with a file to open in a Terminal tab of
+// host h (term.open's edit), h null or not a remote for this computer.
+// For this computer's file: [ui] editor_line if its program runs in a
+// terminal, else the editor set (editorset) if it does. For a remote's
+// (ssh, WSL, a container): the settings alone, never this window's
+// $VISUAL or $EDITOR, and only an editor that runs in a terminal: to a
+// host of the same OS family [ui] editor_line, else [ui] editor, as
+// written; to another family [ui] editor by its known name alone
+// (editorbare), since its path and arguments may mean nothing there.
+// Nothing (term 0) has the host's own editor run there: its login
+// shell's $VISUAL or $EDITOR, else vi. The name is its program's file
+// name, without .exe and the like, as the reply's.
+struct EditAsk {
+    Str editor;  // the editor's command, else null
+    Str tmpl;    // or its template
+    Str name;    // its program's file name
+    b32 term;    // one of them is sent, an editor that runs in a terminal
+};
+
+static b32 hostwin(GuiHost *);
+
+static EditAsk editask(Gui *g, Arena *a, GuiHost *h)
+{
+    EditAsk r      = {};
+    b32     remote = h && h->kind==GH_REMOTE;
+    Str     cmd    = trim(remote ? g->editor : editorset(g, a));
+    Str     tmpl   = trim(g->edjumpfmt);
+    if (remote && hostwin(h)!=(b32)HOST_WINDOWS) {
+        cmd  = editorbare(cmd);
+        tmpl = {};
+    } else if (remote) {
+        cmd  = editorterm(cmd) ? cmd : Str{};
+        tmpl = editorterm(tmpl) ? tmpl : Str{};
+    }
+    Str use = tmpl.len ? tmpl : cmd;
+    if (use.len && editorterm(use)) {
+        r.term   = 1;
+        r.name   = termeditname(cmdprog(use, 0));  // as the reply has it
+        r.tmpl   = tmpl.len ? tmpl : Str{};
+        r.editor = tmpl.len ? Str{} : cmd;
+    }
+    return r;
 }
 
 // Why no file can go out to the editor now, for session s (null for the
 // configuration), or null if one can.
 static Str editorwhy(Gui *g, GuiSession *s, Arena *a)
 {
-    if (!editorcmd(g, a).len) {
+    Str cmd = editordraft(g, a);
+    if (!cmd.len) {
         return "no editor: set [ui] editor in the settings (or $VISUAL or $EDITOR)";
+    } else if (editorterm(cmd)) {
+        Buf b(a, 160);
+        print(&b, termeditname(cmdprog(cmd, 0)));
+        print(&b, " runs in a terminal: drafts, plans and the configuration file "
+                  "need [ui] editor to open a window of its own");
+        return finish(&b);
     } else if (g->edcfg) {
         return "the editor has the configuration file open";
     } else if (g->edproc && g->edplan) {
@@ -7073,34 +7264,149 @@ static Str editorwhy(Gui *g, GuiSession *s, Arena *a)
     return {};
 }
 
-// Run the editor on a file, from dir, its output to log. Null on failure.
-static Proc *editrun(Gui *g, Arena a, Str cmd, Str path, Str dir, Str log)
+// Where a program the GUI would run is: at its path if it has a
+// separator (~/ the home directory), else on the GUI's PATH. On Windows
+// a name with no extension is tried with PATHEXT's extensions only,
+// never bare, as cmd.exe would choose: VS Code's bin holds both an
+// extensionless sh script "code" and "code.cmd". Null if nowhere.
+// Network paths are never touched (one may stall for seconds): a
+// program there counts as found, and a PATH entry there is passed over.
+// On Windows the path is a full one, for cmdabs: a program named by a
+// relative path, and a relative PATH entry, are not looked at.
+static Str editorfound(Gui *g, Arena *a, Str prog, b32 direct)
+{
+    if (cfgtilde(prog)) {
+        prog = concat(a, userhome(g->os, a), cuthead(prog, 1));
+    }
+    Slice<Str> exts = {};
+    if (HOST_WINDOWS && direct) {
+        // A direct viewer matches CreateProcessW's own .exe lookup,
+        // never an extensionless file or a shell's PATHEXT candidates.
+        exts = push(a, exts, winviewerext(prog));
+    } else if (!HOST_WINDOWS || find(basename(prog), ".")>=0) {
+        exts = push(a, exts, Str{});
+    } else {
+        Str pe = trim(os_getenv(g->os, a, "PATHEXT"));
+        for (Str rest = pe.len ? pe : Str(".COM;.EXE;.BAT;.CMD"); rest.len;) {
+            Cut c = cut(rest, ';');
+            rest = c.tail;
+            if (trim(c.head).len) {
+                exts = push(a, exts, trim(c.head));
+            }
+        }
+    }
+    b32 sep = find(prog, "/")>=0 || (HOST_WINDOWS && (find(prog, "\\")>=0 || find(prog, ":")>=0));
+    if (HOST_WINDOWS && sep && !pathroot(prog, 1)) {
+        return {};
+    } else if (sep && netpath(prog, HOST_WINDOWS)) {
+        return prog;
+    }
+    Str path = sep ? Str(".") : guipath(g, a);
+    for (Str rest = path; rest.len;) {
+        Cut c = cut(rest, HOST_WINDOWS ? ';' : ':');
+        Str d = trim(c.head);
+        rest = c.tail;
+        if (d.len>=2 && d[0]=='"' && d[d.len-1]=='"') {
+            d = takehead(cuthead(d, 1), d.len-2);
+        }
+        if (!d.len || (!sep && netpath(d, HOST_WINDOWS)) ||
+                (HOST_WINDOWS && !sep && !pathroot(d, 1))) {
+            continue;
+        }
+        for (iz i = 0; i < exts.len; i++) {
+            Arena t = *a;
+            Str   p = concat(&t, sep ? prog : join(&t, d, prog), exts[i]);
+            if (os_stat(g->os, t, p).type == STAT_FILE) {
+                *a = t;
+                return p;
+            }
+        }
+    }
+    return {};
+}
+
+// editorfound's answer for prog, kept: looked for again when the
+// program or PATH changes, else at most every few seconds, since menus
+// and the toolbar ask each frame. Null if not found.
+static Str editorexe(Gui *g, Arena *a, Str prog, b32 direct)
+{
+    u64 key = editorfindkey(prog, guipath(g, a), direct);
+    i64 now = os_ticks(g->os);
+    if (!g->edfoundat || key!=g->edfoundkey || now-g->edfoundat>=5000000) {
+        Str exe = editorfound(g, a, prog, direct);
+        if (!(exe == g->edfound)) {
+            g->edfound = clone(&g->perm, exe);  // only when it changes
+        }
+        g->edfoundkey = key;
+        g->edfoundat  = now;
+    }
+    return g->edfound;
+}
+
+// Why the editor's program, prog (named name), cannot run: not found,
+// or on Windows not by a full path cmd.exe can take.
+static Str editormissing(Arena *a, Str prog, Str name)
+{
+    b32 sep = find(prog, "/")>=0 || (HOST_WINDOWS && find(prog, "\\")>=0);
+    Buf b(a, 64 + prog.len + name.len);
+    print(&b, "Its editor, ");
+    print(&b, sep ? prog : name);
+    if (HOST_WINDOWS && (sep || find(prog, ":")>=0) && !pathroot(prog, 1)) {
+        print(&b, ", is not named by its full path");
+    } else {
+        print(&b, sep ? Str(", is not there") : Str(", is not on PATH"));
+    }
+    return finish(&b);
+}
+
+// The editor's line for cmd.exe with its program by the full path
+// editorexe found (cmdabs), else null and *why.
+static Str editorabs(Gui *g, Arena *a, Str line, Str prog, Str name, Str *why)
+{
+    Str exe = editorexe(g, a, prog, 0);
+    Str r   = exe.len ? cmdabs(a, line, exe) : Str{};
+    if (!exe.len) {
+        *why = editormissing(a, prog, name);
+    } else if (!r.len) {
+        *why = "Its editor's path holds %, \", a control character or another character "
+               "cmd.exe cannot pass on";
+    }
+    return r;
+}
+
+// Run the editor on a file, from dir, its output to log. Null on
+// failure, and *err why, in a. On Windows cmd.exe runs it by the full
+// path editorexe found (editorabs).
+static Proc *editrun(Gui *g, Arena *a, Str cmd, Str path, Str dir, Str log, Str *err)
 {
     Spawn sp = {};
     #ifdef _WIN32
-    Str comspec = os_getenv(g->os, &a, "COMSPEC");
+    Str rest = cmd;
+    Str prog = cmdword(&rest);
+    Str line = editorabs(g, a, editorline(a, cmd, path, 1), prog, editorname(cmd), err);
+    if (!line.len) {
+        return 0;
+    }
+    Str comspec = os_getenv(g->os, a, "COMSPEC");
     comspec = comspec.len ? comspec : Str("cmd.exe");
-    Str line = editorline(&a, cmd, path, 1);
-    Buf c(&a, 64 + comspec.len + line.len);
-    putbyte(&c, '"');
-    print(&c, comspec);
-    print(&c, "\" /d /s /c \"");
-    print(&c, line);
-    putbyte(&c, '"');
-    sp.argv    = push(&a, sp.argv, comspec);
-    sp.cmdline = finish(&c);
+    sp.argv    = push(a, sp.argv, comspec);
+    sp.cmdline = cmdcline(a, comspec, line);
     #else
-    sp.argv = push(&a, sp.argv, Str("/bin/sh"));
-    sp.argv = push(&a, sp.argv, Str("-c"));
-    sp.argv = push(&a, sp.argv, editorline(&a, cmd, path, 0));
+    sp.argv = push(a, sp.argv, Str("/bin/sh"));
+    sp.argv = push(a, sp.argv, Str("-c"));
+    sp.argv = push(a, sp.argv, editorline(a, cmd, path, 0));
     #endif
     sp.cwd      = dir;
-    sp.env      = guienv(g, &a);
+    sp.env      = guienv(g, a);
     sp.outpath  = log;
     sp.maxbytes = 1<<16;
     sp.mbox     = g->edbox;
     sp.id       = ++g->edid;
-    return os_spawn(g->os, &sp, a);
+    Proc *p = os_spawn(g->os, &sp, *a);
+    if (!p) {
+        *err = concat(a, "cannot start the editor: ", os_lasterr(g->os, a));
+    }
+    return p;
 }
 
 // The draft of session s in the editor, a its scratch.
@@ -7111,7 +7417,7 @@ static void editstart(Gui *g, Arena a, GuiSession *s)
         setnote(g, s, why, 1);
         return;
     }
-    Str cmd  = editorcmd(g, &a);
+    Str cmd  = editordraft(g, &a);
     Str dir  = join(&a, g->statedir, "edit");
     Str base = concat(&a, "draft-", s->sid.len ? s->sid : Str("new"));
     Str path = join(&a, dir, concat(&a, base, ".md"));
@@ -7120,9 +7426,10 @@ static void editstart(Gui *g, Arena a, GuiSession *s)
         setnote(g, s, concat(&a, "cannot write the draft for the editor: ", os_lasterr(g->os, &a)), 1);
         return;
     }
-    Proc *p = editrun(g, a, cmd, path, dir, log);
+    Str   err = {};
+    Proc *p   = editrun(g, &a, cmd, path, dir, log, &err);
     if (!p) {
-        setnote(g, s, concat(&a, "cannot start the editor: ", os_lasterr(g->os, &a)), 1);
+        setnote(g, s, err, 1);
         os_remove(g->os, a, path);
         return;
     }
@@ -7160,12 +7467,18 @@ static void planedit(Gui *g, Arena a, GuiSession *s, Str path, Str req)
         setnote(g, s, why, 1);
         return;
     }
-    Str cmd = editorcmd(g, &a);
+    Str cmd = editordraft(g, &a);
     Str dir = join(&a, g->statedir, "edit");
     Str log = join(&a, dir, concat(&a, concat(&a, "plan-", s->sid), ".log"));
-    Proc *p = os_mkdirs(g->os, a, dir) ? editrun(g, a, cmd, path, dir, log) : 0;
+    Str   err = {};
+    Proc *p   = 0;
+    if (!os_mkdirs(g->os, a, dir)) {
+        err = concat(&a, "cannot start the editor: ", os_lasterr(g->os, &a));
+    } else {
+        p = editrun(g, &a, cmd, path, dir, log, &err);
+    }
     if (!p) {
-        setnote(g, s, concat(&a, "cannot start the editor: ", os_lasterr(g->os, &a)), 1);
+        setnote(g, s, err, 1);
         return;
     }
     g->edsess = s;
@@ -7187,15 +7500,17 @@ static void cfgeditrun(Gui *g, Arena a, Str path)
     Str   why = editorwhy(g, 0, &a);
     Str   err = {};
     Proc *p   = 0;
-    Str   cmd = editorcmd(g, &a);
+    Str   cmd = editordraft(g, &a);
     Str   dir = join(&a, g->statedir, "edit");
     Str   log = join(&a, dir, "config.log");
     if (why.len) {
         err = why;
     } else if (!path.len) {
         err = "no configuration file location";
-    } else if (!(p = os_mkdirs(g->os, a, dir) ? editrun(g, a, cmd, path, dir, log) : 0)) {
+    } else if (!os_mkdirs(g->os, a, dir)) {
         err = concat(&a, "cannot start the editor: ", os_lasterr(g->os, &a));
+    } else {
+        p = editrun(g, &a, cmd, path, dir, log, &err);
     }
     if (!p) {
         cfgsay(g, err, 0);
@@ -7240,82 +7555,24 @@ static void guishow(Gui *g, Str path)
     }
 }
 
-// Whether a program the GUI would run is there: at its path if it has
-// a separator (~/ the home directory), else on the GUI's PATH. The shell
-// editor tries PATHEXT on Windows; a direct viewer matches os_launch's
-// extensionless .exe lookup only. Network paths are never touched (one may
-// stall for seconds): a program there counts as found, and a PATH entry
-// there is passed over.
-static b32 editorfound(Gui *g, Arena a, Str prog, b32 direct)
-{
-    if (cfgtilde(prog)) {
-        prog = concat(&a, userhome(g->os, &a), cuthead(prog, 1));
-    }
-    Slice<Str> exts = {};
-    exts = push(&a, exts, HOST_WINDOWS && direct ? winviewerext(prog) : Str{});
-    if (HOST_WINDOWS && !direct && find(basename(prog), ".")<0) {
-        Str pe = trim(os_getenv(g->os, &a, "PATHEXT"));
-        for (Str rest = pe.len ? pe : Str(".COM;.EXE;.BAT;.CMD"); rest.len;) {
-            Cut c = cut(rest, ';');
-            rest = c.tail;
-            if (trim(c.head).len) {
-                exts = push(&a, exts, trim(c.head));
-            }
-        }
-    }
-    b32 sep = find(prog, "/")>=0 || (HOST_WINDOWS && (find(prog, "\\")>=0 || find(prog, ":")>=0));
-    if (sep && netpath(prog, HOST_WINDOWS)) {
-        return 1;
-    }
-    Str path = sep ? Str(".") : guipath(g, &a);
-    for (Str rest = path; rest.len;) {
-        Cut c = cut(rest, HOST_WINDOWS ? ';' : ':');
-        Str d = trim(c.head);
-        rest = c.tail;
-        if (d.len>=2 && d[0]=='"' && d[d.len-1]=='"') {
-            d = takehead(cuthead(d, 1), d.len-2);
-        }
-        if (!d.len || (!sep && netpath(d, HOST_WINDOWS))) {
-            continue;
-        }
-        for (iz i = 0; i < exts.len; i++) {
-            Arena t = a;
-            Str   p = concat(&t, sep ? prog : join(&t, d, prog), exts[i]);
-            if (os_stat(g->os, t, p).type == STAT_FILE) {
-                return 1;
-            }
-        }
-    }
-    return 0;
-}
-
-// Look for the program an EditJump names, as menus and toolbars ask for it
-// every frame: again when it or PATH changes, else at most every few seconds.
+// A remote viewer's availability and direct/shell error, resolved through
+// the same full-path finder and mode-keyed cache as the local GUI editors.
 static void editorfindfor(Gui *g, Arena *a, EditJump *j)
 {
-    if (j->why.len) {
+    if (j->why.len || editorexe(g, a, j->prog, j->argv.len>0).len) {
         return;
     }
-    b32 direct = j->argv.len>0;
-    u64 key = editorfindkey(j->prog, guipath(g, a), direct);
-    i64 now = os_ticks(g->os);
-    if (!g->edfoundat || key!=g->edfoundkey || now-g->edfoundat>=5000000) {
-        g->edfound    = editorfound(g, *a, j->prog, direct);
-        g->edfoundkey = key;
-        g->edfoundat  = now;
-    }
-    if (!g->edfound) {
-        b32 sep = find(j->prog, "/")>=0 || (HOST_WINDOWS && find(j->prog, "\\")>=0);
-        Buf b(a, 64 + j->prog.len);
-        print(&b, j->argv.len ? Str("Its viewer, ") : Str("Its editor, "));
-        print(&b, sep ? j->prog : j->name);
-        print(&b, sep ? Str(", is not there") : Str(", is not on PATH"));
-        j->why = finish(&b);
-    }
+    b32 sep = find(j->prog, "/")>=0 || (HOST_WINDOWS && find(j->prog, "\\")>=0);
+    Buf b(a, 64 + j->prog.len);
+    print(&b, j->argv.len ? Str("Its viewer, ") : Str("Its editor, "));
+    print(&b, sep ? j->prog : j->name);
+    print(&b, sep ? Str(", is not there") : Str(", is not on PATH"));
+    j->why = finish(&b);
 }
 
 // Open in editor for path, a file here, at line (1-based) and col (0
-// for none): the command, or why not.
+// for none): the command, or why not. An editor that runs in a terminal
+// is refused: the window runs its line with no terminal.
 static EditJump editorjumpfor(Gui *g, Arena *a, Str path, i32 line, i32 col)
 {
     Str cmd  = editorcmd(g, a);
@@ -7324,7 +7581,14 @@ static EditJump editorjumpfor(Gui *g, Arena *a, Str path, i32 line, i32 col)
         tmpl = cmdhome(a, tmpl, userhome(g->os, a));
     }
     EditJump j = editorjump(a, cmd, tmpl, path, line>0 ? line : 1, col, HOST_WINDOWS);
-    editorfindfor(g, a, &j);
+    j = editorwindow(a, j);
+    if (j.argv.len) {
+        editorfindfor(g, a, &j);
+    } else if (!j.why.len && HOST_WINDOWS) {
+        j.line = editorabs(g, a, j.line, j.prog, j.name, &j.why);
+    } else if (!j.why.len && !editorexe(g, a, j.prog, 0).len) {
+        j.why = editormissing(a, j.prog, j.name);
+    }
     return j;
 }
 
@@ -7373,14 +7637,8 @@ static void editorjumprun(Gui *g, Arena a, Str path, i32 line, i32 col)
     #ifdef _WIN32
     Str comspec = os_getenv(g->os, &a, "COMSPEC");
     comspec = comspec.len ? comspec : Str("cmd.exe");
-    Buf c(&a, 64 + comspec.len + j.line.len);
-    putbyte(&c, '"');
-    print(&c, comspec);
-    print(&c, "\" /d /s /c \"");
-    print(&c, j.line);
-    putbyte(&c, '"');
     argv    = push(&a, argv, comspec);
-    cmdline = finish(&c);
+    cmdline = cmdcline(&a, comspec, j.line);
     #else
     argv = push(&a, argv, Str("/bin/sh"));
     argv = push(&a, argv, Str("-c"));
@@ -7579,7 +7837,8 @@ static DirList *dirslot(Gui *g, GuiHost *h, Str dir, b32 files)
     return free;
 }
 
-// A folder's listing, from the GUI's own or a dir command's reply.
+// A folder's listing, from the window's file workers or a dir command's
+// reply, or why it is not.
 static void dirput(PathComp *pc, DirList *l, Slice<PathEntry> ents, b32 more, Str err)
 {
     l->ents = {};
@@ -7593,9 +7852,12 @@ static void dirput(PathComp *pc, DirList *l, Slice<PathEntry> ents, b32 more, St
     l->id   = 0;
 }
 
+static void dirlistlocal(Gui *, DirList *, Str, Arena);
+
 // The folders in a folder typed on a host, or with files its files too,
 // as listed so far, which is listed if it is not, or was a while ago:
-// here at once, or by the host's engine (dir), its answer later (ondir).
+// here by the window's file workers (dirlistlocal), there by the host's
+// engine (dir), its answer later either way (dirlocal, ondir).
 static DirList *dirget(Gui *g, Arena scratch, GuiHost *h, Str dir, b32 files = 0)
 {
     DirList *l = dirslot(g, h, dir, files);
@@ -7604,22 +7866,15 @@ static DirList *dirget(Gui *g, Arena scratch, GuiHost *h, Str dir, b32 files = 0
     }
     l->at = g->sched.now;
     if (h->kind != GH_REMOTE) {
-        Arena            a  = scratch;
         // The slot's own copy of the directory, not the caller's: the
-        // listing's arena starts where the caller's string may lie, so
-        // cstr's NUL-terminated copy of it would overwrite it as it is made
-        HomePath         hp = tildepath(&a, l->dir, h->home, HOST_WINDOWS);
-        Listing          ls = hp.err.len ? Listing{} :
-                              os_listall(g->os, &a, hp.path, !files,
-                                         files ? DIRLIST_FILES : DIRLIST_MAX);
-        Slice<PathEntry> e  = {};
-        for (Dirent *d = ls.head; d; d = d->next) {
-            e = push(&a, e, PathEntry{d->name, d->isdir});
+        // job's arena starts where the caller's string may lie
+        Arena    a  = scratch;
+        HomePath hp = tildepath(&a, l->dir, h->home, HOST_WINDOWS);
+        if (hp.err.len) {
+            dirput(&g->pc, l, {}, 0, hp.err);
+        } else {
+            dirlistlocal(g, l, hp.path, a);
         }
-        Str err = hp.err.len ? hp.err : ls.ok ? Str{} :
-                  os_stat(g->os, a, hp.path).type==STAT_MISSING ? Str("no such folder") :
-                  Str("cannot list this folder");
-        dirput(&g->pc, l, e, ls.more, err);
         return l;
     }
     Arena a = newarena(g->cmdr);
@@ -8497,6 +8752,18 @@ static GuiCtr *ctrofhost(Gui *g, GuiHost *h)
     return h && h->kind==GH_REMOTE ? ctrof(g, h->name) : 0;
 }
 
+// Whether a host's name is that of a container a subagent runs in:
+// ctr:t- and 8 hex digits (hostlink.cpp).
+static b32 ctrtaskhost(Str hostname)
+{
+    Str name = startswith(hostname, "ctr:t-") ? cuthead(hostname, 4) : Str{};
+    b32 ok   = name.len == 10;
+    for (iz i = 2; ok && i < name.len; i++) {
+        ok = hexval(name[i]) >= 0;
+    }
+    return ok;
+}
+
 // The host of the container a subagent runs in, by its name ctr:t-NAME
 // (hostlink.cpp): made from the container.ini that the parent's engine
 // keeps in this state directory while the container is there, else null.
@@ -8504,12 +8771,9 @@ static GuiCtr *ctrofhost(Gui *g, GuiHost *h)
 // no GuiCtr: the parent's engine made it, and removes it.
 static GuiHost *ctrtask(Gui *g, Arena scratch, Str hostname)
 {
-    Str  name = startswith(hostname, "ctr:t-") ? cuthead(hostname, 4) : Str{};
-    b32  ok   = name.len == 10;
-    for (iz i = 2; ok && i < name.len; i++) {
-        ok = hexval(name[i]) >= 0;
-    }
-    GuiHost *h = ok ? findhost(g, GH_REMOTE, hostname) : 0;
+    b32      ok   = ctrtaskhost(hostname);
+    Str      name = ok ? cuthead(hostname, 4) : Str{};
+    GuiHost *h    = ok ? findhost(g, GH_REMOTE, hostname) : 0;
     if (!ok || (h && h->taskexec.len)) {
         return h;
     }
@@ -10405,6 +10669,7 @@ static void ontask(Gui *g, Record r)
         return;
     case TASK_OPENFILE:
         if (r.id == g->fask.p.id) {
+            g->fask.opening = 0;
             fileanswer(g, r.data);
         }
         return;
@@ -11602,6 +11867,7 @@ static void shed(Gui *g)
     if (!g->trayup) {
         g->trayup = os_trayopen(g->os, "Prospero: sessions running in the background");
     }
+    g->drag = {};  // its platform's word of leaving goes with the window
     os_guished(g->os);
     // The renderer is gone, and with it every texture it had (its
     // Shutdown destroys them): the dying ones' pixels go now, as no
@@ -12310,6 +12576,101 @@ static void gui_input(Gui *g, i32 kind)
         g->lastkey = os_ticks(g->os);
         ImGui::GetIO().ConfigInputTextCursorBlink = 1;
     }
+    if (g->drag.on && (kind==INPUT_MOVE || kind==INPUT_BUTTON)) {
+        // No platform moves or clicks a window's pointer while a drag is
+        // over it: the drag ended unsaid (X11's refused drop; macOS's
+        // failed ones end through draggingEnded:). Not a wheel, which
+        // macOS passes on mid-drag, nor keys and focus, which reach a
+        // window a drag hovers
+        g->drag.on = 0;
+        guilog(g, "drag ended by input");
+    }
+}
+
+// Whether a drop of l at x, y (if at) would be refused there, between
+// frames by what the last one left (dropfacts), as nothing moves while
+// a drag goes on; inside one (a COM call's reentry), its verdict.
+static b32 gui_dragrefuse(Gui *g, f32 x, f32 y, b32 at, DropLoad l)
+{
+    if (g->sched.inframe) {
+        return g->drag.refused;
+    }
+    Arena scratch = g->frame;
+    return dropwhere(&scratch, dropfacts(g, x, y, at), l).refuse;
+}
+
+// Files dragged over the window (DRAG_OVER), at x, y in ImGui's units
+// if at, else over its title bar, holding n items of kind (DRAGLOAD_*),
+// dirs of them folders, as far as the platform knows; or gone
+// (DRAG_LEAVE). Returns whether a drop there would be refused, for the
+// platform to say so. A frame follows a change alone: the platforms
+// repeat themselves as a drag rests. Leaving applies at once, inside a
+// frame too, being said only once; an OVER inside a frame changes
+// nothing, the next one coming soon enough.
+static b32 gui_dragover(Gui *g, i32 how, f32 x, f32 y, b32 at, i32 kind, i32 n, i32 dirs)
+{
+    DragOver *d = &g->drag;
+    g->woke |= WOKE_OTHER;
+    if (how == DRAG_LEAVE) {
+        if (d->on) {
+            d->on = 0;
+            scheddirty(&g->sched);
+            guilog(g, "drag left");
+        }
+        return 0;
+    } else if (g->sched.inframe) {
+        return d->refused;
+    }
+    DropLoad l = {kind, n, dirs};
+    d->refused = gui_dragrefuse(g, x, y, at, l);
+    if (d->on && d->x==x && d->y==y && d->at==at &&
+            d->load.kind==kind && d->load.n==n && d->load.dirs==dirs) {
+        return d->refused;
+    }
+    if (!d->on) {
+        Arena a = g->frame;
+        Buf   b(&a, 128);
+        print(&b, "drag over the window: ");
+        print(&b, kind==DRAGLOAD_FILES ? Str("files") : kind==DRAGLOAD_TEXT ? Str("text") :
+                  kind==DRAGLOAD_OTHER ? Str("other") : Str("not known"));
+        if (kind == DRAGLOAD_FILES) {
+            print(&b, ", ");
+            print(&b, (i64)n);
+            print(&b, " items, ");
+            print(&b, (i64)dirs);
+            print(&b, " folders");
+        }
+        print(&b, at ? Str("") : Str(", over the title bar"));
+        guilog(g, finish(&b));
+    }
+    d->on   = 1;
+    d->x    = x;
+    d->y    = y;
+    d->at   = at;
+    d->load = l;
+    scheddirty(&g->sched);
+    return d->refused;
+}
+
+// Where a drop of the files dragged over the window would go, for the
+// frame to outline and say (drawdragover): after ImGui's NewFrame, which
+// knows what was where, and before the places are drawn (dragplace).
+static void dragwhere(Gui *g)
+{
+    DragOver *d = &g->drag;
+    d->shown = 0;
+    for (i32 i = 0; i < DROPTO_COUNT; i++) {
+        d->place[i] = {};
+    }
+    if (!d->on) {
+        return;
+    }
+    DropWhere w = dropwhere(&g->frame, dropfacts(g, d->x, d->y, d->at), d->load);
+    d->to      = w.to;
+    d->amber   = w.amber;
+    d->refused = w.refuse;
+    fieldput(d->label, w.label);
+    fieldput(d->detail, w.detail);
 }
 
 static b32 drivewaitdone(Gui *g);
@@ -12388,10 +12749,17 @@ static void drainmail(Gui *g, i64 now)
         }
     }
 
-    // Other threads' outcomes, while hosting too
+    // Other threads' outcomes, while hosting too. A file worker's makes
+    // no frame of its own: what it changes asks for one (guifsdone)
     {
         Mail m = mailtake(g->tasks);
         for (Record r = mailnext(&m); r.ok; r = mailnext(&m)) {
+            if (r.type == TASK_FS) {
+                if (g->fs) {
+                    fsdone(g->fs, r, g->fsmem);
+                }
+                continue;
+            }
             ontask(g, r);
             other = 1;
         }
@@ -12456,6 +12824,7 @@ static void drainmail(Gui *g, i64 now)
             schedat(s, g->lastjobs+JOBS_PERIOD, DUE_STREAM);
         }
     }
+    guifstick(g);  // the file workers' next deadline, if any
 }
 
 // The wake flag was cleared: drain the mail, timed, since its work
@@ -12735,6 +13104,13 @@ static void saveini(Gui *g, b32 last)
 //   Opened=a
 //   [Prospero][Help]
 //   Page=plan
+//   [Prospero][Files]
+//   Wrap=0
+//   Root=here,u1763100000000,s20261114-101500-ab12
+//   Tab=m,o0,t202,y0.51,p/home/me/src/notes.md
+//   Tab=*,u,o1,t1499,b1500-1504,p/home/me/src/main.c
+//   Root=remote,u1763100000000,s20261114-102000-cd34,hbox
+//   Tab=*,r,o0,p/srv/app/README
 //   [Prospero][Layout Review]
 //   Shown=Sessions,Transcript,Prompt
 //   Split=X,0.22
@@ -12748,7 +13124,13 @@ static void saveini(Gui *g, b32 last)
 // sidebar keeps its groups' order, empty ones included, and each fold
 // the user chose by its key (sidebar.cpp), folded or opened, and its
 // order, written only when not the default, recent activity. Help keeps
-// its topic by name (help.cpp), an unknown one the first. Each layout
+// its topic by name (help.cpp), an unknown one the first. Files keeps
+// each root's tabs (fileset.cpp's filekeepline): a Root line, the
+// window's own (none), a session's here, or a remote's by sid and its
+// host's name, when last known alive, then its tabs in the bar's order,
+// each its flags, opened rank, place (in ems) and band, its path last,
+// %-escaped; a line that cannot be read is dropped and counted, the
+// rest kept, and Wrap is Wrap's last choice when off. Each layout
 // the user saved has a section, in the order saved (dock.cpp); one
 // that cannot be read, or named as one before it, is dropped (iniapply).
 
@@ -12767,6 +13149,9 @@ static void *iniopen(ImGuiContext *, ImGuiSettingsHandler *h, char const *name)
         g->layouts    = push(&g->perm, g->layouts, l);
         g->readlayout = &g->layouts[g->layouts.len-1];  // until the next push
         return (void *)5;
+    } else if (n == "Files") {
+        g->fkeep.at = 0;  // its lines to no record yet
+        return (void *)6;
     }
     return n=="Panes"   ? (void *)1 : n=="Window" ? (void *)2 :
            n=="Sidebar" ? (void *)3 : n=="Help"   ? (void *)4 : 0;
@@ -12780,6 +13165,11 @@ static void iniline(ImGuiContext *, ImGuiSettingsHandler *h, void *entry, char c
         return;
     } else if (entry == (void *)5) {
         dockline(g->readlayout, kv.head, kv.tail);
+        return;
+    } else if (entry == (void *)6) {
+        if (!filekeepline(&g->fkeep, &g->perm, kv.head, kv.tail)) {
+            g->fkeep.bad++;
+        }
         return;
     }
     Int v = parseint(kv.tail);
@@ -12879,7 +13269,11 @@ static void iniwrite(ImGuiContext *, ImGuiSettingsHandler *h, ImGuiTextBuffer *o
         Str page = helpnames[g->helppage];
         out->appendf("[Prospero][Help]\nPage=%.*s\n\n", (int)page.len, page.cdata);
     }
-    Arena a = g->frame;
+    Arena a  = g->frame;
+    Str   fk = filekeepsection(g, &a);
+    if (fk.len) {  // a null end would be taken for a C string's
+        out->append((char *)fk.data, (char *)fk.data + fk.len);
+    }
     for (iz i = 0; i < g->layouts.len; i++) {
         DockLayout *l = &g->layouts[i];
         Buf         b(&a, 1024);
@@ -12893,7 +13287,7 @@ static void iniwrite(ImGuiContext *, ImGuiSettingsHandler *h, ImGuiTextBuffer *o
 }
 
 // After the layout file is read: the saved layouts that can be had, the
-// first of each name.
+// first of each name, and the Files tabs kept.
 static void iniapply(ImGuiContext *, ImGuiSettingsHandler *h)
 {
     Gui *g = (Gui *)h->UserData;
@@ -12921,6 +13315,21 @@ static void iniapply(ImGuiContext *, ImGuiSettingsHandler *h)
     }
     g->layouts.len = n;
     g->readlayout  = 0;
+
+    // The Files tabs kept, each record waiting for its root
+    filekeepdone(&g->fkeep);
+    if (g->fkeep.nowrap) {
+        g->filewrap = 0;
+    }
+    if (g->fkeep.bad) {
+        Arena a = g->frame;
+        Buf   b(&a, 128);
+        print(&b, "the layout file's Files lines: ");
+        print(&b, (i64)g->fkeep.bad);
+        print(&b, g->fkeep.bad==1 ? Str(" could not be read, and is dropped")
+                                  : Str(" could not be read, and are dropped"));
+        guilog(g, finish(&b));
+    }
 }
 
 // Read and write the window's settings with the layout file's.
@@ -13154,6 +13563,7 @@ static void gui_frame(Gui *g)
     }
     cachereset(g->vcache, 0);
     filesframe(g);
+    guifstick(g);  // its deadline consumed by schedbegin
     if (g->held && s->now>=g->holduntil) {
         gui_wake(g);  // the hold is over: take what piled up
     }
@@ -13196,13 +13606,22 @@ static void gui_frame(Gui *g)
         // The backend reads the real mouse when the window has focus and
         // the mouse is elsewhere: the script's mouse is the one
         io.AddMousePosEvent(g->drivex, g->drivey);
+    } else if (g->drag.on && !g->drive) {
+        // The backend reads the real mouse, as SDL's does when the window
+        // is key and its own pointer is elsewhere (a drag from a window
+        // behind): nothing is hovered under the drag, and no tooltip
+        // waits out its delay there
+        io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
     }
     uishiftpaste(g);
     ImGui::NewFrame();
     droproute(g);  // what was where, as NewFrame knows, before any is drawn
+    dragwhere(g);  // likewise, where a drag would go
     i64 t1 = os_ticks(g->os);
     dockwindows(g);
-    codelinksflush(g);  // what inline code drawn asks of other hosts
+    drawdragover(g);  // over all of it, its places drawn now (dragplace)
+    codelinksflush(g);  // what inline code drawn asks, here and of other hosts
+    guifstick(g);       // and the deadlines of jobs put while drawing
     i64 t2 = os_ticks(g->os);
     ImGui::Render();
     i64 t3 = os_ticks(g->os);
@@ -13702,6 +14121,8 @@ enum : i32 {
     OP_IDLE,      // log frames since the last OP_MARK
     OP_MARK,
     OP_SELCODE,   // select the first code block in the transcript
+    OP_SELRUN,    // aim at the latest message's first block the Run
+                  // button runs (coderun), without selecting it
     OP_MODALSIZE, // Win32: a modal resize loop, dx steps wider
     OP_DPI,       // Win32: a DPI change to dx
     OP_STREAM,    // the fake agent streams continuously at dx tok/s
@@ -13750,7 +14171,8 @@ enum : i32 {
                   // Fill), else skip the next op where that is no maximum
     OP_DROP,      // write a dx by dy PNG (or dy lines, .txt; dy pages, .pdf) to
                   // --cwd as text, drop it on the target, or at no point
-                  // with T_NONE (a flat gray JPEG if text ends in .jpg)
+                  // with T_NONE (a flat gray JPEG if text ends in .jpg);
+                  // text may name several, comma-separated, one drop
     OP_CLIPPNG,   // the clipboard's text kept, a dx by dy PNG put there
     OP_CLIPBACK,  // the clipboard's text put back
     OP_CLIPRACE,  // macOS: the window becomes key while another process
@@ -13769,15 +14191,35 @@ enum : i32 {
     OP_NOTIFY,    // [ui] notify is dx (NOTIFY_*), as a setting would
     OP_TOASTMARK, // remember the toasts shown and withdrawn so far
     OP_TOASTCLICK,// click the latest toast, which gives the window focus
-    OP_MENTIONHOLD,// dx 1: the shown session's '@' index begins again and is
-                  // not walked, as a tree too big for one frame is not, so
-                  // the picker lists a folder; dx 0 lets the walk go on
+    OP_MENTIONHOLD,// dx 1: the shown session's '@' index begins again and its
+                  // walk is not put on the window's pool, as a walk still
+                  // going is not done, so the picker lists a folder; dx 0
+                  // puts the walk held
     OP_MENTIONS,  // dx 0 as [ui] mentions = false would, dx 1 as true
     OP_NODIALOG,  // the next file dialog cannot be shown, as without a portal
     OP_OPENFILE,  // open text in Files, as a reference (fileref) in --cwd,
                   // in the session shown
     OP_MDOWN,     // middle button
     OP_MUP,
+    OP_DRAG,      // a drag over the window, as the platform's come: dx 0
+                  // leaves, 1 is over the target (T_NONE: the title bar),
+                  // 2 drops there; it holds the words text (dy 1), else
+                  // the comma-separated files text names in --cwd, a
+                  // folder by a trailing '/', made if missing, a file of
+                  // 3 lines if missing. The platform's answer goes to
+                  // drivedragfx (GEV_DRAG)
+    OP_IFDRAGLOAD,// unless the platform says what a drag holds before its
+                  // drop (no GUI_NODRAGLOAD), skip dx ops
+    OP_IFFARMG,   // unless the remote host's login shell has gui.py's fake
+                  // mg as $VISUAL (PROSPERO_TEST_FARMG), skip dx ops
+    OP_IFFSSTALL, // unless file work stalls paths for the checklist, here
+                  // and on the remote host (PROSPERO_TEST_FSSTALL), skip
+                  // dx ops
+    OP_NOSESS,    // show no session: the empty view, whose Files tabs are
+                  // the window's own
+    OP_SHOWFILES, // Files in front, as opening a file puts it
+    OP_FILESROOT, // show the first session on the remote text whose Files
+                  // tabs are not empty, Files in front; none fails
     OP_VIEWERSET, // the shown remote's viewer: empty, invalid, valid, or a
                   // template (a checklist override, not a configuration edit)
 };
@@ -13858,6 +14300,7 @@ enum : i32 {
     T_RAIL,        // the latest fold rail drawn
     T_CODEBLOCK,   // the code block selectcode chose, as drawn
     T_CODECOPY,    // and its Copy button
+    T_CODERUN,     // and its Run button
     T_SHELLBTN,    // the session bar's toggles
     T_TOOLSBTN,
     T_THINKBTN,
@@ -14034,6 +14477,7 @@ enum : i32 {
     CHK_THINKSTAYS,
     CHK_THINKREFOLD,
     CHK_COPYBTN,
+    CHK_RUNBTN,       // the aimed code block's Run button shows, enabled
     CHK_CODECOPIED,
     CHK_COPYQUIET,
     CHK_REFLOW,
@@ -14135,7 +14579,8 @@ enum : i32 {
     CHK_PLANEDITED,   // the plan's ask shows the file as edited, with text
     CHK_PLANREVEAL,   // Reveal showed the plan file, once
     CHK_TERMRAN,      // dx terminals opened, the latest's launch with text,
-                      // with dy in its shell's environment (shell.env)
+                      // with dy in its shell's environment (shell.env);
+                      // text POSIX|WINDOWS is the half for the session's host
     CHK_PLANPLAIN,    // the plan is out in the editor, no plan waiting
     CHK_PLANQUIET,    // the session is idle, asking nothing
     CHK_PLANREVISED,  // the agent heard the plan approved was revised by hand
@@ -14281,7 +14726,8 @@ enum : i32 {
                       // with dx 1, they do not have text
     CHK_FILEASKERR,   // Open file is up, saying text
     CHK_FILESHOWN,    // Files is hidden (dx 0), shown (1), or shown central (2)
-    CHK_FILEBODIES,   // the bodies fit the budget, dx files read at least
+    CHK_FILEBODIES,   // the bodies fit the budget, dx files read at least,
+                      // and dy at most if dy > 0
     CHK_FILEQUIET,    // no frames while idle, a file shown
     CHK_LINKTIP,      // the last link's tooltip was text, or began so (dx 1)
     CHK_FILEPATH,     // the front file's path ends with text ('/' either way)
@@ -14293,7 +14739,9 @@ enum : i32 {
                       // this computer, and dx 1 read there (fs.read); or
                       // dx 2 Open file's path is, checked there (fs.stat)
     CHK_EDITJUMP,     // Open in editor ran dx times, the latest's command
-                      // with text in it ('/' either way, '"' as '\'')
+                      // with text in it ('/' either way, '"' as '\'');
+                      // dy 1: its program is text (on Windows a quoted
+                      // full path whose name, less its extension, is text)
     CHK_EDITWHY,      // the Files toolbar's Open in editor is disabled,
                       // saying text
     CHK_REVEALED,     // the file shown in the file manager ends with text
@@ -14313,6 +14761,20 @@ enum : i32 {
                       // the bar, with text "hit" the current match's start,
                       // and "carry" a hit also drawn carried into a chunk
     CHK_CONTINUED,    // a turn began by Continue, with its note, not paused
+    CHK_DRAGTO,       // text "off": no drag; else "TO[|LABEL[|DETAIL]]", a
+                      // drag drawn going to TO (droptoname), its label and
+                      // its detail's start as said where the platform
+                      // says what it holds, or with dx 4 anywhere (words
+                      // that need no count, attachwhy's), and refused
+                      // (dx 1) or not there; dx 2: its place outlined is
+                      // New session's folder field (RECT_NEWCWD)
+    CHK_DRAGQUIET,    // no frames since the mark with a drag resting over
+                      // the window (dx 0), or after it ended (dx 1)
+    CHK_FILEFOCUS,    // the Files pane has the focus
+    CHK_TERMBANNER,   // the front terminal tab's banner begins with text
+    CHK_EDITROUTE,    // the Files toolbar's Open in editor would open a
+                      // Terminal tab (dx 1) or a window (dx 0), its
+                      // tooltip holding text
     CHK_COUNT,
 };
 
@@ -14424,6 +14886,7 @@ static Str chknames[] = {
     "open: the committed reasoning stays open",
     "fold again: reasoning folded, but for what the user opened",
     "a code block shows its Copy button while the mouse is over it",
+    "a shell's code block shows its Run button, enabled, while the mouse is over it",
     "its Copy put its code on the clipboard byte for byte, and said so",
     "Copied went back to Copy on its deadline, and little else drew",
     "a new width kept the line at the top edge there",
@@ -14636,6 +15099,11 @@ static Str chknames[] = {
     "the Files find bar is as said",
     "the spot in the file is in view",
     "a turn began by Continue, and nothing is paused",
+    "where a drag would drop, and what its card says",
+    "no frames with a drag resting, or after it",
+    "the Files pane has the focus",
+    "the terminal's banner says what it should",
+    "Open in editor opens a tab or a window, as said",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -14721,6 +15189,7 @@ enum : i32 {
     W_CTR,        // the container runtime, or the first container, is as
                   // text says (ctrwait)
     W_TERM,       // the shown session's terminal shows text
+    W_TERMBANNER, // the front terminal tab ended or failed, its banner up
     W_TERMBUSY,   // its front tab runs a program, or not with "idle"
     W_TERMCOUNT,  // dx terminals are open, in every session
     W_FILEREADY,  // the front file is read and drawn, jumped or restored
@@ -14728,6 +15197,13 @@ enum : i32 {
     W_FILEFOUND,  // the Files find bar drew over the front file, searched
                   // it, and brought the match it went to into view
     W_PAUSED,     // the session shown waits, paused, before a request
+    W_FILEASKED,  // Open file's check answered: closed, or an error
+    W_FSIDLE,     // no file work out: no job on the window's file workers
+                  // (an '@' walk held, never put, is none), no folder
+                  // listing asked, no inline code's batch here or
+                  // elsewhere, and none turned away
+    W_FILESKEPT,  // no Files record of a session on the remote text still
+                  // waits: each attached or dropped (filesrestore)
 };
 
 static Str waitnames[] = {
@@ -14753,10 +15229,12 @@ static Str waitnames[] = {
     "the subagent on far", "the subagent on far shown", "a toast",
     "the changes", "the folder's probe", "the worktree's branch",
     "the thin remote", "a relayed stream", "the thin remote's skill", "the container",
-    "the terminal's text", "the terminal's program", "the terminals' count",
+    "the terminal's text", "the terminal's banner", "the terminal's program", "the terminals' count",
     "the file", "the file checked", "the file's find", "the pause",
+    "Open file's check", "the file work",
+    "Files tabs of the remote attached or dropped",
 };
-static_assert(countof(waitnames) == W_PAUSED+1);
+static_assert(countof(waitnames) == W_FILESKEPT+1);
 
 enum : i32 {
     KEY_CTRL  = 1,
@@ -14832,7 +15310,8 @@ struct DriveOp {
     {op, 0, 0, 0, 100, dir}, \
     {OP_TEXT, 0, 0, 0, 300, missing}, \
     {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""}, \
-    {OP_KEYUP, 0, GKEY_ENTER, 0, 2000, ""}, \
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""}, \
+    {OP_WAIT, W_FILEASKED, 0, 0, 5000, ""}, \
     {OP_CHECK, CHK_FILEASKERR, 0, 0, 0, "No such file"}, \
     {OP_CHECK, CHK_FILEHOST, 2, 0, 0, ""}, \
     {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""}, \
@@ -16543,13 +17022,15 @@ static DriveOp m3ops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 500, ""},
     // The Files pane (gui.py's files in work/files). Open file, with the
-    // pane hidden: Ctrl/Cmd+O, a path Tab completes, a line after it,
-    // and the pane docks, its text jumped to the line, centered
+    // pane hidden: Ctrl/Cmd+O, a path Tab completes once its folder is
+    // listed (on the window's file workers), a line after it, and the
+    // pane docks, its text jumped to the line, centered
     {OP_MAIN, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_FILESHOWN, 0, 0, 0, ""},
     CMDKEY(GKEY_O, 500),
     {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
     {OP_TEXTCWD, 0, 0, 0, 300, "/files/line"},
+    {OP_WAIT, W_FSIDLE, 0, 0, 5000, ""},
     {OP_KEYDOWN, 0, GKEY_TAB, 0, 50, ""},
     {OP_KEYUP, 0, GKEY_TAB, 0, 300, ""},
     {OP_TEXT, 0, 0, 0, 300, ":1200"},
@@ -16739,6 +17220,12 @@ static DriveOp m3ops[] = {
     {OP_CHECK, CHK_FILENOTE, 0, 0, 0, "The file has only 3000 lines."},
     {OP_CHECK, CHK_FILELINE, 3000, 0, 0, ""},
     {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "3000-3000"},
+    // From the bottom, a line too near the top to center: scrolled to
+    // the top, not left where it was
+    {OP_OPENFILE, 0, 0, 0, 300, "files/lines.txt:2"},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "2-2"},
+    {OP_CHECK, CHK_FILELINE, 2, 0, 0, ""},
     // A long line wraps; unwrapped it takes a row, scrolled sideways,
     // the top line kept
     {OP_OPENFILE, 0, 0, 0, 300, "files/long.txt:150"},
@@ -17083,8 +17570,9 @@ static DriveOp m3ops[] = {
     {OP_UP, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_CLIPEND, 0, 0, 0, "/cite/hello.c"},
     // Its Open in editor, at its line ([ui] editor_line a test
-    // script's, only noted under the drive)
-    {OP_IFEDITOR, 0, 8, 0, 0, ""},
+    // script's, only noted under the drive), on Windows by sh's full
+    // path, which cmd.exe does not look for again
+    {OP_IFEDITOR, 0, 9, 0, 0, ""},
     {OP_MOVE, T_NAMED, 0, 0, 300, "link cite/hello.c:12"},
     {OP_RDOWN, 0, 0, 0, 60, ""},
     {OP_RUP, 0, 0, 0, 500, ""},
@@ -17093,6 +17581,7 @@ static DriveOp m3ops[] = {
     {OP_UP, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_EDITJUMP, 1, 0, 0, " +12 '"},
     {OP_CHECK, CHK_EDITJUMP, 1, 0, 0, "/cite/hello.c'"},
+    {OP_CHECK, CHK_EDITJUMP, 1, 1, 0, "sh"},
     {OP_MOVE, T_NAMED, 0, 0, 800, "link mailto:"},
     {OP_CHECK, CHK_TOOLTIP, 0, 0, 0, ""},
     {OP_CHECK, CHK_LINKTIP, 0, 0, 0,
@@ -17135,8 +17624,10 @@ static DriveOp m3ops[] = {
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
     {OP_CHECK, CHK_FILEPATH, 0, 0, 0, "/cite/hello.c"},
-    // Inline code naming a file is a link once the file is found, at
-    // its line; one naming no file is no link, and has no rect
+    // Inline code naming a file is a link once the file is found (on
+    // the window's file workers), at its line; one naming no file is no
+    // link, and has no rect
+    {OP_WAIT, W_FSIDLE, 0, 0, 5000, ""},
     {OP_CHECK, CHK_FILELINK, 1, 0, 0, "cite/hello.c:7"},
     {OP_CHECK, CHK_FILELINK, 0, 0, 0, "cite/nothere.c:2"},
     // ... and through a symlink below the folder, out of it or not,
@@ -17191,7 +17682,8 @@ static DriveOp m3ops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_CHECK, CHK_REVEALED, 0, 0, 0, "/files/lines.txt"},
-    {OP_IFEDITOR, 0, 5, 0, 0, ""},
+    {OP_IFEDITOR, 0, 6, 0, 0, ""},
+    {OP_CHECK, CHK_EDITROUTE, 0, 0, 0, "Open the file in your editor: "},
     {OP_MOVE, T_NAMED, 0, 0, 300, "file editor"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
@@ -17270,6 +17762,36 @@ static DriveOp m3ops[] = {
     {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
     {OP_CHECK, CHK_FILENOTE, 0, 0, 0, "Not an image it can show: "},
     {OP_SHOT, 0, 0, 0, 300, "files-badimage"},
+    // A file here on a file system that stops responding (a test hook
+    // stalls its path on the window's file workers): a slow one says
+    // "Reading..." and opens; a dead one says so once its worker is
+    // stuck, then at once on Retry and in Open file, while other files
+    // still read (fswork.cpp). Open file is closed after, for the drop
+    {OP_IFFSSTALL, 0, 27, 0, 0, ""},
+    {OP_OPENFILE, 0, 0, 0, 800, "files/stallslow.txt"},
+    {OP_CHECK, CHK_FILENOTE, 0, 0, 0, "Reading..."},
+    {OP_WAIT, W_FILEREADY, 0, 0, 8000, ""},
+    {OP_CHECK, CHK_FILETEXT, 0, 0, 0, "slow\n"},
+    {OP_OPENFILE, 0, 0, 0, 300, "files/stalldead.txt"},
+    {OP_WAIT, W_FILEREADY, 0, 0, 12000, ""},
+    {OP_CHECK, CHK_FILENOTE, 0, 0, 0, "The file system is not responding"},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "file retry"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 2000, ""},
+    {OP_CHECK, CHK_FILENOTE, 0, 0, 0, "The file system is not responding"},
+    {OP_OPENFILE, 0, 0, 0, 300, "files/pixels.png"},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILENOTE, 0, 0, 0, ""},
+    CMDKEY(GKEY_O, 500),
+    {OP_TEXTCWD, 0, 0, 0, 300, "/files/stalldead.txt"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_FILEASKED, 0, 0, 2000, ""},
+    {OP_CHECK, CHK_FILEASKERR, 0, 0, 0, "The file system is not responding"},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 500, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
     // A file dropped on the pane opens in a tab, attached to nothing;
     // dropped while Open file is up, it fills the field, a line typed
     // after it
@@ -17290,6 +17812,25 @@ static DriveOp m3ops[] = {
     {OP_CHECK, CHK_FILEPATH, 0, 0, 0, "/files/dropped2.txt"},
     {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "4-4"},
     {OP_CHECK, CHK_ATTACHED, 0, 0, 0, ""},
+    // Files dropped together on the pane open together, the last in
+    // front; one dropped at no point (a title bar) while Open file is up
+    // fills its field, as one dropped on the window does
+    {OP_DROP, T_FILESPANE, 0, 5, 800, "files/both1.txt,files/both2.txt"},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEPATH, 0, 0, 0, "/files/both2.txt"},
+    {OP_CHECK, CHK_ATTACHED, 0, 0, 0, ""},
+    CMDKEY(GKEY_O, 500),
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_DROP, T_NONE, 0, 5, 800, "files/both1.txt"},
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 300, ":2"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_FILEPATH, 0, 0, 0, "/files/both1.txt"},
+    {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "2-2"},
+    {OP_CHECK, CHK_ATTACHED, 0, 0, 0, ""},
     // Quiet with a file shown, its find bar open, its field let go, past
     // the tooltips and the layout's save
     {OP_MOVE, T_FILETEXT, 0, 0, 100, "1"},
@@ -17303,9 +17844,80 @@ static DriveOp m3ops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_CHECK, CHK_FILEFIND, 2, 0, 0, ""},
-    {OP_MOVE, T_EMPTY, 0, 0, 4500, ""},
+    // 6 s: the last file opened saves the layout up to 5 s later
+    {OP_MOVE, T_EMPTY, 0, 0, 6000, ""},
     {OP_MARK, 0, 0, 0, 3000, ""},
     {OP_CHECK, CHK_FILEQUIET, 0, 0, 0, ""},
+    // Files dragged over the window: over Files, the pane outlined with a
+    // card saying they would open there, resting with no frames; over the
+    // prompt, and over the title bar, to be attached; and gone, the card
+    // with them, still no frames. Counts only where the platform says
+    // what a drag holds
+    {OP_DRAG, T_FILESPANE, 1, 0, 600, "files/drag1.txt,files/drag2.txt"},
+    {OP_CHECK, CHK_DRAGTO, 0, 0, 0, "files|Open 2 in Files|to read, not attached"},
+    {OP_SHOT, 0, 0, 0, 300, "files-dragover"},
+    {OP_MARK, 0, 0, 0, 3000, ""},
+    {OP_CHECK, CHK_DRAGQUIET, 0, 0, 0, ""},
+    {OP_DRAG, T_PROMPT, 1, 0, 600, "files/drag1.txt,files/drag2.txt"},
+    {OP_CHECK, CHK_DRAGTO, 0, 0, 0, "attach|Attach 2|to the next message"},
+    {OP_SHOT, 0, 0, 0, 300, "files-dragattach"},
+    {OP_DRAG, T_NONE, 1, 0, 600, "files/drag1.txt,files/drag2.txt"},
+    {OP_CHECK, CHK_DRAGTO, 0, 0, 0, "attach"},
+    {OP_DRAG, 0, 0, 0, 600, ""},
+    {OP_CHECK, CHK_DRAGTO, 0, 0, 0, "off"},
+    // past the hover the drag's points left behind, as CHK_FILEQUIET
+    {OP_MOVE, T_EMPTY, 0, 0, 4500, ""},
+    {OP_MARK, 0, 0, 0, 3000, ""},
+    {OP_CHECK, CHK_DRAGQUIET, 1, 0, 0, ""},
+    // With Open file up, its field, which a drop fills with the first;
+    // and a drag that ends unsaid ends with the pointer's next move
+    CMDKEY(GKEY_O, 500),
+    {OP_DRAG, T_FILESPANE, 1, 0, 600, "files/drag1.txt,files/drag2.txt"},
+    {OP_CHECK, CHK_DRAGTO, 0, 0, 0, "field|Fill in the path|the first of 2 files only"},
+    {OP_SHOT, 0, 0, 0, 300, "files-dragfield"},
+    {OP_DRAG, T_FILESPANE, 2, 0, 800, "files/drag1.txt,files/drag2.txt"},
+    {OP_CHECK, CHK_DRAGTO, 0, 0, 0, "off"},
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 300, ":2"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_FILEPATH, 0, 0, 0, "/files/drag1.txt"},
+    {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "2-2"},
+    {OP_CHECK, CHK_ATTACHED, 0, 0, 0, ""},
+    {OP_DRAG, T_FILESPANE, 1, 0, 600, "files/drag1.txt"},
+    {OP_MOVE, T_EMPTY, 0, 0, 600, ""},
+    {OP_CHECK, CHK_DRAGTO, 0, 0, 0, "off"},
+    {OP_DRAG, 0, 0, 0, 300, ""},
+    // Where the platform says what a drag holds: text, refused; a folder,
+    // to New session, its folder field outlined once that is up; and a
+    // folder with a file, each its own way
+    {OP_IFDRAGLOAD, 0, 23, 0, 0, ""},
+    {OP_DRAG, T_PROMPT, 1, 1, 600, "Some dragged words"},
+    {OP_CHECK, CHK_DRAGTO, 1, 0, 0, "none|Only files can be dropped here"},
+    {OP_SHOT, 0, 0, 0, 300, "files-dragtext"},
+    {OP_DRAG, 0, 0, 0, 300, ""},
+    {OP_DRAG, T_FILESPANE, 1, 0, 600, "files/dragdir/"},
+    {OP_CHECK, CHK_DRAGTO, 0, 0, 0, "newsession|New session|in the folder dropped"},
+    {OP_DRAG, 0, 0, 0, 300, ""},
+    {OP_DRAG, T_FILESPANE, 1, 0, 600, "files/drag1.txt,files/dragdir/"},
+    {OP_CHECK, CHK_DRAGTO, 0, 0, 0,
+     "files|Open in Files|to read, not attached, and New session for the folder"},
+    {OP_DRAG, 0, 0, 0, 300, ""},
+    {OP_MOVE, T_SESSMENU, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NEWBTN, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_DRAG, T_NEWCWD, 1, 0, 600, "files/dragdir/"},
+    {OP_CHECK, CHK_DRAGTO, 2, 0, 0, "newsession|New session|in the folder dropped"},
+    {OP_DRAG, 0, 0, 0, 300, ""},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 500, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
     // Closing with a turn running asks first; Cancel goes back, and
     // stopping quits
     {OP_PROMPT, 0, 0, 0, 100, "Close me: run a very slow command."},
@@ -18937,7 +19549,7 @@ static DriveOp remoteops[] = {
     {OP_MOVE, T_NAMED, 0, 0, 100, "Open in external terminal"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
-    {OP_CHECK, CHK_TERMRAN, 1, 0, 0, "ssh -t -- here cd "},
+    {OP_CHECK, CHK_TERMRAN, 1, 0, 0, "ssh -t -- here cd |ssh -t -- here cmd /k cd /d "},
     {OP_SHOT, 0, 0, 0, 300, "remote-terminal"},
     // Its model picker lists the models of the host's own configuration
     {OP_MOVE, T_NAMED, 0, 0, 100, "model picker"},
@@ -19054,11 +19666,29 @@ static DriveOp remoteops[] = {
     // refused; a link to a file there, and to one not there
     REMOTEFILES(OP_TEXTRCWD, "", "/hello.txt", "/nope.txt"),
     {OP_SHOT, 0, 0, 0, 300, "remote-files"},
+    {OP_VIEWERSET, 0, 0, 0, 300, ""}, // unset: native Terminal-tab fallback
+    // Open in editor there: a Terminal tab of its session, where its
+    // engine runs the editor its login shell's $VISUAL names (gui.py's
+    // fake mg, which far's own .profile sets, here only); once it saves
+    // and exits, Files has the file, read again there, with the focus
+    {OP_IFFARMG, 0, 14, 0, 0, ""},
+    {OP_CHECK, CHK_EDITROUTE, 1, 0, 0, "in a Terminal tab on r (here), in the editor $VISUAL or $EDITOR names there"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file editor"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_WAIT, W_TERM, 0, 0, 15000, "fake mg [+1]"},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*mg hello.txt"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 100, "w hello by mg"},
+    TERMKEY(GKEY_ENTER, 300),
+    {OP_WAIT, W_TERMCOUNT, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_FILEFOCUS, 0, 0, 0, ""},
+    {OP_WAIT, W_FILEFRESH, 0, 0, 20000, ""},
+    {OP_CHECK, CHK_FILETEXT, 0, 0, 0, "hello by mg"},
+
     // Its configured viewer gets the path there, not [ui] editor or a local
     // mapping. Unset and malformed ones say why; a valid one has its argv
     // noted, never launched, with no blocking editor or plan state of ours.
-    {OP_CHECK, CHK_EDITWHY, 0, 0, 0,
-     "No viewer: set viewer in this window's [remote r] section to a local command using {path}"},
     {OP_VIEWERSET, 0, 0, 0, 300, "invalid"},
     {OP_CHECK, CHK_EDITWHY, 0, 0, 0,
      "[remote r] viewer: cannot parse the viewer command: a single quote is not closed"},
@@ -19075,6 +19705,7 @@ static DriveOp remoteops[] = {
     {OP_CHECK, CHK_NOTEDITING, 0, 0, 0, ""},
     // Inline code naming the file there: a link once fs.stat there
     // found it
+    {OP_WAIT, W_FSIDLE, 0, 0, 5000, ""},
     {OP_CHECK, CHK_FILELINK, 1, 0, 0, "hello.txt"},
     {OP_MOVE, T_NAMED, 0, 0, 800, "codelink hello.txt"},
     {OP_CHECK, CHK_LINKTIP, 1, 0, 0, "Files \xe2\x86\x92 hello.txt, on "},
@@ -19085,6 +19716,43 @@ static DriveOp remoteops[] = {
     {OP_WAIT, W_FILEFRESH, 0, 0, 20000, ""},
     {OP_CHECK, CHK_FILETEXT, 0, 0, 0, "hullo "},
     {OP_CHECK, CHK_FILEHOST, 1, 0, 0, ""},
+    // A file there on a file system that stops responding (a test hook
+    // stalls its path there): Open file says so once its worker is
+    // stuck, then at once; a slow one opens all the same, and nothing
+    // else waited on either (fswork.cpp)
+    {OP_IFFSSTALL, 0, 41, 0, 0, ""},
+    CMDKEY(GKEY_O, 800),
+    {OP_TEXTRCWD, 0, 0, 0, 100, ""},
+    {OP_TEXT, 0, 0, 0, 300, "/stalldead.txt"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_FILEASKED, 0, 0, 12000, ""},
+    {OP_CHECK, CHK_FILEASKERR, 0, 0, 0, "The file system is not responding"},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 500, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    CMDKEY(GKEY_O, 800),
+    {OP_TEXTRCWD, 0, 0, 0, 100, ""},
+    {OP_TEXT, 0, 0, 0, 300, "/stalldead.txt"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_FILEASKED, 0, 0, 2000, ""},
+    {OP_CHECK, CHK_FILEASKERR, 0, 0, 0, "The file system is not responding"},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 500, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    CMDKEY(GKEY_O, 800),
+    {OP_TEXTRCWD, 0, 0, 0, 100, ""},
+    {OP_TEXT, 0, 0, 0, 300, "/stallslow.txt"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_FILEASKED, 0, 0, 8000, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 8000, ""},
+    {OP_CHECK, CHK_FILETEXT, 0, 0, 0, "slow\n"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file tab 3"},
+    {OP_MDOWN, 0, 0, 0, 60, ""},
+    {OP_MUP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_FILETABS, 0, 0, 0, "hello.txt|*nope.txt"},
     // An image file there, read there whole, in parts
     CMDKEY(GKEY_O, 800),
     {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
@@ -19172,6 +19840,46 @@ static DriveOp remoteops[] = {
     {OP_CHECK, CHK_NOSTALE, 0, 0, 0, ""},
     {OP_SYSTHEME, 0, -1, 0, 300, ""},
     {OP_CLIPOWN, 0, 1, 0, 0, ""},
+    {OP_SUMMARY, 0, 0, 0, 0, ""},
+    {OP_QUIT, 0, 0, 0, 0, ""},
+};
+
+// After a restart (--remote-again): the Files tabs of the session made
+// on r wait in the layout file, written back as read, until r is
+// connected again and lists it; then they are back as left, the front
+// image and hello.txt read there, and written as a live root once r is
+// closed again.
+static DriveOp remote2ops[] = {
+    {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
+    {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_SIDEINI, 0, 0, 0, ",hr\nTab="},
+    {OP_CHECK, CHK_SIDEINI, 0, 0, 0, "pixels.png\n"},
+    // Connected from the sidebar, whose place the restored layout keeps
+    // (the Hosts tab's moves as the tabs beside it are drawn)
+    {OP_MOVE, T_NAMED, 0, 0, 300, "connect r"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_NAMEDUP, 0, 0, 90000, "r"},
+    {OP_WAIT, W_FILESKEPT, 0, 0, 30000, "r"},
+    {OP_FILESROOT, 0, 0, 0, 300, "r"},
+    {OP_WAIT, W_OPENED, 0, 0, 30000, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 20000, ""},
+    {OP_CHECK, CHK_FILETABS, 0, 0, 0, "hello.txt|nope.txt|*pixels.png"},
+    {OP_CHECK, CHK_FILEHOST, 1, 0, 0, ""},
+    {OP_CHECK, CHK_FILEIMAGE, 40, 30, 0, "fit"},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "file tab 1"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 20000, ""},
+    {OP_CHECK, CHK_FILETEXT, 0, 0, 0, "hullo "},
+    {OP_CHECK, CHK_FILEHOST, 1, 0, 0, ""},
+    {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "1-1"},
+    {OP_SHOT, 0, 0, 0, 300, "remote-files-restored"},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "connect r"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_NAMEDCLOSED, 0, 0, 15000, "r"},
+    {OP_CHECK, CHK_SIDEINI, 0, 0, 0, ",hr\nTab="},  // live, its host down
     {OP_SUMMARY, 0, 0, 0, 0, ""},
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
@@ -19389,6 +20097,21 @@ static DriveOp ctrops[] = {
     {OP_UP, 0, 0, 0, 300, ""},
     REMOTEFILES(OP_TEXT, "/work", "/hello.txt", "/nope.txt"),
     {OP_SHOT, 0, 0, 0, 300, "containers-files"},
+    // Open in editor on its file, only in the container: a Terminal tab
+    // there runs its own editor, with no editor set for it, busybox's
+    // vi, which quits with 0, and Files has the focus again
+    {OP_CHECK, CHK_EDITROUTE, 1, 0, 0, ", in the editor $VISUAL or $EDITOR names there, else vi"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file editor"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_WAIT, W_TERM, 0, 0, 20000, "hello world"},
+    {OP_CHECK, CHK_TERMCOUNT, 2, 0, 0, ""},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "containers-editor"},
+    {OP_TEXT, 0, 0, 0, 100, ":q"},
+    TERMKEY(GKEY_ENTER, 300),
+    {OP_WAIT, W_TERMCOUNT, 1, 0, 10000, ""},
+    {OP_CHECK, CHK_FILEFOCUS, 0, 0, 0, ""},
     {OP_MOVE, T_SESSTITLE, 0, 0, 100, ""},  // untitled, the only one
     {OP_RDOWN, 0, 0, 0, 60, ""},
     {OP_RUP, 0, 0, 0, 500, ""},
@@ -20437,6 +21160,137 @@ static DriveOp termops[] = {
     {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
     CTRLKEY(GKEY_C, 300),
     {OP_WAIT, W_TERMBUSY, 0, 0, 5000, "idle"},
+    // Open in editor, [ui] editor a terminal editor (gui.py's fake mg,
+    // which prints its arguments, then takes 'w TEXT' or 'q N'): a
+    // Terminal tab of the file's session runs it, named by it, with the
+    // keyboard, and draws nothing while it waits. The keyboard is first
+    // taken from the terminal, whose Ctrl+O is the shell's on Linux and
+    // Windows.
+    {OP_MOVE, T_TRANSCRIPT, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    CMDKEY(GKEY_O, 500),
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 300, "edit.txt:12"},
+    TERMKEY(GKEY_ENTER, 300),
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_EDITROUTE, 1, 0, 0, "in mg, in a Terminal tab"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file editor"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_WAIT, W_TERM, 0, 0, 10000, "fake mg [+12]"},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, TERMSH "|*mg edit.txt"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMCOUNT, 3, 0, 0, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 4500, ""},
+    {OP_MARK, 0, 0, 0, 3000, ""},
+    {OP_CHECK, CHK_TERMQUIET, 0, 0, 0, ""},
+    // Again from Files, in front of the Terminal pane in their shared
+    // node: its tab is shown, not another opened
+    {OP_MOVE, T_TRANSCRIPT, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    CMDKEY(GKEY_O, 500),
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 300, "edit.txt"},
+    TERMKEY(GKEY_ENTER, 300),
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_EDITROUTE, 1, 0, 0, "Show its Terminal tab, where mg has it open"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file editor"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMCOUNT, 3, 0, 0, ""},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, TERMSH "|*mg edit.txt"},
+    // Saved, the editor exits: its tab closes, and Files has the file,
+    // read again, with the focus
+    {OP_TEXT, 0, 0, 0, 100, "w edited by mg"},
+    TERMKEY(GKEY_ENTER, 300),
+    {OP_WAIT, W_TERMCOUNT, 2, 0, 5000, ""},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*" TERMSH},
+    {OP_CHECK, CHK_FILEFOCUS, 0, 0, 0, ""},
+    {OP_WAIT, W_FILEFRESH, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILETEXT, 0, 0, 0, "edited by mg"},
+    // A failing exit leaves its banner, naming it, and Enter (Restart)
+    // runs it again; quitting asks, counting it, and a clean exit closes
+    // it
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file editor"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_WAIT, W_TERM, 0, 0, 10000, "fake mg ["},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 100, "q 3"},
+    TERMKEY(GKEY_ENTER, 1000),
+    {OP_CHECK, CHK_TERMBANNER, 0, 0, 0, "mg exited with code 3"},
+    {OP_SHOT, 0, 0, 0, 300, "terminal-editor"},
+    TERMKEY(GKEY_ENTER, 500),
+    {OP_WAIT, W_TERM, 0, 0, 10000, "fake mg ["},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, TERMSH "|*mg edit.txt"},
+    {OP_CLOSE, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_CLOSEMODAL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMCLOSE, 1, 0, 0, ""},
+    {OP_MOVE, T_CLOSECANCEL, 0, 0, 200, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    CTRLKEY(GKEY_GRAVE, 500),  // the dialog took the keyboard
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 100, "q 0"},
+    TERMKEY(GKEY_ENTER, 300),
+    {OP_WAIT, W_TERMCOUNT, 2, 0, 5000, ""},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*" TERMSH},
+    {OP_CHECK, CHK_FILEFOCUS, 0, 0, 0, ""},
+    // The Run button on a block of the agent's tagged with its shell
+    // (the fake provider's: sh, or powershell on Windows), shown while
+    // the mouse is over it: a Terminal tab runs it, labeled by its first
+    // line, with the keyboard; its exit, 3, leaves a banner whose Enter
+    // does nothing for a moment, then runs it again in the same tab;
+    // the button runs it again too, in that tab; the agent hears how it
+    // ended at its next request; the banner's Close closes it
+    {OP_PROMPT, 0, 0, 0, 0, "Give me commands to run."},
+    {OP_WAIT, W_SAID, 0, 0, 20000, "Run this:"},
+    {OP_SELRUN, 0, 0, 0, 0, ""},
+    {OP_SHOWCODE, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_CODEBLOCK, 0, 0, 400, ""},
+    {OP_CHECK, CHK_RUNBTN, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "terminal-runbutton"},
+    {OP_MOVE, T_CODERUN, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_TERM, 0, 0, 20000, "run-1"},
+    {OP_WAIT, W_TERMBANNER, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMCOUNT, 3, 0, 0, ""},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, TERMSH "|*echo run-start..."},
+    TERMKEY(GKEY_ENTER, 300),  // too soon: ignored
+    {OP_CHECK, CHK_TERMBANNER, 0, 0, 1200, "`echo run-start...` exited with code 3"},
+    {OP_SHOT, 0, 0, 0, 300, "terminal-run"},
+    // Under the banner the wheel still scrolls its output (a notch may
+    // be lost to XWayland, so only back at all)
+    {OP_MOVE, T_TERMGRID, 0, 0, 100, ""},
+    {OP_WHEEL, 0, 0, 1, 50, ""},
+    {OP_WHEEL, 0, 0, 1, 300, ""},
+    {OP_CHECK, CHK_TERMVIEW, 1, 0, 0, ""},
+    TERMKEY(GKEY_ENTER, 300),
+    {OP_WAIT, W_TERM, 0, 0, 20000, "run-2"},
+    {OP_WAIT, W_TERMBANNER, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_TERMCOUNT, 3, 0, 0, ""},
+    {OP_SHOWCODE, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_CODEBLOCK, 0, 0, 400, ""},
+    {OP_MOVE, T_CODERUN, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_TERM, 0, 0, 20000, "run-3"},
+    {OP_WAIT, W_TERMBANNER, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_TERMCOUNT, 3, 0, 0, ""},
+    {OP_PROMPT, 0, 0, 0, 0, "Tell me how it ran."},
+    {OP_WAIT, W_SAID, 0, 0, 20000, "Heard: exited with code 3"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "term banner close"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_TERMCOUNT, 2, 0, 5000, ""},
     // A session on a remote host (tests/gui.py's fake ssh, --rcwd its
     // folder) has its own tabs there, its shell run by that host's
     // engine: busy comes back through the host, a dropped link shows
@@ -20492,6 +21346,34 @@ static DriveOp termops[] = {
     {OP_WAIT, W_REMOTEUP, 0, 0, 60000, ""},
     {OP_WAIT, W_TERM, 0, 0, 10000, "\nlate\ntty$"},
     {OP_CHECK, CHK_TERMWAIT, 0, 0, 0, ""},
+    // Open in editor on its file: a tab there runs [ui] editor as
+    // written, a host of the same OS family; it exits at once, and Files
+    // has the focus, the shell's tab the front one again
+    {OP_MOVE, T_TRANSCRIPT, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    CMDKEY(GKEY_O, 800),
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_TEXTRCWD, 0, 0, 0, 100, ""},
+    {OP_TEXT, 0, 0, 0, 300, "/hello.txt"},
+    TERMKEY(GKEY_ENTER, 300),
+    {OP_WAIT, W_FILEREADY, 0, 0, 20000, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_EDITROUTE, 1, 0, 0, "Open the file in mg, in a Terminal tab on r"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file editor"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_WAIT, W_TERM, 0, 0, 15000, "fake mg [+1]"},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, TERMSH "|*mg hello.txt"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMCOUNT, 4, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 100, "q 0"},
+    TERMKEY(GKEY_ENTER, 300),
+    {OP_WAIT, W_TERMCOUNT, 3, 0, 10000, ""},
+    {OP_CHECK, CHK_FILEFOCUS, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*" TERMSH},
+    CTRLKEY(GKEY_GRAVE, 500),
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
     {OP_TEXT, 0, 0, 0, 100, "echo $$ >remote.pid; trap 'echo hup >hup-remote.txt; exit' HUP EXIT"},
     TERMKEY(GKEY_ENTER, 100),
     {OP_WAIT, W_TERM, 0, 0, 5000, "EXIT\ntty$"},
@@ -20685,7 +21567,8 @@ static DriveOp launchops[] = {
     // typed in part lists the folders it picks, not dot folders nor
     // files; Tab completes the first; Esc closes the list, not the
     // dialog; Down twice picks the second, which Enter completes; a
-    // click on a row completes it; and Enter then creates the session
+    // click on a row completes it; and Enter then creates the session.
+    // Each folder is listed on the window's file workers, waited for
     {OP_MOVE, T_SESSMENU, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 500, ""},
@@ -20695,6 +21578,7 @@ static DriveOp launchops[] = {
     {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
     // The field has the keyboard, its text all selected, to type over
     {OP_TEXTCWD, 0, 0, 0, 500, "/pick/al"},
+    {OP_WAIT, W_FSIDLE, 0, 0, 5000, ""},
     {OP_CHECK, CHK_PATHPICK, 2, 0, 0, "alpha"},
     {OP_SHOT, 0, 0, 0, 300, "launch-5-pathpick"},
     {OP_KEYDOWN, 0, GKEY_TAB, 0, 50, ""},
@@ -20702,6 +21586,7 @@ static DriveOp launchops[] = {
     {OP_CHECK, CHK_NEWCWD, 0, 0, 0, "/pick/alpha/"},
     {OP_CHECK, CHK_PATHPICK, 0, 0, 0, ""},
     {OP_TEXT, 0, 0, 0, 500, "t"},
+    {OP_WAIT, W_FSIDLE, 0, 0, 5000, ""},
     {OP_CHECK, CHK_PATHPICK, 2, 0, 0, "three"},
     {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
     {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
@@ -20718,6 +21603,7 @@ static DriveOp launchops[] = {
     {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
     // A click on a row accepts it too, the field keeping the keyboard
     {OP_TEXT, 0, 0, 0, 500, "d"},
+    {OP_WAIT, W_FSIDLE, 0, 0, 5000, ""},
     {OP_CHECK, CHK_PATHPICK, 1, 0, 0, "deep"},
     {OP_MOVE, T_NAMED, 0, 0, 100, "path pick"},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -21167,6 +22053,39 @@ static DriveOp composeops[] = {
     {OP_CHECK, CHK_ATTACHED, 0, 0, 0, ""},
     {OP_CHECK, CHK_USERIMAGES, 0, 0, 0, "I see 4 lines, 0 lost."},
     {OP_CHECK, CHK_USERFILES, 0, 0, 0, "Attached: dropped.pdf"},
+    // E4: files dropped together attach together or not at all: three
+    // with room for two attach none, one note saying how many fit, as
+    // one past the message's ten says why
+    {OP_NEWSESSION, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_DROP, T_PROMPT, 0, 2, 800, "m1.txt,m2.txt,m3.txt,m4.txt,m5.txt,m6.txt,m7.txt,m8.txt"},
+    {OP_CHECK, CHK_ATTACHED, 8, 0, 0, ""},
+    // Dragged first, where the platform says how many: refused, the card
+    // saying why
+    {OP_IFDRAGLOAD, 0, 3, 0, 0, ""},
+    {OP_DRAG, T_PROMPT, 1, 0, 600, "m9.txt,m10.txt,m11.txt"},
+    {OP_CHECK, CHK_DRAGTO, 1, 0, 0, "attach|Not attached|Room for 2 more in this message"},
+    {OP_DRAG, 0, 0, 0, 300, ""},
+    {OP_DROP, T_PROMPT, 0, 2, 800, "m9.txt,m10.txt,m11.txt"},
+    {OP_CHECK, CHK_ATTACHED, 8, 0, 0, ""},
+    {OP_CHECK, CHK_NOTE, 0, 0, 0, "not attached: Room for 2 more in this message"},
+    {OP_DROP, T_PROMPT, 0, 2, 800, "m9.txt,m10.txt"},
+    {OP_CHECK, CHK_ATTACHED, 10, 0, 0, ""},
+    // A drag with the message full says why in amber, whatever it holds
+    {OP_DRAG, T_PROMPT, 1, 0, 600, "m11.txt"},
+    {OP_CHECK, CHK_DRAGTO, 5, 0, 0, "attach|Not attached|At most 10 files go in a message"},
+    {OP_SHOT, 0, 0, 0, 300, "compose-dragrefused"},
+    {OP_DRAG, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_DRAGTO, 0, 0, 0, "off"},
+    {OP_DROP, T_PROMPT, 0, 2, 800, "m11.txt"},
+    {OP_CHECK, CHK_ATTACHED, 10, 0, 0, ""},
+    {OP_CHECK, CHK_NOTE, 0, 0, 0, "not attached: At most 10 files go in a message"},
+    CLICK(T_PROMPT, "", 200),
+    {OP_TEXT, 0, 0, 0, 200, "Describe the files."},
+    KEY(GKEY_ENTER, 0, 300),
+    {OP_WAIT, W_TURNS, 1, 0, 10000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 600, ""},
+    {OP_CHECK, CHK_ATTACHED, 0, 0, 0, ""},  // sent: no draft left behind
     // Mentions: '@' at a word's start opens the picker of the session
     // folder's files and folders, which typing narrows, Up/Down pick in,
     // and Tab or a bare Enter insert without sending, a file's text
@@ -21180,6 +22099,7 @@ static DriveOp composeops[] = {
     {OP_TOUCH, 0, 0, 0, 300, "mention-send.txt"},
     CLICK(T_PROMPT, "", 300),
     TYPE1("@"),
+    {OP_WAIT, W_FSIDLE, 0, 0, 5000, ""},  // the walk, on the window's file pool
     {OP_CHECK, CHK_MENTION, 0, 0, 0, ""},  // dx 0: one row or more
     {OP_SHOT, 0, 0, 0, 300, "compose-mention"},
     TYPE1("m"), TYPE1("e"), TYPE1("n"), TYPE1("t"), TYPE1("i"), TYPE1("o"),
@@ -21260,6 +22180,7 @@ static DriveOp composeops[] = {
     // one-folder listing standing in for it would draw just as well
     CLICK(T_PROMPT, "", 300),
     TYPE1("@"),
+    {OP_WAIT, W_FSIDLE, 0, 0, 5000, ""},
     {OP_CHECK, CHK_MENTION, 0, 0, 0, ""},  // dx 0: one row or more
     {OP_CHECK, CHK_MENTIONKIND, 0, 0, 0, "index"},
     // A query that matches nothing leaves the popup up, its one line
@@ -21354,15 +22275,17 @@ static DriveOp composeops[] = {
     // Left as the steps after expect: no text, no attachment
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
     {OP_CHECK, CHK_ATTACHED, 0, 0, 0, ""},
-    // The folder listing that stands in for the index while a tree too big
-    // for one frame is walked, on this machine: the tree above is walked
-    // in the frame that opens the picker, so it never gets here. Held, the
-    // walk stays at its start, and the picker lists the folder; a pick
-    // from it attaches as the index's does, and a folder typed is listed
-    // in its turn
+    // The folder listing that stands in for the index while its walk goes
+    // on, on this machine: the tree above is walked by a worker in a few
+    // milliseconds, so it is seldom seen. Held, the walk is set up but
+    // not put on the window's pool, and the picker lists the folder; a
+    // pick from it attaches as the index's does, and a folder typed is
+    // listed in its turn. Let go, the walk is put, and W_FSIDLE waits
+    // for it
     {OP_MENTIONHOLD, 0, 1, 0, 300, ""},
     CLICK(T_PROMPT, "", 300),
     TYPE1("@"),
+    {OP_WAIT, W_FSIDLE, 0, 0, 5000, ""},  // the folder's listing
     {OP_CHECK, CHK_MENTIONKIND, 0, 0, 0, "list"},
     {OP_CHECK, CHK_MENTION, 0, 0, 0, ""},  // dx 0: one row or more
     TYPE1("m"), TYPE1("e"), TYPE1("n"), TYPE1("t"), TYPE1("i"), TYPE1("o"),
@@ -21374,6 +22297,7 @@ static DriveOp composeops[] = {
     {OP_CHECK, CHK_ATTACHED, 1, 0, 0, ""},
     TYPE1("@"), TYPE1("."), TYPE1("c"), TYPE1("l"), TYPE1("a"), TYPE1("u"),
     TYPE1("d"), TYPE1("e"), TYPE1("/"),
+    {OP_WAIT, W_FSIDLE, 0, 0, 5000, ""},  // .claude's listing
     {OP_CHECK, CHK_MENTIONKIND, 0, 0, 0, "list"},
     {OP_CHECK, CHK_MENTIONSEL, 0, 0, 0, ".claude/skills"},
     {OP_SHOT, 0, 0, 0, 300, "compose-mention-list"},
@@ -21386,6 +22310,7 @@ static DriveOp composeops[] = {
     {OP_CHECK, CHK_ATTACHED, 0, 0, 0, ""},
     {OP_MOVE, T_EMPTY, 0, 0, 600, ""},
     {OP_MENTIONHOLD, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_FSIDLE, 0, 0, 5000, ""},
     // A file whose contents cannot come, a binary one (gui.py writes it):
     // its token goes in with a path-only chip, and a note that typing
     // leaves; the message, with that chip alone, goes as its text, the
@@ -21475,6 +22400,40 @@ static DriveOp composeops[] = {
     {OP_CHECK, CHK_COMPACTED, 0, 0, 0, "keep the API"},
     {OP_CHECK, CHK_WRAPBLANK, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "compose-compacted"},
+    // C's Files tabs, kept in the layout file for the restart: Markdown
+    // at a heading, Markdown turned off there, unwrapped (Wrap's last
+    // choice, then, for new tabs), and banded lines in front; then the
+    // window's own, with no session shown
+    {OP_OPENFILE, 0, 0, 0, 300, "files/guide.md#middle"},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEMODE, FMODE_MARKDOWN, 0, 0, ""},
+    {OP_CHECK, CHK_FILETOP, 203, 0, 0, ""},
+    {OP_OPENFILE, 0, 0, 0, 300, "files/manual.md#middle"},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    CLICK(T_NAMED, "file markdown", 800),
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEMODE, FMODE_TEXT, 0, 0, ""},
+    {OP_CHECK, CHK_FILETOP, 203, 0, 0, ""},
+    {OP_OPENFILE, 0, 0, 0, 300, "files/long.txt:150"},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    CLICK(T_NAMED, "file wrap", 800),
+    {OP_CHECK, CHK_FILEROWS, 100, 1, 0, "hbar"},
+    {OP_OPENFILE, 0, 0, 0, 300, "files/lines.txt:1500-1504"},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILELINE, 1500, 1504, 0, "centered"},
+    {OP_CHECK, CHK_FILETABS, 0, 0, 0, "guide.md|manual.md|long.txt|*lines.txt"},
+    {OP_CHECK, CHK_SIDEINI, 0, 0, 0, "[Prospero][Files]\nWrap=0\n"},
+    {OP_CHECK, CHK_SIDEINI, 0, 0, 0, "Root=here,u"},
+    {OP_CHECK, CHK_SIDEINI, 0, 0, 0, "Tab=m,o0,t"},
+    {OP_CHECK, CHK_SIDEINI, 0, 0, 0, ",b1500-1504,p"},
+    {OP_NOSESS, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_FILETABS, 0, 0, 0, ""},
+    {OP_OPENFILE, 0, 0, 0, 300, "hello.txt"},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILETABS, 0, 0, 0, "*hello.txt"},
+    {OP_CHECK, CHK_SIDEINI, 0, 0, 0, "Root=none,u"},
+    CLICK(T_SESSTITLE, "Answer at length.", 300),
+    {OP_WAIT, W_OPENED, 0, 0, 10000, ""},
     // Quitting keeps a draft typed just before
     CLICK(T_PROMPT, "", 200),
     {OP_TEXT, 0, 0, 0, 100, "Draft for C"},
@@ -21489,11 +22448,44 @@ static DriveOp composeops[] = {
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
 
-// After a restart: each draft back from its engine, as typed.
+// After a restart: the Files tabs back, each read only once shown, as
+// they were (gui.py appended records of a session deleted, of a remote
+// not known here, and a second of the window's own, which the first
+// wins over); and each draft back from its engine, as typed.
 static DriveOp compose2ops[] = {
     {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
     {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
     {OP_CHECK, CHK_MAXIMIZED, 0, 0, 0, ""},
+    {OP_CHECK, CHK_FILESHOWN, 1, 0, 0, ""},
+    {OP_SHOWFILES, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILETABS, 0, 0, 0, "*hello.txt"},
+    {OP_CHECK, CHK_FILEBODIES, 1, 1, 0, ""},  // the one shown, alone
+    CLICK(T_SESSTITLE, "Answer at length.", 300),
+    {OP_WAIT, W_OPENED, 0, 0, 10000, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILETABS, 0, 0, 0, "guide.md|manual.md|long.txt|*lines.txt"},
+    {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "1500-1504"},
+    {OP_CHECK, CHK_FILELINE, 1500, 1504, 0, ""},
+    {OP_CHECK, CHK_FILEBODIES, 2, 2, 0, ""},
+    {OP_CHECK, CHK_NOINI, 0, 0, 0, "s20200101-000000-dead"},  // dropped once listed
+    {OP_CHECK, CHK_SIDEINI, 0, 0, 0, ",hnowhere\n"},  // kept for its host
+    CLICK(T_NAMED, "file tab 1", 300),
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEMODE, FMODE_MARKDOWN, 0, 0, ""},
+    {OP_CHECK, CHK_FILETOP, 203, 0, 0, ""},
+    CLICK(T_NAMED, "file tab 2", 300),
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEMODE, FMODE_TEXT, 0, 0, ""},
+    {OP_CHECK, CHK_FILETOP, 203, 0, 0, ""},
+    CLICK(T_NAMED, "file tab 3", 300),
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEROWS, 100, 1, 0, "hbar"},
+    {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "150-150"},
+    {OP_OPENFILE, 0, 0, 0, 300, "files/wide.txt:150"},  // new tabs unwrapped
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEROWS, 100, 1, 0, "hbar"},
+    {OP_SHOT, 0, 0, 0, 300, "compose-files"},
     {OP_MOVE, T_EMPTY, 0, 0, 1000, ""},
     CLICK(T_SESSTITLE, "Session A", 300),
     {OP_WAIT, W_OPENED, 0, 0, 10000, ""},
@@ -21704,6 +22696,7 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_SIDELINK:      return rectcenter(g->rects[RECT_SIDELINK]);
     case T_CODEBLOCK:     return rectcenter(g->rects[RECT_CODEBLOCK]);
     case T_CODECOPY:      return rectcenter(g->rects[RECT_CODECOPY]);
+    case T_CODERUN:       return rectcenter(g->rects[RECT_CODERUN]);
     case T_SHELLBTN:      return rectcenter(g->rects[RECT_SHELLBTN]);
     case T_TOOLSBTN:      return rectcenter(g->rects[RECT_TOOLSBTN]);
     case T_THINKBTN:      return rectcenter(g->rects[RECT_THINKBTN]);
@@ -22427,11 +23420,22 @@ static i64 drivetermcount(Gui *g)
 }
 
 // The Files pane, for the checklist: the front tab read and drawn, at
-// its cited lines if any, else at its place restored.
+// its cited lines if any, else at its place restored, and no check of it
+// in flight or due, where its check can go (filewatch): here, or on a
+// host that is up. A check answers in a later frame than it is asked.
 static b32 drivefileready(Gui *g)
 {
+    // Not while Open file's check, or the file it found, is on its way:
+    // the front tab is still the one before
     FileTab *ft = filefront(g);
-    if (!ft || !g->filesdrawn || ft->state==FTAB_UNREAD || ft->state==FTAB_READING) {
+    if (g->fask.statid || g->fask.opening) {
+        return 0;
+    } else if (!ft || !g->filesdrawn || ft->state==FTAB_UNREAD || ft->state==FTAB_READING) {
+        return 0;
+    }
+    FileWatch *w    = &ft->watch;
+    b32        acts = !ft->host || !filehostwhy(filehost(g, ft->host)).len;
+    if (w->id || (ft->state==FTAB_READ && (w->stale || w->force) && acts)) {
         return 0;
     }
     return ft->state==FTAB_FAILED || g->fshowing!=ft ||
@@ -22601,7 +23605,9 @@ static b32 drivefilecheck(Gui *g, i32 chk)
              g->panes[PANE_FILES] && n && n->IsCentralNode();
     } break;
     case CHK_FILEBODIES: {
-        // Within the budget, dx at least read since the start
+        // Within the budget, dx at least read since the start, and dy
+        // at most if dy > 0: counted once per read, as its result is
+        // made a body (fetchmade), here and on other hosts alike
         i32 n     = 0;
         iz  bytes = filebytes(g, &n);
         print(&b, "drive: file bodies ");
@@ -22610,7 +23616,8 @@ static b32 drivefilecheck(Gui *g, i32 chk)
         print(&b, (i64)(bytes>>10));
         print(&b, " KiB; read ");
         print(&b, g->fileloads);
-        ok = bytes<=FILES_BUDGET && n>0 && g->fileloads>=(i64)op->dx;
+        ok = bytes<=FILES_BUDGET && n>0 && g->fileloads>=(i64)op->dx &&
+             (op->dy<=0 || g->fileloads<=(i64)op->dy);
     } break;
     case CHK_FILEQUIET:
         return g->panes[PANE_FILES] && drivequiet(g, "idle with a file shown", 2);
@@ -22734,7 +23741,21 @@ static b32 drivefilecheck(Gui *g, i32 chk)
         print(&b, g->editjumps);
         print(&b, ", the latest ");
         print(&b, g->editjump);
-        ok = g->editjumps==(i64)op->dx && find(line, op->text)>=0;
+        ok = g->editjumps==(i64)op->dx;
+        if (op->dy == 1) {
+            Str rest = g->editjump;
+            Str prog = cmdword(&rest);
+            Str name = basename(prog);
+            if (HOST_WINDOWS) {
+                Cut c = cut(name, '.');
+                ok = ok && g->editjump.len && g->editjump[0]=='"' && pathroot(prog, 1) &&
+                     c.ok && equalfold(c.head, op->text);
+            } else {
+                ok = ok && prog==op->text;
+            }
+        } else {
+            ok = ok && find(line, op->text)>=0;
+        }
     } break;
     case CHK_EDITWHY: {
         Str why = {g->fjumpwhy, g->fjumpwhylen};
@@ -22838,6 +23859,20 @@ static b32 drivewaitdone(Gui *g)
         return g->sess && v->state==LIVE_STREAMING && v->deltas>0;
     case W_PAUSED:
         return g->sess && v->busy && v->paused && v->state==LIVE_PAUSED;
+    case W_FILEASKED:
+        return !g->fask.statid && (!g->fask.p.shown || g->fask.p.err.len);
+    case W_FSIDLE: {
+        CodeLinks *c    = &g->codelinks;
+        b32        idle = !(g->fs && fspending(g->fs)) && !c->local.n && !c->local.id &&
+                          !c->waiting;
+        for (i32 i = 0; i < CODELINK_HOSTS; i++) {
+            idle &= !c->asks[i].host;
+        }
+        for (i32 i = 0; i < DIRLISTS; i++) {
+            idle &= !g->pc.lists[i].id;
+        }
+        return idle;
+    }
     case W_THINKING:
         return g->sess && thinking(v) && (v->thinking==THINK_HIDE || g->thinkcount>0);
     case W_THINKSTALL:
@@ -22987,6 +24022,10 @@ static b32 drivewaitdone(Gui *g)
         Arena a = g->frame;
         return find(termscreen(g, &a), g->ops[g->drivepc-1].text) >= 0;
     }
+    case W_TERMBANNER: {
+        TermTab *tt = termfront(g);
+        return tt && (tt->state==TT_ENDED || tt->state==TT_FAILED);
+    }
     case W_TERMBUSY: {
         TermTab *tt   = termfront(g);
         b32      idle = g->ops[g->drivepc-1].text == Str("idle");
@@ -23001,6 +24040,16 @@ static b32 drivewaitdone(Gui *g)
         FileWatch *w  = ft ? &ft->watch : 0;
         return drivefileready(g) && ft->body && !w->stale && !w->force && !w->id &&
                g->ffetch.ft!=ft;
+    }
+    case W_FILESKEPT: {
+        Str name = g->ops[g->drivepc-1].text;
+        for (i32 i = 0; i < g->fkeep.n; i++) {
+            FileKeep *k = &g->fkeep.keeps[i];
+            if (k->kind==FKEEP_REMOTE && k->host==name && !k->done) {
+                return 0;
+            }
+        }
+        return 1;
     }
     case W_FILEFOUND: {
         FileTab     *ft = filefront(g);
@@ -23509,6 +24558,82 @@ static b32 drivecheck(Gui *g, i32 chk)
         ImGuiWindow *w = ImGui::FindWindowByName("Output");
         return !g->outopen && (!w || !w->Active);
     }
+    case CHK_DRAGTO: {
+        DriveOp  *op     = &g->ops[g->drivepc-1];
+        DragOver *d      = &g->drag;
+        i32       dx     = (i32)op->dx;
+        Str       label  = {(u8 *)d->label, (iz)__builtin_strlen(d->label)};
+        Str       detail = {(u8 *)d->detail, (iz)__builtin_strlen(d->detail)};
+        Rect      place  = d->place[DROPTO_NEWSESSION];
+        Rect      field  = g->rects[RECT_NEWCWD];
+        Arena     a      = g->frame;
+        Buf       b(&a, 512);
+        print(&b, "drive: the drag is ");
+        if (!d->on) {
+            print(&b, "off");
+        } else {
+            print(&b, droptoname(d->to));
+            putbyte(&b, '|');
+            print(&b, label);
+            putbyte(&b, '|');
+            print(&b, detail);
+            print(&b, d->refused ? Str(", refused") : Str(""));
+            print(&b, d->shown ? Str("") : Str(", not drawn"));
+        }
+        guilog(g, finish(&b));
+        if (op->text == Str("off")) {
+            return !d->on;
+        }
+        // The words and the verdict where the platform says what the
+        // drag holds, and so the counts; its answer, where it gives one
+        Cut  to    = cut(op->text, '|');
+        Cut  words = cut(to.tail, '|');
+        b32  known = !(os_guilimits(g->os) & GUI_NODRAGLOAD);
+        b32  ok    = d->on && d->shown && droptoname(d->to)==to.head;
+        if (to.ok && (known || dx&4)) {
+            ok &= label == words.head;
+            ok &= !words.ok || startswith(detail, words.tail);
+        }
+        if (known && g->drivedragfx>=0) {
+            ok &= d->refused == ((dx&1) != 0);
+            ok &= (g->drivedragfx == 0) == ((dx&1) != 0);
+        }
+        if (dx & 2) {
+            ok &= place.x0==field.x0 && place.y0==field.y0 && place.x1==field.x1 &&
+                  place.y1==field.y1 && place.x1>place.x0;
+        }
+        return ok;
+    }
+    case CHK_DRAGQUIET:
+        if (g->ops[g->drivepc-1].dx == 0) {
+            return g->drag.on && drivequiet(g, "with a drag resting over the window", 2);
+        }
+        return !g->drag.on && drivequiet(g, "after a drag", 2);
+    case CHK_FILEFOCUS:
+        return g->panes[PANE_FILES] && g->filesfocus;
+    case CHK_TERMBANNER: {
+        TermTab *tt  = termfront(g);
+        Arena    a   = g->frame;
+        b32      end = tt && (tt->state==TT_ENDED || tt->state==TT_FAILED);
+        Str      got = end ? termbannertext(&a, tt) : Str("no banner");
+        guilog(g, concat(&a, "drive: the terminal's banner: ", got));
+        return end && startswith(got, g->ops[g->drivepc-1].text);
+    }
+    case CHK_EDITROUTE: {
+        DriveOp *op  = &g->ops[g->drivepc-1];
+        Str      tip = {g->fedittip, g->fedittiplen};
+        Arena    a   = g->frame;
+        Buf      b(&a, 128 + tip.len);
+        print(&b, "drive: Open in editor opens ");
+        print(&b, g->fedithow==FE_WINDOW ? Str("a window") :
+                  g->fedithow==FE_WHY    ? Str("nothing") : Str("a tab"));
+        print(&b, ", saying ");
+        print(&b, tip);
+        guilog(g, finish(&b));
+        b32 tab = g->fedithow==FE_TAB || g->fedithow==FE_SHOW;
+        b32 how = op->dx!=0 ? tab : g->fedithow==FE_WINDOW;
+        return filefront(g) && how && find(tip, op->text)>=0;
+    }
     case CHK_SHOTCLOSED: {
         ImGuiWindow *w = ImGui::FindWindowByName("Screenshot");
         return !g->img.view.open && !g->img.view.tex && !g->img.dying && (!w || !w->Active);
@@ -23605,6 +24730,17 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_COPYBTN:
         return g->rects[RECT_CODECOPY].x1 > g->rects[RECT_CODECOPY].x0;
+    case CHK_RUNBTN: {
+        b32 shown = g->rects[RECT_CODERUN].x1 > g->rects[RECT_CODERUN].x0;
+        if (!shown || g->drivecodemsg<0) {
+            guilog(g, "drive: no Run button");
+            return 0;
+        }
+        Arena   a  = g->frame;
+        CodeRun cr = coderun(g, g->view, &a, g->drivecodemsg, g->drivecodeblk);
+        guilog(g, concat(&a, "drive: Run's why: ", cr.why.len ? cr.why : Str("none")));
+        return cr.kind && !cr.why.len;
+    }
     case CHK_CODECOPIED: {
         // The code without its last newline, as a triple click copies it
         Str want = g->drivecode;
@@ -23882,8 +25018,10 @@ static b32 drivecheck(Gui *g, i32 chk)
         b32 found = find(in, text) >= 0;
         b32 absent = chk==CHK_NOSIDE || chk==CHK_NOINI;
         if (absent == found) {
-            Arena a = g->frame;
-            guilog(g, concat(&a, "drive: the sidebar:\n", Str{g->sidedump, g->sidelen}));
+            Arena a  = g->frame;
+            b32   fi = chk==CHK_SIDEINI || chk==CHK_NOINI;
+            guilog(g, fi ? concat(&a, "drive: the layout file:\n", in)
+                         : concat(&a, "drive: the sidebar:\n", Str{g->sidedump, g->sidelen}));
             guilog(g, concat(&a, "drive: the latest error: ", g->lasterr));
         }
         return absent != found;
@@ -24984,7 +26122,7 @@ static b32 drivecheck(Gui *g, i32 chk)
         for (i32 i = 0; s && i<s->terms.n; i++) {
             print(&b, i ? Str("|") : Str(""));
             print(&b, i==s->terms.front ? Str("*") : Str(""));
-            print(&b, termlabel(s->terms.tabs[i]));
+            termlabel(&b, s->terms.tabs[i]);
         }
         Str got = finish(&b);
         if (!(got == g->ops[g->drivepc-1].text)) {
@@ -25021,7 +26159,11 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_FILESPOT:
         return drivefilecheck(g, chk);
     case CHK_TERMQUIET:
-        return g->panes[PANE_TERMINAL] && drivequiet(g, "idle with the terminal shown", 2);
+        // A file opened before (an editor's) saves the layout up to 5 s
+        // later: a save's frame, and a probe after
+        return g->panes[PANE_TERMINAL] &&
+               drivequiet(g, "idle with the terminal shown",
+                          2 + 3*(g->saves - g->marksaves));
     case CHK_TERMFORCE: {
         DriveOp *op = &g->ops[g->drivepc-1];
         g->termforcecols = (i32)op->dx;
@@ -25115,10 +26257,12 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_NOTIFY:
         return g->notify == (u32)g->ops[g->drivepc-1].dx;
     case CHK_TERMRAN: {
-        DriveOp *op = &g->ops[g->drivepc-1];
-        Arena    a  = g->frame;
+        DriveOp *op   = &g->ops[g->drivepc-1];
+        Arena    a    = g->frame;
+        Cut      alts = cut(op->text, '|');  // a Windows host's launch differs
+        Str      want = alts.ok && g->sess && hostwin(g->sess->host) ? alts.tail : alts.head;
         guilog(g, concat(&a, "drive: terminal: ", g->termline));
-        return g->terms==(i32)op->dx && g->termline.len && find(g->termline, op->text)>=0 &&
+        return g->terms==(i32)op->dx && g->termline.len && find(g->termline, want)>=0 &&
                (op->dy==0 || g->termenv);
     }
     case CHK_PLANREVEAL: {
@@ -25772,6 +26916,27 @@ static Str flatjpeg(Arena *a, i32 w, i32 h)
     return finish(&b);
 }
 
+// A file for OP_DROP to drop, as its name says: w by h pixels px as a
+// PNG, a flat gray JPEG (.jpg) of that size, a PDF (.pdf) of h pages, or
+// h numbered lines of text (.txt).
+static Str dropbody(Arena *a, Str name, u8 *px, i32 w, i32 h)
+{
+    if (endswith(name, ".jpg")) {
+        return flatjpeg(a, w, h);
+    } else if (endswith(name, ".pdf")) {
+        return droppdf(a, h);
+    } else if (endswith(name, ".txt")) {
+        Buf t(a, 64*(iz)h);
+        for (i32 i = 1; i <= h; i++) {
+            print(&t, "Line ");
+            print(&t, (i64)i);
+            print(&t, " of the dropped notes.\n");
+        }
+        return finish(&t);
+    }
+    return pngencodez(a, px, w, h, 0);
+}
+
 static void drivestep(Gui *g)
 {
     ImGuiPlatformIO &pio = ImGui::GetPlatformIO();
@@ -26037,21 +27202,8 @@ static void drivestep(Gui *g)
                 p[3] = 255;
             }
         }
-        // A .txt is dy numbered lines of text instead
-        Str png = endswith(op->text, ".jpg") ? flatjpeg(&a, w, h) :
-                  pngencodez(&a, px, w, h, 0);
-        if (endswith(op->text, ".pdf")) {
-            png = droppdf(&a, (i32)op->dy);
-        } else if (endswith(op->text, ".txt")) {
-            Buf t(&a, 64*(iz)op->dy);
-            for (i32 i = 1; i <= (i32)op->dy; i++) {
-                print(&t, "Line ");
-                print(&t, (i64)i);
-                print(&t, " of the dropped notes.\n");
-            }
-            png = finish(&t);
-        }
         if (op->op == OP_CLIPPNG) {
+            Str png = pngencodez(&a, px, w, h, 0);
             char const *t = ImGui::GetClipboardText();
             g->clipkept = t ? clone(&g->perm, Str{(u8 *)t, (iz)__builtin_strlen(t)}) : Str{};
             g->clippng  = clone(&g->perm, png);
@@ -26065,16 +27217,28 @@ static void drivestep(Gui *g)
             }
             break;
         }
-        // Kept for the event, which outlives this frame
-        Str path = join(&g->perm, g->drivecwd, op->text);
-        if (!os_write(g->os, a, path, png)) {
-            guilog(g, "drive: FAIL could not write the image to drop");
+        // Its files, comma-separated, each written as its name says and
+        // dropped together; their paths each end in a NUL, kept for the
+        // event, which outlives this frame
+        Buf paths(&g->perm, 4096);
+        b32 ok = 1;
+        for (Str rest = op->text; ok && rest.len;) {
+            Cut c    = cut(rest, ',');
+            rest     = c.tail;
+            Str body = dropbody(&a, c.head, px, w, h);
+            Str path = join(&a, g->drivecwd, c.head);
+            ok = os_write(g->os, a, path, body);
+            print(&paths, path);
+            putbyte(&paths, 0);
+        }
+        if (!ok) {
+            guilog(g, "drive: FAIL could not write the file to drop");
             g->drivechecks++;
             g->drivefails++;
             break;
         }
         e.kind = GEV_DROP;
-        e.text = {(u8 *)cstr0(&g->perm, path), path.len};
+        e.text = finish(&paths);
         if (op->target != T_NONE) {
             // T_NONE's would be (0, 0): it is at no point instead
             ImVec2 p = targetpos(g, op->target);
@@ -26084,6 +27248,65 @@ static void drivestep(Gui *g)
         }
         os_guiinject(g->os, &e);
     } break;
+    case OP_DRAG: {
+        // Its items as GEV_DROP has them, each ending in a NUL, kept for
+        // the events, which outlive this frame; or its words
+        Arena a = g->frame;
+        Buf   items(&g->perm, 4096);
+        b32   ok = 1;
+        if (op->dy == 1) {
+            print(&items, op->text);
+            putbyte(&items, 0);
+        }
+        for (Str rest = op->dy==1 ? Str{} : op->text; ok && rest.len;) {
+            Cut c    = cut(rest, ',');
+            rest     = c.tail;
+            b32 dir  = endswith(c.head, "/");
+            Str path = join(&a, g->drivecwd, dir ? cuttail(c.head, 1) : c.head);
+            i32 st   = os_stat(g->os, a, path).type;
+            if (dir && st!=STAT_DIR) {
+                ok = os_mkdirs(g->os, a, path);
+            } else if (!dir && st==STAT_MISSING) {
+                Str body = dropbody(&a, ".txt", 0, 0, 3);
+                ok = os_write(g->os, a, path, body);
+            }
+            print(&items, path);
+            putbyte(&items, 0);
+        }
+        if (!ok) {
+            guilog(g, "drive: FAIL could not make the files to drag");
+            g->drivechecks++;
+            g->drivefails++;
+            break;
+        }
+        // The title bar's point, T_NONE's, is above the window, as the
+        // platforms have it
+        ImVec2 p = op->target!=T_NONE ? targetpos(g, op->target) : v2(40, -10);
+        e.kind   = GEV_DRAG;
+        e.button = (i32)op->dx;
+        e.key    = op->dy == 1;
+        e.down   = op->target != T_NONE;
+        e.x      = p.x;
+        e.y      = p.y;
+        e.text   = finish(&items);
+        os_guiinject(g->os, &e);
+        g->drivedragfx = e.x;
+        // A fresh scratch: on Windows the inject reenters through the
+        // drop target's hook, whose own scratch went over a's
+        Arena l = g->frame;
+        Buf   b(&l, 128);
+        print(&b, "drive: drag ");
+        print(&b, op->dx==0 ? Str("left") : op->dx==1 ? Str("over") : Str("dropped"));
+        print(&b, e.x<0 ? Str(", the platform said nothing") :
+                  e.x>0 ? Str(", taken") : Str(", refused"));
+        guilog(g, finish(&b));
+    } break;
+    case OP_IFDRAGLOAD:
+        if (os_guilimits(g->os) & GUI_NODRAGLOAD) {
+            guilog(g, "drive: skip, with no word of what a drag holds before its drop");
+            g->drivepc += (i32)op->dx;
+        }
+        break;
     case OP_CLIPRACE: {
         e.kind = GEV_CLIPRACE;
         os_guiinject(g->os, &e);
@@ -26229,6 +27452,26 @@ static void drivestep(Gui *g)
         selectcode(g);
         scheddirty(&g->sched);
         break;
+    case OP_SELRUN: {
+        View *v = g->view;
+        Arena a = g->frame;
+        g->drivecodemsg = -1;
+        for (i32 i = (i32)v->msgs.len-1; i>=0 && g->drivecodemsg<0; i--) {
+            if (v->msgs[i].role != VIEW_ASSISTANT) {
+                continue;
+            }
+            Doc *d = msgdoc(v, i);
+            for (i32 k = 0; k<d->blocks.len && g->drivecodemsg<0; k++) {
+                if (coderun(g, v, &a, i, k).kind) {
+                    g->drivecodemsg = i;
+                    g->drivecodeblk = k;
+                }
+            }
+        }
+        guilog(g, g->drivecodemsg<0 ? Str("drive: no block to run")
+                                    : Str("drive: aiming at a block to run"));
+        scheddirty(&g->sched);
+    } break;
     case OP_SUMMARY:
         drivesummary(g);
         break;
@@ -26367,7 +27610,9 @@ static void drivestep(Gui *g)
     case OP_MENTIONHOLD:
         g->mentionhold = op->dx != 0;
         if (g->mentionhold && g->sess) {
-            mentionidxdrop(g, g->sess);  // begun again, and held unwalked
+            mentionidxdrop(g, g->sess);  // begun again, and held unput
+        } else if (g->sess) {
+            mentionidxgo(g, g->sess, g->frame);  // the walk held is put
         }
         break;
     case OP_MENTIONS:
@@ -26424,6 +27669,19 @@ static void drivestep(Gui *g)
             g->drivepc += (i32)op->dx;
         }
         break;
+    case OP_IFFARMG:
+        if (!os_getenv(g->os, &g->frame, "PROSPERO_TEST_FARMG").len) {
+            guilog(g, "drive: skip, with no fake mg on the remote host");
+            g->drivepc += (i32)op->dx;
+        }
+        break;
+    case OP_IFFSSTALL:
+        // gui.py sets it here, and passes it to a remote host it starts
+        if (!os_getenv(g->os, &g->frame, "PROSPERO_TEST_FSSTALL").len) {
+            guilog(g, "drive: skip, with no stalled paths (PROSPERO_TEST_FSSTALL)");
+            g->drivepc += (i32)op->dx;
+        }
+        break;
     case OP_IFROLE: {
         b32 found = 0;
         for (iz i = 0; i < g->cfgheads.len; i++) {
@@ -26467,6 +27725,29 @@ static void drivestep(Gui *g)
     case OP_NODIALOG:
         g->nodialog = 1;
         break;
+    case OP_NOSESS:
+        setcur(g, 0);
+        scheddirty(&g->sched);
+        break;
+    case OP_SHOWFILES:
+        setpane(g, PANE_FILES, 1);
+        break;
+    case OP_FILESROOT: {
+        // By its Files tabs, as an imported copy has its original's title
+        GuiHost    *h = findhost(g, GH_REMOTE, op->text);
+        GuiSession *s = g->sessions;
+        for (; s && (!h || s->host!=h || !s->files.n); s = s->next) {}
+        if (!s) {
+            Arena a = g->frame;
+            guilog(g, concat(&a, concat(&a, "drive: FAIL no session on remote ", op->text),
+                             " has Files tabs"));
+            g->drivechecks++;
+            g->drivefails++;
+            break;
+        }
+        guiselect(g, s);
+        setpane(g, PANE_FILES, 1);
+    } break;
     case OP_OPENFILE: {
         Arena    a   = g->frame;
         FileRef  ref = fileref(&a, op->text);
@@ -26806,6 +28087,7 @@ static Str guiusage =
 "                 then come back from the tray (tests/gui.py drives it)\n"
 "  --attach       a second window while one runs in the background\n"
 "  --remote       a remote host, [remote r], its link dropped mid-turn\n"
+"  --remote-again  its Files tabs after a restart, [remote r] connected again\n"
 "  --rcwd DIR     the remote checklist's working directory there\n"
 "  --compose      the compose box's checklist: drafts, history, the menu,\n"
 "                 the editor, slash commands ([ui] editor a test script)\n"
@@ -27063,6 +28345,9 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
             attach = probe = 1;
         } else if (a == "--remote") {
             remote = probe = 1;
+        } else if (a == "--remote-again") {
+            remote = 2;
+            probe  = 1;
         } else if (a == "--compose") {
             compose = probe = 1;
         } else if (a == "--launch") {
@@ -27197,8 +28482,8 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
             g->ops  = attachops;
             g->nops = countof(attachops);
         } else if (remote) {
-            g->ops  = remoteops;
-            g->nops = countof(remoteops);
+            g->ops  = remote==1 ? remoteops : remote2ops;
+            g->nops = remote==1 ? countof(remoteops) : countof(remote2ops);
         } else if (settings) {
             g->ops  = settingsops;
             g->nops = countof(settingsops);
@@ -27236,8 +28521,11 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->cfgbase   = g->cfgmem.beg;
     g->pendmem   = newarena(os_reserve(os, 256*mb));
     g->pendbase  = g->pendmem.beg;
+    // The file workers' (guifs): fstick's, and the far mount table read
+    // into it on Linux, 1 MiB
+    g->fsmem     = newarena(os_reserve(os, 64*mb));
     if (!g->perm.beg || !g->frame.beg || !g->vcache->arena.beg || !g->replayr ||
-            !g->cmdr || !g->cfgmem.beg || !g->pendmem.beg) {
+            !g->cmdr || !g->cfgmem.beg || !g->pendmem.beg || !g->fsmem.beg) {
         os_print(os, 2, "prospero: out of memory\n");
         return 2;
     }
@@ -27477,6 +28765,9 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
             os_guiwslwatch(os, &g->perm, g->tasks, TASK_WSLCHANGED);
         }
     }
+    // The Files tabs kept: the window's own, and the fake's session's;
+    // the others as their hosts list them (onsessions)
+    filesrestore(g, 0);
     if (history) {
         g->histreq = os_ticks(os);
         fakeint(g, FAKE_HISTORY, history);
@@ -27487,6 +28778,12 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->bench = bench;
 
     gui_run(g);
+    if (g->fs) {
+        // Jobs still out end, answering nothing; a worker in a call that
+        // never returns is left to it, detached, as the process ends
+        g->fsclosing = 1;
+        fsquit(g->fs, "Prospero is closing", g->fsmem);
+    }
 
     saveini(g, 1);
     if (!g->quitting && !g->enginegone) {

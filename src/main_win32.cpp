@@ -874,7 +874,8 @@ static Dirent *os_list(Os *, Arena *a, Str path)
     return head;
 }
 
-static Listing os_listall(Os *, Arena *a, Str path, b32 dirs, iz max)
+static Listing os_listall(Os *, Arena *a, Str path, b32 dirs, iz max,
+                          void (*beat)(void *), void *ctx)
 {
     Listing r = {};
     if (!path.len || hasnul(path)) {
@@ -908,6 +909,9 @@ static Listing os_listall(Os *, Arena *a, Str path, b32 dirs, iz max)
     }
     r.ok = 1;
     do {
+        if (beat) {
+            beat(ctx);
+        }
         c16 *name = fd.name;
         if (name[0]=='.' && (!name[1] || (name[1]=='.' && !name[2]))) {
             continue;
@@ -2681,6 +2685,12 @@ static b32 os_ptyresize(Os *os, Proc *p, PtySize z)
 // such as w64devkit's sh.exe, or Git's bash.exe, starts the real shell
 // as its child and waits. That comes within moments of the root, and
 // nothing typed at the shell's prompt comes so soon.
+// ConPTY keeps the console's modes to itself
+static i32 os_ptymode(Os *, Proc *)
+{
+    return PTY_UNKNOWN;
+}
+
 static b32 os_ptybusy(Os *, Proc *p)
 {
     enum { SHELLTIME = 200*10000 };  // 200 ms
@@ -4166,6 +4176,92 @@ static void os_httpfree(Os *, Http *h)
 }
 
 
+W32(i32, GetDriveTypeW(c16 *));
+W32(i32, QueryDosDeviceW(c16 *, c16 *, i32));
+
+enum : i32 {
+    DRIVE_UNKNOWN     = 0,
+    DRIVE_NO_ROOT_DIR = 1,
+    DRIVE_REMOVABLE   = 2,
+    DRIVE_FIXED       = 3,
+    DRIVE_REMOTE      = 4,
+    DRIVE_CDROM       = 5,
+    DRIVE_RAMDISK     = 6,
+};
+
+// How near a path's drive is, for what may be asked of it on a thread
+// that must not wait (w32drive)
+enum : i32 {
+    DRIVEAT_LOCAL,  // a fixed, removable or RAM disk: may be statted
+    DRIVEAT_OTHER,  // an optical drive, none, or not known: left untouched
+    DRIVEAT_FAR,    // a network share: left untouched
+};
+
+// The one Windows drive classifier, which never waits on a share. The
+// drive's DOS device target comes first (QueryDosDeviceW), since that
+// only looks up a name: GetDriveTypeW opens the drive's root, which
+// on a mapped drive whose server is gone waits for the network. So a
+// target dosdrive calls far is far without another call, a subst is
+// followed once to the drive it is on, and only then is GetDriveTypeW
+// asked, of a local device. UNC paths are far; other paths with no
+// drive letter (the device namespace, relative ones) are left alone.
+// The path is UTF-8, either separator. A path on a local drive can
+// still pass through a junction, symlink or mounted folder to a share,
+// which only opening it would tell.
+static i32 w32drive(Str path)
+{
+    u8 d = windriveof(path);
+    if (!d) {
+        return netpath(path, 1) ? DRIVEAT_FAR : DRIVEAT_OTHER;
+    }
+    for (i32 hop = 0; hop < 2; hop++) {
+        c16 name[]     = {(c16)d, ':', 0};
+        c16 target[1024];
+        i32 len = QueryDosDeviceW(name, target, countof(target));
+        if (len <= 0) {
+            return DRIVEAT_OTHER;  // no such drive, or a target too long to tell
+        }
+        // Its first string, as ASCII: the names it is told by are
+        u8 narrow[countof(target)];
+        iz n = 0;
+        for (; n<len && target[n]; n++) {
+            narrow[n] = target[n]<0x80 ? (u8)target[n] : 0x7f;
+        }
+        DosDrive dd = dosdrive({narrow, n});
+        if (dd.kind == DOSDRIVE_FAR) {
+            return DRIVEAT_FAR;
+        } else if (dd.kind == DOSDRIVE_SUBST) {
+            d = dd.onto;
+            continue;
+        }
+        c16 root[] = {(c16)d, ':', '\\', 0};
+        switch (GetDriveTypeW(root)) {
+        case DRIVE_REMOTE:
+            return DRIVEAT_FAR;
+        case DRIVE_FIXED:
+        case DRIVE_REMOVABLE:
+        case DRIVE_RAMDISK:
+            return DRIVEAT_LOCAL;
+        }
+        return DRIVEAT_OTHER;
+    }
+    return DRIVEAT_OTHER;  // a subst onto a subst: followed once only
+}
+
+// A drive w32drive calls far is the mount, whole ("Z:/", a subst onto
+// one too), as is a UNC path's share ("//host/share/"); WSL's own
+// shares and the device namespace are not.
+static Str os_farmount(Os *, Arena *a, Str path)
+{
+    if (!pathroot(path, 1)) {
+        return {};
+    }
+    Str norm = normpath(a, path, ".", 1);
+    Str root = fswinroot(norm);
+    return root.len && w32drive(norm)==DRIVEAT_FAR ? root : Str{};
+}
+
+
 #if PROSPERO_GUI
 #  include "app.cpp"
 #  include "gui_win32.cpp"
@@ -4208,6 +4304,8 @@ extern "C" [[noreturn]] void prospero_desktop();
 // resize arrives as an event too, and writes through the console, which
 // ConPTY renders anew, so tests match its text and not its bytes. A hang
 // up is CTRL_CLOSE_EVENT, and "busy" and "nohup" run "--tty-nap MS".
+// "args" prints its arguments after its name as there: each in
+// brackets, with controls, brackets and backslash as \xHH.
 
 enum : i32 {
     PROBE_KEY_EVENT   = 1,
@@ -4312,7 +4410,7 @@ static uz probenap(Os *os, Arena scratch, i64 ms, b32 detach)
     return pi.process;
 }
 
-[[noreturn]] static void ttyprobe(Os *os, Arena a)
+[[noreturn]] static void ttyprobe(Os *os, Arena a, Slice<Str> args)
 {
     uz in  = os->std[0];
     uz out = os->std[1];
@@ -4320,8 +4418,9 @@ static uz probenap(Os *os, Arena scratch, i64 ms, b32 detach)
     SetConsoleMode(out, PROBE_OUTMODE);
     probeline(os, a, "probe ready");
 
-    u8 line[4096];
-    iz len = 0;
+    u8  line[4096];
+    iz  len  = 0;
+    b32 pass = 0;  // the next line answers "Password: "
     for (;;) {
         iz nl = 0;
         for (; nl<len && line[nl]!='\n' && line[nl]!='\r'; nl++) {}
@@ -4351,7 +4450,31 @@ static uz probenap(Os *os, Arena scratch, i64 ms, b32 detach)
         Cut c   = cut(cmd, ' ');
         Str arg = c.tail;
         Int n   = parseint(arg);
-        if (c.head == "size") {
+        if (pass) {
+            // The console never echoes key events read this way, so the
+            // password shows only as the program's slip
+            pass = 0;
+            Str say = concat(&scratch, "pass got ", cmd);
+            probeline(os, scratch, "");
+            probeline(os, scratch, say);
+        } else if (c.head=="pass" && (!arg.len || n.ok)) {
+            Sleep(arg.len ? (i32)n.val : 0);
+            writeall(out, "Password: ");
+            pass = 1;
+        } else if (cmd=="cooked" || cmd=="raw") {
+            probeline(os, scratch, cmd);  // a console's modes don't show
+        } else if (c.head == "say") {
+            probeline(os, scratch, arg);
+        } else if (c.head=="lines" && n.ok) {
+            for (i64 i = 1; i <= n.val; i++) {
+                Buf b(&scratch, 32);
+                print(&b, "line ");
+                print(&b, i);
+                probeline(os, scratch, finish(&b));
+            }
+        } else if (c.head == "title") {
+            writeall(out, concat(&scratch, concat(&scratch, "\x1b]2;", arg), "\x07"));
+        } else if (c.head == "size") {
             probesize(os, scratch, "size ", 1);
         } else if (c.head == "echo") {
             probeline(os, scratch, arg);
@@ -4377,6 +4500,24 @@ static uz probenap(Os *os, Arena scratch, i64 ms, b32 detach)
                 say = concat(&scratch, say, " unset");
             }
             probeline(os, scratch, say);
+        } else if (cmd == "args") {
+            Buf b(&scratch, 4096);
+            print(&b, "args");
+            for (iz i = 1; i < args.len; i++) {
+                print(&b, " [");
+                for (iz k = 0; k < args[i].len; k++) {
+                    u8 ch = args[i][k];
+                    if (ch<0x20 || ch==0x7f || ch=='[' || ch==']' || ch=='\\') {
+                        print(&b, "\\x");
+                        putbyte(&b, (u8)"0123456789abcdef"[ch>>4]);
+                        putbyte(&b, (u8)"0123456789abcdef"[ch&15]);
+                    } else {
+                        putbyte(&b, ch);
+                    }
+                }
+                putbyte(&b, ']');
+            }
+            probeline(os, scratch, finish(&b));
         } else if (c.head == "cwd") {
             c16 dir[1024];
             i32 dlen = GetCurrentDirectoryW(countof(dir), dir);
@@ -4468,7 +4609,7 @@ void mainCRTStartup()
         Sleep((i32)parseint(args[2]).val);
         ExitProcess(0);
     } else if (args.len>1 && args[1]=="--tty-probe") {
-        ttyprobe(&os, a);
+        ttyprobe(&os, a, args);
     }
 
     if (args.len>1 && args[1]=="desktop") {

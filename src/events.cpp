@@ -395,6 +395,17 @@ static Str capnames[] = {
                        // skill that the computer it relays to shares, made
                        // current, replied to late, before a prompt {skill}
                        // that invokes it; skills' from, that computer
+    "term.edit",       // term.open {edit: {path, line?, col?, editor? |
+                       // template?}}: an editor on the file in place of
+                       // the shell, which this host picks and starts
+                       // (the window's, else its own $VISUAL, $EDITOR or
+                       // vi), the reply's editor its name on Windows,
+                       // and on POSIX an OSC 1 naming it (ptyhost.cpp)
+    "term.run",        // term.open {run: {text, lang, from?}}: a code block
+                       // of the agent's run in place of the shell, in the
+                       // block's shell, its screen kept after it ends,
+                       // and the agent told of its end by a notice
+                       // "terminal" to from at its next request
 };
 
 static Str evname(i32 ev)

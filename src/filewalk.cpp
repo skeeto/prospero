@@ -1,19 +1,28 @@
 // The paths an '@' mention picker offers: a walk of a working directory,
-// one directory at a time, so that a frame's budget can be checked between
-// listings, without a thread and without a half-listed directory. Each step
+// one directory at a time, without a half-listed directory. Each step
 // lists one directory and pushes the subdirectories it must visit onto a
 // stack, so a walk may be stopped anywhere and resumed.
 //
-// The budget bounds the walk's own work — the entries it records, the ignore
-// rules it loads, the bookkeeping between directories — and not one
-// os_listall, which cannot be interrupted: a directory of ten thousand
-// entries still costs the frame that lists it that one listing's time, and
-// nothing here pretends otherwise.
+// It runs on a file worker (fswork.cpp) as a job of its own
+// (filewalkrun): a folder on a share that stops answering, or a link
+// into one, stops that worker alone. Only when the pool has no thread at
+// all, and none can start, does the job run inline on the window's
+// thread: then it has FILEWALK_INLINE of work, one frame's time, and the
+// index is what that found, truncated. Before each
+// folder it lists, and before each subfolder's real path, it asks its
+// gate, which beats and refuses a path under a mark (fsat): that folder
+// is passed over, and the rest is walked. os_listall beats per entry.
+// So a big tree that keeps answering is never declared stuck (FS_STUCK
+// counts silence, not the walk's length); its own budget, FILEWALK_TIME
+// of work, ends it as the caps do, truncated, with what it found. A call
+// silent past FS_STUCK gives the job up, and marks the path it was on
+// alone (the job is exact): the folder being listed, or the link being
+// resolved, never the root's whole tree.
 //
 // It reads the tree through Os and reuses search.cpp's .gitignore rules,
 // which are static in the same translation unit. Nothing here knows of the
-// GUI: MentionIdx holds one of these, and the adapter that ranks its paths
-// lives in mention.cpp.
+// GUI: mention.cpp's index puts a FileWalkJob on the window's pool, and
+// sorts and ranks its paths on the window's thread once it is answered.
 //
 // The caps are fields, set by filewalkbegin to the constants below, so
 // that a test can drive them without a tree of ten thousand files.
@@ -27,8 +36,8 @@
 
 enum : i32 {
     FILEWALK_DIRS   = 1,      // directories listed per step: one, so that the
-                              // budget is checked between listings and the
-                              // worst case is one directory's listing
+                              // budget and the job are checked between
+                              // listings
     FILEWALK_FILES  = 30000,  // paths kept, at most
     FILEWALK_DIRMAX = 10000,  // entries listed in one directory, at most
     FILEWALK_DEPTH  = 128,    // levels below the root, at most
@@ -40,6 +49,11 @@ enum : iz {
                                // worst case, its clone, and its Dirent
     FILEWALK_REAL    = 4096,   // and the PATH_MAX os_realpath takes as it runs
     FILEWALK_RULES   = 64<<10, // and a level's .gitignore, which is read whole
+};
+
+enum : i64 {
+    FILEWALK_TIME   = 30000000,  // os_ticks (µs) a walk on a worker takes at most
+    FILEWALK_INLINE = 16000,     // and one run inline, on the window's thread
 };
 
 // A walk in progress: the stack of directories still to list, with each
@@ -65,6 +79,11 @@ struct FileWalk {
     iz                 maxdepth;
     b32                win;       // Windows paths
     b32                done, truncated;
+    // On a worker (filewalkrun): whether it may go to a path, and a beat
+    // per entry listed, both with ctx; neither in a walk without them
+    b32              (*gate)(void *ctx, Str path);
+    void             (*beat)(void *ctx);
+    void              *ctx;
 };
 
 // Start a walk of root, an absolute directory: the root joins the stack at
@@ -150,6 +169,14 @@ static iz filewalkleft(Arena *a)
     return limit - a->beg;
 }
 
+// End the walk where it is, truncated: what it found stays.
+static void filewalkstop(FileWalk *w)
+{
+    w->dirs.len = w->rels.len = w->chains.len = w->reals.len = w->depths.len = 0;
+    w->truncated = 1;
+    w->done      = 1;
+}
+
 // Whether the retained arena has room for one more entry: its cloned
 // strings, and — for a slice it fills — the copy and the doubling a push
 // makes in one go, which is the most one entry can ever ask for.
@@ -170,9 +197,8 @@ static b32 filewalkroom(FileWalk *w, iz strs)
 // One step of the walk: list the next directory off the stack, recording
 // what it holds and pushing the subdirectories to visit. Returns 1 while
 // there is more to do. The step is one directory's listing and nothing more,
-// which is what lets mentionidxstep check its budget between directories: a
-// step's cost is that listing, so a very large directory is one slow frame
-// and not eight. The caps are entry counts, so a tree of very long paths
+// which is what lets filewalkrun check its budget and its job between
+// directories. The caps are entry counts, so a tree of very long paths
 // fills the arenas before it fills them: a step with no room left ends the
 // walk as truncated, as the caps do, rather than reaching os_oom, which would
 // take the GUI down with it.
@@ -196,6 +222,11 @@ static b32 filewalkstep(FileWalk *w)
         w->reals.len--;
         w->chains.len--;
         w->depths.len--;
+        // A folder its gate refuses (under a mark: its file system stopped
+        // answering) is passed over, the rest walked
+        if (w->gate && !w->gate(w->ctx, dir)) {
+            continue;
+        }
         // The level's .gitignore, in mem with the rest of its chain: a
         // level's rules must outlive the step that loaded them, or nested
         // files stop applying once a walk is resumed. Its size is the
@@ -215,7 +246,7 @@ static b32 filewalkstep(FileWalk *w)
             stop = 1;
             break;
         }
-        Listing l = os_listall(w->os, &w->scratch, dir, 0, max);
+        Listing l = os_listall(w->os, &w->scratch, dir, 0, max, w->beat, w->ctx);
         for (Dirent *d = l.head; d && !stop; d = d->next) {
             if (d->name == ".git") {
                 continue;
@@ -235,6 +266,9 @@ static b32 filewalkstep(FileWalk *w)
             }
             Str real = {};  // a folder's real path, resolved once below
             if (d->isdir) {
+                if (w->gate && !w->gate(w->ctx, path)) {
+                    continue;  // a link under a mark is not resolved
+                }
                 real = os_realpath(w->os, &w->scratch, path);
                 if (filewalklinked(&w->scratch, dreal, d->name, real)) {
                     continue;
@@ -273,8 +307,7 @@ static b32 filewalkstep(FileWalk *w)
         }
     }
     if (stop) {  // truncated: the walk ends here, cleanly
-        w->dirs.len = w->rels.len = w->chains.len = w->depths.len = 0;
-        w->done = 1;
+        filewalkstop(w);
     } else if (!w->dirs.len) {
         w->done = 1;
     }
@@ -293,27 +326,97 @@ static void filewalkfree(FileWalk *w)
     w->done       = 1;
 }
 
+// A walk as a job on a file pool (FsPool): at the start of a Region of
+// its own, set up by its owner before the job is put (FsPut.ctx) and
+// read by the owner again only once the job is answered. The walk's
+// arena, w.mem, is the rest of the Region. root and win are never
+// changed after the put. A job given up leaves the Region to the pool,
+// whose drop (the owner's) runs filewalkfree and releases it once the
+// worker is out of it.
+struct FileWalkJob {
+    FileWalk w;
+    Region  *r;
+    Str      root;   // absolute, as given, in r
+    b32      win;
+    i64      limit;  // os_ticks of work at most (FILEWALK_TIME)
+};
+
+// The gate of a walk on a worker: a beat, and 0 for a path under a mark,
+// or once the job was given up, so a big folder stops at once.
+static b32 filewalkgate(void *ctx, Str path)
+{
+    FsCall *c = (FsCall *)ctx;
+    return fsat(c, path) && !fsgone(c);
+}
+
+// A walk's job, on its worker: the walk to its end, its caps or its
+// budget (FILEWALK_INLINE at most inline, its worker never started),
+// c->res the FileWalk; c->err for a root under a mark, and for
+// no room to list anything. The scratch reservation goes as it ends.
+static void filewalkrun(FsCall *c)
+{
+    FileWalkJob *j = (FileWalkJob *)c->ctx;
+    FileWalk    *w = &j->w;
+    c->res = w;
+    if (!fsat(c, j->root)) {
+        c->err = fsstuck;
+        return;
+    }
+    Arena mem = w->mem;
+    filewalkbegin(w, c->os, &mem, j->root, j->win);
+    w->gate = filewalkgate;
+    w->beat = fsbeat;
+    w->ctx  = c;
+    if (!w->scratchreg) {
+        c->err = "out of memory";
+        return;
+    }
+    i64 limit = j->limit;
+    if (!c->w->started && limit>FILEWALK_INLINE) {
+        limit = FILEWALK_INLINE;  // on the caller's thread: one frame's time
+    }
+    i64 end = os_ticks(c->os) + limit;
+    while (!w->done) {
+        if (fsgone(c)) {
+            break;
+        } else if (os_ticks(c->os) >= end) {
+            filewalkstop(w);
+            break;
+        }
+        filewalkstep(w);
+    }
+    filewalkfree(w);
+    w->gate = 0;
+    w->beat = 0;
+    w->ctx  = 0;
+}
+
 // The '@' picker's index of a working directory: the walk, what its paths
 // are relative to, when it began, and the rank of the last query it was
-// asked.
+// asked. The walk is a job on the window's pool (mention.cpp), in its own
+// Region: before it is put (held), and once it is answered, it is the
+// window's; while walkid is set it is the worker's, and nothing here
+// reads it.
 struct MentionIdx {
-    FileWalk w;
-    Str      root;     // what the paths are relative to
-    i64      born;     // µs: rebuilt once older than MENTION_TTL
+    FileWalkJob *job;     // the walk and its Region, else null
+    FileWalk    *w;       // job's walk, done once served
+    i64          walkid;  // the job out on the pool, else 0
+    Str          root;    // what the paths are relative to, job's
+    i64          born;    // µs: rebuilt once older than MENTION_TTL
     // The picks the last query was ranked to, kept so that a frame asking
     // the same word again does not rank the whole index again: the popup
     // asks twice a frame, and an index holds up to 30,000 paths. A pick is
-    // an index into w.paths, which does not move once the walk is done and
+    // an index into w->paths, which does not move once the walk is done and
     // sorted, so the cache is only ever read for the walk it was made in:
     // gen is bumped whenever a walk starts, and the picks of another
     // generation are no picks at all.
-    b32      ranked;      // the picks below may be read
-    u32      gen;         // the walk this index is on
-    u32      rankgen;     // the walk the picks were made in
-    iz       qlen;        // the query they were ranked for, kept here since
-    u8       qtext[MENTION_QUERY];  // the frame's copy of it does not outlive
-    MentionPick picks[MENTION_PICKS];  // what mentionpicks truncates to
-    iz       npicks;
+    b32          ranked;   // the picks below may be read
+    u32          gen;      // the walk this index is on
+    u32          rankgen;  // the walk the picks were made in
+    iz           qlen;     // the query they were ranked for, kept here since
+    u8           qtext[MENTION_QUERY];  // the frame's copy of it does not outlive
+    MentionPick  picks[MENTION_PICKS];  // what mentionpicks truncates to
+    iz           npicks;
 };
 
 // A session's two indexes: the one the picker is served from, its walk
@@ -322,7 +425,10 @@ struct MentionIdx {
 struct MentionIdxs {
     MentionIdx slot[2];
     i32        cur;      // the slot served, -1 for none yet
-    i32        next;     // the slot being walked, -1 for none
+    i32        next;     // the slot being walked, -1 for none: held
+                         // (OP_MENTIONHOLD) until its job is put
+    i64        again;    // µs: no new walk before, after one refused or
+                         // given up
     b32        stale;    // rebuilt when the popup next opens
     b32        wasbusy;  // the view was busy when last seen: stale as it ends
     b32        nomem;    // no index could be had: the listing answers

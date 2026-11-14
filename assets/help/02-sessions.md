@@ -183,8 +183,13 @@ from the start.
 
 Attach adds files to the message: drop them on the window (but not on
 the Files pane, which opens them, or while Open file asks for a path,
-which takes the first), paste them, or pick them with the paper clip. Images go to a model that takes
-them, as pictures. Any other file goes as text, as `read` shows it:
+which takes the first), paste them, or pick them with the paper clip.
+Files dropped together are attached together or not at all: when the
+message has no room for them all, none are, and the note says why: how
+many more fit, or that ten is the most. While files are dragged over
+the window, the place they would go is outlined, with a card saying
+what a drop there does ([Dropping files](help:keys#dropping-files)).
+Images go to a model that takes them, as pictures. Any other file goes as text, as `read` shows it:
 numbered lines, the first 2000 or so, then a note to read on. The
 session keeps a copy in its own folder, so the agent can read the rest
 without asking. A PDF goes as its text, extracted, a `--- page N ---`
@@ -294,7 +299,9 @@ session's folder, which Tab completes. After the
 path, `:N` goes to line N and `:A-B` to lines A to B, marked with a
 band until text is selected; opening it again goes there again. A file
 dropped on the pane opens in a tab too, rather than being attached,
-and one dropped anywhere while Open file asks fills in its path.
+and one dropped anywhere while Open file asks fills in its path; as
+files are dragged, the pane or the field is outlined where they would
+go.
 
 A file shows as text, its lines numbered and highlighted, wrapped at
 the pane's width unless Wrap is off (then scrolled sideways), or a
@@ -315,16 +322,63 @@ editor (`[ui] editor`, or
 [`[ui] editor_line`](settings:ui#editor_line) for one Prospero doesn't
 know) at the line last gone to (a link's first, Go to line's, or the
 current find match's, with its column), else the band's first line,
-else the line at the top, without waiting for it. Both work for a file on this computer, in a
-container's folder mounted here, or, on Windows, in a WSL distro. For
-another host, Open in editor uses that remote's `viewer` command template
-in this window's `[remote NAME]` section: a local, remote-aware editor,
-launched detached without a shell or any `[ui] editor` fallback. With no
-viewer, or a bad one, it is disabled and says how to configure or fix it.
-Reveal still requires a local or mounted path. See
+else the line at the top, without waiting for it. Reveal works for a
+file on this computer, in a container's folder mounted here, or, on
+Windows, in a WSL distro; for another host's it says why not. Open in
+editor opens another host's file in a Terminal tab there, in that
+host's editor ([Hosts](help:hosts#sessions-on-a-remote)); a file in a
+container's folder mounted here, or in a WSL distro, still opens here
+when the editor has a window of its own. A binary file says
+so, with Show as text anyway; past 4 MiB or 100,000 lines only the
+start shows.
+
+The tabs last across a restart, kept with the window's layout: each
+session's, in their order, with the one in front (another host's, once
+it is connected: [Hosts](help:hosts#sessions-on-a-remote)), and the
+window's own, shown when no session is. Each keeps its place in the
+file and its band, Markdown or text, Wrap, Fit and Show as text anyway,
+and Wrap's last choice holds for new tabs. A tab is read again only
+once shown, so a restart reads just the file in front. A session deleted or put in the
+Trash takes its tabs with it.
+
+A file on this computer is read off to the side, as one on another
+host is, so the window carries on meanwhile: "Reading..." shows if
+that takes more than a moment, and Open file says "Checking..." while
+it looks for the path. A file on a share or mount that stops answering
+says "The file system is not responding" after ten seconds; other
+files still open, and that file, or the rest of its network share, is
+refused at once until it answers again, when Retry reads it. Folders
+are listed off to the side as well, for Open file's Tab, the new
+session's folder field and the folders of an '@' mention: "Listing..."
+shows if that takes more than a moment, and a Tab pressed meanwhile
+completes once the listing comes.
+
+An editor that runs in a terminal (`vim`, `nvim`, `nano`, `hx`,
+`emacs -nw`), as `[ui] editor`, `$VISUAL` or `$EDITOR` names it, opens
+a file of this computer in a Terminal tab of its session instead, at
+the same line and column, with the keyboard. On Linux and macOS your
+login shell starts it, so your profile's `$PATH` applies
+([Settings](help:config)); on Windows it is found on PATH and runs
+through cmd.exe. On
+Linux with no editor set at all, the tab runs the login shell's
+`$VISUAL` or `$EDITOR`, else `vi`. The tab is named for the editor and
+the file, as `vim notes.txt`. When the editor exits with status 0, as
+after `:wq`, its tab closes and Files shows the file again, read
+again, with the focus. Any other exit (`:cq`) leaves the tab with a
+banner saying how it ended, and its Restart (or Enter) runs the editor
+on the file again. Open in editor on a file already open in a tab
+shows that tab. Drafts, plans and the configuration file still need an
+editor with a window of its own.
+
+
+For a genuinely remote file with a configured `[remote NAME] viewer`, a
+nonempty template takes over from that native route: it gives the file's
+remote path to the local remote-aware editor and launches detached without
+a shell or a `[ui] editor` fallback. When `viewer` is unset, the native
+Terminal-tab editing described above applies instead. A malformed or
+missing configured viewer is disabled with a reason rather than silently
+falling back. Reveal still requires a local or mounted path. See
 [Hosts and remotes](help:hosts#viewing-remote-files-in-a-local-editor).
-A binary file says so, with Show
-as text anyway; past 4 MiB or 100,000 lines only the start shows.
 
 An image file (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp` or `.bmp`)
 shows as the image, up to 32 MiB and 16 million pixels, its size in
@@ -355,7 +409,8 @@ link too, but only once Prospero finds that file: on its host, within
 the folder its relative links are from, and never by a network path,
 since nobody asked for that file to be looked at. It looks only at
 what is on screen, and a file not found then is looked for again only
-when shown 15 seconds later or more. Code inside a link stays part of
+when shown 15 seconds later or more, and one on a share that stops
+answering just stays plain text. Code inside a link stays part of
 that link.
 
 ## The session's menu
@@ -430,7 +485,12 @@ Right-click a session in the sidebar, or open the Session menu, for:
   console) on Windows, and elsewhere `$TERMINAL` or the first of the
   usual ones found.
 - **New terminal tab** (Ctrl+Shift+`): another shell in its folder, in
-  a tab of the Terminal pane.
+  a tab of the Terminal pane. A session has at most 8 tabs, and a host
+  16 open, an editor's tab from Files' Open in editor among them. An
+  editor's tab has a file open: quitting asks first, as for a tab
+  running a program, and says that its unsaved changes would be lost;
+  its menu's Close and Kill hang the editor up, and Restart runs it on
+  the file again.
 - **Close**: stop its background jobs and subagents, deny what it asks
   from then on, and let it go from memory in this window. Opening it
   again reads it back.
@@ -441,6 +501,52 @@ Right-click in the transcript to Copy Message, or to fork there: Fork
 before this prompt puts that prompt in the fork's box to edit and
 send, and Fork after this turn keeps the conversation up to that
 point.
+
+## The agent and your terminals
+
+The agent can read the session's Terminal pane tabs with its
+`read_terminal` tool: a list of them, newest first, each with its
+number (the tab's tooltip shows it, as "Terminal 7"), and a tab's last
+lines as its screen and history show them, up to as many as the tab
+keeps, at most 2000. It reads the tab you used last unless it names
+one. A tab whose shell ended stays readable until you close it. It
+cannot type, and runs nothing. A subagent reads its session's
+tabs, and a side chat in the same folder its original's. The tool is
+offered to sessions you open while `[terminal] agent` is on (the
+default), and refuses once you turn it off.
+
+What you type at a password prompt is hidden from it as `[hidden]`,
+wherever it shows: a prompt with echo off, or a line that asks for a
+password, passphrase, PIN, secret or token, and a line typed just
+ahead of such a prompt. So are the values of secret settings, such as
+an endpoint's `key`. A secret of six bytes or more is hidden anywhere,
+a shorter one only as a whole word. Not hidden: a password you type
+into a shell before you ever type it at a prompt, and what a program
+prints of secrets Prospero does not know (`env`, `cat .env`). In a
+shell without a line editor, such as dash, a command typed just
+before a password prompt may be hidden too.
+
+### Running the agent's commands
+
+A code block in the agent's reply tagged with a shell (`sh`, `bash`,
+`zsh`, `ksh`, `powershell`, `pwsh`, or on Windows `cmd`) has a Run
+button beside Copy while the mouse is over it, and Run in Terminal on
+the right-click menu. It runs the block in a Terminal tab of the
+session, in its folder, labeled by its first line: in your shell, as
+you would paste it (a POSIX shell reads its interactive startup files;
+another, such as fish, runs the block in its own shell, else sh), in
+PowerShell, or cmd.exe with one line. The command shows first, dimmed.
+A block whose lines are prompts and output, or that holds characters
+that would not show, has none. It gets your terminal's environment
+less the variables secret settings name, with `PROSPERO_TAB=run`.
+
+The tab keeps its output when the command ends, under a banner with
+its exit code: Run again (Enter, after a moment) runs it in the same
+tab, as does the button again, and Close closes it. The agent hears
+how it ended, with its last lines (secrets hidden), with its next
+request; it is not woken for it. The agent is asked to put commands
+that only you can run, such as one that asks for your password, in
+such blocks.
 
 ## Side chats
 

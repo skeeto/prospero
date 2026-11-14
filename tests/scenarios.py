@@ -19,7 +19,9 @@ ssh for a remote host's files and processes.
 With --host, the fake provider runs here and the harness runs on the
 Windows host over ssh, reaching the provider through a reverse tunnel;
 PATH is the prospero.exe already on that host. busybox.exe is copied next
-to it from the host's w64devkit, which is how the harness finds its shell.
+to it from the host's w64devkit, which is how the harness finds its shell;
+from a newer w64devkit, whose busybox has no shell applet, its sh.exe too,
+and the harness runs with w64devkit's bin first on PATH (see stageshell).
 
   uv run tests/scenarios.py --prospero 'C:/DOCUME~1/u/LOCALS~1/Temp/prospero.exe' \\
       --xp XPHOST [NAME ...]
@@ -172,9 +174,34 @@ class LocalHost:
             print(f"     kill: {e}", flush=True)
 
 
+def stageshell(host, root):
+    """Copy w64devkit's shell into the run's root, where the harness
+    finds it next to itself: busybox.exe, or, from a newer w64devkit
+    whose busybox.exe has no shell applet, its separate sh.exe beside
+    it, as in w64devkit's bin. That sh.exe finds the usual tools on
+    PATH alone, so then the bin's own path, for the harness's PATH
+    (pathenv), else None."""
+    bb = '"$HOME/w64devkit/bin/busybox.exe"'
+    ok = host.sh(f'{bb} sh -c "echo ok" 2>/dev/null || true', check=False)
+    host.sh(f"mkdir -p {root} && cp {bb} {root}/busybox.exe")
+    if ok.strip() == "ok":
+        return None
+    host.sh(f'cp "$HOME/w64devkit/bin/sh.exe" {root}/sh.exe')
+    return host.sh('cd "$HOME/w64devkit/bin" && pwd -W').strip().replace("/", "\\")
+
+
+def pathenv(binpath, env):
+    """env, with binpath (stageshell's) first on the inherited PATH,
+    which cmd.exe expands; a PATH of env's own stays as given."""
+    if not binpath or "PATH" in (env or {}):
+        return env
+    return dict(env or {}, PATH=binpath + ";%PATH%")
+
+
 class SshHost:
     """A Windows host reached over ssh, with busybox from w64devkit."""
     windows = True
+    binpath = None  # w64devkit's bin, for PATH, as stageshell says
 
     def __init__(self, host, prospero, port, rport):
         self.host = host
@@ -190,9 +217,8 @@ class SshHost:
             self.url = f"http://127.0.0.1:{rport}"
             tmp = self.sh("echo \"$TMP\"").strip()
             self.root = f"{tmp}/prospero-scen-{random.randrange(1 << 32):08x}"
-            self.sh(f"mkdir -p {self.root} && cp $HOME/w64devkit/bin/busybox.exe "
-                    f"{self.root}/busybox.exe && cp {shlex.quote(prospero)} "
-                    f"{self.root}/prospero.exe")
+            self.binpath = stageshell(self, self.root)
+            self.sh(f"cp {shlex.quote(prospero)} {self.root}/prospero.exe")
         except BaseException:
             self.close()
             raise
@@ -283,6 +309,7 @@ class SshHost:
             return '"' + a + '"' if (" " in a or not a) else a
         win = lambda p: p.replace("/", "\\")
         # cmd.exe keeps a blank before && in the value, hence the quotes
+        env = pathenv(self.binpath, env)
         sets = "".join(f'set "{k}={v}"&& ' for k, v in (env or {}).items())
         cmd = (f"{sets}cd /d {win(cwd)} && {win(self.exe)} " +
                " ".join(q(a) for a in args))
@@ -342,9 +369,8 @@ class XpHost(SshHost):
         # A name of the run's own, which no other run's harness, nor any
         # engine of the user's, has
         self.exename = f"p-{run}.exe"
-        self.sh(f"mkdir -p {self.root} && "
-                f"cp \"$HOME/w64devkit/bin/busybox.exe\" {self.root}/busybox.exe && "
-                f"cp {shlex.quote(prospero)} {self.root}/{self.exename}")
+        self.binpath = stageshell(self, self.root)
+        self.sh(f"cp {shlex.quote(prospero)} {self.root}/{self.exename}")
         self.exe = f"{self.root}/{self.exename}"
 
     def close(self):
@@ -370,6 +396,8 @@ class XpHost(SshHost):
 
     def popen(self, args, cwd, stdin=False, env=None):
         sets = "".join(f"{k}={shlex.quote(v)} " for k, v in (env or {}).items())
+        if self.binpath and "PATH" not in (env or {}):
+            sets += f'PATH={shlex.quote(self.binpath)}";$PATH" '
         cmd = (f"cd {shlex.quote(cwd)} && {sets}{shlex.quote(self.exe)} " +
                " ".join(shlex.quote(a) for a in args))
         return subprocess.Popen(
@@ -2191,7 +2219,9 @@ def file_links(t):
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")
-    t.check(bullet in shown and "around a path with spaces.\n\nWorking directory: " in shown,
+    # Then the Run blocks' bullet, read_terminal being offered
+    t.check(bullet in shown and "around a path with spaces.\n- When the user must run" in shown
+            and "Run everything else yourself.\n\nWorking directory: " in shown,
             f"attended: {shown[:1200]!r}")
     kid = fake_provider.system_of(t.requests(t.model2)[0]["body"])
     t.check(bullet in kid, f"its subagent: {kid[:1200]!r}")
@@ -4092,7 +4122,8 @@ def hello_caps(t):
                  "message", "bypass", "nofolder", "dir", "config.create", "side", "background", "models",
                  "mcp", "mcp.auth", "task.remote", "task.host", "memory", "shell",
                  "git", "answer.trust", "trash", "cut", "endpoint.auth",
-                 "endpoint.copilot", "term", "ask.hold", "fs", "pause", "skill.fetch"} <= set(caps)
+                 "endpoint.copilot", "term", "ask.hold", "fs", "pause", "skill.fetch",
+                 "term.edit", "term.run"} <= set(caps)
                 and "host" not in caps,
                 f"caps: {caps}")
         want = 0 if isinstance(t.host, XpHost) else 1  # ConPTY, from 10 1809
@@ -5448,7 +5479,7 @@ def role_words(t):
                 f"roles {list(roles)}")
         default = ["read", "write", "edit", "shell", "grep", "glob", "todo_write", "jobs",
                    "job_output", "job_kill", "task", "skill", "sessions", "send_message",
-                   "memory", "web_search", "web_fetch"]
+                   "memory", "web_search", "web_fetch", "read_terminal"]
         every = default[:11] + ["desktop"] + default[11:]
         t.check(roles["general"]["tools"] == default, f"general {roles['general']}")
         t.check(roles["every"]["tools"] == every, f"* {roles['every']}")
@@ -9863,6 +9894,94 @@ def winfarlinks(t, base):
     local = os.path.join(base, "jlocal")
     winjunction(local, "\\??\\" + os.path.abspath(base))
     return far, local
+
+
+@scenario(bound=60)
+def fs_stall(t):
+    """fs.read, fs.stat and dir run on workers (fswork.cpp), so a stalled
+    path stops nothing else: a slow read answers after a quick one sent
+    later; a dead path answers "not responding" once its worker is stuck,
+    and then is refused at once, while other paths still work; with every
+    worker stuck, new jobs answer busy; quit still exits promptly. The
+    stalls are a test hook (PROSPERO_TEST_FSSTALL), and a worker is stuck
+    after 2 s here (PROSPERO_TEST_FSSTUCK_MS). The stall keys hold letters
+    past f, so that no hex nonce in the base folder's name matches."""
+    base = t.host.join(t.base, "fsstall")
+    t.host.mkdir(t.host.join(base, "zdeaddir"))
+    hello = t.host.join(base, "hello.txt")
+    slow = t.host.join(base, "slowfile.txt")
+    t.host.write(hello, "hello\n")
+    t.host.write(slow, "slow\n")
+    for i in range(1, 9):
+        t.host.write(t.host.join(base, f"zdead{i}.txt"), "dead\n")
+    stuck = "the file system is not responding"
+    busy = "the file system is busy: try again"
+    h = t.headless(env={"PROSPERO_TEST_FSSTALL": "slowfile=1500;zdead=600000",
+                        "PROSPERO_TEST_FSSTUCK_MS": "2000"})
+    try:
+        h.call("hello", proto=0, client="scenarios")
+
+        # Sent together, the quick one answers first
+        a = h.send("fs.read", path=slow)
+        b = h.send("fs.read", path=hello)
+        for i in (a, b):
+            h.wait(lambda e: e.get("ev") == "reply" and e.get("id") == i, 10)
+        got = [e for e in h.events if e.get("ev") == "reply" and e.get("id") in (a, b)]
+        t.check([e["id"] for e in got] == [b, a], f"order: {[e['id'] for e in got]}")
+        t.check(all(e.get("ok") == 1 for e in got), f"slow and quick: {got}")
+
+        # A dead path: not responding once stuck, then at once
+        dead1 = t.host.join(base, "zdead1.txt")
+        t0 = time.monotonic()
+        r = h.call("fs.read", path=dead1, timeout=10)
+        took = time.monotonic() - t0
+        t.check(r.get("ok") == 0 and r.get("err") == stuck and took < 5,
+                f"dead1 in {took:.1f} s: {r}")
+        t0 = time.monotonic()
+        r = h.call("fs.read", path=dead1, timeout=10)
+        took = time.monotonic() - t0
+        t.check(r.get("ok") == 0 and r.get("err") == stuck and took < 1,
+                f"dead1 again in {took:.1f} s: {r}")
+        r = h.call("fs.stat", paths=[dead1, hello], timeout=10)
+        t.check(r.get("ok") == 1 and [s.get("type") for s in r.get("stats", [])] ==
+                ["bad", "file"], f"stat dead1 and hello: {r}")
+
+        # A dead folder: not responding, then refused; its parent lists
+        deaddir = t.host.join(base, "zdeaddir")
+        r = h.call("dir", path=deaddir, timeout=10)
+        t.check(r.get("ok") == 0 and r.get("err") == stuck, f"dir deaddir: {r}")
+        t0 = time.monotonic()
+        r = h.call("dir", path=deaddir, timeout=10)
+        took = time.monotonic() - t0
+        t.check(r.get("ok") == 0 and r.get("err") == stuck and took < 1,
+                f"dir deaddir again in {took:.1f} s: {r}")
+        r = h.call("dir", path=base, timeout=10)
+        names = sorted(e.get("name") for e in r.get("entries", []))
+        t.check(r.get("ok") == 1 and "hello.txt" in names and "zdeaddir" in names,
+                f"dir of the folder: {r}")
+
+        # Every worker stuck: new jobs answer busy
+        ids = [h.send("fs.read", path=t.host.join(base, f"zdead{i}.txt"))
+               for i in range(2, 8)]
+        for i in ids:
+            r = h.wait(lambda e: e.get("ev") == "reply" and e.get("id") == i, 10)
+            t.check(r.get("ok") == 0 and r.get("err") == stuck, f"dead2..7: {r}")
+        t0 = time.monotonic()
+        c = h.send("fs.read", path=t.host.join(base, "zdead8.txt"))
+        d = h.send("fs.read", path=hello)
+        for i in (c, d):
+            r = h.wait(lambda e: e.get("ev") == "reply" and e.get("id") == i, 10)
+            t.check(r.get("ok") == 0 and r.get("err") == busy, f"with all stuck: {r}")
+        took = time.monotonic() - t0
+        t.check(took < 5, f"busy in {took:.1f} s")
+
+        t0 = time.monotonic()
+        h.send("quit")
+        h.exit(timeout=10)
+        took = time.monotonic() - t0
+        t.check(took < 5, f"quit in {took:.1f} s")
+    finally:
+        h.close()
 
 
 @scenario(bound=30)
@@ -17557,10 +17676,18 @@ def vtplain(data):
 
 
 def ttyprobe(t):
-    """[terminal] shell set to this harness's own --tty-probe. On Windows
-    it is a copy that runs as a console program, which ConPTY attaches,
-    as it never does a GUI program: the same image with its subsystem,
-    in the PE header (offset 0x3c, then 92), changed from 2 to 3."""
+    """[terminal] shell set to this harness's own --tty-probe (probeexe)."""
+    exe = probeexe(t)
+    # Quoted as a word of its own, and so the whole value too
+    t.host.write(t.config, (t.host.read(t.config) or "") +
+                 f'[terminal]\nshell = "\\"{exe}\\" --tty-probe"\n')
+
+
+def probeexe(t):
+    """This harness, to run as --tty-probe. On Windows it is a copy that
+    runs as a console program, which ConPTY attaches, as it never does a
+    GUI program: the same image with its subsystem, in the PE header
+    (offset 0x3c, then 92), changed from 2 to 3."""
     if isinstance(t.host, XpHost):
         raise Skip("no ConPTY before Windows 10 1809 (term_refused)")
     exe = getattr(t.host, "exe", None) or t.host.prospero
@@ -17577,9 +17704,7 @@ def ttyprobe(t):
                       f"if [ \"$(od -An -tu1 -j$at -N1 {probe} | tr -d ' ')\" = 2 ]; then "
                       f"printf '\\003' | dd of={probe} bs=1 seek=$at conv=notrunc 2>/dev/null; fi")
         exe = probe
-    # Quoted as a word of its own, and so the whole value too
-    t.host.write(t.config, (t.host.read(t.config) or "") +
-                 f'[terminal]\nshell = "\\"{exe}\\" --tty-probe"\n')
+    return exe
 
 
 class Tty:
@@ -17790,6 +17915,9 @@ def term_basic(t):
         got = tt.line("winch ")
         t.check(got == "winch 120x40", got)
 
+        # Windows takes a process born within 200 ms of the shell as part
+        # of it (a launcher's), and a fast host gets this far sooner
+        time.sleep(0.3)
         tt.type("busy 2500\n")
         tt.pump(lambda x: 1 in x.busy, 10, "term.busy 1")
         tt.line("busy done", 10)
@@ -17840,6 +17968,9 @@ def term_flood(t):
                 f"{tt.dups} records again, {tt.resends} resends")
         t.check(tt.window > TERM_WINDOW * 3 // 4, f"the window never filled: {tt.window}")
         t.note(f"{tt.records} records, window {tt.window}")
+        st = h.call("status")
+        t.check(st.get("screens") == 1 and st.get("fed") == len(tt.data),
+                f"the engine's screen was fed {st.get('fed')} of {len(tt.data)}: {st}")
         tt.type("exit 0\n")
         t.check(tt.ended().get("code") == 0, "exit 0")
     finally:
@@ -17879,6 +18010,9 @@ def term_resend(t):
         t.check(floodof(tt, start, n) == floodbytes(n), "the flood is whole")
         t.check(tt.window <= TERM_WINDOW, f"{tt.window} bytes unacked at once")
         t.check(tt.end is None, f"no end: {tt.end}")
+        st = h.call("status")
+        t.check(st.get("fed") == len(tt.data),
+                f"the screen was fed once, all of it: {st.get('fed')} of {len(tt.data)}")
     finally:
         h.close()
 
@@ -18010,6 +18144,270 @@ def term_refused(t):
         h.close()
 
 
+
+def probeargs(words):
+    """--tty-probe's "args" line for these words: each in brackets, with
+    controls, brackets and backslash as \\xHH."""
+    def esc(w):
+        out = []
+        for b in w.encode():
+            if b < 0x20 or b == 0x7f or b in b"[]\\":
+                out.append(f"\\x{b:02x}")
+            else:
+                out.append(chr(b))
+        return "".join(out).encode("latin-1").decode("utf-8")
+    return "args" + "".join(f" [{esc(w)}]" for w in words)
+
+
+def editready(tt, timeout=20):
+    """Waits for the editor, a probe, to start, past whatever the login
+    shell or the OSC 1 before it wrote."""
+    tt.pump(lambda x: b"probe ready\n" in x.text, timeout, "probe ready")
+    tt.cur = tt.text.index(b"probe ready\n") + len(b"probe ready\n")
+
+
+def editbin(t, names=("vi", "hx")):
+    """A folder of editors by these names, links to this harness, whose
+    --tty-probe stands in for one."""
+    bindir = t.host.join(t.base, "bin")
+    os.makedirs(bindir, exist_ok=True)
+    for name in names:
+        os.symlink(t.host.prospero, os.path.join(bindir, name))
+    return bindir
+
+
+def editargs(t, tt, want):
+    tt.type("args\n")
+    got = tt.line("args")
+    t.check(got == probeargs(want), f"args {got!r}, wanted {probeargs(want)!r}")
+
+
+@scenario(bound=60, posix=True)
+def term_edit(t):
+    """term.open's edit runs an editor on a file in a terminal, with the
+    preset's arguments ahead of the path, which no shell parses: blanks,
+    quotes, $ and a newline arrive whole. OSC 1 names it, the request's
+    variables are gone, and its exit is the terminal's. A template takes
+    {file} and {line}, and an editor missing where it says runs by its
+    name on the login shell's PATH."""
+    bindir = editbin(t)
+    vi = t.host.join(bindir, "vi")
+    hx = t.host.join(bindir, "hx")
+    # The profile puts the editors first on PATH, for the rebased one
+    t.host.write(t.host.join(t.home, ".profile"),
+                 f"PATH='{bindir}':$PATH; export PATH\n")
+    h = t.headless(env={"SHELL": "/bin/sh", "VISUAL": "", "EDITOR": ""})
+    try:
+        sid = termsession(t, h)
+        path = t.host.join(t.work, "a b'c\"$d\ne.txt")
+        t.host.write(path, "x\n")
+        tt = Tty(t, h, sid, edit={"path": path, "line": 12, "editor": f"'{vi}' --tty-probe"})
+        argv = tt.reply.get("argv")
+        t.check(argv and argv[-1] == "--tty-edit", f"argv {argv}")
+        t.check("editor" not in tt.reply, f"no editor in the reply: {tt.reply}")
+        t.check(samedir(t, tt.reply.get("cwd"), t.work), f"cwd {tt.reply.get('cwd')}")
+        editready(tt)
+        t.check(b"\x1b]1;vi\x07" in tt.data, f"OSC 1 vi: {bytes(tt.data[:300])!r}")
+        editargs(t, tt, ["--tty-probe", "+12", path])
+        tt.type("env PROSPERO_EDIT_FILE\n")
+        got = tt.line("env PROSPERO_EDIT_FILE")
+        t.check(got == "env PROSPERO_EDIT_FILE unset", got)
+        tt.type("cwd\n")
+        got = tt.line("cwd ")
+        t.check(samedir(t, got[4:], t.work), got)
+        tt.type("exit 3\n")
+        end = tt.ended()
+        t.check(end.get("code") == 3, f"term.end {end}")
+
+        # hx takes path:line:col
+        tt = Tty(t, h, sid, edit={"path": path, "line": 12, "col": 3,
+                                  "editor": f"'{hx}' --tty-probe"})
+        editready(tt)
+        t.check(b"\x1b]1;hx\x07" in tt.data, f"OSC 1 hx: {bytes(tt.data[:300])!r}")
+        editargs(t, tt, ["--tty-probe", f"{path}:12:3"])
+        tt.type("exit 0\n")
+        t.check(tt.ended().get("code") == 0, "exit 0")
+
+        # A template, with {file} and {line}
+        tt = Tty(t, h, sid, edit={"path": path, "line": 12,
+                                  "template": f"'{vi}' --tty-probe --at {{file}}:{{line}}"})
+        editready(tt)
+        editargs(t, tt, ["--tty-probe", "--at", f"{path}:12"])
+        tt.type("exit 0\n")
+        t.check(tt.ended().get("code") == 0, "exit 0")
+
+        # Not where it says: vi by its name, on the profile's PATH
+        tt = Tty(t, h, sid, edit={"path": path, "line": 7,
+                                  "editor": "/nonexistent/vi --tty-probe"})
+        editready(tt)
+        editargs(t, tt, ["--tty-probe", "+7", path])
+        tt.type("exit 0\n")
+        t.check(tt.ended().get("code") == 0, "exit 0")
+    finally:
+        h.close()
+
+
+@scenario(bound=60, posix=True)
+def term_edit_profile(t):
+    """With no editor given, the host's own runs: $VISUAL as the login
+    shell's profile sets it, bash's interactive ~/.bashrc too (-i); with
+    none on PATH, the terminal says so and ends with 127. An empty PATH
+    entry never runs a vi in the session's folder."""
+    bindir = editbin(t)
+    vi = t.host.join(bindir, "vi")
+    hx = t.host.join(bindir, "hx")
+    path = t.host.join(t.work, "f.txt")
+    t.host.write(path, "x\n")
+    profile = t.host.join(t.home, ".profile")
+    t.host.write(profile, f"VISUAL=\"'{vi}' --tty-probe\"; export VISUAL\n")
+    env = {"SHELL": "/bin/sh", "VISUAL": "", "EDITOR": ""}
+    h = t.headless(env=env)
+    try:
+        sid = termsession(t, h)
+        tt = Tty(t, h, sid, edit={"path": path, "line": 3})
+        editready(tt)
+        editargs(t, tt, ["--tty-probe", "+3", path])
+        tt.type("exit 0\n")
+        t.check(tt.ended().get("code") == 0, "exit 0")
+    finally:
+        h.close()
+
+    if os.path.exists("/bin/bash"):
+        # Behind Ubuntu's guard, which only an interactive shell passes
+        t.host.write(t.host.join(t.home, ".bashrc"),
+                     "case $- in *i*) ;; *) return;; esac\n"
+                     f"VISUAL=\"'{hx}' --tty-probe\"; export VISUAL\n")
+        t.host.write(t.host.join(t.home, ".bash_profile"), ". ~/.bashrc\n")
+        h = t.headless(env=dict(env, SHELL="/bin/bash",
+                                BASH_SILENCE_DEPRECATION_WARNING="1"))
+        try:
+            sid = termsession(t, h)
+            tt = Tty(t, h, sid, edit={"path": path, "line": 3})
+            editready(tt)
+            editargs(t, tt, ["--tty-probe", f"{path}:3"])
+            tt.type("exit 0\n")
+            t.check(tt.ended().get("code") == 0, "exit 0")
+        finally:
+            h.close()
+    else:
+        t.note("no /bin/bash: its -i case skipped")
+
+    # An empty PATH entry, which sh takes as the session's folder, where
+    # a vi waits: the one found on PATH's full-path entries runs
+    t.host.write(t.host.join(t.work, "vi"), "#!/bin/sh\necho planted; exit 9\n")
+    os.chmod(t.host.join(t.work, "vi"), 0o755)
+    t.host.write(profile, f"PATH=\":{bindir}:$PATH\"; export PATH\n"
+                          "VISUAL='vi --tty-probe'; export VISUAL\n")
+    h = t.headless(env=env)
+    try:
+        sid = termsession(t, h)
+        tt = Tty(t, h, sid, edit={"path": path, "line": 3})
+        editready(tt)
+        editargs(t, tt, ["--tty-probe", "+3", path])
+        tt.type("exit 0\n")
+        t.check(tt.ended().get("code") == 0, "exit 0")
+        t.check(b"planted" not in tt.data, f"output {bytes(tt.data[-300:])!r}")
+    finally:
+        h.close()
+        os.remove(t.host.join(t.work, "vi"))
+
+    # No editor at all: PATH set after the system's profile (macOS's
+    # path_helper puts /usr/bin, and its vi, back)
+    empty = t.host.join(t.base, "empty")
+    os.makedirs(empty, exist_ok=True)
+    t.host.write(profile, f"PATH='{empty}'; export PATH; unset VISUAL EDITOR\n")
+    h = t.headless(env=env)
+    try:
+        sid = termsession(t, h)
+        tt = Tty(t, h, sid, edit={"path": path, "line": 3})
+        end = tt.ended()
+        t.check(end.get("code") == 127, f"term.end {end}")
+        t.check(b"no editor here" in tt.data, f"output {bytes(tt.data[-300:])!r}")
+    finally:
+        h.close()
+
+
+@scenario(bound=60)
+def term_edit_windows(t):
+    """On Windows the editor is found up front with PATHEXT, by its path
+    or its name (vi.cmd), and runs through cmd.exe by its full path, the
+    file's path quoted with backslashes; the reply names it. A path that
+    holds %, or U+FF02, is refused, as are an editor that is nowhere and
+    one after VAR=value."""
+    if not t.host.windows:
+        raise Skip("Windows only (term_edit on POSIX)")
+    probe = probeexe(t).replace("/", "\\")
+    bindir = t.host.join(t.base, "bin")
+    t.host.mkdir(bindir)
+    # The probe stays off PATH, where plain vi would find vi.exe first
+    t.host.write(t.host.join(bindir, "vi.cmd"), f'@"{probe}" --tty-probe %*\r\n')
+    system = "C:\\Windows\\System32;C:\\Windows"
+    winbin = bindir.replace("/", "\\")
+    h = t.headless(env={"PATH": f"{winbin};{system}", "VISUAL": "", "EDITOR": ""})
+    try:
+        sid = termsession(t, h)
+        path = t.host.join(t.work, "a b.txt")
+        t.host.write(path, "x\n")
+        winpath = path.replace("/", "\\")
+        for editor in [t.host.join(bindir, "vi.cmd").replace("/", "\\"), "vi"]:
+            tt = Tty(t, h, sid, cols=400, edit={"path": path, "line": 12, "editor": editor})
+            t.check(tt.reply.get("editor") == "vi", f"reply {tt.reply}")
+            tt.line("probe ready")
+            editargs(t, tt, ["--tty-probe", "+12", winpath])
+            tt.type("exit 0\n")
+            t.check(tt.ended().get("code") == 0, f"{editor}: exit 0")
+        bad = t.host.join(t.work, "100%.txt")
+        r = h.call("term.open", sid=sid, cols=80, rows=24, edit={"path": bad, "editor": "vi"})
+        t.check(not r.get("ok") and "cmd.exe" in r.get("err", ""), f"a path with %: {r}")
+        # A fullwidth quote, which an ANSI editor gets as " (WorstFit)
+        bad = t.host.join(t.work, "a＂ +!calc ＂.txt")
+        r = h.call("term.open", sid=sid, cols=80, rows=24, edit={"path": bad, "editor": "vi"})
+        t.check(not r.get("ok") and "Windows may pass" in r.get("err", ""),
+                f"a path with U+FF02: {r}")
+        # cmd.exe takes no VAR=value words
+        r = h.call("term.open", sid=sid, cols=80, rows=24,
+                   edit={"path": path, "editor": "FOO=1 vi"})
+        t.check(not r.get("ok") and "VAR=value" in r.get("err", ""), f"FOO=1 vi: {r}")
+    finally:
+        h.close()
+
+    h = t.headless(env={"PATH": system, "VISUAL": "", "EDITOR": ""})
+    try:
+        sid = termsession(t, h)
+        r = h.call("term.open", sid=sid, cols=80, rows=24,
+                   edit={"path": t.host.join(t.work, "a b.txt"), "editor": "nosuchedit"})
+        t.check(not r.get("ok") and "no editor found here: nosuchedit" in r.get("err", ""),
+                f"a missing editor: {r}")
+    finally:
+        h.close()
+
+
+@scenario(bound=15)
+def term_edit_refused(t):
+    """term.open refuses an edit that is not an object, a relative path,
+    and both an editor and a template; with no ConPTY (XP), term_refused's
+    error comes first."""
+    h = t.headless()
+    try:
+        sid = termsession(t, h)
+        path = t.host.join(t.work, "f.txt")
+        cases = [
+            ("f.txt", "edit must be an object"),
+            ({"path": "f.txt"}, "edit.path must be an absolute path"),
+            ({"path": path, "editor": "vi", "template": "vi {file}"},
+             "edit: give editor or template, not both"),
+            ({"path": path, "line": "12"}, "edit.line must be a number"),
+        ]
+        for edit, want in cases:
+            r = h.call("term.open", sid=sid, cols=80, rows=24, edit=edit)
+            if isinstance(t.host, XpHost):
+                t.check(not r.get("ok") and "1809" in r.get("err", ""), f"term.open: {r}")
+            else:
+                t.check(not r.get("ok") and r.get("err") == want, f"{edit!r}: {r}")
+        t.check(h.call("status").get("terms") == 0, "no terminal")
+    finally:
+        h.close()
+
 # The soak: sessions under 10% random faults for a while
 
 def soak(host, minutes, workers):
@@ -18060,6 +18458,505 @@ def soak(host, minutes, workers):
     for p in problems[:20]:
         print("  " + p)
     return not problems
+
+
+# read_terminal: the agent reads the session's terminals, through the
+# engine's own screen of each, with what was typed at password prompts
+# hidden
+
+def readsession(t, h, cwd=None, attended=True):
+    return h.call("new", cwd=cwd or t.work, model=t.model, endpoint="fake",
+                  attended=attended)["sid"]
+
+
+def turnof(h, sid, text="go", timeout=30):
+    """Prompt a session and wait for its turn's end: the turn's events."""
+    def mine():
+        return [e for e in h.events if e.get("sid") == sid]
+    with h.cond:
+        before = sum(1 for e in mine() if e.get("ev") == "turn.end")
+    h.send("prompt", sid=sid, text=text)
+    deadline = time.monotonic() + timeout
+    with h.cond:
+        while True:
+            evs = mine()
+            ends = [i for i, e in enumerate(evs) if e.get("ev") == "turn.end"]
+            if len(ends) > before:
+                start = ends[before - 1] + 1 if before else 0
+                return evs[start:ends[before] + 1]
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise Failure(f"timed out waiting for the turn; saw "
+                              f"{compact([e.get('ev') for e in evs])}")
+            h.cond.wait(left)
+
+
+def toolends(evs):
+    return [e for e in evs if e.get("ev") == "tool.end"]
+
+
+def saidin(evs):
+    """The visible text of a turn's assistant messages."""
+    return "".join(b.get("text", "") for e in evs if e.get("ev") == "assistant"
+                   for b in e.get("blocks", []) if b.get("t") == "text")
+
+
+@scenario(bound=40)
+def read_terminal(t):
+    """read_terminal lists the session's terminals newest first, reads the
+    one used last by default, a tab's last lines, a title as its label,
+    a full-screen program's screen, and says when nothing is new."""
+    ttyprobe(t)
+    h = t.headless()
+    try:
+        sid = readsession(t, h)
+        one = Tty(t, h, sid)
+        one.line("probe ready")
+        one.type("lines 150\r")
+        one.line("line 150")
+        two = Tty(t, h, sid)
+        two.line("probe ready")
+        two.type("title build box\r")
+        two.type("say \x1b[?1049hfullscreen\r")
+        two.pump(lambda x: b"fullscreen" in x.text, 10, "the full screen")
+        one.type("say hello there\r")
+        one.line("hello there")
+        st = h.call("status")
+        t.check(st.get("screens") == 2, f"two screens: {st}")
+        ends = toolends(turnof(h, sid))
+        statuses = [e.get("status") for e in ends]
+        t.check(statuses == ["ok", "ok", "error", "ok"], f"statuses {statuses}")
+        first, second, third, fourth = [e.get("text", "") for e in ends]
+        t.check(first.find(f"terminal {two.tid}: build box") <
+                first.find(f"terminal {one.tid}:") and "at its prompt" in first,
+                f"newest first, the title its label: {first[:300]!r}")
+        t.check(f"Terminal {one.tid}, its last lines:" in first and
+                "hello there" in first and "line 150" in first and
+                "line 40\n" not in first, f"the last 100 lines of the one used last: {first[-400:]!r}")
+        t.check("fullscreen" in second and "full-screen program" in second and
+                "line 150" not in second, f"tab 2's screen: {second!r}")
+        t.check("No terminal 9 is among them" in third, f"no such tab: {third!r}")
+        t.check("no new output since you last read it" in fourth,
+                f"nothing new: {fourth[-200:]!r}")
+    finally:
+        h.close()
+
+
+@scenario(conf={"_extra": "[endpoint stored]\nurl = http://127.0.0.1:9/v1\n"
+                          "key = literal-config-secret\n"
+                          "[endpoint viaenv]\nurl = http://127.0.0.1:9/v1\n"
+                          "key = env:PROSPERO_TERMKEY\n"}, bound=40)
+def read_terminal_secret(t):
+    """What was typed at a password prompt is hidden wherever it shows,
+    a program's slip included; a line typed ahead of the prompt too
+    (POSIX); a short one only as a whole word; secret settings' values
+    too; and secrets are hidden before lines are cut."""
+    ttyprobe(t)
+    h = t.headless(env={"PROSPERO_TERMKEY": "env-config-secret-9"})
+    try:
+        sid = readsession(t, h)
+        tt = Tty(t, h, sid)
+        tt.line("probe ready")
+        tt.type("pass\r")
+        tt.pump(lambda x: b"Password: " in x.text, 10, "the prompt")
+        tt.type("hunter2-secret\r")
+        tt.line("pass got")
+        tt.type("say my pw is hunter2-secret, again\r")
+        tt.line("my pw is")
+        # A short secret, hidden only where it stands as a word
+        tt.type("pass\r")
+        tt.pump(lambda x: x.text.count(b"Password: ") >= 2, 10, "the second prompt")
+        tt.type("abcd\r")
+        tt.pump(lambda x: x.text.count(b"pass got") >= 2, 10, "the second answer")
+        tt.type("say abcdef abcd xabcdx\r")
+        tt.line("abcdef")
+        tt.type("env PROSPERO_TERMKEY\r")
+        tt.line("env PROSPERO_TERMKEY")
+        tt.type("say literal-config-secret\r")
+        tt.line("literal-config")
+        if not t.host.windows:
+            # Cut at READ_LINEMAX (2000) bytes, the secret across the cut
+            # (ConPTY repaints a long line as rows, which line() can't match)
+            tt.type("say " + "x" * 1995 + "hunter2-secret\r")
+            tt.line("x" * 100)
+            # Typed ahead, echoed, while the program had not yet turned
+            # echo off: learned once it did
+            tt.type("cooked\r")
+            tt.line("cooked")
+            tt.type("pass 600\rtyped-ahead-pw\r")
+            tt.pump(lambda x: b"pass got typed" in x.text, 10, "the typed-ahead answer")
+        ends = toolends(turnof(h, sid))
+        text = ends[0].get("text", "") if ends else ""
+        t.check(ends and ends[0].get("status") == "ok", f"read: {ends}")
+        for leak in ["hunter2-secret", "literal-config-secret", "env-config-secret-9",
+                     "typed-ahead-pw", "hunte", " abcd "]:
+            t.check(leak not in text, f"{leak!r} shows: {text[-1500:]!r}")
+        t.check("pass got [hidden]" in text and "my pw is [hidden], again" in text,
+                f"hidden where it shows: {text[:800]!r}")
+        t.check("abcdef [hidden] xabcdx" in text, f"a short one as a word only: {text!r}")
+        t.check("PROSPERO_TERMKEY=[hidden]" in text, f"an env: setting's value: {text!r}")
+        t.check("secrets are hidden" in text, f"the count is told: {text[-300:]!r}")
+        t.check(t.host.windows or "x" * 1995 + "[hidden"[:5] in text,
+                f"cut after hiding: {text[-2200:-2000]!r}")
+        if not t.host.windows:
+            t.check("pass got typed" not in text or "pass got [hidden]" in text,
+                    "typed ahead, hidden")
+    finally:
+        h.close()
+
+
+@scenario(bound=40)
+def read_terminal_root(t):
+    """A subagent reads its root's terminals; a session of its own in
+    another folder sees none of them."""
+    ttyprobe(t)
+    h = t.headless()
+    try:
+        sid = readsession(t, h)
+        tt = Tty(t, h, sid)
+        tt.line("probe ready")
+        tt.type("say the root's own tab\r")
+        tt.line("the root's own tab")
+        turnof(h, sid, text="root", timeout=40)
+        kids = [e for e in h.all("tool.end") if e.get("sid") != sid]
+        t.check(kids and "the root's own tab" in kids[0].get("text", ""),
+                f"the subagent read it: {kids}")
+        other = t.host.join(t.base, "elsewhere")
+        t.host.mkdir(other)
+        osid = readsession(t, h, cwd=other)
+        ends = toolends(turnof(h, osid, text="other"))
+        t.check(ends and "no Terminal tabs open" in ends[0].get("text", ""),
+                f"another session sees none: {ends}")
+    finally:
+        h.close()
+
+
+@scenario(bound=60)
+def read_terminal_loop(t):
+    """Reading a terminal again and again with nothing new is stopped as
+    a loop, as any repeated call is."""
+    ttyprobe(t)
+    h = t.headless()
+    try:
+        sid = readsession(t, h)
+        tt = Tty(t, h, sid)
+        tt.line("probe ready")
+        ends = toolends(turnof(h, sid, timeout=50))
+        st = [e.get("status") for e in ends]
+        t.check(st == ["ok"] * 6 + ["error"], f"statuses {st}")
+        t.check("already made 4 times" in ends[-1].get("text", ""), f"loop: {ends[-1]}")
+    finally:
+        h.close()
+
+
+@scenario(bound=30)
+def read_terminal_off(t):
+    """With [terminal] agent off, no session is offered read_terminal and
+    the engine keeps no screens."""
+    ttyprobe(t)
+    t.host.write(t.config, t.host.read(t.config) + "agent = false\n")  # [terminal]
+    h = t.headless()
+    try:
+        sid = readsession(t, h)
+        tt = Tty(t, h, sid)
+        tt.line("probe ready")
+        t.check(h.call("status").get("screens") == 0, "no screens")
+        evs = turnof(h, sid)
+        ends = toolends(evs)
+        t.check(ends and "is not available" in ends[0].get("text", ""), f"unknown: {ends}")
+        said = saidin(evs)
+        t.check("Tools: " in said and "read_terminal" not in said, f"not offered: {said!r}")
+    finally:
+        h.close()
+
+
+@scenario(bound=40)
+def read_terminal_replay(t):
+    """A session offered read_terminal keeps it when it opens again, and
+    one born without it (unattended) never gains it."""
+    h = t.headless()
+    try:
+        sid = readsession(t, h)
+        plain = readsession(t, h, attended=False)
+    finally:
+        h.close()
+    h = t.headless()
+    try:
+        for s, want in [(sid, True), (plain, False)]:
+            t.check(h.call("open", sid=s).get("ok") == 1, "reopened")
+            evs = turnof(h, s)
+            said = saidin(evs)
+            t.check("Tools: " in said and
+                    ("read_terminal" in said.split("Tools: ")[-1]) == want,
+                    f"offered {want}: {said!r}")
+    finally:
+        h.close()
+
+
+def waitstatus(t, h, key, want, within=5):
+    """status's key once it is want, else a failed check."""
+    deadline = time.monotonic() + within
+    while True:
+        got = h.call("status").get(key)
+        if got == want or time.monotonic() >= deadline:
+            t.check(got == want, f"status {key} {got}, wanted {want}")
+            return got
+        time.sleep(0.05)
+
+
+def sessevs(h, sid):
+    with h.cond:
+        return [e for e in h.events if e.get("sid") == sid]
+
+
+@scenario(bound=60)
+def term_kept(t):
+    """An ended terminal's screen is kept for read_terminal: term.close
+    frees it, as does a hang-up of all; when every slot is taken, a new
+    terminal takes the kept one unused longest. One closed while it ran
+    keeps nothing."""
+    ttyprobe(t)
+    h = t.headless()
+    try:
+        sid = termsession(t, h)
+        tt = Tty(t, h, sid)
+        tt.line("probe ready")
+        tt.type("exit 0\n")
+        tt.ended()
+        waitstatus(t, h, "kept", 1)
+        h.send("term.close", tid=tt.tid)
+        waitstatus(t, h, "kept", 0)
+
+        tt = Tty(t, h, sid)
+        tt.line("probe ready")
+        h.send("term.close", tid=tt.tid)  # while it runs
+        time.sleep(0.5)
+        waitstatus(t, h, "kept", 0)
+        waitstatus(t, h, "terms", 0)
+
+        # More ended terminals than slots (32)
+        first = None
+        for i in range(34):
+            tt = Tty(t, h, sid)
+            first = first or tt.tid
+            tt.line("probe ready")
+            tt.type("exit 0\n")
+            tt.ended()
+            waitstatus(t, h, "kept", min(i + 1, 32))
+        st = h.call("status")
+        t.check(st.get("kept") == 32 and st.get("screens") == 32, f"status {st}")
+        h.send("term.close", tid=first)  # evicted already: nothing
+        h.send("term.close", tid=first + 2)
+        waitstatus(t, h, "kept", 31)
+        h.send("term.close", all=True)
+        waitstatus(t, h, "kept", 0)
+    finally:
+        h.close()
+
+
+@scenario(bound=60, posix=True)
+def term_run(t):
+    """term.open's run shows a code block of the agent's, dimmed, then runs
+    it in the terminal's shell, interactive, so that ~/.bashrc's functions
+    work; with PROSPERO_TAB=run and no PROSPERO_RUN_*. Its exit is the
+    terminal's, its screen is kept after, and the agent hears how it
+    ended at its next request, without a turn of its own."""
+    if not os.path.exists("/bin/bash"):
+        raise Skip("no /bin/bash")
+    t.host.write(t.host.join(t.home, ".bashrc"),
+                 "case $- in *i*) ;; *) return;; esac\n"
+                 "runfn() { echo \"fn-$1\"; }\n")
+    t.host.write(t.host.join(t.home, ".bash_profile"), ". ~/.bashrc\n")
+    h = t.headless(env={"SHELL": "/bin/bash", "BASH_SILENCE_DEPRECATION_WARNING": "1",
+                        "PROSPERO_TAB": "inherited", "PROSPERO_RUN_TEXT": "inherited"})
+    try:
+        sid = readsession(t, h)
+        text = ("runfn ok\n"
+                "echo \"tab=$PROSPERO_TAB run=${PROSPERO_RUN_TEXT-unset}\"\n"
+                "exit 3")
+        tt = Tty(t, h, sid, run={"text": text + "\r\n", "lang": "bash", "from": sid})
+        argv = tt.reply.get("argv")
+        t.check(argv and argv[-1] == "--tty-run", f"argv {argv}")
+        t.check(samedir(t, tt.reply.get("cwd"), t.work), f"cwd {tt.reply.get('cwd')}")
+        tt.line("fn-ok")
+        got = tt.line("tab=")
+        t.check(got.strip() == "tab=run run=unset", repr(got))
+        end = tt.ended()
+        t.check(end.get("code") == 3, f"term.end {end}")
+        t.check(b"\x1b[2mrunfn ok" in tt.data, f"the dimmed header: {bytes(tt.data[:200])!r}")
+        waitstatus(t, h, "kept", 1)
+        time.sleep(0.3)
+        kinds = [e.get("ev") for e in sessevs(h, sid)]
+        t.check("turn" not in kinds and "notice" not in kinds,
+                f"no turn, no notice yet: {kinds}")
+
+        evs = turnof(h, sid)
+        notices = [e for e in evs if e.get("ev") == "notice" and e.get("kind") == "terminal"]
+        t.check(len(notices) == 1 and notices[0].get("tid") == tt.tid and
+                notices[0].get("code") == 3 and notices[0].get("ms", -1) >= 0,
+                f"one notice: {notices}")
+        note = notices[0].get("text", "") if notices else ""
+        t.check(note.startswith("The user ran `runfn ok`... (3 lines) from your message, "
+                                f"in terminal {tt.tid}") and
+                "It exited with code 3" in note and "fn-ok" in note,
+                f"notice {note!r}")
+        ends = toolends(evs)
+        read = ends[0].get("text", "") if ends else ""
+        t.check(f"terminal {tt.tid}: `runfn ok`... (the user ran it from your message), "
+                "exited with code 3" in read and "fn-ok" in read and
+                "tab=run" in read, f"read after its end: {read!r}")
+        said = saidin(evs)
+        t.check("It exited with code 3" in said, f"the request had it: {said[-300:]!r}")
+
+        # Read while it runs: told not to poll; a second turn has no notice
+        tt = Tty(t, h, sid, run={"text": "echo started; sleep 30", "lang": "sh",
+                                 "from": sid})
+        tt.line("started")
+        evs = turnof(h, sid)
+        ends = toolends(evs)
+        read = ends[0].get("text", "") if ends else ""
+        t.check("do not poll" in read and ", running" in read, f"read: {read!r}")
+        t.check(not [e for e in evs if e.get("ev") == "notice"], "no notice while it runs")
+        h.send("term.close", tid=tt.tid)
+        deadline = time.monotonic() + 5
+        while not [e for e in sessevs(h, sid) if e.get("ev") == "notice"] and \
+                time.monotonic() < deadline:
+            time.sleep(0.1)
+        evs = turnof(h, sid)
+        notices = [e for e in evs if e.get("ev") == "notice" and e.get("kind") == "terminal"]
+        t.check(len(notices) == 1 and "closed while it ran" in notices[0].get("text", ""),
+                f"closed: {notices}")
+        waitstatus(t, h, "kept", 1)  # the first one's, not this one's
+    finally:
+        h.close()
+
+
+@scenario(bound=60)
+def term_run_parked(t):
+    """A Run's notice reaches its session though it was closed (parked)
+    while the command ran, and goes with its next request after it is
+    opened again; one for a session in the Trash goes nowhere."""
+    ttyprobe(t)
+    h = t.headless()
+    try:
+        sid = readsession(t, h)
+        gone = readsession(t, h)
+        lang = "powershell" if t.host.windows else "sh"
+        a = Tty(t, h, sid, cols=200, run={"text": "Start-Sleep 1; exit 2" if t.host.windows
+                                          else "sleep 1; exit 2", "lang": lang, "from": sid})
+        b = Tty(t, h, sid, cols=200, run={"text": "Start-Sleep 1; exit 6" if t.host.windows
+                                          else "sleep 1; exit 6", "lang": lang, "from": gone})
+        t.check(h.call("close", sid=sid).get("ok") == 1, "closed")
+        t.check(h.call("trash", sid=gone).get("ok") == 1, "trashed")
+        t.check(a.ended(30).get("code") == 2, "exit 2")
+        t.check(b.ended(30).get("code") == 6, "exit 6")
+        time.sleep(0.3)
+        t.check(h.call("open", sid=sid).get("ok") == 1, "reopened")
+        evs = turnof(h, sid)
+        notices = [e for e in evs if e.get("ev") == "notice" and e.get("kind") == "terminal"]
+        t.check([n.get("code") for n in notices] == [2], f"notices {notices}")
+    finally:
+        h.close()
+
+
+@scenario(bound=60, posix=True)
+def term_run_fish(t):
+    """A shell not of sh's family (here a link named fish) runs a Run in
+    two phases: it runs this program again, which runs the block in its
+    own shell (bash) where there is one. Text that starts with - is no
+    option of sh's."""
+    if not os.path.exists("/bin/bash"):
+        raise Skip("no /bin/bash")
+    bindir = t.host.join(t.base, "bin")
+    os.makedirs(bindir, exist_ok=True)
+    fish = os.path.join(bindir, "fish")
+    os.symlink("/bin/sh", fish)
+    h = t.headless(env={"SHELL": fish})
+    try:
+        sid = readsession(t, h)
+        tt = Tty(t, h, sid, run={"text": "echo \"in=${BASH_VERSION:+bash}\"", "lang": "bash",
+                                 "from": sid})
+        got = tt.line("in=")
+        t.check(got.strip() == "in=bash", repr(got))
+        t.check(tt.ended().get("code") == 0, "exit 0")
+        tt = Tty(t, h, sid, run={"text": "-x 2>/dev/null; echo dash-ok", "lang": "sh"})
+        tt.line("dash-ok")
+        tt.ended()
+    finally:
+        h.close()
+
+
+@scenario(bound=30)
+def term_run_refused(t):
+    """term.open refuses a run that may not run: with edit, a language no
+    shell here runs, cmd's off Windows, an invisible character, too long."""
+    h = t.headless()
+    try:
+        sid = termsession(t, h)
+        cases = [
+            ({"text": "ls", "lang": "sh"}, {"path": "/a"}, "run or edit, not both"),
+            ({"text": "ls", "lang": "python"}, None, "names no shell"),
+            ({"text": "rm -rf \u202e/", "lang": "sh"}, None, "invisible character"),
+            ({"text": "a" * (16 << 10) + "a", "lang": "sh"}, None, "over 16 KiB"),
+            ({"text": "\n", "lang": "sh"}, None, "empty"),
+            ({"text": "ls", "lang": "sh", "from": "../x"}, None, "session id"),
+            ("ls", None, "must be an object"),
+        ]
+        if not t.host.windows:
+            cases.append(({"text": "dir", "lang": "cmd"}, None, "only on Windows"))
+        else:
+            cases.append(({"text": "dir\ncd ..", "lang": "cmd"}, None, "one line"))
+        for run, edit, want in cases:
+            kw = {"run": run}
+            if edit:
+                kw["edit"] = edit
+            r = h.call("term.open", sid=sid, cols=80, rows=24, **kw)
+            t.check(not r.get("ok") and want in (r.get("err") or ""), f"{run!r}: {r}")
+        t.check(h.call("status").get("terms") == 0, "none started")
+    finally:
+        h.close()
+
+
+@scenario(bound=90)
+def term_run_windows(t):
+    """On Windows a cmd block runs by cmd.exe /s /c, %VAR% expanded, its
+    exit the terminal's, and a program the agent left in the folder
+    never runs by its bare name; a PowerShell block runs with its
+    native exit code, shown first, and Read-Host reads what is typed."""
+    if not t.host.windows:
+        raise Skip("Windows only (term_run on POSIX)")
+    t.host.write(t.host.join(t.work, "planted.cmd"), "@echo PLANTED-RAN\r\n")
+    h = t.headless(env={"RUNVAR": "val"})
+    try:
+        sid = readsession(t, h)
+        tt = Tty(t, h, sid, cols=400, run={"text": "echo %RUNVAR%-ok& echo tab=%PROSPERO_TAB%"
+                                                   "& planted& exit /b 4",
+                                           "lang": "cmd", "from": sid})
+        t.check(tt.reply.get("argv", [""])[0].lower().endswith("cmd.exe"),
+                f"argv {tt.reply.get('argv')}")
+        tt.line("val-ok")
+        got = tt.line("tab=")
+        t.check(got.strip() == "tab=run", repr(got))
+        end = tt.ended()
+        t.check(end.get("code") == 4, f"term.end {end}")
+        t.check(b"PLANTED-RAN" not in bytes(tt.text), f"output {bytes(tt.text)[-300:]!r}")
+
+        text = "$x = Read-Host 'Name'\nWrite-Output \"got-$x-$env:RUNVAR\"\nexit 5"
+        tt = Tty(t, h, sid, cols=400, run={"text": text, "lang": "powershell", "from": sid})
+        tt.pump(lambda x: b"Name:" in x.text, 30, "the Read-Host prompt")
+        tt.type("zed\r")
+        got = tt.line("got-")
+        t.check(got.strip() == "got-zed-val", repr(got))
+        end = tt.ended(30)
+        t.check(end.get("code") == 5, f"term.end {end}")
+        t.check(b"Write-Output" in bytes(tt.text), f"shown first: {bytes(tt.text)[:300]!r}")
+        waitstatus(t, h, "kept", 2)
+        evs = turnof(h, sid)
+        notices = [e for e in evs if e.get("ev") == "notice" and e.get("kind") == "terminal"]
+        codes = sorted(n.get("code") for n in notices)
+        t.check(codes == [4, 5], f"notices {notices}")
+    finally:
+        h.close()
 
 
 def main():

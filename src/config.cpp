@@ -644,14 +644,28 @@ static CfgKey cfgschema[] = {
      "(NotoSansCJK.ttc#2); none for none. Read at startup"},
     {"ui", "editor", CFG_STRING, "", {}, {}, "ui",
      "The command that opens a draft in an editor (Ctrl+G, or the compose "
-     "box's menu), given the file as one more word; it must wait until the "
-     "editing is done, as code --wait, subl -w or gvim -f do, and run a "
-     "window of its own, since there is no terminal. Empty: $VISUAL, else "
-     "$EDITOR, else on macOS the default text editor (open -W -n -t), "
-     "which must be quit. A GUI started from the Finder or a desktop menu "
+     "box's menu), a plan or the configuration file, given the file as one "
+     "more word; for those it must wait until the editing is done, as code "
+     "--wait, subl -w or gvim -f do, and run a window of its own, since "
+     "there is no terminal. Empty: $VISUAL, else $EDITOR, else on macOS the "
+     "default text editor (open -W -n -t), which must be quit; on macOS a "
+     "terminal editor named only by $VISUAL or $EDITOR gives way to it for "
+     "those. Files' Open in editor runs a terminal editor (vim, nvim, nano, "
+     "hx, emacs -nw) in a Terminal tab of the file's session, on Linux and "
+     "macOS through the login shell, which can test PROSPERO_EDIT_FILE to "
+     "skip an exec tmux (on Windows found on PATH, run by cmd.exe). "
+     "Another host's file (ssh, WSL, a container) opens in a Terminal tab "
+     "there, with this editor only if it runs in a terminal: as written on "
+     "a host of the same OS family, else by its name alone (nvim); "
+     "otherwise that host's own $VISUAL or $EDITOR runs, else vi, never "
+     "this computer's. An editor with a window of its own still opens a "
+     "container's mounted folder or a WSL distro's file here. "
+     "A GUI started from the Finder or a desktop menu "
      "has no shell environment: no $VISUAL, no $EDITOR, and its PATH may "
      "lack the editor, so name it in full here, or add its directory to "
-     "[tools] path_prepend"},
+     "[tools] path_prepend. On Windows its program is looked for here, by "
+     "its full path or on PATH, and cmd.exe runs it by the full path found: "
+     "never from the file's folder, nor by a relative path"},
     {"ui", "editor_line", CFG_STRING, "", {}, {}, "ui",
      "The command that Files' Open in editor runs, for an editor whose "
      "arguments for a line are not known: {file} the file's path, quoted "
@@ -660,7 +674,12 @@ static CfgKey cfgschema[] = {
      "myedit --goto {file}:{line}; with no {file}, the path goes last. "
      "Empty: [ui] editor's command, with the arguments its editor takes "
      "(code -g, zed, subl, gvim +N, emacs, JetBrains --line and others). "
-     "It must open a window of its own, and it is not waited for"},
+     "An editor with a window of its own is not waited for; one that runs "
+     "in a terminal runs in a Terminal tab, as for [ui] editor. On Linux "
+     "with no editor set at all, the tab runs the login shell's $VISUAL or "
+     "$EDITOR, else vi. Another host's file gets it only on a host of the "
+     "same OS family, and only when it runs in a terminal; else as [ui] "
+     "editor says"},
     {"ui", "terminal", CFG_STRING, "", {}, {}, "ui",
      "The terminal that a session's Open in external terminal opens in its folder: "
      "on macOS an application's name (Terminal, iTerm, Ghostty), elsewhere "
@@ -708,12 +727,13 @@ static CfgKey cfgschema[] = {
     {"theme", "scrollbar", CFG_COLOR, "", {}, {}, "theme", "Scrollbars; unset, scrollbar_hover and scrollbar_pressed follow it"},
     {"theme", "scrollbar_hover", CFG_COLOR, "", {}, {}, "theme", "A scrollbar under the pointer"},
     {"theme", "scrollbar_pressed", CFG_COLOR, "", {}, {}, "theme", "A scrollbar dragged"},
+    {"theme", "scrollbar_track", CFG_COLOR, "", {}, {}, "theme", "Behind a scrollbar"},
     {"theme", "menu_bar", CFG_COLOR, "", {}, {}, "theme", "The menu bar, under panel_text"},
     {"theme", "text", CFG_COLOR, "", {}, {}, "theme", "The transcript's text"},
     {"theme", "text_dim", CFG_COLOR, "", {}, {}, "theme", "Headers and secondary text in the transcript"},
     {"theme", "reasoning", CFG_COLOR, "", {}, {}, "theme", "Reasoning and notes"},
     {"theme", "link", CFG_COLOR, "", {}, {}, "theme", "Links"},
-    {"theme", "code", CFG_COLOR, "", {}, {}, "theme", "Code spans"},
+    {"theme", "code", CFG_COLOR, "", {}, {}, "theme", "Code spans in Markdown"},
     {"theme", "code_block", CFG_COLOR, "", {}, {}, "theme", "Code blocks' background"},
     {"theme", "code_block_text", CFG_COLOR, "", {}, {}, "theme", "Plain text in code blocks"},
     {"theme", "table_header", CFG_COLOR, "", {}, {}, "theme", "Table header rows' background"},
@@ -726,6 +746,7 @@ static CfgKey cfgschema[] = {
     {"theme", "tool_row", CFG_COLOR, "", {}, {}, "theme", "Tool rows' background"},
     {"theme", "ask_card", CFG_COLOR, "", {}, {}, "theme", "Ask cards' background"},
     {"theme", "tool_summary", CFG_COLOR, "", {}, {}, "theme", "A tool row's arguments, an ask's path"},
+    {"theme", "tool_output", CFG_COLOR, "", {}, {}, "theme", "A tool's output in its row; unset, it follows code"},
     {"theme", "syntax_comment", CFG_COLOR, "", {}, {}, "theme", "Comments in code blocks"},
     {"theme", "syntax_keyword", CFG_COLOR, "", {}, {}, "theme", "Keywords in code blocks"},
     {"theme", "syntax_type", CFG_COLOR, "", {}, {}, "theme", "Types in code blocks"},
@@ -775,6 +796,10 @@ static CfgKey cfgschema[] = {
     {"terminal", "copy_on_select", CFG_BOOL, "false", {}, {}, "terminal",
      "Whether selecting text in a terminal copies it at once, without "
      "the copy key"},
+    {"terminal", "agent", CFG_BOOL, "true", {}, {}, "terminal",
+     "Whether the agent may read the session's terminal tabs "
+     "(read_terminal), for which the engine keeps a copy of each "
+     "screen. Text typed at password prompts is hidden from it"},
 
     {"host", "idle_exit", CFG_SECONDS, "600", {}, {}, "host",
      "Seconds a host waits with no client connected and nothing running, "

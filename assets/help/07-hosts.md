@@ -174,7 +174,47 @@ broken, a file not yet read there says its host is not connected, and
 is read once it is back. One shown is checked there, and read again
 when it changes, as a file on this computer is ([Files](help:sessions#files)).
 An engine older than this window says it is
-too old to show its files: update it (below).
+too old to show its files: update it (below). A file on a share or
+mount there that stops answering does not stop the rest: after ten
+to twenty seconds Open file says "The file system is not responding", other
+files there still open, and that file, or anything under it, is
+refused at once until the share answers again; then open it again.
+When it is on a network share or mount (NFS, SMB, sshfs, a mapped
+drive), the rest of that share is refused at once too, with the same
+words, until the stuck read comes back; a folder on that host's own
+disks is never refused whole.
+
+Such a session's Files tabs last across a restart, as on this
+computer, those on its host and those here: they come back once its
+host is connected and lists the session. Until then they wait in the
+window's layout, and they are dropped if the host no longer has the
+session. A container's come back at once, saying its host is not
+connected until it is started. A subagent's container keeps none, as
+it is removed when the subagent ends.
+
+Open in editor on such a file opens a Terminal tab of its session
+there, where that host's engine runs the editor on it, at the line in
+view, as on this computer ([Files](help:sessions#files)): the tab
+closes when the editor exits with 0, and Files reads the file again
+there. The editor is `[ui] editor` when it runs in a terminal (`vim`,
+`nvim`, `nano`, `hx`, `emacs -nw`): as written on a host of the same
+kind as this computer (Windows, or not), and on the other kind by its
+name alone, as `nvim` for `C:\Tools\nvim.exe`; `[ui] editor_line`
+goes only to a host of the same kind. Otherwise, and never from this
+computer's own `$VISUAL` or `$EDITOR`, the host's own editor runs: on
+Linux and macOS the one its login shell's `$VISUAL` or `$EDITOR`
+names, else `vi` (busybox's `vi`, as in Alpine, at the top, without
+the line); on Windows `%VISUAL%` or `%EDITOR%`, else `vi`, found on its
+PATH. An image with no editor at all ends the tab with code 127, saying
+so. A file in a container's folder mounted here, or on Windows in a WSL
+distro, still opens here when the editor has a window of its own (VS
+Code, Notepad++), through this computer's path to it. A Windows host
+refuses a path holding `%`, `"` or a control character, as on Windows
+here. An engine older than this window says to update it (below), and
+a Windows host before Windows 10 version 1809 has no terminals.
+Closing the window, or running it in the background, hangs the editor
+up and loses its unsaved edits; a broken connection only shows
+Reconnecting, the editor running on.
 
 ### Viewing remote files in a local editor
 
@@ -191,6 +231,11 @@ That opens Ghostty and runs `fresh` with one argument,
 `ssh://user@host/home/user/agent-context/plan.md`, for the example plan path.
 The Plan pane's **View in editor** and Files' **Open in editor** use the
 same detached launcher. There is no `[ui] editor` fallback.
+
+An explicitly configured viewer takes precedence over the native Terminal
+tab. When `viewer` is unset, the native Terminal-tab editor above applies
+instead. A malformed or missing configured viewer is disabled with a reason
+rather than silently falling back.
 
 The placeholders are `{path}` (the absolute remote file or directory),
 `{ssh}` (the configured destination or ssh alias), `{wsl}` and `{exec}`

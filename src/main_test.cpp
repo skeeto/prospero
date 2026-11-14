@@ -52,10 +52,16 @@ struct Os {
     u64        rng;
     i32        syncs;     // os_logsync calls
     i32        realpaths; // os_realpath calls
+    Slice<Str> farmounts; // os_farmount's mounts, the longest holding a path
     i32        writes;    // os_logwrite calls left while failwrites is set
     b32        failwrites;
     b32        failtrunc;
     b32        failsync;
+    Str        growpath;  // os_readat of it appends growby after every
+    Str        growby;    //   growevery-th read, growtimes times
+    i32        growevery;
+    i32        growtimes;
+    i32        growreads;
 };
 
 static VFile *vfind(Os *os, Str path, b32 create)
@@ -235,12 +241,16 @@ static Dirent *os_list(Os *os, Arena *a, Str path)
 }
 
 // Links listed as what they name, through os_realpath.
-static Listing os_listall(Os *os, Arena *a, Str path, b32 dirs, iz max)
+static Listing os_listall(Os *os, Arena *a, Str path, b32 dirs, iz max,
+                          void (*beat)(void *), void *ctx)
 {
     Listing r = {};
     VFile  *d = vfind(os, path, 0);
     r.ok = d && d->exists && d->isdir;
     for (Dirent *e = r.ok ? os_list(os, a, path) : 0; e; e = e->next) {
+        if (beat) {
+            beat(ctx);
+        }
         if (dirs && !e->isdir) {
             continue;
         } else if (r.len == max) {
@@ -356,7 +366,8 @@ static b32  os_thread(Os *, void (*)(void *), void *) { return 0; }
 static void os_lockinit(Lock *) {}
 static void os_lock(Lock *) {}
 static void os_unlock(Lock *) {}
-static b32  os_eventinit(Event *e) { e->h[0] = 0; return 1; }
+static b32  testnoevent;  // tests: os_eventinit fails
+static b32  os_eventinit(Event *e) { e->h[0] = 0; return !testnoevent; }
 static void os_signal(Event *e) { e->h[0] = 1; }
 
 static b32 os_wait(Event *e, i32)
@@ -422,6 +433,12 @@ static Read os_readat(Os *os, Arena *a, Str path, i64 off, iz max)
         d = off<d.len ? cuthead(d, (iz)off) : cuthead(d, d.len);
         r.data = d.len>max ? takehead(d, max) : d;
     }
+    // A file growing as it is read: after this read, for the next
+    if (os->growtimes>0 && path==os->growpath && ++os->growreads%os->growevery==0) {
+        VFile *f = vfind(os, path, 0);
+        f->data = concat(&os->mem, f->data, os->growby);
+        os->growtimes--;
+    }
     return r;
 }
 
@@ -441,6 +458,16 @@ static Str os_hostids(Os *, Arena *a) { return clone(a, Str("1000:1000")); }
 
 static b32 os_linkfar(Os *, Arena, Str) { return 0; }
 static b32 os_haslink(Os *, Arena, Str, iz) { return 0; }
+
+static Str os_farmount(Os *os, Arena *, Str path)
+{
+    Str r = {};
+    for (iz i = 0; i < os->farmounts.len; i++) {
+        Str m = os->farmounts[i];
+        r = m.len>r.len && fsunder(m, 0, path, 0) ? m : r;
+    }
+    return r;
+}
 
 static Str os_realpath(Os *os, Arena *a, Str path)
 {
@@ -550,6 +577,7 @@ static void  os_ptytake(Os *, Proc *, iz) {}
 static b32   os_ptyresize(Os *, Proc *, PtySize) { return 0; }
 static b32   os_ptybusy(Os *, Proc *) { return 0; }
 static b32   os_ptyable(Os *) { return 0; }
+static i32   os_ptymode(Os *, Proc *) { return PTY_UNKNOWN; }
 static void  os_httpcancel(Os *, Http *) {}
 static void  os_httpfree(Os *, Http *) {}
 static Str   os_lasterr(Os *, Arena *) { return "not supported in tests"; }
@@ -684,6 +712,8 @@ static Str istr(Arena *a, i64 v)
 #include "test/edit_test.cpp"
 #include "test/tools_test.cpp"
 #include "test/guard_test.cpp"
+#include "test/fswork_test.cpp"
+#include "test/editjump_test.cpp"
 #include "test/fileref_test.cpp"
 #include "test/admit_test.cpp"
 #include "test/compact_test.cpp"
@@ -711,6 +741,7 @@ static Str istr(Arena *a, i64 v)
 #include "test/delta_test.cpp"
 #include "test/relay_test.cpp"  // after config's test platform
 #include "test/term_test.cpp"
+#include "test/termset_test.cpp"
 #include "dbus.cpp"
 #include "test/dbus_test.cpp"
 #include "test/door_test.cpp"
@@ -728,9 +759,9 @@ static Str istr(Arena *a, i64 v)
 #  include "pathpick.cpp"
 #  include "sidebar.cpp"
 #  include "dock.cpp"
-#  include "termset.cpp"
 #  include "fileset.cpp"
 #  include "palette.cpp"
+#  include "dropto.cpp"
 #  include "test/sched_test.cpp"
 #  include "test/highlight_test.cpp"
 #  include "test/doc_test.cpp"
@@ -746,9 +777,9 @@ static Str istr(Arena *a, i64 v)
 #  include "test/pathpick_test.cpp"
 #  include "test/sidebar_test.cpp"
 #  include "test/dock_test.cpp"
-#  include "test/termset_test.cpp"
 #  include "test/fileset_test.cpp"
 #  include "test/palette_test.cpp"
+#  include "test/dropto_test.cpp"
 #endif
 
 int main()
@@ -768,6 +799,7 @@ int main()
     test_ini(&t);
     test_web(&t);
     test_mailbox(&t);
+    test_fswork(&t);
     test_events(&t);
     test_frame(&t);
     test_remoteask(&t);
@@ -778,6 +810,7 @@ int main()
     test_edit(&t);
     test_tools(&t);
     test_guard(&t);
+    test_editjump(&t);
     test_fileref(&t);
     test_admit(&t);
     test_compact(&t);
@@ -816,6 +849,9 @@ int main()
     test_delta(&t);
     test_relay(&t);
     test_term(&t);
+    test_termsecret(&t);
+    test_termrun(&t);
+    test_termset(&t);
     test_dbus(&t);
     test_door(&t);
     #if PROSPERO_GUI
@@ -842,10 +878,13 @@ int main()
     test_pathpick(&t);
     test_sidebar(&t);
     test_dock(&t);
-    test_termset(&t);
     test_fileset(&t);
+    test_filekeep(&t);
+    test_filereadall(&t);
     test_filefind(&t);
     test_palette(&t);
+    test_dropto(&t);
+    test_dropload(&t);
     test_viewexport(&t);
     #endif
 

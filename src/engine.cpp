@@ -91,6 +91,12 @@
 // has the session open. A second process opens it read-only: it replays
 // and lists, but refuses anything that would write.
 //
+// Files of this machine for a frontend (fs.read, fs.stat and dir) are
+// read on fswork.cpp's workers, never on this thread, so that a dead
+// mount stops nothing here; their replies may come before those of
+// commands sent earlier. Quitting answers any still out, waiting for
+// none.
+//
 // This is free and unencumbered software released into the public domain.
 
 enum : u32 {
@@ -102,7 +108,9 @@ enum : u32 {
     MAIL_GIT,         // git's answer for a repository (git.cpp)
     MAIL_WORKTREE,    // a worktree job's answer (worktree.cpp)
     MAIL_CTR,         // a container job's answer, for subagents (hostlink.cpp)
+    MAIL_FS,          // an fs.read, fs.stat or dir job's end (fswork.cpp)
 };
+static_assert(MAIL_FS == 108);
 
 enum : i64 {
     MS           = 1000,          // in os_ticks units (microseconds)
@@ -278,7 +286,7 @@ static i32 modefind(Str name)
 // in the background.
 struct Notice {
     Str kind;    // "job", "rewind", "instructions", "skills", "budget",
-                 // "mode", "message", "task", "shell"
+                 // "mode", "message", "task", "shell", "terminal"
     Str text;
     i64 job;     // for "job"
     i32 mode;    // for "mode": MODE_*, the one it tells
@@ -289,6 +297,10 @@ struct Notice {
     Str host;    // and for "task", its host, if another
     i32 hop;     // and its hop count (see "Messages")
     Slice<Str> urls;  // for "task": its report's URLs the subagent saw
+    i64 tid;     // for "terminal": the terminal a Run ran in, its exit
+    i32 code;    // (-1 for its tab closed while it ran, 128+N for
+    i64 ms;      // signal N), how long it ran, and its text's hash, by
+    u64 key;     // which a newer one replaces it
 };
 
 enum : i32 {
@@ -764,6 +776,7 @@ struct Session {
     u64          lastset;    // hash of the last step's calls
     i32          setrepeat;
     u64          seen;       // what the last step's desktop looks saw
+    u64          termseen;   // what the last read_terminal showed, hashed
     b32          blocked;    // this step's calls repeat too often
     b32          progressed; // a tool succeeded this step
     b32          contnext;   // nudge to continue after the tools
@@ -1008,6 +1021,18 @@ struct WtJob {
 // allocated in its own scratch stays intact below them.
 struct Terms;  // ptyhost.cpp
 
+// What fs.read, fs.stat and dir read of the engine, on a worker: set
+// once, before the first (enginefs), and never changed.
+enum : i32 {
+    FSLOST_MAX = 256,  // dropped fs replies remembered, to fail (fsreply)
+};
+
+struct FsEnv {
+    Os  *os;
+    Str  home;
+    iz   outmax;  // the longest record the frontend's mailbox takes
+};
+
 struct Engine {
     Os         *os;
     Arena       perm;
@@ -1064,6 +1089,10 @@ struct Engine {
     Str         ctruser;  // and whom Prospero is in its containers (ctruser)
     b32         ctrprobed;   // asked anew (farctrok)
     b32         ctrprobing;  // and not answered yet
+    FsEnv       fsenv;    // what fs.read, fs.stat and dir need on a worker
+    FsPool     *fs;       // and their workers, once asked (enginefs)
+    i64         fslost[FSLOST_MAX];  // their replies dropped (fsreply), to fail
+    i32         nfslost;
     GitWork    *git;      // runs git for sessions' changes, once asked
     GitWork    *wt;       // runs git for worktrees (worktree.cpp)
     Slice<WtJob> wtjobs;  // worktree jobs not yet answered
@@ -1833,6 +1862,11 @@ static void deliver(Session *s, Arena scratch)
         if (n->kind == "mode") {
             putstrkey(&w.json, "mode", modenames[n->mode]);
         }
+        if (n->kind == "terminal") {
+            putintkey(&w.json, "tid", n->tid);
+            putintkey(&w.json, "code", n->code);
+            putintkey(&w.json, "ms", n->ms);
+        }
         if (n->kind == "shell") {
             putstrkey(&w.json, "shell", n->shell.name);
             putstrkey(&w.json, "path", n->shell.path);
@@ -2204,6 +2238,9 @@ static i64  termnext(Engine *, i64 now);
 static i32  termcount(Engine *, i64 peer);
 static void termhangupall(Engine *, i64 peer, Str sid);
 static void termaway(Engine *, i64 peer, b32 away);
+static void termstatus(Engine *, JsonOut *);
+static b32  termagent(Engine *);
+static void toolreadterm(Session *, Arena, Args *);
 static Terms *newterms(Arena *);
 
 // Start a request to an endpoint, its records to req->mbox with its id,
@@ -8482,6 +8519,16 @@ static b32 webfetchon(Engine *e)
            cfgbool(trim(cfgget(e->cfg, "web", "", "fetch", 0))) != 0;
 }
 
+// read_terminal's bit, denied to a new session but where the user has
+// terminals to read and the agent may: [terminal] agent on, terminals
+// possible here, and a session the user attends (a subagent: one whose
+// parent was offered it). Off later, it refuses at the call instead,
+// which leaves tool lists and the prompt's cache as they were.
+static u32 termdeny(Engine *e, b32 attended)
+{
+    return attended && termagent(e) && os_ptyable(e->os) ? 0 : (u32)TOOL_TERMMASK;
+}
+
 // The web tools' bits denied to a new session: each unless configured.
 static u32 webdeny(Engine *e)
 {
@@ -8611,7 +8658,8 @@ static void webnoteuser(Session *s, Arena scratch, Str via, Str text, Slice<Str>
 // background subagent's report the URLs it vouched for.
 static void webnotenotice(Session *s, Arena scratch, Str kind, Str text, Slice<Str> urls)
 {
-    if (kind=="instructions" || kind=="skills" || kind=="job" || kind=="mcp") {
+    if (kind=="instructions" || kind=="skills" || kind=="job" || kind=="mcp" ||
+        kind=="terminal") {
         webnote(s, scratch, text, 0);
     }
     webnoteurls(s, urls);
@@ -8632,7 +8680,7 @@ static void webnotetool(Session *s, Arena scratch, Str name, Str status, Str tex
     b32 counts = t==TOOL_READ   || t==TOOL_GREP  || t==TOOL_GLOB  ||
                  t==TOOL_SHELL  || t==TOOL_JOBOUT || t==TOOL_SKILL ||
                  t==TOOL_DESKTOP || t==TOOL_WEBSEARCH || t==TOOL_WEBFETCH ||
-                 startswith(name, "mcp__");
+                 t==TOOL_READTERM || startswith(name, "mcp__");
     if (counts) {
         webnote(s, scratch, text, 0);
     }
@@ -14651,6 +14699,7 @@ static b32 runtool(Session *s, Arena scratch)
     case TOOL_SESSIONS: toolsessions(s, scratch);      return 1;
     case TOOL_MESSAGE: toolmessage(s, scratch, &args); return 1;
     case TOOL_MEMORY:  toolmemory(s, scratch, &args);  return 1;
+    case TOOL_READTERM: toolreadterm(s, scratch, &args); return 1;
     case TOOL_WEBSEARCH:
     case TOOL_WEBFETCH:  assert(0);  // webcall
     case TOOL_TASK:      assert(0);  // starttasks has these
@@ -15500,6 +15549,13 @@ static void finalize(Session *s, Arena scratch)
         // Looking again repeats only if the last look saw no change
         set ^= (s->seen + 1) * 0x9e3779b97f4a7c15u;
     }
+    for (iz i = 0; i < calls.len; i++) {
+        if (toolfind(calls[i].name) == TOOL_READTERM) {
+            // Likewise reading a terminal again, by what the last read showed
+            set ^= (s->termseen + 1) * 0xbf58476d1ce4e5b9u;
+            break;
+        }
+    }
     s->setrepeat = set==s->lastset ? s->setrepeat+1 : 1;
     s->lastset   = set;
     s->blocked   = s->setrepeat >= 5;
@@ -16300,18 +16356,81 @@ static Guard sessionguard(Session *s, Arena *perm)
     return g;
 }
 
+// An executable on a PATH, by its file name with each of exts appended
+// in turn (an empty one for the name alone), entry by entry, or null.
+// Strict, for a line cmd.exe runs, passes over an entry that is not a
+// full path or is a network one (which may stall for seconds), and
+// takes one in double quotes as Windows does.
+static Str findpathext(Os *os, Arena *perm, Arena scratch, Str path, Str name,
+                       Slice<Str> exts, b32 win, b32 strict)
+{
+    for (Str rest = path; rest.len;) {
+        Cut c = cut(rest, win ? ';' : ':');
+        Str d = strict ? trim(c.head) : c.head;
+        rest = c.tail;
+        if (strict && d.len>=2 && d[0]=='"' && d[d.len-1]=='"') {
+            d = takehead(cuthead(d, 1), d.len-2);
+        }
+        if (!d.len || (strict && (!pathroot(d, win) || netpath(d, win)))) {
+            continue;
+        }
+        for (iz i = 0; i < exts.len; i++) {
+            Arena a = scratch;
+            Str   p = join(&a, d, concat(&a, name, exts[i]));
+            if (os_stat(os, a, p).type == STAT_FILE) {
+                return clone(perm, p);
+            }
+        }
+    }
+    return {};
+}
+
 // An executable on a PATH, by its file name, or null.
 static Str findpath(Os *os, Arena *perm, Arena scratch, Str path, Str name,
                     b32 win)
 {
-    for (Str rest = path; rest.len;) {
-        Cut c = cut(rest, win ? ';' : ':');
-        rest = c.tail;
-        if (!c.head.len) {
-            continue;
+    Str        none[] = {{}};
+    Slice<Str> exts   = {none, 1, 1};
+    return findpathext(os, perm, scratch, path, name, exts, win, 0);
+}
+
+// Where a program that a command names, prog, is: with a separator (or
+// on Windows a drive) where it says, else on path (findpathext). On
+// Windows a name with no extension takes each of pathext's in turn
+// (.COM;.EXE;.BAT;.CMD without one), never none, as cmd.exe chooses,
+// and the answer is a full path for cmdabs: a relative program, and a
+// relative or network PATH entry, are not looked at. A program on a
+// network path counts as found, untouched. Null if nowhere.
+static Str findprog(Os *os, Arena *perm, Arena scratch, Str path, Str prog,
+                    Str pathext, b32 win)
+{
+    if (!prog.len) {
+        return {};
+    }
+    Slice<Str> exts = {};
+    if (!win || find(basename(prog), ".")>=0) {
+        exts = push(&scratch, exts, Str{});
+    } else {
+        pathext = trim(pathext);
+        for (Str rest = pathext.len ? pathext : Str(".COM;.EXE;.BAT;.CMD"); rest.len;) {
+            Cut c = cut(rest, ';');
+            rest = c.tail;
+            if (trim(c.head).len) {
+                exts = push(&scratch, exts, trim(c.head));
+            }
         }
+    }
+    b32 sep = find(prog, "/")>=0 || (win && (find(prog, "\\")>=0 || find(prog, ":")>=0));
+    if (!sep) {
+        return findpathext(os, perm, scratch, path, prog, exts, win, win);
+    } else if (win && !pathroot(prog, 1)) {
+        return {};
+    } else if (netpath(prog, win)) {
+        return clone(perm, prog);
+    }
+    for (iz i = 0; i < exts.len; i++) {
         Arena a = scratch;
-        Str   p = join(&a, c.head, name);
+        Str   p = concat(&a, prog, exts[i]);
         if (os_stat(os, a, p).type == STAT_FILE) {
             return clone(perm, p);
         }
@@ -17149,7 +17268,8 @@ static void logsession(Session *s, Arena scratch)
     // the memory record; questions to the user, by questions. The web's
     // are listed when offered, so that a session from before them
     // replays without them.
-    u32 plain = TOOL_OFFMASK | TOOL_WEBMASK | (s->role.len ? (u32)TOOL_PLANMASK : 0);
+    u32 plain = TOOL_OFFMASK | TOOL_WEBMASK | TOOL_TERMMASK |
+                (s->role.len ? (u32)TOOL_PLANMASK : 0);
     u32 aside = TOOL_MEMMASK | TOOL_ASKMASK;
     if ((s->te.deny | aside) != (plain | aside)) {
         putkey(&w.json, "tools");
@@ -17510,6 +17630,7 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err)
     s->depth   = p->depth + 1;
     s->te.deny = r.deny | (s->depth>=TASK_DEPTH ? (u32)1<<TOOL_TASK : 0) |
                  deskdeny(e, scratch, 1) | skilldeny(e) | webdeny(e) |
+                 (p->te.deny & TOOL_TERMMASK) | termdeny(e, 1) |
                  TOOL_PLANMASK | TOOL_ASKMASK;
     s->mcpfilter = r.mcp.data ? clone(&s->perm, r.mcp) :
                    p->mcpfilter.data ? clone(&s->perm, p->mcpfilter) : Str{};
@@ -19058,16 +19179,22 @@ static void sweepremovals(Engine *e, Arena scratch)
 static Str const NOMODEL = "no model: give one, or set model in the config "
                            "(an endpoint's own models count once listed)";
 
-static void reply(Engine *e, Arena scratch, i64 id, b32 ok, Str err, Str sid)
+// A reply's line, as of ts (epoch ms), made anywhere (fswork's workers).
+static Str replyline(Arena *a, Str sid, i64 ts, i64 id, b32 ok, Str err)
 {
-    Buf   b(&scratch, 256 + err.len);
-    EvOut w = evbegin(&b, sid, 0, os_time(e->os), EV_REPLY);
+    Buf   b(a, 256 + 6*err.len);
+    EvOut w = evbegin(&b, sid, 0, ts, EV_REPLY);
     putintkey(&w.json, "id", id);
     putintkey(&w.json, "ok", ok);
     if (err.len) {
         putstrkey(&w.json, "err", err);
     }
-    emit(e, evend(&w));
+    return evend(&w);
+}
+
+static void reply(Engine *e, Arena scratch, i64 id, b32 ok, Str err, Str sid)
+{
+    emit(e, replyline(&scratch, sid, os_time(e->os), id, ok, err));
 }
 
 // A flag in a command: true or false, or a number, nonzero for true.
@@ -19400,6 +19527,7 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
     // session of their own, attended as it begins, with every tool
     b32 asks = s->attended && !task.ok && !role.ok && !tools.data;
     s->te.deny |= asks ? 0 : (u32)TOOL_ASKMASK;
+    s->te.deny |= termdeny(e, s->attended && !task.ok);
     s->mcpfilter  = tools.data ? clone(&s->perm, tools) :
                     role.mcp.data ? clone(&s->perm, role.mcp) : Str{};
     s->stepmax    = steps>0 ? steps : 0;
@@ -19773,7 +19901,7 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             } else {
                 // As it began: every tool but those offered by name, and
                 // plan mode's for a role
-                s->te.deny = TOOL_OFFMASK | TOOL_WEBMASK |
+                s->te.deny = TOOL_OFFMASK | TOOL_WEBMASK | TOOL_TERMMASK |
                              (s->role.len ? (u32)TOOL_PLANMASK : 0);
             }
             // Its edit format as it began: absent, the first one
@@ -20865,32 +20993,53 @@ static Str pathinside(Os *os, Arena *a, Str dir, Str path)
 
 // Part of a file for a frontend, read from off, at most max bytes (for
 // none or too many, as many as fit), at most FILECMD_MAX, or less where
-// the frontend's mailbox could not take the reply: in base64 (binary),
-// as is and cut anywhere, else as text, cleaned as tool output is and
-// cut before a character the end may cut short.
+// the frontend's mailbox, which takes outmax, could not take the reply:
+// in base64 (binary), as is and cut anywhere, else as text, cleaned as
+// tool output is and cut before a character the end may cut short. Read
+// in pieces of FS_PIECE, on a worker (c) with a heartbeat before each.
 struct FilePart {
-    Str text;  // as the reply carries it
-    i64 next;  // where the next part begins
-    i64 size;  // the file's
-    b32 more;  // anything after it
-    i32 err;   // READ_*
+    Str text;    // as the reply carries it
+    i64 next;    // where the next part begins
+    i64 size;    // the file's
+    b32 more;    // anything after it
+    i32 err;     // READ_*
+    b32 marked;  // on a worker, the file came under a mark meanwhile
 };
 
-static FilePart filepart(Engine *e, Arena *a, Str real, i64 off, i64 max, b32 binary)
+static FilePart filepart(Os *os, iz outmax, Arena *a, Str real, i64 off, i64 max,
+                         b32 binary, FsCall *c = 0)
 {
     // Every byte may be escaped, or base64 takes 4 for 3
-    iz most = mailmax(e->out) / (binary ? 2 : 8);
+    iz most = outmax / (binary ? 2 : 8);
     most = most<(iz)FILECMD_MAX ? most : (iz)FILECMD_MAX;
     max  = max<1 || max>most ? most : max;
 
-    FilePart r  = {};
-    Read     rd = os_readat(e->os, a, real, off, (iz)max);
-    r.err = rd.err;
-    if (rd.err != READ_OK) {
-        return r;
+    FilePart r    = {};
+    u8      *buf  = allocbytes(a, (iz)max);
+    iz       got  = 0;
+    for (;;) {
+        if (c && !fsat(c, real)) {
+            r.marked = 1;
+            r.err    = READ_IO;
+            return r;
+        }
+        Arena t    = *a;  // for the piece, copied into buf
+        iz    want = (iz)max - got;
+        want = want<(iz)FS_PIECE ? want : (iz)FS_PIECE;
+        Read  rd   = os_readat(os, &t, real, off+got, want);
+        if (rd.err != READ_OK) {
+            r.err = rd.err;
+            return r;
+        }
+        copybytes(buf+got, rd.data.data, rd.data.len);
+        got   += rd.data.len;
+        r.size = rd.size;
+        if (rd.data.len<want || got==max) {
+            break;
+        }
     }
-    Str data = rd.data;
-    r.more = off+data.len < rd.size;
+    Str data = {buf, got};
+    r.more = off+data.len < r.size;
     if (r.more && !binary) {
         // Before any character at the end, which may be cut short
         iz i = data.len - 1;
@@ -20899,10 +21048,11 @@ static FilePart filepart(Engine *e, Arena *a, Str real, i64 off, i64 max, b32 bi
     }
     r.text = binary ? base64(a, data) : cleanoutput(a, data);
     r.next = off + data.len;
-    r.size = rd.size;
     return r;
 }
 
+// It stays on the engine thread: it reads in a session's own folder,
+// which that session's tools touch too.
 static void cmdfile(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
 {
     Os *os     = e->os;
@@ -20916,7 +21066,7 @@ static void cmdfile(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
         reply(e, scratch, id, 0, "no such file in the session's directory", s->sid);
         return;
     }
-    FilePart p = filepart(e, &scratch, real, off, max, binary);
+    FilePart p = filepart(os, mailmax(e->out), &scratch, real, off, max, binary);
     if (p.err != READ_OK) {
         reply(e, scratch, id, 0, p.err==READ_NOTFOUND ? Str("no such file")
                                                       : Str("cannot read the file"), s->sid);
@@ -20935,22 +21085,30 @@ static void cmdfile(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
     emit(e, evend(&w));
 }
 
+// fs.read, fs.stat and dir run on fswork's workers (fscmd), so that a
+// path on a dead mount stops no thread of the engine's. A worker builds
+// the whole reply line through c->mem; the engine thread emits it, or
+// says why the job did not run (enginefs's fsreply). Their replies may
+// come before those of commands sent earlier.
+
 // A path a frontend gave fs.read or fs.stat, on this machine: a leading
 // ~ the home directory, else absolute, normalized; else err says why.
 // A device's, or one that may reach over the network (Windows), is bad
 // too, before anything opens it: on Windows a stat opens the path, and
 // whatever a link along it names, so os_linkfar walks the links first
-// without opening their targets.
+// without opening their targets. On a worker (c), its heartbeat comes
+// first, and a path under a mark goes no further.
 struct FsPath {
     Str path;
-    Str err;  // null if none
-    b32 bad;  // a device or the network's
+    Str err;     // null if none
+    b32 bad;     // a device or the network's
+    b32 marked;  // under a mark (fsat): the file system is not responding
 };
 
-static FsPath fspath(Engine *e, Arena *a, Str path)
+static FsPath fspath(FsEnv *v, Arena *a, Str path, FsCall *c = 0)
 {
     FsPath   r  = {};
-    HomePath hp = tildepath(a, path, e->home, HOST_WINDOWS);
+    HomePath hp = tildepath(a, path, v->home, HOST_WINDOWS);
     if (!path.len) {
         r.err = "path is required";
     } else if (hp.err.len) {
@@ -20959,8 +21117,12 @@ static FsPath fspath(Engine *e, Arena *a, Str path)
         r.err = "the path must be absolute, or begin with ~";
     } else {
         r.path = normpath(a, hp.path, ".", HOST_WINDOWS);
-        r.bad  = devicepath(r.path, HOST_WINDOWS) || netpath(r.path, HOST_WINDOWS) ||
-                 os_linkfar(e->os, *a, r.path);
+        r.bad  = devicepath(r.path, HOST_WINDOWS) || netpath(r.path, HOST_WINDOWS);
+        if (!r.bad && c && !fsat(c, r.path, 1)) {
+            r.marked = 1;
+        } else if (!r.bad) {
+            r.bad = os_linkfar(v->os, *a, r.path);
+        }
     }
     return r;
 }
@@ -20975,46 +21137,53 @@ static FsPath fspath(Engine *e, Arena *a, Str path)
 // off where the next part begins, and more:1 if there is more after it.
 // Only a regular file is read: not a folder, a device, a FIFO, nor a
 // network path (Windows). Like dir, it needs no session: the client may
-// list any folder already, and open a shell (term.open).
-static void cmdfsread(Engine *e, Arena scratch, i64 id, Json *j)
+// list any folder already, and open a shell (term.open). The reply is
+// dated before the stat, so that a write during the read counts as a
+// change.
+static Str fsdoread(FsCall *c, Json *j)
 {
-    Os    *os  = e->os;
+    FsEnv *v   = (FsEnv *)c->ctx;
+    Os    *os  = v->os;
+    Arena *a   = c->mem;
+    i64    id  = jsonint(jsonget(j, "id"), 0);
     Str    raw = jsonstr(jsonget(j, "path"));
     i64    off = jsonint(jsonget(j, "off"), 0);
     i64    max = jsonint(jsonget(j, "max"), FILECMD_MAX);
-    FsPath p   = fspath(e, &scratch, raw);
+    FsPath p   = fspath(v, a, raw, c);
     if (p.err.len) {
-        reply(e, scratch, id, 0, p.err, {});
-        return;
+        return replyline(a, {}, os_time(os), id, 0, p.err);
     } else if (off < 0) {
-        reply(e, scratch, id, 0, "off must not be negative", {});
-        return;
+        return replyline(a, {}, os_time(os), id, 0, "off must not be negative");
     } else if (p.bad) {
-        reply(e, scratch, id, 0, "not a regular file", {});
-        return;
+        return replyline(a, {}, os_time(os), id, 0, "not a regular file");
+    } else if (p.marked) {
+        return replyline(a, {}, os_time(os), id, 0, fsstuck);
     }
-    Str real = os_realpath(os, &scratch, p.path);
-    if (real.data && (devicepath(real, HOST_WINDOWS) || netpath(real, HOST_WINDOWS))) {
-        reply(e, scratch, id, 0, "not a regular file", {});
-        return;
+    Str real = os_realpath(os, a, p.path);
+    if (real.data && !fsat(c, real)) {
+        return replyline(a, {}, os_time(os), id, 0, fsstuck);
+    } else if (real.data && (devicepath(real, HOST_WINDOWS) || netpath(real, HOST_WINDOWS))) {
+        return replyline(a, {}, os_time(os), id, 0, "not a regular file");
     }
-    Stat st = real.data ? os_stat(os, scratch, real) : Stat{};
+    i64  ts = os_time(os);
+    Stat st = real.data ? os_stat(os, *a, real) : Stat{};
     if (st.type != STAT_FILE) {
-        reply(e, scratch, id, 0, st.type==STAT_MISSING ? Str("no such file") :
-                                 st.type==STAT_DIR     ? Str("that is a folder") :
-                                                         Str("not a regular file"), {});
-        return;
+        return replyline(a, {}, os_time(os), id, 0,
+                         st.type==STAT_MISSING ? Str("no such file") :
+                         st.type==STAT_DIR     ? Str("that is a folder") :
+                                                 Str("not a regular file"));
     }
-    FilePart f = filepart(e, &scratch, real, off, max, 1);
+    FilePart f = filepart(os, v->outmax, a, real, off, max, 1, c);
     if (f.err != READ_OK) {
-        reply(e, scratch, id, 0, f.err==READ_NOTFOUND ? Str("no such file") :
-                                 f.err==READ_NOTFILE  ? Str("not a regular file") :
-                                                        Str("cannot read the file"), {});
-        return;
+        return replyline(a, {}, os_time(os), id, 0,
+                         f.marked              ? fsstuck :
+                         f.err==READ_NOTFOUND  ? Str("no such file") :
+                         f.err==READ_NOTFILE   ? Str("not a regular file") :
+                                                 Str("cannot read the file"));
     }
 
-    Buf   b(&scratch, 256 + 6*(raw.len + real.len) + f.text.len);
-    EvOut w = evbegin(&b, {}, 0, os_time(os), EV_REPLY);
+    Buf   b(a, 256 + 6*(raw.len + real.len) + f.text.len);
+    EvOut w = evbegin(&b, {}, 0, ts, EV_REPLY);
     putintkey(&w.json, "id", id);
     putintkey(&w.json, "ok", 1);
     putstrkey(&w.json, "path", raw);
@@ -21024,41 +21193,44 @@ static void cmdfsread(Engine *e, Arena scratch, i64 id, Json *j)
     putintkey(&w.json, "off", f.next);
     putintkey(&w.json, "more", f.more);
     putstrkey(&w.json, "data", f.text);
-    emit(e, evend(&w));
+    return evend(&w);
 }
 
 // fs.stat {paths}: what each of at most FSSTAT_MAX paths on this machine
 // is, in order, as fs.read takes them: stats, each {type} of "file",
 // "dir", "other" (a device, a FIFO), "missing", or "bad" (relative,
 // ~user, a device's name or a network path on Windows), and for a file
-// or folder its size and mtime (epoch ms), links followed.
-static void cmdfsstat(Engine *e, Arena scratch, i64 id, Json *j)
+// or folder its size and mtime (epoch ms), links followed. A path under
+// a mark, on a file system that stopped responding (fswork.cpp), is
+// "bad" too, so that one dead path fails none of the others; but when
+// every path is, the reply is that error, as when the job is refused.
+static Str fsdostat(FsCall *c, Json *j)
 {
-    Os   *os    = e->os;
-    Json *paths = jsonget(j, "paths");
-    iz    n     = jsonlen(paths);
-    if (paths->type != JSON_ARRAY) {
-        reply(e, scratch, id, 0, "paths is required", {});
-        return;
-    } else if (n > FSSTAT_MAX) {
-        reply(e, scratch, id, 0, "at most 64 paths at a time", {});
-        return;
-    }
-    Buf   b(&scratch, 256 + 64*n);
-    EvOut w = evbegin(&b, {}, 0, os_time(os), EV_REPLY);
+    FsEnv *v     = (FsEnv *)c->ctx;
+    Os    *os    = v->os;
+    i64    id    = jsonint(jsonget(j, "id"), 0);
+    Json  *paths = jsonget(j, "paths");
+    iz     n     = jsonlen(paths);
+    Buf    b(c->mem, 256 + 64*n);
+    EvOut  w = evbegin(&b, {}, 0, os_time(os), EV_REPLY);
     putintkey(&w.json, "id", id);
     putintkey(&w.json, "ok", 1);
     putkey(&w.json, "stats");
     putarray(&w.json);
+    iz marked = 0;
     for (iz i = 0; i < n; i++) {
-        Arena  a    = scratch;
+        Arena  a    = *c->mem;
         Json  *path = jsonat(paths, i);
-        FsPath p    = path->type==JSON_STRING ? fspath(e, &a, jsonstr(path)) : FsPath{};
+        FsPath p    = path->type==JSON_STRING ? fspath(v, &a, jsonstr(path), c) : FsPath{};
         Stat   st   = {};
         Str    type = "bad";
-        if (p.path.len && !p.bad) {
+        marked += p.marked;
+        if (p.path.len && !p.bad && !p.marked) {
             Str real = os_realpath(os, &a, p.path);
-            if (!real.data) {
+            if (real.data && !fsat(c, real)) {
+                marked++;
+                st.type = -1;
+            } else if (!real.data) {
                 // Missing, or a link to nothing; else unknowable here
                 st.type = os_stat(os, a, p.path).type==STAT_MISSING ? STAT_MISSING
                                                                      : STAT_OTHER;
@@ -21081,7 +21253,10 @@ static void cmdfsstat(Engine *e, Arena scratch, i64 id, Json *j)
         putend(&w.json);
     }
     putend(&w.json);
-    emit(e, evend(&w));
+    if (n && marked==n) {
+        return replyline(c->mem, {}, os_time(os), id, 0, fsstuck);
+    }
+    return evend(&w);
 }
 
 // dir {path, dirs?}: the entries of a directory on this machine, for a
@@ -21092,35 +21267,37 @@ static void cmdfsstat(Engine *e, Arena scratch, i64 id, Json *j)
 // the user knows. At most DIRCMD_MAX entries and DIRCMD_BYTES of names,
 // fewer where the frontend's mailbox could not take them, in no order,
 // with more:1 if any were left out. The reply's path is as given.
-static void cmddir(Engine *e, Arena scratch, i64 id, Json *j)
+static Str fsdolist(FsCall *c, Json *j)
 {
-    Os      *os   = e->os;
+    FsEnv   *v    = (FsEnv *)c->ctx;
+    Os      *os   = v->os;
+    Arena   *a    = c->mem;
+    i64      id   = jsonint(jsonget(j, "id"), 0);
     Str      path = jsonstr(jsonget(j, "path"));
     b32      dirs = jsonflag(jsonget(j, "dirs"), 0);
-    HomePath hp   = tildepath(&scratch, path, e->home, HOST_WINDOWS);
+    HomePath hp   = tildepath(a, path, v->home, HOST_WINDOWS);
     if (!path.len) {
-        reply(e, scratch, id, 0, "path is required", {});
-        return;
+        return replyline(a, {}, os_time(os), id, 0, "path is required");
     } else if (hp.err.len) {
-        reply(e, scratch, id, 0, hp.err, {});
-        return;
+        return replyline(a, {}, os_time(os), id, 0, hp.err);
     } else if (!pathroot(hp.path, HOST_WINDOWS)) {
-        reply(e, scratch, id, 0, "the path must be absolute, or begin with ~", {});
-        return;
+        return replyline(a, {}, os_time(os), id, 0, "the path must be absolute, or begin with ~");
+    } else if (!fsat(c, normpath(a, hp.path, ".", HOST_WINDOWS), 1)) {
+        return replyline(a, {}, os_time(os), id, 0, fsstuck);
     }
-    Listing l = os_listall(os, &scratch, hp.path, dirs, DIRCMD_MAX);
+    Listing l = os_listall(os, a, hp.path, dirs, DIRCMD_MAX, fsbeat, c);
     if (!l.ok) {
-        i32 type = os_stat(os, scratch, hp.path).type;
-        reply(e, scratch, id, 0, type==STAT_MISSING ? Str("no such directory") :
-                                 type!=STAT_DIR     ? Str("not a directory")   :
-                                                      Str("cannot list the directory"), {});
-        return;
+        i32 type = os_stat(os, *a, hp.path).type;
+        return replyline(a, {}, os_time(os), id, 0,
+                         type==STAT_MISSING ? Str("no such directory") :
+                         type!=STAT_DIR     ? Str("not a directory")   :
+                                              Str("cannot list the directory"));
     }
 
     // Every byte of a name may be escaped
-    iz budget = mailmax(e->out) / 8;
+    iz budget = v->outmax / 8;
     budget = budget<(iz)DIRCMD_BYTES ? budget : (iz)DIRCMD_BYTES;
-    Buf   b(&scratch, 256 + 6*budget + 32*l.len);
+    Buf   b(a, 256 + 6*budget + 32*l.len);
     EvOut w = evbegin(&b, {}, 0, os_time(os), EV_REPLY);
     putintkey(&w.json, "id", id);
     putintkey(&w.json, "ok", 1);
@@ -21142,7 +21319,171 @@ static void cmddir(Engine *e, Arena scratch, i64 id, Json *j)
     }
     putend(&w.json);
     putintkey(&w.json, "more", more);
-    emit(e, evend(&w));
+    return evend(&w);
+}
+
+enum : i32 {
+    FSK_READ = 1,
+    FSK_STAT,
+    FSK_LIST,
+};
+
+// A worker's entry: the command as fscmd made it, parsed and run.
+static void fsengine(FsCall *c)
+{
+    JsonDoc d = jsonparse(c->mem, c->arg);
+    switch (c->kind) {
+    case FSK_READ: c->out = fsdoread(c, d.root); break;
+    case FSK_STAT: c->out = fsdostat(c, d.root); break;
+    case FSK_LIST: c->out = fsdolist(c, d.root); break;
+    }
+}
+
+// Every reply to fs.read, fs.stat or dir, from the engine thread.
+// Unlike other replies, which come in order with a status that flushes
+// out those that went missing, one dropped from a full mailbox would
+// leave its frontend waiting, so its id is kept for fsresend to fail
+// it once there is room. A refusal (err) goes this way too.
+static void fspost(Engine *e, Arena scratch, i64 id, Str line, Str err)
+{
+    if (err.len || !line.len) {
+        err  = err.len ? err : Str("cannot read the file");
+        line = replyline(&scratch, {}, os_time(e->os), id, 0, err);
+    }
+    if (!mailpost(e->out, MAIL_OUT, 0, line, 0)) {
+        if (e->nfslost == FSLOST_MAX) {
+            e->nfslost--;  // the oldest: the host gives up on it too
+            for (i32 i = 0; i < e->nfslost; i++) {
+                e->fslost[i] = e->fslost[i+1];
+            }
+        }
+        e->fslost[e->nfslost++] = id;
+    }
+}
+
+// A job's end, on the engine thread: its reply line, else why it did
+// not run or was given up.
+static void fsreply(void *owner, FsJob *job, Arena scratch)
+{
+    fspost((Engine *)owner, scratch, job->put.id, job->out, job->err);
+}
+
+// Fail the fs replies dropped (fsreply), in order, as far as the
+// mailbox takes them now: after its consumer's next take.
+static void fsresend(Engine *e, Arena scratch)
+{
+    i32 sent = 0;
+    for (; sent < e->nfslost; sent++) {
+        Arena a    = scratch;
+        Str   line = replyline(&a, {}, os_time(e->os), e->fslost[sent], 0,
+                               "the reply was lost: try again");
+        if (!mailpost(e->out, MAIL_OUT, 0, line, 0)) {
+            break;
+        }
+    }
+    e->nfslost -= sent;
+    for (i32 i = 0; i < e->nfslost; i++) {
+        e->fslost[i] = e->fslost[i+sent];
+    }
+}
+
+static FsPool *enginefs(Engine *e)
+{
+    if (!e->fsenv.os) {
+        e->fsenv.os     = e->os;
+        e->fsenv.home   = e->home;
+        e->fsenv.outmax = mailmax(e->out);
+    }
+    if (!e->fs) {
+        e->fs = fsnew(e->os, &e->perm, e->in, MAIL_FS, e, fsreply);
+    }
+    return e->fs;
+}
+
+// A path's mark path, as fsput compares it: tildepath, then normalized,
+// strings alone, since the engine thread touches no file system for
+// these commands; null for one that has none (relative, ~user, empty).
+static Str fsmarkpath(Engine *e, Arena *a, Str path)
+{
+    HomePath hp = tildepath(a, path, e->home, HOST_WINDOWS);
+    if (!path.len || hp.err.len || !pathroot(hp.path, HOST_WINDOWS)) {
+        return {};
+    }
+    return normpath(a, hp.path, ".", HOST_WINDOWS);
+}
+
+// fs.read, fs.stat or dir, to a worker: what it needs, made anew from
+// the command (so that a worker never parses more than that), with the
+// paths it goes to; refused at once with why, as when every path lies
+// on a file system that stopped responding (fswork.cpp).
+static void fscmd(Engine *e, Arena scratch, i64 id, i32 cmd, Json *j, Str line)
+{
+    if (line.len > FS_ARGMAX) {
+        fspost(e, scratch, id, {}, "command too long");
+        return;
+    }
+    FsPool *fs  = enginefs(e);
+    Buf     b(&scratch, 256 + 6*line.len);
+    JsonOut o   = {&b};
+    FsPut   put = {};
+    put.id  = id;
+    put.run = fsengine;
+    put.ctx = &e->fsenv;
+    putobject(&o);
+    putintkey(&o, "id", id);
+    if (cmd == CMD_FSSTAT) {
+        Json *paths = jsonget(j, "paths");
+        iz    n     = jsonlen(paths);
+        if (paths->type != JSON_ARRAY) {
+            fspost(e, scratch, id, {}, "paths is required");
+            return;
+        } else if (n > FSSTAT_MAX) {
+            fspost(e, scratch, id, {}, "at most 64 paths at a time");
+            return;
+        }
+        put.kind = FSK_STAT;
+        putkey(&o, "paths");
+        putarray(&o);
+        for (Json *p = paths->child; p; p = p->next) {
+            Str path = jsonstr(p);
+            if (p->type!=JSON_STRING || path.len>FS_PATHMAX) {
+                putnull(&o);  // bad
+                continue;
+            }
+            putstr(&o, path);
+            Str mark = fsmarkpath(e, &scratch, path);
+            if (mark.len) {
+                put.paths = push(&scratch, put.paths, mark);
+            }
+        }
+        putend(&o);
+    } else {
+        Str path = jsonstr(jsonget(j, "path"));
+        if (path.len > FS_PATHMAX) {
+            fspost(e, scratch, id, {}, "the path is too long");
+            return;
+        }
+        putstrkey(&o, "path", path);
+        if (cmd == CMD_FSREAD) {
+            put.kind = FSK_READ;
+            putintkey(&o, "off", jsonint(jsonget(j, "off"), 0));
+            putintkey(&o, "max", jsonint(jsonget(j, "max"), FILECMD_MAX));
+        } else {
+            put.kind  = FSK_LIST;
+            put.exact = 1;
+            putintkey(&o, "dirs", jsonflag(jsonget(j, "dirs"), 0));
+        }
+        Str mark = fsmarkpath(e, &scratch, path);
+        if (mark.len) {
+            put.paths = push(&scratch, put.paths, mark);
+        }
+    }
+    putend(&o);
+    put.arg = finish(&b);
+    Str why = {};
+    if (!fsput(fs, &put, &why, scratch)) {
+        fspost(e, scratch, id, {}, why);
+    }
 }
 
 // An entry, then its subagents under it, each with its depth there.
@@ -24202,6 +24543,11 @@ static void command(Engine *e, Arena scratch, Str line)
         case CMD_TERMOPEN:
             reply(e, scratch, id, 0, "the engine is stopping", sid);
             return;
+        case CMD_DIR:
+        case CMD_FSREAD:
+        case CMD_FSSTAT:
+            fspost(e, scratch, id, {}, "the engine is stopping");
+            return;
         }
     }
     switch (cmd) {
@@ -24275,6 +24621,7 @@ static void command(Engine *e, Arena scratch, Str line)
         putintkey(&w.json, "turns", turns);
         putintkey(&w.json, "jobs", jobs);
         putintkey(&w.json, "terms", termcount(e, -1));
+        termstatus(e, &w.json);
         emit(e, evend(&w));
     } return;
     case CMD_STOP:
@@ -24345,13 +24692,9 @@ static void command(Engine *e, Arena scratch, Str line)
         cmdmodel(e, scratch, id, j);
         return;
     case CMD_DIR:
-        cmddir(e, scratch, id, j);
-        return;
     case CMD_FSREAD:
-        cmdfsread(e, scratch, id, j);  // inline, as dir: a slow mount stalls
-        return;
     case CMD_FSSTAT:
-        cmdfsstat(e, scratch, id, j);
+        fscmd(e, scratch, id, cmd, j, line);  // on a worker (fswork.cpp)
         return;
     case CMD_MODELS:
         cmdmodels(e, scratch, id);
@@ -24660,6 +25003,13 @@ static void onrecord(Engine *e, Arena scratch, Record r)
     } else if (r.type == MAIL_GIT) {
         gitdone(e, scratch, r.data);
         return;
+    } else if (r.type == MAIL_FS) {
+        // By type, before the handlers that match on an id alone: a
+        // worker's index may be any probe's id too
+        if (e->fs) {
+            fsdone(e->fs, r, scratch);
+        }
+        return;
     } else if (r.type == MAIL_WORKTREE) {
         wtdone(e, scratch, r.data);
         return;
@@ -24902,6 +25252,8 @@ static void enginethread(void *arg)
         next = relaynext(e, now)<next ? relaynext(e, now) : next;
         next = termnext(e, now)<next ? termnext(e, now) : next;
         next = skillfetchnext(e)<next ? skillfetchnext(e) : next;
+        next = e->fs && fsnext(e->fs)<next ? fsnext(e->fs) : next;
+        next = e->nfslost && now+20*MS<next ? now+20*MS : next;  // fsresend
         for (Lister *l = e->listers; l; l = l->next) {
             next = !l->replied && l->by<next ? l->by : next;
         }
@@ -24949,6 +25301,12 @@ static void enginethread(void *arg)
         termtick(e, newarena(e->scratch));
         if (skillfetchnext(e) <= now) {
             skillfetchtimeout(e, newarena(e->scratch), now);
+        }
+        if (e->fs && fsnext(e->fs)<=now) {
+            fstick(e->fs, newarena(e->scratch), now);
+        }
+        if (e->nfslost) {
+            fsresend(e, newarena(e->scratch));
         }
         if (mcpnext(e) <= now) {
             mcptick(e, newarena(e->scratch), now);
@@ -25002,6 +25360,10 @@ static void enginethread(void *arg)
                 }
             }
             e->parked = {};
+            if (e->fs) {
+                // Every fs command answered, none waited for
+                fsquit(e->fs, "the engine is stopping", newarena(e->scratch));
+            }
             mcpquit(e);
             gitquit(e);
             wtquit(e);

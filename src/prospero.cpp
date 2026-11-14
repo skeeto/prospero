@@ -136,8 +136,10 @@ static Dirent *os_list(Os *, Arena *, Str path);
 // List a directory for a person to pick from (path completion): as
 // os_list, but symlinks are what they name, a link to a directory one
 // too, only directories with dirs, and at most max entries, in no
-// particular order. Broken links are left out.
-static Listing os_listall(Os *, Arena *, Str path, b32 dirs, iz max);
+// particular order. Broken links are left out. beat, if any, is called
+// with ctx for each entry read, a heartbeat for a slow folder (fsbeat).
+static Listing os_listall(Os *, Arena *, Str path, b32 dirs, iz max,
+                          void (*beat)(void *) = 0, void *ctx = 0);
 // Type, size, and modification time of a path, following symlinks.
 static Stat    os_stat(Os *, Arena, Str path);
 // Rename a file, replacing any existing target.
@@ -299,6 +301,14 @@ static b32     os_linkfar(Os *, Arena, Str path);
 // so nothing a link names is touched; a part missing ends the walk (0).
 // For checks nobody asked for (inline code), which take no link at all.
 static b32     os_haslink(Os *, Arena, Str path, iz from);
+// The mount point of the network or FUSE file system (NFS, SMB, sshfs,
+// a mapped drive) that holds an absolute path, else empty: on a local
+// disk, or not known. Told from the mount table alone (Linux's
+// mountinfo, macOS's getfsstat without waiting, Windows' DOS device
+// names), never by touching the share, so it answers while the share
+// hangs. autofs is passed over for the mount beneath it. Windows
+// answers "X:/" or "//host/share/".
+static Str     os_farmount(Os *, Arena *, Str path);
 
 // This user's ids as UID:GID on Linux, for a container whose root would
 // be root here (ctruser); null elsewhere.
@@ -353,6 +363,11 @@ static b32     os_ptyresize(Os *, Proc *, PtySize);
 static b32     os_ptybusy(Os *, Proc *);
 // Whether os_ptyspawn can work here: on Windows, from 10 version 1809.
 static b32     os_ptyable(Os *);
+// How the terminal reads typing now, as its foreground program set it:
+// a password's way (lines, no echo), a shell's (lines, echoed), raw (a
+// line editor, a full-screen program), or unknown (ConPTY hides it).
+enum { PTY_UNKNOWN, PTY_RAW, PTY_ECHO, PTY_SECRET };
+static i32     os_ptymode(Os *, Proc *);
 #if defined(_WIN32)
 enum { PTY_MAC = 0, PTY_LINUX = 0 };
 #elif defined(__APPLE__)
@@ -492,7 +507,11 @@ static void    os_wake(Os *);
 // window moved, resized, maximized or restored (WinGeom, below), and
 // gui_drop of a file dropped on the window, by its path, at a point in
 // ImGui's units if the platform knows it, or opened in the application
-// as a whole (macOS: Finder, the Dock, open -a), and
+// as a whole (macOS: Finder, the Dock, open -a), the files of one drop
+// one after another at one point, gui_droptext of text dropped on the
+// window where the platform could not refuse it first, gui_dragover of
+// a drag over the window and of its leaving, which answers whether a
+// drop there would be refused, and
 // gui_toasted and gui_toastfail of a desktop notification clicked or
 // refused (os_guitoast).
 struct Gui;
@@ -618,8 +637,10 @@ enum {
                     // or back to what it really is (x -1)
     GEV_TRAY,       // the tray icon's menu item x (TRAY_*) is picked,
                     // tray or not, window or not
-    GEV_DROP,       // a file, its path the text, is dropped on the window,
-                    // at x, y if down is set, else at no known point
+    GEV_DROP,       // files are dropped on the window together, their
+                    // paths the text, each ending in a NUL (len counts
+                    // them all), at x, y if down is set, else at no
+                    // known point
     GEV_TOAST,      // toast x is clicked (y 0), or was refused (y 1),
                     // shown or not, by the platform's own path
     GEV_FLAGPASTE,  // macOS: Cmd+V as dictation apps post it, Cmd in V's
@@ -635,6 +656,12 @@ enum {
                     // the checklist's own pasteboard and the real one;
                     // down 1 gives in x and y how far each moved since,
                     // or x -1 where there is no own pasteboard
+    GEV_DRAG,       // a drag over the window, as the platform's own drags
+                    // come: button 0 leaves, 1 is over, 2 drops; key 1
+                    // holds the words text, else the paths text as for
+                    // GEV_DROP; at x, y if down is set, else over the
+                    // title bar. Out, x 1 if the platform was told to
+                    // take it, 0 to refuse it, -1 where it says nothing
 };
 enum {
     GKEY_TAB,
@@ -758,10 +785,14 @@ static b32     os_guiopenurl(Os *, Arena scratch, Str url);
 // sets its place, and cannot leave being minimized by itself
 // (GUI_NOPLACE); it takes a new clipboard selection only with the serial
 // of a real input event newer than the last one's, which no synthetic
-// event has (GUI_NOSERIAL). The checklist allows for both.
+// event has (GUI_NOSERIAL). What a drag over the window holds may be
+// known only once it is dropped (GUI_NODRAGLOAD): Linux's drags never
+// say, while macOS reads a drag's pasteboard and Windows its data
+// object as it enters. The checklist allows for each.
 enum : u32 {
-    GUI_NOPLACE  = 1<<0,
-    GUI_NOSERIAL = 1<<1,
+    GUI_NOPLACE    = 1<<0,
+    GUI_NOSERIAL   = 1<<1,
+    GUI_NODRAGLOAD = 1<<2,
 };
 static u32     os_guilimits(Os *);
 #endif
@@ -789,6 +820,8 @@ static u32     os_guilimits(Os *);
 #include "desktop.cpp"
 #include "tools.cpp"
 #include "guard.cpp"
+#include "fswork.cpp"    // after guard.cpp and mailbox.cpp: normpath, mailpost
+#include "editjump.cpp"  // after tools.cpp and guard.cpp: basename, pathroot
 #include "search.cpp"
 #include "instructions.cpp"
 #include "memory.cpp"
@@ -801,6 +834,9 @@ static u32     os_guilimits(Os *);
 #include "help.cpp"   // after config.cpp and mcp.cpp: cfgkinds, hexval
 #include "engine.cpp"
 #include "relay.cpp"
+#include "../ariel/ariel.h"
+#include "termset.cpp"
+#include "termsecret.cpp"
 #include "ptyhost.cpp"  // after relay.cpp
 #include "git.cpp"
 #include "worktree.cpp"

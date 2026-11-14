@@ -117,6 +117,19 @@ static void itemrect(Gui *g, i32 which)
     g->rects[which] = {a.x, a.y, z.x, z.y};
 }
 
+// While files are dragged over the window, remember where the last item
+// went as the place a drop to (DROPTO_*) would go, for drawdragover to
+// outline: never in the checklist's rects, which go stale whenever their
+// item is not drawn.
+static void dragplace(Gui *g, i32 to)
+{
+    if (g->drag.on) {
+        ImVec2 a = ImGui::GetItemRectMin();
+        ImVec2 z = ImGui::GetItemRectMax();
+        g->drag.place[to] = {a.x, a.y, z.x, z.y};
+    }
+}
+
 static b32 checkbox(char const *label, b32 *v)
 {
     bool b = *v;
@@ -543,6 +556,7 @@ static void themestyle(ImGuiStyle *st, Palette *p)
     c[ImGuiCol_ScrollbarGrab]    = v(p->scroll);
     c[ImGuiCol_ScrollbarGrabHovered] = v(p->scrollhover);
     c[ImGuiCol_ScrollbarGrabActive]  = v(p->scrollpress);
+    c[ImGuiCol_ScrollbarBg]      = v(p->scrolltrack);
     c[ImGuiCol_TextSelectedBg]   = v(p->sel);
     c[ImGuiCol_WindowBg]      = ImGui::ColorConvertU32ToFloat4(p->panel);
     c[ImGuiCol_Text]          = ImGui::ColorConvertU32ToFloat4(p->paneltext);
@@ -784,8 +798,9 @@ static u32 fade(u32 col, f32 alpha)
     return (col & ~IM_COL32_A_MASK) | a<<IM_COL32_A_SHIFT;
 }
 
-// A piece's color, in a code block or elsewhere.
-static u32 piececolor(Palette *pal, Piece *p, b32 codeblock)
+// A piece's color, in a code block or elsewhere. In plain text, as a
+// tool's output is parsed, code is the output's, not a Markdown span's.
+static u32 piececolor(Palette *pal, Piece *p, b32 codeblock, b32 plain)
 {
     if (p->hl) {
         return pal->hl[p->hl];
@@ -796,7 +811,7 @@ static u32 piececolor(Palette *pal, Piece *p, b32 codeblock)
     } else if (p->style & STYLE_DIM) {
         return pal->reasoning;
     } else if (p->style & STYLE_CODE) {
-        return pal->code;
+        return plain ? pal->tooltext : pal->code;
     }
     return pal->text;
 }
@@ -1040,7 +1055,7 @@ static void drawblock(Gui *g, ImDrawList *dl, ImDrawListSplitter *sp,
             ImVec2       at   = v2(ox + r->x, ly + l->base - bk->Ascent);
             char const  *beg  = pc->text.cdata + r->b0;
             char const  *end  = pc->text.cdata + r->b1;
-            u32          col  = fade(cand ? pal->link : piececolor(pal, pc, code), alpha);
+            u32          col  = fade(cand ? pal->link : piececolor(pal, pc, code, d->plain), alpha);
             ImFont      *font = stylefont(f, pc->style);
             f32          size = stylesize(f, pc->style);
             sp->SetCurrentChannel(dl, CH_TEXT);
@@ -3741,13 +3756,78 @@ static Marks msgmarks(Gui *g, View *v, i32 msg)
     return hitmarks(s->hits, s->cur, msg);
 }
 
+static b32 menutip(Gui *, Arena *, Str, Str, Str, char const *);
+
+// A code block of the shown session's transcript that the Run button
+// runs (termrunblock), and why it cannot now, if so.
+struct CodeRun {
+    i32 kind;   // RUN_NONE: no Run
+    Str lang;
+    Str text;
+    Str why;
+    u64 key;    // its tab's (termrunkey)
+};
+
+// Message msg's block as a Run: one of the agent's, committed, in the
+// shown session's transcript, a fenced block whose closing fence came,
+// of a shell's language, in a session that may change (not read-only,
+// archived or in the Trash).
+static CodeRun coderun(Gui *g, View *v, Arena *a, i32 msg, i32 block)
+{
+    CodeRun     r = {};
+    GuiSession *s = g->sess;
+    ViewMsg    *m = &v->msgs[msg];
+    if (!s || s->view!=v || m->role!=VIEW_ASSISTANT || m->prov || m->lines || !m->seq) {
+        return r;
+    } else if (s->readonly || s->trashed || s->gone || sessroot(g, s)->archived) {
+        return r;
+    }
+    Doc *d = msgdoc(v, msg);
+    if (block<0 || block>=d->blocks.len) {
+        return r;
+    }
+    DocBlock *k = &d->blocks[block];
+    if (k->type!=DOC_CODE || !k->fence || !termrunlang(k->lang)) {
+        return r;
+    } else if (blocklines(d, block).end <= lineend(d->src, k->off1)) {
+        return r;  // its fence not closed yet
+    }
+    TermRunBlock b = termrunblock(a, k->lang, copyblock(v, a, msg, block));
+    if (!b.kind) {
+        return r;
+    }
+    r.kind = b.kind;
+    r.lang = trim(k->lang);
+    r.text = b.text;
+    r.key  = termrunkey(s->sid, m->seq, block);
+    r.why  = b.why.len ? b.why : termrunwhy(g, s, b.kind, r.key);
+    return r;
+}
+
+// Run's tooltip: what runs it, and where.
+static Str coderuntip(Gui *g, Arena *a, CodeRun *cr)
+{
+    if (cr->why.len) {
+        return concat(a, "Can't run it: ", cr->why);
+    }
+    Buf b(a, 256);
+    print(&b, "Run in a Terminal tab (");
+    print(&b, cr->kind==RUN_PS ? Str("PowerShell") : cr->kind==RUN_CMD ? Str("cmd.exe")
+                               : cr->lang);
+    print(&b, "), in ");
+    print(&b, termrunfolder(g, g->sess));
+    print(&b, ". The agent hears how it ended at its next request.");
+    return finish(&b);
+}
+
 // A code block's Copy button, at its top right while the mouse is over
 // the block, which it overlaps as the headers' toggles overlap the text:
 // the code byte for byte, as selecting the block whole copies it. It
 // shows a check mark for a moment after, until a deadline. With aim, the
-// one the checklist chose is where it can find it.
+// one the checklist chose is where it can find it. Beside it, in the
+// transcript (runs), a block coderun takes has a Run button.
 static void drawcodecopy(Gui *g, View *v, i32 msg, Placed *pl, ImVec2 origin, f32 top,
-                         b32 dragging, b32 aim)
+                         b32 dragging, b32 aim, b32 runs)
 {
     BlockLayout *bl = pl->bl;
     Deco        *bg = 0;
@@ -3802,6 +3882,28 @@ static void drawcodecopy(Gui *g, View *v, i32 msg, Placed *pl, ImVec2 origin, f3
         g->copiedmsg  = msg;
         g->copiedblk  = pl->block;
         g->copiedat   = g->sched.now;
+    }
+
+    Arena   t  = g->frame;
+    CodeRun cr = runs ? coderun(g, v, &t, msg, pl->block) : CodeRun{};
+    if (!cr.kind) {
+        return;
+    }
+    ImGui::SetCursorScreenPos(v2(z.x - 2*bw - 8*sc, by));
+    ImGui::PushID(pl->block);
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, v2(st.FramePadding.x, 0));
+    ImGui::BeginDisabled(cr.why.len > 0);
+    b32 run = ImGui::Button(ICON_PLAY "###run", v2(bw, 0));
+    ImGui::EndDisabled();
+    ImGui::PopStyleVar();
+    ImGui::PopID();
+    itemtip("%s", cstr0(&t, coderuntip(g, &t, &cr)));
+    itemnamed(g, "code run");
+    if (aimed) {
+        itemrect(g, RECT_CODERUN);
+    }
+    if (run) {
+        termrun(g, g->sess, cr.lang, cr.text, cr.key);
     }
 }
 
@@ -4029,7 +4131,7 @@ static void drawmsgtext(Gui *g, ImDrawList *dl, ImDrawListSplitter *sp, TextArea
                 origin.y+pl->y+pl->bl->h < top) {
             continue;
         }
-        drawcodecopy(g, v, i, pl, origin, top, *ta->dragging, aim);
+        drawcodecopy(g, v, i, pl, origin, top, *ta->dragging, aim, ta->permsg);
     }
     ImGui::PopID();
 }
@@ -4371,6 +4473,7 @@ static Str drawlines(Gui *g, DocView *d, char const *id, DocLines *dl)
         // first line, or the column's row
         f64 yc = col ? v->msgs[k].top + pad + cr.y : y0;
         want  = y1-y0 <= vish-2*pad ? (y0+y1)/2 - vish/2 : yc - vish/3;
+        want  = want<0 ? 0 : want;  // near the top: the top, not "stay put"
         wantx = 0;
         if (col && !dl->wrap) {
             f32 vw = avail.x - st.ScrollbarSize - pad - gutter;
@@ -5613,11 +5716,28 @@ static void drawtranscript(Gui *g)
     }
     if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
         g->menumsg = hit.hit ? hit.at.msg : -1;  // the popup takes the hover from here on
+        g->menuoff = hit.hit ? hit.at.off : -1;
     }
     if (begintextmenu(g, v, RECT_COPYITEM)) {
         b32 onmsg = g->menumsg>=0 && g->menumsg<v->msgs.len;
         if (ImGui::MenuItem("Copy Message", 0, false, onmsg)) {
             copymessage(g, g->menumsg);
+        }
+        // A right-click inside a code block the Run button runs
+        Arena   t  = g->frame;
+        CodeRun cr = {};
+        if (onmsg && g->menuoff>=0 && !v->msgs[g->menumsg].lines) {
+            Doc *d = msgdoc(v, g->menumsg);
+            i32  b = blockat(d, g->menuoff);
+            if (b>=0 && g->menuoff>=d->blocks[b].off0 && g->menuoff<=d->blocks[b].off1) {
+                cr = coderun(g, v, &t, g->menumsg, b);
+            }
+        }
+        if (cr.kind) {
+            if (menutip(g, &t, "Run in Terminal", cr.why, coderuntip(g, &t, &cr), 0)) {
+                termrun(g, g->sess, cr.lang, cr.text, cr.key);
+            }
+            itemnamed(g, "text run");
         }
         b32 forked = forkitem(g, onmsg ? &v->msgs[g->menumsg] : 0);
         sideitem(g, v, !forked);
@@ -5650,6 +5770,7 @@ static void drawtranscript(Gui *g)
     g->rects[RECT_MSGLINK]   = {};
     g->rects[RECT_CODEBLOCK] = {};
     g->rects[RECT_CODECOPY]  = {};
+    g->rects[RECT_CODERUN]   = {};
     g->copiedshown = 0;
     g->clockshown  = 0;
     g->railseen    = 0;
@@ -7169,6 +7290,7 @@ static void drawprompt(Gui *g)
     g->promptend = g->promptend==2 ? 0 : g->promptend;
     ImGui::PopID();
     itemrect(g, RECT_PROMPT);
+    dragplace(g, DROPTO_ATTACH);
     ImVec2 r0 = ImGui::GetItemRectMin();
     ImVec2 r1 = ImGui::GetItemRectMax();
     if (edited && !cb.recalled) {
@@ -7341,13 +7463,14 @@ static void drawprompt(Gui *g)
         act = ImGui::MenuItem("Select all", cmdkey(g, &a, "A"), false, any) ? CM_SELALL : act;
         itemrect(g, RECT_CMSELALL);
         ImGui::Separator();
-        b32 ed = !g->edproc && editorcmd(g, &a).len;
+        Str edwhy = editorwhy(g, s, &a);
+        b32 ed    = !edwhy.len;
         if (ImGui::MenuItem("Open in editor", "Ctrl+G", false, ed)) {
             editstart(g, a, s);
         }
         itemrect(g, RECT_CMEDITOR);
-        if (!editorcmd(g, &a).len) {
-            itemtip("Set [ui] editor in the settings, or $VISUAL or $EDITOR");
+        if (edwhy.len) {
+            whytip(edwhy);
         }
         g->cmenustate = (undo ? 1 : 0) | (redo ? 2 : 0) | (sel ? 4 : 0) | (clip ? 8 : 0) | (ed ? 16 : 0);
         if (act) {
@@ -9312,6 +9435,20 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other, 
     ImGui::PopID();
 }
 
+// A card over everything, c0 to c1, with a shadow below it: a dragged
+// session's (dragcard), or what a drop of files would do (drawdragover).
+static void cardbox(ImDrawList *dl, f32 sc, ImVec2 c0, ImVec2 c1, Palette *pal, u32 border)
+{
+    f32 rd = 6*sc;
+    for (i32 i = 4; i >= 1; i--) {
+        f32 d = (f32)i*2*sc;
+        dl->AddRectFilled(v2(c0.x - d/2, c0.y + d/2), v2(c1.x + d/2, c1.y + d),
+                          IM_COL32(0, 0, 0, 16), rd + d);
+    }
+    dl->AddRectFilled(c0, c1, fade(pal->rowhover, 0.88f), rd);
+    dl->AddRect(c0, c1, border, rd, sc);
+}
+
 // The dragged session's card, held under the pointer where its row was
 // taken hold of, as if lifted out of the list, with a shadow: its dot,
 // its title, and below, where it would go if dropped now. It moves up
@@ -9337,14 +9474,7 @@ static void dragcard(Gui *g, Arena a, GuiSession *s)
         c0.y = st.y - 4*sc - h;
     }
     ImVec2 c1 = v2(c0.x + w, c0.y + h);
-    f32    rd = 6*sc;
-    for (i32 i = 4; i >= 1; i--) {
-        f32 d = (f32)i*2*sc;
-        dl->AddRectFilled(v2(c0.x - d/2, c0.y + d/2), v2(c1.x + d/2, c1.y + d),
-                          IM_COL32(0, 0, 0, 16), rd + d);
-    }
-    dl->AddRectFilled(c0, c1, fade(g->pal->rowhover, 0.88f), rd);
-    dl->AddRect(c0, c1, fade(g->pal->active, 0.7f), rd, sc);
+    cardbox(dl, sc, c0, c1, g->pal, fade(g->pal->active, 0.7f));
 
     View *v     = s->view;
     i32   state = v ? v->state : s->state;
@@ -9362,6 +9492,88 @@ static void dragcard(Gui *g, Arena a, GuiSession *s)
     } else {
         pen(&b, sesswhere(&a, s), 0, g->pal->dim);
     }
+}
+
+// While files are dragged over the window, the place a drop would go,
+// tinted and outlined, with a card over it that says what a drop does,
+// or in amber why the files would not go (dragwhere): drawn over
+// everything, a modal's dim too, as no item of ImGui's, so that it takes
+// no input, no name and no cursor, the platform's own during a drag.
+// The places:
+// - Open file's field, and New session's folder field (else the whole
+//   window, under another dialog such as the fork's);
+// - the Files pane, as FindHoveredWindowEx finds it (dropfacts): docked,
+//   below its tab, as the dock's tab strip is not the pane's;
+// - the prompt, to attach to, through a modal's dim as well.
+static void drawdragover(Gui *g)
+{
+    DragOver *d = &g->drag;
+    if (!d->on) {
+        return;
+    }
+    f32            sc   = g->scale;
+    Palette       *pal  = g->pal;
+    ImDrawList    *dl   = ImGui::GetForegroundDrawList();
+    ImGuiViewport *vp   = ImGui::GetMainViewport();
+    DropBox        work = {vp->WorkPos.x, vp->WorkPos.y, vp->WorkPos.x + vp->WorkSize.x,
+                           vp->WorkPos.y + vp->WorkSize.y};
+    Rect           at   = {};
+    f32            rd   = ImGui::GetStyle().FrameRounding;
+    switch (d->to) {
+    case DROPTO_FIELD:
+    case DROPTO_ATTACH:
+        at = d->place[d->to];
+        break;
+    case DROPTO_FILES:
+        if (g->filesdrawn && g->fileswindow) {
+            ImRect r = g->fileswindow->OuterRectClipped;
+            at = {r.Min.x, r.Min.y, r.Max.x, r.Max.y};
+            rd = 6*sc;
+        }
+        break;
+    case DROPTO_NEWSESSION:
+        at = d->place[DROPTO_NEWSESSION];
+        if (at.x1<=at.x0 || at.y1<=at.y0) {
+            at = {work.x0 + 4*sc, work.y0 + 4*sc, work.x1 - 4*sc, work.y1 - 4*sc};
+            rd = 6*sc;
+        }
+        break;
+    }
+    u32 c = d->amber ? pal->amber : pal->active;
+    if (at.x1>at.x0 && at.y1>at.y0) {
+        dl->AddRectFilled(v2(at.x0, at.y0), v2(at.x1, at.y1), fade(c, d->amber ? 0.10f : 0.16f), rd);
+        dl->AddRect(v2(at.x0, at.y0), v2(at.x1, at.y1), fade(c, d->amber ? 0.6f : 0.85f), rd, 2*sc);
+    }
+
+    // The card: an icon, the label, and below it the detail
+    Str label  = {(u8 *)d->label, (iz)__builtin_strlen(d->label)};
+    Str detail = {(u8 *)d->detail, (iz)__builtin_strlen(d->detail)};
+    Str icon   = d->to==DROPTO_FIELD || d->to==DROPTO_FILES ? Str(ICON_FILE) :
+                 d->to==DROPTO_NEWSESSION                  ? Str(ICON_NEWFOLDER) :
+                                                             Str(ICON_ATTACH);
+    f32     size   = g->fonts.size;
+    f32     small  = smallsize(&g->fonts);
+    f32     lineh  = ImGui::GetTextLineHeight();
+    f32     padx   = 10*sc;
+    f32     pady   = 6*sc;
+    ImFont *prose  = stylefont(&g->fonts, 0);
+    f32     indent = textsize(prose, size, icon, 0).x + 6*sc;
+    f32     lw     = textsize(stylefont(&g->fonts, STYLE_BOLD), size, label, 0).x;
+    f32     dw     = detail.len ? textsize(prose, small, detail, 0).x : 0;
+    f32     w      = 2*padx + indent + (lw>dw ? lw : dw);
+    f32     h      = 2*pady + lineh + (detail.len ? lineh*small/size : 0);
+    w = w<work.x1-work.x0 ? w : work.x1-work.x0;
+    DropBox card = cardplace({at.x0, at.y0, at.x1, at.y1}, w, h, work, d->x, d->y, 8*sc);
+    ImVec2  c0   = v2(card.x0, card.y0);
+    ImVec2  c1   = v2(card.x1, card.y1);
+    cardbox(dl, sc, c0, c1, pal, c);
+    Pen p = {dl, &g->fonts, c0.x + padx, c0.y + pady, c1.x - padx, size};
+    pen(&p, icon, 0, c);
+    p.x = c0.x + padx + indent;
+    pen(&p, label, STYLE_BOLD, d->amber ? pal->amber : pal->text);
+    Pen q = {dl, &g->fonts, c0.x + padx + indent, c0.y + pady + lineh, c1.x - padx, small};
+    pen(&q, detail, 0, pal->dim);
+    d->shown = 1;
 }
 
 // While a session is dragged: the space below the rows, out of its
@@ -10866,9 +11078,11 @@ static void importfill(Gui *g, GuiHost *h)
 // field. It shows once the text is typed in, or Up or Down pressed, and
 // hides on accepting a pick, on Esc, and as the field loses the keyboard.
 // Up and Down pick; Tab accepts the pick, or the first, and Enter one
-// picked, else Enter is the dialog's; a click on a row accepts it. An
-// accepted folder is the text's, with a separator: its own folders are
-// then listed, as soon as the text changes again.
+// picked, else Enter is the dialog's; Tab while the folder is being
+// listed stays with the field, and completes once the listing comes; a
+// click on a row accepts it. An accepted folder is the text's, with a
+// separator: its own folders are then listed, as soon as the text
+// changes again.
 struct PathCb {
     Gui            *g;
     PathQuery       q;
@@ -10906,6 +11120,8 @@ static i32 pathcb(ImGuiInputTextCallbackData *d)
             d->InsertChars(0, t.cdata, t.cdata+t.len);
             c->accepted = 1;
         }
+    } else if (d->EventFlag == ImGuiInputTextFlags_CallbackCompletion) {
+        pc->tabwait = 1;  // the folder still being listed: once it comes
     } else if (d->EventFlag == ImGuiInputTextFlags_CallbackEdit) {
         byte  mem[FIELD_MAX+8];
         Arena a = {mem, mem+sizeof(mem)};
@@ -10920,6 +11136,19 @@ static i32 pathcb(ImGuiInputTextCallbackData *d)
         }
     }
     return 0;
+}
+
+// Put an accepted pick in the field, from outside it.
+static void pathput(PathField *f, char *buf, PathPick p, Arena scratch)
+{
+    Str t = pathaccept(&scratch, f->cb.q, p);
+    if (t.len < FIELD_MAX) {
+        fieldput(buf, t);
+        ImGuiInputTextState *st = ImGui::GetInputTextState(f->id);
+        if (st && ImGui::GetActiveID()==f->id) {
+            st->ReloadUserBufAndMoveToEnd();
+        }
+    }
 }
 
 // Before the field: what it picks, from its text as it stands, and the
@@ -10939,8 +11168,9 @@ static PathField pathbefore(Gui *g, GuiHost *h, char *buf, b32 *enter, b32 off,
     }
     b32 active = ImGui::GetActiveID() == f.id;
     if (!active && !pc->refocus) {
-        pc->shown = 0;
-        pc->sel   = -1;
+        pc->shown   = 0;
+        pc->sel     = -1;
+        pc->tabwait = 0;
     }
     if (pc->refocus && active) {
         // Back after a click on a row: the caret at the end, not all
@@ -10979,16 +11209,33 @@ static PathField pathbefore(Gui *g, GuiHost *h, char *buf, b32 *enter, b32 off,
     f.cb.scratch = *a;
     i32 n      = (i32)f.cb.picks.len;
     pc->sel    = pc->sel<n ? pc->sel : -1;
-    f.visible  = pc->shown && (n || f.list->err.len || !f.list->got);
+    if (pc->tabwait && f.list->got) {
+        // Tab came before the listing, which is here now: it completes
+        pc->tabwait = 0;
+        if (n) {
+            pathput(&f, buf, f.cb.picks[pc->sel>=0 ? pc->sel : 0], f.cb.scratch);
+            f.cb.accepted = 1;
+            return f;
+        }
+    }
+    // "Listing..." once the listing has taken a moment, else not at all
+    i64 noteat = f.list->at + FILES_NOTEDELAY;
+    b32 noted  = !f.list->got && g->sched.now>=noteat;
+    if (pc->shown && !f.list->got && !noted) {
+        schedat(&g->sched, noteat, DUE_APP);
+    }
+    if (pc->shown && (n || !f.list->got)) {
+        // Tab, kept from nav, also while the listing is on its way
+        f.flags |= ImGuiInputTextFlags_CallbackCompletion;
+    }
+    f.visible  = pc->shown && (n || f.list->err.len || noted);
     if (!f.visible) {
         return f;
     }
-    if (n) {
-        f.flags |= ImGuiInputTextFlags_CallbackCompletion;  // Tab, kept from nav
-    }
     // Esc closes the dropdown, not the dialog, nor reverts the field
     if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
-        pc->shown = 0;
+        pc->shown   = 0;
+        pc->tabwait = 0;  // a Tab waiting on the listing goes with it
         ImGui::SetKeyOwner(ImGuiKey_Escape, ImGui::GetID("##pathkeys"),
                            ImGuiInputFlags_LockThisFrame);
     }
@@ -11004,19 +11251,6 @@ static PathField pathbefore(Gui *g, GuiHost *h, char *buf, b32 *enter, b32 off,
     return f;
 }
 
-// Put an accepted pick in the field, from outside it.
-static void pathput(PathField *f, char *buf, PathPick p, Arena scratch)
-{
-    Str t = pathaccept(&scratch, f->cb.q, p);
-    if (t.len < FIELD_MAX) {
-        fieldput(buf, t);
-        ImGuiInputTextState *st = ImGui::GetInputTextState(f->id);
-        if (st && ImGui::GetActiveID()==f->id) {
-            st->ReloadUserBufAndMoveToEnd();
-        }
-    }
-}
-
 // After the field: an accepted pick, then the dropdown under the field.
 static void pathafter(Gui *g, PathField *f, char *buf)
 {
@@ -11026,9 +11260,10 @@ static void pathafter(Gui *g, PathField *f, char *buf)
         pc->sel   = -1;
         pc->accepts++;
     } else if (ImGui::IsItemEdited()) {
-        pc->shown = 1;
-        pc->sel   = -1;
-        pc->top   = 0;
+        pc->shown   = 1;
+        pc->sel     = -1;
+        pc->top     = 0;
+        pc->tabwait = 0;  // typed over: a Tab before it is forgotten
     }
     Slice<PathPick> picks = f->cb.picks;
     i32             n     = (i32)picks.len;
@@ -11040,9 +11275,13 @@ static void pathafter(Gui *g, PathField *f, char *buf)
     }
     pc->rows = 0;
     if (!f->visible || f->cb.accepted || f->enter) {
+        // Up or Down showed it: drawn next frame, or a listing still on
+        // its way once "Listing..." is due
         DirList *l = f->list;
-        if (pc->shown && l && (n || l->err.len || !l->got)) {
-            scheddirty(&g->sched);  // Up or Down showed it: drawn next frame
+        if (pc->shown && l && (n || l->err.len)) {
+            scheddirty(&g->sched);
+        } else if (pc->shown && l && !l->got) {
+            schedat(&g->sched, l->at+FILES_NOTEDELAY, DUE_APP);
         }
         return;
     }
@@ -11184,10 +11423,17 @@ static void drawpathask(Gui *g, PathAsk *pa, char const *pid, char const *name, 
         ImGui::InputTextWithHint("##cwd", cstr0(&a, hint), pa->buf, FIELD_MAX,
                                  pf.flags, pathcb, &pf.cb);
         itemnamed(g, concat(&a, nm, " field"));
+        if (openfile) {
+            dragplace(g, DROPTO_FIELD);
+        }
         pathafter(g, &pf, pa->buf);
+        // Said once the check has taken a moment, else not at all
         b32 checking = openfile && g->fask.statid;
-        if (checking) {
+        i64 noteat   = g->fask.statat + FILES_NOTEDELAY;
+        if (checking && g->sched.now>=noteat) {
             ImGui::TextDisabled("Checking...");
+        } else if (checking) {
+            schedat(&g->sched, noteat, DUE_APP);
         } else if (pa->err.len) {
             ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
             ImGui::TextWrapped("%s", cstr0(&a, pa->err));
@@ -11637,6 +11883,7 @@ static b32 drawnewctr(Gui *g, Arena a, b32 *enter)
     ImGui::InputTextWithHint("##cwd", "A folder on this computer", g->newcwd, FIELD_MAX,
                              pf.flags, pathcb, &pf.cb);
     itemrect(g, RECT_NEWCWD);
+    dragplace(g, DROPTO_NEWSESSION);
     pathafter(g, &pf, g->newcwd);
     ImGui::SameLine();
     if (ImGui::Button(browse)) {
@@ -11791,6 +12038,7 @@ static void drawnew(Gui *g)
         PathField pf = pathbefore(g, host, g->newcwd, &enter, nofolder);
         ImGui::InputText("##cwd", g->newcwd, FIELD_MAX, pf.flags, pathcb, &pf.cb);
         itemrect(g, RECT_NEWCWD);
+        dragplace(g, DROPTO_NEWSESSION);  // not drawmove's: a folder starts New session
         pathafter(g, &pf, g->newcwd);
         ImGui::SameLine();
         b32 remote = host->kind == GH_REMOTE;
@@ -12000,6 +12248,7 @@ static void drawclose(Gui *g)
         i32 j = jobbing(g);
         i32 m = elsewhere(g);
         i32 t = termbusy(g);
+        i32 e = termedits(g);  // of those, editors'
         g->closeterms = t;
         g->closejobs  = j;
         Buf b(&a, 128);
@@ -12024,13 +12273,22 @@ static void drawclose(Gui *g)
         if (!n && !j && !t) {
             ImGui::TextUnformatted("Nothing is running here any more.");
         }
-        if (t) {
-            Buf e(&a, 128);
-            print(&e, (i64)t);
-            print(&e, t==1 ? Str(" terminal tab is running a program")
-                           : Str(" terminal tabs are running programs"));
-            print(&e, ", which quitting hangs up.");
-            ImGui::TextUnformatted(cstr0(&a, finish(&e)));
+        if (t > e) {
+            Buf w(&a, 128);
+            print(&w, (i64)(t - e));
+            print(&w, t-e==1 ? Str(" terminal tab is running a program")
+                             : Str(" terminal tabs are running programs"));
+            print(&w, ", which quitting hangs up.");
+            ImGui::TextUnformatted(cstr0(&a, finish(&w)));
+        }
+        if (e) {
+            Buf w(&a, 128);
+            print(&w, (i64)e);
+            print(&w, e==1 ? Str(" editor tab has a file open, which quitting hangs up, "
+                                 "losing what it has not saved.")
+                           : Str(" editor tabs have files open, which quitting hangs up, "
+                                 "losing what they have not saved."));
+            ImGui::TextUnformatted(cstr0(&a, finish(&w)));
         }
         if (m) {
             Buf e(&a, 128);
@@ -12054,6 +12312,11 @@ static void drawclose(Gui *g)
             itemrect(g, RECT_CLOSEBG);
             if (g->whynobg.len) {
                 itemtip("Not here: %s", cstr0(&a, g->whynobg));
+            } else if (e) {
+                itemtip("Close the window and its terminal tabs, and keep this "
+                        "process running its sessions, unattended, with a tray icon "
+                        "to bring it back. Its editor tabs lose what they have not "
+                        "saved");
             } else {
                 itemtip("Close the window and its terminal tabs, and keep this "
                         "process running its sessions, unattended, with a tray icon "

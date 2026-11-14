@@ -1427,8 +1427,112 @@ static void testtaskspent(Test *t)
            "[Its context peaked at 8.5k.]");
 }
 
+// fs.read, fs.stat and dir through command(), on fswork's pool: with no
+// threads in this build each job runs inline, inside fscmd.
+static void testfscmd(Test *t)
+{
+    Arena   a = t->perm;
+    CfgEnv  v = newcfgenv(&a);
+    Engine *e = alloc<Engine>(&a);
+    e->os       = v.os;
+    e->out      = newmailbox(&a, 1<<16, 0, 0);
+    e->statedir = "/s";
+    e->perm     = carve(&a, 1<<20);
+    Str root    = HOST_WINDOWS ? Str("C:") : Str("");
+    e->home     = concat(&a, root, "/h");
+    os_mkdirs(v.os, v.scratch, concat(&a, root, "/h/w"));
+    os_mkdirs(v.os, v.scratch, concat(&a, root, "/h/w/sub"));
+    os_write(v.os, v.scratch, concat(&a, root, "/h/w/hello.txt"), "hello\n");
+
+    command(e, v.scratch, "{\"cmd\":\"fs.read\",\"id\":1,\"path\":\"~/w/hello.txt\"}");
+    command(e, v.scratch, "{\"cmd\":\"fs.read\",\"id\":2,\"path\":\"~/w/hello.txt\",\"off\":2,\"max\":2}");
+    command(e, v.scratch, "{\"cmd\":\"fs.read\",\"id\":3,\"path\":\"~/w/sub\"}");
+    command(e, v.scratch, "{\"cmd\":\"fs.read\",\"id\":4,\"path\":\"w/hello.txt\"}");
+    command(e, v.scratch, "{\"cmd\":\"fs.stat\",\"id\":5,\"paths\":"
+                          "[\"~/w/hello.txt\",\"~/w/sub\",\"~/w/none\",7]}");
+    command(e, v.scratch, "{\"cmd\":\"fs.stat\",\"id\":6}");
+    command(e, v.scratch, "{\"cmd\":\"dir\",\"id\":7,\"path\":\"~/w\"}");
+    command(e, v.scratch, "{\"cmd\":\"dir\",\"id\":8,\"path\":\"~/w\",\"dirs\":1}");
+    command(e, v.scratch, "{\"cmd\":\"dir\",\"id\":9,\"path\":\"~/none\"}");
+    {
+        Arena s    = v.scratch;
+        Buf   long_(&s, FS_ARGMAX + 64);
+        print(&long_, "{\"cmd\":\"fs.read\",\"id\":10,\"path\":\"/");
+        for (i32 i = 0; i < FS_ARGMAX; i++) {
+            putbyte(&long_, 'x');
+        }
+        print(&long_, "\"}");
+        command(e, s, finish(&long_));
+    }
+    e->quitting = 1;
+    command(e, v.scratch, "{\"cmd\":\"fs.read\",\"id\":11,\"path\":\"~/w/hello.txt\"}");
+    command(e, v.scratch, "{\"cmd\":\"fs.stat\",\"id\":12,\"paths\":[\"~/w\"]}");
+    command(e, v.scratch, "{\"cmd\":\"dir\",\"id\":13,\"path\":\"~/w\"}");
+
+    Buf  got(&a, 4096);
+    Mail m = mailtake(e->out);
+    for (Record r; (r = mailnext(&m)).ok;) {
+        EvRec rec = evparse(&a, r.data);
+        if (rec.ev != EV_REPLY) {
+            continue;
+        }
+        Json *k = rec.root;
+        print(&got, jsonint(jsonget(k, "id"), 0));
+        putbyte(&got, jsonint(jsonget(k, "ok"), 0) ? '+' : '-');
+        print(&got, jsonstr(jsonget(k, "err")));
+        if (jsonget(k, "data")->type == JSON_STRING) {
+            Str real = jsonstr(jsonget(k, "real"));
+            print(&got, " ");
+            print(&got, jsonstr(jsonget(k, "path")));
+            print(&got, " ");
+            print(&got, cuthead(real, root.len));
+            print(&got, " size=");
+            print(&got, jsonint(jsonget(k, "size"), -1));
+            print(&got, " mtime=");
+            print(&got, jsonint(jsonget(k, "mtime"), -1) >= 0);
+            print(&got, " off=");
+            print(&got, jsonint(jsonget(k, "off"), -1));
+            print(&got, " more=");
+            print(&got, jsonint(jsonget(k, "more"), -1));
+            print(&got, " data=");
+            print(&got, jsonstr(jsonget(k, "data")));
+        }
+        for (Json *s = jsonget(k, "stats")->child; s; s = s->next) {
+            putbyte(&got, ' ');
+            print(&got, jsonstr(jsonget(s, "type")));
+        }
+        Json *ents = jsonget(k, "entries");
+        if (ents->type == JSON_ARRAY) {
+            iz n = 0, dirs = 0;
+            for (Json *d = ents->child; d; d = d->next, n++) {
+                dirs += jsonint(jsonget(d, "dir"), 0);
+            }
+            print(&got, " entries=");
+            print(&got, n);
+            print(&got, " dirs=");
+            print(&got, dirs);
+        }
+        putbyte(&got, '\n');
+    }
+    expect(t, "fs commands", finish(&got),
+           "1+ ~/w/hello.txt /h/w/hello.txt size=6 mtime=1 off=6 more=0 data=aGVsbG8K\n"
+           "2+ ~/w/hello.txt /h/w/hello.txt size=6 mtime=1 off=4 more=1 data=bGw=\n"
+           "3-that is a folder\n"
+           "4-the path must be absolute, or begin with ~\n"
+           "5+ file dir missing bad\n"
+           "6-paths is required\n"
+           "7+ entries=2 dirs=1\n"
+           "8+ entries=1 dirs=1\n"
+           "9-no such directory\n"
+           "10-command too long\n"
+           "11-the engine is stopping\n"
+           "12-the engine is stopping\n"
+           "13-the engine is stopping\n");
+}
+
 static void test_engine(Test *t)
 {
+    testfscmd(t);
     testtaskspent(t);
     testcallimages(t);
     testdeskkeepset(t);

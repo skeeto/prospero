@@ -79,9 +79,16 @@ there too.
   sessions, ranked as you type. **Tab** or a
   plain **Enter** puts the pick in the message without sending it,
   **Up** and **Down** move the pick, and **Esc** closes the list before
-  it reaches the turn.
-- **Ctrl+G** opens the draft in your editor (`[ui] editor`); the draft
-  becomes what you save, once the editor exits.
+  it reaches the turn. The files of a folder on this computer are found
+  in the background, the folder's own entries listed meanwhile. A
+  search held up by a share that stops answering is given up, and the
+  next one, a minute later, leaves that folder out.
+- **Ctrl+G** opens the draft in your editor (`[ui] editor`), which
+  must open a window of its own; the draft becomes what you save, once
+  the editor exits. A terminal `[ui] editor`, such as `vim`, is
+  refused here, though the Files pane's Open in editor runs one in a
+  Terminal tab; on macOS one named only by `$VISUAL` or `$EDITOR` gives
+  way to the default text editor.
 - **Ctrl+V** pastes text, or attaches a copied image. **Ctrl+Shift+V**
   does the same.
 - Right-click for Undo, Redo, Cut, Copy, Paste, Select all and Open in
@@ -101,7 +108,10 @@ The transcript, the Plan pane and these Help pages select alike:
   the selection in the side chat's box).
 
 A code block's Copy button, at its corner while the mouse is over it,
-copies its code exactly, and shows a check mark for a moment. A click on a tool row's or reasoning's header
+copies its code exactly, and shows a check mark for a moment. Beside
+it, a shell's block has a Run button
+([The agent and your terminals](help:sessions#the-agent-and-your-terminals)),
+as does Run in Terminal on the right-click menu. A click on a tool row's or reasoning's header
 opens or folds it. So does a click on the bar at its left (a tool
 row's colored bar, reasoning's gray one), from anywhere along it,
 which, folding, scrolls back to its header if that was above the view.
@@ -136,18 +146,37 @@ cancels it.
 
 ## Dropping files
 
+- While files are dragged over the window, the place they would go is
+  outlined, and a card says what a drop there does: Open in Files,
+  Attach, Fill in the path, or New session; or, in amber, why they
+  would not be attached. On macOS and Windows the card knows what a
+  drag holds: it counts the files and folders, a folder goes to New
+  session, and text, or anything else not files, is refused ("Only
+  files can be dropped here"); where nothing in the drag would be
+  taken, the drop is refused and the drag springs back. On Windows a
+  folder is told from a file only on this computer's own disks: a drag
+  with anything on a network drive, a UNC path, or a CD or DVD, which
+  is never asked while dragged, shows only the place, as on Linux, and
+  is never refused, so a folder there still starts its New session
+  when dropped. On Linux the card shows only the place, not
+  what the drag holds: it counts no files, and a folder or text dragged
+  shows where files would go, until the drop says otherwise.
 - A folder dropped on the window, anywhere, opens the New session
   dialog with it.
 - While Open file asks for a path, a file dropped anywhere on the
-  window fills the path in, to add a `:N` to. It takes one: others
-  dropped with it are not attached. While another dialog is up, a
-  dropped file is attached.
+  window, its title bar included, fills the path in, to add a `:N` to.
+  It takes one: others dropped with it are not attached. While another
+  dialog is up, a dropped file is attached.
 - Otherwise a file dropped on the Files pane opens there, in a tab of
   the session shown, and is not attached: an image (PNG, JPEG, GIF,
   WebP or BMP, by its name's extension) as the image, anything else as
   text.
 - A file dropped anywhere else on the window is attached to the
-  draft, at most ten to a message. An image (PNG, JPEG, GIF, WebP or
+  draft, at most ten to a message. Files dropped together are attached
+  together or not at all: when the message has no room for them all,
+  none are, and the note says why: how many more fit, or that ten is
+  the most. Text dropped on the
+  window is not attached: only files can be dropped there. An image (PNG, JPEG, GIF, WebP or
   BMP) goes as a picture, to a model that takes images; any other file
   goes as text, as `read` shows it, and a binary file is refused. The agent can also
   look at image files itself: `read` shows them to a model that takes

@@ -5,8 +5,8 @@
 // shell's settings, while the frontend emulates the terminal (ariel).
 // The engine is only a flow-controlled pipe of bytes between the two:
 //
-//   term.open {sid, cols, rows, xpx?, ypx?, cwd?}
-//       replies {tid, shell, argv, cwd} before any output
+//   term.open {sid, cols, rows, xpx?, ypx?, cwd?, scrollback?, edit? | run?}
+//       replies {tid, shell, argv, cwd, editor?} before any output
 //   term.input {tid, data}            typed bytes, base64, 16 KiB at most
 //   term.resize {tid, cols, rows, xpx?, ypx?}
 //   term.ack {tid, off, resend?}      output taken up to off
@@ -55,6 +55,75 @@
 // and its version, without another terminal's variables, nor COLUMNS
 // and LINES.
 //
+// An editor on a file (cap term.edit), in place of the shell:
+//
+//   edit {path, line?, col?, editor? | template?}
+//
+// path is absolute for this machine, line (1 to 1e9) and col (0 to 1e9)
+// are clamped, editor is the window's terminal editor's command and
+// template its [ui] editor_line; with neither, this host's own editor
+// runs. The command is built here, where the editor is: only this host
+// knows its login shell, its $VISUAL and $EDITOR, its PATH and how its
+// shell quotes. Without the cap an engine would ignore edit and open a
+// shell.
+//
+// On POSIX this program runs again as "--tty-edit" (main_posix.cpp),
+// /proc/self/exe on Linux, with the request in the environment, never
+// quoted: PROSPERO_EDIT_FILE, _LINE, _COL, _EDITOR or _TEMPLATE, and
+// _LOGIN (0 where a terminal's shell would not be a login shell). Phase
+// one becomes the login shell ($SHELL, else the account's, else
+// /bin/sh) with editshell's flags, which runs "exec SELF --tty-edit-in";
+// phase two picks the editor there (editpick: the window's, $VISUAL,
+// $EDITOR, vi, by the shell's PATH, less its empty and relative
+// entries, which sh would take as the session's folder), names it by
+// OSC 1, drops PROSPERO_EDIT_*, and becomes sh -c 'CMD "$@"' NAME ARGS,
+// the path a positional word (editorrun). The editor is then the
+// terminal's own process, its exit the terminal's; with none, it says so
+// and exits 127.
+// A profile can test PROSPERO_TAB, edit while it runs (or
+// PROSPERO_EDIT_FILE), to skip what would keep an editor from starting
+// (exec tmux).
+//
+// On Windows there is no login shell: the window's editor, %VISUAL%,
+// %EDITOR%, then vi, the first found on PATH with PATHEXT (findprog), or
+// a refusal before anything starts; cmd.exe runs its line (editorjump)
+// with the program, its first word, by its full path, quoted (cmdabs),
+// so that cmd.exe's own lookup, which tries the current folder first,
+// never picks it; an editor that starts with VAR=value is refused, and
+// so is a path an editor reading the ANSI code page might get as more
+// than one argument (cmdwordok). The reply's editor is its name. Either
+// way the editor runs in the session's folder, and a session whose
+// files are another OS's (a container's kept subagent) is refused.
+//
+// A code block of the agent's run for the user (cap term.run, the Run
+// button), in place of the shell:
+//
+//   run {text, lang, from?}
+//
+// lang is the block's (termrunlang: sh, bash, zsh, ksh, powershell,
+// pwsh, cmd and their aliases), text what runs (termruntext: at most 16
+// KiB, nothing the window would draw invisibly, cmd's one line and only
+// on Windows), from the session told of its end. Being the agent's, it
+// runs without the variables secret settings come from (shellenv's
+// rule), and with PROSPERO_TAB=run. On POSIX this program runs again as
+// "--tty-run" (main_posix.cpp), the request in PROSPERO_RUN_TEXT, _LANG,
+// _SHELL (the terminal's shell) and _LOGIN: it shows the text, dimmed,
+// then a POSIX sh runs it as an interactive shell would (-i -c, its rc
+// files read, as for a paste), and another shell (fish) runs phase two,
+// "--tty-run-in", the block's own shell if here, else /bin/sh, while
+// PowerShell's runs in pwsh by psrunboot. On Windows cmd.exe runs the
+// line by /s /c with NoDefaultCurrentDirectoryInExePath set, PowerShell
+// (the session's, else pwsh, else powershell.exe) by psrunhead, and sh
+// in the session's sh or busybox.
+//
+// A terminal that ends, its tab still open, keeps its slot and screen
+// (kept) for read_terminal, until term.close, a hang-up of all, or a
+// term.open finding no free slot, which takes the kept one unused
+// longest. One hung up while it ran keeps nothing. A Run that ends, or
+// whose tab closed while it ran, leaves a notice "terminal" for from
+// (termnotice): how it ended and its screen's last lines, masked, at
+// that session's next request, never starting a turn.
+//
 // This is free and unencumbered software released into the public domain.
 
 enum : i32 {
@@ -69,6 +138,15 @@ enum : i32 {
     TERM_RETRY   = 5,           // ms between tries while held back
     TERM_BUSYMS  = 1000,        // between looks at who has the terminal
     TERM_DIMMAX  = 4096,        // columns or rows
+    TERM_EDITPATH = 32 << 10,   // an edit's path, in bytes, under this
+    TERM_EDITCMD  = 4 << 10,    // its editor or template
+    TERM_HIST     = 2000,       // history lines a screen keeps, at most
+    TERM_TYPEAHEAD = 2,         // seconds a line typed may precede echo off
+    TERM_CWDCAP   = 1024,       // bytes of a terminal's folder kept
+    TERM_SHELLCAP = 64,         // of its shell's name
+    TERM_RUNTEXT  = 16 << 10,   // a Run's text, in bytes, at most
+    TERM_RUNCMD   = 8191,       // a cmd line's UTF-16 units: cmd.exe's most
+    TERM_RUNLINE  = 120,        // bytes of its first line kept, for labels
 };
 
 struct Term {
@@ -91,6 +169,43 @@ struct Term {
     b32   away;     // its frontend's link is down: no stalls meanwhile
     i64   stallat;  // ticks: send again, 0 while nothing is unacked
     i32   tries;
+
+    // The screen read_terminal reads, while [terminal] agent is on, fed
+    // the output ahead of what is sent (termscan): fed >= sent >= acked
+    Region     *region;   // the screen's block, alone in it
+    ariel_Term *screen;
+    i32         capcols;
+    i32         caprows;
+    i32         hist;
+    i64         fed;
+    i64         readfed;  // fed as of the agent's last read of it
+    i64         used;     // ticks: opened, or typed into
+    i32         mode;     // os_ptymode as last looked at
+    TermLine    line;     // the line being typed (termsecret.cpp)
+    u8          cand[TERMLINE_CAP];  // the latest echoed line, and when
+    i32         candlen;
+    i64         candat;
+    u8          title[TERMTITLECAP];
+    iz          titlelen;
+    u8          shell[TERM_SHELLCAP];
+    iz          shelllen;
+    u8          cwd[TERM_CWDCAP];
+    iz          cwdlen;
+
+    // A Run's (term.open's run): what ran, for labels and its notice
+    b32 run;
+    b32 keep;       // hung up, its screen kept once it ends
+    b32 kept;       // ended, its screen kept for read_terminal until
+                    // term.close, eviction, or a hang-up of all
+    b32 told;       // its end notice went
+    b32 cut;        // hung up while it ran
+    i64 startat;    // ticks
+    u64 runkey;     // its text's hash: a newer run's notice replaces it
+    u8  runline[TERM_RUNLINE];
+    iz  runlinelen;
+    i32 runlines;
+    u8  from[64];   // the session its notice goes to
+    iz  fromlen;
 };
 
 struct Terms {
@@ -98,6 +213,8 @@ struct Terms {
     i64  nexttid;
     b32  held;      // a record waited for room in the outbox
     i64  busyat;    // ticks: look at who has each terminal
+    TermSecrets secrets;  // typed at prompts, in any terminal
+    i64  lastread;  // the tid read_terminal read last
 };
 
 static Terms *newterms(Arena *perm)
@@ -244,8 +361,440 @@ static Slice<Str> termargv(Arena *a, Str conf, Str home, Str kind, Str path,
     return r;
 }
 
+struct TermEditAsk {
+    b32 on;      // term.open has edit
+    Str path;
+    i32 line;    // 1-based, 0 for none
+    i32 col;     // 0 for none
+    Str editor;  // the window's editor, else null
+    Str tmpl;    // or its template, else null
+    Str why;     // why refused, else null
+};
+
+// A number of edit's, clamped to lo..1e9, or *why.
+static i32 termeditnum(Json *j, i32 lo, Str name, Str *why)
+{
+    if (j->type == JSON_MISSING) {
+        return 0;
+    } else if (j->type != JSON_NUMBER) {
+        *why = name;
+        return 0;
+    }
+    f64 v = jsonfloat(j, lo);
+    v = v<lo ? lo : v>1e9 ? 1e9 : v;
+    return (i32)v;
+}
+
+// term.open's edit, checked: absent, or an object whose path is
+// absolute for this machine (win: Windows), with no NUL and under
+// TERM_EDITPATH, and on Windows nothing cmd.exe cannot pass on (C10);
+// editor or template, not both, each a string under TERM_EDITCMD with
+// no NUL (empty is none).
+static TermEditAsk termeditask(Json *j, b32 win)
+{
+    TermEditAsk r  = {};
+    Json       *ed = jsonget(j, "edit");
+    if (ed->type == JSON_MISSING) {
+        return r;
+    }
+    r.on = 1;
+    if (ed->type != JSON_OBJECT) {
+        r.why = "edit must be an object";
+        return r;
+    }
+    Json *p = jsonget(ed, "path");
+    r.path = jsonstr(p);
+    if (p->type!=JSON_STRING || !pathroot(r.path, win) || cut(r.path, 0).ok) {
+        r.why = "edit.path must be an absolute path";
+        return r;
+    } else if (r.path.len >= TERM_EDITPATH) {
+        r.why = "edit.path is too long";
+        return r;
+    }
+    switch (win ? cmdwordok(r.path) : (i32)CMDWORD_OK) {
+    case CMDWORD_CMD:
+        r.why = "edit.path holds %, \" or a control character, which cmd.exe cannot pass on";
+        return r;
+    case CMDWORD_BESTFIT:
+        r.why = "edit.path holds a character Windows may pass to the editor as \" or \\";
+        return r;
+    }
+    r.line = termeditnum(jsonget(ed, "line"), 1, "edit.line must be a number", &r.why);
+    r.col  = termeditnum(jsonget(ed, "col"), 0, "edit.col must be a number", &r.why);
+    if (r.why.len) {
+        return r;
+    }
+    Str  names[] = {"editor", "template"};
+    Str *dsts[]  = {&r.editor, &r.tmpl};
+    for (iz i = 0; i < countof(names); i++) {
+        Json *v = jsonget(ed, names[i]);
+        if (v->type == JSON_MISSING) {
+            continue;
+        } else if (v->type != JSON_STRING) {
+            r.why = i ? Str("edit.template must be a string") : Str("edit.editor must be a string");
+            return r;
+        } else if (v->str.len>=TERM_EDITCMD || cut(v->str, 0).ok) {
+            r.why = i ? Str("edit.template must be under 4 KiB, with no NUL")
+                      : Str("edit.editor must be under 4 KiB, with no NUL");
+            return r;
+        }
+        *dsts[i] = trim(v->str);
+    }
+    if (r.editor.len && r.tmpl.len) {
+        r.why = "edit: give editor or template, not both";
+    }
+    return r;
+}
+
+// An editor's name, as the reply gives it: its program's file name
+// without .exe, .com, .cmd or .bat.
+static Str termeditname(Str prog)
+{
+    Str name = basename(prog);
+    Str exts[] = {".exe", ".com", ".cmd", ".bat"};
+    for (iz i = 0; i < countof(exts); i++) {
+        if (name.len>exts[i].len && equalfold(cuthead(name, name.len-exts[i].len), exts[i])) {
+            return takehead(name, name.len-exts[i].len);
+        }
+    }
+    return name;
+}
+
+// Runs: a code block of the agent's run in a terminal (cap term.run)
+
+enum : i32 {
+    RUN_NONE,   // not a shell's command: no Run
+    RUN_SH,     // a POSIX sh's
+    RUN_PS,     // PowerShell's
+    RUN_CMD,    // cmd.exe's, one line, on Windows
+};
+
+// A fence's language as a Run's kind, case-insensitive: RUN_NONE for
+// any other, and for console and shellsession, which name transcripts.
+static i32 termrunlang(Str lang)
+{
+    static struct {
+        Str name;
+        i32 kind;
+    } langs[] = {
+        {"sh", RUN_SH}, {"shell", RUN_SH}, {"bash", RUN_SH}, {"zsh", RUN_SH},
+        {"ksh", RUN_SH}, {"powershell", RUN_PS}, {"pwsh", RUN_PS}, {"ps1", RUN_PS},
+        {"cmd", RUN_CMD}, {"bat", RUN_CMD}, {"batch", RUN_CMD},
+    };
+    lang = trim(lang);
+    for (iz i = 0; i < countof(langs); i++) {
+        if (equalfold(lang, langs[i].name)) {
+            return langs[i].kind;
+        }
+    }
+    return RUN_NONE;
+}
+
+// Whether a code point shows as nothing, or as other than it is, in the
+// window: a control but TAB and LF, DEL, C1, a format character (bidi
+// controls, zero widths, joiners, the BOM, tags), or a line or paragraph
+// separator. What runs must be what shows.
+static b32 termruninvisible(i32 c)
+{
+    static i32 const ranges[][2] = {
+        {0x00ad, 0x00ad}, {0x0600, 0x0605}, {0x061c, 0x061c}, {0x06dd, 0x06dd},
+        {0x070f, 0x070f}, {0x08e2, 0x08e2}, {0x180e, 0x180e}, {0x200b, 0x200f},
+        {0x2028, 0x202e}, {0x2060, 0x2064}, {0x2066, 0x206f}, {0xfeff, 0xfeff},
+        {0xfff9, 0xfffb}, {0x110bd, 0x110bd}, {0x110cd, 0x110cd},
+        {0x1d173, 0x1d17a}, {0xe0000, 0xe007f},
+    };
+    if ((c<0x20 && c!='\t' && c!='\n') || (c>=0x7f && c<0xa0)) {
+        return 1;
+    }
+    for (iz i = 0; i < countof(ranges); i++) {
+        if (c>=ranges[i][0] && c<=ranges[i][1]) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// A Run's text, checked: CRLF as LF, blank lines before it and blanks
+// after it dropped. Null, and *why, if it may not run: empty, over
+// TERM_RUNTEXT, not UTF-8, holding what termruninvisible hides, or for
+// cmd, more than one line or longer than cmd.exe takes.
+static Str termruntext(Arena *a, Str text, i32 kind, Str *why)
+{
+    Buf b(a, text.len + 1);
+    for (iz i = 0; i < text.len; i++) {
+        if (!(text[i]=='\r' && i+1<text.len && text[i+1]=='\n')) {
+            putbyte(&b, text[i]);
+        }
+    }
+    Str r = trimright(finish(&b));
+    iz  lead = 0;
+    for (iz i = 0; i < r.len && (r[i]==' ' || r[i]=='\t' || r[i]=='\n'); i++) {
+        lead = r[i]=='\n' ? i+1 : lead;
+    }
+    r = cuthead(r, lead);
+    if (!r.len) {
+        *why = "the command is empty";
+        return {};
+    } else if (r.len > TERM_RUNTEXT) {
+        *why = "the command is over 16 KiB";
+        return {};
+    }
+    iz units = 0;
+    for (iz i = 0; i < r.len;) {
+        i32 c = utf8strict(r, &i);
+        if (c<0 || (c>=0xd800 && c<=0xdfff)) {
+            *why = "the command is not UTF-8";
+            return {};
+        } else if (termruninvisible(c)) {
+            *why = "the command holds a control or invisible character, "
+                   "so what runs would not be what shows";
+            return {};
+        }
+        units += c>0xffff ? 2 : 1;
+    }
+    if (kind==RUN_CMD && cut(r, '\n').ok) {
+        *why = "cmd.exe runs one line, and this is more";
+        return {};
+    } else if (kind==RUN_CMD && units>TERM_RUNCMD) {
+        *why = "the command is longer than cmd.exe takes (8191 characters)";
+        return {};
+    }
+    return r;
+}
+
+struct TermRunBlock {
+    i32 kind;   // RUN_NONE: no Run at all
+    Str text;   // what runs, prompts stripped
+    Str why;    // a Run, but one that may not: why
+};
+
+// Whether a code block's line begins with a prompt: "$ " for sh, "PS> "
+// or "PS FOLDER> " for PowerShell. Returns its length, else 0.
+static iz termrunprompt(Str line, i32 kind)
+{
+    if (kind==RUN_SH && startswith(line, "$ ")) {
+        return 2;
+    } else if (kind==RUN_PS && startswith(line, "PS> ")) {
+        return 4;
+    } else if (kind==RUN_PS && startswith(line, "PS ")) {
+        for (iz i = 3; i+1 < line.len; i++) {
+            if (line[i]=='>' && line[i+1]==' ') {
+                return i + 2;
+            }
+        }
+    }
+    return 0;
+}
+
+// A fenced code block of the agent's as a Run (the Run button): its kind
+// by its language, its text as termruntext has it. A block whose every
+// line (but blank ones, and those continuing a line that ends in \ or,
+// for PowerShell, `) begins with a prompt runs without them; one where
+// only some do is a transcript, with output, and has no Run, as has an
+// empty block.
+static TermRunBlock termrunblock(Arena *a, Str lang, Str code)
+{
+    TermRunBlock r    = {};
+    i32          kind = termrunlang(lang);
+    if (!kind) {
+        return r;
+    }
+    i32 with = 0, without = 0;
+    b32 cont = 0;
+    for (Cut c = {{}, code, 1}; c.ok;) {
+        c = cut(c.tail, '\n');
+        Str line = trimright(c.head);
+        if (line.len && !cont) {
+            with    += termrunprompt(line, kind) > 0;
+            without += !termrunprompt(line, kind);
+        }
+        u8 last = line.len ? line[line.len-1] : 0;
+        cont = last=='\\' || (kind==RUN_PS && last=='`');
+    }
+    if (!with && !without) {
+        return r;
+    } else if (with && without) {
+        return r;  // a transcript
+    }
+    Str text = code;
+    if (with) {
+        Buf b(a, code.len + 1);
+        cont = 0;
+        for (Cut c = {{}, code, 1}; c.ok;) {
+            c = cut(c.tail, '\n');
+            Str line = c.head;
+            Str bare = trimright(line);
+            if (bare.len && !cont) {
+                line = cuthead(line, termrunprompt(bare, kind));
+            }
+            print(&b, line);
+            if (c.ok) {
+                putbyte(&b, '\n');
+            }
+            u8 last = bare.len ? bare[bare.len-1] : 0;
+            cont = last=='\\' || (kind==RUN_PS && last=='`');
+        }
+        text = finish(&b);
+    }
+    r.kind = kind;
+    r.text = termruntext(a, text, kind, &r.why);
+    r.text = r.text.len ? r.text : text;
+    return r;
+}
+
+struct TermRunAsk {
+    b32 on;     // term.open has run
+    i32 kind;
+    Str text;
+    Str lang;
+    Str from;   // the session its notice goes to, else empty
+    Str why;    // a refusal
+};
+
+// term.open's run, checked: absent, or an object with a text that may
+// run (termruntext), a lang naming a shell (termrunlang), cmd's only on
+// Windows, and from, if any, a session id. Never with edit.
+static TermRunAsk termrunask(Arena *a, Json *j, b32 win)
+{
+    TermRunAsk r  = {};
+    Json      *rj = jsonget(j, "run");
+    if (rj->type == JSON_MISSING) {
+        return r;
+    }
+    r.on = 1;
+    if (rj->type != JSON_OBJECT) {
+        r.why = "run must be an object";
+        return r;
+    } else if (jsonget(j, "edit")->type != JSON_MISSING) {
+        r.why = "term.open takes run or edit, not both";
+        return r;
+    }
+    Json *tj = jsonget(rj, "text");
+    Json *lj = jsonget(rj, "lang");
+    Json *fj = jsonget(rj, "from");
+    if (tj->type!=JSON_STRING || lj->type!=JSON_STRING) {
+        r.why = "run.text and run.lang must be strings";
+        return r;
+    } else if (fj->type!=JSON_MISSING && (fj->type!=JSON_STRING || !validsid(jsonstr(fj)))) {
+        r.why = "run.from must be a session id";
+        return r;
+    }
+    r.lang = jsonstr(lj);
+    r.from = jsonstr(fj);
+    r.kind = termrunlang(r.lang);
+    if (!r.kind) {
+        r.why = "run.lang names no shell this runs: sh, bash, zsh, ksh, "
+                "powershell, pwsh or cmd";
+        return r;
+    } else if (r.kind==RUN_CMD && !win) {
+        r.why = "run: cmd runs only on Windows";
+        return r;
+    }
+    Str why = {};
+    r.text = termruntext(a, jsonstr(tj), r.kind, &why);
+    if (!r.text.len) {
+        r.why = concat(a, "run: ", why);
+    }
+    return r;
+}
+
+// How PowerShell runs a Run's text, which it takes from the environment
+// rather than its command line, which has no quoting to get wrong, as
+// the agent's commands do (psboot): parsed alone first, so that a
+// syntax error shows as one, then run as a script whose exit is a
+// native program's status, if it ran one, else 0 or 1. Unlike psboot it
+// runs interactively, for Read-Host and Get-Credential, and on Windows
+// first shows the text, dimmed (psrunhead), as --tty-run does on POSIX.
+#define PSRUNVAR "PROSPERO_RUN_TEXT"
+#define PSRUNREAD "$__c=$env:" PSRUNVAR ";Remove-Item Env:" PSRUNVAR ";"
+#define PSRUNBODY \
+    "try{$__b=[ScriptBlock]::Create($__c)}" \
+    "catch{$__e=$_.Exception;if($__e.InnerException){$__e=$__e.InnerException};" \
+    "[Console]::Error.WriteLine($__e.Message);exit 1};" \
+    "$__b=[ScriptBlock]::Create($__c+[char]10+'$global:__ok=$?');" \
+    "$global:__ok=$false;$global:LASTEXITCODE=0;" \
+    "try{. $__b|Out-Default}catch{[Console]::Error.WriteLine(($_|Out-String).Trim());exit 1};" \
+    "if($global:__ok){exit 0};if($LASTEXITCODE){exit $LASTEXITCODE};exit 1"
+static char const psrunboot[] = PSRUNREAD PSRUNBODY;
+static char const psrunhead[] =
+    PSRUNREAD "[Console]::WriteLine([char]27+'[2m'+$__c+[char]27+'[0m');" PSRUNBODY;
+
+// A Run's first line, cut to TERM_RUNLINE bytes on a code point, and how
+// many lines it has.
+static Str termrunfirst(Str text, i32 *lines)
+{
+    *lines = 1;
+    for (iz i = 0; i < text.len; i++) {
+        *lines += text[i] == '\n';
+    }
+    Str first = cut(text, '\n').head;
+    return first.len>TERM_RUNLINE ? utf8head(first, TERM_RUNLINE) : first;
+}
+
+// A session as the walk to its terminals' owner sees it.
+struct TermNode {
+    b32 found;
+    Str parent;    // a subagent's on this host, else empty
+    Str sideof;    // a side chat's original, else empty
+    b32 worktree;  // in a worktree of its own
+    Str cwd;
+};
+
+typedef TermNode TermLook(void *ctx, Arena *, Str sid);
+
+// The session whose terminals a session shares, as the frontend files
+// them (term.cpp's termroot): the top of its parents on this host, then
+// a side chat's original's, if in the same folder, and so on. A
+// worktree session, in a folder of its own, has its own.
+static Str termrootwalk(Arena *a, Str sid, TermLook *look, void *ctx)
+{
+    for (i32 side = 0; side < 8; side++) {
+        TermNode n = look(ctx, a, sid);
+        for (i32 up = 0; up<16 && n.found && n.parent.len && !(n.parent==sid); up++) {
+            TermNode p = look(ctx, a, n.parent);
+            if (!p.found) {
+                break;
+            }
+            sid = n.parent;
+            n   = p;
+        }
+        if (!n.found || !n.sideof.len || n.worktree || n.sideof==sid) {
+            break;
+        }
+        TermNode o = look(ctx, a, n.sideof);
+        if (!o.found || !(o.cwd == n.cwd)) {
+            break;
+        }
+        sid = n.sideof;
+    }
+    return sid;
+}
+
 
 // The table
+
+// Whether the agent may read terminals, and so the engine keeps their
+// screens: [terminal] agent.
+static b32 termagent(Engine *e)
+{
+    return cfgbool(cfgget(e->cfg, "terminal", {}, "agent", 0)) != 0;
+}
+
+// For status: the screens, the output they were fed, and those kept
+// after their terminals ended, for tests.
+static void termstatus(Engine *e, JsonOut *w)
+{
+    i64 screens = 0, fed = 0, kept = 0;
+    for (i32 i = 0; e->terms && i < TERM_MAX; i++) {
+        Term *t = &e->terms->slots[i];
+        screens += t->tid && t->screen;
+        fed     += t->tid ? t->fed : 0;
+        kept    += t->tid && t->kept;
+    }
+    putintkey(w, "screens", screens);
+    putintkey(w, "fed", fed);
+    putintkey(w, "kept", kept);
+}
 
 static Term *termbytid(Engine *e, i64 tid, i64 peer)
 {
@@ -282,10 +831,251 @@ static i32 termcount(Engine *e, i64 peer)
 
 // Hang up, or with kill sweep the tree. The terminal says nothing more,
 // and its slot goes once the shell's exit and EOF are in.
-static void termhangup(Engine *e, Term *t, b32 kill)
+// Free a slot, and its screen.
+static void termfree(Engine *e, Term *t)
 {
+    if (t->region) {
+        os_release(e->os, t->region);
+    }
+    *t = {};
+}
+
+// The capacity for a screen's size: room to grow before a move.
+static i32 termscreencap(i32 n, i32 least)
+{
+    i32 r = n + n/2;
+    r = r<least ? least : r;
+    return r<TERM_DIMMAX ? r : TERM_DIMMAX;
+}
+
+// A screen's block, fresh or moved into from the one it had, with room
+// for cols by rows. Returns 0, keeping what it had, if it cannot be had.
+static b32 termscreenblock(Engine *e, Term *t, i32 cols, i32 rows)
+{
+    static char  name[] = "Prospero(" PROSPERO_VERSION ")";
+    ariel_Config c      = {};
+    c.cols      = cols;
+    c.rows      = rows;
+    c.capcols   = termscreencap(cols, 200);
+    c.caprows   = termscreencap(rows, 80);
+    c.histlines = t->hist ? t->hist : -1;  // ariel's 0 is its default
+    c.histbytes = termscrollbytes(t->hist);
+    c.flags     = ARIEL_F_NOREPLY;
+    c.name.data = (u8 *)name;
+    c.name.len  = countof(name) - 1;
+    iz size = ariel_size(&c);
+    if (!size) {
+        return 0;
+    }
+    Region *r = os_reserve(e->os, size + ((iz)1<<16));
+    if (!r) {
+        return 0;
+    }
+    Arena a = newarena(r);
+    allocbytes(&a, -(uz)a.beg & 15);
+    void       *mem = allocbytes(&a, size);
+    ariel_Term *st  = t->screen ? ariel_move(t->screen, mem, size, &c)
+                                : ariel_init(mem, size, &c);
+    if (!st) {
+        os_release(e->os, r);
+        return 0;
+    }
+    if (t->region) {
+        os_release(e->os, t->region);
+    }
+    t->region  = r;
+    t->screen  = st;
+    t->capcols = c.capcols;
+    t->caprows = c.caprows;
+    return 1;
+}
+
+// The screen's text on the cursor's row, left of the cursor, into buf.
+static Str termcursorrow(Term *t, u8 *buf, iz cap)
+{
+    ariel_Cursor cur = ariel_cursor(t->screen);
+    if (cur.y < 0) {
+        return {};
+    }
+    ariel_Cell cells[256];
+    i32        n = ariel_row(t->screen, cur.y, cells, countof(cells));
+    n = n<countof(cells) ? n : countof(cells);
+    n = cur.x<n ? cur.x : n;
+    iz len = 0;
+    for (i32 x = 0; x<n && len+4<=cap; x++) {
+        if (cells[x].width) {
+            len += utf8encode(buf+len, cells[x].cp ? (i32)cells[x].cp : ' ');
+        }
+    }
+    return {buf, len};
+}
+
+static void termfeedbytes(Term *t, Str data)
+{
+    ariel_Str in = {data.data, data.len};
+    for (;;) {
+        ariel_Fed f = ariel_feed(t->screen, in);
+        in = f.rest;
+        if (f.ev.kind == ARIEL_EV_NONE) {
+            return;
+        } else if (f.ev.kind==ARIEL_EV_TITLE && !f.ev.arg) {
+            t->titlelen = termtitle(t->title, {f.ev.data.data, f.ev.data.len});
+        }
+    }
+}
+
+// Output to the screen: its title is the only event kept. While a line
+// typed with echo on is fresh, a password prompt that shows meanwhile,
+// at any line's end or where the output stops, makes it a secret: the
+// program reads a line typed ahead of its prompt at once, too soon for
+// echo off to be seen (termscan).
+static void termfeedscreen(Engine *e, Term *t, Str data)
+{
+    if (!t->candlen || os_ticks(e->os)-t->candat>(i64)TERM_TYPEAHEAD*SEC) {
+        termfeedbytes(t, data);
+        return;
+    }
+    u8 row[1024];
+    for (iz i = 0; t->candlen;) {
+        iz j = i;
+        for (; j<data.len && data[j]!='\r' && data[j]!='\n'; j++) {}
+        termfeedbytes(t, Str{data.data+i, j-i});
+        if (termprompt(termcursorrow(t, row, countof(row)))) {
+            termsecretadd(&e->terms->secrets, {t->cand, t->candlen}, 2);
+            t->candlen = 0;
+        }
+        if (j == data.len) {
+            return;
+        }
+        termfeedbytes(t, Str{data.data+j, 1});
+        i = j + 1;
+        if (i == data.len) {
+            return;
+        }
+        if (!t->candlen) {
+            termfeedbytes(t, cuthead(data, i));
+            return;
+        }
+    }
+}
+
+// Feed the screen what the ring holds past what it was fed, and look at
+// how the terminal reads typing: echo going off soon after a line was
+// typed with echo on makes that line a secret, typed ahead of the
+// prompt (sudo keeps such a line, and reads it).
+static void termscan(Engine *e, Term *t)
+{
+    if (!t->screen || !t->proc) {
+        return;
+    }
+    for (;;) {
+        Str s = os_ptypeek(e->os, t->proc, (iz)(t->fed - t->acked));
+        if (!s.len) {
+            break;
+        }
+        termfeedscreen(e, t, s);
+        t->fed += s.len;
+    }
+    i32 mode = os_ptymode(e->os, t->proc);
+    if (mode != t->mode) {
+        i64 now = os_ticks(e->os);
+        if (mode==PTY_SECRET && t->candlen && now-t->candat<=(i64)TERM_TYPEAHEAD*SEC) {
+            termsecretadd(&e->terms->secrets, {t->cand, t->candlen}, 2);
+        }
+        if (mode == PTY_SECRET) {
+            t->candlen = 0;
+        }
+        t->mode = mode;
+    }
+}
+
+// Typed input, before it is written: the line it continues, and the
+// secrets that line teaches once entered.
+static void termtyped(Engine *e, Arena scratch, Term *t, Str data)
+{
+    if (!t->screen) {
+        return;
+    }
+    termscan(e, t);
+    i32 kind = TL_SKIP;  // of a line begun in this input
+    u8 row[1024];
+    if (t->mode==PTY_SECRET || termprompt(termcursorrow(t, row, countof(row)))) {
+        kind = TL_SECRET;
+    } else if (t->mode == PTY_ECHO) {
+        kind = TL_CAND;
+    }
+    Slice<TermCommit> m = termlinefeed(&scratch, &t->line, data, kind);
+    for (iz i = 0; i < m.len; i++) {
+        if (m[i].kind == TL_SECRET) {
+            termsecretadd(&e->terms->secrets, m[i].text, t->mode==PTY_SECRET ? 2 : 1);
+        } else {
+            t->candlen = (i32)m[i].text.len;
+            t->candat  = os_ticks(e->os);
+            copybytes(t->cand, m[i].text.data, m[i].text.len);
+        }
+    }
+}
+
+// The values of secret settings, as secrets to hide: each definition
+// of any section of any file loaded, an env:NAME read from env (the
+// terminal's) or else the engine's own, a file:PATH read. Short ones,
+// which common words would match, are left out.
+static void termconfsecrets(Engine *e, Arena scratch, Slice<Str> env, b32 win)
+{
+    for (IniSection *sec = e->cfg->ini->sections; sec; sec = sec->next) {
+        for (IniEntry *k = sec->keys; k; k = k->next) {
+            CfgKey *key = cfgkey(sec->kind, k->key);
+            if (!key || key->type!=CFG_SECRET) {
+                continue;
+            }
+            for (IniEntry *d = k; d; d = d->older) {
+                Arena a = scratch;
+                Str   v = trim(d->value);
+                if (startswith(v, "env:")) {
+                    Str name = trim(cuthead(v, 4));
+                    Str got  = envget(env, name, win);
+                    v = got.len ? got : envget(e->env, name, win);
+                } else if (startswith(v, "file:")) {
+                    Str path = cfgsecretfile(e->os, &a, v);
+                    v = path.len ? cfgreadsecret(e->os, &a, path) : Str{};
+                }
+                if (v.len >= 8) {
+                    termsecretadd(&e->terms->secrets, v, 1);
+                }
+            }
+        }
+    }
+}
+
+// Once hung up, and the shell's exit and EOF both in: the slot goes, or
+// with keep stays, kept, its screen readable until term.close, its
+// slot's eviction (termstart), or a hang-up of all.
+static void termsettle(Engine *e, Term *t)
+{
+    if (t->closed && t->exited && t->eof) {
+        if (t->keep && t->screen) {
+            t->kept = 1;
+            t->used = os_ticks(e->os);
+        } else {
+            termfree(e, t);
+        }
+    }
+}
+
+// Hang up, or with kill sweep the tree. The terminal says nothing more,
+// and its slot goes once the shell's exit and EOF are in, or with keep
+// is kept (termsettle). A kept one goes now.
+static void termhangup(Engine *e, Term *t, b32 kill, b32 keep)
+{
+    if (t->kept) {
+        termfree(e, t);
+        return;
+    }
+    termscan(e, t);  // before the ring goes
     if (!t->closed) {
         t->closed = 1;
+        t->keep   = keep;
+        t->cut    = !t->exited;
         if (kill) {
             os_kill(e->os, t->proc, 1);
         } else {
@@ -293,10 +1083,10 @@ static void termhangup(Engine *e, Term *t, b32 kill)
         }
         os_procfree(e->os, t->proc);  // the hang-up: SIGHUP to the shell
         t->proc = 0;
+    } else {
+        t->keep &= keep;
     }
-    if (t->exited && t->eof) {
-        *t = {};
-    }
+    termsettle(e, t);
 }
 
 
@@ -329,6 +1119,7 @@ static void termpump(Engine *e, Arena scratch, Term *t)
     if (t->closed || !t->proc) {
         return;
     }
+    termscan(e, t);  // what goes out is on the screen first
     while (!e->terms->held) {
         iz can = termcan(t->sent, t->acked, TERM_WINDOW, TERM_LINE);
         Str s  = can ? os_ptypeek(e->os, t->proc, (iz)(t->sent - t->acked)) : Str{};
@@ -358,7 +1149,7 @@ static void termpump(Engine *e, Arena scratch, Term *t)
         t->ended = termemit(e, evend(&w));
     }
     if (t->ended && t->acked==t->total) {
-        termhangup(e, t, 0);  // nothing left to hang up, but its reaper
+        termhangup(e, t, 0, 1);  // nothing left to hang up, but its reaper
     }
 }
 
@@ -379,7 +1170,7 @@ static void termstall(Engine *e, Arena scratch, Term *t)
     putintkey(&w.json, "signal", 0);
     putstrkey(&w.json, "err", "stalled");
     emit(e, evend(&w));  // once, so whatever the room
-    termhangup(e, t, 0);
+    termhangup(e, t, 0, 1);
 }
 
 
@@ -429,22 +1220,200 @@ static Str termname(Engine *e, Arena scratch, b32 win)
     return "xterm";
 }
 
-// Start a terminal's shell, and reply with its tid, before its output.
-static Str termstart(Engine *e, Arena scratch, i64 id, Json *j, Session *s, Str sid)
+// Where editpick looks for an editor's program on Windows (findprog).
+struct TermFind {
+    Os *os;
+    Str path;
+    Str pathext;
+};
+
+static i32 termfound(void *ctx, Arena *a, Str prog)
+{
+    TermFind *f    = (TermFind *)ctx;
+    Arena     perm = *a;
+    Arena     tmp  = carve(&perm, 1<<20);
+    Str       exe  = findprog(f->os, &perm, tmp, f->path, prog, f->pathext, 1);
+    return exe.len ? EDITOR_FOUND : EDITOR_MISSING;
+}
+
+// The editor's command line on Windows, an edit's, by cmd.exe in env:
+// the first of the window's editor, %VISUAL%, %EDITOR% and vi found on
+// PATH (editpick), its line (editorjump) with the program by its full
+// path (cmdabs), *argv and *name set. Null and *why if there is none.
+static Str termeditwin(Engine *e, Arena *a, TermEditAsk *ed, Slice<Str> env,
+                       Slice<Str> *argv, Str *name, Str *why)
+{
+    // cmd.exe takes no VAR=value words: a line's program is its first
+    // word (editorjump), so one that starts with an assignment is
+    // refused if asked for, else passed over
+    Str asks[] = {ed->editor, ed->tmpl};
+    for (iz i = 0; i < countof(asks); i++) {
+        Str rest = asks[i];
+        if (cmdassign(cmdword(&rest))) {
+            *why = "edit: cmd.exe takes no VAR=value words ahead of the editor";
+            return {};
+        }
+    }
+    Str home   = e->home;
+    Str envs[] = {envget(env, "VISUAL", 1), envget(env, "EDITOR", 1)};
+    for (iz i = 0; i < countof(envs); i++) {
+        Str rest = envs[i];
+        envs[i]  = cmdassign(cmdword(&rest)) ? Str{} : cmdhome(a, envs[i], home);
+    }
+    TermFind f    = {e->os, envpath(env, 1), envget(env, "PATHEXT", 1)};
+    EditPick pick = editpick(a, cmdhome(a, ed->editor, home), cmdhome(a, ed->tmpl, home),
+                             envs[0], envs[1], termfound, &f);
+    Str use = pick.tmpl.len ? pick.tmpl : pick.cmd;
+    if (!use.len) {
+        Str asked = cmdprog(ed->tmpl.len ? ed->tmpl : ed->editor, 0);
+        if (asked.len) {
+            Buf b(a, 96 + asked.len);
+            print(&b, "no editor found here: ");
+            print(&b, basename(asked));
+            print(&b, " is not on PATH, nor are VISUAL, EDITOR or vi");
+            *why = finish(&b);
+        } else {
+            *why = "no editor found here: VISUAL, EDITOR and vi are not on PATH";
+        }
+        return {};
+    }
+    Str  rest  = use;
+    Str  prog  = cmdword(&rest);  // as editorjump takes it
+    Str  exe   = findprog(e->os, a, carve(a, 1<<20), f.path, prog, f.pathext, 1);
+    Str  file  = clone(a, ed->path);
+    for (iz i = 0; i < file.len; i++) {
+        file.data[i] = file[i]=='/' ? '\\' : file[i];
+    }
+    EditJump j = editorjump(a, pick.cmd, pick.tmpl, file, ed->line>0 ? ed->line : 1,
+                            ed->col, 1);
+    if (j.why.len) {
+        *why = j.why;
+        return {};
+    }
+    Str line = cmdabs(a, j.line, exe);
+    if (!line.len) {
+        *why = "cannot start the editor: its path holds %, \", a control character "
+               "or another character cmd.exe cannot pass on";
+        return {};
+    }
+    // cmd.exe itself by a full path, as CreateProcess would try the
+    // current folder for a bare name
+    Str comspec = trim(envget(env, "COMSPEC", 1));
+    if (!pathroot(comspec, 1)) {
+        comspec = findprog(e->os, a, carve(a, 1<<20), f.path, "cmd.exe", {}, 1);
+    }
+    if (!comspec.len) {
+        *why = "cannot start the editor: cmd.exe is not on PATH";
+        return {};
+    }
+    *argv = {};
+    *argv = push(a, *argv, comspec);
+    *name = termeditname(prog);
+    return cmdcline(a, comspec, line);
+}
+
+// A Run's program on Windows (term.open's run), by its kind. cmd.exe
+// runs the line as it is (/s), with its AutoRun, as a cmd tab would,
+// but without the current folder in its program lookup, so that a
+// git.cmd the agent left there never runs for "git status". PowerShell
+// is the session's, if that is its shell, else pwsh, else
+// powershell.exe, running psrunhead with the text in the environment.
+// sh is the session's sh or busybox, with its login flags; never WSL's.
+// Returns why it cannot run, else null.
+static Str termrunwin(Engine *e, Arena *a, TermRunAsk *run, Shell *sh, Slice<Str> *env,
+                      Slice<Str> *argv, Str *cmdline)
+{
+    Str path = envpath(*env, 1);
+    Str kind = shellkinds[sh->kind];
+    *argv = {};
+    switch (run->kind) {
+    case RUN_CMD: {
+        Str comspec = trim(envget(*env, "COMSPEC", 1));
+        if (!pathroot(comspec, 1)) {
+            comspec = findprog(e->os, a, carve(a, 1<<20), path, "cmd.exe", {}, 1);
+        }
+        if (!comspec.len) {
+            return "cannot run the command: cmd.exe is not on PATH";
+        }
+        Buf b(a, 64 + comspec.len + run->text.len);
+        putbyte(&b, '"');
+        print(&b, comspec);
+        print(&b, "\" /s /c \"");
+        print(&b, run->text);
+        putbyte(&b, '"');
+        *cmdline = finish(&b);
+        *argv    = push(a, *argv, comspec);
+        *env     = envset(a, *env, "NoDefaultCurrentDirectoryInExePath", "1", 1);
+    } break;
+    case RUN_PS: {
+        Str prog = kind=="pwsh" || kind=="powershell" ? sh->path : Str{};
+        Str exes[] = {"pwsh.exe", "powershell.exe"};
+        for (iz i = 0; !prog.len && i < countof(exes); i++) {
+            prog = findprog(e->os, a, carve(a, 1<<20), path, exes[i], {}, 1);
+        }
+        if (!prog.len) {
+            return "cannot run the command: neither pwsh nor powershell.exe is on PATH";
+        }
+        *argv = push(a, *argv, prog);
+        *argv = push(a, *argv, Str("-NoLogo"));
+        *argv = push(a, *argv, Str("-Command"));
+        *argv = push(a, *argv, Str(psrunhead));
+        *env  = envset(a, *env, PSRUNVAR, run->text, 1);
+    } break;
+    case RUN_SH:
+        if (kind!="sh" && kind!="busybox") {
+            return concat(a, "run: sh blocks run in this session's POSIX shell, sh or "
+                             "busybox, and its shell is ", kind);
+        }
+        *argv = termshell(a, kind, sh->path, 1);
+        if (!argv->len) {
+            return "run: this session's shell has no path";
+        }
+        *argv = push(a, *argv, Str("-c"));
+        *argv = push(a, *argv, run->text);
+        break;
+    }
+    return {};
+}
+
+// Start a terminal's shell, or an edit's editor, and reply with its tid,
+// before its output.
+static Str termstart(Engine *e, Arena *scratch, i64 id, Json *j, Session *s, Str sid)
 {
     i64   peer = jsonint(jsonget(j, "peer"), 0);
     Term *t    = 0;
     for (i32 i = 0; !t && i < TERM_MAX; i++) {
         t = e->terms->slots[i].tid ? 0 : &e->terms->slots[i];
     }
+    Term *old = 0;  // else the slot of the kept screen longest unused
+    for (i32 i = 0; !t && i < TERM_MAX; i++) {
+        Term *k = &e->terms->slots[i];
+        old = k->kept && (!old || k->used<old->used) ? k : old;
+    }
+    if (!t && old) {
+        termfree(e, old);
+        t = old;
+    }
     if (!t || termcount(e, peer)>=TERM_PERPEER) {
         return "too many terminals are open";
     }
+    b32         win = s->te.windows;
+    TermRunAsk  run = termrunask(scratch, j, win);
+    TermEditAsk ed  = termeditask(j, win);
+    if (run.why.len) {
+        return run.why;
+    } else if (ed.why.len) {
+        return ed.why;
+    } else if ((ed.on || run.on) && win!=HOST_WINDOWS) {
+        // A container's kept subagent on Windows: Linux's paths, in a
+        // folder gone, with no editor here to take them
+        return ed.on ? Str("edit: this session's files are not on this machine")
+                     : Str("run: this session's files are not on this machine");
+    }
 
     // In its folder, or the one asked for if it is one
-    b32 win = s->te.windows;
     Str cwd = jsonstr(jsonget(j, "cwd"));
-    cwd = cwd.len && os_stat(e->os, scratch, cwd).type==STAT_DIR ? cwd : s->cwd;
+    cwd = cwd.len && os_stat(e->os, *scratch, cwd).type==STAT_DIR ? cwd : s->cwd;
 
     // A login shell runs the profile itself, so it starts from what
     // this process started with, as a terminal's would: not the login
@@ -452,29 +1421,120 @@ static Str termstart(Engine *e, Arena scratch, i64 id, Json *j, Session *s, Str 
     // would start zsh in vi mode, its PATH entries doubled
     Shell      sh    = s->te.shell;
     b32        login = !(PTY_LINUX && e->gui);
-    Slice<Str> env   = login && !win ? os_launchenv(e->os, &scratch) : e->env;
-    Str        path  = cfgsearchpath(e->cfg, &scratch, envpath(env, win), e->home, win);
-    env = envsetpath(&scratch, env, path, win);
-    env = shellover(s, &scratch, &sh, env, 1);
-    Str        conf = trim(cfgget(e->cfg, "terminal", {}, "shell", 0));
-    Slice<Str> argv = termargv(&scratch, conf, e->home, shellkinds[sh.kind],
-                               sh.path, sh.distro, envget(env, "SHELL", win),
-                               win, login);
-    if (!argv.len) {
-        return "[terminal] shell: a quote is left open";
+    Slice<Str> env   = login && !win ? os_launchenv(e->os, scratch) : e->env;
+    Str        path  = cfgsearchpath(e->cfg, scratch, envpath(env, win), e->home, win);
+    env = envsetpath(scratch, env, path, win);
+    env = shellover(s, scratch, &sh, env, 1);
+    if (run.on) {
+        // Agent-written, so no more than the agent's own commands get
+        // (shellenv): none of the variables secret settings come from
+        Slice<Str> secrets = cfgsecrets(e->cfg, scratch);
+        for (iz i = 0; i < secrets.len; i++) {
+            env = envdel(scratch, env, secrets[i], win);
+        }
     }
-    Str term = termname(e, scratch, win);  // a literal
-    env = termenv(&scratch, env, win, PTY_MAC, term);
+    Slice<Str> argv    = {};
+    Str        cmdline = {};
+    Str        editor  = {};  // the reply's, on Windows
+    if (run.on && win) {
+        Str why = termrunwin(e, scratch, &run, &sh, &env, &argv, &cmdline);
+        if (why.len) {
+            return why;
+        }
+    } else if (run.on) {
+        // This program again, which shows the command and becomes the
+        // terminal's shell running it (main_posix.cpp)
+        Str self = PTY_LINUX ? Str("/proc/self/exe") : e->te.exe;
+        if (!self.len) {
+            return "cannot run the command: this program's path is not known";
+        }
+        Str conf  = trim(cfgget(e->cfg, "terminal", {}, "shell", 0));
+        Slice<Str> shv = termargv(scratch, conf, e->home, shellkinds[sh.kind], sh.path,
+                                  sh.distro, envget(env, "SHELL", win), win, login);
+        argv = push(scratch, argv, self);
+        argv = push(scratch, argv, Str("--tty-run"));
+        env  = envset(scratch, env, "PROSPERO_RUN_TEXT", run.text, 0);
+        env  = envset(scratch, env, "PROSPERO_RUN_LANG", run.lang, 0);
+        env  = envset(scratch, env, "PROSPERO_RUN_SHELL", shv.len ? shv[0] : Str{}, 0);
+        env  = envset(scratch, env, "PROSPERO_RUN_LOGIN", login ? Str("1") : Str("0"), 0);
+    } else if (ed.on && win) {
+        Str why = {};
+        cmdline = termeditwin(e, scratch, &ed, env, &argv, &editor, &why);
+        if (!cmdline.len) {
+            return why;
+        }
+    } else if (ed.on) {
+        // This program again, which becomes the login shell and then the
+        // editor (main_posix.cpp): on Linux the very file this runs,
+        // even once a rebuild replaced it
+        Str self = PTY_LINUX ? Str("/proc/self/exe") : e->te.exe;
+        if (!self.len) {
+            return "cannot start the editor: this program's path is not known";
+        }
+        argv = push(scratch, argv, self);
+        argv = push(scratch, argv, Str("--tty-edit"));
+    } else {
+        Str conf = trim(cfgget(e->cfg, "terminal", {}, "shell", 0));
+        argv = termargv(scratch, conf, e->home, shellkinds[sh.kind], sh.path, sh.distro,
+                        envget(env, "SHELL", win), win, login);
+        if (!argv.len) {
+            return "[terminal] shell: a quote is left open";
+        }
+    }
+    Str term = termname(e, *scratch, win);  // a literal
+    env = termenv(scratch, env, win, PTY_MAC, term);
+    // What a profile tests to skip what would keep a tab's program from
+    // starting (exec tmux): edit or run, else unset
+    env = envdel(scratch, env, "PROSPERO_TAB", win);
+    if (ed.on || run.on) {
+        env = envset(scratch, env, "PROSPERO_TAB", ed.on ? Str("edit") : Str("run"), win);
+    }
+    if (!run.on) {
+        Str names[] = {
+            "PROSPERO_RUN_TEXT", "PROSPERO_RUN_LANG", "PROSPERO_RUN_SHELL", "PROSPERO_RUN_LOGIN",
+        };
+        for (iz i = 0; i < countof(names); i++) {
+            env = envdel(scratch, env, names[i], win);
+        }
+    }
+    if (ed.on && !win) {
+        // Never quoted: no shell parses these
+        Str names[] = {
+            "PROSPERO_EDIT_FILE", "PROSPERO_EDIT_LINE", "PROSPERO_EDIT_COL",
+            "PROSPERO_EDIT_EDITOR", "PROSPERO_EDIT_TEMPLATE", "PROSPERO_EDIT_LOGIN",
+        };
+        for (iz i = 0; i < countof(names); i++) {
+            env = envdel(scratch, env, names[i], 0);
+        }
+        env = envset(scratch, env, names[0], ed.path, 0);
+        if (ed.line) {
+            env = envset(scratch, env, names[1], deskint(scratch, ed.line), 0);
+        }
+        if (ed.col) {
+            env = envset(scratch, env, names[2], deskint(scratch, ed.col), 0);
+        }
+        if (ed.editor.len) {
+            env = envset(scratch, env, names[3], ed.editor, 0);
+        }
+        if (ed.tmpl.len) {
+            env = envset(scratch, env, names[4], ed.tmpl, 0);
+        }
+        env = envset(scratch, env, names[5], login ? Str("1") : Str("0"), 0);
+    }
 
-    Spawn sp = {};
-    sp.argv  = argv;
-    sp.cwd   = cwd;
-    sp.env   = env;
-    sp.mbox  = e->in;
-    sp.id    = ++e->nextid;
-    Proc *p  = os_ptyspawn(e->os, &sp, termsize(j), TERM_RING, scratch);
+    Spawn sp   = {};
+    sp.argv    = argv;
+    sp.cmdline = cmdline;
+    sp.cwd     = cwd;
+    sp.env     = env;
+    sp.mbox    = e->in;
+    sp.id      = ++e->nextid;
+    Proc *p    = os_ptyspawn(e->os, &sp, termsize(j), TERM_RING, *scratch);
     if (!p) {
-        return concat(&scratch, "cannot start the shell: ", os_lasterr(e->os, &scratch));
+        Str what = ed.on  ? Str("cannot start the editor: ") :
+                   run.on ? Str("cannot run the command: ") :
+                   Str("cannot start the shell: ");
+        return concat(scratch, what, os_lasterr(e->os, scratch));
     }
     *t = {};
     t->tid    = ++e->terms->nexttid;
@@ -483,8 +1543,32 @@ static Str termstart(Engine *e, Arena scratch, i64 id, Json *j, Session *s, Str 
     copybytes(t->sid, sid.data, sid.len);
     t->proc   = p;
     t->procid = sp.id;
+    t->used   = os_ticks(e->os);
+    Str label = ed.on && editor.len ? editor : sh.name;
+    t->shelllen = label.len<TERM_SHELLCAP ? label.len : 0;
+    copybytes(t->shell, label.data, t->shelllen);
+    t->cwdlen = cwd.len<TERM_CWDCAP ? cwd.len : 0;
+    copybytes(t->cwd, cwd.data, t->cwdlen);
+    if (run.on) {
+        Str first = termrunfirst(run.text, &t->runlines);
+        t->run        = 1;
+        t->startat    = t->used;
+        t->runkey     = hash(run.text);
+        t->runlinelen = first.len;
+        copybytes(t->runline, first.data, first.len);
+        t->fromlen = run.from.len<=countof(t->from) ? run.from.len : 0;
+        copybytes(t->from, run.from.data, t->fromlen);
+    }
+    if (termagent(e)) {
+        termconfsecrets(e, *scratch, env, win);
+        // As much history as the frontend keeps, within TERM_HIST
+        PtySize z  = termsize(j);
+        i64     sb = jsonint(jsonget(j, "scrollback"), 1000);
+        t->hist = (i32)(sb<0 ? 0 : sb>TERM_HIST ? (i64)TERM_HIST : sb);
+        termscreenblock(e, t, z.cols, z.rows);  // else no screen, no reads
+    }
 
-    Buf   b(&scratch, 1024);
+    Buf   b(scratch, 1024);
     EvOut w = evbegin(&b, sid, 0, os_time(e->os), EV_REPLY);
     putintkey(&w.json, "id", id);
     putintkey(&w.json, "ok", 1);
@@ -497,6 +1581,9 @@ static Str termstart(Engine *e, Arena scratch, i64 id, Json *j, Session *s, Str 
     }
     putend(&w.json);
     putstrkey(&w.json, "cwd", cwd);
+    if (editor.len) {
+        putstrkey(&w.json, "editor", editor);
+    }
     emit(e, evend(&w));
     return {};
 }
@@ -520,10 +1607,7 @@ static void termopen(Engine *e, Arena scratch, i64 id, Json *j)
         reply(e, scratch, id, 0, "no such session", sid);
         return;
     }
-    Str err = termstart(e, scratch, id, j, s, sid);
-    if (err.len) {
-        err = clone(&scratch, err);
-    }
+    Str err = termstart(e, &scratch, id, j, s, sid);
     if (transient) {
         forget(e, s);
     }
@@ -543,19 +1627,37 @@ static void termcmd(Engine *e, Arena scratch, i32 cmd, Json *j)
         return;
     }
     Term *t = termbytid(e, jsonint(jsonget(j, "tid"), 0), peer);
-    if (!t || t->closed) {
+    if (t && t->closed && cmd==CMD_TERMCLOSE) {
+        // Its tab closed after its end: nothing to keep for
+        t->keep = 0;
+        if (t->kept) {
+            termfree(e, t);
+        }
+        return;
+    } else if (!t || t->closed) {
         return;
     }
     switch (cmd) {
     case CMD_TERMINPUT: {
         Unbase64 u = unbase64(&scratch, jsonstr(jsonget(j, "data")));
         if (u.ok && u.data.len && u.data.len<=TERM_INPUT) {
+            termtyped(e, scratch, t, u.data);
+            t->used = os_ticks(e->os);
             os_procwrite(e->os, t->proc, u.data);
         }
     } break;
-    case CMD_TERMRESIZE:
-        os_ptyresize(e->os, t->proc, termsize(j));
-        break;
+    case CMD_TERMRESIZE: {
+        // The screen takes the output written at the old size first
+        PtySize z = termsize(j);
+        if (t->screen) {
+            termscan(e, t);
+            if (z.cols>t->capcols || z.rows>t->caprows) {
+                termscreenblock(e, t, z.cols, z.rows);
+            }
+            ariel_resize(t->screen, z.cols, z.rows, z.xpx/z.cols, z.ypx/z.rows);
+        }
+        os_ptyresize(e->os, t->proc, z);
+    } break;
     case CMD_TERMACK: {
         i64     off = jsonint(jsonget(j, "off"), -1);
         TermAck k   = termack(t->sent, t->acked, off, jsonflag(jsonget(j, "resend"), 0));
@@ -570,13 +1672,15 @@ static void termcmd(Engine *e, Arena scratch, i32 cmd, Json *j)
         termpump(e, scratch, t);
     } break;
     case CMD_TERMCLOSE:
-        termhangup(e, t, jsonflag(jsonget(j, "kill"), 0));
+        termhangup(e, t, jsonflag(jsonget(j, "kill"), 0), 0);
         break;
     }
 }
 
 
 // Hooks: records, the loop, and what hangs terminals up
+
+static void termnotice(Engine *, Arena, Term *);
 
 // A record of a terminal's shell. Returns 0 if it is not one.
 static b32 termrecord(Engine *e, Arena scratch, Record r)
@@ -602,8 +1706,12 @@ static b32 termrecord(Engine *e, Arena scratch, Record r)
     default:
         return 1;
     }
+    if (t->run && !t->told && t->exited && t->eof) {
+        termscan(e, t);
+        termnotice(e, scratch, t);
+    }
     if (t->closed) {
-        termhangup(e, t, 0);  // frees it once both are in
+        termsettle(e, t);  // frees or keeps it once both are in
     } else {
         termpump(e, scratch, t);
     }
@@ -693,7 +1801,343 @@ static void termhangupall(Engine *e, i64 peer, Str sid)
         Term *t = &e->terms->slots[i];
         b32 match = peer<0 ? !sid.len || Str{t->sid, t->sidlen}==sid : t->peer==peer;
         if (t->tid && match) {
-            termhangup(e, t, 0);
+            termhangup(e, t, 0, 0);
         }
     }
+}
+
+
+// read_terminal: the agent reads the user's terminals
+
+enum : i32 {
+    TERM_READBYTES = 50 << 10,  // of a terminal's text shown at once
+    TERM_READLINES = 100,       // lines shown by default
+};
+
+// A session as termrootwalk sees it: from memory, else from the first
+// record of its log.
+static TermNode termlookup(void *ctx, Arena *a, Str sid)
+{
+    Engine  *e = (Engine *)ctx;
+    TermNode n = {};
+    Session *s = findsession(e, sid);
+    if (s) {
+        n.found    = 1;
+        n.parent   = s->psid;
+        n.sideof   = s->wt.from;
+        n.worktree = s->wt.name.len > 0;
+        n.cwd      = s->cwd;
+        return n;
+    } else if (!validsid(sid)) {
+        return n;
+    }
+    Str   path = join(a, join(a, join(a, e->statedir, "sessions"), sid), "events.jsonl");
+    Read  rd   = os_readat(e->os, a, path, 0, 4096);
+    Cut   line = cut(rd.data, '\n');
+    EvRec rec  = evparse(a, line.head);
+    if (!line.ok || rec.ev!=EV_SESSION) {
+        return n;
+    }
+    n.found    = 1;
+    n.parent   = jsonint(jsonget(rec.root, "remote"), 0)==1 ? Str{}
+                                                             : jsonstr(jsonget(rec.root, "parent"));
+    n.sideof   = jsonstr(jsonget(rec.root, "side_of"));
+    n.worktree = wtfrom(a, jsonget(rec.root, "worktree")).name.len > 0;
+    n.cwd      = jsonstr(jsonget(rec.root, "cwd"));
+    return n;
+}
+
+// A terminal's line in the list: its number, label, state and folder.
+static void termlistline(Buf *b, Arena *a, Term *t, TermSecrets *ss, iz *hidden)
+{
+    iz  h     = 0;
+    Str label = t->run      ? termmask(a, {t->runline, t->runlinelen}, ss, &h)
+              : t->titlelen ? termmask(a, {t->title, t->titlelen}, ss, &h)
+              : Str{t->shell, t->shelllen};
+    *hidden += h;
+    print(b, "terminal ");
+    print(b, t->tid);
+    print(b, ": ");
+    if (t->run) {
+        print(b, "`");
+        print(b, label);
+        print(b, t->runlines>1 ? Str("`... (the user ran it from your message)")
+                               : Str("` (the user ran it from your message)"));
+    } else {
+        print(b, label.len ? label : Str("shell"));
+    }
+    if (t->cut) {
+        print(b, ", its tab closed while it ran");
+    } else if (t->exited && t->signal) {
+        print(b, ", killed by signal ");
+        print(b, (i64)t->signal);
+    } else if (t->exited) {
+        print(b, ", exited with code ");
+        print(b, (i64)t->code);
+    } else if (t->run) {
+        print(b, ", running");
+    } else if (t->busy) {
+        print(b, ", a program is running");
+    } else {
+        print(b, ", at its prompt");
+    }
+    if (t->cwdlen) {
+        print(b, ", in ");
+        print(b, Str{t->cwd, t->cwdlen});
+    }
+    if (!t->screen) {
+        print(b, " (not readable: it opened while [terminal] agent was off)");
+    }
+    putbyte(b, '\n');
+}
+
+// The last n lines of text, each cut at READ_LINEMAX bytes, and no more
+// of them than fit in max bytes, the newest kept. *more says lines were
+// left out before them.
+static Str termlast(Arena *a, Str text, i64 n, iz max, b32 *more)
+{
+    Slice<Str> lines = {};
+    for (Cut c = {{}, text, text.len>0}; c.ok;) {
+        c     = cut(c.tail, '\n');
+        lines = push(a, lines, c.head.len>READ_LINEMAX ? utf8head(c.head, READ_LINEMAX)
+                                                       : c.head);
+    }
+    iz first = lines.len>n ? lines.len-(iz)n : 0;
+    iz total = 0;
+    iz from  = lines.len;
+    while (from > first && total+lines[from-1].len+1 <= max) {
+        total += lines[--from].len + 1;
+    }
+    *more = from > 0;
+    Buf b(a, total + 1);
+    for (iz i = from; i < lines.len; i++) {
+        print(&b, lines[i]);
+        putbyte(&b, '\n');
+    }
+    return finish(&b);
+}
+
+// A screen's whole text, wrapped rows joined, with the secrets hidden
+// before anything cuts it, so that none is cut in two.
+static Str termscreentext(Arena *a, Term *t, TermSecrets *ss, iz *hidden)
+{
+    ariel_select(t->screen, ARIEL_SEL_ALL, 0, 0);
+    iz  len = ariel_copy(t->screen, 0, 0);
+    u8 *raw = len>0 ? alloc<u8>(a, len) : 0;
+    len     = len>0 ? ariel_copy(t->screen, raw, len) : 0;
+    ariel_select(t->screen, ARIEL_SEL_CLEAR, 0, 0);
+    return termmask(a, trimright(Str{raw, len}), ss, hidden);
+}
+
+// The session a Run's notice goes to, as a message would (toolmessage):
+// in memory, revived, or loaded as closed; none if it is gone, in the
+// Trash, archived, or another process's.
+static Session *termnoticeto(Engine *e, Arena scratch, Str sid)
+{
+    SessScan sc = scansessions(e, &scratch);
+    iz       at = -1;
+    for (iz i = 0; i < sc.list.len; i++) {
+        at = sc.list[i].sid==sid ? i : at;
+    }
+    if (at<0 || scanaside(&sc, at) || sc.list[at].locked) {
+        return 0;
+    }
+    i64      first = 0;
+    b32      fresh = 0;
+    Session *s     = findsession(e, sid);
+    s = s ? s : revive(e, scratch, sid, {}, {}, &first);
+    if (!s) {
+        s     = loadsession(e, scratch, sid, {}, {}, &first, -1);
+        fresh = s != 0;
+    }
+    if (s && s->readonly) {
+        if (fresh) {
+            forget(e, s);
+        }
+        return 0;
+    } else if (s && fresh) {
+        s->closed = 1;  // as it was: no frontend has it open
+    }
+    return s;
+}
+
+// A Run ended, or its tab closed while it ran: tell the session whose
+// message it came from, at its next request, never starting a turn. A
+// notice of the same text not yet delivered gives way to this one.
+static void termnotice(Engine *e, Arena scratch, Term *t)
+{
+    t->told = 1;
+    Str sid = {t->from, t->fromlen};
+    if (!sid.len || !termagent(e)) {
+        return;
+    }
+    Session *s = termnoticeto(e, scratch, sid);
+    if (!s) {
+        return;
+    }
+    TermSecrets *ss     = &e->terms->secrets;
+    iz           hidden = 0;
+    i64          ms     = (os_ticks(e->os) - t->startat) / MS;
+    Buf          b(&scratch, 4096);
+    print(&b, "The user ran `");
+    print(&b, termmask(&scratch, {t->runline, t->runlinelen}, ss, &hidden));
+    print(&b, "`");
+    if (t->runlines > 1) {
+        print(&b, "... (");
+        print(&b, (i64)t->runlines);
+        print(&b, " lines)");
+    }
+    print(&b, " from your message, in terminal ");
+    print(&b, t->tid);
+    if (t->cwdlen) {
+        print(&b, ", in ");
+        print(&b, Str{t->cwd, t->cwdlen});
+    }
+    print(&b, ". ");
+    if (t->cut) {
+        print(&b, "Its tab was closed while it ran, after ");
+    } else if (t->signal) {
+        print(&b, "It was killed by signal ");
+        print(&b, (i64)t->signal);
+        print(&b, ", after ");
+    } else {
+        print(&b, "It exited with code ");
+        print(&b, (i64)t->code);
+        print(&b, " after ");
+    }
+    printelapsed(&b, ms);
+    print(&b, ".");
+    Str  text = t->screen ? termscreentext(&scratch, t, ss, &hidden) : Str{};
+    b32  more = 0;
+    Str  last = termlast(&scratch, text, 20, 2<<10, &more);
+    if (last.len) {
+        print(&b, " Its terminal ends with:\n");
+        print(&b, last);
+    } else {
+        print(&b, "\n");
+    }
+    if (hidden) {
+        print(&b, "[secrets typed at password prompts are hidden as [hidden]]\n");
+    }
+    if (t->screen && (more || t->kept || !t->closed)) {
+        print(&b, "read_terminal reads it while its tab is open.\n");
+    }
+    Notice n = {};
+    n.kind = "terminal";
+    n.text = clone(&s->perm, finish(&b));
+    n.tid  = t->tid;
+    n.code = t->cut ? -1 : t->signal ? 128+t->signal : t->code;
+    n.ms   = ms;
+    n.key  = t->runkey;
+    for (iz i = 0; i < s->notices.len; i++) {
+        if (s->notices[i].kind=="terminal" && s->notices[i].key==n.key) {
+            s->notices[i] = n;
+            return;
+        }
+    }
+    s->notices = push(&s->perm, s->notices, n);
+}
+
+static void toolreadterm(Session *s, Arena scratch, Args *args)
+{
+    Engine *e = s->e;
+    if (!termagent(e)) {
+        toolend(s, scratch, "error", "Reading terminals is turned off ([terminal] "
+                "agent), so nothing was read.", 0, 0, {}, 0);
+        return;
+    }
+
+    // The session's terminals, as the frontend files them, newest first
+    Str   root = termrootwalk(&scratch, s->sid, termlookup, e);
+    Term *list[TERM_MAX];
+    i32   n = 0;
+    for (i32 i = 0; i < TERM_MAX; i++) {
+        Term *t = &e->terms->slots[i];
+        if (t->tid && (!t->closed || t->kept) && Str{t->sid, t->sidlen}==root) {
+            i32 k = n++;
+            for (; k>0 && list[k-1]->tid<t->tid; k--) {
+                list[k] = list[k-1];
+            }
+            list[k] = t;
+        }
+    }
+    if (!n) {
+        toolend(s, scratch, "ok", "The user has no Terminal tabs open for this "
+                "session.", 0, 0, {}, 0);
+        s->termseen = 0;
+        return;
+    }
+
+    // The one asked for, else the one opened or typed into last
+    Term *pick = 0;
+    for (i32 i = 0; i < n; i++) {
+        if (args->tab ? list[i]->tid==args->tab : !pick || list[i]->used>pick->used) {
+            pick = list[i];
+        }
+    }
+
+    TermSecrets *ss     = &e->terms->secrets;
+    iz           hidden = 0;
+    Buf          b(&scratch, 1024);
+    print(&b, n==1 ? Str("The session's terminal:\n") : Str("The session's terminals, newest first:\n"));
+    for (i32 i = 0; i < n; i++) {
+        termlistline(&b, &scratch, list[i], ss, &hidden);
+    }
+    if (!pick) {
+        print(&b, "\nNo terminal ");
+        print(&b, args->tab);
+        print(&b, " is among them.");
+        Str text = finish(&b);
+        toolend(s, scratch, "error", text, 0, 0, {}, 0);
+        return;
+    }
+
+    putbyte(&b, '\n');
+    if (!pick->screen) {
+        print(&b, "Terminal ");
+        print(&b, pick->tid);
+        print(&b, " cannot be read: it opened while [terminal] agent was off.\n");
+    } else {
+        // Catch up, take the whole text, wrapped rows joined, then hide
+        // the secrets before it is cut, so that none is cut in two
+        termscan(e, pick);
+        iz  h    = 0;
+        Str text = termscreentext(&scratch, pick, ss, &h);
+        hidden  += h;
+        b32 more = 0;
+        Str last = termlast(&scratch, text, args->lines ? args->lines : (i64)TERM_READLINES,
+                            TERM_READBYTES, &more);
+        b32 alt  = ariel_modes(pick->screen).altscreen;
+        print(&b, "Terminal ");
+        print(&b, pick->tid);
+        if (!text.len) {
+            print(&b, " shows nothing yet.\n");
+        } else {
+            print(&b, more ? Str(", its last lines:\n") : Str(", all of it:\n"));
+            print(&b, last);
+        }
+        if (alt) {
+            print(&b, "[a full-screen program has the terminal: this is its "
+                      "screen, without the history above it]\n");
+        }
+        if (pick->readfed && pick->fed==pick->readfed) {
+            print(&b, "[no new output since you last read it]\n");
+        }
+        if (pick->run && !pick->exited && !pick->closed && pick->fromlen) {
+            print(&b, "[it still runs: you are told when it ends, at your next "
+                      "request, so do not poll it]\n");
+        }
+        pick->readfed = pick->fed;
+    }
+    if (hidden) {
+        print(&b, "[");
+        print(&b, (i64)hidden);
+        print(&b, hidden==1 ? Str(" secret is") : Str(" secrets are"));
+        print(&b, " hidden as [hidden]: typed at password prompts, or "
+                  "settings' secret values]\n");
+    }
+    Str text = finish(&b);
+    e->terms->lastread = pick->tid;
+    s->termseen = hash(text);
+    toolend(s, scratch, "ok", text, 0, 0, {}, 0);
 }

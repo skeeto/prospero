@@ -33,12 +33,17 @@ the X at the field's end, empties it.
 
 **Open in editor**, beside Reload, opens the file itself in your
 editor (`[ui] editor`, else `$VISUAL` or `$EDITOR`), to edit it by
-hand. A missing file is first created: from the built-in copy, as by
-a first save, or empty for one named by `-c`. Once the editor exits, Settings reads the file again.
+hand, in an editor with a window of its own: a `[ui] editor` that runs
+in a terminal, such as `vim`, is refused here, as for drafts and
+plans, while on macOS one named only by `$VISUAL` or `$EDITOR` gives
+way to the default text editor. A missing file is first created: from
+the built-in copy, as by a first save, or empty for one named by `-c`.
+Once the editor exits, Settings reads the file again.
 Cancel stops the editor and keeps the file as it left it.
 
 The state directory holds the sessions, those in the Trash too, the
-window's layout and `gui.log`: `$XDG_STATE_HOME/prospero`, else
+window's layout (with the paths of the files open in Files) and
+`gui.log`: `$XDG_STATE_HOME/prospero`, else
 `~/.local/state/prospero`. On Windows `%LOCALAPPDATA%\prospero` is
 used while there is none under home. `--statedir DIR` names another,
 for a separate instance.
@@ -104,17 +109,7 @@ a theme with a swatch, the base's color as the hint, and a change there
 recolors the window at once. `system`, `dark` and `light` name the
 built-in themes and cannot be reused.
 
-A theme is an ordinary section, so it may come from an include. The
-[Gruvbox](https://github.com/skeeto/prospero/blob/master/assets/themes/gruvbox.ini)
-theme, by Arthur Cnops (accnops) after Pavel Pertsev's palette, lists
-every color there is to set:
-
-```ini
-include = themes/gruvbox.ini
-
-[ui]
-theme = gruvbox
-```
+A theme is an ordinary section, so it may come from an include.
 
 ## Session titles
 
@@ -280,13 +275,36 @@ fails with a link to sign up for Copilot Free.
   missing, rather than asking to install them. The branch on the
   session bar needs no git. A remote host's engine uses its own
   configuration's.
-- **[`[ui] editor`](settings:ui#editor)**: the command that opens a draft (Ctrl+G) or a plan
-  in an editor, given the file as one more word. It must wait until
-  you are done and open a window of its own, as `code --wait`,
-  `subl -w` or `gvim -f` do. Empty, it is `$VISUAL`, else `$EDITOR`,
-  else on macOS the default text editor, which you then quit. Started
-  from the Finder or a desktop menu, Prospero has no `$VISUAL` or
-  `$EDITOR`: set this, with a full path if need be.
+- **[`[ui] editor`](settings:ui#editor)**: the command that opens a draft (Ctrl+G), a plan
+  or the configuration file in an editor, given the file as one more
+  word, and the editor of the Files pane's Open in editor. For a
+  draft, a plan or the configuration file it must wait until you are
+  done and open a window of its own, as `code --wait`, `subl -w` or
+  `gvim -f` do. Empty, it is `$VISUAL`, else `$EDITOR`, else on macOS
+  the default text editor, which you then quit; on macOS a terminal
+  editor named only by `$VISUAL` or `$EDITOR` gives way to that default
+  for drafts, plans and the configuration file. Open in editor runs an
+  editor that runs in a terminal (`vim`, `nvim`, `nano`, `hx`,
+  `emacs -nw`) in a Terminal tab of the file's session
+  ([Files](help:sessions#files)), on Linux and macOS through your login
+  shell, so `$PATH` and the rest of your profile apply; a profile that
+  starts something interactive, such as `exec tmux`, can skip it where
+  `PROSPERO_TAB` is set: to `edit` there, and to `run` in a tab that
+  runs a command for you (`PROSPERO_EDIT_FILE` works too, in an editor's
+  tab). On Windows, which has no login shell, it
+  is found on PATH and runs through cmd.exe. Another host's file (over
+  ssh, in WSL or in a container) opens in a Terminal tab there
+  ([Hosts](help:hosts#sessions-on-a-remote)), with this editor only if
+  it runs in a terminal: as written on a host of the same OS family
+  (Windows, or not), else by its name alone, as `nvim`; otherwise that
+  host's own `$VISUAL` or `$EDITOR` runs there, else `vi`, never this
+  computer's. An editor with a window of its own still opens a file in
+  a container's folder mounted here, or in a WSL distro, here. Started
+  from the Finder or a desktop menu, Prospero has no `$VISUAL` or `$EDITOR`: set this,
+  with a full path if need be. On Windows its program is looked for by
+  its full path or on PATH, and run by the full path found, so a
+  program of that name in the file's folder never runs instead, and a
+  relative path does not work.
 - **[`[ui] editor_line`](settings:ui#editor_line)**: the command that
   the Files pane's Open in editor runs, for an editor whose arguments
   for a line Prospero does not know: `{file}` is the file's path,
@@ -295,13 +313,23 @@ fails with a link to sign up for Copilot Free.
   Empty, it is the editor's command with the arguments its editor
   takes: `code -g`, `cursor`, `windsurf`, `zed`, `subl`, `gvim +N`,
   `emacs`, `gedit`, JetBrains' `--line`, `mate` and `kate`'s `-l`,
-  `notepad++ -n`. Open in editor does not wait, and refuses an editor
-  that runs in a terminal (`vim`, `nano`, `emacs -nw`); one opened by a
-  terminal, as `alacritty -e nvim`, works.
+  `notepad++ -n`. Open in editor does not wait for an editor with a
+  window of its own; one that runs in a terminal (`vim`, `nano`,
+  `emacs -nw`) runs in a Terminal tab of the file's session, as
+  `[ui] editor` says, and one opened by a terminal of its own, as
+  `alacritty -e nvim`, opens as a window would. On Linux with no editor set at all, Open in
+  editor opens a Terminal tab with your login shell's `$VISUAL` or
+  `$EDITOR`, else `vi`. Another host's file gets it only on a host of
+  the same OS family, and only when it runs in a terminal; otherwise
+  as `[ui] editor` says.
 - **[`[ui] terminal`](settings:ui#terminal)**: the terminal that Open in external terminal opens: on
   macOS an application's name (`iTerm`, `Ghostty`), elsewhere a program
   (`wt.exe`, `konsole`, `kitty`, `wezterm`), whose options for its
   folder and command Prospero knows; another gets `-e`.
+- **[`[terminal] agent`](settings:terminal#agent)**: whether the agent
+  may read the session's Terminal pane tabs (read_terminal), for which
+  the engine keeps a copy of each tab's screen. What is typed at
+  password prompts is hidden from it ([Sessions](help:sessions)).
 - **[`[ui] notify`](settings:ui#notify)**: desktop notifications while the window is in the
   background, minimized, or showing another session: `allow` when a
   permission ask waits for your answer, `done` when a session stops by

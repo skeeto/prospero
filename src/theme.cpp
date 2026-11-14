@@ -25,7 +25,7 @@
 // key (themekeys), as #rgb or #rrggbb. A button or toggle given a color
 // of its own whose hover and pressed shades are left unset gets shades
 // that differ from it as the base's differ from its own (themebuild), as
-// do a field and a scrollbar.
+// do a field and a scrollbar. A tool's output, left unset, follows code.
 //
 // This is free and unencumbered software released into the public domain.
 
@@ -68,13 +68,14 @@ struct Palette {
     u32 scroll;     // scrollbars' grab: at rest, under the mouse, pressed
     u32 scrollhover;
     u32 scrollpress;
+    u32 scrolltrack; // behind the grab
     u32 menubar;    // the main menu bar, under paneltext
     // The transcript, on panel
     u32 text;
     u32 dim;        // headers and secondary text
     u32 reasoning;  // reasoning and notes (STYLE_DIM)
     u32 link;
-    u32 code;       // code spans
+    u32 code;       // Markdown's code spans
     u32 codetext;   // plain text in code blocks, on codebg
     u32 codebg;
     u32 headerbg;   // table header rows
@@ -87,6 +88,7 @@ struct Palette {
     u32 toolbg;     // tool rows
     u32 askbg;      // ask cards
     u32 summary;    // a tool row's arguments, an ask's path
+    u32 tooltext;   // a tool's output as plain text, on toolbg
     u32 hl[HL_COUNT];  // code highlight classes on codebg (HL_PLAIN unused)
     // States, as text on panel, toolbg, askbg and selrow
     u32 ok;
@@ -133,6 +135,7 @@ static Palette themedark = {
     .scroll    = rgb( 79,  79,  79),
     .scrollhover = rgb(105, 105, 105),
     .scrollpress = rgb(130, 130, 130),
+    .scrolltrack = rgb( 10,  10,  10),
     .menubar   = rgb( 36,  36,  36),
     .text      = rgb(222, 222, 222),
     .dim       = rgb(160, 170, 190),
@@ -151,6 +154,7 @@ static Palette themedark = {
     .toolbg    = rgb( 34,  36,  40),
     .askbg     = rgb( 48,  42,  30),
     .summary   = rgb(200, 200, 205),
+    .tooltext  = rgb(225, 190, 140),
     .hl = {
         0,
         rgb(118, 160, 115),  // comment
@@ -208,6 +212,7 @@ static Palette themelight = {
     .scroll    = rgb(189, 189, 189),
     .scrollhover = rgb(148, 148, 148),
     .scrollpress = rgb(125, 125, 125),
+    .scrolltrack = rgb(245, 245, 245),
     .menubar   = rgb(219, 219, 219),
     .text      = rgb( 32,  33,  36),
     .dim       = rgb( 80,  88, 100),
@@ -226,6 +231,7 @@ static Palette themelight = {
     .toolbg    = rgb(230, 231, 234),
     .askbg     = rgb(252, 243, 220),
     .summary   = rgb( 52,  56,  64),
+    .tooltext  = rgb(150,  60,   0),
     .hl = {
         0,
         rgb( 89,  99, 110),  // comment
@@ -291,6 +297,7 @@ static ThemeKey themekeys[] = {
     TK("scrollbar", scroll),
     TK("scrollbar_hover", scrollhover),
     TK("scrollbar_pressed", scrollpress),
+    TK("scrollbar_track", scrolltrack),
     TK("menu_bar", menubar),
     TK("text", text),
     TK("text_dim", dim),
@@ -309,6 +316,7 @@ static ThemeKey themekeys[] = {
     TK("tool_row", toolbg),
     TK("ask_card", askbg),
     TK("tool_summary", summary),
+    TK("tool_output", tooltext),
     TKA("syntax_comment", hl, 1),
     TKA("syntax_keyword", hl, 2),
     TKA("syntax_type", hl, 3),
@@ -387,9 +395,14 @@ static Palette themebuild(Str base, F get)
 {
     Palette const *b = base=="light" ? &themelight : &themedark;
     Palette        p = *b;
+    b32            tooltext = 0;
     for (iz i = 0; i < countof(themekeys); i++) {
-        themeput(&p, themekeys[i].key, get(themekeys[i].key));
+        b32 set = themeput(&p, themekeys[i].key, get(themekeys[i].key));
+        tooltext |= set && themekeys[i].key=="tool_output";
     }
+    // A tool's output was drawn in code's color before it had its own,
+    // so a theme that sets only code keeps its look
+    p.tooltext = tooltext ? p.tooltext : p.code==b->code ? b->tooltext : p.code;
     // Each color with its shades, as offsets into Palette
     static constexpr iz shades[][3] = {
         #define S(f) __builtin_offsetof(Palette, f)

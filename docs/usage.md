@@ -28,7 +28,11 @@ Shell output button (the Bash logo) folds every shell command's output,
 short ones too, and its Tool output and Reasoning buttons (a wrench and
 screwdriver, a light bulb) open everything, each for that session alone. Cmd/Ctrl+F finds text
 in what the transcript shows, as shown rather than its Markdown, not in folded rows, and a code block's Copy button
-copies its code exactly. A bar above the transcript shows how full the
+copies its code exactly. A block of the agent's tagged with a shell (`sh`,
+`bash`, `zsh`, `powershell`, or `cmd` on Windows) also has a Run button,
+which runs it in a Terminal tab of the session, in its folder; the tab
+keeps its output after it ends, Enter runs it again, and the agent hears
+how it ended at its next request. A bar above the transcript shows how full the
 context is. A file tool that goes outside the session's working directory,
 or the roots the configuration adds, asks first, and an answer not given
 in time denies it. The settings window edits the configuration file in
@@ -56,8 +60,25 @@ Session → Open file... (Ctrl+O, Cmd+O) shows a file on the session's host
 (this computer, or another whose engine reads it for the window) in the
 Files pane, hidden until then: in a tab of the session shown, its lines
 numbered and highlighted, wrapped or not, a Markdown file rendered (or as
-text), and `path:N` or `path:A-B` scrolled to those lines and marked. Ctrl+W (Cmd+W) closes its front tab, Ctrl+F (Cmd+F) finds in its file, and Ctrl+G goes to a line, while it has the focus. A
-file dropped on the Files pane opens there too, not attached. The
+text), and `path:N` or `path:A-B` scrolled to those lines and marked;
+reading a file, or checking it, never holds up the window, so a file on a
+share that stops answering says so after ten seconds ("The file system is
+not responding") while the rest carries on. Ctrl+W (Cmd+W) closes its front tab, Ctrl+F (Cmd+F) finds in its file, and Ctrl+G goes to a line, while it has the focus. Its tabs, each session's and its own, where each was and how it showed, are kept with the window's layout across a restart, each file read again only once shown; a session on another host gets its tabs back once that host is connected and lists it, a container's at once. A
+file dropped on the Files pane opens there too, not attached; while files
+are dragged over the window, the place they would go (Files, the prompt
+or Open file's field) is outlined, with a card saying what a
+drop there does or why the files would not be attached; on macOS and
+Windows it knows what the drag holds, counting the files, sending a
+folder to New session and refusing text, and a drop that would be
+refused springs back (on Linux, and on Windows for a drag with paths on
+a network drive or a disc, which are not looked at, it shows only the
+place). Its Open in editor opens the file at its line in `[ui] editor`
+(else `$VISUAL` or `$EDITOR`); one that runs in a terminal, such as
+`vim`, `nano` or `hx`, runs in a Terminal tab of the session, started
+by the login shell (on Windows, found on PATH and run by cmd.exe),
+and once it exits with status 0 the tab closes and Files shows the
+file again, read again (on Linux, with no editor set,
+the login shell's `$VISUAL` or `$EDITOR`, else `vi`). The
 window opens where it was last, fitted to the displays there are; the
 first time, 1700 by 900 at the display's scale, or maximized on a display
 too small for that. The first run shows Help in front, with Settings and
@@ -137,7 +158,9 @@ started from a session begins fresh, nested under it, and reports its
 branch back to it with `send_message` when asked. The prompt box keeps a draft
 per session, with the engine, has the session's earlier prompts on Up
 and Down, opens the draft in an editor with Ctrl+G (`[ui] editor`,
-else `$VISUAL` or `$EDITOR`), and takes `/compact`, `/model`,
+else `$VISUAL` or `$EDITOR`, one with a window of its own: a terminal
+editor is refused, or on macOS, named only by `$VISUAL` or `$EDITOR`,
+gives way to the default text editor), and takes `/compact`, `/model`,
 `/rename`, `/fork`, `/side`, `/worktree`, `/export`, `/plan`, `/background` and a skill's
 `/NAME`. Run in background (Ctrl+B, Cmd+B on macOS) moves a running
 command to a job, or a subagent at work on by itself, so that the

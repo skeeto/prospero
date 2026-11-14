@@ -15,11 +15,25 @@
 // first, at frame start, never the one shown, its tab kept to be read
 // again when shown.
 //
-// Files on this computer are read here, by the GUI, through filestat
-// and fileread, which refuse device and network paths before anything
-// touches them. Files on other hosts (remotes, containers, WSL) come
-// through their engines, fs.read a part at a time (FileFetch), the
-// front tab's only, and Open file checks a path there with fs.stat.
+// Files on this computer are read by the window's own file workers
+// (fswork.cpp's FsPool, guifs), never on its thread, so that a file on
+// a share that stops answering never stops the window: filereadall and
+// filestat (fileset.cpp) refuse device and network paths before
+// anything touches them. Files on other hosts (remotes, containers,
+// WSL) come through their engines, fs.read a part at a time. Either
+// way one read is in flight (FileFetch), the front tab's only, and
+// "Reading..." shows once it has taken FILES_NOTEDELAY. The watch's
+// checks, Open file's check and inline code's links go to the workers
+// here as to fs.stat there, each answered in a later frame; a job the
+// pool refuses (its path's file system not responding, the pool busy)
+// is answered at once, by its caller. So do the folders listed for a
+// path typed (dirget's GFS_LIST): Open file's Tab completion, the new
+// session's folder field and the '@' list's folders, "Listing..." once
+// one has taken FILES_NOTEDELAY. The '@' list's index is walked there
+// too (mention.cpp's GFS_WALK, filewalk.cpp's filewalkrun). On the
+// window's thread still: one-off actions on a path picked in a dialog or
+// dropped (drops, attachments, import's folder, Browse, the typed-path
+// dialog's OK, a container's folder), and the editor's look-up on PATH.
 //
 // A file opens from Open file, or from a link to it (filelinkopen) in
 // the transcript, the plan or a Markdown file shown here.
@@ -153,37 +167,6 @@ static GuiSession *filesroot(Gui *g)
     return g->sess ? termroot(g, g->sess) : &g->nosession;
 }
 
-// A path's type on this computer, a device or a network path refused
-// (STAT_OTHER) before anything touches it: on Windows os_stat opens
-// the path, and opening a device can do things.
-static Stat filestat(Gui *g, Arena scratch, Str path)
-{
-    if (devicepath(path, HOST_WINDOWS) || netpath(path, HOST_WINDOWS)) {
-        return {0, 0, STAT_OTHER};
-    }
-    return os_stat(g->os, scratch, path);
-}
-
-// At most max bytes of a file on this computer, refused likewise.
-static Read fileread(Gui *g, Arena *a, Str path, iz max)
-{
-    if (devicepath(path, HOST_WINDOWS) || netpath(path, HOST_WINDOWS)) {
-        return {{}, 0, READ_NOTFILE};
-    }
-    return os_readat(g->os, a, path, 0, max);
-}
-
-// Why a stat's type is not a file to read, else empty.
-static Str filestatwhy(i32 type)
-{
-    switch (type) {
-    case STAT_MISSING: return "No such file";
-    case STAT_DIR:     return "That is a folder";
-    case STAT_OTHER:   return "Not a regular file";
-    }
-    return {};
-}
-
 // Let a body go: its Region, and whatever names its views.
 static void filefindforget(Gui *, FileBody *);
 
@@ -225,11 +208,24 @@ static void filedrop(Gui *g, FileTab *ft)
     g->filespare = ft;
 }
 
-// Close tab i of a root's set.
+// The layout file is to be saved, the tabs having changed as the user
+// asked: opened, closed, picked, reordered, or shown another way. Not
+// as they scroll: their places go out with the next save, at shedding
+// or at exit. ui.cpp schedules the save's frame.
+static void filesdirty(Gui *)
+{
+    if (ImGui::GetCurrentContext()) {
+        ImGui::MarkIniSettingsDirty();
+    }
+}
+
+// Close tab i of a root's set: from its menu, its middle click or its
+// close button, Ctrl+W, or as its session goes (filesweep).
 static void fileclose(Gui *g, FileSet *set, i32 i)
 {
     filedrop(g, filesetdrop(set, i));
     scheddirty(&g->sched);
+    filesdirty(g);
 }
 
 // Close the shown root's front tab, if any (Ctrl+W).
@@ -489,52 +485,188 @@ static void filesfit(Gui *g, FileTab *keep, iz extra)
     }
 }
 
-// A tab's file, on this computer, read into a new body, else null,
-// saying why, the tab left as it is.
-static FileBody *filebody(Gui *g, FileTab *ft, Str *why)
+// Files on this computer, through the window's own file workers
+
+// A listing's answer (GFS_LIST): the entries, else why not, as dirget
+// says it.
+struct GfsList {
+    Listing ls;
+    Str     err;
+};
+
+// A worker's job: c->arg the path (GFS_FILE, GFS_STAT); or (GFS_LIST)
+// 'f' with files, else 'd', then the folder; else (GFS_LINKS) each
+// path's rootlen, in order, its paths c->paths; its answer in c->res,
+// from its own arena, or c->err for a path under a mark.
+static void guifsrun(FsCall *c)
 {
-    Region *sr = os_reserve(g->os, filescratch(ft));
-    if (!sr) {
-        *why = "There is no memory to show it";
-        return 0;
+    Arena *a = c->mem;
+    switch (c->kind) {
+    case GFS_FILE: {
+        GfsFile  *h = (GfsFile *)c->ctx;
+        FileRead *r = alloc<FileRead>(a);
+        *r = filereadall(c, c->os, *a, c->arg, h->buf, h->max, h->image);
+        c->res = r;
+    } break;
+    case GFS_STAT: {
+        Stat *st = alloc<Stat>(a);
+        if (!fsat(c, c->arg, 1)) {
+            c->err = fsstuck;
+        } else {
+            *st = filestat(c->os, *a, c->arg);
+        }
+        c->res = st;
+    } break;
+    case GFS_LINKS: {
+        // Each path a file (1), a miss (0), or a miss for a link on its
+        // way, never stat'ed (2), as codelinkdrawn once did here
+        u8 *found = alloc<u8>(a, c->paths.len);
+        Str rest  = c->arg;
+        for (iz i = 0; i<c->paths.len && !fsgone(c); i++) {
+            Cut n = cut(rest, ' ');
+            rest = n.tail;
+            Int rootlen = parseint(n.head);
+            Str path    = c->paths[i];
+            if (!rootlen.ok || rootlen.val<0 || !fsat(c, path, 1)) {
+                continue;
+            }
+            b32 ln = os_haslink(c->os, *a, path, (iz)rootlen.val+1);
+            found[i] = ln ? 2 : filestat(c->os, *a, path).type==STAT_FILE;
+        }
+        c->res = found;
+    } break;
+    case GFS_LIST: {
+        // os_listall beats per entry, a listing that stalls on one of
+        // them marking only its folder (exact)
+        b32      files = c->arg.len && c->arg[0]=='f';
+        Str      dir   = cuthead(c->arg, 1);
+        GfsList *l     = alloc<GfsList>(a);
+        c->res = l;
+        if (!fsat(c, c->paths[0], 1)) {
+            c->err = fsstuck;
+            break;
+        }
+        l->ls = os_listall(c->os, a, dir, !files, files ? DIRLIST_FILES : DIRLIST_MAX,
+                           fsbeat, c);
+        if (!l->ls.ok) {
+            l->err = os_stat(c->os, *a, dir).type==STAT_MISSING ? Str("no such folder") :
+                     Str("cannot list this folder");
+        }
+    } break;
     }
-    Arena s  = newarena(sr);
-    Stat  st = filestat(g, s, ft->path);
-    Read  rd = {};
-    *why = filestatwhy(st.type);
-    if (!why->len && fileimgname(ft->path) && st.size>IMG_FILEMAX) {
-        *why = filebigwhy();
-    } else if (!why->len) {
-        rd   = fileread(g, &s, ft->path, filecap(ft));
-        *why = rd.err==READ_OK       ? Str{} :
-               rd.err==READ_NOTFOUND ? Str("No such file") :
-               rd.err==READ_NOTFILE  ? Str("Not a regular file") :
-               Str("It could not be read");
-    }
-    if (why->len) {
-        os_release(g->os, sr);
-        return 0;
-    }
-    return filemake(g, ft, sr, s, rd.data, rd.size, st.mtime, 0, why);
 }
 
-// Read a tab's file, on this computer, into a body of its own, else say
-// why not in the tab. One read already stays shown until the new one is
-// made, room for it made first.
-static void fileload(Gui *g, FileTab *ft)
+// What a GFS_FILE job holds, its fetch's Region, let go by the pool
+// once its worker is done with it, the fetch having given it up.
+static void guifsdrop(Os *os, void *own)
 {
-    g->fileloads++;
-    if (ft->body) {
-        filesfit(g, ft, filebodybytes(ft->body));
-    } else {
-        ft->err = {};
+    os_release(os, (Region *)own);
+}
+
+static void guifsdone(void *, FsJob *, Arena);
+
+// The window's pool, made as first needed: its answers come to g->tasks
+// as TASK_FS records (drainmail), which make no frame of their own.
+static FsPool *guifs(Gui *g)
+{
+    if (!g->fs) {
+        g->fs = fsnew(g->os, &g->perm, g->tasks, TASK_FS, g, guifsdone);
     }
-    ft->watch.stale  = 0;
-    ft->watch.readat = os_time(g->os);
-    Str       why = {};
-    FileBody *nb  = filebody(g, ft, &why);
-    if (fileswap(g, ft, nb, why)) {
-        scheddirty(&g->sched);
+    return g->fs;
+}
+
+// Put a job on the window's pool, else (0) why not: its scratch is the
+// pool's own (g->fsmem), apart from the frame's, which a job finished at
+// once (inline, refused) may use.
+static b32 guifsput(Gui *g, FsPut *put, Str *why)
+{
+    return fsput(guifs(g), put, why, g->fsmem);
+}
+
+// Whether the answer to id is still awaited: from this computer's pool
+// (host 0), else in the request table, which REQ_MAX may evict it from.
+static b32 reqheld(Gui *, i64);
+
+static b32 idheld(Gui *g, u64 host, i64 id)
+{
+    return host ? reqheld(g, id) : g->fs && fsheld(g->fs, id);
+}
+
+// A pool job for a path on this computer, of kind GFS_STAT or GFS_FILE.
+static FsPut guifsjob(Gui *g, i32 kind, Str *path)
+{
+    FsPut put = {};
+    put.id    = ++g->nextid;
+    put.kind  = kind;
+    put.run   = guifsrun;
+    put.arg   = *path;
+    put.paths = {path, 1, 1};
+    return put;
+}
+
+// dirget's listing of a folder here, its path as tildepath made it: on
+// the window's pool, its answer in a later frame (dirlocal), or one the
+// pool refuses (its folder's file system not responding, the pool busy)
+// at once, as the listing's error. A busy pool's refusal is shown but not
+// kept: the next frame that wants the folder asks again.
+static void dirlistlocal(Gui *g, DirList *l, Str path, Arena scratch)
+{
+    Str   norm = normpath(&scratch, path, ".", HOST_WINDOWS);
+    FsPut put  = {};
+    put.id    = ++g->nextid;
+    put.kind  = GFS_LIST;
+    put.run   = guifsrun;
+    put.arg   = concat(&scratch, l->files ? Str("f") : Str("d"), path);
+    put.paths = {&norm, 1, 1};
+    put.exact = 1;
+    l->id     = put.id;  // first: an inline job is answered in guifsput
+    Str why   = {};
+    if (!guifsput(g, &put, &why)) {
+        dirput(&g->pc, l, {}, 0, why);
+        if (why == fsbusy) {
+            l->at = g->sched.now - DIRLIST_TTL;  // asked again when wanted
+        }
+    }
+}
+
+// The window's pool's answer to a listing here (GFS_LIST), for the list
+// that asked, if still kept: one given up says why, as an error does.
+static void dirlocal(Gui *g, FsJob *job, b32 back, Str err)
+{
+    PathComp *pc = &g->pc;
+    DirList  *l  = 0;
+    for (i32 i = 0; i < DIRLISTS; i++) {
+        l = pc->lists[i].id==job->put.id ? &pc->lists[i] : l;
+    }
+    if (!l) {
+        return;
+    }
+    Arena            a = g->fsmem;
+    GfsList         *r = back && !err.len ? (GfsList *)job->res : 0;
+    Slice<PathEntry> e = {};
+    for (Dirent *d = r ? r->ls.head : 0; d; d = d->next) {
+        e = push(&a, e, PathEntry{d->name, d->isdir});
+    }
+    dirput(pc, l, e, r && r->ls.more, r ? r->err : err);
+    scheddirty(&g->sched);
+}
+
+// Each time the mail is drained, and twice a frame: workers gone silent
+// held or given up (fstick), and a frame asked for at the next such
+// deadline, only while one is pending, so idle stays at zero frames.
+static void guifstick(Gui *g)
+{
+    FsPool *p = g->fs;
+    if (!p) {
+        return;
+    }
+    i64 now = os_ticks(g->os);
+    if (fsnext(p) <= now) {
+        fstick(p, g->fsmem, now);
+    }
+    i64 next = fsnext(p);
+    if (next < I64MAX) {
+        schedat(&g->sched, next, DUE_APP);
     }
 }
 
@@ -563,11 +695,29 @@ static b32 reqheld(Gui *g, i64 id)
     return 0;
 }
 
-// Ask for the fetch's next part.
+// An answer's reason, as a tab says it: the engine's, or the pool's.
+static Str  fswhy(Str err);
+static void fetchfail(Gui *, Str);
+
+// Ask for the fetch's next part, or here its whole read: a read the
+// pool refuses (its file system not responding, the pool busy) fails.
 static void fsrequest(Gui *g)
 {
     FileFetch *f = &g->ffetch;
-    GuiHost   *h = filehost(g, f->host);
+    if (!f->host) {
+        FsPut put = guifsjob(g, GFS_FILE, &f->ft->path);
+        put.ctx  = f->head;
+        put.own  = f->r;
+        put.drop = guifsdrop;
+        f->id    = put.id;  // first: an inline job is answered in guifsput
+        Str why  = {};
+        if (!guifsput(g, &put, &why)) {
+            f->id = 0;
+            fetchfail(g, fswhy(why));
+        }
+        return;
+    }
+    GuiHost *h = filehost(g, f->host);
     if (!h) {
         return;
     }
@@ -585,10 +735,15 @@ static void fsrequest(Gui *g)
     cmdsend(g, &w, a);
 }
 
-// The fetch let go, its tab as it is: one read again checked again.
+// The fetch let go, its tab as it is: one read again checked again. A
+// read here given up while its worker runs leaves its Region to the
+// pool, which lets it go once the worker is done with it.
 static void fetchend(Gui *g)
 {
     FileFetch *f = &g->ffetch;
+    if (!f->host && f->id && g->fs && fsabandon(g->fs, f->id)) {
+        f->r = 0;
+    }
     if (f->reload && f->ft && f->ft->serial==f->serial) {
         f->ft->watch.id = 0;
         if (f->ft->watch.stale || f->ft->watch.force) {
@@ -633,15 +788,15 @@ static void fetchfail(Gui *g, Str why)
     scheddirty(&g->sched);
 }
 
-// Start reading a tab's file on another host, as its tab shows: one
-// fetch at a time, the last given up. With its host down, the tab waits
-// (filesnote says so); with an engine there too old, it fails. A tab
-// read already is read again (reload) into a new body, the old shown
-// until it is made.
+// Start reading a tab's file, as its tab shows: one fetch at a time,
+// the last given up, here on the window's pool, on another host through
+// its engine. With its host down, the tab waits (filesnote says so);
+// with an engine there too old, it fails. A tab read already is read
+// again (reload) into a new body, the old shown until it is made.
 static void filefetch(Gui *g, FileTab *ft, b32 reload)
 {
     GuiHost *h   = filehost(g, ft->host);
-    Str      why = filehostwhy(h);
+    Str      why = ft->host ? filehostwhy(h) : Str{};
     if (why.len && h && h->r && !h->closing && h->up && !reload) {
         filefail(g, ft, why);  // too old, until updated
         return;
@@ -657,11 +812,17 @@ static void filefetch(Gui *g, FileTab *ft, b32 reload)
         return;
     }
     // The buffer is the region's, not f->mem's: f->mem is let go (fetchend)
-    // before the body is made from what came, which must stay readable
+    // before the body is made from what came, which must stay readable.
+    // A worker here reads into it, as the header before it says
     Arena m = newarena(f->r);
+    f->head   = alloc<GfsFile>(&m);
     f->max    = filecap(ft);
     f->buf    = allocbytes(&m, f->max);
     f->mem    = m;
+    f->head->buf   = f->buf;
+    f->head->max   = f->max;
+    f->head->image = fileimgname(ft->path);
+    f->askedat = os_ticks(g->os);
     f->ft     = ft;
     f->serial = ft->serial;
     f->host   = ft->host;
@@ -686,7 +847,7 @@ static void fetchtick(Gui *g, FileTab *ft)
     FileFetch *f = &g->ffetch;
     if (f->ft && (f->ft!=ft || !fetchwanted(f))) {
         fetchdrop(g);
-    } else if (f->ft && f->id && !reqheld(g, f->id)) {
+    } else if (f->ft && f->id && !idheld(g, f->host, f->id)) {
         fsrequest(g);
     }
 }
@@ -779,7 +940,40 @@ static Str fswhy(Str err)
     return err=="no such file"       ? Str("No such file") :
            err=="that is a folder"   ? Str("That is a folder") :
            err=="not a regular file" ? Str("Not a regular file") :
+           err==fsstuck              ? Str("The file system is not responding") :
+           err==fsbusy               ? Str("The file system is busy: try again") :
                                        Str("It could not be read");
+}
+
+// The fetch all here, raw at the start of its buffer, of a file of size
+// bytes and mtime, read as of readat on its host's clock (twice: it
+// changed again while read, what came kept): its body made from the
+// scratch past what came, room made first for it beside one read
+// already, and shown. Each read that came whole counts once, here,
+// whether here or there (fileloads, CHK_FILEBODIES).
+static void fetchmade(Gui *g, Str raw, i64 size, i64 mtime, b32 twice, i64 readat)
+{
+    FileFetch *f       = &g->ffetch;
+    FileTab   *ft      = f->ft;
+    Region    *r       = f->r;
+    Arena      s       = f->mem;
+    b32        fetched = f->host != 0;
+    ft->watch.readat = readat;
+    f->r = 0;
+    fetchend(g);
+    g->fileloads++;
+    if (ft->body) {
+        filesfit(g, ft, filebodybytes(ft->body));
+    }
+    Str       why = {};
+    FileBody *nb  = filemake(g, ft, r, s, raw, size>raw.len ? size : raw.len, mtime, twice,
+                             &why);
+    if (nb) {
+        nb->fetched = fetched;
+    }
+    if (fileswap(g, ft, nb, why)) {
+        scheddirty(&g->sched);
+    }
 }
 
 // A part of the fetch's file came: the next asked for, or once all is
@@ -844,37 +1038,49 @@ static void onfsread(Gui *g, Arena scratch, Json *j, b32 ok, Str err, i64 ts)
         return;
     }
 
-    // All here: its body, from the scratch past what came, room made
-    // first for it beside one read already
-    Region *r = f->r;
-    Arena   s = f->mem;
-    Str     raw = {f->buf, (iz)f->off};
-    i64     total = f->changed ? f->off : f->size;
-    b32     twice = f->changed;
-    i64     when  = f->mtime;
-    ft->watch.readat = f->ts;
-    f->r = 0;
-    fetchend(g);
-    g->fileloads++;
-    if (ft->body) {
-        filesfit(g, ft, filebodybytes(ft->body));
+    fetchmade(g, {f->buf, (iz)f->off}, f->changed ? f->off : f->size, f->mtime, f->changed,
+              f->ts);
+}
+
+// The fetch's read here answered (GFS_FILE), back its worker's own
+// answer, else the pool's, err, its Region the pool's then: a body made
+// of what came, else the tab fails, saying why. An answer for a fetch
+// given up is let go.
+static void fetchlocal(Gui *g, FsJob *job, b32 back, Str err)
+{
+    FileFetch *f = &g->ffetch;
+    if (!f->ft || f->host || f->id!=job->put.id) {
+        if (back) {
+            os_release(g->os, (Region *)job->put.own);
+        }
+        return;
     }
-    Str       why = {};
-    FileBody *nb  = filemake(g, ft, r, s, raw, total>raw.len ? total : raw.len, when, twice,
-                             &why);
-    if (nb) {
-        nb->fetched = 1;
+    f->id = 0;
+    if (!back) {
+        f->r = 0;  // its worker may be in it still
     }
-    if (fileswap(g, ft, nb, why)) {
-        scheddirty(&g->sched);
+    FileRead *rd = back && !err.len ? (FileRead *)job->res : 0;
+    if (!fetchwanted(f)) {
+        fetchend(g);
+    } else if (!rd) {
+        fetchfail(g, fswhy(err.len ? err : fsstuck));
+    } else if (rd->toobig) {
+        fetchfail(g, filebigwhy());
+    } else if (rd->err.len) {
+        fetchfail(g, rd->err);
+    } else {
+        fetchmade(g, {f->buf, rd->len}, rd->size, rd->mtime, rd->changed, rd->readat);
     }
 }
 
+static void fileswatched(Gui *, FileTab *, b32, Str, i64, i64);
+
 // Each frame the pane is drawn, for its front tab ft, read: its file
 // checked, as filenext says, once marked as it may have changed (stale),
-// here by its stat, on another host by fs.stat there, and read again
-// into a new body, the old shown meanwhile, when its stat says so
-// (filechanged), or at once for Reload. Nothing while its host is down.
+// here by its stat on the window's pool, on another host by fs.stat
+// there, and read again into a new body, the old shown meanwhile, when
+// its stat says so (filechanged), or at once for Reload. Nothing while
+// its host is down.
 static void filewatch(Gui *g, FileTab *ft)
 {
     FileWatch *w = &ft->watch;
@@ -882,7 +1088,7 @@ static void filewatch(Gui *g, FileTab *ft)
     if (ft->state!=FTAB_READ || !ft->body || (ft->host && filehostwhy(h).len)) {
         return;
     }
-    if (w->id>0 && !reqheld(g, w->id)) {
+    if (w->id>0 && !idheld(g, ft->host, w->id)) {
         w->id    = 0;  // its request slot went (REQ_MAX)
         w->stale = 1;
     } else if (w->id<0 && !(g->ffetch.ft==ft && fetchwanted(&g->ffetch))) {
@@ -900,7 +1106,7 @@ static void filewatch(Gui *g, FileTab *ft)
     w->stale = 0;
     w->force = 0;
     w->sent  = now;
-    if (ft->host && force) {
+    if (force) {
         filefetch(g, ft, 1);
     } else if (ft->host) {
         Arena a = newarena(g->cmdr);
@@ -913,58 +1119,54 @@ static void filewatch(Gui *g, FileTab *ft)
         w->id = g->nextid;
         cmdsend(g, &o, a);
     } else {
-        FileBody *b  = ft->body;
-        Stat      st = filestat(g, g->frame, ft->path);
-        b32       go = force || st.type!=STAT_FILE ||
-                       filechanged(b->size, b->mtime, w->readat, st.size, st.mtime);
-        if (go) {
-            fileload(g, ft);
+        FsPut put = guifsjob(g, GFS_STAT, &ft->path);
+        w->id = put.id;  // first: an inline job is answered in guifsput
+        Str why = {};
+        if (!guifsput(g, &put, &why)) {
+            fileswatched(g, ft, 0, {}, 0, 0);
         }
     }
 }
 
-// A host's answer to a tab's check (filewatch), the reply to id: read
-// again if its stat says so, else as it is. A file gone fails the tab.
-static void onfswatch(Gui *g, i64 id, Json *j, b32 ok, Str err)
+// The tab whose check (filewatch) is id, else null.
+static FileTab *filewatching(Gui *g, i64 id)
 {
     GuiSession *roots[] = {&g->nosession, g->sessions};
-    FileTab    *ft      = 0;
-    for (i32 k = 0; k<countof(roots) && !ft; k++) {
-        for (GuiSession *s = roots[k]; s && !ft; s = k ? s->next : 0) {
+    for (i32 k = 0; k < countof(roots); k++) {
+        for (GuiSession *s = roots[k]; s; s = k ? s->next : 0) {
             for (i32 i = 0; i < s->files.n; i++) {
-                ft = s->files.tabs[i]->watch.id==id ? s->files.tabs[i] : ft;
+                if (s->files.tabs[i]->watch.id == id) {
+                    return s->files.tabs[i];
+                }
             }
         }
     }
-    if (!ft) {
-        return;
-    }
+    return 0;
+}
+
+// The answer to a tab's check (filewatch), ok, else failed: its file
+// of size and mtime, else why it is no file to show (why), read again if
+// its stat says so, else left as it is. A file gone fails the tab.
+static void fileswatched(Gui *g, FileTab *ft, b32 ok, Str why, i64 size, i64 mtime)
+{
     FileWatch *w = &ft->watch;
     w->id = 0;
     if (ft->state!=FTAB_READ || !ft->body) {
         return;
     } else if (!ok) {
-        // Not sent, lost, refused, or its host went: the mark kept, so
-        // checked again a few times (else at the next mark), or once
-        // its host is back
+        // Not sent, lost, refused, stuck, or its host went: the mark
+        // kept, so checked again a few times (else at the next mark), or
+        // once its host is back. One here keeps what it shows
         w->fails++;
-        if (w->fails<=FILES_TRIES || filehostwhy(filehost(g, ft->host)).len) {
+        if (w->fails<=FILES_TRIES || (ft->host && filehostwhy(filehost(g, ft->host)).len)) {
             w->stale = 1;
             scheddirty(&g->sched);
         }
         return;
     }
     w->fails = 0;
-    FileBody *b     = ft->body;
-    Json     *st    = jsonat(jsonget(j, "stats"), 0);
-    Str       type  = jsonstr(jsonget(st, "type"));
-    i64       size  = jsonint(jsonget(st, "size"), -1);
-    i64       mtime = jsonint(jsonget(st, "mtime"), 0);
-    if (type != "file") {
-        Str why = type=="dir"     ? Str("That is a folder") :
-                  type=="missing" ? Str("No such file") :
-                  type=="bad"     ? Str("It cannot be shown") :
-                                    Str("Not a regular file");
+    FileBody *b = ft->body;
+    if (why.len) {
         fileswap(g, ft, 0, why);
         scheddirty(&g->sched);
     } else if (filechanged(b->size, b->mtime, w->readat, size, mtime)) {
@@ -974,6 +1176,42 @@ static void onfswatch(Gui *g, i64 id, Json *j, b32 ok, Str err)
             w->stale = 1;  // no longer shown: checked again once it is
         }
     }
+}
+
+// A host's answer to a tab's check (filewatch), the reply to id.
+static void onfswatch(Gui *g, i64 id, Json *j, b32 ok, Str)
+{
+    FileTab *ft = filewatching(g, id);
+    if (!ft) {
+        return;
+    } else if (!ok) {
+        fileswatched(g, ft, 0, {}, 0, 0);
+        return;
+    }
+    Json *st    = jsonat(jsonget(j, "stats"), 0);
+    Str   type  = jsonstr(jsonget(st, "type"));
+    i64   size  = jsonint(jsonget(st, "size"), -1);
+    i64   mtime = jsonint(jsonget(st, "mtime"), 0);
+    Str   why   = type=="file"    ? Str{} :
+                  type=="dir"     ? Str("That is a folder") :
+                  type=="missing" ? Str("No such file") :
+                  type=="bad"     ? Str("It cannot be shown") :
+                                    Str("Not a regular file");
+    fileswatched(g, ft, 1, why, size, mtime);
+}
+
+// The window's pool's answer to a tab's check here (GFS_STAT).
+static void filewatchlocal(Gui *g, FsJob *job, b32 back, Str err)
+{
+    FileTab *ft = filewatching(g, job->put.id);
+    Stat    *st = back && !err.len ? (Stat *)job->res : 0;
+    if (!ft || ft->host) {
+        return;
+    } else if (!st) {
+        fileswatched(g, ft, 0, {}, 0, 0);
+        return;
+    }
+    fileswatched(g, ft, 1, filestatwhy(st->type), st->size, st->mtime);
 }
 
 // Each frame, at its start: the bodies' caches reset when past their
@@ -1047,6 +1285,39 @@ static void filesrelease(Gui *g)
     g->fshowing = 0;
 }
 
+// A new tab, not yet in a set, for path on the host of uid host (win:
+// that host compares without case): a spare's, its path's room used
+// again where it fits, or a new one; wrapped as the last choice was,
+// fitted, Markdown by its name, and unread.
+static FileTab *filetabnew(Gui *g, u64 host, Str path, b32 win)
+{
+    FileTab *ft = g->filespare;
+    if (ft) {
+        g->filespare = ft->next;
+    } else {
+        ft = alloc<FileTab>(&g->perm);
+    }
+    // A spare's path buffer is used again where it has room
+    Str was = ft->path;
+    iz  cap = ft->pathcap;
+    *ft = {};
+    if (cap >= path.len) {
+        copybytes(was.data, path.data, path.len);
+        ft->path    = {was.data, path.len};
+        ft->pathcap = cap;
+    } else {
+        ft->path    = clone(&g->perm, path);
+        ft->pathcap = path.len;
+    }
+    ft->serial = ++g->fileserial;
+    ft->host   = host;
+    ft->win    = win;
+    ft->wrap   = g->filewrap;
+    ft->fit    = 1;
+    ft->mode   = filemdname(path) ? FMODE_MARKDOWN : FMODE_TEXT;
+    return ft;
+}
+
 // Show a file in the Files pane, in the tab set of session s's root, or
 // the window's own with s null: its tab, made if it has none, in front;
 // at lines line0 to line1 (1-based; 0 for none), banded and scrolled
@@ -1066,30 +1337,7 @@ static FileTab *filesopen(Gui *g, GuiSession *s, u64 host, Str path, i32 line0, 
         ft = set->tabs[i];
         filesetshow(set, i);
     } else {
-        ft = g->filespare;
-        if (ft) {
-            g->filespare = ft->next;
-        } else {
-            ft = alloc<FileTab>(&g->perm);
-        }
-        // A spare's path buffer is used again where it has room
-        Str was = ft->path;
-        iz  cap = ft->pathcap;
-        *ft = {};
-        if (cap >= path.len) {
-            copybytes(was.data, path.data, path.len);
-            ft->path    = {was.data, path.len};
-            ft->pathcap = cap;
-        } else {
-            ft->path    = clone(&g->perm, path);
-            ft->pathcap = path.len;
-        }
-        ft->serial = ++g->fileserial;
-        ft->host   = host;
-        ft->win    = win;
-        ft->wrap   = g->filewrap;
-        ft->fit    = 1;
-        ft->mode   = filemdname(path) ? FMODE_MARKDOWN : FMODE_TEXT;
+        ft = filetabnew(g, host, path, win);
         FileTab *gone = filesetadd(set, ft);
         if (gone) {
             filedrop(g, gone);
@@ -1117,7 +1365,145 @@ static FileTab *filesopen(Gui *g, GuiSession *s, u64 host, Str path, i32 line0, 
     }
     setpane(g, PANE_FILES, 1);
     scheddirty(&g->sched);
+    filesdirty(g);
     return ft;
+}
+
+// Tabs that last: each root's tabs are kept in the layout file's
+// [Prospero][Files] section (fileset.cpp's filekeep*), read before any
+// session is known into g->fkeep, a record for each root, until its
+// root is found (filesrestore). The window's own set is found at once,
+// a session of this state directory once its engine lists it, and a
+// remote session's, known by its host's name and its sid, once that
+// host is connected and lists it (a container's sessions are known at
+// launch); until then a record waits, written back as read. A
+// subagent's container (ctrtaskhost) is never kept: its parent's engine
+// removes it. Restored tabs are unread, each read once shown
+// (drawfiles), so a launch reads only the shown front file, on the
+// window's file workers as any other.
+
+// A record's tabs into root's set (filesetrestore), each made as
+// opening would (filetabnew), then shown as kept (filekeeptab): those
+// on its remote host only with far, that host's uid, else passed over.
+// Markdown only for a Markdown file's name. Nothing is read, stated or
+// shown here.
+static void filesattach(Gui *g, GuiSession *root, FileKeep *k, u64 far)
+{
+    FileTab *made[FILES_TABS];
+    i32      n     = 0;
+    i32      front = -1;
+    for (i32 i = 0; i < k->n; i++) {
+        FileKeepTab *kt    = &k->tabs[i];
+        b32          there = !!(kt->flags & FKT_FAR);
+        if (there && !far) {
+            continue;
+        }
+        b32      win = there ? !!(kt->flags & FKT_WIN) : (b32)HOST_WINDOWS;
+        FileTab *ft  = filetabnew(g, there ? far : 0, kt->path, win);
+        filekeeptab(ft, kt);
+        if (ft->mode==FMODE_MARKDOWN && !filemdname(ft->path)) {
+            ft->mode = FMODE_TEXT;
+        }
+        front     = kt->flags&FKT_FRONT ? n : front;
+        made[n++] = ft;
+    }
+    i32 took = filesetrestore(&root->files, made, n, front);
+    for (i32 i = took; i < n; i++) {
+        filedrop(g, made[i]);  // the set had it, or was full
+    }
+    k->done = 1;
+}
+
+// The records still waiting whose roots are now known: the window's
+// own set's at once; a session of this state directory's once found,
+// dropped if it is deleted or in the Trash, or if listed's sessions
+// (this state directory's engine, or this window's own background
+// host), which cover the whole state directory, the Trash too, lack
+// it. A remote session's likewise once its host (by name) has it, its
+// far tabs on that host, or dropped once that host lists its sessions
+// without it; until then it waits. At startup, with listed null, and as
+// each host lists its sessions, before --session shows one.
+static void filesrestore(Gui *g, GuiHost *listed)
+{
+    FileKeeps *ks    = &g->fkeep;
+    b32        whole = listed && (listed->kind==GH_ENGINE ||
+                                  (listed->kind==GH_LOCAL && listed->own));
+    for (i32 i = 0; i < ks->n; i++) {
+        FileKeep *k = &ks->keeps[i];
+        if (k->done) {
+            continue;
+        } else if (k->kind == FKEEP_NONE) {
+            filesattach(g, &g->nosession, k, 0);
+        } else if (k->kind == FKEEP_HERE) {
+            GuiSession *s = findlocal(g, k->sid);
+            if (s && (s->gone || s->trashed)) {
+                k->done = 1;
+            } else if (s) {
+                filesattach(g, termroot(g, s), k, 0);
+            } else if (whole) {
+                k->done = 1;
+            }
+        } else if (k->kind == FKEEP_REMOTE) {
+            GuiHost    *h = findhost(g, GH_REMOTE, k->host);
+            GuiSession *s = h ? findsess(g, h, k->sid) : 0;
+            if (ctrtaskhost(k->host) || (s && (s->gone || s->trashed))) {
+                k->done = 1;
+            } else if (s) {
+                filesattach(g, termroot(g, s), k, h->uid);
+            } else if (listed && listed==h) {
+                k->done = 1;
+            }
+        }
+    }
+}
+
+// The layout file's Files section (filekeeptext), in a: the live roots,
+// each written as last known alive now, the window's own and those of
+// sessions with tabs, not deleted nor in the Trash, of this state
+// directory or of a remote host, connected or not, with its far tabs,
+// though not of a subagent's container; then the records still
+// waiting, unless a live root has the same key, as it wins.
+static Str filekeepsection(Gui *g, Arena *a)
+{
+    i64 now = os_time(g->os);
+    i32 cap = 1 + g->fkeep.n;
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        cap += s->files.n > 0;
+    }
+    FileKeep  **list  = alloc<FileKeep *>(a, cap);
+    i32         n     = 0;
+    GuiSession *roots[] = {&g->nosession, g->sessions};
+    for (i32 r = 0; r < countof(roots); r++) {
+        for (GuiSession *s = roots[r]; s; s = r ? s->next : 0) {
+            GuiHost *h   = r ? s->host : 0;
+            b32      far = h && h->kind==GH_REMOTE;
+            if (r && (!s->files.n || s->gone || s->trashed ||
+                      (far && (ctrtaskhost(h->name) || h->taskexec.len)))) {
+                continue;
+            }
+            FileKeep *k = alloc<FileKeep>(a);
+            filesetkeep(&s->files, far ? h->uid : 0, g->fonts.size, k);
+            k->kind = far ? FKEEP_REMOTE : r ? FKEEP_HERE : FKEEP_NONE;
+            k->sid  = r ? s->sid : Str{};
+            k->host = far ? h->name : Str{};
+            k->seen = now;
+            k->live = 1;
+            list[n++] = k;
+        }
+    }
+    i32 nlive = n;
+    for (i32 i = 0; i < g->fkeep.n; i++) {
+        FileKeep *k    = &g->fkeep.keeps[i];
+        b32       live = 0;
+        for (i32 j = 0; !k->done && j < nlive; j++) {
+            FileKeep *o = list[j];
+            live |= o->kind==k->kind && o->sid==k->sid && o->host==k->host;
+        }
+        if (!k->done && !live) {
+            list[n++] = k;
+        }
+    }
+    return filekeeptext(a, list, n, !g->filewrap, now);
 }
 
 
@@ -1369,6 +1755,203 @@ static Str filejumptip(Arena *a, EditJump *j)
     return tip;
 }
 
+// How Open in editor opens a file
+enum : i32 {
+    FE_WHY,     // it cannot: why
+    FE_WINDOW,  // in an editor with a window of its own (editorjumprun)
+    FE_TAB,     // in a Terminal tab of its root, on its host (termedit)
+    FE_SHOW,    // the tab that has it open already, shown
+};
+
+struct FileEdit {
+    i32         how;   // FE_*
+    EditJump    j;     // FE_WINDOW's command
+    GuiSession *root;  // FE_TAB's and FE_SHOW's
+    TermTab    *tt;    // FE_SHOW's tab
+    Str         name;  // the editor sent (editask), null for the host's own
+    Str         on;    // FE_TAB's host by name, for another host's file
+    Str         why;   // FE_WHY's
+};
+
+// How Open in editor would open a file of a host (uid, 0 for this
+// computer) at a line and column (0 for none), from root (the window's
+// nosession for none). This computer's file opens in a Terminal tab of
+// root when the editor runs in a terminal (editask), and on Linux when
+// no editor is set at all, the login shell's $VISUAL or $EDITOR then,
+// else vi; an editor with a window of its own opens as C10 has it, as
+// does no editor on macOS (TextEdit) or Windows (a why). Another host's
+// file opens here only in an editor with a window of its own, where
+// C10 maps it (a container's mount, WSL's share); else in a Terminal
+// tab of root there, with the editor editask sends, or none, the
+// host's own.
+static FileEdit fileedit(Gui *g, Arena *a, GuiSession *root, u64 host, Str path, i32 line,
+                         i32 col)
+{
+    FileEdit r = {};
+    r.root = root;
+    GuiHost *fh   = filehost(g, host);
+    EditAsk  ask  = editask(g, a, host ? fh : 0);
+    b32      none = !editorset(g, a).len && !trim(g->edjumpfmt).len;
+    b32      own  = !host && none && !g->mac && !HOST_WINDOWS;
+    b32      here = !host && !ask.term && !own;
+    if (host) {
+        // Judged by what would run here: the template, else the editor
+        Str tmpl = trim(g->edjumpfmt);
+        Str use  = tmpl.len ? tmpl : trim(editorcmd(g, a));
+        Str why  = {};
+        here = use.len && !editorterm(use) && filelocal(g, a, host, path, &why).len &&
+               !why.len;
+    }
+    if (here) {
+        r.j   = filejump(g, a, host, path, line, col);
+        r.how = r.j.why.len ? FE_WHY : FE_WINDOW;
+        r.why = r.j.why;
+        return r;
+    }
+    // An explicitly configured per-host viewer wins over native Terminal-tab
+    // fallback. When it is unset, continue through the usual upstream route.
+    GuiHost *viewerhost = filehost(g, host);
+    if (viewerhost && trim(remoteset(g, viewerhost->name, "viewer")).len) {
+        r.j   = filejump(g, a, host, path, line, col);
+        r.how = r.j.why.len ? FE_WHY : FE_WINDOW;
+        r.why = r.j.why;
+        return r;
+    }
+    r.name  = ask.name;
+    r.on    = host ? filehostname(g, a, host) : Str{};
+    r.how   = FE_WHY;
+    if (root == &g->nosession) {
+        // No host, no session: termwhy must never see it
+        Str who = r.name.len ? r.name : Str("the editor");
+        r.why = concat(a, concat(a, "No session is open: ", who),
+                       " runs in a session's Terminal tab");
+        return r;
+    }
+    u64 at = fileuid(root->host);
+    if (at != host) {
+        Buf b(a, 128);
+        print(&b, "Its file is on ");
+        print(&b, filehostname(g, a, host));
+        print(&b, ", its session on ");
+        print(&b, filehostname(g, a, at));
+        r.why = finish(&b);
+        return r;
+    }
+    // The engine there refuses as C10 does: said before anything opens
+    switch (hostwin(root->host) ? cmdwordok(path) : (i32)CMDWORD_OK) {
+    case CMDWORD_CMD:
+        r.why = "Its path holds %, \" or a control character, which cmd.exe cannot pass on";
+        return r;
+    case CMDWORD_BESTFIT:
+        r.why = "Its path holds a character Windows may pass to the editor as \" or \\";
+        return r;
+    }
+    r.why = termwhy(g, root);
+    r.why = r.why.len ? r.why : hostwhy(g, root, "term.edit");
+    if (!r.why.len && root->host->nopty) {
+        r.why = "Terminals need Windows 10 version 1809 or later";
+    }
+    if (r.why.len) {
+        return r;
+    }
+    TermTab *tt = termeditof(root, path);
+    if (tt && tt->state!=TT_ENDED && tt->state!=TT_FAILED) {
+        r.how = FE_SHOW;
+        r.tt  = tt;
+        return r;
+    }
+    r.why = tt ? Str{} : termfull(g, root);
+    r.how = r.why.len ? FE_WHY : FE_TAB;
+    return r;
+}
+
+// Open in editor, launched as fileedit says.
+static void fileeditrun(Gui *g, Arena a, GuiSession *root, u64 host, Str path, i32 line,
+                        i32 col)
+{
+    FileEdit e = fileedit(g, &a, root, host, path, line, col);
+    switch (e.how) {
+    case FE_WHY:
+        g->lasterr = clone(&g->perm, e.why);
+        break;
+    case FE_WINDOW:
+        filejumprun(g, a, host, path, line, col);
+        break;
+    case FE_TAB:
+    case FE_SHOW:
+        termedit(g, e.root, path, line, col);
+        break;
+    }
+}
+
+// Open in editor's tooltip while it can, as fileedit has it.
+static Str fileedittip(Arena *a, FileEdit *e)
+{
+    switch (e->how) {
+    case FE_WINDOW:
+        return filejumptip(a, &e->j);
+    case FE_SHOW: {
+        Str name = termeditname(e->tt);
+        name = name.len ? name : e->name.len ? e->name : Str("the editor");
+        return concat(a, concat(a, "Show its Terminal tab, where ", name), " has it open");
+    }
+    case FE_TAB: {
+        Buf b(a, 160);
+        if (e->name.len) {
+            print(&b, "Open the file in ");
+            print(&b, e->name);
+            print(&b, ", in a Terminal tab");
+        } else {
+            print(&b, "Open the file in a Terminal tab");
+        }
+        if (e->on.len) {
+            print(&b, " on ");
+            print(&b, e->on);
+        }
+        if (!e->name.len) {
+            print(&b, ", in the editor $VISUAL or $EDITOR names there, else vi");
+        }
+        return finish(&b);
+    }
+    }
+    return {};
+}
+
+// An editor tab's file, on its host, in root's tabs: marked to be
+// checked once shown, as the editor may have changed it.
+static void termeditstale(Gui *g, GuiSession *root, TermTab *tt)
+{
+    u64      uid = fileuid(tt->host);
+    GuiHost *h   = filehost(g, uid);
+    i32      i   = filesetfind(&root->files, uid, tt->edpath, h ? hostwin(h) : (b32)HOST_WINDOWS);
+    if (i >= 0) {
+        filetabstale(g, root->files.tabs[i]);
+    }
+}
+
+// An editor's tab in root closed as the editor exited with status 0:
+// its file, of host h, on path, shown again in Files, read again, with
+// the focus, as the root is shown; the Terminal pane hidden again if it
+// was as the editor opened (hide) and has no tab left. A root not shown
+// only has the file marked.
+static void editdone(Gui *g, GuiSession *root, GuiHost *h, Str path, b32 hide)
+{
+    u64      uid = fileuid(h);
+    GuiHost *fh  = filehost(g, uid);
+    i32      i   = filesetfind(&root->files, uid, path, fh ? hostwin(fh) : (b32)HOST_WINDOWS);
+    if (i >= 0) {
+        filetabstale(g, root->files.tabs[i]);
+    }
+    if (!g->sess || termroot(g, g->sess)!=root) {
+        return;
+    }
+    g->termletgo = 1;
+    filesopen(g, root, uid, path, 0, 0, {});
+    if (hide && !root->terms.n) {
+        setpane(g, PANE_TERMINAL, 0);
+    }
+}
+
 // Reveal's tooltip, by the platform's file manager.
 static Str filerevealtip()
 {
@@ -1402,16 +1985,20 @@ static void filelinkitems(Gui *g)
     } else {
         itemtip("Show the file in the Files pane");
     }
-    EditJump j = path.len ? filejump(g, &a, m->host, path, m->line0, m->col) : EditJump{};
-    Str jwhy = !path.len ? why : j.why;
+    GuiSession *root = m->s ? termroot(g, m->s) : &g->nosession;
+    FileEdit    e    = {};
+    if (path.len) {
+        e = fileedit(g, &a, root, m->host, path, m->line0, m->col);
+    }
+    Str jwhy = !path.len ? why : e.how==FE_WHY ? e.why : Str{};
     if (ImGui::MenuItem("Open in editor", 0, false, !jwhy.len)) {
-        filejumprun(g, a, m->host, path, m->line0, m->col);
+        fileeditrun(g, a, root, m->host, path, m->line0, m->col);
     }
     itemnamed(g, "linkmenu editor");
     if (jwhy.len) {
         whytip(jwhy);
     } else {
-        itemtip("%s", cstr0(&a, filejumptip(&a, &j)));
+        itemtip("%s", cstr0(&a, fileedittip(&a, &e)));
     }
     if (ImGui::MenuItem("Copy path", 0, false, path.len>0)) {
         ImGui::SetClipboardText(cstr0(&a, path));
@@ -1435,12 +2022,15 @@ static void filelinkitems(Gui *g)
 // symlink or junction below the folder (os_haslink, told without
 // following it) is a miss, never stat'ed, wherever the link leads, as
 // a link inside a cloned repository may name a share or an automount.
-// Else filestat answers, at most CODELINK_BATCH paths
-// or CODELINK_US a frame; on another host fs.stat does, in batches of
-// CODELINK_BATCH, one in flight per host. A miss is asked again only
-// when drawn CODELINK_AGAIN later: no timers, no idle frames. A batch
-// whose reply is lost (its host gone, its request slot taken, or
-// FILES_LOST passed) lets its paths be asked again.
+// Else filestat answers. Both run on the window's pool (GFS_LINKS),
+// each path with the bound of its own folder (rootlen), as fs.stat
+// does on another host, in batches of CODELINK_BATCH, one in flight per
+// host. A span drawn while its host's batch is in flight, or full, is
+// turned away (waiting), and the answer to any batch, or its loss,
+// draws again, for it to be asked. A miss is asked again only when
+// drawn CODELINK_AGAIN later: no timers, no idle frames. A batch whose reply is lost (its
+// host gone, its request slot taken, or FILES_LOST passed) lets its
+// paths be asked again; one the pool refuses or gives up is misses.
 
 // The cache's entry for a span's file from where it is, made if new;
 // null if it names none it may check, or there is no room. It is
@@ -1492,6 +2082,14 @@ static CodeLink *codelinkget(Gui *g, Arena scratch, LinkFrom *from, Str span)
         for (i32 i = 0; i < CODELINK_HOSTS; i++) {
             c->asks[i] = {};
         }
+        if (c->local.id && g->fs) {
+            fsabandon(g->fs, c->local.id);
+        }
+        c->local = {};
+        if (c->waiting) {
+            scheddirty(&g->sched);  // the spans turned away, asked anew
+        }
+        c->waiting = 0;
         m = &c->root;
     }
     CodeLink *e = alloc<CodeLink>(&c->mem);
@@ -1526,27 +2124,19 @@ static b32 codelinkdrawn(Gui *g, Arena scratch, LinkFrom *from, Str span)
     }
 
     if (!e->host) {
-        if (c->stats>=CODELINK_BATCH || c->spent>=CODELINK_US) {
-            c->more = 1;  // the next frame's
+        CodeAsk *q = &c->local;
+        if (q->id || q->n==CODELINK_BATCH) {
+            c->waiting = 1;  // asked once the batch in flight answers
             return 0;
         }
         // Below the folder, by its parts' bytes: its own path, and
         // what leads to it, are the user's choice
         Str root = normpath(&scratch, from->base, ".", from->win);
         for (; root.len && issep(root[root.len-1], from->win); root.len--) {}
-        i64  t0 = os_ticks(g->os);
-        b32  ln = os_haslink(g->os, scratch, e->path, root.len+1);
-        Stat st = ln ? Stat{0, 0, STAT_OTHER} : filestat(g, scratch, e->path);
-        i64  t1 = os_ticks(g->os);
-        e->linked = (u8)ln;
-        c->stats++;
-        c->spent += t1 - t0;
-        e->asked  = t1;
-        e->state  = st.type==STAT_FILE ? CODE_FILE : CODE_MISS;
-        if (e->state == CODE_FILE) {
-            scheddirty(&g->sched);
-        }
-        return e->state == CODE_FILE;
+        e->rootlen = root.len;
+        q->paths[q->n++] = e;
+        e->state = CODE_ASKING;
+        return 0;
     }
 
     GuiHost *h = filehost(g, e->host);
@@ -1561,7 +2151,8 @@ static b32 codelinkdrawn(Gui *g, Arena scratch, LinkFrom *from, Str span)
         q = !c->asks[i].host ? &c->asks[i] : 0;
     }
     if (!q || q->id || q->n==CODELINK_BATCH) {
-        return 0;  // after the batch in flight, whose answer draws again
+        c->waiting = 1;  // after the batch in flight, whose answer draws again
+        return 0;
     }
     q->host = e->host;
     q->paths[q->n++] = e;
@@ -1590,23 +2181,85 @@ static Str codelinkat(Gui *g, Arena scratch, View *v, TextHit hit, LinkFrom *fro
     return {};
 }
 
-// A batch's paths, its answer lost, to be asked again as drawn.
-static void codeaskdrop(CodeAsk *q)
+// A batch's paths, its answer lost, to be asked again as drawn. Drawn
+// again if a span was turned away meanwhile: no answer is coming to
+// draw it, and one turned away again sets waiting again.
+static void codeaskdrop(Gui *g, CodeAsk *q)
 {
+    CodeLinks *c = &g->codelinks;
     for (i32 i = 0; i < q->n; i++) {
         if (q->paths[i]->state == CODE_ASKING) {
             q->paths[i]->state = CODE_NEW;
         }
     }
     *q = {};
+    if (c->waiting) {
+        scheddirty(&g->sched);
+    }
+    c->waiting = 0;
 }
 
-// At the end of a frame's drawing: the batches built sent, those lost
-// let go, and another frame if paths drawn here were left unasked.
+// A batch answered, each path a file (found[i] 1), a miss (0), or a
+// miss for a link on its way (2); all misses with found null. Drawn
+// again if it found a file, or a span was turned away meanwhile.
+static void codelinkanswered(Gui *g, CodeAsk *q, u8 *found)
+{
+    CodeLinks *c   = &g->codelinks;
+    i64        now = os_ticks(g->os);
+    b32        any = 0;
+    for (i32 i = 0; i < q->n; i++) {
+        CodeLink *e = q->paths[i];
+        u8        k = found ? found[i] : 0;
+        e->state  = k==1 ? CODE_FILE : CODE_MISS;
+        e->linked = k == 2;
+        e->asked  = now;
+        any      |= k == 1;
+    }
+    *q = {};
+    if (any || c->waiting) {
+        scheddirty(&g->sched);
+    }
+    c->waiting = 0;
+}
+
+// The window's pool's answer to the batch here (GFS_LINKS).
+static void codelinklocal(Gui *g, FsJob *job, b32 back, Str err)
+{
+    CodeAsk *q = &g->codelinks.local;
+    if (q->id && q->id==job->put.id) {
+        codelinkanswered(g, q, back && !err.len ? (u8 *)job->res : 0);
+    }
+}
+
+// At the end of a frame's drawing: the batches built sent, here to the
+// window's pool, and those lost let go.
 static void codelinksflush(Gui *g)
 {
     CodeLinks *c   = &g->codelinks;
     i64        now = g->sched.now;
+    CodeAsk   *lq  = &c->local;
+    if (lq->n && !lq->id) {
+        Arena      a = g->frame;
+        Buf        b(&a, 24*(iz)lq->n);
+        Slice<Str> paths = {alloc<Str>(&a, lq->n), lq->n, lq->n};
+        for (i32 k = 0; k < lq->n; k++) {
+            print(&b, (i64)lq->paths[k]->rootlen);
+            putbyte(&b, ' ');
+            paths[k] = lq->paths[k]->path;
+        }
+        FsPut put = {};
+        put.id    = ++g->nextid;
+        put.kind  = GFS_LINKS;
+        put.run   = guifsrun;
+        put.arg   = finish(&b);
+        put.paths = paths;
+        lq->id    = put.id;  // first: an inline job is answered in guifsput
+        lq->sent  = now;
+        Str why   = {};
+        if (!guifsput(g, &put, &why)) {
+            codelinkanswered(g, lq, 0);  // misses, asked again later
+        }
+    }
     for (i32 i = 0; i < CODELINK_HOSTS; i++) {
         CodeAsk *q = &c->asks[i];
         if (!q->host) {
@@ -1616,11 +2269,11 @@ static void codelinksflush(Gui *g)
         if (q->id) {
             if (filehostwhy(h).len || !reqheld(g, q->id) ||
                     now-q->sent > (i64)FILES_LOST*1000) {
-                codeaskdrop(q);
+                codeaskdrop(g, q);
             }
             continue;
         } else if (filehostwhy(h).len) {
-            codeaskdrop(q);
+            codeaskdrop(g, q);
             continue;
         }
         iz    len = 0;
@@ -1640,12 +2293,6 @@ static void codelinksflush(Gui *g)
         q->sent = now;
         cmdsend(g, &o, a);
     }
-    if (c->more) {
-        scheddirty(&g->sched);
-    }
-    c->stats = 0;
-    c->spent = 0;
-    c->more  = 0;
 }
 
 // A host's answer to a batch, if id is one's: each path a file or a
@@ -1671,9 +2318,10 @@ static b32 codelinkreply(Gui *g, i64 id, Json *j, b32 ok)
         found   |= e->state == CODE_FILE;
     }
     *q = {};
-    if (found) {
+    if (found || c->waiting) {
         scheddirty(&g->sched);
     }
+    c->waiting = 0;
     return 1;
 }
 
@@ -1682,15 +2330,16 @@ static void codelinkhostend(Gui *g, u64 host)
 {
     for (i32 i = 0; i < CODELINK_HOSTS; i++) {
         if (g->codelinks.asks[i].host == host) {
-            codeaskdrop(&g->codelinks.asks[i]);
+            codeaskdrop(g, &g->codelinks.asks[i]);
         }
     }
 }
 
 
 // Open file...: a path typed in a modal of its own (drawpathask), on
-// the shown session's host, its answer TASK_OPENFILE. On another host
-// the path is checked there (fs.stat) first.
+// the shown session's host, its answer TASK_OPENFILE once the path is
+// checked: here on the window's pool (GFS_STAT), on another host there
+// (fs.stat), "Checking..." shown if that takes FILES_NOTEDELAY.
 
 // The host Open file opens files on: the shown session's, else this
 // computer (null).
@@ -1735,8 +2384,9 @@ static void fileaskopen(Gui *g)
     GuiHost *h = fileaskhost(g);
     g->fask.host   = h ? h->uid : 0;
     g->fask.statid = 0;
-    g->fask.stated = 0;
-    g->fask.close  = 0;
+    g->fask.stated  = 0;
+    g->fask.close   = 0;
+    g->fask.opening = 0;
     scheddirty(&g->sched);
 }
 
@@ -1759,16 +2409,8 @@ static FilePath fileasked(Gui *g, Arena *a, Str text, FileRef *ref)
         copybytes(g->fask.err, p.err.data, n);
         g->fask.err[0] = (u8)(p.err[0]>='a' && p.err[0]<='z' ? p.err[0]-0x20 : p.err[0]);
         p.err = {g->fask.err, n};  // kept past the frame, for the modal
-        return p;
-    } else if (g->fask.host) {
-        return p;  // checked there (fileaskok)
     }
-    Str why = filestatwhy(filestat(g, *a, p.path).type);
-    if (why.len) {
-        p.err  = why;
-        p.path = {};
-    }
-    return p;
+    return p;  // else checked (fileaskok)
 }
 
 // Open file's answer, as drawpathask posted it: "LINE0 LINE1 PATH",
@@ -1786,20 +2428,33 @@ static Str fileanswerput(Arena *a, FilePath p, FileRef ref)
     return finish(&b);
 }
 
-// Ask the host whether Open file's path, kept as its answer, is a file.
+static void fileaskanswered(Gui *, Str);
+
+// Ask whether Open file's path, kept as its answer, is a file: here the
+// window's pool, else its host.
 static void fileaskstat(Gui *g)
 {
-    FileAsk *f = &g->fask;
-    GuiHost *h = filehost(g, f->host);
+    FileAsk *f      = &g->fask;
+    Str      answer = {f->answer, f->answerlen};
+    Cut      pl     = cut(cut(cut(answer, ' ').tail, ' ').tail, '\n');
+    f->statat = os_ticks(g->os);
+    if (!f->host) {
+        FsPut put = guifsjob(g, GFS_STAT, &pl.head);
+        f->statid = put.id;  // first: an inline job is answered in guifsput
+        Str why   = {};
+        if (!guifsput(g, &put, &why)) {
+            fileaskanswered(g, fswhy(why));
+        }
+        return;
+    }
+    GuiHost *h   = filehost(g, f->host);
     Str      why = filehostwhy(h);
     if (why.len) {
         f->statid = 0;
         f->p.err  = why;
         return;
     }
-    Str   answer = {f->answer, f->answerlen};
-    Cut   pl     = cut(cut(cut(answer, ' ').tail, ' ').tail, '\n');
-    Arena a      = newarena(g->cmdr);
+    Arena a = newarena(g->cmdr);
     Buf   b(&a, 256 + 6*pl.head.len);
     EvOut w = cmdopen(g, &b, CMD_FSSTAT, 0, h);
     putkey(&w.json, "paths");
@@ -1810,9 +2465,9 @@ static void fileaskstat(Gui *g)
     cmdsend(g, &w, a);
 }
 
-// Open file's OK: the path typed, its answer posted, else why not. On
-// another host, its answer waits for the check there, the modal open,
-// saying "Checking...".
+// Open file's OK: the path typed, its answer posted once the check
+// says it is a file, else why not. The modal stays open meanwhile,
+// saying "Checking..." if that takes a while.
 static Str fileaskok(Gui *g, Str text)
 {
     Arena    a   = g->frame;
@@ -1822,44 +2477,36 @@ static Str fileaskok(Gui *g, Str text)
         return p.err;
     }
     Str answer = fileanswerput(&a, p, ref);
-    if (!g->fask.host) {
-        mailpost(g->tasks, TASK_OPENFILE, g->fask.p.id, answer, 1);
-        return {};
-    } else if (answer.len > countof(g->fask.answer)) {
+    if (answer.len > countof(g->fask.answer)) {
         return "Its path is too long";
     }
     copybytes(g->fask.answer, answer.data, answer.len);
     g->fask.answerlen = answer.len;
+    g->fask.close     = 0;
     fileaskstat(g);
-    return g->fask.statid ? Str{} : g->fask.p.err;
+    return g->fask.statid || g->fask.close ? Str{} : g->fask.p.err;
 }
 
 // Each frame Open file is up: its check asked again where its request
 // slot went (REQ_MAX).
 static void fileaskcheck(Gui *g)
 {
-    if (g->fask.statid && !reqheld(g, g->fask.statid)) {
+    if (g->fask.statid && !idheld(g, g->fask.host, g->fask.statid)) {
         fileaskstat(g);
     }
 }
 
-// The host's answer to Open file's check: a file opens, else the modal
-// says why not.
-static void onfsstat(Gui *g, Arena, Json *j, b32 ok, Str err)
+// The answer to Open file's check, why its path is no file to open,
+// else (empty) its answer posted, a file: the modal closes, else says
+// why.
+static void fileaskanswered(Gui *g, Str why)
 {
     FileAsk *f = &g->fask;
     f->statid = 0;
-    f->stated = 1;
-    Str type = jsonstr(jsonget(jsonat(jsonget(j, "stats"), 0), "type"));
-    Str why  = !ok              ? err :
-               type == "file"   ? Str{} :
-               type == "dir"    ? Str("That is a folder") :
-               type == "missing" ? Str("No such file") :
-               type == "bad"    ? Str("It cannot be shown") :
-                                  Str("Not a regular file");
     if (!why.len) {
         mailpost(g->tasks, TASK_OPENFILE, f->p.id, {f->answer, f->answerlen}, 1);
-        f->close = 1;
+        f->close   = 1;
+        f->opening = 1;
     } else {
         iz n = why.len<countof(f->err) ? why.len : countof(f->err);
         copybytes(f->err, why.data, n);
@@ -1867,6 +2514,69 @@ static void onfsstat(Gui *g, Arena, Json *j, b32 ok, Str err)
         f->p.err  = {f->err, n};
     }
     scheddirty(&g->sched);
+}
+
+// The host's answer to Open file's check.
+static void onfsstat(Gui *g, Arena, Json *j, b32 ok, Str err)
+{
+    g->fask.stated = 1;
+    Str type = jsonstr(jsonget(jsonat(jsonget(j, "stats"), 0), "type"));
+    Str why  = !ok              ? err :
+               type == "file"   ? Str{} :
+               type == "dir"    ? Str("That is a folder") :
+               type == "missing" ? Str("No such file") :
+               type == "bad"    ? Str("It cannot be shown") :
+                                  Str("Not a regular file");
+    fileaskanswered(g, why);
+}
+
+// The window's pool's answer to Open file's check here (GFS_STAT).
+static void fileasklocal(Gui *g, FsJob *job, b32 back, Str err)
+{
+    Stat *st = back && !err.len ? (Stat *)job->res : 0;
+    fileaskanswered(g, st ? filestatwhy(st->type) : fswhy(err.len ? err : fsstuck));
+}
+
+// A job of the window's pool finished: on the window's thread, from
+// fsdone as its worker answers (back), else from fstick, fsrunqueue or
+// fsquit (given up, refused, or closing), when the pool keeps what it
+// holds, to drop once its worker is done, and err says why. Calls into
+// the pool from here take the scratch past what the pool still holds.
+static void guifsdone(void *owner, FsJob *job, Arena scratch)
+{
+    Gui *g    = (Gui *)owner;
+    b32  back = !fsabandon(g->fs, job->put.id);
+    Str  err  = back || job->err.len ? job->err : fsstuck;
+    if (g->fsclosing) {
+        if (back && job->put.own) {
+            job->put.drop(g->os, job->put.own);
+        }
+        return;
+    }
+    Arena keep = g->fsmem;
+    g->fsmem = scratch;
+    switch (job->put.kind) {
+    case GFS_FILE:
+        fetchlocal(g, job, back, err);
+        break;
+    case GFS_STAT:
+        if (!g->fask.host && g->fask.statid && g->fask.statid==job->put.id) {
+            fileasklocal(g, job, back, err);
+        } else {
+            filewatchlocal(g, job, back, err);
+        }
+        break;
+    case GFS_LINKS:
+        codelinklocal(g, job, back, err);
+        break;
+    case GFS_LIST:
+        dirlocal(g, job, back, err);
+        break;
+    case GFS_WALK:
+        mentionwalkdone(g, job, back, err);
+        break;
+    }
+    g->fsmem = keep;
 }
 
 static void fileanswer(Gui *g, Str data)
@@ -1883,15 +2593,39 @@ static void fileanswer(Gui *g, Str data)
 }
 
 
-// Files dropped at a point (gui_drop's queue), routed each frame after
-// ImGui's NewFrame, which says what windows were where last frame, and
-// before anything is drawn. With Open file up, the first fills its
-// field, a check in flight for the path it replaces let go, or, too
-// long for the field, says so there; the rest go nowhere. With another
-// modal up, each is attached, as a drop always was; else a file dropped
-// on the Files pane, drawn last frame, opens there, a file on this
-// computer, in the shown root's tabs, and one dropped elsewhere is
-// attached.
+// The facts of the window that decide where a drop at x, y (if at) goes
+// (dropwhere), as the last frame left them: ImGui's NewFrame says what
+// windows were where.
+static DropFacts dropfacts(Gui *g, f32 x, f32 y, b32 at)
+{
+    DropFacts f = {};
+    f.at        = at;
+    f.askshown  = g->fask.p.shown;
+    f.modal     = !f.askshown && ImGui::GetTopMostPopupModal();
+    f.attachwhy = attachwhy(g->sess);
+    f.room      = attachroom(g->sess ? g->sess->att : 0);
+    f.attachmax = ATTACH_MAX;
+    f.tabs      = FILES_TABS;
+    ImGuiWindow *files = ImGui::FindWindowByName(panenames[PANE_FILES]);
+    if (at && !f.modal && files && g->filesdrawn) {
+        ImGuiWindow *w = 0, *under = 0;
+        ImGui::FindHoveredWindowEx(v2(x, y), true, &w, &under);
+        f.overfiles = w && w->RootWindow==files;
+    }
+    return f;
+}
+
+// Files dropped on the window (gui_drop's queue), routed each frame
+// after ImGui's NewFrame and before anything is drawn, a drop at a time:
+// the files of one drop are consecutive, at one point. Where a drop goes
+// is dropwhere's, its facts gathered for it, as a drop before it may
+// have taken the message's room:
+// - Open file's field: the first fills it, a check in flight for the
+//   path it replaces let go, or, too long for the field, says so there;
+//   the rest go nowhere.
+// - the Files pane: each opens in the shown root's tabs.
+// - attached: all of them, or, with no room for them all, none, with
+//   one note that says why.
 static void droproute(Gui *g)
 {
     DropAt *d = g->drophead;
@@ -1899,40 +2633,52 @@ static void droproute(Gui *g)
         return;
     }
     g->drophead = g->droptail = 0;
-    ImGuiWindow *files = ImGui::FindWindowByName(panenames[PANE_FILES]);
-    b32          ask   = g->fask.p.shown;
-    b32          modal = !ask && ImGui::GetTopMostPopupModal();
-    for (; d; d = d->next) {
-        if (ask) {
-            ask = 0;  // the first only, and the rest nowhere
-            if (d->path.len >= FIELD_MAX) {
-                // Never cut, which would name another file
-                g->fask.p.err = "Its path is too long";
-                guilog(g, concat(&g->frame, "dropped on Open file, too long: ", d->path));
-                continue;
+    while (d) {
+        DropAt *end = d->next;
+        i32     n   = 1;
+        for (; end && end->x==d->x && end->y==d->y && end->at==d->at; end = end->next) {
+            n++;
+        }
+        DropFacts f = dropfacts(g, d->x, d->y, d->at);
+        DropWhere w = dropwhere(&g->frame, f, {DRAGLOAD_FILES, n, 0});
+        for (b32 first = 1; d != end; d = d->next, first = 0) {
+            switch (w.to) {
+            case DROPTO_FIELD:
+                if (!first) {
+                    guilog(g, concat(&g->frame, "dropped on Open file, which takes one: ", d->path));
+                } else if (d->path.len >= FIELD_MAX) {
+                    // Never cut, which would name another file
+                    g->fask.p.err = "Its path is too long";
+                    guilog(g, concat(&g->frame, "dropped on Open file, too long: ", d->path));
+                } else {
+                    fieldput(g->fask.p.buf, d->path);
+                    g->fask.p.err   = {};
+                    g->fask.statid  = 0;  // a check in flight is of the path replaced,
+                    g->fask.close   = 0;  // its answer to open nothing, as on Cancel
+                    g->fask.dropped = 1;
+                }
+                break;
+            case DROPTO_FILES: {
+                // From g->frame itself, past what filesopen's copies of it take
+                Str path = d->path;
+                path = pathroot(path, HOST_WINDOWS) ? normpath(&g->frame, {}, path, HOST_WINDOWS)
+                                                    : path;
+                filesopen(g, g->sess, 0, path, 0, 0, {});
+            } break;
+            case DROPTO_ATTACH:
+                if (!w.refuse) {
+                    dropattach(g, d->path);
+                } else if (first) {
+                    Str note = concat(&g->frame, "not attached: ", w.detail);
+                    if (g->sess) {
+                        setnote(g, g->sess, note, 1);
+                    } else {
+                        guilog(g, note);
+                    }
+                    scheddirty(&g->sched);
+                }
+                break;
             }
-            fieldput(g->fask.p.buf, d->path);
-            g->fask.p.err   = {};
-            g->fask.statid  = 0;  // a check in flight is of the path replaced,
-            g->fask.close   = 0;  // its answer to open nothing, as on Cancel
-            g->fask.dropped = 1;
-            continue;
-        } else if (g->fask.p.shown) {
-            guilog(g, concat(&g->frame, "dropped on Open file, which takes one: ", d->path));
-            continue;
-        }
-        ImGuiWindow *w = 0, *under = 0;
-        if (!modal && files && g->filesdrawn) {
-            ImGui::FindHoveredWindowEx(v2(d->x, d->y), true, &w, &under);
-        }
-        if (w && w->RootWindow==files) {
-            // From g->frame itself, past what filesopen's copies of it take
-            Str path = d->path;
-            path = pathroot(path, HOST_WINDOWS) ? normpath(&g->frame, {}, path, HOST_WINDOWS)
-                                                : path;
-            filesopen(g, g->sess, 0, path, 0, 0, {});
-        } else {
-            dropattach(g, d->path);
         }
     }
     os_release(g->os, g->dropr);
@@ -2049,10 +2795,11 @@ static FileBar filetabs(Gui *g, GuiSession *root)
             }
             i32      col  = 0;
             i32      line = filetabline(ft, &col);
-            EditJump j    = filejump(g, &a, ft->host, ft->path, line, col);
-            Str      tip  = j.why.len ? Str{} : filejumptip(&a, &j);
-            if (menutip(g, &a, "Open in editor", j.why, tip)) {
-                filejumprun(g, a, ft->host, ft->path, line, col);
+            FileEdit e    = fileedit(g, &a, root, ft->host, ft->path, line, col);
+            Str      ewhy = e.how==FE_WHY ? e.why : Str{};
+            Str      tip  = ewhy.len ? Str{} : fileedittip(&a, &e);
+            if (menutip(g, &a, "Open in editor", ewhy, tip)) {
+                fileeditrun(g, a, root, ft->host, ft->path, line, col);
             }
             ImGui::EndPopup();
         }
@@ -2107,8 +2854,11 @@ static FileBar filetabs(Gui *g, GuiSession *root)
             }
         }
         scheddirty(&g->sched);
+        filesdirty(g);
     }
-    filesetorder(set, order, norder);
+    if (filesetorder(set, order, norder)) {
+        filesdirty(g);  // dragged into another order
+    }
     ImGui::EndTabBar();
     return r;
 }
@@ -2192,14 +2942,17 @@ static void filemdgo(Gui *g, FileBody *b, i32 line, f32 dy)
     for (i32 n = 0; n<line && off<b->body.len; off++) {
         n += b->body[off] == '\n';
     }
+    i32 end = off;
+    for (; end<b->body.len && b->body[end]!='\n'; end++) {}
     FontMetrics fm    = fontmetrics(&g->fonts, 0);
     f32         charw = fontadvance(&g->fonts, 0, 'n');
     if (width != v->lastw) {
         v->topsdirty = 1;
         v->lastw     = width;
     }
-    msglayout(v, 0, &g->measure, width, sc);
+    MsgLayout *ml = msglayout(v, 0, &g->measure, width, sc);
     viewtops(v, width, charw, fm.lineh);
+    off = msgrowfrom(msgdoc(v, 0), ml, off, end);  // as filemdtop reads it back
     Anchor an = {0, off, dy};
     d->scrollto = anchory(v, an, &g->measure, width, sc, pad);
 }
@@ -2330,6 +3083,7 @@ static void filegoto(Gui *g, FileTab *ft, FrefLines l)
     ft->jump   = l.line0;
     ft->jumped = 0;
     scheddirty(&g->sched);
+    filesdirty(g);
 }
 
 // Open in editor goes where the current hit begins, its line and column.
@@ -2730,10 +3484,8 @@ static void drawfiles(Gui *g)
             ft->state       = FTAB_UNREAD;
         }
     }
-    if (ft->state==FTAB_UNREAD && ft->host) {
+    if (ft->state == FTAB_UNREAD) {
         filefetch(g, ft, 0);
-    } else if (ft->state == FTAB_UNREAD) {
-        fileload(g, ft);
     } else {
         filewatch(g, ft);  // changed, maybe, since it was read
     }
@@ -2752,6 +3504,7 @@ static void drawfiles(Gui *g)
             // The line at the top stays there, at its top
             ft->mode = on ? FMODE_MARKDOWN : FMODE_TEXT;
             ft->dy   = 0;
+            filesdirty(g);
         }
         ImGui::EndDisabled();
         itemnamed(g, "file markdown");
@@ -2761,6 +3514,7 @@ static void drawfiles(Gui *g)
     if (b && b->kind==FBODY_TEXT && ft->mode==FMODE_TEXT) {
         if (checkbox("Wrap", &ft->wrap)) {
             g->filewrap = ft->wrap;  // new tabs take it
+            filesdirty(g);
         }
         itemnamed(g, "file wrap");
         itemtip("Wrap long lines at the pane's width");
@@ -2791,19 +3545,26 @@ static void drawfiles(Gui *g)
         whytip(rwhy.len ? rwhy : filerevealtip());
         ImGui::SameLine();
 
-        i32      col  = 0;
-        i32      line = filetabline(ft, &col);
-        EditJump j    = filejump(g, &a, ft->host, ft->path, line, col);
-        ImGui::BeginDisabled(j.why.len > 0);
+        i32         col  = 0;
+        i32         line = filetabline(ft, &col);
+        GuiSession *root = filesroot(g);
+        FileEdit    e    = fileedit(g, &a, root, ft->host, ft->path, line, col);
+        Str         ewhy = e.how==FE_WHY ? e.why : Str{};
+        ImGui::BeginDisabled(ewhy.len > 0);
         if (ImGui::Button("Open in editor")) {
-            filejumprun(g, a, ft->host, ft->path, line, col);
+            fileeditrun(g, a, root, ft->host, ft->path, line, col);
         }
         ImGui::EndDisabled();
         itemnamed(g, "file editor");
-        whytip(j.why.len ? j.why : filejumptip(&a, &j));
-        iz n = j.why.len<(iz)sizeof(g->fjumpwhy) ? j.why.len : (iz)sizeof(g->fjumpwhy);
-        copybytes(g->fjumpwhy, j.why.data, n);
+        Str tip = ewhy.len ? ewhy : fileedittip(&a, &e);
+        whytip(tip);
+        iz n = ewhy.len<(iz)sizeof(g->fjumpwhy) ? ewhy.len : (iz)sizeof(g->fjumpwhy);
+        copybytes(g->fjumpwhy, ewhy.data, n);
         g->fjumpwhylen = (i32)n;
+        iz t = tip.len<(iz)sizeof(g->fedittip) ? tip.len : (iz)sizeof(g->fedittip);
+        copybytes(g->fedittip, tip.data, t);
+        g->fedittiplen = (i32)t;
+        g->fedithow    = e.how;
         ImGui::SameLine();
     }
     {
@@ -2830,9 +3591,14 @@ static void drawfiles(Gui *g)
         g->fshowing = 0;
         return;
     } else if (!b) {
-        // Coming from its host, or waiting for it to connect
-        if (ft->state == FTAB_READING) {
+        // Being read, said once it has taken a moment, else waiting for
+        // its host to connect
+        FileFetch *f  = &g->ffetch;
+        i64        at = f->ft==ft ? f->askedat+FILES_NOTEDELAY : 0;
+        if (ft->state==FTAB_READING && g->sched.now>=at) {
             filenote(g, "Reading...", 0);
+        } else if (ft->state == FTAB_READING) {
+            schedat(&g->sched, at, DUE_APP);
         } else if (farwhy.len) {
             filenote(g, farwhy, 1);
             if (fh && fh->r && !fh->closing && !fh->up) {
@@ -2857,8 +3623,12 @@ static void drawfiles(Gui *g)
         putbyte(&nb, 'x');
         print(&nb, (i64)b->h);
         print(&nb, " pixels");
-        ImgDrawn d = drawimage(g, b->tex, b->w, b->h, &ft->fit, finish(&nb),
-                               "Scale it to fit the pane");
+        b32      fit = ft->fit;
+        ImgDrawn d   = drawimage(g, b->tex, b->w, b->h, &ft->fit, finish(&nb),
+                                 "Scale it to fit the pane");
+        if (ft->fit != fit) {
+            filesdirty(g);
+        }
         g->fimgshown = d.shown;
         g->fimgsize  = d.size;
         g->fimgroom  = d.room;
@@ -2876,6 +3646,7 @@ static void drawfiles(Gui *g)
             filefree(g, ft);
             ft->state = FTAB_UNREAD;
             scheddirty(&g->sched);
+            filesdirty(g);
         }
         itemnamed(g, "file astext");
         g->fshowing = 0;
@@ -2911,6 +3682,13 @@ static void drawfiles(Gui *g)
         g->fshowingserial = ft->serial;
         g->fshowingmode   = ft->mode;
         g->fshowingbody   = b;
+        if (ft->ems) {
+            // Restored from the layout file, its place in ems, now that
+            // the font's size is final
+            ft->dy      *= g->fonts.size;
+            ft->scrollx *= g->fonts.size;
+            ft->ems      = 0;
+        }
         dl->restore = 1;
         dl->top     = ft->top;
         dl->dy      = ft->dy;
