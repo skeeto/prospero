@@ -1597,6 +1597,8 @@ class Far:
         self.host = host
         self.local = not args.ssh
         self.windows = isinstance(host, Remote)
+        # Far runs on Windows: driven over --host, or this machine itself
+        self.winfar = self.windows or os.name == "nt"
         self.server = None
         if self.local:
             self.root = host.path("far")
@@ -1623,12 +1625,18 @@ class Far:
             host.write(self.work + "/stallslow.txt", "slow\n")
             host.write(self.work + "/stalldead.txt", "dead\n")
             host.mkdir(self.work + "/nested")  # for the directory's completion
-            if self.windows:
+            if self.winfar:
+                # No scp stand-in: the steps that need one are skipped
                 fakehome = host.path("fakehome")
                 self.ssh = fakehome + "/fakessh.exe"
+                self.scp = None
                 host.mkdir(fakehome)
                 host.write(host.path("fakessh.c"), FAKESSH_C)
-                host.h.sh(f"cd {host.root} && gcc -O2 -o {self.ssh} fakessh.c -lshell32")
+                if self.windows:
+                    host.h.sh(f"cd {host.root} && gcc -O2 -o {self.ssh} fakessh.c -lshell32")
+                else:
+                    subprocess.run(["gcc", "-O2", "-o", self.ssh, host.path("fakessh.c"),
+                                    "-lshell32"], check=True)
             else:
                 # Its home directory, not this user's: deploying there
                 # writes .prospero
@@ -1718,7 +1726,7 @@ class Far:
                 + (f"\n# The same host, through the stand-in for wsl.exe\n"
                    f"[remote rw]\nwsl = Far\npath = {self.prospero}\n"
                    f"state = {self.state}\nconfig = {self.config}\n"
-                   if self.local and not self.windows else ""))
+                   if self.local and not self.winfar else ""))
 
     def hostsection(self):
         """--mode hosttask's: the remote far, this machine through the
@@ -1730,8 +1738,11 @@ class Far:
         if not self.local:
             return {}
         elif self.args.mode in ("hosttask", "thin", "terminal"):
-            return {"PROSPERO_TEST_SSH": self.ssh, "PROSPERO_TEST_SCP": self.scp}
-        elif self.windows:
+            env = {"PROSPERO_TEST_SSH": self.ssh}
+            if self.scp:
+                env["PROSPERO_TEST_SCP"] = self.scp
+            return env
+        elif self.winfar:
             return dict(FSSTALL, PROSPERO_TEST_SSH=self.ssh, PROSPERO_TEST_FARMG="1")
         # Engines started through the fake ssh leave out a cap, as an
         # older one would; this one's host, started here, does not. Its
