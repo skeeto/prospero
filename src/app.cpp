@@ -20861,6 +20861,12 @@ static DriveOp termops[] = {
     TERMKEY(GKEY_ENTER, 300),  // too soon: ignored
     {OP_CHECK, CHK_TERMBANNER, 0, 0, 1200, "`echo run-start...` exited with code 3"},
     {OP_SHOT, 0, 0, 0, 300, "terminal-run"},
+    // Under the banner the wheel still scrolls its output (a notch may
+    // be lost to XWayland, so only back at all)
+    {OP_MOVE, T_TERMGRID, 0, 0, 100, ""},
+    {OP_WHEEL, 0, 0, 1, 50, ""},
+    {OP_WHEEL, 0, 0, 1, 300, ""},
+    {OP_CHECK, CHK_TERMVIEW, 1, 0, 0, ""},
     TERMKEY(GKEY_ENTER, 300),
     {OP_WAIT, W_TERM, 0, 0, 20000, "run-2"},
     {OP_WAIT, W_TERMBANNER, 0, 0, 10000, ""},

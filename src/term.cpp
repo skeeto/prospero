@@ -1630,13 +1630,18 @@ static void termselect(Gui *g, TermTab *tt, TermMetrics *m, ImVec2 pos, b32 loca
 // when the app asks (mouse modes), unless Shift is held, which keeps it
 // local for selection (I6). The wheel, also when reported, otherwise
 // sends arrows on the alternate screen (mode 1007, on by default), and
-// later scrolls history (L3). Ctrl+wheel stays the app's zoom.
+// later scrolls history (L3). Ctrl+wheel stays the app's zoom. Under
+// an ended tab's banner, nothing goes to the program, gone: the mouse
+// selects and the wheel scrolls history.
 static void termmouse(Gui *g, TermTab *tt, TermMetrics *m, ImVec2 pos, ImGuiID id, b32 hovered)
 {
-    ImGuiIO    &io  = ImGui::GetIO();
-    ariel_Modes mo  = ariel_modes(tt->t);
-    b32         rep = mo.mouse && !io.KeyShift;
-    if (!rep && tt->mheld) {
+    ImGuiIO    &io   = ImGui::GetIO();
+    ariel_Modes mo   = ariel_modes(tt->t);
+    b32         live = tt->state == TT_LIVE;
+    b32         rep  = live && mo.mouse && !io.KeyShift;
+    if (!live) {
+        tt->mheld = 0;
+    } else if (!rep && tt->mheld) {
         // Shift came down mid-drag, or the app stopped asking: the
         // releases still go, so it sees no button stuck
         rep = mo.mouse != 0;
@@ -1706,7 +1711,7 @@ static void termmouse(Gui *g, TermTab *tt, TermMetrics *m, ImVec2 pos, ImGuiID i
             e.button = notches>0 ? 4 : 5;
             ariel_Str s = ariel_mouse(tt->t, &e);
             termsend(g, tt, {s.data, s.len});
-        } else if (mo.altscreen && mo.altscroll) {
+        } else if (live && mo.altscreen && mo.altscroll) {
             ariel_Key k = {};
             k.key = notches>0 ? ARIEL_K_UP : ARIEL_K_DOWN;
             for (i32 i = 0; i < 3; i++) {
@@ -2456,7 +2461,7 @@ static void drawterm(Gui *g)
     }
     termsizetip(g, dl, bb, cols, rows, a);
     g->termverts = dl->VtxBuffer.Size;
-    if (tt->state == TT_LIVE) {
+    if (tt->state==TT_LIVE || tt->state==TT_ENDED) {
         termmouse(g, tt, &m, pos, id, hovered);
     }
 

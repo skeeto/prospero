@@ -3181,11 +3181,11 @@ def sc_gui(model, n, req):
         # transcript, which has none
         if "Platform: Windows" in system_of(req):
             block = ("```powershell\necho run-start\n"
-                     "$n = [int](Get-Content runs -EA 0) + 1; Set-Content runs $n; "
+                     "1..100; $n = [int](Get-Content runs -EA 0) + 1; Set-Content runs $n; "
                      "\"run-$n\"; exit 3\n```")
         else:
             block = ("```sh\necho run-start\n"
-                     "n=$(cat runs 2>/dev/null || echo 0); n=$((n+1)); echo $n >runs; "
+                     "seq 1 100; n=$(cat runs 2>/dev/null || echo 0); n=$((n+1)); echo $n >runs; "
                      "echo run-$n; exit 3\n```")
         yield from answer(model, "Run this:\n\n" + block +
                           "\n\nIt prints:\n\n```console\n$ ls\nruns\n```\n")
