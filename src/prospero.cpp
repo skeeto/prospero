@@ -301,6 +301,14 @@ static b32     os_linkfar(Os *, Arena, Str path);
 // so nothing a link names is touched; a part missing ends the walk (0).
 // For checks nobody asked for (inline code), which take no link at all.
 static b32     os_haslink(Os *, Arena, Str path, iz from);
+// The mount point of the network or FUSE file system (NFS, SMB, sshfs,
+// a mapped drive) that holds an absolute path, else empty: on a local
+// disk, or not known. Told from the mount table alone (Linux's
+// mountinfo, macOS's getfsstat without waiting, Windows' DOS device
+// names), never by touching the share, so it answers while the share
+// hangs. autofs is passed over for the mount beneath it. Windows
+// answers "X:/" or "//host/share/".
+static Str     os_farmount(Os *, Arena *, Str path);
 
 // This user's ids as UID:GID on Linux, for a container whose root would
 // be root here (ctruser); null elsewhere.

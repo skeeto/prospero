@@ -179,6 +179,10 @@ mount there that stops answering does not stop the rest: after ten
 to twenty seconds Open file says "The file system is not responding", other
 files there still open, and that file, or anything under it, is
 refused at once until the share answers again; then open it again.
+When it is on a network share or mount (NFS, SMB, sshfs, a mapped
+drive), the rest of that share is refused at once too, with the same
+words, until the stuck read comes back; a folder on that host's own
+disks is never refused whole.
 
 Open in editor on such a file opens a Terminal tab of its session
 there, where that host's engine runs the editor on it, at the line in

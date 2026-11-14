@@ -4248,6 +4248,19 @@ static i32 w32drive(Str path)
     return DRIVEAT_OTHER;  // a subst onto a subst: followed once only
 }
 
+// A drive w32drive calls far is the mount, whole ("Z:/", a subst onto
+// one too), as is a UNC path's share ("//host/share/"); WSL's own
+// shares and the device namespace are not.
+static Str os_farmount(Os *, Arena *a, Str path)
+{
+    if (!pathroot(path, 1)) {
+        return {};
+    }
+    Str norm = normpath(a, path, ".", 1);
+    Str root = fswinroot(norm);
+    return root.len && w32drive(norm)==DRIVEAT_FAR ? root : Str{};
+}
+
 
 #if PROSPERO_GUI
 #  include "app.cpp"

@@ -42,10 +42,21 @@
 // link's path alone, since the real path is not yet known; other paths
 // into the same dead target are neither held nor refused.
 //
+// Far mounts. A dead share fails every path on it, not just the one
+// that hung, so a share is held and marked whole: when a worker first
+// goes silent past FS_SLOW, the owner asks os_farmount, once, which
+// network or FUSE mount its given path and its `at` are on (the mount
+// table alone, never the share), and jobs under either mount are held
+// with its paths; when it is stuck, each mount becomes a mark beside
+// its paths, by the same worker, so both kinds clear when the stuck
+// call returns. Local volumes are never marked whole: a slow disk, a
+// privacy prompt or a cloud file being fetched marks its own path.
+//
 // Paths are compared as normpath gives them, '/' throughout; a worker's
 // own spelling (Win32's '\\' real paths) is compared with either
 // separator, and without case on Windows. A listing's paths are exact:
-// it holds and marks its folder alone, not what lies below.
+// it holds and marks its folder alone, not what lies below, nor its
+// mount.
 //
 // Locks. Dispatch decides under the pool's lock, then lets go of it to
 // run an inline job and to call finish and drop, which may call fsput
@@ -162,8 +173,11 @@ struct FsWorker {
     u32     stalled;   // the stall hooks applied in this job
     Str     given;     // the path given that it is on
     Str     at;        // where it is
+    Str     mounts[2]; // the far mounts of given and at, looked up as it
+                       // began holding (normalized, perhaps empty)
     u8      givenbuf[FS_MARKMAX];
     u8      atbuf[FS_MARKMAX];
+    u8      mountbuf[2][FS_MARKMAX];
 };
 
 struct FsMark {
@@ -296,6 +310,107 @@ static b32 fsunder(Str mark, b32 exact, Str path, b32 win)
     return m==n || mark[n-1]=='/' || issep(path[n], win);
 }
 
+// Whether a file system type, as Linux's mountinfo or macOS's getfsstat
+// names it, reaches another computer or a user's process: a network
+// file system, or FUSE (sshfs and the like, "fuse.sshfs"), whose server
+// can stop answering. Not fuseblk (a local disk through FUSE, as NTFS),
+// nor autofs, whose mount point is a trigger above many shares: the
+// share mounted beneath it is the one that counts.
+static b32 fsfartype(Str type)
+{
+    static Str const far[] = {
+        "nfs", "nfs4", "cifs", "smb3", "smbfs", "ncpfs", "9p", "afs", "ceph",
+        "glusterfs", "lustre", "davfs", "vboxsf", "prl_fs", "afpfs", "webdav",
+        "fuse",
+    };
+    for (iz i = 0; i < countof(far); i++) {
+        if (type == far[i]) {
+            return 1;
+        }
+    }
+    return startswith(type, "fuse.") || startswith(type, "macfuse") ||
+           startswith(type, "osxfuse");
+}
+
+// A mountinfo field with its \ooo octal escapes (space, tab, newline
+// and backslash) decoded, a copy only when it has one.
+static Str fsunoctal(Arena *a, Str s)
+{
+    if (find(s, "\\") < 0) {
+        return s;
+    }
+    Buf b(a, s.len);
+    for (iz i = 0; i < s.len; i++) {
+        u8 c = s[i];
+        if (c=='\\' && i+3<s.len && s[i+1]>='0' && s[i+1]<='3' &&
+                s[i+2]>='0' && s[i+2]<='7' && s[i+3]>='0' && s[i+3]<='7') {
+            c  = (u8)((s[i+1]-'0')<<6 | (s[i+2]-'0')<<3 | (s[i+3]-'0'));
+            i += 3;
+        }
+        putbyte(&b, c);
+    }
+    return finish(&b);
+}
+
+// The far mount that holds an absolute path, by Linux's
+// /proc/self/mountinfo: the longest mount point that is the path or
+// lies above it at a separator, autofs passed over (later mounts win a
+// tie, being on top), returned when its type is far (fsfartype), else
+// empty, as for a path on a local disk below a share. In each line the
+// fifth field is the mount point and the field after " - " the type;
+// a line cut short or malformed, or without its newline (a table cut
+// off at its end), is passed over.
+static Str fsmountinfo(Arena *a, Str text, Str path)
+{
+    Str best    = {};
+    b32 bestfar = 0;
+    for (Str rest = text; rest.len;) {
+        Cut line = cut(rest, '\n');
+        rest = line.tail;
+        if (!line.ok) {
+            break;
+        }
+        Str fields[5] = {};
+        Str tail      = line.head;
+        i32 n         = 0;
+        for (; n<5 && tail.len; n++) {
+            Cut f = cut(tail, ' ');
+            fields[n] = f.head;
+            tail      = f.tail;
+        }
+        iz dash = find(tail, " - ");
+        if (n<5 || !fields[4].len || dash<0) {
+            continue;
+        }
+        Str type = cut(cuthead(tail, dash+3), ' ').head;
+        if (!type.len || type=="autofs") {
+            continue;
+        }
+        Str point = fsunoctal(a, fields[4]);
+        if (point.len>=best.len && fsunder(point, 0, path, 0)) {
+            best    = point;
+            bestfar = fsfartype(type);
+        }
+    }
+    return bestfar ? best : Str{};
+}
+
+// Where a normalized Windows path's drive or share would be mapped:
+// "C:/" of "C:/x", "//h/s/" of "//h/s/x", else empty (the device
+// namespace, "//?/" and "//./", and anything relative).
+static Str fswinroot(Str norm)
+{
+    iz n = pathroot(norm, 1);
+    if (n==3 && isdrive(norm)) {
+        return takehead(norm, 3);
+    } else if (n<6 || norm[n-1]!='/' || norm[2]=='?' || norm[2]=='.') {
+        return {};
+    }
+    iz j = 2;
+    for (; j<n && norm[j]!='/'; j++) {}
+    return j>2 && j+2<n ? takehead(norm, n) : Str{};
+}
+
 static b32 fsmarked(FsPool *p, Str path)
 {
     for (i32 i = 0; i < FS_MARKS; i++) {
@@ -327,7 +442,7 @@ static b32 fsbusyon(FsWorker *w)
 }
 
 // Held: it has paths, and every one lies under the given path or `at`
-// of a worker silent past slow.
+// of a worker silent past slow, or under their far mounts.
 static b32 fsheldback(FsPool *p, FsPut *put)
 {
     for (iz i = 0; i < put->paths.len; i++) {
@@ -336,8 +451,11 @@ static b32 fsheldback(FsPool *p, FsPut *put)
             FsWorker *w = &p->workers[k];
             if (fsbusyon(w) && w->holding) {
                 b32 exact = w->job->put.exact;
-                held = fsunder(w->given, exact, put->paths[i], p->win) ||
-                       fsunder(w->at, exact, put->paths[i], p->win);
+                Str path  = put->paths[i];
+                held = fsunder(w->given, exact, path, p->win) ||
+                       fsunder(w->at, exact, path, p->win) ||
+                       fsunder(w->mounts[0], 0, path, p->win) ||
+                       fsunder(w->mounts[1], 0, path, p->win);
             }
         }
         if (!held) {
@@ -454,6 +572,7 @@ static void fshandover(FsPool *p, FsJob *j, FsWorker *w)
     w->stalled = 0;
     w->given   = {};
     w->at      = {};
+    w->mounts[0] = w->mounts[1] = {};
 }
 
 // Run a worker's job, on its thread or inline, then store its answer;
@@ -760,16 +879,56 @@ static void fsfinishall(FsPool *p, FsJob **slots, FsJob *copies, i32 n, Arena sc
     }
 }
 
-// Time passes, now in ticks: workers silent past slow hold their paths,
-// and past stuck are declared stuck, once, their jobs and those held
-// behind them finished, their paths marked; queued jobs past stuck
-// expire as busy.
+// The far mount a worker's path is on (os_farmount), normalized: empty
+// for none, and for a path that is not absolute.
+static Str fsfarmount(FsPool *p, Arena *scratch, Str path)
+{
+    if (!path.len || !pathroot(path, p->win)) {
+        return {};
+    }
+    Str m = os_farmount(p->os, scratch, path);
+    return m.len && pathroot(m, p->win) ? normpath(scratch, m, ".", p->win) : Str{};
+}
+
+// Time passes, now in ticks: workers silent past slow hold their paths
+// and their far mounts, looked up as they begin to, and past stuck are
+// declared stuck, once, their jobs and those held behind them finished,
+// their paths and mounts marked; queued jobs past stuck expire as busy.
 static void fstick(FsPool *p, Arena scratch, i64 now)
 {
     FsJob *ends[FS_JOBS];
     FsJob *copies = alloc<FsJob>(&scratch, FS_JOBS);
     i32    n      = 0;
+
+    // Workers going silent past slow: their mounts, looked up with the
+    // lock let go, as the system's mount table is read. Only the owner
+    // starts or ends a job, so each is still on the job it was.
+    FsWorker *look[FS_THREADS];
+    Str       paths[2*FS_THREADS];
+    Str       mounts[2*FS_THREADS];
+    i32       nlook = 0;
     os_lock(&p->lock);
+    for (i32 i = 0; i < FS_THREADS; i++) {
+        FsWorker *w = &p->workers[i];
+        if (fsbusyon(w) && !w->holding && !w->job->put.exact && now-w->beat>=p->slow) {
+            paths[2*nlook]   = clone(&scratch, w->given);
+            paths[2*nlook+1] = clone(&scratch, w->at);
+            look[nlook++]    = w;
+        }
+    }
+    os_unlock(&p->lock);
+    for (i32 i = 0; i < 2*nlook; i++) {
+        b32 same  = i%2 && paths[i]==paths[i-1];
+        mounts[i] = same ? mounts[i-1] : fsfarmount(p, &scratch, paths[i]);
+    }
+
+    os_lock(&p->lock);
+    for (i32 i = 0; i < nlook; i++) {
+        FsWorker *w = look[i];
+        for (i32 k = 0; k < 2; k++) {
+            w->mounts[k] = fskeep(w->mountbuf[k], mounts[2*i+k], p->win);
+        }
+    }
     for (i32 i = 0; i < FS_THREADS; i++) {
         FsWorker *w = &p->workers[i];
         if (!fsbusyon(w)) {
@@ -783,6 +942,8 @@ static void fstick(FsPool *p, Arena scratch, i64 now)
             __atomic_store_n(&j->gone, 1, __ATOMIC_RELEASE);
             fsmark(p, scratch, w->given, j->put.exact, w->index);
             fsmark(p, scratch, w->at, j->put.exact, w->index);
+            fsmark(p, scratch, w->mounts[0], 0, w->index);
+            fsmark(p, scratch, w->mounts[1], 0, w->index);
             if (!j->abandoned) {  // else nobody waits: dropped at its end
                 j->finishing = 2;
                 copies[n] = fscopy(j, fsstuck);

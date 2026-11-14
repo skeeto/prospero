@@ -52,6 +52,7 @@ struct Os {
     u64        rng;
     i32        syncs;     // os_logsync calls
     i32        realpaths; // os_realpath calls
+    Slice<Str> farmounts; // os_farmount's mounts, the longest holding a path
     i32        writes;    // os_logwrite calls left while failwrites is set
     b32        failwrites;
     b32        failtrunc;
@@ -446,6 +447,16 @@ static Str os_hostids(Os *, Arena *a) { return clone(a, Str("1000:1000")); }
 
 static b32 os_linkfar(Os *, Arena, Str) { return 0; }
 static b32 os_haslink(Os *, Arena, Str, iz) { return 0; }
+
+static Str os_farmount(Os *os, Arena *, Str path)
+{
+    Str r = {};
+    for (iz i = 0; i < os->farmounts.len; i++) {
+        Str m = os->farmounts[i];
+        r = m.len>r.len && fsunder(m, 0, path, 0) ? m : r;
+    }
+    return r;
+}
 
 static Str os_realpath(Os *os, Arena *a, Str path)
 {

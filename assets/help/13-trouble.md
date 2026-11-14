@@ -67,6 +67,8 @@ full path if need be. See [Configuration](help:config).
 try again".** A file, folder or completion on another host's share or
 mount took over ten seconds without an answer, so the engine gave up
 on it; paths under it are refused at once until it answers again.
+When it is on a network share or mount, the whole share is refused
+that way, so other files there fail at once instead of each waiting.
 Busy means the engine's file readers were all occupied, usually
 waiting on such a path, so the request was not started in time. Check the share or network drive there, then try again. A reader
 stuck that way can also make that engine slow to exit.

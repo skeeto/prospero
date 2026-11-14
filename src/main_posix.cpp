@@ -41,6 +41,8 @@
 #  include <dlfcn.h>       // dlsym, for the responsibility functions
 #  include <libproc.h>     // proc_listpids, proc_pidinfo
 #  include <sys/event.h>   // EVFILT_PROC
+#  include <sys/param.h>   // MAXPATHLEN, for sys/mount.h
+#  include <sys/mount.h>   // getfsstat, MNT_LOCAL
 #  include <sys/sysctl.h>  // KERN_PROC_UID
 #endif
 #ifdef __linux__
@@ -1042,6 +1044,64 @@ static Str os_hostids(Os *, Arena *a)
 }
 
 static b32 os_linkfar(Os *, Arena, Str) { return 0; }
+
+#if defined(__linux__)
+// /proc/self/mountinfo reports a size of 0, so it is read to its end,
+// at most FARMOUNT_MAX bytes: a longer table is parsed as far as it
+// goes, its last line cut off and passed over.
+static Str os_farmount(Os *, Arena *a, Str path)
+{
+    enum : iz { FARMOUNT_MAX = 1 << 20 };
+    if (hasnul(path)) {
+        return {};
+    }
+    i32 fd = open("/proc/self/mountinfo", O_RDONLY|O_CLOEXEC);
+    if (fd < 0) {
+        return {};
+    }
+    u8 *buf = allocbytes(a, FARMOUNT_MAX);
+    iz  len = 0;
+    while (len < FARMOUNT_MAX) {
+        iz n = read(fd, buf+len, (uz)(FARMOUNT_MAX-len));
+        if (n<0 && errno==EINTR) continue;
+        if (n <= 0) break;
+        len += n;
+    }
+    close(fd);
+    return fsmountinfo(a, {buf, len}, path);
+}
+#elif defined(__APPLE__)
+// The longest mount point at or above the path, autofs passed over (its
+// trigger sits above the share it mounts), is far when it is not local
+// (no MNT_LOCAL: SMB, NFS, AFP, WebDAV, most of macFUSE) or its type
+// says so. MNT_NOWAIT gives the kernel's last-known table without
+// asking each file system, which a dead share would not answer.
+static Str os_farmount(Os *, Arena *a, Str path)
+{
+    i32 count = getfsstat(0, 0, MNT_NOWAIT);
+    if (count <= 0) {
+        return {};
+    }
+    count += 8;  // room for mounts made meanwhile
+    struct statfs *fs = alloc<struct statfs>(a, count);
+    count = getfsstat(fs, (i32)(count*(iz)sizeof(*fs)), MNT_NOWAIT);
+    Str best    = {};
+    b32 bestfar = 0;
+    for (i32 i = 0; i < count; i++) {
+        char *on    = fs[i].f_mntonname;
+        char *ty    = fs[i].f_fstypename;
+        Str   point = {(u8 *)on, (iz)strnlen(on, sizeof(fs[i].f_mntonname))};
+        Str   type  = {(u8 *)ty, (iz)strnlen(ty, sizeof(fs[i].f_fstypename))};
+        if (!(type=="autofs") && point.len>=best.len && fsunder(point, 0, path, 0)) {
+            best    = point;
+            bestfar = !(fs[i].f_flags & MNT_LOCAL) || fsfartype(type);
+        }
+    }
+    return bestfar ? clone(a, best) : Str{};
+}
+#else
+static Str os_farmount(Os *, Arena *, Str) { return {}; }
+#endif
 
 static b32 os_haslink(Os *, Arena scratch, Str path, iz from)
 {

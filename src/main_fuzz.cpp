@@ -245,6 +245,7 @@ static Slice<Str> os_launchenv(Os *, Arena *) { return {}; }
 static iz    os_stdin(Os *, u8 *, iz) { return 0; }
 static Str   os_realpath(Os *, Arena *, Str) { return {}; }
 static b32   os_haslink(Os *, Arena, Str, iz) { return 0; }
+static Str   os_farmount(Os *, Arena *, Str) { return {}; }
 static Str   os_hostids(Os *, Arena *) { return {}; }
 static Proc *os_spawn(Os *, Spawn *, Arena) { return 0; }
 static Proc *os_spawnio(Os *, Spawn *, Arena) { return 0; }

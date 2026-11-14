@@ -497,6 +497,131 @@ static void testfsstallparse(Test *t, Arena a)
     expect(t, "fs stuck ms, in range", istr(&a, fsstuckparse("2000")), istr(&a, 2000*FS_MS));
 }
 
+// What counts as far, by type, and where a path's mount is, by Linux's
+// mountinfo lines.
+static void testfsmountinfo(Test *t, Arena a)
+{
+    Buf far(&a, 256);
+    Str types[] = {
+        "nfs", "nfs4", "cifs", "smb3", "smbfs", "9p", "fuse", "fuse.sshfs",
+        "macfuse", "osxfuse", "afpfs", "webdav", "fuseblk", "fusectl", "ext4",
+        "tmpfs", "overlay", "autofs", "apfs", "",
+    };
+    for (iz i = 0; i < countof(types); i++) {
+        print(&far, fsfartype(types[i]) ? Str("1") : Str("0"));
+    }
+    expect(t, "fs far types", finish(&far), "11111111111100000000");
+
+    Str table =
+        "22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n"
+        "30 22 0:26 / /tmp rw shared:5 - tmpfs tmpfs rw\n"
+        "40 22 0:40 / /mnt/a rw,relatime shared:9 - nfs4 srv:/a rw,vers=4.2\n"
+        "41 22 0:41 / /mnt/ab rw - ext4 /dev/sdb1 rw\n"
+        "42 22 0:42 / /mnt/my\\040share rw - cifs //srv/s rw\n"
+        "50 22 0:50 / /net rw shared:20 - autofs /etc/auto.net rw\n"
+        "51 50 0:51 / /net/host rw - fuse.sshfs u@host: rw\n"
+        "52 22 0:52 / /media/ntfs rw - fuseblk /dev/sdc1 rw\n"
+        "60 40 8:2 / /mnt/a/local rw - ext4 /dev/sdd1 rw\n"
+        "61 22 0:61 / /mnt/stacked rw - nfs srv:/s rw\n"
+        "62 22 0:62 / /mnt/stacked rw - tmpfs tmpfs rw\n"
+        "63 22 0:63 / /mnt/broken rw nfs srv:/b rw\n"
+        "64 22 0:64 /\n"
+        "65 22 0:65 / /mnt/cut rw - nfs srv:/c rw";
+    Buf got(&a, 512);
+    Str paths[] = {
+        "/mnt/a", "/mnt/a/x/y", "/mnt/ab/x", "/mnt/abc", "/mnt/my share/f",
+        "/net/host/f", "/net/other/f", "/media/ntfs/f", "/mnt/a/local/f",
+        "/mnt/stacked/f", "/mnt/broken/f", "/mnt/cut/f", "/tmp/x", "/home",
+    };
+    for (iz i = 0; i < countof(paths); i++) {
+        print(&got, fsmountinfo(&a, table, paths[i]));
+        putbyte(&got, '|');
+    }
+    expect(t, "fs mountinfo", finish(&got),
+           "/mnt/a|/mnt/a|||/mnt/my share|/net/host|||||||||");
+    expect(t, "fs mountinfo, empty", fsmountinfo(&a, "", "/x"), "");
+    expect(t, "fs mountinfo, far root",
+           fsmountinfo(&a, "1 0 0:1 / / rw - nfs srv:/ rw\n", "/x/y"), "/");
+
+    // Windows: where a drive or a share would be mounted
+    got = Buf(&a, 256);
+    Str wins[] = {
+        "C:/", "Z:/dir/f", "//host/share/f", "//host/share/", "//?/GLOBALROOT/x",
+        "//./pipe/x", "//host/", "/x",
+    };
+    for (iz i = 0; i < countof(wins); i++) {
+        print(&got, fswinroot(wins[i]));
+        putbyte(&got, '|');
+    }
+    expect(t, "fs windows roots", finish(&got), "C:/|Z:/|//host/share/|//host/share/|||||");
+}
+
+// A job stuck on a far mount: the mount held, then refused whole, while
+// a path elsewhere goes; the stuck call's return clears both marks. A
+// listing on the mount holds and marks only its folder.
+static void testfsfarmount(Test *t, Arena a)
+{
+    Os     *os = newos(&a, 1<<16);
+    os->farmounts = push(&a, os->farmounts, Str("/far"));
+    FsLog   l  = {};
+    FsPool *p  = fstestpool(os, &a, &l);
+    fstestqueue(p, &a, 1, "/far/a/x");
+    i32    k = fsbegin(p);
+    FsCall c = {};
+    c.w   = &p->workers[k];
+    c.job = c.w->job;
+    fsat(&c, "/far/a/x", 1);
+    os->now += FS_SLOW;
+    fstick(p, a, os->now);
+    Buf got(&a, 64);
+    print(&got, fstestqueue(p, &a, 2, "/far/b"));
+    print(&got, fstestqueue(p, &a, 3, "/near/c"));
+    i32 near = fsbegin(p);
+    print(&got, istr(&a, fsbegin(p)));
+    expect(t, "fs mount held", finish(&got), "++-1");
+    expect(t, "fs mount held, elsewhere goes",
+           istr(&a, near>=0 && p->workers[near].job->put.id==3), "1");
+    expect(t, "fs mount looked up", p->workers[k].mounts[0], "/far");
+
+    os->now += FS_STUCK - FS_SLOW;
+    fstick(p, a, os->now);
+    expect(t, "fs mount stuck", fslogged(&l),
+           concat(&a, concat(&a, concat(&a, "1:", fsstuck), concat(&a, ";2:", fsstuck)), ";"));
+    expect(t, "fs mount marked", fstestmarks(p, &a), "/far/a/x|/far|");
+    got = Buf(&a, 64);
+    print(&got, fstestqueue(p, &a, 4, "/far/b"));
+    print(&got, fstestqueue(p, &a, 5, "/far"));
+    print(&got, fstestqueue(p, &a, 6, "/farther"));
+    print(&got, fstestqueue(p, &a, 7, "/near/d"));
+    expect(t, "fs mount refused", finish(&got),
+           concat(&a, concat(&a, "-", fsstuck), concat(&a, concat(&a, "-", fsstuck), "++")));
+
+    fsrun(p, k);
+    fsrun(p, near);
+    fstestdeliver(p, a);
+    expect(t, "fs mount, the stuck call returns", fstestmarks(p, &a), "");
+    expect(t, "fs mount taken again", fstestqueue(p, &a, 8, "/far/b"), "+");
+
+    // A listing: its folder alone
+    FsPool *q = fstestpool(os, &a, &l);
+    fstestqueue(q, &a, 1, "/far/dir", 1);
+    k   = fsbegin(q);
+    c   = {};
+    c.w   = &q->workers[k];
+    c.job = c.w->job;
+    fsat(&c, "/far/dir", 1);
+    os->now += FS_SLOW;
+    fstick(q, a, os->now);
+    got = Buf(&a, 64);
+    print(&got, fstestqueue(q, &a, 2, "/far/other"));
+    print(&got, istr(&a, fsbegin(q)>=0));
+    expect(t, "fs listing, the mount not held", finish(&got), "+1");
+    os->now += FS_STUCK;
+    fstick(q, a, os->now);
+    fslogged(&l);
+    expect(t, "fs listing, its folder marked", fstestmarks(q, &a), "/far/dir=|");
+}
+
 static void test_fswork(Test *t)
 {
     testfsinline(t, t->perm);
@@ -507,4 +632,6 @@ static void test_fswork(Test *t)
     testfsabandon(t, t->perm);
     testfsquit(t, t->perm);
     testfsstallparse(t, t->perm);
+    testfsmountinfo(t, t->perm);
+    testfsfarmount(t, t->perm);
 }
