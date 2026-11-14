@@ -2100,10 +2100,8 @@ static TermBar termtabs(Gui *g, GuiSession *s)
         print(&b, (i64)tt->serial);
         b32 shown = ImGui::BeginTabItem(cstr0(&a, finish(&b)), &open, flags);
         ids[i] = ImGui::GetItemID();
-        if (tt->tid && !ImGui::IsItemActive()) {
-            // The engine's number, by which the agent knows it; not
-            // while held, as a tooltip over a tab being dragged stopped
-            // the reorder on Windows
+        if (tt->tid) {
+            // The engine's number, by which the agent knows it
             Buf lb(&a, TERMTITLECAP + tt->edpath.len + 32);
             termlabel(&lb, tt);
             Str label = finish(&lb);
