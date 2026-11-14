@@ -193,6 +193,149 @@ printf -- '- Revised by hand.\\n' >> "$1"
 """
 
 
+# The remote mode's local, remote-aware editor. Its argv is logged before
+# anything else, one argument a line, as N.argv beside the script. Each
+# invocation appends a saved marker, records it in N.saved, and holds until
+# OP_TOUCH makes the script's own .release file. Valid and nonzero
+# invocations append an exit marker after that release too: seeing it is what
+# proves the editor-exit reread, rather than only a watch while it was held.
+# A cancelled editor has only its saved marker; a stale one writes nothing
+# more after its release. The fake ssh destination "here" is this filesystem,
+# so its URI is decoded to the one remote plan in place, never a local copy.
+REMOTE_EDITOR_NAME = "remote editor.sh"  # a space: argv, never sh -c
+REMOTE_EDITOR_TOUCH = "../far/" + REMOTE_EDITOR_NAME + ".release"
+REMOTE_EDITOR_MODES = ("valid", "cancel", "nonzero", "valid",
+                       "stale", "valid", "stale", "hold", "valid")
+REMOTE_EDITOR_LITERAL = "dollar $HOME; star *"
+REMOTE_EDITOR_ARGV = ("--stage2-remote-editor", "--mode=auto",
+                      "--literal", REMOTE_EDITOR_LITERAL,
+                      "--position", "1:1", "--remote=r")
+REMOTE_EDITOR = r"""#!/bin/sh
+# Stage 2's controlled editor: a real process that waits for its release.
+self=$0
+release=$self.release
+count=$self.count
+rm -f "$release"
+
+n=0
+if [ -f "$count" ]; then
+    IFS= read -r n <"$count"
+fi
+case $n in
+''|*[!0-9]*) exit 73;;
+esac
+n=$((n + 1))
+printf '%s\n' "$n" >"$count.tmp.$$" || exit 73
+mv "$count.tmp.$$" "$count" || exit 73
+
+argv=$self.$n.argv
+: >"$argv.tmp.$$" || exit 73
+for arg; do
+    printf '%s\n' "$arg" >>"$argv.tmp.$$" || exit 73
+done
+mv "$argv.tmp.$$" "$argv" || exit 73
+
+finish()
+{
+    printf '%s\n' "$1" >"$self.$n.exit.tmp.$$"
+    mv "$self.$n.exit.tmp.$$" "$self.$n.exit"
+    exit "$1"
+}
+
+mode=auto
+plan=
+for arg; do
+    case $arg in
+    --mode=*) mode=${arg#--mode=};;
+    ssh://here/*) plan=${arg#ssh://here};;
+    ssh://*) plan=;;
+    /*) plan=$arg;;
+    esac
+done
+if [ "$mode" = auto ]; then
+    case $n in
+    1|4|6|9) mode=valid;;
+    2) mode=cancel;;
+    3) mode=nonzero;;
+    5|7) mode=stale;;
+    8) mode=hold;;
+    *) mode=unexpected;;
+    esac
+fi
+case $mode in
+valid|cancel|nonzero|stale|hold|unexpected) ;;
+*) printf 'bad editor mode: %s\n' "$mode" >&2; finish 64;;
+esac
+case $plan in
+/*) ;;
+*) printf 'no fake-remote plan in argv\n' >&2; finish 65;;
+esac
+if [ ! -f "$plan" ]; then
+    printf 'remote plan is not a file: %s\n' "$plan" >&2
+    finish 66
+fi
+
+revision=$(printf 'REMOTE-EDITOR-%03d-%s-saved' "$n" "$mode")
+printf '\n- %s\n' "$revision" >>"$plan" || finish 66
+{
+    printf 'revision=%s\n' "$revision"
+    printf 'mode=%s\n' "$mode"
+    printf 'plan=%s\n' "$plan"
+} >"$self.$n.saved.tmp.$$" || finish 73
+mv "$self.$n.saved.tmp.$$" "$self.$n.saved" || finish 73
+if [ "$mode" = unexpected ]; then
+    finish 70  # a fallback invocation fails the run without hanging it
+fi
+
+onterm()
+{
+    printf '%s\n' "$revision" >"$self.$n.cancelled.tmp.$$"
+    mv "$self.$n.cancelled.tmp.$$" "$self.$n.cancelled"
+    finish 143
+}
+trap onterm HUP INT TERM
+
+# This is the wait under test, not a property imputed to arbitrary editors.
+while [ ! -f "$release" ]; do
+    sleep 0.05
+done
+trap - HUP INT TERM
+if [ "$mode" = cancel ]; then
+    finish 140  # cleanup if a broken Cancel did not kill this process
+elif [ "$mode" = stale ] || [ "$mode" = hold ]; then
+    finish 0  # in particular, do not touch the replacement plan here
+fi
+
+revision=$(printf 'REMOTE-EDITOR-%03d-%s-exit' "$n" "$mode")
+printf '\n- %s\n' "$revision" >>"$plan" || finish 66
+{
+    printf 'revision=%s\n' "$revision"
+    printf 'mode=%s\n' "$mode"
+    printf 'plan=%s\n' "$plan"
+} >"$self.$n.released.tmp.$$" || finish 73
+mv "$self.$n.released.tmp.$$" "$self.$n.released" || finish 73
+if [ "$mode" = nonzero ]; then
+    printf 'deliberate editor failure after saving %s\n' "$revision" >&2
+    finish 7
+fi
+finish 0
+"""
+
+
+def remoteeditortemplate(path):
+    """REMOTE_EDITOR as parsed argv. Quoting keeps the script path, the
+    literal $HOME and the URI each in one word; no shell expands them."""
+    words = (path, "--stage2-remote-editor", "--mode=auto",
+             "--literal", REMOTE_EDITOR_LITERAL,
+             "--position", "{line}:{col}", "--remote={remote}",
+             "ssh://{ssh}{path}")
+    return " ".join(shword(w) for w in words)
+
+
+def remoterevision(n, mode, stage):
+    return f"REMOTE-EDITOR-{n:03d}-{mode}-{stage}"
+
+
 # The drive mode's editor: Open in editor in Settings adds a model to
 # the configuration file by hand, which the diff of the file allows for
 CONFIG_EDITED = "\n# Added in the editor\n[model edited-by-hand]\ntemperature = 0.3\n"
@@ -1586,6 +1729,124 @@ FSSTALL = {"PROSPERO_TEST_FSSTALL": "stallslow=2500;stalldead=600000",
            "PROSPERO_TEST_FSSTUCK_MS": "5000"}
 
 
+def remoteeditormeta(text):
+    """The small key=value record REMOTE_EDITOR leaves beside its argv."""
+    out = {}
+    for line in (text or "").splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            out[key] = value
+    return out
+
+
+def remoteeditorproblems(far, model):
+    """Independently check what the GUI drove through REMOTE_EDITOR, before
+    far.close removes it. The drive checks the visible UI; these checks prove
+    parsed argv, real waiting and saving, no local plan copy, and exactly which
+    revised bytes the fake agent was asked to carry out."""
+    problems = []
+
+    def fail(msg):
+        problems.append("remote editor: " + msg)
+
+    editor = far.editor
+    if not editor:
+        return problems
+    count = far.host.read(editor + ".count")
+    try:
+        calls = int((count or "").strip())
+    except ValueError:
+        calls = -1
+    if calls != len(REMOTE_EDITOR_MODES):
+        fail(f"invocation count is {count!r}, expected {len(REMOTE_EDITOR_MODES)}")
+    if calls < 0:
+        return problems
+
+    paths = set()
+    markers = {}
+    for n, mode in enumerate(REMOTE_EDITOR_MODES, 1):
+        argv_text = far.host.read(f"{editor}.{n}.argv")
+        argv = argv_text.splitlines() if argv_text is not None else None
+        if argv is None or len(argv) != len(REMOTE_EDITOR_ARGV) + 1 or \
+                argv[:-1] != list(REMOTE_EDITOR_ARGV):
+            fail(f"call {n}: argv is {argv!r}, expected {list(REMOTE_EDITOR_ARGV)} plus its URI")
+            continue
+        uri = argv[-1]
+        if not uri.startswith("ssh://here/") or not uri.endswith("/plan.md"):
+            fail(f"call {n}: last argument is not the fake remote plan URI: {uri!r}")
+            continue
+        plan = uri[len("ssh://here"):]
+        paths.add(plan)
+        try:
+            inside = os.path.commonpath((os.path.realpath(far.root), os.path.realpath(plan))) == \
+                     os.path.realpath(far.root)
+        except ValueError:
+            inside = False
+        if not inside:
+            fail(f"call {n}: plan escaped the fake remote: {plan}")
+
+        saved = remoterevision(n, mode, "saved")
+        want = {"revision": saved, "mode": mode, "plan": plan}
+        got = remoteeditormeta(far.host.read(f"{editor}.{n}.saved"))
+        if got != want:
+            fail(f"call {n}: saved record is {got}, expected {want}")
+        stages = ["saved"]
+        if mode in ("valid", "nonzero"):
+            stages.append("exit")
+            released = dict(want, revision=remoterevision(n, mode, "exit"))
+            got = remoteeditormeta(far.host.read(f"{editor}.{n}.released"))
+            if got != released:
+                fail(f"call {n}: release record is {got}, expected {released}")
+        elif far.host.read(f"{editor}.{n}.released") is not None:
+            fail(f"call {n} ({mode}) unexpectedly wrote again after its release")
+        markers[n] = tuple(remoterevision(n, mode, stage) for stage in stages)
+
+        status = (far.host.read(f"{editor}.{n}.exit") or "").strip()
+        want_status = "7" if mode == "nonzero" else "0"
+        if mode == "cancel":
+            if status not in ("", "143"):
+                fail(f"call 2: Cancel needed release cleanup or returned an unexpected status: {status!r}")
+        elif mode == "stale" and status in ("0", "143"):
+            pass  # the replacement may race its release; either drops the old read
+        elif status != want_status:
+            fail(f"call {n} ({mode}): exit record is {status!r}, expected {want_status!r}")
+        cancelled = far.host.read(f"{editor}.{n}.cancelled")
+        if cancelled is not None and cancelled.strip() != saved:
+            fail(f"call {n}: cancellation record is {cancelled!r}, expected {saved!r}")
+
+    # An approval's tool result is the next request's last message. In
+    # particular it must have the post-release exit marker, not just the saved
+    # one, proving the engine's final reread sent the bytes the editor left.
+    approvals = []
+    for item in fake_provider.STATE.log(model):
+        messages = item["body"].get("messages", [])
+        last = messages[-1] if messages else {}
+        content = str(last.get("content", ""))
+        if last.get("role") != "tool" or "approved your plan" not in content:
+            continue
+        for n, found in markers.items():
+            stages = [stage for stage, marker in zip(("saved", "exit"), found) if marker in content]
+            if stages:
+                approvals.append((n, stages[-1]))
+    if approvals != [(1, "exit"), (9, "exit")]:
+        fail(f"plan approvals seen by the agent are {approvals}, expected [(1, 'exit'), (9, 'exit')]")
+
+    final = [(path, far.host.read(path) or "") for path in sorted(paths)
+             if remoterevision(9, "valid", "exit") in (far.host.read(path) or "")]
+    if len(final) != 1:
+        fail(f"final revision is in {len(final)} remote plans, expected one")
+    else:
+        path, text = final[0]
+        if "# Plan v2" not in text or remoterevision(9, "valid", "saved") not in text:
+            fail(f"final remote plan {path} lacks the replacement plan or its complete edit")
+        if remoterevision(7, "stale", "saved") in text:
+            fail("the delayed stale edit reappeared in the replacement plan")
+    if not problems:
+        print("remote editor: 9 waiting editors, exact argv and in-place remote plans; "
+              "the agent received the post-release revisions on approvals 1 and 9", flush=True)
+    return problems
+
+
 class Far:
     """The remote host of --mode remote: over real ssh (--ssh), with the
     harness built there, or this machine itself through a fake ssh, its
@@ -1598,6 +1859,7 @@ class Far:
         self.local = not args.ssh
         self.windows = isinstance(host, Remote)
         self.server = None
+        self.editor = None  # the local fake-remote's controlled waiting editor
         if self.local:
             self.root = host.path("far")
             self.prospero = host.h.exe if self.windows else host.prospero
@@ -1623,6 +1885,13 @@ class Far:
             host.write(self.work + "/stallslow.txt", "slow\n")
             host.write(self.work + "/stalldead.txt", "dead\n")
             host.mkdir(self.work + "/nested")  # for the directory's completion
+            if args.mode == "remote" and not self.windows and os.name == "posix":
+                # Run directly by the per-remote editor's parsed argv. Its
+                # absolute path (space included) is also $0, so its release,
+                # logs and markers all live beside it in this fake remote.
+                self.editor = self.root + "/" + REMOTE_EDITOR_NAME
+                host.write(self.editor, REMOTE_EDITOR)
+                os.chmod(self.editor, 0o755)
             if self.windows:
                 fakehome = host.path("fakehome")
                 self.ssh = fakehome + "/fakessh.exe"
@@ -1718,7 +1987,10 @@ class Far:
                 + (f"\n# The same host, through the stand-in for wsl.exe\n"
                    f"[remote rw]\nwsl = Far\npath = {self.prospero}\n"
                    f"state = {self.state}\nconfig = {self.config}\n"
-                   if self.local and not self.windows else ""))
+                   if self.local and not self.windows else "")
+                + (f"\n# A local editor that must never be a remote plan's fallback\n"
+                   f"[ui]\neditor = {shword(self.editor)} --mode=unexpected\n"
+                   if self.editor else ""))
 
     def hostsection(self):
         """--mode hosttask's: the remote far, this machine through the
@@ -1736,9 +2008,13 @@ class Far:
         # Engines started through the fake ssh leave out a cap, as an
         # older one would; this one's host, started here, does not. Its
         # login shell has the fake mg as $VISUAL
-        return {"PROSPERO_TEST_SSH": self.ssh, "PROSPERO_TEST_WSL": self.wsl,
-                "PROSPERO_TEST_SCP": self.scp, "PROSPERO_TEST_DROPCAP": "bypass",
-                "PROSPERO_TEST_FARMG": "1"}
+        env = {"PROSPERO_TEST_SSH": self.ssh, "PROSPERO_TEST_WSL": self.wsl,
+               "PROSPERO_TEST_SCP": self.scp, "PROSPERO_TEST_DROPCAP": "bypass",
+               "PROSPERO_TEST_FARMG": "1"}
+        if self.editor:
+            env["PROSPERO_TEST_REMOTE_EDITOR"] = remoteeditortemplate(self.editor)
+            env["PROSPERO_TEST_REMOTE_ROOT"] = self.root
+        return env
 
     def hosts(self):
         """The hosts running for its state directory, as JSONL lines."""
@@ -2360,6 +2636,7 @@ def main():
             problems.append(f"the URL include was fetched {fetched} times, not again")
         else:
             print(f"the URL include was fetched {fetched} times ({total} in both runs)")
+        problems += remoteeditorproblems(far, model)  # before far.close removes its records
         problems += far.close(args.keep)
     if args.mode == "mcp":
         mcpsrv.terminate()

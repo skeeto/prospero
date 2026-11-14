@@ -85,6 +85,11 @@ cannot choose what runs, so these are ignored in one:
   `cmd`;
 - `[ui] editor`, `[ui] editor_line` and `[ui] terminal`.
 
+That ignored-remote rule includes both local command templates: a remote's
+detached `viewer` and its waiting plan `editor`. Set them in this window's
+own configuration file, not in an include; the remote engine's own file
+does not supply them either.
+
 ## Color themes
 
 A `[theme NAME]` section is a color theme of your own, which

@@ -218,42 +218,77 @@ Reconnecting, the editor running on.
 
 ### Viewing remote files in a local editor
 
-A remote-aware editor installed here can open files there when this
-window's `[remote NAME]` has a `viewer` command template:
+The native Terminal-tab editor above, the detached `viewer`, and the
+waiting remote-plan `editor` are different routes. The native route edits
+Files on the remote host; the other two run a remote-aware program on this
+computer. Configure the latter independently in this window's own
+`[remote NAME]` section:
 
 ```ini
 [remote test1]
 ssh = user@host
 viewer = ghostty -e fresh ssh://{ssh}{path}
+editor = ghostty -e nvim scp://{ssh}/{path}
 ```
 
-That opens Ghostty and runs `fresh` with one argument,
-`ssh://user@host/home/user/agent-context/plan.md`, for the example plan path.
-The Plan pane's **View in editor** and Files' **Open in editor** use the
-same detached launcher. There is no `[ui] editor` fallback.
+The viewer example opens Ghostty and runs `fresh` with one argument,
+`ssh://user@host/home/user/agent-context/plan.md`, for the example plan
+path. The Plan pane's **View in editor** and Files' **Open in editor** use
+that same detached launcher. It never waits, holds plan approval, tells
+the agent the plan was edited, or gets a Cancel button or exit-driven
+refresh. The remote Plan pane keeps this separate **View in editor**
+action while a plan waits.
 
-An explicitly configured viewer takes precedence over the native Terminal
-tab. When `viewer` is unset, the native Terminal-tab editor above applies
-instead. A malformed or missing configured viewer is disabled with a reason
-rather than silently falling back.
+A nonempty configured `viewer` takes precedence over the native Files
+route. When Files' `viewer` is unset, the native Terminal-tab editor above
+applies where supported. A malformed configured template or missing
+executable is disabled with a reason rather than silently falling back;
+there is no `[ui] editor` fallback.
 
-The placeholders are `{path}` (the absolute remote file or directory),
-`{ssh}` (the configured destination or ssh alias), `{wsl}` and `{exec}`
-(the connection value where applicable), `{remote}` (the section name),
-and Files' `{line}` and `{col}` (1 for either when none). Values for a
-different connection kind are unavailable and explain the problem. The
-template is split into arguments with `'...'` or `"..."` quoting before
-these values are substituted: replacement never splits an argument, and
-the command runs directly, without a shell. On Windows, use an executable,
-not a `.cmd` or `.bat` file. Terminal editors need an explicit terminal
-wrapper; Neovim's netrw uses
-`ghostty -e nvim scp://{ssh}/{path}`.
+A pending remote plan's **Edit plan** instead requires its own valid
+`editor`. An unset `editor` leaves that action unavailable, even when a
+viewer exists. There is no fallback to `viewer`, `[ui] editor`,
+`[ui] editor_line`, `$VISUAL`, `$EDITOR`, the remote host's editor or native
+`term.edit`; the Files pane does not use `editor`.
 
-A remote viewer never holds plan approval, tells the agent the plan was
-edited, or gets a Cancel button or exit-driven refresh. The approval
-card's **Edit plan** remains local-only. Existing local, mounted-container
-and Windows-WSL editor paths still work as before, and Reveal is unchanged.
-Generated `ctr:` hosts keep their mounted-only behavior.
+Both settings are full command templates with the same placeholders and
+argv rules. The placeholders are `{path}` (the absolute remote file or
+directory), `{ssh}` (the configured destination or ssh alias), `{wsl}` and
+`{exec}` (the connection value where applicable), `{remote}` (the section
+name), and Files viewer's `{line}` and `{col}` (1 for either when none).
+Values for a different connection kind are unavailable and explain the
+problem. The template is split into arguments with `'...'` or `"..."`
+quoting before these values are substituted: replacement never splits an
+argument, and the command runs directly, without a shell. On Windows, use
+an executable, not a `.cmd` or `.bat` file. Terminal editors need an
+explicit terminal wrapper; Neovim's netrw uses the verified form in the
+example, `ghostty -e nvim scp://{ssh}/{path}`.
+
+The waiting `editor` command must not return until editing is finished.
+Prospero does not infer a wait option from its name or add one. A directly
+launched terminal editor remains open until you exit it. A daemon-based
+IDE must use its own documented wait protocol, not an invented flag or a
+launcher that returns after handing off the file. The editor works on the
+remote `{path}` itself: Prospero makes no local plan copy and provides no
+generic upload or writeback.
+
+After **every** editor exit status, including nonzero, and after **Cancel**,
+Prospero explicitly rereads the remote plan. A nonzero exit warns but still
+rereads; Cancel still picks up saved changes. **Approve plan** remains held
+while the process and read run. Only the complete remote result updates the
+card and Plan pane together and releases that hold. Stale replies for
+another session, ask or edit operation are ignored. A spawn failure is
+reported without stranding the edit and can be retried after correction.
+A failed, disconnected or lost read keeps approval held with the reason and
+**Retry reread**: reconnect if needed, then retry. See
+[Plan mode](help:plan#approving).
+
+Like every `[remote]` setting, `viewer` and `editor` from an included
+configuration file are ignored; set them in this window's own file.
+Existing local, mounted-container and Windows-WSL editor paths still work
+as before, and Reveal is unchanged. Generated `ctr:` hosts have no
+persistent viewer or waiting-editor row and keep their mounted-only
+behavior.
 
 ## A remote with no models of its own
 

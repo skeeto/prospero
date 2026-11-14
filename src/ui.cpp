@@ -2187,18 +2187,29 @@ static void drawforce(Gui *g, GuiSession *s, ViewMsg *m)
     ImGui::TextDisabled("overwrites the changes made since");
 }
 
-// Whether the plan of the session is out in the editor, for the ask req
-// (Approve held), or for none, which holds any.
+// Whether the plan of the session is out in the editor or being reread, for
+// the ask req (Approve held), or for none, which holds any.
 static b32 planediting(Gui *g, GuiSession *s, Str req)
 {
-    return g->edsess==s && g->edplan && (!g->edreq.len || g->edreq==req);
+    return g->edsess==s && g->edplan &&
+           (g->edproc || g->edphase==EP_REFRESH || g->edphase==EP_FAILED) &&
+           (!g->edreq.len || g->edreq==req);
 }
 
-// Why a session's plan file cannot go out to the editor, or empty: only
-// a plan on this computer does.
+// Why a session's plan file cannot go out to the waiting editor, or empty.
+// A non-container remote uses only its configured remote-aware editor.
 static Str planeditwhy(Gui *g, GuiSession *s, Str path, Arena *a)
 {
-    if (s->host->kind == GH_REMOTE) {
+    if (s->host->kind==GH_REMOTE && !startswith(s->host->name, "ctr:")) {
+        if (!path.len) {
+            return "No plan file";
+        }
+        if (g->edproc || (g->edplan && g->edphase!=EP_IDLE)) {
+            return "An editor or a plan reread is in progress: finish or retry it first";
+        }
+        EditJump j = remoteeditorfor(g, a, s->host->name, path, 0, 0);
+        return j.why;
+    } else if (s->host->kind == GH_REMOTE) {
         return concat(a, "The plan is on ", concat(a, s->host->name,
                       ": only a plan on this computer opens in the editor"));
     }
@@ -2208,21 +2219,38 @@ static Str planeditwhy(Gui *g, GuiSession *s, Str path, Arena *a)
 static Str planedittip = "Revise the plan file by hand in your editor before you approve "
                          "it: the agent carries out the plan as the file has it then";
 
-// The plan file in the editor (planedit), for the plan's ask req, else
-// none: its button, or while it is out, which editor and a Cancel.
+// The plan file in the editor (planedit), for the plan's ask req, else none:
+// its button, or its editor, reread progress or retry while approval is held.
 static void planeditbutton(Gui *g, GuiSession *s, Str path, Str req, char const *label,
                            Str named, Str tip)
 {
     Arena a = g->frame;
-    if (g->edsess==s && g->edplan) {
+    b32 editing = planediting(g, s, req);
+    if (editing && g->edproc) {
         ImGui::AlignTextToFramePadding();
-        ImGui::TextDisabled("editing in %s...", cstr0(&a, g->edname));
+        if (g->edphase==EP_DISCARD) {
+            ImGui::TextDisabled("the older plan editor is still running...");
+        } else {
+            ImGui::TextDisabled("editing in %s...", cstr0(&a, g->edname));
+        }
         ImGui::SameLine();
         if (ImGui::SmallButton("Cancel##planedit")) {
             editcancel(g);
         }
         itemnamed(g, "cancel plan editor");
         itemtip("Stop the editor: the plan is as it left the file");
+        return;
+    } else if (editing && g->edphase==EP_REFRESH) {
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextDisabled("rereading the edited plan...");
+        itemtip("Waiting for the edited plan before approval is allowed");
+        return;
+    } else if (editing && g->edphase==EP_FAILED) {
+        if (ImGui::Button("Retry reread")) {
+            planretry(g, a, s, req);
+        }
+        itemnamed(g, named);
+        itemtip("Read the edited remote plan again before approving it");
         return;
     }
     Str why = planeditwhy(g, s, path, &a);
@@ -2237,7 +2265,7 @@ static void planeditbutton(Gui *g, GuiSession *s, Str path, Str req, char const 
 
 // A remote plan's detached View in editor. Unlike planeditbutton this has no
 // process or approval state: it starts the local viewer and returns. The
-// pending approval card does not use it; its Edit plan stays as above.
+// pending approval card does not use it; the Plan pane can offer both.
 static void planviewbutton(Gui *g, GuiSession *s, Str path)
 {
     Arena a = g->frame;
@@ -2552,10 +2580,16 @@ static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
     Arena     a = g->frame;
     if (t->kind=="plan" || t->kind=="plan.enter") {
         // Plan mode's asks: the plan to approve, or to plan first. Not
-        // while the plan is out in the editor, nor once it is empty.
+        // while the plan is out or being reread, nor once it is empty.
         b32 enter   = t->kind == "plan.enter";
         b32 editing = !enter && planediting(g, s, t->req);
-        Str nogo    = editing ? Str("The plan is open in the editor: close it first, "
+        Str nogo    = editing && g->edphase==EP_FAILED
+                              ? Str("The edited plan could not be reread: Retry reread "
+                                    "before approving it") :
+                      editing && g->edphase==EP_REFRESH
+                              ? Str("The edited plan is being reread: wait for it before "
+                                    "approving it") :
+                      editing ? Str("The plan is open in the editor: close it first, "
                                     "and the plan as it saved it is the one approved") :
                       !enter && !trim(m->text).len
                               ? Str("The plan file is empty, or too long to show: write "
@@ -2590,7 +2624,7 @@ static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
             return;
         }
 
-        // Edit plan: the plan file in the editor, on this machine
+        // Edit plan: the waiting local or configured remote-aware editor
         ImGui::SameLine();
         planeditbutton(g, s, t->path, t->req, "Edit plan", "edit plan", planedittip);
         return;
@@ -10396,10 +10430,10 @@ static b32 samelineif(f32);
 
 // The session's plan file, as plan mode writes it, fetched as it
 // changes (guiplan), shown as a document (drawdoc): its text selectable,
-// copied as text or as Markdown. A local file opens in the editor, as the
-// waiting plan's Edit plan, else edited by hand with the agent not told. A
-// remote one opens in its configured detached viewer instead. Reveal and
-// the local editor work only on this computer.
+// copied as text or as Markdown. A waiting plan's Edit plan uses the local
+// waiting editor or a remote's configured remote-aware editor. A remote plan
+// also offers its detached viewer here, alone when no approval waits. Reveal
+// and the local editor work only on this computer.
 static void drawplan(Gui *g)
 {
     GuiSession *s = g->sess;
@@ -10432,14 +10466,18 @@ static void drawplan(Gui *g)
         i32       k = planask(v);
         ViewTool *t = k>=0 ? v->msgs[k].tool : 0;
         Str path = t && t->path.len ? t->path : v->planpath;
-        if (s->host->kind==GH_REMOTE && !startswith(s->host->name, "ctr:")) {
-            // Detached even while approval waits. The card's Edit plan remains
-            // the local, waiting editor flow (and stays disabled remotely).
-            // Synthetic ctr: hosts have no persistent viewer configuration.
-            planviewbutton(g, s, path);
-        } else if (t) {
+        b32 remote = s->host->kind==GH_REMOTE && !startswith(s->host->name, "ctr:");
+        if (t) {
             planeditbutton(g, s, path, t->req, "Edit plan", "plan editor", planedittip);
+            if (remote) {
+                // The waiting editor and detached viewer are independent.
+                ImGui::SameLine();
+                planviewbutton(g, s, path);
+            }
+        } else if (remote) {
+            planviewbutton(g, s, path);
         } else {
+            // Generated ctr: hosts and local plans keep their existing paths.
             planeditbutton(g, s, v->planpath, {}, "View in editor", "plan editor",
                            "Open the plan file in your editor: it shows here as the "
                            "editor leaves it, and the agent is not told");

@@ -38,10 +38,36 @@ shows it:
   agent carries out the plan as the file has it then.
 - **Keep planning…** keeps Plan mode on, and sends the agent a note of
   what to change.
-- **Edit plan** opens the plan file in your editor, to revise it by
-  hand first. Approve plan waits until the editor is closed, and the
-  agent is told you revised the plan. This works only for a session on
-  this computer.
+- **Edit plan** opens the plan file in your editor, to revise it by hand
+  first. Approve plan waits until the editor is closed and the plan is
+  read again; the agent is told you revised it when you approve a changed
+  plan.
+
+For a plan on this computer, Edit plan uses `[ui] editor`, else `$VISUAL`
+or `$EDITOR`, as opening a draft does. For a genuinely remote plan it
+instead requires `[remote NAME] editor`, a remote-aware command on this
+computer configured separately from `viewer`. Without it, remote Edit plan
+is unavailable: there is no fallback to `viewer`, `[ui] editor`, `$VISUAL`,
+`$EDITOR`, or the native Terminal-tab editor.
+
+The remote `editor` command itself must wait until editing is finished;
+Prospero does not infer or add a wait option. For example,
+`editor = ghostty -e nvim scp://{ssh}/{path}` keeps Neovim's terminal open
+until you exit it. An editor that talks to a daemon must use its own
+documented wait protocol. Prospero gives the command the remote path, not a
+local copy, and does no generic writeback.
+
+Approve plan stays held throughout the remote editor process and the
+explicit remote reread that follows **every** exit status or **Cancel**.
+A nonzero exit gives a warning but is still followed by the read; Cancel
+also picks up changes already saved. Only a complete remote result, used
+for both the card and Plan pane, releases that hold and permits approval.
+Replies belonging to another session, ask or older edit operation are
+ignored. A spawn failure is recoverable: fix the command and choose Edit
+plan again. A failed or lost read leaves approval held with the reason and
+**Retry reread**; after
+fixing the cause and reconnecting if needed, use that action rather than
+approving stale text.
 
 A plan approval has no countdown: it waits for you. The model may be
 switched from the Prompt's status line while it waits.
@@ -82,21 +108,41 @@ The Plan pane (View → Plan) shows the plan file, which stays after
 approval, rendered as the transcript renders Markdown. Select its
 text, and right-click to copy it as text or as Markdown.
 
-- **View in editor** opens the file in your editor at any time. While
-  a local plan waits, this is the card's Edit plan; otherwise the agent
-  is not told. On a remote, the approval card's Edit plan stays
-  disabled; this action instead uses the detached viewer below.
-- **Reveal** shows the file in Finder, File Explorer or the file
-  manager.
+- **Edit plan** is the waiting approval flow above. On this computer it
+  uses the normal local plan editor; on a remote it requires that remote's
+  own `editor` command and refreshes the plan before approval.
+- **View in editor** opens the file at any time. While a local plan waits,
+  this is the card's Edit plan; otherwise the agent is not told. A remote
+  plan instead uses its configured `viewer`, which is detached even while
+  approval waits: it holds no plan
+  approval, tells the agent nothing about edits, and has no Cancel or
+  exit-driven refresh. It remains a separate action where supported.
+- **Reveal** shows the file in Finder, File Explorer or the file manager.
+  It is unchanged and only works for a file on this computer.
 
 For a plan on this computer, the editor is `[ui] editor`, else `$VISUAL`
-or `$EDITOR` (see [Configuration](help:config)). For a remote, set
-`[remote NAME] viewer` in this window's configuration to a local,
-remote-aware editor command, for example
-`ghostty -e fresh ssh://{ssh}{path}`. The command template also takes `{path}`,
-`{wsl}`, `{exec}`, `{remote}`, `{line}` and `{col}`; see
+or `$EDITOR` (see [Configuration](help:config)). A remote uses independent
+commands in this window's own configuration, for example:
+
+```ini
+[remote test1]
+ssh = user@host
+viewer = ghostty -e fresh ssh://{ssh}{path}
+editor = ghostty -e nvim scp://{ssh}/{path}
+```
+
+The `editor` template has exactly the `viewer` template's placeholders,
+quoting and direct-argv rules. Both take `{path}`, `{ssh}`, `{wsl}`,
+`{exec}`, `{remote}`, `{line}` and `{col}`, run without an implicit shell,
+and need a terminal wrapper for a terminal editor; see
 [Hosts and remotes](help:hosts#viewing-remote-files-in-a-local-editor).
-There is no `[ui] editor` fallback. The detached viewer holds no plan
-approval, tells the agent nothing about edits, and has no Cancel or
-exit-driven refresh. The pending card's **Edit plan** remains local-only.
-Reveal is unchanged and only works for a file on this computer.
+Included files cannot supply either remote command. An invalid configured
+`viewer` reports its error rather than falling back; an unset Files viewer
+may use the native Terminal-tab route, but remote Edit plan never does.
+Neither command falls back to `[ui] editor`.
+
+A complete remote reread synchronizes nonempty and empty plan text alike;
+the usual empty-plan approval safeguard still applies. Final approval
+keeps the engine's existing final raw-plan hash behavior, with no hash
+fields added to this flow. Existing mounted-container and Windows-WSL path
+mappings are unchanged.

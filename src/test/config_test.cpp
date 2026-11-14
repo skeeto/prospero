@@ -130,6 +130,8 @@ static void testcfgschema(Test *t)
         {"ui", "editor_line", "myedit --goto {file}:{line}", CFG_BAD, 1},
         {"remote", "viewer", "fresh ssh://{ssh}{path}", CFG_OK, 0},
         {"remote", "viewer", "fresh ssh://{ssh}{path}", CFG_BAD, 1},
+        {"remote", "editor", "ghostty -e nvim scp://{ssh}/{path}", CFG_OK, 0},
+        {"remote", "editor", "ghostty -e nvim scp://{ssh}/{path}", CFG_BAD, 1},
         {"ui", "theme", "dark", CFG_OK, 1},
         {"ui", "notify", "allow, done", CFG_OK, 0},
         {"ui", "notify", "none", CFG_OK, 0},
@@ -409,10 +411,13 @@ static void testcfgviewer(Test *t)
     os_write(v.os, a, "/v/prospero.ini",
         "[remote test1]\n"
         "ssh = user@host\n"
-        "viewer = fresh ssh://{ssh}{path}\n");
+        "viewer = fresh ssh://{ssh}{path}\n"
+        "editor = ghostty -e nvim scp://{ssh}/{path}\n");
     Config *c = newconfig(v.os, &a, v.scratch, "/v/prospero.ini", 0);
     expect(t, "viewer.cfg.load", cfgget(c, "remote", "test1", "viewer", 0),
            "fresh ssh://{ssh}{path}");
+    expect(t, "editor.cfg.load", cfgget(c, "remote", "test1", "editor", 0),
+           "ghostty -e nvim scp://{ssh}/{path}");
     Arena tmp = v.scratch;
     CfgSet r = cfgset(c, &tmp, "remote", "test1", "viewer",
                       "fresh --goto \"{path}:{line}:{col}\"");
@@ -424,15 +429,29 @@ static void testcfgviewer(Test *t)
     c = newconfig(v.os, &a, v.scratch, "/v/prospero.ini", 0);
     expect(t, "viewer.cfg.readback", cfgget(c, "remote", "test1", "viewer", 0),
            "fresh --goto \"{path}:{line}:{col}\"");
+    tmp = v.scratch;
+    r = cfgset(c, &tmp, "remote", "test1", "editor",
+                      "editor --wait \"{path}:{line}:{col}\"");
+    expect(t, "editor.cfg.set.err", r.err, "");
+    expect(t, "editor.cfg.reload", cfgget(c, "remote", "test1", "editor", 0),
+           "editor --wait \"{path}:{line}:{col}\"");
+    cfgfree(c);
+    c = newconfig(v.os, &a, v.scratch, "/v/prospero.ini", 0);
+    expect(t, "editor.cfg.readback", cfgget(c, "remote", "test1", "editor", 0),
+           "editor --wait \"{path}:{line}:{col}\"");
     cfgfree(c);
 
     os_write(v.os, a, "/v/main.ini", "include = team.ini\n[remote test1]\nssh = user@host\n");
-    os_write(v.os, a, "/v/team.ini", "[remote test1]\nviewer = included {path}\n");
+    os_write(v.os, a, "/v/team.ini", "[remote test1]\nviewer = included {path}\n"
+                                    "editor = included {path}\n");
     c = newconfig(v.os, &a, v.scratch, "/v/main.ini", 0);
     expect(t, "viewer.cfg.include", inidiags(&a, c->ini),
            "/v/team.ini:2:10: error: a [remote] setting in an included file is "
+           "ignored, since it chooses what runs where: set it in your own file\n"
+           "/v/team.ini:3:10: error: a [remote] setting in an included file is "
            "ignored, since it chooses what runs where: set it in your own file");
     expect(t, "viewer.cfg.ignored", cfgget(c, "remote", "test1", "viewer", 0), "");
+    expect(t, "editor.cfg.ignored", cfgget(c, "remote", "test1", "editor", 0), "");
     cfgfree(c);
 }
 

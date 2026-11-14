@@ -374,11 +374,19 @@ editor with a window of its own.
 For a genuinely remote file with a configured `[remote NAME] viewer`, a
 nonempty template takes over from that native route: it gives the file's
 remote path to the local remote-aware editor and launches detached without
-a shell or a `[ui] editor` fallback. When `viewer` is unset, the native
-Terminal-tab editing described above applies instead. A malformed or
-missing configured viewer is disabled with a reason rather than silently
-falling back. Reveal still requires a local or mounted path. See
+a shell or a `[ui] editor` fallback. Prospero does not wait for this viewer,
+and closing it causes no exit-driven refresh. When Files' `viewer` is
+unset, the native Terminal-tab editing described above applies instead.
+A malformed configured template or missing executable is disabled with a
+reason rather than silently falling back.
+
+The separate `[remote NAME] editor` setting is not a Files command and is
+not a fallback viewer. It is required only for a pending remote plan's
+**Edit plan**, where its command must wait for editing to finish and
+Prospero rereads the remote plan after every exit status or Cancel before
+allowing approval. See [Plan mode](help:plan#approving) and
 [Hosts and remotes](help:hosts#viewing-remote-files-in-a-local-editor).
+Reveal still requires a local or mounted path.
 
 An image file (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp` or `.bmp`)
 shows as the image, up to 32 MiB and 16 million pixels, its size in

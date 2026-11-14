@@ -832,6 +832,15 @@ static CfgKey cfgschema[] = {
      "editor needs a terminal wrapper, as in ghostty -e nvim "
      "scp://{ssh}/{path}. Empty disables "
      "those actions; [ui] editor is not a fallback"},
+    {"remote", "editor", CFG_STRING, "", {}, {}, "remote",
+     "The local, remote-aware waiting editor for a remote pending plan's "
+     "Edit plan. Spawned directly from a template with viewer's placeholders, "
+     "with no shell or inference of whether it waits. It must not exit until "
+     "editing is finished; Prospero rereads the remote plan on every exit or "
+     "Cancel and holds approval until that reread and synchronization finish. "
+     "Empty disables remote Edit plan; not a fallback to viewer, [ui] editor "
+     "or native term.edit. Use your own terminal wrapper for a terminal "
+     "editor, such as ghostty -e nvim scp://{ssh}/{path}"},
     {"remote", "path", CFG_STRING, "prospero", {}, {}, "remote",
      "The prospero executable there, a path or a name on its PATH; unset, "
      "the engine prospero deploy put there, else prospero"},

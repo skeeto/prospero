@@ -960,6 +960,11 @@ struct PlanFile {
     View       *docv;   // and whose plan that is
 };
 
+// A remote plan edit from process launch through reread and UI sync. A
+// failed reread keeps the matching approval held until a successful retry.
+// Discarding releases a moot operation, but waits for its process if needed.
+enum : i32 { EP_IDLE, EP_PROCESS, EP_REFRESH, EP_FAILED, EP_DISCARD };
+
 // A file the Changes pane lists, as git.cpp's gitstatusjson gives it.
 struct ChangeRow {
     u8  x;        // its status in the index
@@ -1989,6 +1994,14 @@ struct Gui {
                                    //   configuration file
     Str                edlog;      // the editor's output
     Str                edname;     // as the box names it
+    PlanFile           edread;     // the edit-specific remote reread. Own its
+                                   //   arena, request, session and generation,
+                                   //   never the displayed Plan pane's request
+    i64                edop;       // editor generation, new at every spawn
+    i32                edphase;    // EP_*
+    b32                edcancelpending; // remote cancellation waits PROC_EXIT
+    Str                edsyncerr;  // the reread-owned session note, if any
+
     i32                slashsel;   // the slash popup's pick, among its matches
     i32                mentionsel;   // the '@' popup's pick, among its rows
     MentionKeep        mentionpath;  // the selected row's path, which survives
@@ -2456,6 +2469,10 @@ static void setcur(Gui *g, GuiSession *s)
     scheddirty(&g->sched);
 }
 
+// A failed edit-specific reread (remoteeditfail), outside request's
+// general-purpose bookkeeping.
+static void editorlostread(Gui *, i64);
+
 // Remember a command until its reply, in place of the oldest if full.
 static void request(Gui *g, i64 id, i32 cmd, GuiSession *s, GuiHost *h)
 {
@@ -2465,10 +2482,12 @@ static void request(Gui *g, i64 id, i32 cmd, GuiSession *s, GuiHost *h)
             slot = &g->reqs[i];  // a free slot (0) or an older command
         }
     }
+    i64 evicted = slot->id;
     slot->id  = id;
     slot->cmd = cmd;
     slot->s   = s;
     slot->h   = h;
+    editorlostread(g, evicted);
 }
 
 static Request takereq(Gui *g, i64 id)
@@ -3821,9 +3840,8 @@ static void guifile(Gui *g)
 }
 
 // Ask for the plan file's next part.
-static void planpart(Gui *g)
+static void planpart(Gui *g, PlanFile *f)
 {
-    PlanFile *f = &g->plan;
     Arena     a = newarena(g->cmdr);
     Buf       b(&a, 256);
     EvOut     w = cmdopen(g, &b, CMD_FILE, f->s);
@@ -3862,7 +3880,7 @@ static void guiplan(Gui *g)
     f->off  = 0;
     f->err  = {};
     f->have = 0;
-    planpart(g);
+    planpart(g, f);
 }
 
 // Show a file of a session's directory in the Output window, taken
@@ -3910,7 +3928,7 @@ static void onplanfile(Gui *g, Json *j, b32 ok, Str err)
     print(&f->text, text);
     f->off = jsonint(jsonget(j, "off"), f->off);
     if (jsonint(jsonget(j, "more"), 0) && f->s) {
-        planpart(g);
+        planpart(g, f);
     } else {
         f->have = 1;
         f->got++;
@@ -5160,6 +5178,9 @@ static b32 quitdone(Gui *g)
 // QUIT_GRACE regardless. Sessions on the other hosts run on.
 static void draftsendall(Gui *);
 static void editcancel(Gui *);
+static void remoteeditread(Gui *);
+static void remoteeditanswer(Gui *, Json *, b32, Str);
+static EditJump remoteeditorfor(Gui *, Arena *, Str, Str, i32, i32);
 
 static void startquit(Gui *g)
 {
@@ -6569,6 +6590,8 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
     case CMD_FILE:
         if (id == g->out.id) {
             onfile(g, j, ok, err);
+        } else if (id && id==g->edread.id) {
+            remoteeditanswer(g, j, ok, err);
         } else if (id && id==g->plan.id) {
             onplanfile(g, j, ok, err);
         } else if (id == g->img.fetch.id) {
@@ -7254,6 +7277,8 @@ static Str editorwhy(Gui *g, GuiSession *s, Arena *a)
         return finish(&b);
     } else if (g->edcfg) {
         return "the editor has the configuration file open";
+    } else if (g->edphase != EP_IDLE) {
+        return "an editor or a plan reread is already in progress";
     } else if (g->edproc && g->edplan) {
         return "the editor has a plan open";
     } else if (g->edproc) {
@@ -7409,6 +7434,24 @@ static Proc *editrun(Gui *g, Arena *a, Str cmd, Str path, Str dir, Str log, Str 
     return p;
 }
 
+// A configured remote-aware editor, directly as argv. Unlike the detached
+// viewer, its process is ours until it exits, so its records can hold approval.
+// Empty cmdline keeps Windows' usual argv quoting instead of cmd.exe.
+static Proc *editrunargv(Gui *g, Arena *a, EditJump j, Str dir, Str log)
+{
+    Spawn sp = {};
+    for (iz i = 0; i < j.argv.len; i++) {
+        sp.argv = push(a, sp.argv, j.argv[i]);
+    }
+    sp.cwd      = dir;
+    sp.env      = guienv(g, a);
+    sp.outpath  = log;
+    sp.maxbytes = 1<<16;
+    sp.mbox     = g->edbox;
+    sp.id       = ++g->edid;
+    return os_spawn(g->os, &sp, *a);
+}
+
 // The draft of session s in the editor, a its scratch.
 static void editstart(Gui *g, Arena a, GuiSession *s)
 {
@@ -7462,33 +7505,63 @@ static i32 planask(View *v)
 // plan's ask req, else with none waiting. Its scratch is a.
 static void planedit(Gui *g, Arena a, GuiSession *s, Str path, Str req)
 {
-    Str   why = editorwhy(g, s, &a);
-    if (why.len) {
-        setnote(g, s, why, 1);
+    b32 remote = s->host->kind==GH_REMOTE && !startswith(s->host->name, "ctr:");
+    if (remote && (g->edproc || (g->edplan && g->edphase!=EP_IDLE))) {
+        setnote(g, s, "An editor or a plan reread is already in progress: finish or retry it first", 1);
         return;
     }
-    Str cmd = editordraft(g, &a);
-    Str dir = join(&a, g->statedir, "edit");
-    Str log = join(&a, dir, concat(&a, concat(&a, "plan-", s->sid), ".log"));
-    Str   err = {};
-    Proc *p   = 0;
-    if (!os_mkdirs(g->os, a, dir)) {
-        err = concat(&a, "cannot start the editor: ", os_lasterr(g->os, &a));
+    if (remote) {
+        EditJump j = remoteeditorfor(g, &a, s->host->name, path, 0, 0);
+        if (j.why.len) {
+            setnote(g, s, j.why, 1);
+            return;
+        }
+        Str dir = join(&a, g->statedir, "edit");
+        Str log = join(&a, dir, concat(&a, concat(&a, "plan-", s->sid), ".log"));
+        Proc *p = os_mkdirs(g->os, a, dir) ? editrunargv(g, &a, j, userhome(g->os, &a), log) : 0;
+        if (!p) {
+            setnote(g, s, concat(&a, "cannot start the editor: ", os_lasterr(g->os, &a)), 1);
+            return;
+        }
+        g->edsess = s;
+        g->edplan = 1;
+        g->edproc = p;
+        g->edpath = clone(&g->perm, path);
+        g->edreq  = clone(&g->perm, req);
+        g->edlog  = clone(&g->perm, log);
+        g->edname = clone(&g->perm, j.name);
+        g->edop++;
+        g->edphase = EP_PROCESS;
+        guilog(g, concat(&a, "editing a remote plan: ", j.line));
     } else {
-        p = editrun(g, &a, cmd, path, dir, log, &err);
+        Str why = editorwhy(g, s, &a);
+        if (why.len) {
+            setnote(g, s, why, 1);
+            return;
+        }
+        Str cmd = editordraft(g, &a);
+        Str dir = join(&a, g->statedir, "edit");
+        Str log = join(&a, dir, concat(&a, concat(&a, "plan-", s->sid), ".log"));
+        Str   err = {};
+        Proc *p   = 0;
+        if (!os_mkdirs(g->os, a, dir)) {
+            err = concat(&a, "cannot start the editor: ", os_lasterr(g->os, &a));
+        } else {
+            p = editrun(g, &a, cmd, path, dir, log, &err);
+        }
+        if (!p) {
+            setnote(g, s, err, 1);
+            return;
+        }
+        g->edsess = s;
+        g->edplan = 1;
+        g->edproc = p;
+        g->edpath = clone(&g->perm, path);
+        g->edreq  = clone(&g->perm, req);
+        g->edlog  = clone(&g->perm, log);
+        g->edname = clone(&g->perm, editorname(cmd));
+        guilog(g, concat(&a, "editing a plan: ", cmd));
     }
-    if (!p) {
-        setnote(g, s, err, 1);
-        return;
-    }
-    g->edsess = s;
-    g->edplan = 1;
-    g->edproc = p;
-    g->edpath = clone(&g->perm, path);
-    g->edreq  = clone(&g->perm, req);
-    g->edlog  = clone(&g->perm, log);
-    g->edname = clone(&g->perm, editorname(cmd));
-    guilog(g, concat(&a, "editing a plan: ", cmd));
     s->note = {};
     scheddirty(&g->sched);
 }
@@ -7557,14 +7630,15 @@ static void guishow(Gui *g, Str path)
 
 // A remote viewer's availability and direct/shell error, resolved through
 // the same full-path finder and mode-keyed cache as the local GUI editors.
-static void editorfindfor(Gui *g, Arena *a, EditJump *j)
+static void editorfindfor(Gui *g, Arena *a, EditJump *j, Str key)
 {
     if (j->why.len || editorexe(g, a, j->prog, j->argv.len>0).len) {
         return;
     }
     b32 sep = find(j->prog, "/")>=0 || (HOST_WINDOWS && find(j->prog, "\\")>=0);
     Buf b(a, 64 + j->prog.len);
-    print(&b, j->argv.len ? Str("Its viewer, ") : Str("Its editor, "));
+    print(&b, key=="editor" ? Str("Its editor, ") :
+          j->argv.len ? Str("Its viewer, ") : Str("Its editor, "));
     print(&b, sep ? j->prog : j->name);
     print(&b, sep ? Str(", is not there") : Str(", is not on PATH"));
     j->why = finish(&b);
@@ -7583,7 +7657,7 @@ static EditJump editorjumpfor(Gui *g, Arena *a, Str path, i32 line, i32 col)
     EditJump j = editorjump(a, cmd, tmpl, path, line>0 ? line : 1, col, HOST_WINDOWS);
     j = editorwindow(a, j);
     if (j.argv.len) {
-        editorfindfor(g, a, &j);
+        editorfindfor(g, a, &j, Str("viewer"));
     } else if (!j.why.len && HOST_WINDOWS) {
         j.line = editorabs(g, a, j.line, j.prog, j.name, &j.why);
     } else if (!j.why.len && !editorexe(g, a, j.prog, 0).len) {
@@ -7651,6 +7725,220 @@ static void editorjumprun(Gui *g, Arena a, Str path, i32 line, i32 col)
     }
 }
 
+// The pending plan targeted by an edit, not an answered historical ask.
+static i32 editpending(GuiSession *s, Str req)
+{
+    if (!s || s->gone) {
+        return -1;
+    }
+    View *v = s->view;
+    if (!v) {
+        return -1;
+    }
+    if (req.len) {
+        i32 i = findask(v, req);
+        return i>=0 && v->msgs[i].role==VIEW_ASK && v->msgs[i].tool->kind=="plan" &&
+               v->msgs[i].tool->answer==VASK_PENDING ? i : -1;
+    }
+    return planask(v);
+}
+
+static void remoteeditpart(Gui *g)
+{
+    PlanFile *f = &g->edread;
+    if (!f->base) {
+        f->mem  = newarena(os_reserve(g->os, (iz)1<<20));
+        f->base = f->mem.beg;
+    }
+    f->mem.beg = f->base;
+    f->s    = g->edsess;
+    f->v    = f->s ? f->s->view : 0;
+    f->ver  = (i32)g->edop;
+    f->text = Buf(&f->mem, 1<<16);
+    f->off  = 0;
+    f->err  = {};
+    f->have = 0;
+    f->id   = 0;
+    f->doc  = 0;
+    planpart(g, f);
+}
+
+// Release the edit's session, ask and read state. A live process remains
+// owned in EP_DISCARD until its exit, but can no longer affect an approval.
+// Clear only our own reread note, never a concurrently set unrelated note.
+static void remoteeditrelease(Gui *g)
+{
+    if (g->edsess && g->edsyncerr.len && g->edsess->note == g->edsyncerr) {
+        g->edsess->note = {};
+    }
+    g->edsyncerr = {};
+    g->edread.id   = 0;
+    g->edread.s    = 0;
+    g->edread.v    = 0;
+    g->edread.err  = {};
+    g->edread.text = {};
+    g->edread.off  = 0;
+    g->edread.have = 0;
+    // A stale editor may still write this session's remote file. Retain its
+    // owner and an any-ask hold until the exit is actually confirmed. Its
+    // empty edreq distinguishes that hold; no stale read is applied.
+    g->edplan      = g->edproc != 0;
+    g->edsess      = g->edproc ? g->edsess : 0;
+    g->edreq       = {};
+    g->edphase     = g->edproc ? EP_DISCARD : EP_IDLE;
+    g->edcancelpending = 0;
+    scheddirty(&g->sched);
+}
+
+static void remoteeditdiscard(Gui *g)
+{
+    remoteeditrelease(g);
+    if (g->edproc) {
+        g->edcancelpending = 1;
+        os_kill(g->os, g->edproc, 1);
+    }
+}
+
+static void remoteeditfail(Gui *g, GuiSession *s, Str why)
+{
+    if (g->edphase != EP_REFRESH) {
+        return;
+    }
+    g->edread.id = 0;  // a reply or request-loss notification has arrived
+    if (!s || s->gone || editpending(s, g->edreq)<0) {
+        remoteeditrelease(g);
+        return;
+    }
+    g->edphase = EP_FAILED;
+    Arena a = g->frame;
+    Str note = concat(&a, concat(&a, "cannot reread the edited plan: ", why),
+                      Str("; Retry reread before approving it"));
+    g->edsyncerr = clone(&g->perm, note);
+    setnote(g, s, note, 1);
+    scheddirty(&g->sched);
+}
+
+static void editorlostread(Gui *g, i64 id)
+{
+    if (id && g->edphase==EP_REFRESH && g->edread.id==id) {
+        remoteeditfail(g, g->edsess, Str("the plan read request was evicted"));
+    }
+}
+
+// Update the selected Plan pane from the edit's completed buffer, not a
+// second fetch, and prevent an older display fetch from appending after it.
+static void editplanview(Gui *g, GuiSession *s, Str text)
+{
+    View *v = s->view;
+    if (!v) {
+        return;
+    }
+    v->planver++;
+    PlanFile *f = &g->plan;
+    if (f->s != s || f->v != v) {
+        return;
+    }
+    f->id = 0;  // trailing chunks of an older display fetch are ignored
+    if (!f->base) {
+        f->mem  = newarena(os_reserve(g->os, (iz)1<<20));
+        f->base = f->mem.beg;
+    }
+    f->mem.beg = f->base;
+    f->ver  = v->planver;
+    f->text = Buf(&f->mem, 1<<16);
+    print(&f->text, text);
+    f->err  = {};
+    f->have = 1;
+    f->got++;
+    f->docv = v;
+}
+
+// The editor exited with a status; its remote reread starts here.
+static void remoteeditread(Gui *g)
+{
+    if (g->edphase != EP_PROCESS) {
+        return;
+    }
+    if (g->quitting || editpending(g->edsess, g->edreq)<0) {
+        remoteeditrelease(g);
+        return;
+    }
+    g->edphase = EP_REFRESH;
+    remoteeditpart(g);
+}
+
+// Apply the whole remote result only while its operation and pending ask
+// still match. Stale replies must not replace a newer plan or another one.
+static void remoteeditready(Gui *g, PlanFile *f)
+{
+    GuiSession *s = g->edsess;
+    i32 i = editpending(s, g->edreq);
+    if (i<0 || f->v!=s->view) {
+        remoteeditrelease(g);
+        return;
+    }
+    Str text = f->have ? trimright(finish(&f->text)) : Str{};
+    settext(f->v, &f->v->msgs[i], text, 1);
+    g->planedits++;
+    editplanview(g, s, text);
+    remoteeditrelease(g);
+}
+
+static void remoteeditanswer(Gui *g, Json *j, b32 ok, Str err)
+{
+    PlanFile *f = &g->edread;
+    f->id = 0;
+    if (g->edphase != EP_REFRESH || f->ver != (i32)g->edop) {
+        return;
+    }
+    if (!ok && err=="no such file") {
+        // Absent means an empty plan, never a successfully read prefix.
+        // Approval keeps the engine's existing empty-plan safeguard.
+        f->text.len = 0;
+        f->off  = 0;
+        f->have = 1;
+        f->got++;
+        remoteeditready(g, f);
+        return;
+    }
+    if (!ok) {
+        remoteeditfail(g, g->edsess, err.len ? err : Str("cannot read plan.md"));
+        return;
+    }
+    i64 off = jsonint(jsonget(j, "off"), f->off);
+    Str text = jsonstr(jsonget(j, "text"));
+    // off is the cumulative byte position AFTER these bytes. It advances
+    // across chunks; the first successful position advances from zero.
+    if (off < f->off || f->text.len+text.len > (iz)64<<10) {
+        remoteeditfail(g, g->edsess, Str("the plan read was garbled or too long"));
+        return;
+    }
+    print(&f->text, text);
+    f->off = off;
+    if (jsonint(jsonget(j, "more"), 0) && f->s) {
+        if (!text.len) {
+            remoteeditfail(g, g->edsess, Str("the plan read made no progress"));
+            return;
+        }
+        planpart(g, f);
+    } else {
+        f->have = 1;
+        f->got++;
+        remoteeditready(g, f);
+    }
+}
+
+static void planretry(Gui *g, Arena a, GuiSession *s, Str req)
+{
+    if (!s || g->edsess != s || !g->edplan || g->edphase != EP_FAILED ||
+            g->edreq != req || editpending(s, req) < 0) {
+        return;
+    }
+    g->edop++;
+    g->edphase = EP_REFRESH;
+    remoteeditpart(g);
+}
+
 // The plan file as the editor left it, in its ask (or the plan's ask
 // that came while it was out), empty if it is gone or too long to put
 // to the user, and in the Plan window, fetched again.
@@ -7674,17 +7962,20 @@ static void planedited(Gui *g, GuiSession *s)
 // The editor exited with a status, or was cancelled (status -1).
 static void editend(Gui *g, i32 status)
 {
-    GuiSession *s    = g->edsess;
-    Arena       a    = g->frame;
-    Str         what = g->edcfg  ? Str("the configuration") :
-                       g->edplan ? Str("the plan") : Str("the draft");
+    GuiSession *s      = g->edsess;
+    Arena       a      = g->frame;
+    b32         remote = g->edphase != EP_IDLE;
+    Str         what = remote ? Str("the plan") : g->edcfg ? Str("the configuration") :
+                        g->edplan ? Str("the plan") : Str("the draft");
     if (g->edcfg) {
         // Read again, however it went: this answer is the one that counts
         g->cfgget = 0;
         guiconfigget(g);
+    } else if (remote && g->edplan) {
+        remoteeditread(g);
     } else if (g->edplan) {
         planedited(g, s);
-    } else if (status == 0) {
+    } else if (!remote && status==0) {
         Read rd = os_read(g->os, &a, g->edpath, DRAFT_MAX+2);
         Str  t  = editortext(rd.data);
         if (rd.err==READ_TOOBIG || t.len>DRAFT_MAX) {
@@ -7696,7 +7987,7 @@ static void editend(Gui *g, i32 status)
             s->note = {};
         }
     }
-    if (status > 0) {
+    if (status>0 && g->edphase!=EP_DISCARD) {
         // Its output's last line says why, as a shell's does when it
         // finds no such command
         Read rd   = os_read(g->os, &a, g->edlog, 1<<16);
@@ -7729,23 +8020,41 @@ static void editend(Gui *g, i32 status)
         print(&lb, (i64)status);
     }
     guilog(g, finish(&lb));
-    if (!g->edplan && !g->edcfg) {
+    if (!remote && !g->edplan && !g->edcfg) {
         os_remove(g->os, a, g->edpath);  // the plan and config files stay, of course
     }
     os_remove(g->os, a, g->edlog);
     os_procfree(g->os, g->edproc);
-    g->edsess = 0;
     g->edproc = 0;
-    g->edplan = 0;
+    // A remote edit owns its original session and ask through reread and
+    // any retryable failure. Only a synchronized result releases this hold.
+    if (remote) {
+        if (g->edphase!=EP_REFRESH && g->edphase!=EP_FAILED) {
+            remoteeditrelease(g);
+        }
+    } else {
+        g->edsess = 0;
+        g->edplan = 0;
+    }
     g->edcfg  = 0;
     scheddirty(&g->sched);
 }
 
-// Cancel the edit: the editor is killed, and its exit, when it comes,
-// is ignored.
+// Cancel the edit. A remote read must follow its actual process exit,
+// which matters for a final write after the signal but before termination.
+// Local draft/Settings cancellation keeps the previous immediate behavior.
 static void editcancel(Gui *g)
 {
+    if (g->edphase!=EP_IDLE && (g->quitting || editpending(g->edsess, g->edreq)<0)) {
+        remoteeditdiscard(g);
+        return;
+    }
     if (g->edproc) {
+        if (g->edphase==EP_PROCESS || g->edphase==EP_DISCARD) {
+            g->edcancelpending = 1;
+            os_kill(g->os, g->edproc, 1);
+            return;
+        }
         os_kill(g->os, g->edproc, 1);
         editend(g, -1);
     }
@@ -7754,16 +8063,26 @@ static void editcancel(Gui *g)
 // The editor's records: only its exit matters.
 static b32 drainedit(Gui *g)
 {
-    if (!g->edbox) {
-        return 0;
+    b32 any = 0;
+    if (g->edphase!=EP_IDLE && g->edphase!=EP_DISCARD &&
+            editpending(g->edsess, g->edreq)<0) {
+        // Discard a moot read. A live editor is left to finish normally:
+        // only explicit Cancel, deletion or quitting kills it. Until then
+        // its released any-ask hold keeps a replacement approval closed.
+        remoteeditrelease(g);
+        any = 1;
     }
-    b32  any = 0;
+    if (!g->edbox) {
+        return any;
+    }
     Mail m   = mailtake(g->edbox);
     for (Record r = mailnext(&m); r.ok; r = mailnext(&m)) {
         if (r.type==PROC_EXIT && g->edproc && r.id==g->edid) {
             i32 code = get32(r.data);
             i32 sig  = get32(cuthead(r.data, 4));
-            editend(g, sig ? 128+sig : code<0 ? 255 : code);
+            b32 cancelled = g->edcancelpending;
+            g->edcancelpending = 0;
+            editend(g, cancelled ? -1 : sig ? 128+sig : code<0 ? 255 : code);
             any = 1;
         }
     }
@@ -8601,7 +8920,9 @@ static void reissue(Gui *g)
             }
             break;
         case CMD_FILE:
-            if (g->out.id == q.id) {
+            if (g->edread.id == q.id) {
+                remoteeditfail(g, g->edsess, Str("the connection was interrupted"));
+            } else if (g->out.id == q.id) {
                 g->out.id = 0;
             } else if (g->img.fetch.id == q.id) {
                 imgrequest(g);  // the same part again
@@ -8860,13 +9181,17 @@ static Reach remotelink(Gui *g, Str name)
 // viewer and connection values as they are in effect here, never the remote
 // engine's configuration. An unset or bad one is a reason, not a fallback to
 // [ui] editor. line and col are Files' position, 0 for none (the Plan pane).
-static EditJump remoteviewerfor(Gui *g, Arena *a, Str name, Str path, i32 line, i32 col)
+static EditJump remotecommandfor(Gui *g, Arena *a, Str name, Str path, i32 line, i32 col, Str key)
 {
     EditJump j = {};
-    Str tmpl = trim(remoteset(g, name, "viewer"));
+    Str tmpl = trim(remoteset(g, name, key));
     if (!tmpl.len) {
-        Buf b(a, 128 + 2*name.len);
-        print(&b, "No viewer: set viewer in this window's [remote ");
+        Buf b(a, 128 + 2*name.len + 2*key.len);
+        print(&b, "No ");
+        print(&b, key);
+        print(&b, ": set ");
+        print(&b, key);
+        print(&b, " in this window's [remote ");
         print(&b, name);
         print(&b, "] section to a local command using {path}");
         j.why = finish(&b);
@@ -8886,7 +9211,9 @@ static EditJump remoteviewerfor(Gui *g, Arena *a, Str name, Str path, i32 line, 
         Buf b(a, 64 + name.len + j.why.len);
         print(&b, "[remote ");
         print(&b, name);
-        print(&b, "] viewer: ");
+        print(&b, "] ");
+        print(&b, key);
+        print(&b, ": ");
         print(&b, j.why);
         j.why = finish(&b);
         return j;
@@ -8907,15 +9234,29 @@ static EditJump remoteviewerfor(Gui *g, Arena *a, Str name, Str path, i32 line, 
         Buf b(a, 128 + name.len + j.prog.len);
         print(&b, "[remote ");
         print(&b, name);
-        print(&b, "] viewer: ");
+        print(&b, "] ");
+        print(&b, key);
+        print(&b, ": ");
         print(&b, j.prog);
         print(&b, " is a batch script; name a direct executable instead "
-                  "(a remote viewer does not use cmd.exe)");
+                  "(a remote ");
+        print(&b, key);
+        print(&b, " does not use a shell)");
         j.why = finish(&b);
         return j;
     }
-    editorfindfor(g, a, &j);
+    editorfindfor(g, a, &j, key);
     return j;
+}
+
+static EditJump remoteviewerfor(Gui *g, Arena *a, Str name, Str path, i32 line, i32 col)
+{
+    return remotecommandfor(g, a, name, path, line, col, Str("viewer"));
+}
+
+static EditJump remoteeditorfor(Gui *g, Arena *a, Str name, Str path, i32 line, i32 col)
+{
+    return remotecommandfor(g, a, name, path, line, col, Str("editor"));
 }
 
 static void remoteviewerrun(Gui *g, Arena a, Str name, Str path, i32 line, i32 col)
@@ -9675,6 +10016,9 @@ static b32 ctrjob(Gui *, i32, GuiCtr *);
 
 static void onhostend(Gui *g, GuiHost *h)
 {
+    if (g->edsess && g->edsess->host==h && g->edphase==EP_REFRESH) {
+        remoteeditfail(g, g->edsess, Str("the host disconnected"));
+    }
     guirelaydrop(g, newarena(g->cmdr), h);
     b32 again = h->reconnect;
     h->r         = 0;
@@ -10071,6 +10415,9 @@ static void sessgone(Gui *g, GuiSession *s)
 {
     s->gone   = 1;
     s->listed = 0;
+    if (g->edsess==s && g->edphase!=EP_IDLE) {
+        remoteeditdiscard(g);  // kill only our editor; never use its path locally
+    }
     imgdrop(g, s);
     attachclear(g, s);
     mentionidxdrop(g, s);  // its 16 MiB of file list must not outlive it
@@ -14222,6 +14569,13 @@ enum : i32 {
                   // tabs are not empty, Files in front; none fails
     OP_VIEWERSET, // the shown remote's viewer: empty, invalid, valid, or a
                   // template (a checklist override, not a configuration edit)
+    OP_EDITORSET, // the shown remote's requiring editor: valid/missing/invalid/unset
+    OP_PLANEDIT,  // invoke the pending plan's exact waiting-Edit handler
+    OP_SELECTOTHER, // select an imported remote session other than the marked one
+    OP_SELECTSESS,  // restore the marked original session
+    OP_PLANPANE,  // put the current session's Plan pane in front
+    OP_PLANWRITE, // bounded fake-remote fixture change: oversized or recovered
+    OP_PLANRETRY, // invoke the pending remote reread's retry handler
 };
 // OP_TEXTCWD with text types the --cwd directory and text after it, on
 // Windows with backslashes, as a Windows user types a path.
@@ -14529,7 +14883,7 @@ enum : i32 {
     CHK_CLIPBOARD,    // the clipboard holds text
     CHK_EDITING,
     CHK_NOTEDITING,
-    CHK_NOTE,         // the session's note has text in it
+    CHK_NOTE,         // session's note: dx 1 contains text, -1 does not; 0 old probe
     CHK_MARK,         // the transcript's last change to the session says it
     CHK_SLASH,        // the slash popup lists dx commands, skills aside (0: none)
     CHK_SLASHSEL,     // its pick is text
@@ -14563,6 +14917,7 @@ enum : i32 {
     CHK_SNAPLIVE,
     CHK_PLANMODE,     // dx 1: the session shown is in plan mode, 0 not
     CHK_PLANASK,      // the open ask is the plan's, in Markdown, its buttons drawn
+    CHK_PLANABSENT,   // Plan belongs to this session and excludes stale text
     CHK_PLANTEXT,     // the Plan window shows the plan, with text in it
     CHK_PLANMODEL,    // the model picker is enabled while the plan waits
     CHK_MAXIMIZED,    // maximized, filling its display, and saved so;
@@ -14576,6 +14931,7 @@ enum : i32 {
     CHK_BROWSED,      // Browse put its directory in the new session dialog
     CHK_BROWSEOFF,    // Browse is off for a remote host's directory
     CHK_PLANEDITING,  // the plan is out in the editor, Approve held
+    CHK_REREADHELD,   // a failed reread holds approval and every editor entry
     CHK_PLANEDITED,   // the plan's ask shows the file as edited, with text
     CHK_PLANREVEAL,   // Reveal showed the plan file, once
     CHK_TERMRAN,      // dx terminals opened, the latest's launch with text,
@@ -14972,6 +15328,7 @@ static Str chknames[] = {
     "the metrics overlay's numbers went on as frames ran on",
     "plan mode is on or off as it should be",
     "the plan's ask shows the plan, with Approve plan and Keep planning",
+    "the Plan pane belongs to its session and excludes stale text",
     "the Plan window shows the plan as the agent wrote it",
     "the model may change while the plan waits",
     "the window is maximized, filling its display, and will open so",
@@ -14984,6 +15341,7 @@ static Str chknames[] = {
     "Browse put the directory chosen in the field",
     "Browse is off for a directory on a remote host",
     "the plan is open in the editor, Approve held meanwhile",
+    "a failed reread holds approval and every editor entry",
     "the plan's ask shows the plan as the editor left it",
     "Reveal showed the plan file in the file manager",
     "Open in external terminal opened one in its folder, as said",
@@ -15152,6 +15510,7 @@ enum : i32 {
     W_THINKSTALL, // and has had none for a while
     W_TURNS,      // the session shown is idle after dx turns
     W_EDITED,     // no editor runs
+    W_EDITSAVED,  // the test editor's saved marker has appeared
     W_NOTE,       // the session shown has a note
     W_MARK,       // the transcript's last change to the session says text
     W_COMPACTED,  // it has a compaction card, and is idle
@@ -15216,7 +15575,7 @@ static Str waitnames[] = {
     "the window to come back", "a background host", "the remote host",
     "the link to drop", "the remote to close", "the output", "a file",
     "the includes", "the thumbnails", "the screenshot", "reasoning",
-    "a pause in reasoning", "turns", "the editor", "a note",
+    "a pause in reasoning", "turns", "the editor", "the editor's save", "a note",
     "a change to the session", "a compaction card",
     "a named item", "a launch to hand off", "the import", "the export",
     "the plan", "the menu's pick", "the drafts kept", "the offer to deploy",
@@ -19796,6 +20155,184 @@ static DriveOp remoteops[] = {
     {OP_CHECK, CHK_NOTEDITING, 0, 0, 0, ""},
     {OP_CHECK, CHK_PLANASK, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "remote-plan-view"},
+    {OP_EDITORSET, 0, 29, 0, 0, "valid"},
+    {OP_EDITORSET, 0, 4, 0, 0, "missing"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "edit plan"},
+    {OP_CHECK, CHK_TOOLTIP, 0, 0, 0, "[remote r] editor"},
+    {OP_CHECK, CHK_EDITJUMP, 2, 0, 0, ""},
+    {OP_CHECK, CHK_TERMCOUNT, 0, 0, 0, ""},
+    {OP_CHECK, CHK_NOTEDITING, 0, 0, 0, ""},
+    {OP_EDITORSET, 0, 4, 0, 0, "invalid"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "edit plan"},
+    {OP_CHECK, CHK_TOOLTIP, 0, 0, 0, "[remote r] editor"},
+    {OP_CHECK, CHK_EDITJUMP, 2, 0, 0, ""},
+    {OP_CHECK, CHK_TERMCOUNT, 0, 0, 0, ""},
+    {OP_CHECK, CHK_NOTEDITING, 0, 0, 0, ""},
+    {OP_EDITORSET, 0, 4, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "edit plan"},
+    {OP_CHECK, CHK_TOOLTIP, 0, 0, 0, "[remote r] editor"},
+    {OP_CHECK, CHK_EDITJUMP, 2, 0, 0, ""},
+    {OP_CHECK, CHK_TERMCOUNT, 0, 0, 0, ""},
+    {OP_CHECK, CHK_NOTEDITING, 0, 0, 0, ""},
+    {OP_EDITORSET, 0, 10, 0, 0, "valid"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "edit plan"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_PLANEDITING, 0, 0, 0, ""},
+    {OP_WAIT, W_EDITSAVED, 0, 0, 10000, "1"},
+    {OP_TOUCH, 0, 0, 0, 300, "../far/remote editor.sh.release"},
+    {OP_WAIT, W_EDITED, 0, 0, 10000, ""},
+    {OP_WAIT, W_PLAN, 0, 0, 10000, "REMOTE-EDITOR-001-valid-exit"},
+    {OP_CHECK, CHK_PLANASK, 0, 0, 100, "REMOTE-EDITOR-001-valid-exit"},
+    {OP_CHECK, CHK_PLANEDITED, 0, 0, 0, "REMOTE-EDITOR-001-valid-exit"},
+    {OP_CHECK, CHK_NOTEDITING, 0, 0, 0, ""},
+    {OP_MOVE, T_ALLOW, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_SAID, 0, 0, 15000, "Done"},
+    {OP_CHECK, CHK_PLANMODE, 0, 0, 0, ""},
+    // Without the fixture, each jump lands on CHK_NOTEDITING before
+    // the untouched baseline approval, not on the failed-read tooltip.
+    {OP_EDITORSET, 0, 133, 0, 0, "valid"},
+    // A second remote editing lifecycle, in place on that same host: cancel,
+    // exit 7, another save, lost connection, a recovered read, then a stale reply.
+    {OP_MOVE, T_NAMED, 0, 0, 100, "session mode"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "session mode Plan"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_MARK, 0, 0, 5000, "Plan mode"},
+    {OP_PROMPT, 0, 0, 0, 200, "Plan the viewer test"},
+    {OP_WAIT, W_ASK, 0, 0, 30000, ""},
+    {OP_PLANEDIT, 0, 0, 0, 100, ""},
+    {OP_CHECK, CHK_PLANEDITING, 0, 0, 0, ""},
+    {OP_WAIT, W_EDITSAVED, 0, 0, 10000, "2"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "cancel plan editor"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_PLAN, 0, 0, 10000, "REMOTE-EDITOR-002-cancel-saved"},
+    {OP_CHECK, CHK_PLANASK, 0, 0, 100, "REMOTE-EDITOR-002-cancel-saved"},
+    {OP_CHECK, CHK_PLANTEXT, 0, 0, 100, "REMOTE-EDITOR-002-cancel-saved"},
+    {OP_CHECK, CHK_NOTEDITING, 0, 0, 0, ""},
+    {OP_EDITORSET, 0, 0, 0, 0, "valid"},
+    {OP_PLANEDIT, 0, 0, 0, 100, ""},
+    {OP_CHECK, CHK_PLANEDITING, 0, 0, 0, ""},
+    {OP_WAIT, W_EDITSAVED, 0, 0, 10000, "3"},
+    {OP_TOUCH, 0, 0, 0, 300, "../far/remote editor.sh.release"},
+    {OP_WAIT, W_EDITED, 0, 0, 10000, ""},
+    {OP_WAIT, W_PLAN, 0, 0, 10000, "REMOTE-EDITOR-003-nonzero-exit"},
+    {OP_CHECK, CHK_PLANASK, 0, 0, 100, "REMOTE-EDITOR-003-nonzero-exit"},
+    {OP_CHECK, CHK_PLANEDITED, 0, 0, 0, "REMOTE-EDITOR-003-nonzero-exit"},
+    {OP_CHECK, CHK_NOTE, 1, 0, 0, "status 7"},
+    {OP_CHECK, CHK_NOTEDITING, 0, 0, 0, ""},
+    {OP_PLANEDIT, 0, 0, 0, 100, ""},
+    {OP_CHECK, CHK_PLANEDITING, 0, 0, 0, ""},
+    {OP_WAIT, W_EDITSAVED, 0, 0, 10000, "4"},
+    {OP_TOUCH, 0, 0, 0, 300, "../far/remote editor.sh.release"},
+    {OP_WAIT, W_EDITED, 0, 0, 10000, ""},
+    {OP_WAIT, W_PLAN, 0, 0, 10000, "REMOTE-EDITOR-004-valid-exit"},
+    {OP_CHECK, CHK_PLANASK, 0, 0, 100, "REMOTE-EDITOR-004-valid-exit"},
+    {OP_CHECK, CHK_PLANEDITED, 0, 0, 0, "REMOTE-EDITOR-004-valid-exit"},
+    {OP_CHECK, CHK_NOTEDITING, 0, 0, 0, ""},
+    {OP_PLANEDIT, 0, 0, 0, 100, ""},
+    {OP_CHECK, CHK_PLANEDITING, 0, 0, 0, ""},
+    {OP_WAIT, W_EDITSAVED, 0, 0, 10000, "5"},
+    {OP_DROPLINK, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_REMOTEDOWN, 0, 0, 15000, ""},
+    {OP_PLANWRITE, 0, 0, 0, 0, "oversize"},
+    {OP_TOUCH, 0, 0, 0, 300, "../far/remote editor.sh.release"},
+    {OP_WAIT, W_NOTE, 0, 0, 10000, "cannot reread"},
+    {OP_CHECK, CHK_NOTE, 0, 0, 100, "cannot reread"},
+    {OP_CHECK, CHK_REREADHELD, 0, 0, 0, ""},
+    {OP_WAIT, W_REMOTEUP, 0, 0, 15000, ""},
+    {OP_PLANWRITE, 0, 0, 0, 0, "recovered"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "dismiss"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_MOVE, T_ALLOW, 0, 0, 100, ""},
+    {OP_CHECK, CHK_TOOLTIP, 0, 0, 0, "could not be reread"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "edit plan"},  // its error-state Retry button
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_PLAN, 0, 0, 10000, "Recovered after failed reread"},
+    {OP_CHECK, CHK_PLANASK, 0, 0, 100, "Recovered after failed reread"},
+    {OP_CHECK, CHK_PLANTEXT, 0, 0, 100, "Recovered after failed reread"},
+    {OP_CHECK, CHK_NOTE, -1, 0, 0, "Retry reread"},
+    {OP_CHECK, CHK_NOTEDITING, 0, 0, 0, ""},
+    {OP_PLANEDIT, 0, 0, 0, 100, ""},
+    {OP_CHECK, CHK_PLANEDITING, 0, 0, 0, ""},
+    {OP_WAIT, W_EDITSAVED, 0, 0, 10000, "6"},
+    {OP_TOUCH, 0, 0, 0, 300, "../far/remote editor.sh.release"},
+    {OP_WAIT, W_EDITED, 0, 0, 10000, ""},
+    {OP_WAIT, W_PLAN, 0, 0, 10000, "REMOTE-EDITOR-006-valid-exit"},
+    {OP_CHECK, CHK_PLANASK, 0, 0, 100, "REMOTE-EDITOR-006-valid-exit"},
+    {OP_CHECK, CHK_PLANEDITED, 0, 0, 0, "REMOTE-EDITOR-006-valid-exit"},
+    {OP_CHECK, CHK_NOTEDITING, 0, 0, 0, ""},
+    // A failed reread whose ask is answered elsewhere must not strand its
+    // session, or block the editor for the replacement pending plan.
+    {OP_PLANEDIT, 0, 0, 0, 100, ""},
+    {OP_CHECK, CHK_PLANEDITING, 0, 0, 0, ""},
+    {OP_WAIT, W_EDITSAVED, 0, 0, 10000, "7"},
+    {OP_DROPLINK, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_REMOTEDOWN, 0, 0, 15000, ""},
+    {OP_PLANWRITE, 0, 0, 0, 0, "oversize"},
+    {OP_TOUCH, 0, 0, 0, 300, "../far/remote editor.sh.release"},
+    {OP_WAIT, W_NOTE, 0, 0, 10000, "cannot reread"},
+    {OP_CHECK, CHK_REREADHELD, 0, 0, 0, ""},
+    {OP_PLANWRITE, 0, 0, 0, 0, "recovered"},
+    {OP_WAIT, W_REMOTEUP, 0, 0, 15000, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "dismiss"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_MOVE, T_DENY, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_POPUP, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 300, "Stop retrying the old plan"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 500, ""},
+    {OP_CHECK, CHK_NOTEDITING, 0, 0, 0, ""},
+    // Still connected here: otherwise Keep planning's card is read-only.
+    {OP_EDITORSET, 0, 0, 0, 0, "valid"},
+    {OP_PLANEDIT, 0, 0, 0, 100, ""},
+    {OP_CHECK, CHK_PLANEDITING, 0, 0, 0, ""},
+    {OP_WAIT, W_EDITSAVED, 0, 0, 10000, "8"},
+    {OP_MARKSESS, 0, 0, 0, 0, ""},
+    {OP_MOVE, T_DENY, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_POPUP, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 300, "Replace the old editor"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 500, ""},
+    {OP_WAIT, W_PLAN, 0, 0, 15000, "Plan v2"},
+    {OP_WAIT, W_ASK, 0, 0, 15000, ""},
+    {OP_CHECK, CHK_PLANEDITING, 0, 0, 0, ""},  // the discarded editor still holds
+    {OP_SELECTOTHER, 0, 0, 0, 0, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_PLANABSENT, 0, 0, 0, ""},
+    {OP_TOUCH, 0, 0, 0, 300, "../far/remote editor.sh.release"},
+    {OP_CHECK, CHK_PLANABSENT, 0, 0, 0, ""},
+    {OP_SELECTSESS, 0, 0, 0, 0, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_PLANPANE, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_PLAN, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_PLANABSENT, 1, 0, 0, "REMOTE-EDITOR-007-stale-saved"},
+    {OP_CHECK, CHK_NOTEDITING, 0, 0, 0, ""},
+    {OP_EDITORSET, 0, 0, 0, 0, "valid"},
+    {OP_PLANEDIT, 0, 0, 0, 100, ""},
+    {OP_CHECK, CHK_PLANEDITING, 0, 0, 0, ""},
+    {OP_WAIT, W_EDITSAVED, 0, 0, 10000, "9"},
+    {OP_TOUCH, 0, 0, 0, 300, "../far/remote editor.sh.release"},
+    {OP_WAIT, W_EDITED, 0, 0, 10000, ""},
+    {OP_WAIT, W_PLAN, 0, 0, 10000, "REMOTE-EDITOR-009-valid-exit"},
+    {OP_CHECK, CHK_PLANASK, 0, 0, 100, "REMOTE-EDITOR-009-valid-exit"},
+    {OP_CHECK, CHK_PLANEDITED, 0, 0, 0, "REMOTE-EDITOR-009-valid-exit"},
+    {OP_CHECK, CHK_PLANABSENT, 1, 0, 0, "REMOTE-EDITOR-007-stale-saved"},
+    {OP_CHECK, CHK_NOTEDITING, 0, 0, 0, ""},
     {OP_MOVE, T_ALLOW, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
@@ -23881,6 +24418,16 @@ static b32 drivewaitdone(Gui *g)
         return g->sess && !v->busy && v->turn>=(i32)g->ops[g->drivepc-1].dx;
     case W_EDITED:
         return !g->edproc;
+    case W_EDITSAVED: {
+        Arena a = g->frame;
+        Str root = os_getenv(g->os, &a, "PROSPERO_TEST_REMOTE_ROOT");
+        if (!root.len || !g->edproc) {
+            return 0;
+        }
+        Str name = join(&a, root, concat(&a, concat(&a, "remote editor.sh.",
+                                         g->ops[g->drivepc-1].text), ".saved"));
+        return os_stat(g->os, a, name).type == STAT_FILE;
+    }
     case W_NOTE:
         return g->sess && g->sess->note.len;
     case W_MARK: {
@@ -24932,6 +25479,14 @@ static b32 drivecheck(Gui *g, i32 chk)
         return boxoverlap(w.box, disp[0]) == (i64)w.box.w*w.box.h &&
                cx-dx<=4 && dx-cx<=4 && g->geom.box.x==w.box.x && g->geom.box.y==w.box.y;
     }
+    case CHK_NOTE: {
+        DriveOp *op = &g->ops[g->drivepc-1];
+        if (!op->dx) {
+            return composecheck(g, chk, op);
+        }
+        Str text = g->sess && !g->sess->gone ? g->sess->note : Str{};
+        return (find(text, op->text)>=0) == (op->dx>0);
+    }
     case CHK_PROMPT:
     case CHK_HIST:
     case CHK_DRAFTFILE:
@@ -24939,7 +25494,6 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_CMENU:
     case CHK_SELALL:
     case CHK_CLIPBOARD:
-    case CHK_NOTE:
     case CHK_MARK:
     case CHK_SLASH:
     case CHK_SLASHSEL:
@@ -24964,7 +25518,7 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_EDITING:
         return g->sess && g->edsess==g->sess && g->editshown;
     case CHK_NOTEDITING:
-        return !g->edsess && !g->edproc;
+        return !g->edsess && !g->edproc && g->edphase==EP_IDLE;
     case CHK_MODELS:
         return g->modelsshown;
     case CHK_COMPACTED: {
@@ -25950,9 +26504,28 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_PLANASK: {
         ViewMsg *m = lastmsg(g, VIEW_ASK);
+        Str text = g->ops[g->drivepc-1].text;
         return m && m->tool->answer==VASK_PENDING && m->tool->kind=="plan" &&
                m->md && find(m->text, "# Plan")==0 && g->rects[RECT_ALLOW].x1>0 &&
-               g->rects[RECT_DENY].x1>0;
+               g->rects[RECT_DENY].x1>0 &&
+               (!text.len || find(m->text, text)>=0);
+    }
+    case CHK_PLANABSENT: {
+        PlanFile *f = &g->plan;
+        Str text = g->ops[g->drivepc-1].text.len
+                       ? g->ops[g->drivepc-1].text : Str("REMOTE-EDITOR-007-stale-saved");
+        b32 have = f->have && f->text.len;
+        b32 contains = text.len && find(finish(&f->text), text)>=0;
+        // An existing plan on another session is valid. What must be absent
+        // is the older editor operation's revision, not any plan document.
+        if (!g->ops[g->drivepc-1].dx) {
+            // During selection, another session may not yet have a Plan
+            // document. The old owner must not be mistaken for the new one.
+            return g->panes[PANE_PLAN] && !f->id &&
+                   (f->s!=g->sess || !f->have || !f->text.len || !contains);
+        }
+        return g->panes[PANE_PLAN] && !f->id && f->s==g->sess && f->v==g->view &&
+               have && !contains;
     }
     case CHK_GITBRANCH: {
         GuiSession *s     = g->sess;
@@ -26227,7 +26800,20 @@ static b32 drivecheck(Gui *g, i32 chk)
         // For the plan waiting, which is held: Approve is disabled
         i32 k = planask(v);
         return g->sess && g->edsess==g->sess && g->edplan && g->edproc && k>=0 &&
-               g->edreq==v->msgs[k].tool->req && planediting(g, g->sess, g->edreq);
+               (g->edreq==v->msgs[k].tool->req ||
+                (g->edphase==EP_DISCARD && !g->edreq.len)) &&
+               planediting(g, g->sess, v->msgs[k].tool->req);
+    }
+    case CHK_REREADHELD: {
+        i32 k = planask(v);
+        if (k<0 || g->edsess!=g->sess || !g->edreq.len ||
+                g->edreq!=v->msgs[k].tool->req) {
+            return 0;
+        }
+        Arena a = g->frame;
+        return g->edplan && !g->edproc && g->edphase==EP_FAILED &&
+               planediting(g, g->sess, g->edreq) &&
+               editorwhy(g, g->sess, &a).len && editorwhy(g, 0, &a).len;
     }
     case CHK_PLANPLAIN:
         return g->sess && g->edsess==g->sess && g->edplan && g->edproc &&
@@ -26277,7 +26863,8 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_PLANEDITED: {
         ViewMsg *m = lastmsg(g, VIEW_ASK);
-        return !g->edproc && g->planedits>0 && m && m->tool->kind=="plan" &&
+        return !g->edproc && g->edphase==EP_IDLE && g->planedits>0 &&
+               m && m->tool->kind=="plan" &&
                m->tool->answer==VASK_PENDING && find(m->text, g->ops[g->drivepc-1].text)>=0;
     }
     case CHK_LAUNCHDIR:
@@ -27797,6 +28384,123 @@ static void drivestep(Gui *g)
             g->drivefails++;
         }
         scheddirty(&g->sched);
+    } break;
+    case OP_EDITORSET: {
+        Arena a = g->frame;
+        Str set = op->text;
+        Str script = os_getenv(g->os, &a, "PROSPERO_TEST_REMOTE_EDITOR");
+        if (set == "valid" && (!script.len || !os_getenv(g->os, &a, "PROSPERO_TEST_REMOTE_ROOT").len)) {
+            guilog(g, "drive: skip the controlled remote editor");
+            g->drivepc += (i32)op->dx;
+            break;
+        }
+        if (set == "valid") {
+            set = script;
+        } else if (set == "missing") {
+            set = "/definitely/not/a/prospero-editor {path}";
+        } else if (set == "invalid") {
+            set = "editor '{path}";
+        }
+        Str name = g->sess && g->sess->host->kind==GH_REMOTE ? g->sess->host->name : Str{};
+        b32 found = 0;
+        for (iz i = 0; name.len && i < g->cfgrows.len; i++) {
+            CfgRow *r = &g->cfgrows[i];
+            if (r->kind=="remote" && r->name==name && r->key=="editor") {
+                r->value  = clone(&g->cfgmem, op->text.len ? set : Str{});
+                r->valid  = 1;
+                r->isdflt = !op->text.len;
+                found     = 1;
+            }
+        }
+        if (!found && name.len && set.len) {
+            CfgRow row = {};
+            row.kind  = "remote";
+            row.name  = name;
+            row.key   = "editor";
+            row.value = clone(&g->cfgmem, set);
+            row.valid = 1;
+            g->cfgrows = push(&g->cfgmem, g->cfgrows, row);
+            found = 1;
+        }
+        if (!found) {
+            guilog(g, "drive: FAIL no remote editor setting to override");
+            g->drivechecks++;
+            g->drivefails++;
+        }
+        scheddirty(&g->sched);
+    } break;
+    case OP_PLANEDIT: {
+        Arena a = g->frame;
+        i32 k = g->sess && g->sess->view ? planask(g->sess->view) : -1;
+        if (k < 0) {
+            guilog(g, "drive: FAIL no pending plan for the controlled editor");
+            g->drivechecks++;
+            g->drivefails++;
+            break;
+        }
+        GuiSession *s = g->sess;
+        ViewTool *t = s->view->msgs[k].tool;
+        planedit(g, a, s, t->path.len ? t->path : s->view->planpath, t->req);
+    } break;
+    case OP_PLANPANE:
+        setpane(g, PANE_PLAN, 1);
+        break;
+    case OP_SELECTOTHER: {
+        b32 found = 0;
+        for (GuiSession *s = g->sessions; s; s = s->next) {
+            if (s!=g->drivesess && s->host->kind==GH_REMOTE && sessgo(g, s)) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            guilog(g, "drive: FAIL no imported remote session to select");
+            g->drivechecks++;
+            g->drivefails++;
+        }
+    } break;
+    case OP_SELECTSESS:
+        if (!g->drivesess || !sessgo(g, g->drivesess)) {
+            guilog(g, "drive: FAIL cannot restore the original session");
+            g->drivechecks++;
+            g->drivefails++;
+        }
+        break;
+    case OP_PLANRETRY: {
+        Arena a = g->frame;
+        i32 k = g->sess && g->sess->view ? planask(g->sess->view) : -1;
+        if (k >= 0) {
+            planretry(g, a, g->sess, g->sess->view->msgs[k].tool->req);
+        }
+    } break;
+    case OP_PLANWRITE: {
+        Arena a = g->frame;
+        Str root = os_getenv(g->os, &a, "PROSPERO_TEST_REMOTE_ROOT");
+        GuiSession *s = g->sess;
+        if (!root.len || !s || !s->view || !startswith(s->view->planpath, root)) {
+            guilog(g, "drive: SKIP changing the fake remote's plan directly");
+            break;
+        }
+        b32 recovered = op->text == "recovered";
+#ifdef _WIN32
+        guilog(g, "drive: skip the POSIX unreadable-plan failure fixture");
+#else
+        // The fake remote is this filesystem: force a real read denial, then
+        // restore permission before its requested retry. No public writeback.
+        if (chmod(cstr0(&a, s->view->planpath), recovered ? 0600 : 0) != 0) {
+            guilog(g, concat(&a, "drive: could not change the fixture mode: ",
+                             os_lasterr(g->os, &a)));
+        }
+#endif
+        if (recovered) {
+            Buf text(&a, 128);
+            print(&text, "# Plan\n\n- Recovered after failed reread\n");
+            if (!os_write(g->os, a, s->view->planpath, finish(&text))) {
+                guilog(g, "drive: FAIL could not prepare the remote plan fixture");
+                g->drivechecks++;
+                g->drivefails++;
+            }
+        }
     } break;
     case OP_PLACE:
         if (op->dx != 0) {
