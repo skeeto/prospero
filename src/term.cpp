@@ -1488,10 +1488,11 @@ static void termpasteask(Gui *g, Arena a)
 }
 
 // Whether a chord on Windows and Linux is the app's, not the terminal's:
-// Ctrl+` and Ctrl+Shift+`, copy and paste, zoom, and the menus' Ctrl+Shift
-// chords (menukeys), which route over the terminal. Every other Ctrl
-// chord goes to the terminal: Ctrl+N, Ctrl+F, Ctrl+1 and the rest, and
-// every chord with AltGr, which types (German Ctrl+AltGr+ß is Ctrl+\).
+// Ctrl+` and Ctrl+Shift+`, copy and paste, zoom (by the character typed,
+// zoomkey), and the menus' Ctrl+Shift chords (menukeys), which route over
+// the terminal. Every other Ctrl chord goes to the terminal: Ctrl+N,
+// Ctrl+F, Ctrl+1 and the rest, and every chord with AltGr, which types
+// (German Ctrl+AltGr+ß is Ctrl+\).
 static b32 termkept(Gui *g, ImGuiKey k)
 {
     ImGuiIO &io = ImGui::GetIO();
@@ -1500,21 +1501,20 @@ static b32 termkept(Gui *g, ImGuiKey k)
     }
     switch (k) {
     case ImGuiKey_GraveAccent:
-    case ImGuiKey_Equal:      // Ctrl++ is Ctrl+Shift+= on US layouts
         return 1;
     case ImGuiKey_KeypadAdd:
-    case ImGuiKey_Minus:
-    case ImGuiKey_0:
     case ImGuiKey_KeypadSubtract:
     case ImGuiKey_Keypad0:
         return !io.KeyShift;
+    case ImGuiKey_0:          // Shift+0 is = on German layouts
+        return !io.KeyShift || zoomkey(g, k, 1);
     case ImGuiKey_V:          // Windows pastes with Ctrl+V too
         return io.KeyShift || HOST_WINDOWS;
     case ImGuiKey_C: case ImGuiKey_N:
     case ImGuiKey_S: case ImGuiKey_T: case ImGuiKey_R:
         return io.KeyShift;
     default:
-        return 0;
+        return zoomkey(g, k, io.KeyShift) != 0;
     }
 }
 
@@ -1522,12 +1522,17 @@ static b32 termkept(Gui *g, ImGuiKey k)
 static b32 termkeptpressed(Gui *g)
 {
     static ImGuiKey const keys[] = {
-        ImGuiKey_GraveAccent, ImGuiKey_Equal, ImGuiKey_KeypadAdd,
-        ImGuiKey_Minus, ImGuiKey_0, ImGuiKey_KeypadSubtract, ImGuiKey_Keypad0,
-        ImGuiKey_C, ImGuiKey_V, ImGuiKey_N, ImGuiKey_S, ImGuiKey_T, ImGuiKey_R,
+        ImGuiKey_GraveAccent, ImGuiKey_KeypadAdd, ImGuiKey_KeypadSubtract,
+        ImGuiKey_Keypad0, ImGuiKey_C, ImGuiKey_V, ImGuiKey_N, ImGuiKey_S,
+        ImGuiKey_T, ImGuiKey_R,
     };
     for (iz i = 0; i < countof(keys); i++) {
         if (ImGui::IsKeyPressed(keys[i], false) && termkept(g, keys[i])) {
+            return 1;
+        }
+    }
+    for (iz i = 0; i < countof(zoomkeys); i++) {  // ImGuiKey_0 among them
+        if (ImGui::IsKeyPressed(zoomkeys[i], false) && termkept(g, zoomkeys[i])) {
             return 1;
         }
     }

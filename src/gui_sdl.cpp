@@ -2049,6 +2049,35 @@ static void os_guiflash(Os *os, i32 how)
                                                     SDL_FLASH_UNTIL_FOCUSED);
 }
 
+// A text key's scancode before it is first pressed (keysc): letters and
+// digits by the layout, which the backend names them by, and the rest by
+// the position its fallback names them by. Menukeys asks of zoom keys a
+// frame before their first press, since a route holds from the next.
+static SDL_Scancode sdlkeyscan(i32 key)
+{
+    if (key>=ImGuiKey_A && key<=ImGuiKey_Z) {
+        return SDL_GetScancodeFromKey((SDL_Keycode)(SDLK_A + (key - ImGuiKey_A)), 0);
+    } else if (key>=ImGuiKey_0 && key<=ImGuiKey_9) {
+        return SDL_GetScancodeFromKey((SDL_Keycode)(SDLK_0 + (key - ImGuiKey_0)), 0);
+    }
+    switch (key) {
+    case ImGuiKey_GraveAccent:  return SDL_SCANCODE_GRAVE;
+    case ImGuiKey_Minus:        return SDL_SCANCODE_MINUS;
+    case ImGuiKey_Equal:        return SDL_SCANCODE_EQUALS;
+    case ImGuiKey_LeftBracket:  return SDL_SCANCODE_LEFTBRACKET;
+    case ImGuiKey_RightBracket: return SDL_SCANCODE_RIGHTBRACKET;
+    case ImGuiKey_Oem102:       return SDL_SCANCODE_NONUSBACKSLASH;
+    case ImGuiKey_Backslash:    return SDL_SCANCODE_BACKSLASH;
+    case ImGuiKey_Semicolon:    return SDL_SCANCODE_SEMICOLON;
+    case ImGuiKey_Apostrophe:   return SDL_SCANCODE_APOSTROPHE;
+    case ImGuiKey_Comma:        return SDL_SCANCODE_COMMA;
+    case ImGuiKey_Period:       return SDL_SCANCODE_PERIOD;
+    case ImGuiKey_Slash:        return SDL_SCANCODE_SLASH;
+    case ImGuiKey_Space:        return SDL_SCANCODE_SPACE;
+    default:                    return SDL_SCANCODE_UNKNOWN;
+    }
+}
+
 static u32 os_guikeycp(Os *os, i32 key, b32 shift)
 {
     GuiSdl *p = (GuiSdl *)os->gui;
@@ -2056,6 +2085,7 @@ static u32 os_guikeycp(Os *os, i32 key, b32 shift)
         return 0;
     }
     SDL_Scancode sc = (SDL_Scancode)p->keysc[key - ImGuiKey_NamedKey_BEGIN];
+    sc = sc ? sc : sdlkeyscan(key);
     if (!sc) {
         return 0;
     }

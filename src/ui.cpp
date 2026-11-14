@@ -15587,6 +15587,31 @@ static b32 filesfocused(Gui *g)
     return !ImGui::GetTopMostPopupModal() && g->fileswindow && nav;
 }
 
+// The text keys that may zoom (zoomkey), which the backends name by
+// their US position, all but digits, letters, Space and `.
+static ImGuiKey const zoomkeys[] = {
+    ImGuiKey_Minus, ImGuiKey_Equal, ImGuiKey_LeftBracket, ImGuiKey_RightBracket,
+    ImGuiKey_Semicolon, ImGuiKey_Apostrophe, ImGuiKey_Backslash, ImGuiKey_Comma,
+    ImGuiKey_Period, ImGuiKey_Slash, ImGuiKey_Oem102,
+    ImGuiKey_0, ImGuiKey_1, ImGuiKey_2, ImGuiKey_3, ImGuiKey_4,
+    ImGuiKey_5, ImGuiKey_6, ImGuiKey_7, ImGuiKey_8, ImGuiKey_9,
+};
+
+// Whether a Ctrl (Cmd) chord's text key zooms, by the character it types
+// under the layout, not by its position: + or = zooms in (1), - out (-1),
+// else 0. So Ctrl++ is Ctrl+Shift+= on US, Ctrl++ on German and Nordic
+// layouts, where - is where US has /, and = is Shift+0. Not the key left
+// of 1, Ctrl+`'s by position, and not an unshifted digit, Ctrl+1 to
+// Ctrl+9's (AZERTY's - is on 6).
+static i32 zoomkey(Gui *g, ImGuiKey k, b32 shift)
+{
+    if (k==ImGuiKey_GraveAccent || (!shift && k>=ImGuiKey_0 && k<=ImGuiKey_9)) {
+        return 0;
+    }
+    u32 cp = os_guikeycp(g->os, k, shift);
+    return cp=='+' || cp=='=' ? 1 : cp=='-' ? -1 : 0;
+}
+
 // The menus' shortcuts, wherever the focus is (a global route, which a
 // focused field's own use of a key goes ahead of): a new session, zoom
 // by key or by Ctrl+wheel (Cmd on macOS), find (the Files find while
@@ -15610,14 +15635,23 @@ static void menukeys(Gui *g)
     if (ImGui::Shortcut(ctrl|ImGuiMod_Shift|ImGuiKey_N, keep)) {
         newfree(g);
     }
-    if (ImGui::Shortcut(ctrl|ImGuiKey_Equal, keep) ||
-            ImGui::Shortcut(ctrl|ImGuiMod_Shift|ImGuiKey_Equal, keep) ||
-            ImGui::Shortcut(ctrl|ImGuiKey_KeypadAdd, keep)) {
-        zoomby(g, 1);
+    // Zoom by the character typed (zoomkey). Both Shift chords route each
+    // frame, since a route holds from the frame after it is asked for.
+    i32 zoom = 0;
+    zoom = ImGui::Shortcut(ctrl|ImGuiKey_KeypadAdd, keep)      ?  1 : zoom;
+    zoom = ImGui::Shortcut(ctrl|ImGuiKey_KeypadSubtract, keep) ? -1 : zoom;
+    for (iz i = 0; i < countof(zoomkeys); i++) {
+        for (i32 shift = 0; shift < 2; shift++) {
+            ImGuiKey k   = zoomkeys[i];
+            i32      dir = zoomkey(g, k, shift);
+            ImGuiKeyChord mods = ctrl | (shift ? (ImGuiKeyChord)ImGuiMod_Shift : 0);
+            if (dir && ImGui::Shortcut(mods|k, keep)) {
+                zoom = dir;
+            }
+        }
     }
-    if (ImGui::Shortcut(ctrl|ImGuiKey_Minus, keep) ||
-            ImGui::Shortcut(ctrl|ImGuiKey_KeypadSubtract, keep)) {
-        zoomby(g, -1);
+    if (zoom) {
+        zoomby(g, zoom);
     }
     if (ImGui::Shortcut(ctrl|ImGuiKey_0, keep) ||
             ImGui::Shortcut(ctrl|ImGuiKey_Keypad0, keep)) {

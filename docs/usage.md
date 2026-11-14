@@ -49,7 +49,8 @@ compositor decides focus. A different `--statedir` (or `XDG_STATE_HOME`)
 is a separate instance. `--session SID` opens the window on that session.
 The View menu shows and hides the panes and zooms
 the text for the run (Ctrl+=, Ctrl+- and Ctrl+0, Cmd on macOS, or the
-wheel with the key held); `[ui] font_size` (17 pixels by default) sets its
+wheel with the key held), by the character the keyboard layout types,
+so Ctrl++ and Ctrl+- on German; `[ui] font_size` (17 pixels by default) sets its
 size for good. Chinese, Japanese and Korean come from the system's fonts,
 which the built-in ones lack: those fontconfig, CoreText or Windows' display
 language picks, or the files `[ui] fonts` names. View → Layout, View's first item, arranges the panes as
