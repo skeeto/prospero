@@ -110,6 +110,11 @@ built-in themes and cannot be reused.
 
 A theme is an ordinary section, so it may come from an include.
 
+The [monocream](https://github.com/skeeto/prospero/blob/master/assets/themes/monocream.ini)
+theme, by Stian Gudmundsen Høiland (stianhoiland), lists every color there
+is to set as well: a minimal, monochrome-ish, amber, no-blue dark theme
+inspired by the plan9's sam color palette--but dark!
+
 ## Session titles
 
 After a session's first turn, its model is asked for a title, on the

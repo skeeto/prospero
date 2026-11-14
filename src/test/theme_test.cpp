@@ -40,6 +40,9 @@ static f64 contrast(u32 a, u32 b)
 static u8 const gruvini[] = {
     #embed "../../assets/themes/gruvbox.ini"
 };
+static u8 const monoini[] = {
+    #embed "../../assets/themes/monocream.ini"
+};
 #ifdef __clang__
 #  pragma clang diagnostic pop
 #endif
@@ -106,8 +109,23 @@ static void test_theme(Test *t)
     expect(t, "theme.gruvbox.blue", istr(&a, gruvbox.ansi[4]), istr(&a, rgb(69, 133, 136)));
     cfgfree(c);
 
-    Palette *pals[]  = {&themedark, &themelight, &gruvbox};
-    Str      names[] = {"theme.dark ", "theme.light ", "theme.gruvbox "};
+    // The shipped monocream, included as a user's configuration would. Its
+    // colors are the author's own, so the checks below fail on it until the
+    // palette is revised with them, and they are named for it either way.
+    CfgEnv mv = newcfgenv(&a);
+    os_write(mv.os, a, "/c/themes/monocream.ini", Str{(u8 *)monoini, countof(monoini)});
+    os_write(mv.os, a, "/c/prospero.ini",
+             "include = themes/monocream.ini\n[ui]\ntheme = monocream\n");
+    Config *mc = newconfig(mv.os, &a, mv.scratch, "/c/prospero.ini", 0);
+    expect(t, "theme.monocream.diags", inidiags(&a, mc->ini), "");
+    Palette monocream = themebuild(cfgget(mc, "theme", "monocream", "base", 0),
+                                   [&](Str key) { return cfgget(mc, "theme", "monocream", key, 0); });
+    expect(t, "theme.monocream.panel", istr(&a, monocream.panel), istr(&a, rgb(25, 25, 0)));
+    expect(t, "theme.monocream.blue", istr(&a, monocream.ansi[4]), istr(&a, rgb(200, 200, 120)));
+    cfgfree(mc);
+
+    Palette *pals[]  = {&themedark, &themelight, &gruvbox, &monocream};
+    Str      names[] = {"theme.dark ", "theme.light ", "theme.gruvbox ", "theme.monocream "};
     for (iz p = 0; p < countof(pals); p++) {
         Palette *pal  = pals[p];
         Str      name = names[p];
