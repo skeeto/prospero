@@ -8563,8 +8563,8 @@ def compact_manual(t):
 @scenario(conf=SMALL, bound=40, alone=True)
 def compact_heed_now(t):
     """A summary at the threshold, mid-turn and in Build mode: the step
-    right after it already has the notices of what it may have left out,
-    rather than learning them a step late."""
+    right after it already has what changed since the session began, in
+    its rebuilt system prompt, rather than learning it a step late."""
     t.host.mkdir(t.host.join(t.work, ".git"))
     t.put("AGENTS.md", "Rule one.\n")
     bigfiles(t, 8, 150)
@@ -8586,19 +8586,22 @@ def compact_heed_now(t):
               (not checkpointed(reqs[k-1]) or reqs[k][1] != reqs[k-1][1])]
     t.check(len(starts) >= 2, f"summarized in both turns: {starts}")
     first = reqs[starts[-1]]
+    system = first[0]["content"]
+    t.check("Rule two, longer." in system and "Rule one." not in system,
+            "in the system prompt at once")
     told = [str(m.get("content")) for m in first[2:] if m.get("role") == "user" and
             str(m.get("content")).startswith("Your conversation was summarized")]
-    t.check(told and "Rule two, longer." in told[0],
-            f"told at once: {[str(m.get('content'))[:60] for m in first[2:]]}")
+    t.check(not told, f"no notice for it: {told}")
 
 
 @scenario(conf=BIG, bound=60, alone=True)
 def compact_heed(t):
-    """A summary may leave out the notices since the system prompt, so
-    the agent is told again what differs from it: a changed instruction
-    file, one loaded for a subdirectory, and its memory, saved by itself.
-    Against the prompt, so a session opened again and summarized again
-    is told again; the prompt stays as it was."""
+    """A summary begins the conversation again, and the system prompt
+    with it (#57): rebuilt as a new session's, with the changed
+    instruction file and the memory saved since. What a new prompt
+    leaves out, an instruction file loaded for a subdirectory, the agent
+    is told again. Opened again, the session sends the rebuilt prompt,
+    and summarized again, the same prompt byte for byte."""
     t.host.mkdir(t.host.join(t.work, ".git"))
     t.put("AGENTS.md", "Rule one.\n")
     t.host.mkdir(t.host.join(t.work, "sub"))
@@ -8630,19 +8633,20 @@ def compact_heed(t):
     t.check(rc == 0, f"headless exit {rc}")
     reqs = [chat(x) for x in t.requests()]
     system = reqs[0][0]["content"]
-    t.check(all(m[0]["content"] == system for m in reqs), "the system prompt stays")
+    before = [m for m in reqs if not checkpointed(m)]
+    t.check(all(m[0]["content"] == system for m in before), "the system prompt stays until then")
     t.check("Rule one." in system and "Sub rule." not in system and
             system.endswith("MEMORY.md:\n\n(empty: no memories yet)"), "the prompt as it began")
     last = reqs[-1]
     t.check(checkpointed(last), "summarized")
+    rebuilt = last[0]["content"]
+    t.check("Rule two, longer." in rebuilt and "Rule one." not in rebuilt and
+            "Sub rule." not in rebuilt and rebuilt.endswith(line), "the prompt rebuilt")
     notes = told(last)
-    t.check(len(notes) == 2, f"two notices: {notes}")
+    t.check(len(notes) == 1, f"one notice: {notes}")
     ins = [x for x in notes if "instructions you were given" in x]
-    t.check(ins and "AGENTS.md (new version)\n\nRule two, longer." in ins[0] and
-            "sub/AGENTS.md (for the files under sub)\n\nSub rule." in ins[0].replace("\\", "/")
-            and "Rule one." not in ins[0], f"the instructions: {ins}")
-    mem = [x for x in notes if "MEMORY.md now reads" in x]
-    t.check(mem and mem[0].endswith("MEMORY.md now reads:\n\n" + line), f"the memory: {mem}")
+    t.check(ins and "sub/AGENTS.md (for the files under sub)\n\nSub rule." in ins[0].replace("\\", "/")
+            and "Rule two" not in ins[0], f"the instructions: {ins}")
 
     # Opened again: told nothing more until summarized again, then the same
     h = t.headless()
@@ -8651,7 +8655,8 @@ def compact_heed(t):
         h.send("prompt", sid=sid, text="read them")
         ended(h, sid, 5)
         n = len(t.requests())
-        t.check(len(told(chat(t.requests()[-1]))) == 2, "nothing new before")
+        t.check(len(told(chat(t.requests()[-1]))) == 1, "nothing new before")
+        t.check(chat(t.requests()[-1])[0]["content"] == rebuilt, "the rebuilt prompt, replayed")
         t.check(h.call("compact", sid=sid).get("ok") == 1, "compact again")
         ended(h, sid, 6)
         h.send("prompt", sid=sid, text="later")
@@ -8660,10 +8665,63 @@ def compact_heed(t):
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")
     again = told(chat(t.requests()[-1]))
-    t.check(len(t.requests()) > n and len(again) == 2 and
-            sorted(x.split(".")[0] for x in again) == sorted(x.split(".")[0] for x in notes),
-            f"told again: {again}")
-    t.check([x for x in again if "MEMORY.md now reads" in x][0].endswith(line), "the same memory")
+    t.check(len(t.requests()) > n and again == notes, f"told again: {again}")
+    t.check(chat(t.requests()[-1])[0]["content"] == rebuilt, "the same prompt, byte for byte")
+
+
+@scenario(conf=BIG, bound=40, alone=True)
+def compact_shell(t):
+    """The prefix rebuilt by a summary (#57) describes the shell the
+    user switched to, not the configured default, and the agent hears
+    of the switch no more after it, also once the session is opened
+    again."""
+    if t.host.windows:
+        raise Skip("a POSIX shell script")
+    other = t.host.join(t.base, "other-sh")
+    t.host.write(other, '#!/bin/sh\nexec /bin/sh "$@"\n')
+    os.chmod(other, 0o755)
+    t.host.write(t.config, t.host.read(t.config) + f"[shell other]\nprogram = {other}\n")
+    bigfiles(t, 8, 256)
+
+    def shelldesc(req):
+        return (tooldef(req, "shell") or {}).get("description", "")
+
+    def toldafter(sid):
+        evs = logged(t, sid)
+        at = max(i for i, x in enumerate(evs) if x.get("ev") == "compact")
+        return [x for x in evs[at:] if x.get("ev") == "notice" and x.get("kind") == "shell"]
+
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="read them")
+        ended(h, sid, 1)
+        t.check(other not in shelldesc(t.requests()[0]["body"]), "the default shell first")
+        r = h.call("shell", sid=sid, shell="other")
+        t.check(r.get("ok") == 1, f"switched {r}")
+        t.check(h.call("compact", sid=sid).get("ok") == 1, "compact")
+        ended(h, sid, 2)
+        h.send("prompt", sid=sid, text="after")
+        ended(h, sid, 3)
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+    last = t.requests()[-1]["body"]
+    t.check(checkpointed(chat(t.requests()[-1])), "summarized")
+    t.check(other in shelldesc(last), f"the switched shell: {shelldesc(last)[:120]}")
+    t.check(not toldafter(sid), f"not told again: {toldafter(sid)}")
+
+    h = t.headless()
+    try:
+        t.check(h.call("open", sid=sid).get("ok") == 1, "reopened")
+        h.send("prompt", sid=sid, text="later")
+        ended(h, sid, 4)
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+    again = t.requests()[-1]["body"]
+    t.check(again["tools"] == last["tools"], "the same tools, replayed")
+    t.check(not toldafter(sid), f"not told after opening: {toldafter(sid)}")
 
 
 @scenario(conf=BIG, bound=25, alone=True)
@@ -12985,6 +13043,44 @@ def mcp_untick(t):
         told = json.dumps(body["messages"])
         t.check("New tools from MCP servers are available now" in told and
                 "mcp__fake__image" in told, "told of the new tools")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf={**BIG, **mcpconf(trust="yes", tools="echo")}, bound=40)
+def mcp_compact(t):
+    """A summary rebuilds the prefix as a new session's would be (#57):
+    its MCP tools taken again from the tools key as it is now, a tool
+    turned off gone and one turned on there, with the server's
+    instructions once. Joining the rebuilt prefix is not news."""
+    bigfiles(t, 8, 256)
+    h = t.headless(env=mcpenv(t))
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.send("prompt", sid=sid, text="read them")
+        t.check(ended(h, sid, 1)["why"] == "done", "the first turn ends")
+        first = t.requests()[0]["body"]
+        names = [x for x in fake_provider.tool_names(first) if x.startswith("mcp__")]
+        t.check(names == ["mcp__fake__echo"], f"only echo at first: {names}")
+        r = h.call("config.set", kind="mcp", name="fake", key="tools", value="image")
+        t.check(r.get("ok") == 1, f"set {r}")
+        r = h.call("compact", sid=sid)
+        t.check(r.get("ok") == 1, f"compact {r}")
+        ended(h, sid, 2)
+        n = len(t.requests())
+        h.send("prompt", sid=sid, text="after")
+        ended(h, sid, 3)
+        body = t.requests()[n]["body"]
+        names = [x for x in fake_provider.tool_names(body) if x.startswith("mcp__")]
+        t.check(names == ["mcp__fake__image"], f"image alone now: {names}")
+        t.check("read" in fake_provider.tool_names(body), "the built-in tools")
+        sysp = fake_provider.system_of(body)
+        t.check(sysp.count("# MCP server instructions") == 1 and
+                "Use echo to repeat things." in sysp, "the server's instructions, once")
+        # Told once, as its summary's request took it in, not again
+        told = json.dumps(body["messages"]).count("New tools from MCP servers")
+        t.check(told == 1, f"told once: {told}")
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")

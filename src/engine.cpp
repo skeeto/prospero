@@ -963,6 +963,7 @@ struct Session {
     Slice<McpServer *> mcpsrvs;   // the servers it offers
     Str          mcpfilter;  // its role's tools, null for every MCP tool
     b32          mcpfixed;   // its tools were fixed by a request
+    b32          mcpquiet;   // they join a rebuilt prefix, untold (reprefix)
     Slice<Str>   mcpwarned;  // servers whose failure it was told
     McpServer   *mcpsrv;     // the server of the call running, if MCP's
     i64          mcpcall;    // that call's request id, -1 until it is sent
@@ -4058,6 +4059,19 @@ static Slice<Str> instrlist(Session *s, Arena *a)
         return {};
     }
     return instrnames(a, cfgget(s->e->cfg, "instructions", "", "files", 0));
+}
+
+// Forget the stamps of the files the system prompt had, as it is built
+// again: those below the working directory, loaded since, stay.
+static void instrunstamp(Session *s)
+{
+    Slice<InstrStamp> keep = {};
+    for (iz i = 0; i < s->instrfiles.len; i++) {
+        if (!s->instrfiles[i].prompt) {
+            keep = push(&s->perm, keep, s->instrfiles[i]);
+        }
+    }
+    s->instrfiles = keep;
 }
 
 // Stamp files just loaded: into the system prompt, or later for the
@@ -12098,7 +12112,9 @@ static b32 mcpgate(Session *s, Arena scratch)
         }
     }
     b32 fixed = s->mcpfixed;
+    b32 quiet = s->mcpquiet;
     s->mcpfixed = 1;  // logged with the tools, if any: else the session
+    s->mcpquiet = 0;
     if (!add.len) {   // opened again waits for its servers once more
         return 1;
     }
@@ -12111,7 +12127,7 @@ static b32 mcpgate(Session *s, Arena scratch)
         b32 first = find(s->system, "\n# MCP server instructions\n") < 0;
         s->system = concat(&s->perm, s->system, mcpinstructions(&scratch, m->name, m->instr, first));
     }
-    if (fixed || had || s->turn>1) {
+    if (!quiet && (fixed || had || s->turn>1)) {
         // Mid-session: the agent is told what it has now
         Buf b(&scratch, 256);
         print(&b, "New tools from MCP servers are available now:");
@@ -15021,6 +15037,8 @@ static void sendcompact(Session *s, Arena scratch)
     setstate(s, S_HEAD);
 }
 
+static void reprefix(Session *, Arena);
+
 // The summary arrived: rebuild the history around it, log it, and carry
 // on with the step, unless the prompt is still above the goal after a
 // compaction at the threshold (the progress guard): compacting again
@@ -15104,6 +15122,7 @@ static void compacted(Session *s, Arena scratch, Partial *p)
         failcompact(s, scratch, CLASS_DETERMINISTIC, 0, why, -1);
         return;
     }
+    reprefix(s, scratch);
     Files f = summaryfiles(&scratch, s->summary);
     f = addfiles(&scratch, f, s->history, cp.start, cp.cut);
     Str summary = withfiles(&s->perm, text, f);
@@ -17036,6 +17055,57 @@ static void buildprefix(Session *s, Arena scratch)
         s->system = concat(&s->perm, s->system, mem);
     }
     s->memsys = s->memseen;
+}
+
+static void logprefix(Session *, Arena);
+
+// Compacting begins the conversation again, and its prefix with it:
+// built as a new session's would be now, from its instructions, memory,
+// skills, configuration and tools as they are, so that a long session
+// learns what it gained since it began. It keeps the shell commands run
+// in, and its MCP tools join it again before the next request (mcpgate),
+// as they do a new session's. Recorded before the summary, which takes
+// the prefix as told (shellheard).
+static void reprefix(Session *s, Arena scratch)
+{
+    if (s->readonly || s->wtdefer || !s->system.data) {
+        return;
+    }
+    instrunstamp(s);
+    s->instr = {};
+    instrstart(s, scratch);
+    Slice<InstrStamp> stamps = {};  // nested files now in the prompt
+    for (iz i = 0; i < s->instrfiles.len; i++) {
+        InstrStamp *k   = &s->instrfiles[i];
+        b32         dup = 0;
+        for (iz j = 0; !k->prompt && j < s->instrfiles.len; j++) {
+            dup |= s->instrfiles[j].prompt && s->instrfiles[j].path==k->path;
+        }
+        if (!dup) {
+            stamps = push(&s->perm, stamps, *k);
+        }
+    }
+    s->instrfiles = stamps;
+    instrlogstart(s, scratch);
+
+    if (s->memdir.len) {
+        s->memseen = clone(&s->perm, memread(s, &scratch));
+    }
+
+    Shell from = s->shellfrom;
+    s->shellfrom = s->te.shell.path.len ? s->te.shell : from;
+    buildprefix(s, scratch);
+    s->shellfrom = from;
+    s->shellmiss = {};
+    s->shelluser = 0;
+    if (s->memdir.len) {
+        logmem(s, scratch, "start");
+    }
+
+    s->mcptools = {};
+    s->mcpfixed = 0;
+    s->mcpquiet = 1;
+    logprefix(s, scratch);
 }
 
 // The prefix's durable record, so that the session opened again, or
@@ -19730,6 +19800,7 @@ static void replaytools(Session *s, Arena scratch, EvRec *r)
     case EV_INSTRUCTIONS: {
         Str why = jsonstr(jsonget(j, "why"));
         if (why == "start") {
+            instrunstamp(s);  // a prompt rebuilt since (reprefix)
             s->instr = clone(&s->perm, jsonstr(jsonget(j, "text")));
             s->instr.data = s->instr.data ? s->instr.data : (u8 *)"";
             webnote(s, scratch, s->instr, 0);

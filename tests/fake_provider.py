@@ -5071,6 +5071,8 @@ def sc_compact_manual(model, n, req):
 
 
 sc_compact_cancel = sc_compact_manual
+sc_mcp_compact = sc_compact_manual
+sc_compact_shell = sc_compact_manual
 
 
 def sc_todo_compact(model, n, req):
