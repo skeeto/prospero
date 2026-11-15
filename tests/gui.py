@@ -194,6 +194,18 @@ printf -- '- Revised by hand.\\n' >> "$1"
 """
 
 
+# The remote mode's fake gvim, found on [tools] path_prepend: Open in
+# editor and Edit plan run it here with the file's scp:// address there,
+# which, far being this machine, names a file here; it revises the file
+# as the plan mode's editor does
+FAR_GVIM = """#!/bin/sh
+for f in "$@"; do :; done
+case $f in scp://*//*) f=/${f#scp://*//};; esac
+sleep 1
+printf -- '- Revised by hand.\\n' >> "$f"
+"""
+
+
 # The drive mode's editor: Open in editor in Settings adds a model to
 # the configuration file by hand, which the diff of the file allows for
 CONFIG_EDITED = "\n# Added in the editor\n[model edited-by-hand]\ntemperature = 0.3\n"
@@ -1658,6 +1670,7 @@ class Far:
         # Far runs on Windows: driven over --host, or this machine itself
         self.winfar = self.windows or os.name == "nt"
         self.server = None
+        self.gvim = None  # the fake gvim's folder, here only
         if self.local:
             self.root = host.path("far")
             self.prospero = host.h.exe if self.windows else host.prospero
@@ -1738,6 +1751,10 @@ class Far:
                     os.chmod(mg, 0o755)
                     host.write(os.path.join(home, ".profile"),
                                f"VISUAL={shword(mg)}; export VISUAL\n")
+                    host.mkdir(self.root + "/bin")
+                    host.write(self.root + "/bin/gvim", FAR_GVIM)
+                    os.chmod(self.root + "/bin/gvim", 0o755)
+                    self.gvim = self.root + "/bin"
                     env = dict(os.environ, HOME=home, SHELL="/bin/sh")
             # The host first, here: started through the fake ssh, it would
             # descend from the GUI's reaper (Linux: a subreaper), or stay
@@ -1773,7 +1790,9 @@ class Far:
 
     def section(self):
         dest = "here" if self.local else self.args.ssh
-        return (f"\n# The checklist's remote host\n[remote r]\nssh = {dest}\n"
+        gvim = (f"\n# The fake gvim, which reaches r's files by scp://\n"
+                f"[tools]\npath_prepend = {self.gvim}\n" if self.gvim else "")
+        return gvim + (f"\n# The checklist's remote host\n[remote r]\nssh = {dest}\n"
                 f"path = {self.prospero}\nstate = {self.state}\nconfig = {self.config}\n"
                 f"\n# One that fails: ssh would take its destination for an option\n"
                 f"[remote bad]\nssh = -oProxyCommand=false\n"
@@ -1807,7 +1826,7 @@ class Far:
         # login shell has the fake mg as $VISUAL
         return {"PROSPERO_TEST_SSH": self.ssh, "PROSPERO_TEST_WSL": self.wsl,
                 "PROSPERO_TEST_SCP": self.scp, "PROSPERO_TEST_DROPCAP": "bypass",
-                "PROSPERO_TEST_FARMG": "1"}
+                "PROSPERO_TEST_FARMG": "1", "PROSPERO_TEST_FARGVIM": "1"}
 
     def hosts(self):
         """The hosts running for its state directory, as JSONL lines."""

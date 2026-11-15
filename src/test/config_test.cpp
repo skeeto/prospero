@@ -134,6 +134,8 @@ static void testcfgschema(Test *t)
         {"ui", "editor", "code --wait", CFG_BAD, 1},
         {"ui", "editor_line", "myedit --goto {file}:{line}", CFG_OK, 0},
         {"ui", "editor_line", "myedit --goto {file}:{line}", CFG_BAD, 1},
+        {"ui", "editor_remote", "fresh ssh://{host}{file}", CFG_OK, 0},
+        {"ui", "editor_remote", "fresh ssh://{host}{file}", CFG_BAD, 1},
         {"ui", "theme", "dark", CFG_OK, 1},
         {"ui", "notify", "allow, done", CFG_OK, 0},
         {"ui", "notify", "none", CFG_OK, 0},
@@ -1136,6 +1138,7 @@ static void testcfgjson(Test *t)
         "ui//fonts=auto*\n"
         "ui//editor=*\n"
         "ui//editor_line=*\n"
+        "ui//editor_remote=*\n"
         "ui//terminal=*\n"
         "ui//mentions=true*\n"
         "ui//accessibility=auto*\n"

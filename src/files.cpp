@@ -1725,6 +1725,7 @@ struct FileEdit {
     i32         how;   // FE_*
     EditJump    j;     // FE_WINDOW's command
     Str         dir;   // FE_WINDOW's folder to run it from
+    b32         far;   // FE_WINDOW's editor reaches an ssh remote's file itself
     GuiSession *root;  // FE_TAB's and FE_SHOW's
     TermTab    *tt;    // FE_SHOW's tab
     Str         name;  // the editor sent (editask), null for the host's own
@@ -1740,9 +1741,11 @@ struct FileEdit {
 // else vi; an editor with a window of its own opens as C10 has it, as
 // does no editor on macOS (TextEdit) or Windows (a why). Another host's
 // file opens here only in an editor with a window of its own, where
-// C10 maps it (a container's mount, WSL's share); else in a Terminal
-// tab of root there, with the editor editask sends, or none, the
-// host's own.
+// C10 maps it (a container's mount, WSL's share), or, on an ssh remote,
+// where the editor reaches it by ssh itself: [ui] editor_remote, which
+// never falls back, else the address a known editor takes (farjump);
+// else in a Terminal tab of root there, with the editor editask sends,
+// or none, the host's own.
 static FileEdit fileedit(Gui *g, Arena *a, GuiSession *root, u64 host, Str path, i32 line,
                          i32 col)
 {
@@ -1769,6 +1772,24 @@ static FileEdit fileedit(Gui *g, Arena *a, GuiSession *root, u64 host, Str path,
         r.how = r.j.why.len ? FE_WHY : FE_WINDOW;
         r.why = r.j.why;
         return r;
+    }
+    if (host) {
+        // An ssh remote's, here in an editor that reaches it by ssh
+        Str tmpl = trim(g->edjumpfmt);
+        Str cmd  = trim(editorcmd(g, a));
+        Str use  = tmpl.len ? tmpl : cmd;
+        if (trim(g->edremote).len || (use.len && !editorterm(use))) {
+            EditJump j = farjump(g, a, fh, cmd, tmpl, path, line>0 ? line : 1, col);
+            if (!j.noaddr) {
+                r.j   = editorfind(g, a, j);
+                r.far = 1;
+                r.on  = filehostname(g, a, host);
+                r.dir = userhome(g->os, a);  // the file's folder is not here
+                r.how = r.j.why.len ? FE_WHY : FE_WINDOW;
+                r.why = r.j.why;
+                return r;
+            }
+        }
     }
     r.name  = ask.name;
     r.on    = host ? filehostname(g, a, host) : Str{};
@@ -1842,6 +1863,14 @@ static Str fileedittip(Arena *a, FileEdit *e)
 {
     switch (e->how) {
     case FE_WINDOW:
+        if (e->far) {
+            Buf b(a, 96 + e->on.len + e->j.line.len);
+            print(&b, "Open the file in your editor, which reaches ");
+            print(&b, e->on);
+            print(&b, " by ssh itself: ");
+            print(&b, e->j.line);
+            return finish(&b);
+        }
         return filejumptip(a, &e->j);
     case FE_SHOW: {
         Str name = termeditname(e->tt);

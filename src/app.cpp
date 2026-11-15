@@ -1893,6 +1893,7 @@ struct Gui {
     // what the box's popups have open
     Str                editor;     // [ui] editor
     Str                edjumpfmt;  // [ui] editor_line, Open in editor's template
+    Str                edremote;   // [ui] editor_remote, an ssh remote's file's template
     Str                editjump;   // Open in editor's latest command, for the
     i64                editjumps;  //   checklist, and how many
     u64                edfoundkey; // editorfound's last answer, by program
@@ -5325,6 +5326,8 @@ static void loadcfg(Gui *g, Str line)
             setcfgstr(g, &g->editor, r);
         } else if (r.kind=="ui" && r.key=="editor_line") {
             setcfgstr(g, &g->edjumpfmt, r);
+        } else if (r.kind=="ui" && r.key=="editor_remote") {
+            setcfgstr(g, &g->edremote, r);
         } else if (r.kind=="ui" && r.key=="terminal") {
             setcfgstr(g, &g->terminal, r);
         } else if (r.kind=="terminal" && r.key=="scrollback") {
@@ -7623,6 +7626,61 @@ static EditJump editorjumpfor(Gui *g, Arena *a, Str path, i32 line, i32 col)
     }
     EditJump j = editorjump(a, cmd, tmpl, path, line>0 ? line : 1, col, HOST_WINDOWS);
     return editorfind(g, a, editorwindow(a, j));
+}
+
+static Reach remotelink(Gui *, Str);
+
+// A host as an ssh remote whose files an editor here may reach by ssh
+// itself: its [remote NAME] ssh, split for an address (sshedithost),
+// else why not: a WSL distro, a command (exec) or a container, or a
+// destination ssh would take for an option.
+static EditHost farhost(Gui *g, Arena *a, GuiHost *h)
+{
+    EditHost r    = {};
+    Reach    link = h && h->kind==GH_REMOTE && !startswith(h->name, "ctr:")
+                  ? remotelink(g, h->name) : Reach{};
+    if (!trim(link.ssh).len) {
+        r.why = "Only an ssh remote's file opens in an editor here that reaches it itself";
+        return r;
+    }
+    Str bad = linkbad(*a, link);
+    if (bad.len) {
+        r.why = concat(a, "Its remote cannot be reached by an editor's ssh: ", bad);
+        return r;
+    }
+    r = sshedithost(a, link.ssh);
+    r.windows = hostwin(h);
+    return r;
+}
+
+// The command that opens path, a file of an ssh remote, here, at line
+// (1-based; 0 for none) and col (0 for none), from cmd (or its template,
+// tmpl): [ui] editor_remote's when set, else the address the preset's
+// editor takes in the path's place (editorjump), else noaddr and why.
+// Its program is not looked for (editorfind).
+static EditJump farjump(Gui *g, Arena *a, GuiHost *h, Str cmd, Str tmpl, Str path,
+                        i32 line, i32 col)
+{
+    EditHost eh = farhost(g, a, h);
+    Str      rt = trim(g->edremote);
+    EditJump j  = {};
+    if (eh.why.len && !(rt.len && eh.ssh.len)) {
+        // Not an ssh remote at all, or not one whose address can be built
+        // with no template to build it
+        j.noaddr = 1;
+        j.why    = eh.why;
+        return j;
+    }
+    if (rt.len) {
+        if (HOST_WINDOWS) {
+            rt = cmdhome(a, rt, userhome(g->os, a));
+        }
+        return editorremote(a, rt, eh.ssh, path, line, col, HOST_WINDOWS);
+    }
+    if (HOST_WINDOWS) {
+        tmpl = cmdhome(a, trim(tmpl), userhome(g->os, a));
+    }
+    return editorwindow(a, editorjump(a, cmd, tmpl, path, line, col, HOST_WINDOWS, &eh));
 }
 
 // Launch an editor's command (editorjumpfor's) from dir, left to run on
@@ -14155,6 +14213,11 @@ enum : i32 {
                   // drop (no GUI_NODRAGLOAD), skip dx ops
     OP_IFFARMG,   // unless the remote host's login shell has gui.py's fake
                   // mg as $VISUAL (PROSPERO_TEST_FARMG), skip dx ops
+    OP_IFFARGVIM, // unless gui.py's fake gvim, which reaches the remote
+                  // host's files by scp://, is on [tools] path_prepend
+                  // (PROSPERO_TEST_FARGVIM), skip dx ops
+    OP_EDITOR,    // text as [ui] editor (dx 0), editor_line (dx 1) or
+                  // editor_remote (dx 2) would have it
     OP_IFFSSTALL, // unless file work stalls paths for the checklist, here
                   // and on the remote host (PROSPERO_TEST_FSSTALL), skip
                   // dx ops
@@ -19701,6 +19764,27 @@ static DriveOp remoteops[] = {
     {OP_CHECK, CHK_FILEFOCUS, 0, 0, 0, ""},
     {OP_WAIT, W_FILEFRESH, 0, 0, 20000, ""},
     {OP_CHECK, CHK_FILETEXT, 0, 0, 0, "hello by mg"},
+    // A window editor that reaches the file there itself (gui.py's fake
+    // gvim, on [tools] path_prepend): Open in editor runs it here, with
+    // the file's scp:// address there; [ui] editor_remote's command in
+    // its place; an editor with no such address, a Terminal tab there
+    {OP_IFFARGVIM, 0, 16, 0, 0, ""},
+    {OP_EDITOR, 0, 0, 0, 300, "gvim -f"},
+    {OP_CHECK, CHK_EDITROUTE, 0, 0, 0, "which reaches r (here) by ssh itself: gvim -f +1 "},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file editor"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_EDITJUMP, 1, 0, 0, "gvim -f +1 'scp://here//"},
+    {OP_CHECK, CHK_EDITJUMP, 1, 0, 0, "/hello.txt'"},
+    {OP_EDITOR, 0, 2, 0, 300, "gvim -f scp://{host}/{file}"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file editor"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_EDITJUMP, 2, 0, 0, "gvim -f scp://'here'/'/"},
+    {OP_EDITOR, 0, 2, 0, 0, ""},
+    {OP_EDITOR, 0, 0, 0, 300, "code"},
+    {OP_CHECK, CHK_EDITROUTE, 1, 0, 0, "in a Terminal tab on r (here)"},
+    {OP_EDITOR, 0, 0, 0, 100, ""},
     // Inline code naming the file there: a link once fs.stat there
     // found it
     {OP_WAIT, W_FSIDLE, 0, 0, 5000, ""},
@@ -28493,6 +28577,16 @@ static void drivestep(Gui *g)
             g->drivepc += (i32)op->dx;
         }
         break;
+    case OP_IFFARGVIM:
+        if (!os_getenv(g->os, &g->frame, "PROSPERO_TEST_FARGVIM").len) {
+            guilog(g, "drive: skip, with no fake gvim for the remote host");
+            g->drivepc += (i32)op->dx;
+        }
+        break;
+    case OP_EDITOR: {
+        Str *dst = op->dx==0 ? &g->editor : op->dx==1 ? &g->edjumpfmt : &g->edremote;
+        *dst = Str(op->text);
+    } break;
     case OP_IFFSSTALL:
         // gui.py sets it here, and passes it to a remote host it starts
         if (!os_getenv(g->os, &g->frame, "PROSPERO_TEST_FSSTALL").len) {
@@ -28980,6 +29074,7 @@ static void readconfig(Gui *g, Arena scratch)
     g->fontsset   = clone(&g->perm, cfgget(cfg, "ui", "", "fonts", 0));
     g->editor     = clone(&g->perm, cfgget(cfg, "ui", "", "editor", 0));
     g->edjumpfmt  = clone(&g->perm, cfgget(cfg, "ui", "", "editor_line", 0));
+    g->edremote   = clone(&g->perm, cfgget(cfg, "ui", "", "editor_remote", 0));
     g->terminal   = clone(&g->perm, cfgget(cfg, "ui", "", "terminal", 0));
     g->notify     = notifyparse(cfgget(cfg, "ui", "", "notify", 0));
     g->nomentions = cfgbool(cfgget(cfg, "ui", "", "mentions", 0)) == 0;

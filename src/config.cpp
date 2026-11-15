@@ -30,7 +30,7 @@
 // (cfgruns): [tools] path_prepend and path_append, which say where
 // programs are found, a [tools] shell other than a keyword (auto, sh,
 // powershell, cmd), [tools] shells and git, and [ui] editor,
-// editor_line and terminal. A [shell] section counts only where the
+// editor_line, editor_remote and terminal. A [shell] section counts only where the
 // user's own file has its header (cfgownsection), and an included
 // file's settings in an [mcp] or [web] section that the user's own file
 // defines (its url or command, its search or url) are ignored
@@ -663,7 +663,11 @@ static CfgKey cfgschema[] = {
      "a host of the same OS family, else by its name alone (nvim); "
      "otherwise that host's own $VISUAL or $EDITOR runs, else vi, never "
      "this computer's. An editor with a window of its own still opens a "
-     "container's mounted folder or a WSL distro's file here. "
+     "container's mounted folder or a WSL distro's file here, and an ssh "
+     "remote's file here too where it reaches it by ssh itself: gvim, mvim, "
+     "and vim or nvim in a terminal window of its own, through scp://; emacs "
+     "and emacsclient through /ssh: (not for a Windows host); else [ui] "
+     "editor_remote. "
      "A GUI started from the Finder or a desktop menu "
      "has no shell environment: no $VISUAL, no $EDITOR, and its PATH may "
      "lack the editor, so name it in full here, or add its directory to "
@@ -683,7 +687,19 @@ static CfgKey cfgschema[] = {
      "with no editor set at all, the tab runs the login shell's $VISUAL or "
      "$EDITOR, else vi. Another host's file gets it only on a host of the "
      "same OS family, and only when it runs in a terminal; else as [ui] "
-     "editor says"},
+     "editor says, except that an ssh remote's file opens here in a known "
+     "editor that reaches it by ssh (gvim, emacs), {file} its address"},
+    {"ui", "editor_remote", CFG_STRING, "", {}, {}, "ui",
+     "The command that opens an ssh remote's file here, in an editor that "
+     "reaches it by ssh itself: Files' Open in editor. As [ui] "
+     "editor_line: {file} the path there and {host} the remote's ssh "
+     "destination as written, each quoted already: do not put them in "
+     "quotes; {line} the line, {col} the column (1 if none); with no "
+     "{file}, the path goes last. For example fresh ssh://{host}{file}, or "
+     "gvim --remote-silent +{line} scp://{host}/{file}. Empty: the address "
+     "a known editor takes (gvim, mvim, vim or nvim in a window: scp://; "
+     "emacs, emacsclient: /ssh:), else a Terminal tab there. It must open "
+     "a window of its own; its ssh has no terminal to ask in"},
     {"ui", "terminal", CFG_STRING, "", {}, {}, "ui",
      "The terminal that a session's Open in external terminal opens in its folder: "
      "on macOS an application's name (Terminal, iTerm, Ghostty), elsewhere "
@@ -1321,7 +1337,7 @@ static b32 cfgruns(CfgKey *k, Str v)
                 (HOST_WINDOWS || v!="bash"));
     }
     return (k->kind=="ui" && (k->key=="editor" || k->key=="editor_line" ||
-                              k->key=="terminal")) ||
+                              k->key=="editor_remote" || k->key=="terminal")) ||
            (k->kind=="terminal" && k->key=="shell");
 }
 
