@@ -2525,7 +2525,7 @@ def main():
         want = want.replace("temp = ask\n", "temp = ask\nroots = ~/a; ~/b\n")
         want = want.replace(SETTINGS_GONE + "\n", "")
         want += ("\n[ui]\ntheme = light\nnotify = allow\n"
-                 "\n[theme gruvbox]\npanel = #3c3836\n"
+                 "\n[theme gruvbox]\npanel =\n"
                  "\n[model fresh]\nreasoning = reasoning_content\n"
                  "\n[theme mine]\nbase = dark\n"
                  "\n[remote box]\nssh = me@box.example\npath = ~/bin/prospero\n"
@@ -2537,7 +2537,7 @@ def main():
                                         "expected", "saved", lineterm="", n=1)
             problems.append("the configuration is not the edits alone:\n" + "\n".join(diff))
         else:
-            print("configuration: the long value, the theme and a color of one, notify, "
+            print("configuration: the long value, the theme and a color of one cleared, notify, "
                   "the roots, a section deleted and five added, nothing else")
         if host.read(host.path("team.ini")) != "# Shared\n[model shared]\ntemperature = 0.1\n":
             problems.append("the included file changed")

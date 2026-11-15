@@ -159,8 +159,10 @@
 // and template.
 //
 // In config.set, kind and name "" (or absent) are the top level, and a
-// null value removes the key. The reply's line is where the key now is
-// in the user's file (0 after a removal). A value invalid for its type,
+// null value removes the key, or writes it empty, the default, over an
+// include that alone sets it, the reply's over naming the include's
+// FILE:LINE. The reply's line is where the key now is in the user's
+// file (0 after a removal). A value invalid for its type,
 // or a plaintext secret, is refused before anything is written, and an
 // edit whose value is not the one in effect afterward fails, saying
 // which file decides. Both replies carry the diagnostics of the
@@ -3802,6 +3804,7 @@ static b32 cfgpoll(Config *c, Arena scratch, b32 force)
 
 struct CfgSet {
     Str err;
+    Str over;  // a removal written empty: the include's line it overrides
     iz  line;  // of the key in the user's file, 0 if removed
     b32 ok;
 };
@@ -3855,9 +3858,11 @@ static IniLine *cfgheader(Ini *ini, IniSection *s, IniFile *f, IniFile **in)
 // replace the file atomically and reload. Kind and name "" are the top
 // level. Unknown keys, values bad for their type, and plaintext secrets
 // are refused. A top-level key that an include after it overrides is
-// moved below the includes, so that it wins. It fails if the value in
-// effect afterward is not the edit: a removal that leaves a value from
-// an include, when the user's file did not set it. Results and
+// moved below the includes, so that it wins. A removal of a key only an
+// include sets writes it empty in the user's file instead, which means
+// the default and overrides the include's (#63): Settings edits only
+// the user's own file, and this is how it unsets another's. It fails if
+// the value in effect afterward is not the edit. Results and
 // temporaries go in perm.
 static CfgSet cfgset(Config *c, Arena *perm, Str kind, Str name, Str key,
                      Str value)
@@ -3906,6 +3911,21 @@ static CfgSet cfgset(Config *c, Arena *perm, Str kind, Str name, Str key,
     b32       move = 0;
     for (IniEntry *o = was ? was->older : 0; o && was->file!=f; o = o->older) {
         move |= o->file == f;
+    }
+    // Removing what only an include sets: written empty over it
+    if (!value.data && was) {
+        b32 own = 0;
+        for (IniEntry *o = was; o; o = o->older) {
+            own |= o->file == f;
+        }
+        if (!own && trim(was->value).len) {
+            Buf b(perm, was->file->path.len + 24);
+            print(&b, was->file->path);
+            putbyte(&b, ':');
+            print(&b, was->line->num);
+            r.over = finish(&b);
+            value  = Str("");
+        }
     }
     // A template argument is written as given: quoted, as "...", to be a
     // string whatever it says, else bare
@@ -4283,6 +4303,9 @@ static void putcfgset(JsonOut *w, Config *c, CfgSet *r)
 {
     putstrkey(w, "path", c->path.len ? c->path : Str(""));
     putintkey(w, "line", (i64)r->line);
+    if (r->over.len) {
+        putstrkey(w, "over", r->over);
+    }
     putintkey(w, "rev", c->rev);
     putcfgdiags(w, c);
 }

@@ -6887,11 +6887,20 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
         } else if (ok) {
             Str path = jsonstr(jsonget(j, "path"));
             i64 at   = jsonint(jsonget(j, "line"), 0);
-            print(&b, at ? Str("Saved: ") : Str("Removed from "));
+            Str over = jsonstr(jsonget(j, "over"));
+            if (over.len) {
+                print(&b, "Set to the default: ");  // what only an include set (#63)
+            } else {
+                print(&b, at ? Str("Saved: ") : Str("Removed from "));
+            }
             print(&b, basename(path));
             if (at) {
                 putbyte(&b, ':');
                 print(&b, at);
+            }
+            if (over.len) {
+                print(&b, ", over ");
+                print(&b, basename(over));
             }
         } else {
             print(&b, "Not saved: ");
@@ -14418,6 +14427,7 @@ enum : i32 {
     CHK_CFGVAL,   // text "KIND NAME KEY=VALUE": that row's value in effect
     CHK_SELTEXT,  // the item named text draws its selected text in the
                   // theme's selection_text color (#64)
+    CHK_CFGSAID,  // Settings' last note begins with text
     CHK_CFGREAD,  // text "KIND NAME KEY=TIME": that row's seconds shown as
                   // that time, or none shown if TIME is "" (#59)
     CHK_ROOTS,
@@ -14830,6 +14840,7 @@ static Str chknames[] = {
     "the settings page picked is shown",
     "the setting has the value given",
     "the field's selected text is in the theme's selection_text color",
+    "Settings' note says what was said",
     "the setting's seconds read as the time given",
     "the roots, one a line, were saved joined by \"; \"",
     "a section only an include defines cannot be deleted, which says where it is",
@@ -18181,6 +18192,31 @@ static DriveOp settingsops[] = {
     {OP_SHOT, 0, 0, 0, 300, "settings-seltext"},
     {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
     {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    // Cleared, the color the user's file set goes, and Gruvbox's own is
+    // back; cleared again, what only the include sets is written empty
+    // in the user's file, the base theme's, over it (#63)
+    {OP_MOVE, T_NAMED, 0, 0, 100, "cfg theme gruvbox panel"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 200, ""},
+    {OP_KEYDOWN, 0, GKEY_BACKSPACE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_BACKSPACE, 0, 100, ""},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_CONFIGSET, 0, 0, 5000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_CFGSAID, 0, 0, 0, "Removed from prospero.ini"},
+    {OP_CHECK, CHK_THEMENAMED, 0, 0, 0, "gruvbox|#1d2021"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "cfg theme gruvbox panel"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 200, ""},
+    {OP_KEYDOWN, 0, GKEY_BACKSPACE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_BACKSPACE, 0, 100, ""},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_CONFIGSET, 0, 0, 5000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_CFGSAID, 0, 0, 0, "Set to the default: prospero.ini:"},
+    {OP_CHECK, CHK_THEMENAMED, 0, 0, 0, "gruvbox|#0f0f10"},
     {OP_SHOWPAGE, 0, 0, 0, 300, "ui"},
     {OP_MOVE, T_PAGEITEM, 0, 0, 100, "ui"},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -26195,6 +26231,8 @@ static b32 drivecheck(Gui *g, i32 chk)
         }
         return found >= 4;
     }
+    case CHK_CFGSAID:
+        return startswith(g->cfgstatus, g->ops[g->drivepc-1].text);
     case CHK_CFGREAD: {
         Cut kind = cut(g->ops[g->drivepc-1].text, ' ');
         Cut name = cut(kind.tail, ' ');

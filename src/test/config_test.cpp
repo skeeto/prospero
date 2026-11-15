@@ -778,14 +778,28 @@ static void testcfgset(Test *t)
         r = cfgset(m, &tmp, "", "", "model", {});
         expect(t, "include.remove", istr(&a, r.ok), "1");
         expect(t, "include.remove.value", cfgget(m, "", "", "model", 0), "team-model");
+        // Removing again, what only the include sets now, writes it
+        // empty, the default, over the include's (#63); removing that
+        // brings the include's back
         tmp = v.scratch;
         r = cfgset(m, &tmp, "", "", "model", {});
-        expect(t, "include.remove.again", r.err,
-               "nothing to remove: /i/team.ini:1 sets it, not this file");
+        expect(t, "include.blank", istr(&a, r.ok*10 + r.line), "12");
+        expect(t, "include.blank.over", r.over, "/i/team.ini:1");
+        expect(t, "include.blank.text", cfgfile(v.os, "/i/h.ini"),
+               "include = team.ini\nmodel =\n");
+        expect(t, "include.blank.value", cfgget(m, "", "", "model", 0), "");
+        tmp = v.scratch;
+        r = cfgset(m, &tmp, "", "", "model", {});
+        expect(t, "include.unblank", istr(&a, r.ok*10 + r.line), "10");
+        expect(t, "include.unblank.over", r.over, "");
+        expect(t, "include.unblank.value", cfgget(m, "", "", "model", 0), "team-model");
         tmp = v.scratch;
         r = cfgset(m, &tmp, "endpoint", "team", "idle_timeout", {});
-        expect(t, "include.remove.section", r.err,
-               "nothing to remove: /i/team.ini:4 sets it, not this file");
+        expect(t, "include.blank.section", r.over, "/i/team.ini:4");
+        expect(t, "include.blank.section.text", cfgfile(v.os, "/i/h.ini"),
+               "include = team.ini\n\n[endpoint team]\nidle_timeout =\n");
+        expect(t, "include.blank.section.value",
+               cfgget(m, "endpoint", "team", "idle_timeout", 0), "90");
         expect(t, "include.untouched", cfgfile(v.os, "/i/team.ini"),
                "model = team-model\n[endpoint team]\nurl = http://t/\nidle_timeout = 5\n");
         cfgfree(m);

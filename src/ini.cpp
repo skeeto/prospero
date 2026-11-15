@@ -1371,7 +1371,7 @@ static IniEdit iniedit(Arena *perm, IniFile *f, Str kind, Str name,
             r.line -= l->type==INI_KEY && iniin(l, kind, name) && l->key==key;
         }
         print(&add, key);
-        print(&add, " = ");
+        print(&add, enc.len ? Str(" = ") : Str(" ="));  // no trailing blank
         print(&add, enc);
         print(&add, eol);
         if (gap) {
