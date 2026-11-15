@@ -238,3 +238,48 @@ static bool prospero_axpreedit(ImGuiContext &g, ImGuiInputTextState *state, ImGu
     *imepos = ImVec2(e.imex, e.imey);
     return true;
 }
+
+// Selected text in the theme's color for it (prospero_seltext), as the
+// transcript draws it, where InputTextEx draws it in its text color on
+// the selection's background (#64). Over the text drawn, each line's
+// selected run gets the background again, then its characters in that
+// color, clipped to it, so no stroke of the first color shows at their
+// edges. A color of 0 leaves the field as ImGui drew it.
+static void prospero_seldraw(ImGuiContext &g, ImGuiInputTextState *state, ImDrawList *dl,
+                             ImGuiTextIndex *line_index, char const *buf, char const *end,
+                             int n0, int n1, ImVec2 origin, ImRect clip, bool multiline,
+                             bool active)
+{
+    unsigned col = prospero_seltext();
+    if (!col || !state || state->Stb->select_start==state->Stb->select_end) {
+        return;
+    }
+    ImU32       bg = ImGui::GetColorU32(ImGuiCol_TextSelectedBg, active ? 1.0f : 0.6f);
+    float       up = multiline ? 0.0f : -1.0f;  // as InputTextEx's
+    float       dn = multiline ? 0.0f :  2.0f;
+    char const *sb = buf + ImMin(state->Stb->select_start, state->Stb->select_end);
+    char const *se = buf + ImMax(state->Stb->select_start, state->Stb->select_end);
+    for (int n = n0; n < n1; n++) {
+        char const *p   = line_index->get_line_begin(buf, n);
+        char const *eol = line_index->get_line_end(buf, n);
+        if (eol<end && *eol!='\n') {
+            eol++;  // a wrap's blank
+        }
+        char const *lb = sb>p ? sb : p;
+        char const *le = se<eol ? se : eol;
+        if (lb >= le) {
+            continue;
+        }
+        float  y  = origin.y + (float)n*g.FontSize;
+        float  x  = origin.x + ImGui::CalcTextSize(p, lb).x;
+        ImRect r(x, y + up, x + ImGui::CalcTextSize(lb, le).x, y + g.FontSize + dn);
+        r.ClipWith(clip);
+        if (r.Min.x>=r.Max.x || r.Min.y>=r.Max.y) {
+            continue;
+        }
+        dl->AddRectFilled(r.Min, r.Max, bg);
+        g.Font->RenderText(dl, g.FontSize, ImVec2(x, y), ImGui::GetColorU32(col),
+                           ImVec4(r.Min.x, r.Min.y, r.Max.x, r.Max.y), lb, le, 0.0f,
+                           ImDrawTextFlags_CpuFineClip);
+    }
+}

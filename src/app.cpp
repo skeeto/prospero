@@ -14416,6 +14416,8 @@ enum : i32 {
     CHK_NOHSCROLL,
     CHK_PAGE,
     CHK_CFGVAL,   // text "KIND NAME KEY=VALUE": that row's value in effect
+    CHK_SELTEXT,  // the item named text draws its selected text in the
+                  // theme's selection_text color (#64)
     CHK_CFGREAD,  // text "KIND NAME KEY=TIME": that row's seconds shown as
                   // that time, or none shown if TIME is "" (#59)
     CHK_ROOTS,
@@ -14827,6 +14829,7 @@ static Str chknames[] = {
     "the settings have nothing to scroll to sideways",
     "the settings page picked is shown",
     "the setting has the value given",
+    "the field's selected text is in the theme's selection_text color",
     "the setting's seconds read as the time given",
     "the roots, one a line, were saved joined by \"; \"",
     "a section only an include defines cannot be deleted, which says where it is",
@@ -18169,6 +18172,15 @@ static DriveOp settingsops[] = {
     {OP_CHECK, CHK_THEMENAMED, 0, 0, 0, "gruvbox|#3c3836"},
     {OP_MOVE, T_EMPTY, 0, 0, 1000, ""},
     {OP_SHOT, 0, 0, 0, 500, "settings-theme"},
+    // A field's selected text in the theme's selection_text, as selected
+    // text elsewhere, not its text color (#64): a click selects it all
+    {OP_MOVE, T_NAMED, 0, 0, 100, "cfg theme gruvbox panel"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_SELTEXT, 0, 0, 0, "cfg theme gruvbox panel"},
+    {OP_SHOT, 0, 0, 0, 300, "settings-seltext"},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
     {OP_SHOWPAGE, 0, 0, 0, 300, "ui"},
     {OP_MOVE, T_PAGEITEM, 0, 0, 100, "ui"},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -26160,6 +26172,28 @@ static b32 drivecheck(Gui *g, i32 chk)
             }
         }
         return 0;
+    }
+    case CHK_SELTEXT: {
+        // Glyphs of that color in the item's rectangle, in the frame last
+        // drawn; the field's own text is in another
+        Named *n = 0;
+        for (i32 i = 0; !n && i < g->nnamed; i++) {
+            Named *k = &g->named[i];
+            n = Str{k->name, k->len}==g->ops[g->drivepc-1].text ? k : 0;
+        }
+        ImDrawData *dd = ImGui::GetDrawData();
+        u32 col = ImGui::GetColorU32(g->pal->seltext);
+        if (!n || !dd || col==ImGui::GetColorU32(ImGuiCol_Text)) {
+            return 0;
+        }
+        iz found = 0;
+        for (ImDrawList *dl : dd->CmdLists) {
+            for (ImDrawVert &v : dl->VtxBuffer) {
+                found += v.col==col && v.pos.x>=n->r.x0 && v.pos.x<=n->r.x1 &&
+                         v.pos.y>=n->r.y0 && v.pos.y<=n->r.y1;
+            }
+        }
+        return found >= 4;
     }
     case CHK_CFGREAD: {
         Cut kind = cut(g->ops[g->drivepc-1].text, ' ');

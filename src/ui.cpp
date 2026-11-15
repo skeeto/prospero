@@ -557,6 +557,16 @@ static void uideadlines(Gui *g, Sched *s)
 // palette's panels, text, fields, rows, buttons, bars, tabs, borders,
 // scrollbars and accent. What is left of the stock style is translucent
 // (dimming, table rows' stripes), so it suits any theme on its base.
+// The patched InputTextEx's side (imconfig.h): the theme's color for
+// selected text, which a field's selection takes as the transcript's
+// does (#64).
+extern "C" unsigned prospero_seltext(void)
+{
+    ImGuiContext *c = ImGui::GetCurrentContext();
+    Gui          *g = c ? (Gui *)c->IO.UserData : 0;
+    return g && g->pal ? g->pal->seltext : 0;
+}
+
 static void themestyle(ImGuiStyle *st, Palette *p)
 {
     if (p->dark) {

@@ -173,6 +173,12 @@ imgui_splice(imgui_widgets_text
   "        // Update render selection flag after events have been handled"
   "        if (g.TestEngineHookItems && !is_readonly)  // prospero\n            prospero_axinput(g, state, id, callback, callback_user_data);\n\n"
   "the comment after InputTextEx's paste")
+# Selected text in a field takes the theme's selection_text color, as
+# selected text elsewhere does (src/imgui_a11y.h, prospero_seldraw).
+imgui_splice(imgui_widgets_text
+  "    // Render blinking cursor"
+  "    if (render_selection)  // prospero\n        prospero_seldraw(g, state, draw_window->DrawList, line_index, buf_display, buf_display_end,\n                         line_visible_n0, line_visible_n1, draw_pos - draw_scroll, clip_rect,\n                         is_multiline, render_cursor);\n\n"
+  "the comment before InputTextEx's caret")
 imgui_splice(imgui_widgets_text
   "    // Render blinking cursor"
   "    if (g.TestEngineHookItems)  // prospero\n        prospero_axdraw(g, state, id, flags, is_password, hint, buf_display, buf_display_end,\n                        draw_pos - draw_scroll, clip_rect, wrap_width);\n\n"

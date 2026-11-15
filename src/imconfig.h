@@ -91,3 +91,8 @@ struct ProsperoPreedit {
 };
 extern "C" int prospero_preediting(void);
 extern "C" int prospero_preedit(ProsperoPreedit *);
+
+// The theme's color for selected text (ui.cpp), which the InputTextEx
+// patch draws a field's selection in, as the transcript draws it; 0 for
+// ImGui's own, the text's color.
+extern "C" unsigned prospero_seltext(void);
