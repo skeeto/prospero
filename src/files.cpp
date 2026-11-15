@@ -1701,32 +1701,6 @@ static Str filelocal(Gui *g, Arena *a, u64 host, Str path, Str *why)
     return {};
 }
 
-// Open in editor for a host's file at a line and column (0 for none):
-// the editor's command, or why not.
-static EditJump filejump(Gui *g, Arena *a, u64 host, Str path, i32 line, i32 col)
-{
-    Str      why  = {};
-    Str      here = filelocal(g, a, host, path, &why);
-    EditJump j    = {};
-    if (why.len) {
-        j.why = why;
-        return j;
-    }
-    return editorjumpfor(g, a, here, line, col);
-}
-
-// Open in editor, launched: the editor on a host's file.
-static void filejumprun(Gui *g, Arena a, u64 host, Str path, i32 line, i32 col)
-{
-    Str why  = {};
-    Str here = filelocal(g, &a, host, path, &why);
-    if (why.len) {
-        g->lasterr = clone(&g->perm, why);
-        return;
-    }
-    editorjumprun(g, a, here, line, col);
-}
-
 // Open in editor's tooltip while it can: what it runs, and for an
 // editor whose arguments for a line aren't known, how to give them.
 static Str filejumptip(Arena *a, EditJump *j)
@@ -1750,6 +1724,7 @@ enum : i32 {
 struct FileEdit {
     i32         how;   // FE_*
     EditJump    j;     // FE_WINDOW's command
+    Str         dir;   // FE_WINDOW's folder to run it from
     GuiSession *root;  // FE_TAB's and FE_SHOW's
     TermTab    *tt;    // FE_SHOW's tab
     Str         name;  // the editor sent (editask), null for the host's own
@@ -1787,7 +1762,10 @@ static FileEdit fileedit(Gui *g, Arena *a, GuiSession *root, u64 host, Str path,
                !why.len;
     }
     if (here) {
-        r.j   = filejump(g, a, host, path, line, col);
+        Str local = filelocal(g, a, host, path, &r.why);
+        r.j   = r.why.len ? EditJump{} : editorjumpfor(g, a, local, line, col);
+        r.j.why = r.why.len ? r.why : r.j.why;
+        r.dir = parentdir(local);
         r.how = r.j.why.len ? FE_WHY : FE_WINDOW;
         r.why = r.j.why;
         return r;
@@ -1850,7 +1828,7 @@ static void fileeditrun(Gui *g, Arena a, GuiSession *root, u64 host, Str path, i
         g->lasterr = clone(&g->perm, e.why);
         break;
     case FE_WINDOW:
-        filejumprun(g, a, host, path, line, col);
+        editorjumprun(g, a, e.j, e.dir);
         break;
     case FE_TAB:
     case FE_SHOW:

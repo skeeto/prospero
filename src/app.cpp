@@ -7266,6 +7266,22 @@ static EditAsk editask(Gui *g, Arena *a, GuiHost *h)
     return r;
 }
 
+// Why the editor cannot take another file now, it having one out
+// already, for session s (null for the configuration), or null.
+static Str editorbusy(Gui *g, GuiSession *s)
+{
+    if (g->edcfg) {
+        return "the editor has the configuration file open";
+    } else if (g->edproc && g->edplan) {
+        return "the editor has a plan open";
+    } else if (g->edproc) {
+        return g->edsess==s ? Str("the draft is open in the editor already") :
+               s            ? Str("the editor has another session's draft open")
+                            : Str("the editor has a draft open");
+    }
+    return {};
+}
+
 // Why no file can go out to the editor now, for session s (null for the
 // configuration), or null if one can.
 static Str editorwhy(Gui *g, GuiSession *s, Arena *a)
@@ -7279,16 +7295,8 @@ static Str editorwhy(Gui *g, GuiSession *s, Arena *a)
         print(&b, " runs in a terminal: drafts, plans and the configuration file "
                   "need [ui] editor to open a window of its own");
         return finish(&b);
-    } else if (g->edcfg) {
-        return "the editor has the configuration file open";
-    } else if (g->edproc && g->edplan) {
-        return "the editor has a plan open";
-    } else if (g->edproc) {
-        return g->edsess==s ? Str("the draft is open in the editor already") :
-               s            ? Str("the editor has another session's draft open")
-                            : Str("the editor has a draft open");
     }
-    return {};
+    return editorbusy(g, s);
 }
 
 // Where a program the GUI would run is: at its path if it has a
@@ -7397,19 +7405,13 @@ static Str editorabs(Gui *g, Arena *a, Str line, Str prog, Str name, Str *why)
     return r;
 }
 
-// Run the editor on a file, from dir, its output to log. Null on
-// failure, and *err why, in a. On Windows cmd.exe runs it by the full
-// path editorexe found (editorabs).
-static Proc *editrun(Gui *g, Arena *a, Str cmd, Str path, Str dir, Str log, Str *err)
+// Run an editor's command line from dir, its output to log, to wait
+// for: sh -c, or on Windows cmd.exe, the line's program by its full
+// path already (editorabs). Null on failure, and *err why, in a.
+static Proc *editspawn(Gui *g, Arena *a, Str line, Str dir, Str log, Str *err)
 {
     Spawn sp = {};
     #ifdef _WIN32
-    Str rest = cmd;
-    Str prog = cmdword(&rest);
-    Str line = editorabs(g, a, editorline(a, cmd, path, 1), prog, editorname(cmd), err);
-    if (!line.len) {
-        return 0;
-    }
     Str comspec = os_getenv(g->os, a, "COMSPEC");
     comspec = comspec.len ? comspec : Str("cmd.exe");
     sp.argv    = push(a, sp.argv, comspec);
@@ -7417,7 +7419,7 @@ static Proc *editrun(Gui *g, Arena *a, Str cmd, Str path, Str dir, Str log, Str 
     #else
     sp.argv = push(a, sp.argv, Str("/bin/sh"));
     sp.argv = push(a, sp.argv, Str("-c"));
-    sp.argv = push(a, sp.argv, editorline(a, cmd, path, 0));
+    sp.argv = push(a, sp.argv, line);
     #endif
     sp.cwd      = dir;
     sp.env      = guienv(g, a);
@@ -7430,6 +7432,24 @@ static Proc *editrun(Gui *g, Arena *a, Str cmd, Str path, Str dir, Str log, Str 
         *err = concat(a, "cannot start the editor: ", os_lasterr(g->os, a));
     }
     return p;
+}
+
+// Run the editor on a file, from dir, its output to log. Null on
+// failure, and *err why, in a. On Windows cmd.exe runs it by the full
+// path editorexe found (editorabs).
+static Proc *editrun(Gui *g, Arena *a, Str cmd, Str path, Str dir, Str log, Str *err)
+{
+    #ifdef _WIN32
+    Str rest = cmd;
+    Str prog = cmdword(&rest);
+    Str line = editorabs(g, a, editorline(a, cmd, path, 1), prog, editorname(cmd), err);
+    if (!line.len) {
+        return 0;
+    }
+    #else
+    Str line = editorline(a, cmd, path, 0);
+    #endif
+    return editspawn(g, a, line, dir, log, err);
 }
 
 // The draft of session s in the editor, a its scratch.
@@ -7578,6 +7598,19 @@ static void guishow(Gui *g, Str path)
     }
 }
 
+// An editor's command, its program looked for: on Windows the line
+// with it by the full path found (editorabs), elsewhere why not if it is
+// nowhere. A command with a why already is as it was.
+static EditJump editorfind(Gui *g, Arena *a, EditJump j)
+{
+    if (!j.why.len && HOST_WINDOWS) {
+        j.line = editorabs(g, a, j.line, j.prog, j.name, &j.why);
+    } else if (!j.why.len && !editorexe(g, a, j.prog).len) {
+        j.why = editormissing(a, j.prog, j.name);
+    }
+    return j;
+}
+
 // Open in editor for path, a file here, at line (1-based) and col (0
 // for none): the command, or why not. An editor that runs in a terminal
 // is refused: the window runs its line with no terminal.
@@ -7589,20 +7622,13 @@ static EditJump editorjumpfor(Gui *g, Arena *a, Str path, i32 line, i32 col)
         tmpl = cmdhome(a, tmpl, userhome(g->os, a));
     }
     EditJump j = editorjump(a, cmd, tmpl, path, line>0 ? line : 1, col, HOST_WINDOWS);
-    j = editorwindow(a, j);
-    if (!j.why.len && HOST_WINDOWS) {
-        j.line = editorabs(g, a, j.line, j.prog, j.name, &j.why);
-    } else if (!j.why.len && !editorexe(g, a, j.prog).len) {
-        j.why = editormissing(a, j.prog, j.name);
-    }
-    return j;
+    return editorfind(g, a, editorwindow(a, j));
 }
 
-// Launch the editor on path at a line, left to run on its own: in the
-// checklist only noted (g->editjump), never run.
-static void editorjumprun(Gui *g, Arena a, Str path, i32 line, i32 col)
+// Launch an editor's command (editorjumpfor's) from dir, left to run on
+// its own: in the checklist only noted (g->editjump), never run.
+static void editorjumprun(Gui *g, Arena a, EditJump j, Str dir)
 {
-    EditJump j = editorjumpfor(g, &a, path, line, col);
     if (j.why.len) {
         g->lasterr = clone(&g->perm, j.why);
         return;
@@ -7613,7 +7639,6 @@ static void editorjumprun(Gui *g, Arena a, Str path, i32 line, i32 col)
     if (g->drive) {
         return;
     }
-    Str dir = parentdir(path);
     if (!dir.len || startswith(dir, "\\\\")) {
         dir = userhome(g->os, &a);  // cmd.exe refuses a UNC folder
     }
