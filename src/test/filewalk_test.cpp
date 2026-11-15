@@ -335,6 +335,7 @@ static void test_filewalk(Test *t)
         os_write(os, *a, "/j/dead/y.c", "y\n");
         WalkJobLog l = {a, {}, 0};
         FsPool    *p = fsnew(os, a, 0, 77, &l, walkjobfinish);
+        p->win = 0;  // marks in POSIX spellings, on any host
         expect(t, "walk.job", walkjob(p, a, &l, "/j", FILEWALK_TIME),
                "a.txt dead/ dead/y.c src/ src/x.c");
         expect(t, "walk.job.scratch", istr(a, l.scratch), "0");

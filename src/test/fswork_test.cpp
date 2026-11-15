@@ -114,6 +114,7 @@ static FsPool *fstestpool(Os *os, Arena *a, FsLog *l)
     *l = {};
     FsPool *p = fsnew(os, a, newmailbox(a, 1<<16, 0, 0), 77, l, fstestfinish);
     p->manual = 1;
+    p->win    = 0;  // POSIX spellings, on any host: else /m isn't a root
     l->p = p;
     return p;
 }
