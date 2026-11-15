@@ -327,6 +327,40 @@ static void test_deploywsl(Test *t)
             expect(t, "deploy.port.scp", scptarget(&a, d, "/t"), ports[i].scp);
         }
     }
+    // A destination for an editor's address (editaddr): user, host and
+    // port, or why not: no option, no IPv6 zone, nothing an address or
+    // TRAMP's ssh word could misread
+    struct { Str name, in, user, host, port; b32 ipv6; b32 bad; } eds[] = {
+        {"plain",   "box",               "",   "box",               "",     0, 0},
+        {"trim",    " me@box ",          "me", "box",               "",     0, 0},
+        {"port",    "me@box:2222",       "me", "box",               "2222", 0, 0},
+        {"v6port",  "me@[fe80::1]:22",   "me", "fe80::1",           "22",   1, 0},
+        {"v6brack", "[::1]",             "",   "::1",               "",     1, 0},
+        {"v6bare",  "fe80::1",           "",   "fe80::1",           "",     1, 0},
+        {"alias",   "my_host.example-1", "",   "my_host.example-1", "",     0, 0},
+        {"zone",    "fe80::1%en0",       "",   "",                  "",     1, 1},
+        {"named",   "host:ssh",          "",   "",                  "",     1, 1},
+        {"trail",   "[::1]x",            "",   "",                  "",     1, 1},
+        {"nouser",  "@box",              "",   "",                  "",     0, 1},
+        {"twoat",   "a@b@box",           "",   "",                  "",     0, 1},
+        {"optuser", "me@-ox",            "",   "",                  "",     0, 1},
+        {"opthost", "-oProxyCommand=x",  "",   "",                  "",     0, 1},
+        {"blank",   "my host",           "",   "",                  "",     0, 1},
+        {"badport", "box:70000",         "",   "",                  "",     0, 1},
+    };
+    for (iz i = 0; i < countof(eds); i++) {
+        EditHost h  = sshedithost(&a, eds[i].in);
+        Str      nm = concat(&a, "deploy.edithost.", eds[i].name);
+        expect(t, nm, h.why.len ? Str("bad") : Str("ok"), eds[i].bad ? Str("bad") : Str("ok"));
+        expect(t, concat(&a, nm, ".ipv6"), istr(&a, h.ipv6), istr(&a, eds[i].ipv6));
+        if (!eds[i].bad) {
+            expect(t, concat(&a, nm, ".ssh"), h.ssh, trim(eds[i].in));
+            expect(t, concat(&a, nm, ".user"), h.user, eds[i].user);
+            expect(t, concat(&a, nm, ".host"), h.host, eds[i].host);
+            expect(t, concat(&a, nm, ".port"), h.port, eds[i].port);
+        }
+    }
+
     ssh.ssh = "me@pi:2222";
     s = linkargv(&a, {}, ssh, "uname");
     expect(t, "deploy.port.argv", joinwords(&a, s),

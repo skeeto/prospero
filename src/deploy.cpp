@@ -589,6 +589,55 @@ static Str scptarget(Arena *a, SshDest d, Str path)
     return concat(a, concat(a, r, ":"), path);
 }
 
+// Whether a user or host name may go in an editor's address of a file
+// over ssh (editaddr): letters, digits, . _ -, and not an option.
+static b32 editnameok(Str s)
+{
+    for (iz i = 0; i < s.len; i++) {
+        u8 c = s[i];
+        if (!(letter(c) || digit(c) || c=='.' || c=='_' || c=='-')) {
+            return 0;
+        }
+    }
+    return s.len && s[0]!='-';
+}
+
+// An ssh destination, [remote NAME] ssh as written, split for an
+// editor's address of a file there: user, host and port, else why no
+// such address can carry it. TRAMP hands the host to ssh as a word of
+// its own, so neither may look like an option.
+static EditHost sshedithost(Arena *a, Str ssh)
+{
+    EditHost r = {};
+    r.ssh = trim(ssh);
+    SshDest d  = sshdest(a, r.ssh);
+    iz      at = -1;
+    for (iz i = 0; i < d.dest.len; i++) {
+        at = d.dest[i]=='@' ? i : at;
+    }
+    r.user = at>=0 ? takehead(d.dest, at) : Str{};
+    r.host = cuthead(d.dest, at+1);
+    r.port = d.port;
+    r.ipv6 = cut(r.host, ':').ok;
+    b32 ok = !d.bad && (at<0 || editnameok(r.user));
+    if (ok && r.ipv6) {
+        i32 colons = 0;
+        for (iz i = 0; i < r.host.len; i++) {
+            u8 c = r.host[i];
+            colons += c == ':';
+            ok &= hexdigit(c) || c==':' || c=='.';
+        }
+        ok &= colons >= 2;
+    } else if (ok) {
+        ok = editnameok(r.host);
+    }
+    if (!ok) {
+        r.why = "Its ssh destination holds a character an editor's address cannot carry: "
+                "name the host in ~/.ssh/config, or set [ui] editor_remote";
+    }
+    return r;
+}
+
 // A remote machine's key for its deploy record and errors: the ssh
 // destination, wsl:DISTRO, or exec:COMMAND, which no ssh destination
 // looks like.

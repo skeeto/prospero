@@ -159,6 +159,12 @@ static void test_editjump(Test *t)
         {"mcedit", "mcedit", {}, "/a/b.c", 6, 0, 0, "term: mcedit +6 '/a/b.c'"},
         {"tmpltermsq", {}, "vim '{file}'", "/a/c.c", 6, 0, 0,
          "why: [ui] editor_line must not put {file} in quotes: it is quoted already"},
+        // No line (a plan): the path alone, a template's {line} 1
+        {"noline", "gvim -f", {}, "/a/b.c", 0, 0, 0, "gvim -f '/a/b.c'"},
+        {"nolinecode", "code", {}, "/a/b.c", 0, 0, 0, "code '/a/b.c'"},
+        {"nolinetmpl", {}, "ed +{line} {file}", "/a/b.c", 0, 0, 0, "ed +1 '/a/b.c'"},
+        // {host} is editor_remote's alone
+        {"tmplhost", {}, "ed {host} {file}", "/a/b.c", 1, 0, 0, "ed {host} '/a/b.c'"},
     };
     for (iz i = 0; i < countof(jumps); i++) {
         EditJump j = editorjump(&a, jumps[i].cmd, jumps[i].tmpl, jumps[i].path,
@@ -210,6 +216,120 @@ static void test_editjump(Test *t)
         j = editorwindow(&a, j);
         Str got = j.why.len ? concat(&a, "why: ", j.why) : j.line;
         expect(t, concat(&a, "editor.window.", windows[i].name), got, windows[i].want);
+    }
+
+    // An ssh remote's file: the address the preset's editor takes in the
+    // path's place (Vim's scp://, Emacs's /ssh:), else noaddr and why
+    Str knowsno = " to open another computer's file: [ui] editor_remote can give one";
+    Str nopath  = "noaddr: Its path holds a character an editor's ssh address cannot "
+                  "carry: [ui] editor_remote can open it";
+    struct {
+        Str name, cmd, tmpl, ssh;
+        b32 hostwin;  // the remote's paths are Windows'
+        Str path;
+        i32 line;
+        b32 win;      // this computer runs cmd.exe
+        Str want;     // as jumps', or "noaddr: " and why
+    } fars[] = {
+        {"gvim", "gvim -f", {}, "box", 0, "/a/b.c", 12, 0, "gvim -f +12 'scp://box//a/b.c'"},
+        {"port", "gvim -f", {}, "me@box:2222", 0, "/a/b.c", 3, 0,
+         "gvim -f +3 'scp://me@box:2222//a/b.c'"},
+        {"alias", "mvim", {}, "my_host.example-1", 0, "/a/b.c", 1, 0,
+         "mvim +1 'scp://my_host.example-1//a/b.c'"},
+        {"emacsclient", "emacsclient -c", {}, "me@box:2222", 0, "/a/b.c", 3, 0,
+         "emacsclient -c +3 '/ssh:me@box#2222:/a/b.c'"},
+        {"v6port", "emacs", {}, "[::1]:42", 0, "/p", 1, 0, "emacs +1 '/ssh:[::1]#42:/p'"},
+        {"v6bare", "emacs", {}, "fe80::1", 0, "/p", 1, 0, "emacs +1 '/ssh:[fe80::1]:/p'"},
+        {"v6scp", "gvim", {}, "[::1]:42", 0, "/p", 1, 0,
+         "noaddr: Vim's scp:// address cannot hold an IPv6 address: name the host in "
+         "~/.ssh/config, or set [ui] editor_remote"},
+        {"zone", "emacs", {}, "fe80::1%en0", 0, "/p", 1, 0,
+         "noaddr: Its ssh destination holds a character an editor's address cannot carry: "
+         "name the host in ~/.ssh/config, or set [ui] editor_remote"},
+        {"optuser", "emacs", {}, "me@-oProxyCommand=x", 0, "/p", 1, 0,
+         "noaddr: Its ssh destination holds a character an editor's address cannot carry: "
+         "name the host in ~/.ssh/config, or set [ui] editor_remote"},
+        {"alacritty", "alacritty -e nvim", {}, "box", 0, "/a/b.c", 10, 0,
+         "alacritty -e nvim +10 'scp://box//a/b.c'"},
+        {"vi", "alacritty -e vi", {}, "box", 0, "/a/b.c", 1, 0,
+         concat(&a, "noaddr: Prospero knows no way for vi", knowsno)},
+        {"code", "code --wait", {}, "box", 0, "/a/b.c", 1, 0,
+         concat(&a, "noaddr: Prospero knows no way for code", knowsno)},
+        {"open", "open -W -n -t", {}, "box", 0, "/a/b.c", 1, 0,
+         concat(&a, "noaddr: Prospero knows no way for the default text editor", knowsno)},
+        {"unknown", "myedit -x", {}, "box", 0, "/a/b.c", 1, 0,
+         concat(&a, "noaddr: Prospero knows no way for myedit", knowsno)},
+        {"tmpl", "code", "gvim --remote-silent +{line} {file}", "box", 0, "/a/b.c", 4, 0,
+         "gvim --remote-silent +4 'scp://box//a/b.c'"},
+        {"tmplunknown", "gvim", "myedit --goto {file}:{line}", "box", 0, "/a/b.c", 4, 0,
+         concat(&a, "noaddr: Prospero knows no way for myedit", knowsno)},
+        {"blank", "gvim", {}, "box", 0, "/a b/c.c", 2, 0, "gvim +2 'scp://box//a b/c.c'"},
+        {"quote", "gvim", {}, "box", 0, "/a'b", 1, 0, nopath},
+        {"dollar", "gvim", {}, "box", 0, "/a$b", 1, 0, nopath},
+        {"star", "gvim", {}, "box", 0, "/a*b", 1, 0, nopath},
+        {"newline", "gvim", {}, "box", 0, "/a\nb", 1, 0, nopath},
+        {"relative", "gvim", {}, "box", 0, "a/b", 1, 0, nopath},
+        {"utf8", "gvim", {}, "box", 0, "/\xe6\x96\x87\xe6\x9b\xb8/a.md", 1, 0,
+         "gvim +1 'scp://box//\xe6\x96\x87\xe6\x9b\xb8/a.md'"},
+        {"noline", "gvim -f", {}, "box", 0, "/s/plan.md", 0, 0, "gvim -f 'scp://box//s/plan.md'"},
+        {"cmdexe", "gvim -f", {}, "box", 0, "/a/b.c", 2, 1, "gvim -f +2 \"scp://box//a/b.c\""},
+        {"winhost", "gvim -f", {}, "box", 1, "C:\\Users\\j\\b.c", 2, 0,
+         "gvim -f +2 'scp://box//C:/Users/j/b.c'"},
+        {"winhostfwd", "gvim", {}, "box", 1, "C:/x/y.txt", 1, 0, "gvim +1 'scp://box//C:/x/y.txt'"},
+        {"winhostunc", "gvim", {}, "box", 1, "\\\\srv\\share\\x", 1, 0, nopath},
+        {"winhosttramp", "emacs", {}, "box", 1, "C:/x", 1, 0,
+         "noaddr: Emacs's /ssh: address does not reach a Windows host: "
+         "[ui] editor_remote can give one"},
+        {"vimterm", "vim", {}, "box", 0, "/a/b.c", 5, 0, "term: vim +5 'scp://box//a/b.c'"},
+    };
+    for (iz i = 0; i < countof(fars); i++) {
+        EditHost h = sshedithost(&a, fars[i].ssh);
+        h.windows  = fars[i].hostwin;
+        EditJump j = editorjump(&a, fars[i].cmd, fars[i].tmpl, fars[i].path, fars[i].line, 0,
+                                fars[i].win, &h);
+        Str got = j.noaddr  ? concat(&a, "noaddr: ", j.why) :
+                  j.why.len ? concat(&a, "why: ", j.why)    :
+                  j.term    ? concat(&a, "term: ", j.line)  : j.line;
+        expect(t, concat(&a, "editor.far.", fars[i].name), got, fars[i].want);
+    }
+
+    // [ui] editor_remote: {host} and {file} quoted words, as editor_line's
+    struct {
+        Str name, tmpl, ssh, path;
+        i32 line, col;
+        b32 win;
+        Str want;  // the command, else "why: " and why
+    } remotes[] = {
+        {"scp", "gvim -f scp://{host}/{file}", "me@box", "/a/b.c", 3, 0, 0,
+         "gvim -f scp://'me@box'/'/a/b.c'"},
+        {"tramp", "emacsclient -c +{line} /ssh:{host}:{file}", "box", "/a b/c", 7, 0, 0,
+         "emacsclient -c +7 /ssh:'box':'/a b/c'"},
+        {"nofile", "fresh --host {host}", " box ", "/a/b.c", 1, 0, 0, "fresh --host 'box' '/a/b.c'"},
+        {"noline", "ed --goto {file}:{line}:{col}", "box", "/a/b.c", 0, 0, 0,
+         "ed --goto '/a/b.c':1:1"},
+        {"nasty", "ed {file}", "box", "/a'b $(id)", 1, 0, 0, "ed '/a'\\''b $(id)'"},
+        {"hostsq", "ed '{host}' {file}", "box", "/a", 1, 0, 0,
+         "why: [ui] editor_remote must not put {host} or {file} in quotes: they are quoted "
+         "already"},
+        {"filedq", "ed \"{file}\"", "box", "/a", 1, 0, 0,
+         "why: [ui] editor_remote must not put {host} or {file} in quotes: they are quoted "
+         "already"},
+        {"term", "vim scp://{host}/{file}", "box", "/a", 1, 0, 0,
+         "why: [ui] editor_remote must open a window of its own: vim runs in a terminal"},
+        {"alacritty", "alacritty -e nvim scp://{host}/{file}", "box", "/a", 1, 0, 0,
+         "alacritty -e nvim scp://'box'/'/a'"},
+        {"cmdexe", "gvim scp://{host}/{file}", "box", "/a/b.c", 1, 0, 1,
+         "gvim scp://\"box\"/\"/a/b.c\""},
+        {"cmdexehost", "gvim scp://{host}/{file}", "bo%x", "/a/b.c", 1, 0, 1,
+         "why: Its ssh destination holds a character cmd.exe cannot pass on"},
+        {"cmdexepath", "gvim {file}", "box", "/a%b", 1, 0, 1,
+         "why: Its path holds %, \" or a control character, which cmd.exe cannot pass on"},
+    };
+    for (iz i = 0; i < countof(remotes); i++) {
+        EditJump j = editorremote(&a, remotes[i].tmpl, remotes[i].ssh, remotes[i].path,
+                                  remotes[i].line, remotes[i].col, remotes[i].win);
+        Str got = j.why.len ? concat(&a, "why: ", j.why) : j.line;
+        expect(t, concat(&a, "editor.remote.", remotes[i].name), got, remotes[i].want);
     }
 
     EditJump ej = editorjump(&a, "LANG=C \"/opt/my edit/ed\" -x", {}, "/f", 1, 0, 0);
@@ -353,6 +473,7 @@ static void test_editjump(Test *t)
          "ed +6:2 \"$1\" --x|/a/b.c"},
         {"tmplnofile", {}, "ed -c {line}", "/a/b.c", 6, 0, 0, "ed -c 6 \"$1\"|/a/b.c"},
         {"tmplnoline", {}, "ed +{line} {file}", "/a/b.c", 0, 0, 1, "ed +1 \"$1\"|/a/b.c"},
+        {"tmplhost", {}, "ed {host} {file}", "/a/b.c", 1, 0, 0, "ed {host} \"$1\"|/a/b.c"},
         {"tmplsq", {}, "ed '{file}'", "/a/b.c", 6, 0, 0,
          "why: [ui] editor_line must not put {file} in quotes: it is quoted already"},
         {"tmpldq", {}, "ed \"{file}:{line}\"", "/a/b.c", 6, 0, 0,

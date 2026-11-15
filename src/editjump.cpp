@@ -60,6 +60,14 @@ enum : i32 {
     JUMP_NPP,    // -nN F
 };
 
+// How an editor names a file of another computer it reaches by ssh
+// itself, an address in the path's place
+enum : i32 {
+    EDITADDR_NONE,   // none known
+    EDITADDR_SCP,    // Vim's netrw: scp://[user@]host[:port]//abs (// for absolute)
+    EDITADDR_TRAMP,  // Emacs's TRAMP: /ssh:[user@]host[#port]:/abs
+};
+
 struct JumpKind {
     Str name;  // the program's file name, lowercase, without .exe
     i32 jump;  // JUMP_*
@@ -89,6 +97,29 @@ static JumpKind jumpkinds[] = {
     {"helix", JUMP_COLON, 1}, {"ne", JUMP_PLUS, 1}, {"nvi", JUMP_PLUS, 1},
     {"vis", JUMP_PLUS, 1}, {"mcedit", JUMP_PLUS, 1},
 };
+
+// The known editors that name a file of another computer by an address
+// of their own (Vim and Neovim through netrw, Emacs through TRAMP), by
+// their names in jumpkinds. A terminal one counts where a window of its
+// own runs it: "alacritty -e nvim".
+static struct {
+    Str name;
+    i32 addr;  // EDITADDR_*
+} jumpaddrs[] = {
+    {"gvim", EDITADDR_SCP}, {"mvim", EDITADDR_SCP}, {"vim", EDITADDR_SCP},
+    {"nvim", EDITADDR_SCP}, {"emacs", EDITADDR_TRAMP}, {"emacsclient", EDITADDR_TRAMP},
+};
+
+// A known editor's address of a file over ssh: EDITADDR_*.
+static i32 jumpaddr(JumpKind *k)
+{
+    for (iz i = 0; k && i < countof(jumpaddrs); i++) {
+        if (k->name == jumpaddrs[i].name) {
+            return jumpaddrs[i].addr;
+        }
+    }
+    return EDITADDR_NONE;
+}
 
 // The next word of a command line, its quotes removed where it is
 // quoted whole (as editorname takes it), and *rest past it. Empty at
@@ -239,6 +270,7 @@ struct EditJump {
     Str name;  // its file name, as the user wrote it
     b32 known; // its editor takes a line (else the path alone)
     b32 term;  // its editor runs in a terminal
+    b32 noaddr; // for a file over ssh: no address it takes names it (why says)
     Str why;   // why not, else null
 };
 
@@ -248,22 +280,133 @@ static Str jumpquote(Arena *a, Str s, b32 windows)
     return windows ? concat(a, concat(a, "\"", s), "\"") : shquote(a, s);
 }
 
-// A template, [ui] editor_line, to b with {file} as file (a word quoted
-// already), {line} and {col} as numbers (col 1 for none), and file
-// appended when it has no {file}. The template's own quotes followed,
-// since {file} inside them would undo its quoting: sh's ' and " (a
-// backslash escaping outside '), cmd.exe's ". Why not, else null.
-static Str jumpfill(Buf *b, Str tmpl, Str file, i32 line, i32 col, b32 windows)
+// An ssh remote, for an editor's address of a file there: its [remote
+// NAME] ssh as written, and split (sshedithost) into what an address
+// carries.
+struct EditHost {
+    Str ssh;      // as written, trimmed: editor_remote's {host}
+    Str user;     // before the last @, else null
+    Str host;     // an IPv6 address without its brackets
+    Str port;     // its digits, else null
+    b32 ipv6;
+    b32 windows;  // its paths are Windows' (a drive)
+    Str why;      // why no address can name it, else null
+};
+
+// Whether an editor's ssh address may carry a path: absolute, of
+// letters, digits, blanks, / . _ - + , = @ ~ and the bytes of other
+// characters (UTF-8). The editor's own scp or ssh takes it on, so a
+// name chosen on the other computer (by an agent, say) must never become
+// words of a command here. A Windows host's comes as /C:/..., its
+// drive's colon the one colon.
+static b32 addrpathok(Str path, b32 windows)
+{
+    iz i = 0;
+    if (windows) {
+        if (path.len<4 || path[0]!='/' || !letter(path[1]) || path[2]!=':' ||
+            path[3]!='/') {
+            return 0;
+        }
+        i = 3;
+    } else if (!startswith(path, "/")) {
+        return 0;
+    }
+    for (; i < path.len; i++) {
+        u8 c = path[i];
+        if (!(c>=0x80 || letter(c) || digit(c) || c==' ' || c=='/' || c=='.' || c=='_' ||
+              c=='-' || c=='+' || c==',' || c=='=' || c=='@' || c=='~')) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+// The address, unquoted, by which an editor of a form (EDITADDR_*) opens
+// path on an ssh remote, else null and *why: netrw's scp://host//abs,
+// which takes no IPv6 address, a Windows host's path as /C:/x; TRAMP's
+// /ssh:host:/abs, [::1] in brackets, a port after #, and no Windows host.
+static Str editaddr(Arena *a, i32 form, EditHost *h, Str path, Str *why)
+{
+    *why = {};
+    if (h->why.len) {
+        *why = h->why;
+        return {};
+    } else if (form==EDITADDR_TRAMP && h->windows) {
+        *why = "Emacs's /ssh: address does not reach a Windows host: "
+               "[ui] editor_remote can give one";
+        return {};
+    } else if (form==EDITADDR_SCP && h->ipv6) {
+        *why = "Vim's scp:// address cannot hold an IPv6 address: name the host in "
+               "~/.ssh/config, or set [ui] editor_remote";
+        return {};
+    }
+    Str p = path;
+    if (h->windows) {
+        Buf w(a, path.len + 1);
+        putbyte(&w, '/');
+        for (iz i = 0; i < path.len; i++) {
+            putbyte(&w, path[i]=='\\' ? '/' : path[i]);
+        }
+        p = finish(&w);
+    }
+    if (!addrpathok(p, h->windows)) {
+        *why = "Its path holds a character an editor's ssh address cannot carry: "
+               "[ui] editor_remote can open it";
+        return {};
+    }
+    Buf b(a, p.len + h->user.len + h->host.len + h->port.len + 16);
+    if (form == EDITADDR_SCP) {
+        print(&b, "scp://");
+    } else {
+        print(&b, "/ssh:");
+    }
+    if (h->user.len) {
+        print(&b, h->user);
+        putbyte(&b, '@');
+    }
+    if (h->ipv6) {
+        putbyte(&b, '[');
+        print(&b, h->host);
+        putbyte(&b, ']');
+    } else {
+        print(&b, h->host);
+    }
+    if (h->port.len) {
+        putbyte(&b, form==EDITADDR_SCP ? ':' : '#');
+        print(&b, h->port);
+    }
+    putbyte(&b, form==EDITADDR_SCP ? '/' : ':');
+    print(&b, p);
+    return finish(&b);
+}
+
+// A template, [ui] editor_line or editor_remote, to b with {file} as
+// file (a word quoted already), {line} and {col} as numbers (col 1 for
+// none), file appended when it has no {file}, and, given host (quoted
+// already: editor_remote's), {host} as host; else {host} stays as it is
+// written. The template's own quotes followed, since {file} or {host}
+// inside them would undo its quoting: sh's ' and " (a backslash escaping
+// outside '), cmd.exe's ". Why not, else null.
+static Str jumpfill(Buf *b, Str tmpl, Str file, i32 line, i32 col, b32 windows,
+                    Str host = {})
 {
     b32 hasfile = 0;
     b32 sq = 0, dq = 0;
     for (iz i = 0; i < tmpl.len;) {
-        Str t = cuthead(tmpl, i);
-        if (startswith(t, "{file}") && (sq || dq)) {
-            return "[ui] editor_line must not put {file} in quotes: it is quoted already";
-        } else if (startswith(t, "{file}")) {
+        Str t      = cuthead(tmpl, i);
+        b32 isfile = startswith(t, "{file}");
+        b32 ishost = host.len && startswith(t, "{host}");
+        if ((isfile || ishost) && (sq || dq)) {
+            return host.len ? Str("[ui] editor_remote must not put {host} or {file} in "
+                                  "quotes: they are quoted already")
+                            : Str("[ui] editor_line must not put {file} in quotes: it is "
+                                  "quoted already");
+        } else if (isfile) {
             print(b, file);
             hasfile = 1;
+            i += 6;
+        } else if (ishost) {
+            print(b, host);
             i += 6;
         } else if (startswith(t, "{line}")) {
             print(b, (i64)line);
@@ -290,14 +433,28 @@ static Str jumpfill(Buf *b, Str tmpl, Str file, i32 line, i32 col, b32 windows)
     return {};
 }
 
-// The shell command that opens path at line (1-based) and col (0 for
-// none) in the editor: cmd's preset arguments (jumppreset), else the
-// path alone; or tmpl, if not empty, with {file} (a quoted word),
-// {line} and {col} in it, the path appended when it has no {file}. An
-// editor that runs in a terminal gets its line too, marked term. A path
-// cmd.exe cannot pass on (cmdwordok) is refused.
+// Why cmd.exe cannot pass on a word in double quotes, else null.
+static Str cmdwordwhy(Str word)
+{
+    switch (cmdwordok(word)) {
+    case CMDWORD_CMD:
+        return "Its path holds %, \" or a control character, which cmd.exe cannot pass on";
+    case CMDWORD_BESTFIT:
+        return "Its path holds a character Windows may pass to the editor as \" or \\";
+    }
+    return {};
+}
+
+// The shell command that opens path at line (1-based; 0 for none) and
+// col (0 for none) in the editor: cmd's preset arguments (jumppreset),
+// else the path alone; or tmpl, if not empty, with {file} (a quoted
+// word), {line} (1 for none) and {col} in it, the path appended when it
+// has no {file}. An editor that runs in a terminal gets its line too,
+// marked term. A path cmd.exe cannot pass on (cmdwordok) is refused.
+// Given far, an ssh remote's path there: the address the preset's
+// editor takes (EDITADDR_*) in the path's place, else noaddr and why.
 static EditJump editorjump(Arena *a, Str cmd, Str tmpl, Str path, i32 line, i32 col,
-                           b32 windows)
+                           b32 windows, EditHost *far = 0)
 {
     EditJump r = {};
     cmd  = trim(cmd);
@@ -307,12 +464,8 @@ static EditJump editorjump(Arena *a, Str cmd, Str tmpl, Str path, i32 line, i32 
         r.why = "No editor: set [ui] editor in the settings (or $VISUAL or $EDITOR)";
         return r;
     }
-    switch (windows ? cmdwordok(path) : (i32)CMDWORD_OK) {
-    case CMDWORD_CMD:
-        r.why = "Its path holds %, \" or a control character, which cmd.exe cannot pass on";
-        return r;
-    case CMDWORD_BESTFIT:
-        r.why = "Its path holds a character Windows may pass to the editor as \" or \\";
+    r.why = windows && !far ? cmdwordwhy(path) : Str{};
+    if (r.why.len) {
         return r;
     }
     // cmd.exe takes no VAR=value words: its program is the first word
@@ -320,6 +473,29 @@ static EditJump editorjump(Arena *a, Str cmd, Str tmpl, Str path, i32 line, i32 
     r.prog = windows ? cmdword(&rest) : cmdprog(use, &rest);
     r.name = basename(r.prog);
     r.term = jumpterm(jumpkind(r.prog), rest);
+
+    if (far) {
+        // macOS's default text editor knows no address of its own
+        JumpKind *k    = !tmpl.len && cmd=="open -W -n -t" ? 0 : jumppreset(use);
+        i32       form = jumpaddr(k);
+        if (!form) {
+            Str name = k ? k->name : cmd=="open -W -n -t" ? Str("the default text editor")
+                                                          : r.name;
+            r.noaddr = 1;
+            r.why    = concat(a, concat(a, "Prospero knows no way for ", name),
+                              " to open another computer's file: [ui] editor_remote can "
+                              "give one");
+            return r;
+        }
+        Str why = {};
+        path = editaddr(a, form, far, path, &why);
+        why  = why.len ? why : windows ? cmdwordwhy(path) : Str{};
+        if (why.len) {
+            r.noaddr = 1;
+            r.why    = why;
+            return r;
+        }
+    }
 
     Str file = jumpquote(a, path, windows);
     Buf at(a, path.len + 32);  // F:N, or F:N:C
@@ -333,7 +509,7 @@ static EditJump editorjump(Arena *a, Str cmd, Str tmpl, Str path, i32 line, i32 
     Str fat = jumpquote(a, finish(&at), windows);
     Buf b(a, use.len + 2*path.len + 64);
     if (tmpl.len) {
-        r.why = jumpfill(&b, tmpl, file, line, col, windows);
+        r.why = jumpfill(&b, tmpl, file, line>0 ? line : 1, col, windows);
         if (r.why.len) {
             return r;
         }
@@ -354,7 +530,7 @@ static EditJump editorjump(Arena *a, Str cmd, Str tmpl, Str path, i32 line, i32 
     JumpKind *k = jumppreset(cmd);
     print(&b, cmd);
     putbyte(&b, ' ');
-    switch (k ? k->jump : (i32)JUMP_NONE) {
+    switch (k && line>0 ? k->jump : (i32)JUMP_NONE) {
     case JUMP_NONE:
         break;
     case JUMP_PLUS:
@@ -404,6 +580,47 @@ static EditJump editorwindow(Arena *a, EditJump j)
         j.why = finish(&b);
     }
     return j;
+}
+
+// [ui] editor_remote's command for path on an ssh remote, whose ssh
+// destination as written is ssh: {host} and {file} quoted words,
+// {line} and {col} numbers (1 for none), the path appended when it has
+// no {file}. It runs here, with no terminal, so a terminal editor is
+// refused; so are a path or destination cmd.exe cannot pass on.
+static EditJump editorremote(Arena *a, Str tmpl, Str ssh, Str path, i32 line, i32 col,
+                             b32 windows)
+{
+    EditJump r = {};
+    tmpl = trim(tmpl);
+    ssh  = trim(ssh);
+    if (windows) {
+        r.why = cmdwordwhy(path);
+        r.why = r.why.len || cmdwordok(ssh)==CMDWORD_OK ? r.why
+              : Str("Its ssh destination holds a character cmd.exe cannot pass on");
+        if (r.why.len) {
+            return r;
+        }
+    }
+    Str rest = tmpl;
+    r.prog = windows ? cmdword(&rest) : cmdprog(tmpl, &rest);
+    r.name = basename(r.prog);
+    r.term = jumpterm(jumpkind(r.prog), rest);
+    if (r.term) {
+        Buf b(a, 80 + r.name.len);
+        print(&b, "[ui] editor_remote must open a window of its own: ");
+        print(&b, r.name);
+        print(&b, " runs in a terminal");
+        r.why = finish(&b);
+        return r;
+    }
+    Buf b(a, tmpl.len + 2*(path.len + ssh.len) + 64);
+    r.why = jumpfill(&b, tmpl, jumpquote(a, path, windows), line>0 ? line : 1, col, windows,
+                     jumpquote(a, ssh, windows));
+    if (!r.why.len) {
+        r.known = 1;
+        r.line  = finish(&b);
+    }
+    return r;
 }
 
 // A line for cmd.exe with its first word, the program, replaced by exe,
