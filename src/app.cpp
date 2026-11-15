@@ -2302,6 +2302,8 @@ struct Gui {
     i32                nops;
     b32                minclose;     // ask to close once minimized
     Counts             markcounts;   // totals at the last OP_MARK
+    i64                markdue[DUE_COUNT];    // deadline wakes since, by source
+    i64                markbusy[BUSY_COUNT];  // frames since, by busy reason
     i64                markat;
     i32                reveal;       // RECT_* the settings scroll to, or -1
     Str                showpage;     // the settings page the list scrolls to
@@ -13884,6 +13886,9 @@ static void gui_frame(Gui *g)
     rollsecond(g, s->now);
     g->total.frames++;
     g->cur.frames++;
+    for (i32 i = 0; i < BUSY_COUNT; i++) {
+        g->markbusy[i] += (busy>>i) & 1;
+    }
     g->modalframes += g->inmodal;
     g->total.presents += f.present;
     g->cur.presents   += f.present;
@@ -14061,6 +14066,7 @@ static void gui_run(Gui *g)
         rollsecond(g, s->now);
         g->total.wakes[why]++;
         g->cur.wakes[why]++;
+        g->markdue[s->duewhy] += why==WAKE_DEADLINE;
         if (scheddue(s)) {
             gui_frame(g);
         }
@@ -15878,7 +15884,7 @@ static DriveOp m3ops[] = {
     // A session with two screenshots (tests/gui.py, on POSIX): their
     // thumbnails, through the file command, then one whole in the
     // Screenshot window, and closed; no frames meanwhile but for input
-    {OP_IFSESS, 0, 23, 0, 0, "Look at the desktop."},
+    {OP_IFSESS, 0, 24, 0, 0, "Look at the desktop."},
     {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Look at the desktop."},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
@@ -24314,13 +24320,53 @@ static b32 hitshown(Gui *g)
 
 // Frames since the mark: the probe's, a deadline's frame and its
 // settling, and the overlay's numbers if shown.
+// What made the frames since the mark, for a quiet check that failed:
+// the loop's wakes by kind, the deadlines by source, and the frames by
+// the reasons they gave to go on.
+static void quietwhy(Gui *g, Buf *b)
+{
+    static Str wakes[] = {
+        "input", "mail", "deadline", "probe", "force", "pace", "other",
+    };
+    static_assert(countof(wakes) == WAKE_COUNT);
+    print(b, " (wakes:");
+    for (i32 i = 0; i < WAKE_COUNT; i++) {
+        i64 n = g->total.wakes[i] - g->markcounts.wakes[i];
+        if (n) {
+            print(b, " ");
+            print(b, wakes[i]);
+            print(b, " ");
+            print(b, n);
+        }
+    }
+    print(b, "; deadlines:");
+    for (i32 i = 0; i < DUE_COUNT; i++) {
+        if (g->markdue[i]) {
+            print(b, " ");
+            print(b, duenames[i]);
+            print(b, " ");
+            print(b, g->markdue[i]);
+        }
+    }
+    print(b, "; busy:");
+    for (i32 i = 0; i < BUSY_COUNT; i++) {
+        if (g->markbusy[i]) {
+            print(b, " ");
+            print(b, busynames[i]);
+            print(b, " ");
+            print(b, g->markbusy[i]);
+        }
+    }
+    print(b, ")");
+}
+
 static b32 drivequiet(Gui *g, Str what, i64 allow)
 {
     i64   n     = g->total.frames - g->driveframes;
     i64   us    = g->sched.now - g->markat;
     i64   other = (g->metricsshown ? 4*us/1000000 : 0) + allow;
     Arena a     = g->frame;
-    Buf   b(&a, 128);
+    Buf   b(&a, 512);
     print(&b, "drive: frames ");
     print(&b, what);
     print(&b, ": ");
@@ -24328,6 +24374,9 @@ static b32 drivequiet(Gui *g, Str what, i64 allow)
     print(&b, " in ");
     printfloat(&b, (f64)us/1e6, 1);
     print(&b, " s");
+    if (n > other) {
+        quietwhy(g, &b);
+    }
     guilog(g, finish(&b));
     return n <= other;
 }
@@ -25847,12 +25896,15 @@ static b32 drivecheck(Gui *g, i32 chk)
         i64   other = (g->metricsshown ? 4*us/1000000 : 0) + 2 +
                       3*(g->saves - g->marksaves);  // a save's, and a probe after
         Arena a     = g->frame;
-        Buf   b(&a, 96);
+        Buf   b(&a, 512);
         print(&b, "drive: frames with screenshots shown: ");
         print(&b, n);
         print(&b, " in ");
         printfloat(&b, (f64)us/1e6, 1);
         print(&b, " s");
+        if (n > other) {
+            quietwhy(g, &b);
+        }
         guilog(g, finish(&b));
         return n <= other;
     }
@@ -26847,13 +26899,16 @@ static b32 drivecheck(Gui *g, i32 chk)
                       3*(g->saves - g->marksaves);  // a save's, and a probe after
         b32   show  = chk == CHK_JOBSDRAWN;
         Arena a     = g->frame;
-        Buf   b(&a, 128);
+        Buf   b(&a, 512);
         print(&b, "drive: frames while a job prints, the Jobs tab ");
         print(&b, show ? Str("shown: ") : Str("hidden: "));
         print(&b, n);
         print(&b, " in ");
         printfloat(&b, (f64)us/1e6, 1);
         print(&b, " s");
+        if (!show && n>other) {
+            quietwhy(g, &b);
+        }
         guilog(g, finish(&b));
         if (show) {
             return tabselected("Jobs") && g->jobsvisible && n>0 &&
@@ -28241,6 +28296,8 @@ static void drivestep(Gui *g)
     case OP_MARK:
         g->driveframes = g->total.frames;
         g->markcounts  = g->total;
+        for (i32 i = 0; i < DUE_COUNT; i++) g->markdue[i] = 0;
+        for (i32 i = 0; i < BUSY_COUNT; i++) g->markbusy[i] = 0;
         g->markat      = g->sched.now;
         g->marksaves   = g->saves;
         if (op->text.len) {
