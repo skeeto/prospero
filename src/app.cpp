@@ -76,6 +76,7 @@
 #include "dock.cpp"
 #include "fileset.cpp"
 #include "palette.cpp"
+#include "nav.cpp"
 #include "dropto.cpp"
 #include "a11y.cpp"
 
@@ -95,6 +96,8 @@ enum : iz {
     REQ_MAX    = 64,      // commands awaiting replies
     FIND_BUDGET = 2<<20,  // bytes of text a frame searches at most
 };
+
+static_assert((iz)NAV_TEXT >= FIELD_MAX);  // a Settings page name fits
 
 enum : i64 {
     QUIT_GRACE = 6000000,  // µs to wait for the engine to stop
@@ -1536,6 +1539,13 @@ struct DriveOp;
 struct AxGui;
 struct Preedit;
 
+// A transcript place Back or Forward goes to, laid out where drawn.
+struct NavTo {
+    GuiSession *sess;  // null if none waits
+    View       *view;  // in this view, else left alone
+    Anchor      an;
+};
+
 struct Gui {
     Os                *os;
     Arena              perm;
@@ -2262,6 +2272,9 @@ struct Gui {
     b32                held;         // a wake came during the hold
     Str                cfgsnap;      // the config file before an edit
     GuiSession        *drivesess;    // the session OP_MARKSESS remembered
+    NavSpot            navmark;      // the transcript's place CHK_NAVPLACE remembered
+    i32                navmarkback;  // and Back's and Forward's reach CHK_NAVDEPTH did
+    i32                navmarkfwd;
     b32                modelsshown;  // /model's list drew
     i32                picksframe;   // the new session's model list drew then
     Str                pickwant;     // its first pick other than the default
@@ -2357,7 +2370,21 @@ struct Gui {
     i32                promptend;    // 1: with the caret at the draft's end,
                                      // 2: the box is active to put it there
     b32                promptactive; // the box was active when last drawn
+
+    Nav                nav;          // back and forward through jumps (navgui.cpp)
+    i32                navpane;      // the pane last focused (navtrack)
+    NavTo              navto;        // a transcript place to go back to
+    f32                navhelpy;     // and Help's scroll, while navhelp
+    b32                navhelp;
+    b32                newmine;      // newid is a session the user asked for
 };
+
+// Back and forward through jumps (navgui.cpp)
+static void     navjump(Gui *);
+static void     navtrack(Gui *);
+static b32      navgo(Gui *, i32);
+static NavSpot *navwhereto(Gui *, i32);
+static Str      navname(Gui *, Arena *, NavSpot *);
 
 // Log to standard error, the log file, and the Log window, which then
 // needs a frame to show it.
@@ -4545,6 +4572,7 @@ static void guinew(Gui *g, GuiHost *h, Str cwd, Str endpoint, Str model, Str rol
     putint(&w.json, 1);
     g->newid  = g->nextid;
     g->newerr = {};
+    g->newmine = 1;  // unless the caller says otherwise
     cmdsend(g, &w, a);
 }
 
@@ -6218,6 +6246,7 @@ static void opendirnew(Gui *g, Str dir, Str why)
     fieldput(g->newcwd, dir);
     guilog(g, concat(&a, concat(&a, concat(&a, "a new session in ", dir), ", as "), why));
     guinew(g, g->main, dir, {}, {});
+    g->newmine = 0;  // not a jump of the user's
 }
 
 // A dropped file attached to the draft shown, saying why not.
@@ -6419,6 +6448,7 @@ static void onsesscmd(Gui *g, GuiHost *h, Arena scratch, Request *q, EvRec *r)
         }
         GuiSession *f = findsess(g, h, sid);
         f = f ? f : addsess(g, h, sid);
+        navjump(g);
         guiselect(g, f);
         if (jsonint(jsonget(j, "side"), 0)) {
             // Idle, the quote to write under, the box ready for it
@@ -6659,6 +6689,9 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
         GuiSession *s = findsess(g, h, r->sid);
         s = s ? s : addsess(g, h, r->sid);
         sessview(g, s);
+        if ((mine && g->newmine) || q.s) {
+            navjump(g);  // asked for: not opendirnew's, nor the checklist's
+        }
         setcur(g, s);
         if (q.s) {
             // A worktree session of q.s (guiworktree): under it, idle,
@@ -10699,6 +10732,7 @@ static void onimport(Gui *g, GuiHost *h, Arena scratch, Request *q, EvRec *r)
     }
     GuiSession *s = findsess(g, h, r->sid);
     s = s ? s : addsess(g, h, r->sid);
+    navjump(g);
     guiselect(g, s);
     setnote(g, s, concat(&scratch, "imported from ", x->path), 0);
     guilist(g, h);
@@ -11978,6 +12012,7 @@ static void gui_toasted(Gui *g, i32 id)
     guilog(g, "a toast was clicked: to its session");
     gui_tray(g, TRAY_OPEN);  // back from the background, or raised
     if (!sel->gone) {
+        navjump(g);
         guiselect(g, sel);
     }
     scheddirty(&g->sched);
@@ -12195,6 +12230,7 @@ static void shednow(Gui *g)
 // the Session menu's Settings..., macOS's application menu's.
 static void opensettings(Gui *g)
 {
+    navjump(g);
     setpane(g, PANE_SETTINGS, 1);
     g->cfgfindkey = 1;
     scheddirty(&g->sched);  // shown already, for a pick that brings no input
@@ -12309,6 +12345,7 @@ static void setpane(Gui *, i32, b32);
 #include "ui.cpp"
 #include "term.cpp"
 #include "files.cpp"
+#include "navgui.cpp"  // after files.cpp and term.cpp: FileTab, TermTab
 #include "a11y_imgui.cpp"
 
 
@@ -14394,6 +14431,8 @@ enum : i32 {
                   // in the session shown
     OP_MDOWN,     // middle button
     OP_MUP,
+    OP_XDOWN,     // a side button: dx 0 back (X1), 1 forward (X2)
+    OP_XUP,
     OP_DRAG,      // a drag over the window, as the platform's come: dx 0
                   // leaves, 1 is over the target (T_NONE: the title bar),
                   // 2 drops there; it holds the words text (dy 1), else
@@ -14984,6 +15023,12 @@ enum : i32 {
     CHK_EDITROUTE,    // the Files toolbar's Open in editor would open a
                       // Terminal tab (dx 1) or a window (dx 0), its
                       // tooltip holding text
+    CHK_PANEFOCUS,    // the pane named text has the focus (ImGui's NavWindow)
+    CHK_NAVDEPTH,     // Back reaches dx spots and Forward dy, a held one
+                      // counted; text "mark" remembers them, "kept" compares
+    CHK_NAVPLACE,     // the transcript's place: text "mark" remembers it,
+                      // "kept" is it again, "stuck" follows its end
+    CHK_MARKSHOWN,    // the session OP_MARKSESS remembered is shown
     CHK_COUNT,
 };
 
@@ -15317,6 +15362,10 @@ static Str chknames[] = {
     "the Files pane has the focus",
     "the terminal's banner says what it should",
     "Open in editor opens a tab or a window, as said",
+    "the pane said has the focus",
+    "Back and Forward reach as many spots as said",
+    "the transcript's place is as said",
+    "the session remembered is shown",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -15581,6 +15630,12 @@ struct DriveOp {
     {OP_MOVE, T_PANEITEM, 0, 0, 100, name}, {OP_DOWN, 0, 0, 0, 60, ""}, \
     {OP_UP, 0, 0, 0, 500, ""}, \
     {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, name}
+// An item of the View menu, by its name
+#define VIEWITEM(name) \
+    {OP_MOVE, T_MENU, 0, 0, 100, ""}, {OP_DOWN, 0, 0, 0, 60, ""}, \
+    {OP_UP, 0, 0, 0, 500, ""}, \
+    {OP_MOVE, T_NAMED, 0, 0, 100, name}, {OP_DOWN, 0, 0, 0, 60, ""}, \
+    {OP_UP, 0, 0, 0, 800, ""}
 
 static DriveOp driveops[] = {
     {OP_MARK, 0, 0, 0, 1500, ""},
@@ -16565,6 +16620,7 @@ static DriveOp m3ops[] = {
     // a toast tells of its end, until it is shown
     {OP_NEWSESSION, 0, 0, 0, 0, ""},
     {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_MARKSESS, 0, 0, 0, 0, ""},
     {OP_PROMPT, 0, 0, 0, 500, "Stream slowly for a while."},
     {OP_MOVE, T_OTHERSESS, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -16579,6 +16635,14 @@ static DriveOp m3ops[] = {
     {OP_CHECK, CHK_TOASTSEL, 0, 0, 0, ""},
     {OP_CHECK, CHK_UNTOASTED, 0, 0, 0, ""},
     {OP_MAIN, 0, 0, 0, 500, ""},
+    // Back goes to the session the sidebar's row left, and Forward
+    // to where Back left (#58)
+    {OP_XDOWN, 0, 0, 0, 60, ""},
+    {OP_XUP, 0, 0, 0, 800, ""},
+    {OP_CHECK, CHK_MARKSHOWN, 0, 0, 0, ""},
+    {OP_XDOWN, 0, 1, 0, 60, ""},
+    {OP_XUP, 0, 1, 0, 800, ""},
+    {OP_CHECK, CHK_PARENTSHOWN, 0, 0, 0, ""},
     // M4, in the light theme first. Two subagents, counted at work in
     // their parent's strip, then listed under it; the parent's task row
     // shows one, and the subagent's up arrow goes back, as does Alt+Up
@@ -16606,6 +16670,13 @@ static DriveOp m3ops[] = {
     {OP_CHECK, CHK_CHILDSHOWN, 0, 0, 0, ""},
     {OP_KEYDOWN, 0, GKEY_UP, KEY_ALT, 50, ""},
     {OP_KEYUP, 0, GKEY_UP, KEY_ALT, 500, ""},
+    {OP_CHECK, CHK_PARENTSHOWN, 0, 0, 0, ""},
+    // Back to the subagent Alt+Up left, Forward up again (#58)
+    {OP_XDOWN, 0, 0, 0, 60, ""},
+    {OP_XUP, 0, 0, 0, 800, ""},
+    {OP_CHECK, CHK_CHILDSHOWN, 0, 0, 0, ""},
+    {OP_XDOWN, 0, 1, 0, 60, ""},
+    {OP_XUP, 0, 1, 0, 800, ""},
     {OP_CHECK, CHK_PARENTSHOWN, 0, 0, 0, ""},
     // A subagent messages its parent, read after it reports; the notice
     // leads to the sender, and its row back
@@ -17744,6 +17815,35 @@ static DriveOp m3ops[] = {
     // an absolute file: URL
     {OP_PROMPT, 0, 0, 0, 1500, "Cite the files."},
     {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
+    // Back and forward through jumps (#58): Back goes to the place in
+    // the transcript a jump (Ctrl+,) left, or to its end, followed again,
+    // if it followed it, leaving the links in view for what follows
+    {OP_MOVE, T_TRANSCRIPT, 0, 0, 100, ""},
+    {OP_WHEEL, 0, 0, 10, 50, ""},
+    {OP_WHEEL, 0, 0, 10, 800, ""},
+    {OP_CHECK, CHK_NAVPLACE, 0, 0, 0, "mark"},
+    CMDKEY(GKEY_COMMA, 500),
+    {OP_CHECK, CHK_PANEFOCUS, 0, 0, 0, "Settings"},
+    {OP_XDOWN, 0, 0, 0, 60, ""},
+    {OP_XUP, 0, 0, 0, 800, ""},
+    {OP_CHECK, CHK_TRANSCRIPTTAB, 0, 0, 0, ""},
+    {OP_CHECK, CHK_NAVPLACE, 0, 0, 0, "kept"},
+    {OP_WHEEL, 0, 0, -10, 50, ""},
+    {OP_WHEEL, 0, 0, -10, 50, ""},
+    {OP_WHEEL, 0, 0, -10, 800, ""},
+    {OP_CHECK, CHK_NAVPLACE, 0, 0, 0, "stuck"},
+    CMDKEY(GKEY_COMMA, 500),
+    {OP_CHECK, CHK_PANEFOCUS, 0, 0, 0, "Settings"},
+    {OP_XDOWN, 0, 0, 0, 60, ""},
+    {OP_XUP, 0, 0, 0, 800, ""},
+    {OP_CHECK, CHK_TRANSCRIPTTAB, 0, 0, 0, ""},
+    {OP_CHECK, CHK_NAVPLACE, 0, 0, 0, "stuck"},
+    // Settings closed again, whose pages would poll (mcplisting)
+    {OP_MOVE, T_MENU, 0, 0, 100, ""}, {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_PANEITEM, 0, 0, 100, "Settings"}, {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PANECLOSED, 0, 0, 0, "Settings"},
     {OP_MOVE, T_NAMED, 0, 0, 800, "link cite/hello.c:12"},
     {OP_CHECK, CHK_TOOLTIP, 0, 0, 0, ""},
     {OP_CHECK, CHK_LINKTIP, 0, 0, 0, "Files \xe2\x86\x92 cite/hello.c:12"},
@@ -17755,6 +17855,40 @@ static DriveOp m3ops[] = {
     {OP_CHECK, CHK_FILEMODE, FMODE_TEXT, 0, 0, ""},
     {OP_CHECK, CHK_FILELINE, 12, 0, 0, ""},
     {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "12-12"},
+    // Back from the file to the transcript the link was in, and Forward
+    // to the file's place again: by the side buttons, the keys and View
+    {OP_CHECK, CHK_FILELINE, 0, 0, 0, "mark"},
+    {OP_XDOWN, 0, 0, 0, 60, ""},
+    {OP_XUP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PANEFOCUS, 0, 0, 0, "Transcript"},
+    {OP_XDOWN, 0, 1, 0, 60, ""},
+    {OP_XUP, 0, 1, 0, 800, ""},
+    {OP_CHECK, CHK_PANEFOCUS, 0, 0, 0, "Files"},
+    {OP_CHECK, CHK_FILEPATH, 0, 0, 0, "/cite/hello.c"},
+    {OP_CHECK, CHK_FILELINE, 0, 0, 0, "kept"},
+    {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "12-12"},
+    {OP_CHECK, CHK_NAVDEPTH, 0, 0, 0, "mark"},
+#if defined(__APPLE__)
+    CMDKEY(GKEY_LBRACKET, 500),
+#else
+    {OP_KEYDOWN, 0, GKEY_LEFT, KEY_ALT, 50, ""},
+    {OP_KEYUP, 0, GKEY_LEFT, KEY_ALT, 500, ""},
+#endif
+    {OP_CHECK, CHK_PANEFOCUS, 0, 0, 0, "Transcript"},
+#if defined(__APPLE__)
+    CMDKEY(GKEY_RBRACKET, 800),
+#else
+    {OP_KEYDOWN, 0, GKEY_RIGHT, KEY_ALT, 50, ""},
+    {OP_KEYUP, 0, GKEY_RIGHT, KEY_ALT, 800, ""},
+#endif
+    {OP_CHECK, CHK_PANEFOCUS, 0, 0, 0, "Files"},
+    {OP_CHECK, CHK_FILELINE, 0, 0, 0, "kept"},
+    VIEWITEM("Back"),
+    {OP_CHECK, CHK_PANEFOCUS, 0, 0, 0, "Transcript"},
+    VIEWITEM("Forward"),
+    {OP_CHECK, CHK_PANEFOCUS, 0, 0, 0, "Files"},
+    {OP_CHECK, CHK_FILELINE, 0, 0, 0, "kept"},
+    {OP_CHECK, CHK_NAVDEPTH, 0, 0, 0, "kept"},
     {OP_MOVE, T_FILETEXT, 0, 0, 100, "12"},
     {OP_WHEEL, 0, 0, -10, 50, ""},
     {OP_WHEEL, 0, 0, -10, 50, ""},
@@ -21034,6 +21168,20 @@ static DriveOp termops[] = {
     {OP_TEXT, 0, 0, 0, 100, "echo after"},
     TERMKEY(GKEY_ENTER, 100),
     {OP_WAIT, W_TERM, 0, 0, 5000, "\nafter"},
+#if !defined(__APPLE__)
+    // Alt+Left is the shell's while the terminal has the keyboard, not
+    // Back's (#58)
+    {OP_CHECK, CHK_NAVDEPTH, 0, 0, 0, "mark"},
+    {OP_TEXT, 0, 0, 0, 100, "cat -v"},
+    TERMKEY(GKEY_ENTER, 300),
+    {OP_KEYDOWN, 0, GKEY_LEFT, KEY_ALT, 50, ""},
+    {OP_KEYUP, 0, GKEY_LEFT, KEY_ALT, 300, ""},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "[1;3D"},
+    CTRLKEY(GKEY_C, 300),
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_CHECK, CHK_NAVDEPTH, 0, 0, 0, "kept"},
+#endif
     {OP_SHOT, 0, 0, 0, 300, "terminal"},
     // A new size, which the shell hears of, shown over it as it changes
     {OP_RESIZE, 0, 1100, 700, 300, ""},
@@ -22951,6 +23099,8 @@ static DriveOp a11yops[] = {
     {OP_A11Y, 0, 0, 0, 0, "logged queued edits dropped: 1 waited too long"},
     {OP_A11Y, 0, 0, 0, 300, "late 6000 press menuitem View"},
     {OP_A11Y, 0, 0, 0, 0, "has menuitem Go to..."},
+    {OP_A11Y, 0, 0, 0, 0, "has menuitem Back"},
+    {OP_A11Y, 0, 0, 0, 0, "has menuitem Forward"},
     KEY(GKEY_ESCAPE, 0, 300),
     {OP_A11Y, 0, 0, 0, 300, "activate textarea Prompt"},
     SELALL,
@@ -25673,6 +25823,77 @@ static b32 drivecheck(Gui *g, i32 chk)
         return !g->drag.on && drivequiet(g, "after a drag", 2);
     case CHK_FILEFOCUS:
         return g->panes[PANE_FILES] && g->filesfocus;
+    case CHK_PANEFOCUS: {
+        // From ImGui's focus, not navtrack's record of it
+        Arena a   = g->frame;
+        Str   got = "no pane";
+        for (ImGuiWindow *w = GImGui->NavWindow; w; w = w->ParentWindow) {
+            i32 p = 0;
+            for (; p<PANE_COUNT && w->ID!=ImHashStr(panenames[p]); p++) {}
+            if (p < PANE_COUNT) {
+                got = navpanename(p);
+                break;
+            }
+        }
+        b32 ok = got == g->ops[g->drivepc-1].text;
+        if (!ok) {
+            guilog(g, concat(&a, "drive: the focus is in ", got));
+        }
+        return ok;
+    }
+    case CHK_NAVDEPTH: {
+        DriveOp *op      = &g->ops[g->drivepc-1];
+        Nav     *n       = &g->nav;
+        NavSpot  now     = navnow(g);
+        b32      pending = n->hold && !navsame(&n->held, &now);
+        i32      back    = n->nback + (pending ? 1 : 0);
+        i32      fwd     = pending ? 0 : n->nfwd;
+        if (op->text == Str("mark")) {
+            g->navmarkback = back;
+            g->navmarkfwd  = fwd;
+            return 1;
+        }
+        b32 kept = op->text == Str("kept");
+        i32 wb   = kept ? g->navmarkback : (i32)op->dx;
+        i32 wf   = kept ? g->navmarkfwd : (i32)op->dy;
+        b32 ok   = back==wb && fwd==wf;
+        if (!ok) {
+            Arena a = g->frame;
+            Buf   b(&a, 64);
+            print(&b, "drive: Back reaches ");
+            print(&b, (i64)back);
+            print(&b, ", Forward ");
+            print(&b, (i64)fwd);
+            guilog(g, finish(&b));
+        }
+        return ok;
+    }
+    case CHK_NAVPLACE: {
+        Str     t = g->ops[g->drivepc-1].text;
+        NavSpot s = {};
+        navplace(g, &s);
+        Arena a = g->frame;
+        Buf   b(&a, 64);
+        print(&b, "drive: the transcript's place: ");
+        if (s.stick) {
+            print(&b, "its end");
+        } else {
+            print(&b, (i64)s.msg);
+            putbyte(&b, ':');
+            print(&b, (i64)s.off);
+        }
+        guilog(g, finish(&b));
+        if (t == "mark") {
+            g->navmark = s;
+            return !s.stick;
+        } else if (t == "stuck") {
+            return s.stick;
+        }
+        NavSpot *m = &g->navmark;
+        return !s.stick && s.view==m->view && s.msg==m->msg && s.off==m->off;
+    }
+    case CHK_MARKSHOWN:
+        return g->drivesess && g->sess==g->drivesess;
     case CHK_TERMBANNER: {
         TermTab *tt  = termfront(g);
         Arena    a   = g->frame;
@@ -28124,12 +28345,16 @@ static void drivestep(Gui *g)
     case OP_RUP:
     case OP_MDOWN:
     case OP_MUP:
+    case OP_XDOWN:
+    case OP_XUP:
         e.kind   = GEV_BUTTON;
         e.x      = g->drivex;
         e.y      = g->drivey;
         e.button = op->op==OP_RDOWN || op->op==OP_RUP ? 1
-                 : op->op==OP_MDOWN || op->op==OP_MUP ? 2 : 0;
-        e.down   = op->op==OP_DOWN || op->op==OP_RDOWN || op->op==OP_MDOWN;
+                 : op->op==OP_MDOWN || op->op==OP_MUP ? 2
+                 : op->op==OP_XDOWN || op->op==OP_XUP ? 3 + (op->dx!=0) : 0;
+        e.down   = op->op==OP_DOWN || op->op==OP_RDOWN || op->op==OP_MDOWN ||
+                   op->op==OP_XDOWN;
         if (op->op == OP_DOWN) {
             // A drag's T_PRESSED moves go where their items are now: a
             // reorder moves items under the drag, and a frame between
@@ -28316,6 +28541,7 @@ static void drivestep(Gui *g)
         break;
     case OP_NEWSESSION:
         guinew(g, g->main, g->drivecwd, {}, {}, op->text);  // in a role, if named
+        g->newmine = 0;  // not a jump of the user's
         break;
     case OP_TOUCH: {
         Arena a    = g->frame;

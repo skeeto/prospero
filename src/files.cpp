@@ -1633,6 +1633,7 @@ static void filelinkopen(Gui *g, Arena *a, Dest *d, LinkFrom *from)
     if (!f.path.len) {
         return;
     }
+    navjump(g);
     if (d->here) {
         filelinkgo(g, from->s, from->host, f.path, from->win, 0, 0, d->section);
     } else {
@@ -1853,6 +1854,7 @@ static void fileeditrun(Gui *g, Arena a, GuiSession *root, u64 host, Str path, i
         break;
     case FE_TAB:
     case FE_SHOW:
+        navjump(g);
         termedit(g, e.root, path, line, col);
         break;
     }
@@ -1958,6 +1960,7 @@ static void filelinkitems(Gui *g)
     Str   path = {m->path, m->pathlen};
     Str   why  = {m->why, m->whylen};
     if (ImGui::MenuItem("Open in Files", 0, false, !why.len)) {
+        navjump(g);
         filelinkgo(g, m->s, m->host, path, m->win, m->line0, m->line1,
                    {m->section, m->sectionlen});
     }
@@ -2571,6 +2574,7 @@ static void fileanswer(Gui *g, Str data)
     if (!l0.ok || !l1.ok || !a.ok || !b.ok || !pl.head.len) {
         return;
     }
+    navjump(g);
     filesopen(g, g->sess, g->fask.host, pl.head, (i32)a.val, (i32)b.val, pl.tail);
 }
 
@@ -2623,6 +2627,9 @@ static void droproute(Gui *g)
         }
         DropFacts f = dropfacts(g, d->x, d->y, d->at);
         DropWhere w = dropwhere(&g->frame, f, {DRAGLOAD_FILES, n, 0});
+        if (w.to == DROPTO_FILES) {
+            navjump(g);  // once for the drop
+        }
         for (b32 first = 1; d != end; d = d->next, first = 0) {
             switch (w.to) {
             case DROPTO_FIELD:
@@ -3061,6 +3068,7 @@ static void filelineleave(Gui *g, b32 focus)
 // scrolled to once, and the place Open in editor opens, its column too.
 static void filegoto(Gui *g, FileTab *ft, FrefLines l)
 {
+    navjump(g);
     ft->mode   = FMODE_TEXT;
     ft->band0  = l.line0;
     ft->band1  = l.line1;

@@ -761,6 +761,7 @@ static Str istr(Arena *a, i64 v)
 #  include "dock.cpp"
 #  include "fileset.cpp"
 #  include "palette.cpp"
+#  include "nav.cpp"
 #  include "dropto.cpp"
 #  include "a11y.cpp"
 #  include "test/sched_test.cpp"
@@ -780,6 +781,7 @@ static Str istr(Arena *a, i64 v)
 #  include "test/dock_test.cpp"
 #  include "test/fileset_test.cpp"
 #  include "test/palette_test.cpp"
+#  include "test/nav_test.cpp"
 #  include "test/dropto_test.cpp"
 #  include "test/a11y_test.cpp"
 #endif
@@ -885,6 +887,7 @@ int main()
     test_filereadall(&t);
     test_filefind(&t);
     test_palette(&t);
+    test_nav(&t);
     test_dropto(&t);
     test_dropload(&t);
     test_a11y(&t);

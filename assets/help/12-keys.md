@@ -36,6 +36,18 @@ there too.
 - **Alt+Up**: from a subagent or side chat, up to the session it
   came from (the up arrow above its transcript). On macOS, Option+Up,
   or Cmd+Up as in Finder.
+- **Alt+Left** and **Alt+Right**: Back and Forward, as in a browser,
+  through the window's jumps: following a link, Open in Files, a
+  session picked in the sidebar or the palette, up to a parent, a pane
+  brought forward by a menu or a key, a Help topic or Settings page
+  picked from its list. Back returns to the session, pane and place a
+  jump left: the transcript where it was (or following its end, if it
+  was), the file at its line. Picking a tab, scrolling, finding and
+  layouts are not jumps. The mouse's side buttons and a keyboard's
+  browser keys do the same, as do View → Back and View → Forward. On
+  macOS, Cmd+[ and Cmd+]. While the Terminal has the keyboard, Alt+Left
+  and Alt+Right are its shell's. The history is the window's, across
+  sessions, and goes when Prospero quits.
 - **Ctrl+Shift+S**: fold, or show again, all of the session's shell
   output (the Shell output button above the transcript, the Bash
   logo), short output too, leaving its other tool rows as they were.

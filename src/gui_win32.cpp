@@ -587,6 +587,12 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
 
     switch (msg) {
+    case WM_XBUTTONDOWN:
+    case WM_XBUTTONUP:
+    case WM_XBUTTONDBLCLK:
+        // Handled (ImGui has them as buttons 3 and 4, back and forward):
+        // no WM_APPCOMMAND from DefWindowProc as well
+        return TRUE;
     case WM_SIZE:
         if (wp == SIZE_MINIMIZED) {
             h->minimized(h->gui, 1);
@@ -1625,6 +1631,13 @@ extern "C" void w32gui_inject(void *p, int kind, float x, float y,
         PostMessageW(w->hwnd, WM_MOUSEMOVE, 0, xy);
         break;
     case 1: {  // button
+        if (button >= 3) {  // back (X1) or forward (X2)
+            WORD   xb = button==3 ? XBUTTON1 : XBUTTON2;
+            WORD   mk = button==3 ? MK_XBUTTON1 : MK_XBUTTON2;
+            PostMessageW(w->hwnd, down ? WM_XBUTTONDOWN : WM_XBUTTONUP,
+                         MAKEWPARAM(down ? mk : 0, xb), xy);
+            break;
+        }
         UINT m = button==2 ? (down ? WM_MBUTTONDOWN : WM_MBUTTONUP)
                : button    ? (down ? WM_RBUTTONDOWN : WM_RBUTTONUP)
                :             (down ? WM_LBUTTONDOWN : WM_LBUTTONUP);
@@ -1643,6 +1656,7 @@ extern "C" void w32gui_inject(void *p, int kind, float x, float y,
             VK_END, VK_CONTROL, VK_OEM_PLUS, VK_OEM_MINUS, '0', 'F', 'G', 'T',
             'R', VK_UP, VK_DOWN, 'V', 'B', '2', VK_OEM_COMMA, 'S', VK_OEM_3,
             VK_BACK, VK_LEFT, 'D', 'K', 'O', 'W', VK_F3, VK_F10, 'Z',
+            VK_RIGHT, VK_OEM_4, VK_OEM_6,
         };
         BYTE state[256];
         GetKeyboardState(state);

@@ -891,6 +891,7 @@ static Str termrunwhy(Gui *g, GuiSession *s, i32 kind, u64 key)
 // checked it can (termrunwhy).
 static TermTab *termrun(Gui *g, GuiSession *from, Str lang, Str text, u64 key)
 {
+    navjump(g);
     GuiSession *s  = termroot(g, from);
     TermTab    *tt = termrunof(s, key);
     if (tt) {
@@ -1860,6 +1861,7 @@ static void termhotkeys(Gui *g)
         return;
     }
     os_guiimereset(g->os);  // on German, ^ is a dead key
+    navjump(g);
     if (io.KeyShift) {
         // A new tab, made by drawterm once the pane's size holds
         g->termaddto = g->sess ? termroot(g, g->sess) : 0;
@@ -1896,6 +1898,7 @@ static void termhotkeys(Gui *g)
 // focused, as Ctrl+` does, which starts a shell if the session has none.
 static void termgo(Gui *g)
 {
+    navjump(g);
     setpane(g, PANE_TERMINAL, 1);
     g->termfocus = 1;
     scheddirty(&g->sched);
@@ -1913,6 +1916,7 @@ static Str termaddwhy(Gui *g, GuiSession *s)
 // follows the pane once shown.
 static void termadd(Gui *g, GuiSession *s)
 {
+    navjump(g);
     GuiSession *r = termroot(g, s);
     setpane(g, PANE_TERMINAL, 1);
     g->termfocus = 1;

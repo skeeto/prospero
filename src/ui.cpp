@@ -1731,6 +1731,7 @@ static void kidreach(Gui *g, Arena a, ViewTool *t, b32 user)
     t->opened = 1;
     if (t->want) {
         t->want = 0;
+        navjump(g);
         setcur(g, k);
     }
 }
@@ -2071,6 +2072,7 @@ static void drawaction(Gui *g, GuiSession *s, ViewMsg *m, MsgAction *act)
                 !(act->child && act->child->host==s->host)) {
             kidopen(g, t);  // not one kept here from its container
         } else if (go) {
+            navjump(g);
             guiselect(g, act->child);
         }
         break;
@@ -3286,6 +3288,7 @@ static void settingsitem(Gui *g, Arena a, Str label, Str kind, Str name)
     if (!menuitem(g, a, label, {}, 0)) {
         return;
     } else if (name.len && cfghas(g, kind, name)) {
+        navjump(g);
         cfgselect(g, kind, name);
         g->cfgshowsel = 1;
         setpane(g, PANE_SETTINGS, 1);
@@ -3442,6 +3445,7 @@ static void drawmodepick(Gui *g, Arena a, GuiSession *s, View *v)
         if (v->plan) {
             ImGui::Separator();
             if (ImGui::Selectable("Show the plan")) {
+                navjump(g);
                 setpane(g, PANE_PLAN, 1);
             }
             itemnamed(g, "show the plan");
@@ -3531,6 +3535,9 @@ static b32 drawbranch(Gui *g, Arena *a, GuiSession *s, f32 end, b32 lead)
         ImGui::EndTooltip();
     }
     if (click) {
+        if (!open) {
+            navjump(g);
+        }
         setpane(g, PANE_CHANGES, !open);
     }
     return 1;
@@ -3550,6 +3557,7 @@ static void drawsesspicks(Gui *g, Arena a, GuiSession *s, View *v)
         // A chip that shows the plan
         ImGui::PushStyleColor(ImGuiCol_Text, g->pal->amber);
         if (ImGui::Button("Plan mode")) {
+            navjump(g);
             setpane(g, PANE_PLAN, 1);
         }
         ImGui::PopStyleColor();
@@ -3604,6 +3612,7 @@ static void goup(Gui *g, GuiSession *s)
 {
     UpTo u = uptoof(g, s);
     if (u.up.len && !u.far) {
+        navjump(g);
         guiselect(g, u.p ? u.p : addsess(g, s->host, u.up));
     }
 }
@@ -4310,12 +4319,14 @@ static void followlink(Gui *g, Str link, LinkFrom *from)
     switch (d.kind) {
     case DEST_HELP:
         if (d.page >= 0) {
+            navjump(g);
             helppick(g, d.page);
             g->helpsect = d.section.len ? clone(&g->perm, d.section) : Str{};
             setpane(g, PANE_HELP, 1);
         }
         break;
     case DEST_SETTINGS:
+        navjump(g);
         d.cfgkind = clone(&g->perm, d.cfgkind);
         d.cfgname = clone(&g->perm, d.cfgname);
         d.cfgkey  = clone(&g->perm, d.cfgkey);
@@ -4328,6 +4339,7 @@ static void followlink(Gui *g, Str link, LinkFrom *from)
         break;
     case DEST_VIEW:
         if (d.pane >= 0) {
+            navjump(g);
             setpane(g, d.pane, 1);
         }
         break;
@@ -5743,6 +5755,24 @@ static void drawtranscript(Gui *g)
         bottom   = 0;
         gs->stick = 0;
         g->findjump = 0;
+    }
+
+    // Back or Forward to a place in this view (navapply): its message
+    // laid out and the place put back, as a new width does. Another
+    // session's place, or another view's, is let go.
+    NavTo *nt = &g->navto;
+    if (nt->sess && (nt->sess!=gs || nt->view!=v || nt->an.msg>=v->msgs.len)) {
+        *nt = {};
+    } else if (nt->sess) {
+        msglayout(v, nt->an.msg, &g->measure, width, sc);
+        viewtops(v, width, charw, fm.lineh);
+        scrolly     = (f32)anchory(v, nt->an, &g->measure, width, sc, head);
+        scrolly     = scrolly<0 ? 0 : scrolly;
+        bottom      = 0;
+        gs->stick   = 0;
+        g->findjump = 0;
+        g->scrollto = -1;
+        *nt = {};
     }
 
     // Anchor on the first visible message, so that height corrections
@@ -9262,6 +9292,7 @@ static b32 sessgo(Gui *g, GuiSession *s)
     if (s->gone || sessroot(g, s)->trashed) {
         return 0;
     }
+    navjump(g);
     guiselect(g, s);
     setpane(g, PANE_TRANSCRIPT, 1);
     g->promptfocus = 1;
@@ -12788,6 +12819,7 @@ static void addsection(Gui *g, Str kind)
 {
     g->addkind = kind;
     g->openadd = 1;
+    navjump(g);
     setpane(g, PANE_SETTINGS, 1);
 }
 
@@ -12847,6 +12879,7 @@ static void drawremote(Gui *g, Arena a, Str name, i32 rect)
         ImGui::SameLine();
         if (ImGui::SmallButton("Settings")) {
             guiconfigset(g, "remote", name, "wsl", auto_->wsl);
+            navjump(g);
             cfgselect(g, "remote", name);
             g->cfgshowsel = 1;
             setpane(g, PANE_SETTINGS, 1);
@@ -13538,6 +13571,7 @@ static void drawcfglist(Gui *g, b32 combo)
         pushstr(kind);
         Str label = cfgkindlabel(&a, kind, 0);
         if (cfgitem(g, a, combo, label, sel, tip, 0, first ? &first->page : 0)) {
+            navjump(g);
             cfgselect(g, kind, "");
         }
         cfgreveal(g, kind, sel);
@@ -13565,6 +13599,7 @@ static void drawcfglist(Gui *g, b32 combo)
             b32 sel = !g->cfgdiag && g->cfgpkind==kind && g->cfgpname==r->name;
             pushstr(r->name);
             if (cfgitem(g, a, combo, r->name, sel, {}, 0, &r->page)) {
+                navjump(g);
                 cfgselect(g, kind, r->name);
             }
             cfgreveal(g, cfgpagekey(&a, kind, r->name), sel);
@@ -13596,6 +13631,7 @@ static void drawcfglist(Gui *g, b32 combo)
                 if (cfgitem(g, a, combo, pn, sel, "A server of projects' .mcp.json: "
                             "its page turns its tools on or off, for every "
                             "project's server of this name", 0, 0)) {
+                    navjump(g);
                     cfgselect(g, kind, pn);
                 }
                 cfgreveal(g, cfgpagekey(&a, kind, pn), sel);
@@ -13642,6 +13678,7 @@ static void drawcfglist(Gui *g, b32 combo)
     Str  label = finish(&db);
     if (cfgitem(g, a, combo, label, g->cfgdiag, "Problems found in the files, "
                 "with where each is", color, &at)) {
+        navjump(g);
         g->cfgdiag = 1;
     }
     cfgreveal(g, "diagnostics", g->cfgdiag);
@@ -15276,6 +15313,10 @@ static void drawhelp(Gui *g)
         g->helpdoc->section = g->helpsect;  // a link's, once laid out
         g->helpsect         = {};
     }
+    if (g->navhelp && !ImGui::IsWindowAppearing()) {
+        g->helpdoc->scrollto = g->navhelpy;  // Back or Forward (navapply)
+        g->navhelp           = 0;
+    }
 
     // The search: Ctrl+F (Cmd+F) to it while Help has the focus, as in
     // Settings; Escape or its X empties it, Enter takes the best hit
@@ -15389,6 +15430,9 @@ static void drawhelp(Gui *g)
     }
     Str link = drawdoc(g, g->helpdoc, "##helppage", "Help");
     itemnamed(g, "help text");
+    if (pick>=0 && pick!=cur) {
+        navjump(g);  // a topic picked from the list
+    }
     helppick(g, pick);
     if (hit >= 0) {
         // Its page, at its heading, or from the top for a page's opening;
@@ -15761,17 +15805,20 @@ static void palgo(Gui *g, i32 i)
         picklayoutnum(g, it->ref);
         break;
     case PAL_PANE:
+        navjump(g);
         setpane(g, it->ref, 1);
         break;
     case PAL_SETTING:
         // Its row, unless the configuration came again since (palbuild
         // then ran again too)
         if (it->ref<g->cfgrows.len && g->cfgrows[it->ref].key==it->title) {
+            navjump(g);
             setpane(g, PANE_SETTINGS, 1);
             cfggoto(g, &g->cfgrows[it->ref]);
         }
         break;
     case PAL_HELP:
+        navjump(g);
         helppick(g, it->ref);
         g->helpsect = it->arg.len ? clone(&g->perm, it->arg) : Str{};
         setpane(g, PANE_HELP, 1);
@@ -16067,6 +16114,46 @@ static void menukeys(Gui *g)
         goup(g, g->sess);
     }
     #endif
+    // Back and forward through jumps (navgui.cpp), never over a dialog
+    // or popup: the mouse's side buttons and the keyboard's browser keys,
+    // which never reach the shell; on macOS Cmd+[ and Cmd+], by the
+    // character typed, as zoom goes (holding Cmd releases the terminal's
+    // keyboard), asked each frame; elsewhere Alt+Left and Alt+Right,
+    // from a field too, but not from the terminal, whose they are.
+    // a11y: View > Back and View > Forward do as the side buttons do.
+    i32 nav = -1;
+    nav = ImGui::IsMouseClicked(3) ? (i32)NAV_BACK : nav;
+    nav = ImGui::IsMouseClicked(4) ? (i32)NAV_FWD : nav;
+    nav = ImGui::IsKeyPressed(ImGuiKey_AppBack, false) ? (i32)NAV_BACK : nav;
+    nav = ImGui::IsKeyPressed(ImGuiKey_AppForward, false) ? (i32)NAV_FWD : nav;
+    #if defined(__APPLE__)
+    for (iz i = 0; i < countof(zoomkeys); i++) {
+        ImGuiKey k  = zoomkeys[i];
+        u32      cp = os_guikeycp(g->os, k, 0);
+        if ((cp=='[' || cp==']') && ImGui::Shortcut(ctrl|k, glob)) {
+            nav = cp=='[' ? (i32)NAV_BACK : (i32)NAV_FWD;
+        }
+    }
+    #else
+    if (!c.ActiveId || c.ActiveId!=g->termid) {
+        ImGuiIO &kio = ImGui::GetIO();
+        if (kio.KeyAlt && !kio.KeyCtrl && !kio.KeyShift && !kio.KeySuper) {
+            // Not also ImGui's keyboard nav in the pane being left
+            ImGuiID id = ImGui::GetID("##navkeys");
+            ImGui::SetKeyOwner(ImGuiKey_LeftArrow, id);
+            ImGui::SetKeyOwner(ImGuiKey_RightArrow, id);
+        }
+        b32 back = ImGui::IsKeyChordPressed(ImGuiMod_Alt|ImGuiKey_LeftArrow);
+        b32 fwd  = ImGui::IsKeyChordPressed(ImGuiMod_Alt|ImGuiKey_RightArrow);
+        nav = back ? (i32)NAV_BACK : fwd ? (i32)NAV_FWD : nav;
+    }
+    #endif
+    if (nav>=0 && !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId|ImGuiPopupFlags_AnyPopupLevel)) {
+        b32 field = c.ActiveId && c.ActiveId==c.InputTextState.ID;
+        if (navgo(g, nav) && field) {
+            ImGui::ClearActiveID();  // a field takes no arrow key too
+        }
+    }
     if (ImGui::Shortcut(ctrl|ImGuiMod_Shift|ImGuiKey_S, keep)) {
         setsessionshell(g, 0, !sessionshell(g));
     }
@@ -16728,6 +16815,25 @@ static void drawmenubar(Gui *g)
             palopen(g);
         }
         itemtip("Find a session by its title, folder or group, or a layout, pane, setting or Help topic");
+        // Back and forward through jumps (navgui.cpp), as the mouse's
+        // side buttons go
+        #if defined(__APPLE__)
+        char const *backkey = cmdkey(g, &k, "[");
+        char const *fwdkey  = cmdkey(g, &k, "]");
+        #else
+        char const *backkey = "Alt+Left";
+        char const *fwdkey  = "Alt+Right";
+        #endif
+        NavSpot *to  = navwhereto(g, NAV_BACK);
+        Str      tip = to ? concat(&k, "Back to ", navname(g, &k, to)) : Str{};
+        if (menutip(g, &k, "Back", to ? Str{} : Str("Nothing to go back to"), tip, backkey)) {
+            navgo(g, NAV_BACK);
+        }
+        to  = navwhereto(g, NAV_FWD);
+        tip = to ? concat(&k, "Forward to ", navname(g, &k, to)) : Str{};
+        if (menutip(g, &k, "Forward", to ? Str{} : Str("Nothing to go forward to"), tip, fwdkey)) {
+            navgo(g, NAV_FWD);
+        }
         ImGui::Separator();
         // Layouts first, the quickest to reach, then the panes
         drawlayoutmenu(g);
@@ -16741,6 +16847,9 @@ static void drawmenubar(Gui *g)
             bool        on  = g->panes[i];
             char const *key = i==PANE_SETTINGS ? cmdkey(g, &a, ",") : 0;
             if (ImGui::MenuItem(panenames[i], key, &on)) {
+                if (on) {
+                    navjump(g);
+                }
                 setpane(g, i, on);
             }
             itemrect(g, RECT_PANE0+i);
@@ -16830,6 +16939,7 @@ static void drawmenubar(Gui *g)
         b32 help = ImGui::MenuItem("Help");
         itemnamed(g, "open Help");
         if (help) {
+            navjump(g);
             setpane(g, PANE_HELP, 1);
         }
         if (ImGui::MenuItem("About Prospero")) {
@@ -17010,6 +17120,7 @@ static void dockwindows(Gui *g)
 {
     termsweep(g);
     filesweep(g);
+    navtrack(g);
     termhotkeys(g);
     menukeys(g);
     termgrab(g);
