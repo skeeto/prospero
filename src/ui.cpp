@@ -2270,15 +2270,36 @@ static b32 planediting(Gui *g, GuiSession *s, Str req)
     return g->edsess==s && g->edplan && (!g->edreq.len || g->edreq==req);
 }
 
-// Why a session's plan file cannot go out to the editor, or empty: only
-// a plan on this computer does.
+// Whether the session's plan is being read again from its ssh remote, as
+// the editor left it, for the ask req (Approve held).
+static b32 planreading(Gui *g, GuiSession *s, Str req)
+{
+    return g->planread.s==s && g->planread.req==req;
+}
+
+// Why a session's plan file cannot go out to the editor, or empty: a
+// plan on this computer does, and one on an ssh remote in an editor
+// here that reaches it itself (planfar).
 static Str planeditwhy(Gui *g, GuiSession *s, Str path, Arena *a)
 {
-    if (s->host->kind == GH_REMOTE) {
-        return concat(a, "The plan is on ", concat(a, s->host->name,
-                      ": only a plan on this computer opens in the editor"));
+    if (!path.len) {
+        return "No plan file";
+    } else if (s->host->kind != GH_REMOTE) {
+        return editorwhy(g, s, a);
     }
-    return !path.len ? Str("No plan file") : editorwhy(g, s, a);
+    EditHost eh = farhost(g, a, s->host);
+    if (!eh.ssh.len) {
+        return concat(a, "The plan is on ", concat(a, s->host->name,
+                      ": only a plan on this computer, or on an ssh remote, opens in "
+                      "the editor"));
+    } else if (g->planread.s && g->planread.s!=s) {
+        return "Another session's plan is being read again from its host, as the "
+               "editor left it";
+    }
+    // Plans need an editor that waits: [ui] editor's, unless
+    // [ui] editor_remote's is set, whose own why says if it cannot
+    Str why = trim(g->edremote).len ? editorbusy(g, s) : editorwhy(g, s, a);
+    return why.len ? why : planfar(g, a, s, path).why;
 }
 
 static Str planedittip = "Revise the plan file by hand in your editor before you approve "
@@ -2290,6 +2311,18 @@ static void planeditbutton(Gui *g, GuiSession *s, Str path, Str req, char const 
                            Str named, Str tip)
 {
     Arena a = g->frame;
+    if (g->planread.s == s) {
+        Str name = s->host->name;
+        ImGui::AlignTextToFramePadding();
+        if (g->planread.again && !hostlive(g, s)) {
+            ImGui::TextDisabled("reading the plan from %s once it is connected again...",
+                                cstr0(&a, name));
+        } else {
+            ImGui::TextDisabled("reading the plan from %s...", cstr0(&a, name));
+        }
+        itemnamed(g, "plan reading");
+        return;
+    }
     if (g->edsess==s && g->edplan) {
         ImGui::AlignTextToFramePadding();
         ImGui::TextDisabled("editing in %s...", cstr0(&a, g->edname));
@@ -2622,8 +2655,11 @@ static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
         // while the plan is out in the editor, nor once it is empty.
         b32 enter   = t->kind == "plan.enter";
         b32 editing = !enter && planediting(g, s, t->req);
+        b32 reading = !enter && planreading(g, s, t->req);
         Str nogo    = editing ? Str("The plan is open in the editor: close it first, "
                                     "and the plan as it saved it is the one approved") :
+                      reading ? concat(&a, concat(&a, "The plan is being read again from ",
+                                       s->host->name), ", as the editor left it") :
                       !enter && !trim(m->text).len
                               ? Str("The plan file is empty, or too long to show: write "
                                     "the plan there, or keep planning") : Str{};

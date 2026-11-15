@@ -667,7 +667,8 @@ static CfgKey cfgschema[] = {
      "remote's file here too where it reaches it by ssh itself: gvim, mvim, "
      "and vim or nvim in a terminal window of its own, through scp://; emacs "
      "and emacsclient through /ssh: (not for a Windows host); else [ui] "
-     "editor_remote. "
+     "editor_remote. An ssh remote's plan opens the same way, read again "
+     "there once the editor exits. "
      "A GUI started from the Finder or a desktop menu "
      "has no shell environment: no $VISUAL, no $EDITOR, and its PATH may "
      "lack the editor, so name it in full here, or add its directory to "
@@ -691,7 +692,8 @@ static CfgKey cfgschema[] = {
      "editor that reaches it by ssh (gvim, emacs), {file} its address"},
     {"ui", "editor_remote", CFG_STRING, "", {}, {}, "ui",
      "The command that opens an ssh remote's file here, in an editor that "
-     "reaches it by ssh itself: Files' Open in editor. As [ui] "
+     "reaches it by ssh itself: Files' Open in editor, and Edit plan for a "
+     "plan there, for which it must wait, as [ui] editor must. As [ui] "
      "editor_line: {file} the path there and {host} the remote's ssh "
      "destination as written, each quoted already: do not put them in "
      "quotes; {line} the line, {col} the column (1 if none); with no "

@@ -3067,7 +3067,8 @@ GUI_PROMPTS = ("Stream slowly", "Run the tools", "be allowed", "wait for nobody"
                "Stream, then pause", "Call the MCP server", "Remember the hosts",
                "Answer with links", "Ask me questions", "Describe the files",
                "Cite the files", "Read the cited lines", "Link the far file",
-               "Edit the lines", "Edit the far file", "Remove the lines",
+               "Edit the lines", "Edit the far file", "Plan the far change",
+               "Remove the lines",
                "Restore the lines",
                "Run a command to stop", "Read a long prompt",
                "Give me commands to run", "Tell me how it ran",
@@ -3248,6 +3249,19 @@ def sc_gui(model, n, req):
             yield from tool(model, n, "edit", args)
         else:
             yield from answer(model, "Edited.")
+    elif "Plan the far change" in prompt:
+        # Plan mode there, asked for, then a plan written there and put
+        # to the user, which Edit plan revises in an editor here
+        name, _ = last_call(req)
+        if step == 0:
+            yield from tool(model, n, "enter_plan_mode", {})
+        elif name == "enter_plan_mode" and plan_path(req):
+            yield from tool(model, n, "write", {"path": plan_path(req),
+                                                "content": "# Plan\n\n- Change the far file.\n"})
+        elif name == "write":
+            yield from tool(model, n, "exit_plan_mode", {})
+        else:
+            yield from answer(model, "Done.")
     elif "Remove the lines" in prompt or "Restore the lines" in prompt:
         # The file shown (after "Edit the lines") deleted, then written
         # again: the pane says it's gone, then shows it again

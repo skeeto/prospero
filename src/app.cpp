@@ -961,6 +961,20 @@ struct PlanFile {
     View       *docv;   // and whose plan that is
 };
 
+// An ssh remote's plan file read again through its engine, as the
+// editor here left it (Edit plan): for its ask, which holds Approve
+// until the text is in.
+struct PlanRead {
+    GuiSession *s;      // whose plan, null if none
+    Str         req;    // its ask
+    i64         id;     // the command in flight, 0 if none
+    i64         off;
+    b32         again;  // to ask (again) once its host is up
+    Buf         text;
+    Arena       mem;
+    byte       *base;
+};
+
 // A file the Changes pane lists, as git.cpp's gitstatusjson gives it.
 struct ChangeRow {
     u8  x;        // its status in the index
@@ -1732,6 +1746,9 @@ struct Gui {
     GuiHost           *newhost;    // the new session's host
     OutFile            out;        // the Output window's file
     PlanFile           plan;       // the Plan window's
+    PlanRead           planread;   // an ssh remote's plan, as edited
+    i64                planreads;  // its replies, for the checklist
+    b32                planreadhold; // the checklist's: it waits to ask
     Changes            changes;    // the Changes pane's
     i32                helppage;   // the Help window's topic (HELP_*)
     DocView           *helpdoc;    // and its page, null until first shown
@@ -1920,6 +1937,8 @@ struct Gui {
     GuiSession        *edsess;     // whose draft it edits, or null
     b32                edplan;     // its plan file instead (Edit plan)
     b32                edcfg;      // or the configuration file (Settings)
+    b32                edfar;      // the plan is an ssh remote's, which the
+                                   //   editor reaches itself
     Str                edreq;      // and that plan's ask, empty if none
     i64                planedits;  // plans edited, for the checklist
     Str                revealed;   // the file guishow showed last, for
@@ -3929,6 +3948,141 @@ static void onplanfile(Gui *g, Json *j, b32 ok, Str err)
         f->got++;
     }
     scheddirty(&g->sched);
+}
+
+static i32  planask(View *);
+static void planreadgo(Gui *);
+static void setnote(Gui *, GuiSession *, Str, b32, b32);
+
+// Ask for the next part of the plan read again (PlanRead), unless the
+// checklist holds it.
+static void planreadpart(Gui *g)
+{
+    PlanRead *r = &g->planread;
+    if (g->planreadhold) {
+        r->again = 1;
+        return;
+    }
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 256);
+    EvOut w = cmdopen(g, &b, CMD_FILE, r->s);
+    putkey(&w.json, "path");
+    putstr(&w.json, "plan.md");  // in the session's directory
+    putkey(&w.json, "off");
+    putint(&w.json, r->off);
+    r->id    = g->nextid;
+    r->again = 0;
+    cmdsend(g, &w, a);
+}
+
+// Read session s's plan file again, from its start, through its engine
+// on an ssh remote, for its ask req, else for the plan's ask waiting:
+// with none, only the Plan window fetches it again.
+static void planreadstart(Gui *g, GuiSession *s, Str req)
+{
+    PlanRead *r = &g->planread;
+    View     *v = s ? s->view : 0;
+    i32       i = !v ? -1 : req.len ? findask(v, req) : planask(v);
+    if (i < 0) {
+        if (v) v->planver++;
+        return;
+    }
+    if (!r->base) {
+        r->mem  = newarena(os_reserve(g->os, (iz)1<<20));
+        r->base = r->mem.beg;
+    }
+    r->mem.beg = r->base;
+    r->s     = s;
+    r->req   = clone(&r->mem, v->msgs[i].tool->req);
+    r->text  = Buf(&r->mem, (iz)64<<10);
+    r->off   = 0;
+    r->id    = 0;
+    r->again = 1;  // asked now, or once its host is up (planreadgo)
+    planreadgo(g);
+}
+
+// Each frame: the plan's read asked for (again) once its host is up, and
+// started over if its host went with it in flight.
+static void planreadgo(Gui *g)
+{
+    PlanRead *r = &g->planread;
+    if (!r->s) {
+        return;
+    }
+    b32 live = hostlive(g, r->s);
+    if (r->id && !live) {
+        r->id       = 0;  // a reply to it, if any, matches nothing
+        r->again    = 1;
+        r->off      = 0;
+        r->text.len = 0;
+    } else if (r->again && !r->id && live) {
+        planreadpart(g);
+    }
+}
+
+// The plan read again is in, or is not: its ask shows it, empty if it is
+// gone or too long (so Approve refuses it, as for a plan here), and
+// Approve goes.
+static void planreaddone(Gui *g, Str text, b32 put)
+{
+    PlanRead   *r = &g->planread;
+    GuiSession *s = r->s;
+    View       *v = s->view;
+    r->s  = 0;
+    r->id = 0;
+    if (!v) {
+        return;
+    }
+    i32 i = findask(v, r->req);
+    if (put && i >= 0) {
+        settext(v, &v->msgs[i], trimright(text), 1);
+        g->planedits++;
+    }
+    v->planver++;
+    scheddirty(&g->sched);
+}
+
+// A part of the plan read again (planreadpart) arrived.
+static void onplanread(Gui *g, Json *j, b32 ok, Str err)
+{
+    PlanRead   *r = &g->planread;
+    GuiSession *s = r->s;
+    r->id = 0;
+    g->planreads++;
+    if (!s) {
+        return;
+    } else if (!ok && !hostlive(g, s)) {
+        r->again    = 1;  // its host went: asked again once it is back
+        r->off      = 0;
+        r->text.len = 0;
+        return;
+    } else if (!ok && (err=="no such file" || startswith(err, "cannot read the file"))) {
+        planreaddone(g, {}, 1);
+        return;
+    } else if (!ok) {
+        Arena a = g->frame;
+        Buf   b(&a, 256 + err.len);
+        print(&b, "cannot read the plan from ");
+        print(&b, s->host->name);
+        print(&b, " again (");
+        print(&b, err);
+        print(&b, "): it shows as it was, and Approve takes the file as it is then");
+        setnote(g, s, finish(&b), 1, 0);
+        planreaddone(g, {}, 0);
+        return;
+    }
+    Str text = jsonstr(jsonget(j, "text"));
+    if (r->text.len+text.len > (iz)64<<10) {
+        planreaddone(g, {}, 1);  // too long to put to the user
+        return;
+    }
+    print(&r->text, text);
+    r->off = jsonint(jsonget(j, "off"), r->off);
+    if (jsonint(jsonget(j, "more"), 0)) {
+        planreadpart(g);
+    } else {
+        planreaddone(g, Str{r->text.data, r->text.len}, 1);
+    }
 }
 
 // A part of the Output window's file arrived. The window keeps 64 MiB at
@@ -6588,6 +6742,8 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
             onfile(g, j, ok, err);
         } else if (id && id==g->plan.id) {
             onplanfile(g, j, ok, err);
+        } else if (id && id==g->planread.id) {
+            onplanread(g, j, ok, err);
         } else if (id == g->img.fetch.id) {
             onimgfile(g, scratch, j, ok, err);
         } else if (id && id==g->exp.id) {
@@ -7506,9 +7662,19 @@ static i32 planask(View *v)
 
 // Edit plan: the plan file at path, in the editor, in place, for the
 // plan's ask req, else with none waiting. Its scratch is a.
+static Str planeditwhy(Gui *, GuiSession *, Str, Arena *);
+static EditJump planfar(Gui *, Arena *, GuiSession *, Str);
+static EditJump editorfind(Gui *, Arena *, EditJump);
+
 static void planedit(Gui *g, Arena a, GuiSession *s, Str path, Str req)
 {
-    Str   why = editorwhy(g, s, &a);
+    // An ssh remote's plan in the editor here that reaches it itself
+    // (planfar): its program looked for only now, as the button's why
+    // runs each frame and editorexe keeps one answer
+    b32      far = s->host->kind == GH_REMOTE;
+    Str      why = planeditwhy(g, s, path, &a);
+    EditJump j   = far && !why.len ? editorfind(g, &a, planfar(g, &a, s, path)) : EditJump{};
+    why = why.len ? why : j.why;
     if (why.len) {
         setnote(g, s, why, 1);
         return;
@@ -7520,6 +7686,8 @@ static void planedit(Gui *g, Arena a, GuiSession *s, Str path, Str req)
     Proc *p   = 0;
     if (!os_mkdirs(g->os, a, dir)) {
         err = concat(&a, "cannot start the editor: ", os_lasterr(g->os, &a));
+    } else if (far) {
+        p = editspawn(g, &a, j.line, userhome(g->os, &a), log, &err);
     } else {
         p = editrun(g, &a, cmd, path, dir, log, &err);
     }
@@ -7529,12 +7697,14 @@ static void planedit(Gui *g, Arena a, GuiSession *s, Str path, Str req)
     }
     g->edsess = s;
     g->edplan = 1;
+    g->edfar  = far;
     g->edproc = p;
     g->edpath = clone(&g->perm, path);
     g->edreq  = clone(&g->perm, req);
     g->edlog  = clone(&g->perm, log);
-    g->edname = clone(&g->perm, editorname(cmd));
-    guilog(g, concat(&a, "editing a plan: ", cmd));
+    g->edname = clone(&g->perm, far ? j.name : editorname(cmd));
+    guilog(g, far ? concat(&a, "editing a plan there: ", j.line)
+                  : concat(&a, "editing a plan: ", cmd));
     s->note = {};
     scheddirty(&g->sched);
 }
@@ -7683,6 +7853,14 @@ static EditJump farjump(Gui *g, Arena *a, GuiHost *h, Str cmd, Str tmpl, Str pat
     return editorwindow(a, editorjump(a, cmd, tmpl, path, line, col, HOST_WINDOWS, &eh));
 }
 
+// Edit plan's command for path, session s's plan file on an ssh remote:
+// the editor it waits for (editordraft), with the address it takes, or
+// [ui] editor_remote's. Its program is not looked for (editorfind).
+static EditJump planfar(Gui *g, Arena *a, GuiSession *s, Str path)
+{
+    return farjump(g, a, s->host, editordraft(g, a), {}, path, 0, 0);
+}
+
 // Launch an editor's command (editorjumpfor's) from dir, left to run on
 // its own: in the checklist only noted (g->editjump), never run.
 static void editorjumprun(Gui *g, Arena a, EditJump j, Str dir)
@@ -7750,6 +7928,8 @@ static void editend(Gui *g, i32 status)
         // Read again, however it went: this answer is the one that counts
         g->cfgget = 0;
         guiconfigget(g);
+    } else if (g->edplan && g->edfar) {
+        planreadstart(g, s, g->edreq);  // read again there, through its engine
     } else if (g->edplan) {
         planedited(g, s);
     } else if (status == 0) {
@@ -7805,6 +7985,7 @@ static void editend(Gui *g, i32 status)
     g->edsess = 0;
     g->edproc = 0;
     g->edplan = 0;
+    g->edfar  = 0;
     g->edcfg  = 0;
     scheddirty(&g->sched);
 }
@@ -10079,6 +10260,10 @@ static void sessgone(Gui *g, GuiSession *s)
     }
     if (g->plan.s == s) {
         g->plan.s = 0;
+    }
+    if (g->planread.s == s) {
+        g->planread.s  = 0;
+        g->planread.id = 0;
     }
     if (g->changes.s == s) {
         g->changes.s = 0;
@@ -12822,7 +13007,8 @@ static void drainmail(Gui *g, i64 now)
             schedat(s, g->lastjobs+JOBS_PERIOD, DUE_STREAM);
         }
     }
-    guifstick(g);  // the file workers' next deadline, if any
+    planreadgo(g);  // an ssh remote's plan, once its host is up
+    guifstick(g);   // the file workers' next deadline, if any
 }
 
 // The wake flag was cleared: drain the mail, timed, since its work
@@ -14218,6 +14404,8 @@ enum : i32 {
                   // (PROSPERO_TEST_FARGVIM), skip dx ops
     OP_EDITOR,    // text as [ui] editor (dx 0), editor_line (dx 1) or
                   // editor_remote (dx 2) would have it
+    OP_HOLDREAD,  // dx 1: an ssh remote's plan, edited, waits to be read
+                  // again (W_PLANREAD); dx 0 lets it go
     OP_IFFSSTALL, // unless file work stalls paths for the checklist, here
                   // and on the remote host (PROSPERO_TEST_FSSTALL), skip
                   // dx ops
@@ -14597,6 +14785,8 @@ enum : i32 {
     CHK_PLANPLAIN,    // the plan is out in the editor, no plan waiting
     CHK_PLANQUIET,    // the session is idle, asking nothing
     CHK_PLANREVISED,  // the agent heard the plan approved was revised by hand
+    CHK_PLANREADING,  // the plan waiting is being read again from its ssh
+                      // remote, Approve held, and says so
     CHK_BYPASS,       // dx 1: the session shown is in Bypass, its mode in red; 0 not
     CHK_LAUNCHDIR,    // the session shown is in the launch's directory (DIR)
     CHK_OPENED,       // dx sessions asked for by launches and open events,
@@ -15006,6 +15196,7 @@ static Str chknames[] = {
     "the plan is open in the editor, with no plan waiting",
     "the session is idle and asks nothing: the agent was not told",
     "the agent heard that the plan it carries out was revised by hand",
+    "the plan is being read again from its host, Approve held meanwhile",
     "Bypass mode is on or off as it should be, in red when on",
     "the launch's directory has the session shown, made after hello",
     "launches and open events asked for as many sessions as they should",
@@ -15167,7 +15358,9 @@ enum : i32 {
     W_THINKING,   // the session shown streams reasoning
     W_THINKSTALL, // and has had none for a while
     W_TURNS,      // the session shown is idle after dx turns
-    W_EDITED,     // no editor runs
+    W_EDITED,     // no editor runs, nor a plan read again it left
+    W_PLANREAD,   // the editor exited, and its plan waits to be read
+                  // again (OP_HOLDREAD)
     W_NOTE,       // the session shown has a note
     W_MARK,       // the transcript's last change to the session says text
     W_COMPACTED,  // it has a compaction card, and is idle
@@ -15232,7 +15425,7 @@ static Str waitnames[] = {
     "the window to come back", "a background host", "the remote host",
     "the link to drop", "the remote to close", "the output", "a file",
     "the includes", "the thumbnails", "the screenshot", "reasoning",
-    "a pause in reasoning", "turns", "the editor", "a note",
+    "a pause in reasoning", "turns", "the editor", "the plan to be read again", "a note",
     "a change to the session", "a compaction card",
     "a named item", "a launch to hand off", "the import", "the export",
     "the plan", "the menu's pick", "the drafts kept", "the offer to deploy",
@@ -19791,6 +19984,38 @@ static DriveOp remoteops[] = {
     {OP_CHECK, CHK_FILELINK, 1, 0, 0, "hello.txt"},
     {OP_MOVE, T_NAMED, 0, 0, 800, "codelink hello.txt"},
     {OP_CHECK, CHK_LINKTIP, 1, 0, 0, "Files \xe2\x86\x92 hello.txt, on "},
+    // Edit plan on the plan there, in the same editor: Approve is held
+    // while it runs, then while the window reads the plan file again
+    // through its engine there (held here, to see it); then the ask
+    // shows it as the editor left it, which is approved, and the agent
+    // hears it was revised
+    {OP_IFFARGVIM, 0, 26, 0, 0, ""},
+    {OP_EDITOR, 0, 0, 0, 100, "gvim -f"},
+    {OP_PROMPT, 0, 0, 0, 100, "Plan the far change."},
+    {OP_WAIT, W_ASK, 0, 0, 30000, ""},
+    {OP_MOVE, T_ALLOW, 0, 0, 100, ""},  // Plan first
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_NAMED, 0, 0, 30000, "edit plan"},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PLANASK, 0, 0, 0, ""},
+    {OP_HOLDREAD, 0, 1, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "edit plan"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_PLANEDITING, 0, 0, 0, ""},
+    {OP_WAIT, W_PLANREAD, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_PLANREADING, 0, 0, 0, ""},
+    {OP_HOLDREAD, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_EDITED, 0, 0, 10000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PLANEDITED, 1, 0, 0, "Revised by hand."},
+    {OP_MOVE, T_ALLOW, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_SAID, 0, 0, 15000, "Done"},
+    {OP_CHECK, CHK_PLANREVISED, 0, 0, 0, ""},
+    {OP_EDITOR, 0, 0, 0, 100, ""},
     // A far file a tool changes is checked there (fs.stat) and read
     // again there (fs.read)
     {OP_PROMPT, 0, 0, 0, 100, "Edit the far file."},
@@ -24666,7 +24891,9 @@ static b32 drivewaitdone(Gui *g)
     case W_TURNS:
         return g->sess && !v->busy && v->turn>=(i32)g->ops[g->drivepc-1].dx;
     case W_EDITED:
-        return !g->edproc;
+        return !g->edproc && !g->planread.s;
+    case W_PLANREAD:
+        return !g->edproc && g->planread.s && !g->planread.id;
     case W_NOTE:
         return g->sess && g->sess->note.len;
     case W_MARK: {
@@ -27053,6 +27280,15 @@ static b32 drivecheck(Gui *g, i32 chk)
         return g->sess && g->edsess==g->sess && g->edplan && g->edproc && k>=0 &&
                g->edreq==v->msgs[k].tool->req && planediting(g, g->sess, g->edreq);
     }
+    case CHK_PLANREADING: {
+        i32 k     = planask(v);
+        b32 named = 0;
+        for (i32 i = 0; i < g->nnamed; i++) {
+            named |= Str{g->named[i].name, g->named[i].len} == "plan reading";
+        }
+        return g->sess && !g->edproc && k>=0 && named &&
+               planreading(g, g->sess, v->msgs[k].tool->req);
+    }
     case CHK_PLANPLAIN:
         return g->sess && g->edsess==g->sess && g->edplan && g->edproc &&
                !g->edreq.len && planask(v)<0;
@@ -27101,8 +27337,12 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_PLANEDITED: {
         ViewMsg *m = lastmsg(g, VIEW_ASK);
+        DriveOp *op = &g->ops[g->drivepc-1];
+        // dx 1: read again through its engine, which for a far host that
+        // is this machine a read here would pass for
         return !g->edproc && g->planedits>0 && m && m->tool->kind=="plan" &&
-               m->tool->answer==VASK_PENDING && find(m->text, g->ops[g->drivepc-1].text)>=0;
+               m->tool->answer==VASK_PENDING && find(m->text, op->text)>=0 &&
+               (op->dx==0 || g->planreads>0);
     }
     case CHK_LAUNCHDIR:
         return g->sess && g->opendir.len && v->cwd==g->opendir && !v->nofolder &&
@@ -28582,6 +28822,10 @@ static void drivestep(Gui *g)
             guilog(g, "drive: skip, with no fake gvim for the remote host");
             g->drivepc += (i32)op->dx;
         }
+        break;
+    case OP_HOLDREAD:
+        g->planreadhold = op->dx != 0;
+        planreadgo(g);
         break;
     case OP_EDITOR: {
         Str *dst = op->dx==0 ? &g->editor : op->dx==1 ? &g->edjumpfmt : &g->edremote;
