@@ -83,7 +83,8 @@ cannot choose what runs, so these are ignored in one:
 - `[tools] path_prepend`, `path_append`, `shells` and `git`;
 - a `[tools] shell` other than `auto`, `sh`, `bash`, `powershell` or
   `cmd`;
-- `[ui] editor`, `[ui] editor_line` and `[ui] terminal`.
+- `[ui] editor`, `[ui] editor_line`, `[ui] editor_remote` and
+  `[ui] terminal`.
 
 ## Color themes
 
@@ -299,7 +300,10 @@ fails with a link to sign up for Copilot Free.
   (Windows, or not), else by its name alone, as `nvim`; otherwise that
   host's own `$VISUAL` or `$EDITOR` runs there, else `vi`, never this
   computer's. An editor with a window of its own still opens a file in
-  a container's folder mounted here, or in a WSL distro, here. Started
+  a container's folder mounted here, or in a WSL distro, here, and an
+  ssh remote's file and plan too when it reaches them over ssh itself
+  (`gvim`, `mvim`, `vim` or `nvim` in a window, by `scp://`; `emacs` and
+  `emacsclient` by `/ssh:`), else as `[ui] editor_remote` says. Started
   from the Finder or a desktop menu, Prospero has no `$VISUAL` or `$EDITOR`: set this,
   with a full path if need be. On Windows its program is looked for by
   its full path or on PATH, and run by the full path found, so a
@@ -321,7 +325,19 @@ fails with a link to sign up for Copilot Free.
   editor opens a Terminal tab with your login shell's `$VISUAL` or
   `$EDITOR`, else `vi`. Another host's file gets it only on a host of
   the same OS family, and only when it runs in a terminal; otherwise
-  as `[ui] editor` says.
+  as `[ui] editor` says, an ssh remote's file opening here in an
+  editor that reaches it, `{file}` its address.
+- **[`[ui] editor_remote`](settings:ui#editor_remote)**: the command
+  that opens an ssh remote's file here, from Files' Open in editor and
+  Edit plan, in an editor that reaches it over ssh itself
+  ([Hosts](help:hosts#sessions-on-a-remote)). As `[ui] editor_line`,
+  with `{file}` the path there and `{host}` the remote's `ssh`
+  destination as written, both quoted already: `fresh ssh://{host}{file}`,
+  or `gvim --remote-silent +{line} scp://{host}/{file}`. Empty, a known
+  editor gets its own address (`scp://` or `/ssh:`), and any other a
+  Terminal tab there. It must open a window of its own, and for a plan
+  wait until you are done; its ssh has no terminal to ask for a password
+  in.
 - **[`[ui] terminal`](settings:ui#terminal)**: the terminal that Open in external terminal opens: on
   macOS an application's name (`iTerm`, `Ghostty`), elsewhere a program
   (`wt.exe`, `konsole`, `kitty`, `wezterm`), whose options for its

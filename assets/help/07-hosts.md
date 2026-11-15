@@ -216,6 +216,29 @@ Closing the window, or running it in the background, hangs the editor
 up and loses its unsaved edits; a broken connection only shows
 Reconnecting, the editor running on.
 
+An ssh remote's file opens here instead when your editor, with a
+window of its own, reaches it over ssh itself: `gvim`, `mvim`, and
+`vim` or `nvim` in a terminal window of their own (`alacritty -e nvim`)
+get its `scp://host//path` address, and `emacs` and `emacsclient` its
+`/ssh:host:/path` one (not for a Windows host), built from the remote's
+`ssh` setting, its user and port included. For `[ui] editor = gvim -f`,
+Open in editor runs `gvim -f +12 'scp://pi.local//home/me/x.c'`.
+[`[ui] editor_remote`](settings:ui#editor_remote) gives the command for
+any other editor, in `[ui] editor_line`'s form with `{host}` the
+remote's `ssh` destination as written, as in `fresh ssh://{host}{file}`
+or `gvim --remote-silent +{line} scp://{host}/{file}`; when it is set
+it is used for every ssh remote, Windows hosts too. A destination with
+a port reaches `{host}` as written, so name such a host in
+`~/.ssh/config`. The editor's own ssh has no terminal to ask in, so it
+needs a key or an agent, as Prospero's connection does. A path holding
+anything but letters, digits, blanks, `/ . _ - + , = @ ~` and
+non-ASCII text, which the editor's own `scp` or `ssh` would hand to a
+shell, opens in the Terminal tab instead (with `[ui] editor_remote`
+set, Open in editor says why). WSL distros, containers and remotes by
+a command keep the Terminal tab. A session's plan there opens the same
+way from Edit plan, with an editor that waits, and is read again there
+once it closes ([Plan mode](help:plan)).
+
 ## A remote with no models of its own
 
 A remote needs no configuration. One whose configuration has no

@@ -79,7 +79,11 @@ place). Its Open in editor opens the file at its line in `[ui] editor`
 by the login shell (on Windows, found on PATH and run by cmd.exe),
 and once it exits with status 0 the tab closes and Files shows the
 file again, read again (on Linux, with no editor set,
-the login shell's `$VISUAL` or `$EDITOR`, else `vi`). The
+the login shell's `$VISUAL` or `$EDITOR`, else `vi`). A file of an
+ssh remote opens here in an editor that reaches it over ssh itself:
+`gvim`, `mvim`, `vim` or `nvim` in a window by its `scp://` address,
+`emacs` or `emacsclient` by TRAMP's `/ssh:`, or `[ui] editor_remote`'s
+command; otherwise in a Terminal tab there. The
 window opens where it was last, fitted to the displays there are; the
 first time, 1700 by 900 at the display's scale, or maximized on a display
 too small for that. The first run shows Help in front, with Settings and
@@ -349,15 +353,16 @@ session's plan file, `plan.md` in the session's directory, the desktop
 tool may only look, and subagents plan too. When it is done it asks for
 approval, showing the plan: Approve plan lets it go ahead, and Keep
 planning sends it a note. Edit plan opens the plan file in the editor
-(as Ctrl+G does a draft), on this computer, to revise it by hand
-first: the agent carries out the plan as the file has it when
+(as Ctrl+G does a draft), on this computer or, in an editor that
+reaches it over ssh, on an ssh remote (read again there once the
+editor exits), to revise it by hand first: the agent carries out the plan as the file has it when
 approved, told that you revised it. The model may be changed while
 the plan waits. The Plan pane shows the plan file, which stays after
 approval, rendered as the transcript renders Markdown, its text
 selectable and copied as text or as Markdown. Its View in editor opens
 the file in the editor at any time (while a plan waits, it is that
 plan's Edit plan; otherwise the agent is not told), and Reveal shows it
-in Finder, Explorer or the file manager; both only for a plan on this
+in Finder, Explorer or the file manager, only for a plan on this
 computer.
 
 When a decision is yours, the agent may ask (its `ask_user` tool),

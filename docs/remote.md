@@ -50,6 +50,27 @@ editor on a file C10 maps here (a container's mount, a WSL distro's
 share on Windows) still runs here (`filelocal`, `editorjumpfor`), and
 Reveal still says "Its file is on another computer" for the rest.
 
+An ssh remote's file (a GH_REMOTE host whose `[remote NAME] ssh` passes
+`linkbad`; not WSL, `exec` or `ctr:`) opens here instead when the
+window's editor reaches it over ssh itself (`farhost`, `farjump`):
+`[ui] editor_remote` when set, in `editor_line`'s dialect plus `{host}`
+(the ssh value as written, quoted like `{file}`), else a preset's own
+address built from `sshdest` (`sshedithost`, `editaddr`): `scp://[user@]
+host[:port]//abs` for the Vim family, Windows hosts included as
+`scp://h//C:/x` but no IPv6; `/ssh:[user@]host[#port]:/abs` for Emacs
+(TRAMP), IPv6 bracketed, no Windows hosts. Remote names reach the
+editor's own scp or ssh, which hand them to a shell, so only a strict
+path charset (letters, digits, blank, `/ . _ - + , = @ ~`, bytes
+>= 0x80) and user and host names not starting with `-` are accepted;
+anything else falls back to the Terminal tab (with `editor_remote` set,
+its why shows). Edit plan on such a session's plan runs the same
+command, waited for, from the home directory; once it exits, the plan
+file is read again through the engine there (CMD_FILE `plan.md`, as
+the Plan pane does; `PlanRead`), Approve held until the text is in,
+asked again once the host is back if it drops. The engine itself is
+unchanged: `planresolve` reads `plan.md` from its own disk at approval
+and tells the agent it was revised.
+
 The window also makes containers for sessions (src/container.cpp),
 with Docker or Podman, found on PATH or where their macOS installers
 put them, and asked `version` at start: no configuration is needed.

@@ -40,8 +40,11 @@ shows it:
   what to change.
 - **Edit plan** opens the plan file in your editor, to revise it by
   hand first. Approve plan waits until the editor is closed, and the
-  agent is told you revised the plan. This works only for a session on
-  this computer.
+  agent is told you revised the plan. This works for a session on
+  this computer, and for one on an ssh remote whose files your editor
+  reaches itself ([Hosts](help:hosts#sessions-on-a-remote)): once the
+  editor closes, Approve plan waits a moment more while the plan is
+  read again there.
 
 A plan approval has no countdown: it waits for you. The model may be
 switched from the Prompt's status line while it waits.
@@ -88,5 +91,9 @@ text, and right-click to copy it as text or as Markdown.
 - **Reveal** shows the file in Finder, File Explorer or the file
   manager.
 
-Both are only for a plan on this computer. The editor is `[ui] editor`,
-else `$VISUAL` or `$EDITOR` (see [Configuration](help:config)).
+Reveal is only for a plan on this computer; View in editor also opens
+an ssh remote's, as Edit plan does. The editor is `[ui] editor`, else
+`$VISUAL` or `$EDITOR`, and it must wait until you are done, as
+`gvim -f` does; for an ssh remote's plan,
+[`[ui] editor_remote`](settings:ui#editor_remote) instead when it is
+set (see [Configuration](help:config)).

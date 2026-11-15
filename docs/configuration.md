@@ -23,7 +23,11 @@ Files pane's Open in editor runs one that runs in a terminal (`vim`,
 through the login shell (on Windows, found on PATH and run by cmd.exe),
 where a profile can test `PROSPERO_TAB` (`edit` there, `run` in a tab
 running a command) to skip what would keep the editor or command from
-starting, such as `exec tmux`.
+starting, such as `exec tmux`. An ssh remote's file and plan open in
+it here when it reaches them over ssh itself (`gvim -f` by `scp://`,
+`emacsclient` by `/ssh:`), or in `[ui] editor_remote`'s command, which
+takes `editor_line`'s `{file}`, `{line}` and `{col}` and the remote's
+ssh destination as `{host}`.
 
 The agent can change the file too, through Prospero's own skill (see
 Skills). A write or edit of the file, or of a local file it includes,
@@ -46,8 +50,8 @@ secrets and `file:` secrets, `[remote]`, `[container]` and `[desktop]`
 settings, an
 `[mcp]` section's `command`, `cwd`, `env.NAME` and `trust = yes`,
 `[web] ask = no`, `[tools] path_prepend` and `path_append`, a
-`[tools] shell` other than a keyword, and `[ui] editor`, `editor_line`
-and `terminal`
+`[tools] shell` other than a keyword, and `[ui] editor`, `editor_line`,
+`editor_remote` and `terminal`
 are ignored. It may define an MCP server by its url, and `[web]`, but
 cannot change a server your own file gives the `url` or `command` of,
 nor a `[web]` whose `search` or `url` your file sets. Your file may add

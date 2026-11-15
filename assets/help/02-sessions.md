@@ -326,7 +326,9 @@ else the line at the top, without waiting for it. Reveal works for a
 file on this computer, in a container's folder mounted here, or, on
 Windows, in a WSL distro; for another host's it says why not. Open in
 editor opens another host's file in a Terminal tab there, in that
-host's editor ([Hosts](help:hosts#sessions-on-a-remote)); a file in a
+host's editor, unless your editor reaches an ssh remote's file itself
+(`gvim`'s `scp://`, Emacs's `/ssh:`, or `[ui] editor_remote`), which
+then opens here ([Hosts](help:hosts#sessions-on-a-remote)); a file in a
 container's folder mounted here, or in a WSL distro, still opens here
 when the editor has a window of its own. A binary file says
 so, with Show as text anyway; past 4 MiB or 100,000 lines only the
