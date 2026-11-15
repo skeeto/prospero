@@ -13069,7 +13069,7 @@ static Str provenance(Gui *g, Arena *a, CfgRow *r, i64 now)
 // Fractions round to the nearest second.
 static Str secsread(Arena *a, Str v)
 {
-    Float f = parsefloat(trim(v));
+    Float f = parsesecs(trim(v));
     if (!f.ok || f.val<59.5 || f.val>=1e7) {
         return {};
     }
@@ -13099,7 +13099,7 @@ static Str timesread(Arena *a, Str v)
         if (!w.len) {
             continue;
         }
-        Float f = parsefloat(w);
+        Float f = parsesecs(w);
         if (!f.ok || f.val<=0 || f.val>=1e7) {
             return {};
         }

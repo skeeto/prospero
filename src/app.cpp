@@ -18069,6 +18069,14 @@ static DriveOp settingsops[] = {
     {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},  // back as it was: no edit
     {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
     {OP_CHECK, CHK_CFGREAD, 0, 0, 0, "endpoint fake idle_timeout="},
+    // In units, too
+    {OP_MOVE, T_NAMED, 0, 0, 100, "cfg endpoint fake idle_timeout"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 200, ""},
+    {OP_TEXT, 0, 0, 0, 300, "90m"},
+    {OP_CHECK, CHK_CFGREAD, 0, 0, 0, "endpoint fake idle_timeout=1 h 30 min"},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
     {OP_CHECK, CHK_CFGVAL, 0, 0, 0, "endpoint fake idle_timeout=10"},
     // The long value: whole in its field, and whole once edited there
     {OP_SHOWPAGE, 0, 0, 0, 300, "role long"},

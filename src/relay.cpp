@@ -2002,8 +2002,17 @@ static void relayofferput(Engine *e, JsonOut *w, Arena scratch, Str own, HostLin
         putstrkey(w, "name", s->name);
         putstrkey(w, "kind", epkindname(ep.kind));
         for (iz i = 0; i < countof(relayepkeys); i++) {
-            putstrkey(w, relayepkeys[i],
-                      trim(cfgget(cfg, "endpoint", s->name, relayepkeys[i], local)));
+            // In plain seconds, as an older engine reads them (#59)
+            Str v = trim(cfgget(cfg, "endpoint", s->name, relayepkeys[i], local));
+            Buf p(&scratch, v.len+16);
+            for (Str rest = v; rest.len;) {
+                Str word = cfgnextword(&rest);
+                if (word.len) {
+                    print(&p, p.len ? Str(" ") : Str(""));
+                    print(&p, secsplain(&scratch, word));
+                }
+            }
+            putstrkey(w, relayepkeys[i], finish(&p));
         }
         putkey(w, "models");
         putarray(w);

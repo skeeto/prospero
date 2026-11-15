@@ -207,14 +207,16 @@ enum : i32 {
     CFG_STRING,
     CFG_INT,      // a whole number
     CFG_NUMBER,
-    CFG_SECONDS,  // a number above 0, fractions allowed
+    CFG_SECONDS,  // above 0: a number, fractions allowed, or in units
+                  // as parsesecs reads them, 15m or 1h30m
     CFG_BOOL,     // true/false, yes/no, on/off, 1/0
     CFG_ENUM,     // one of the choices
     CFG_URL,      // http:// or https://
     CFG_SECRET,   // env:NAME, or file:PATH
     CFG_LIST,     // words from the choices, separated by blanks or commas
     CFG_PATHS,    // absolute or ~ paths, separated by ;
-    CFG_TIMES,    // seconds, each above 0, separated by blanks
+    CFG_TIMES,    // seconds as CFG_SECONDS, each above 0, separated by
+                  // blanks
     CFG_TEMPLATE, // a chat template argument: true, false, a number, else
                   // a string (always, when quoted)
     CFG_COLOR,    // #rgb or #rrggbb
@@ -1191,6 +1193,57 @@ static b32 cfghasword(Str words, Str w)
 }
 
 // 1 for true, 0 for false, -1 for neither.
+// Seconds as configured: a number of them, fractions allowed, or a time
+// in units, "90s", "15m", "1h30m", "1.5h" or "2d", each unit at most
+// once and the larger first (#59). Settings keeps the text as typed.
+static Float parsesecs(Str s)
+{
+    static u8  const units[] = {'d', 'h', 'm', 's'};
+    static f64 const sizes[] = {86400, 3600, 60, 1};
+    Float plain = parsefloat(s);
+    if (plain.ok || !s.len) {
+        return plain;
+    }
+    Float r    = {};
+    i32   next = 0;
+    for (iz i = 0; i < s.len;) {
+        iz j = i;
+        for (; j<s.len && (digit(s[j]) || s[j]=='.'); j++) {}
+        Float f = parsefloat(cuthead(takehead(s, j), i));
+        if (!f.ok || j==s.len) {
+            return {};
+        }
+        i32 u = next;
+        for (; u<countof(units) && units[u]!=s[j]; u++) {}
+        if (u == countof(units)) {
+            return {};
+        }
+        r.val += f.val * sizes[u];
+        next   = u + 1;
+        i      = j + 1;
+    }
+    r.ok = 1;
+    return r;
+}
+
+// Seconds as parsesecs reads them, written as a plain number, for a
+// reader that may know only numbers: another computer's engine, an
+// older one perhaps (relayofferput). Unreadable is left as it is.
+static Str secsplain(Arena *a, Str v)
+{
+    Float f = parsefloat(v);
+    if (f.ok || !(f = parsesecs(v)).ok) {
+        return v;
+    }
+    Buf b(a, 24);
+    if (f.val == (f64)(i64)f.val) {
+        print(&b, (i64)f.val);
+    } else {
+        printfloat(&b, f.val, 3);
+    }
+    return finish(&b);
+}
+
 static i32 cfgbool(Str v)
 {
     static Str const yes[] = {"true", "yes", "on", "1"};
@@ -1394,7 +1447,7 @@ static i32 cfgjudge(CfgKey *k, Str v, b32 shared)
         Int n = parseint(v);
         return n.ok && n.val>=0 && n.val<=36500 ? CFG_OK : CFG_BAD;
     } else if (cfgwaitkey(k)) {
-        Float f = parsefloat(v);
+        Float f = parsesecs(v);
         return f.ok && f.val>=0 && f.val<1e7 ? CFG_OK : CFG_BAD;
     } else if (k->kind=="model" && k->key=="effort_as") {
         return cfgeffortas(v) ? CFG_OK : CFG_BAD;
@@ -1412,7 +1465,7 @@ static i32 cfgjudge(CfgKey *k, Str v, b32 shared)
     case CFG_NUMBER:
         return parsefloat(v).ok ? CFG_OK : CFG_BAD;
     case CFG_SECONDS: {
-        Float f = parsefloat(v);
+        Float f = parsesecs(v);
         return f.ok && f.val>0 && f.val<1e7 ? CFG_OK : CFG_BAD;
     }
     case CFG_BOOL:
@@ -1453,7 +1506,7 @@ static i32 cfgjudge(CfgKey *k, Str v, b32 shared)
     case CFG_TIMES:
         for (Str rest = v; rest.len;) {
             Str   w = cfgnextword(&rest);
-            Float f = parsefloat(w);
+            Float f = parsesecs(w);
             if (w.len && (!f.ok || f.val<=0 || f.val>=1e7)) {
                 return CFG_BAD;
             }
@@ -1519,7 +1572,7 @@ static Str cfgproblem(Arena *a, CfgKey *k, Str v, b32 shared)
     } else if (k->kind=="sessions" && k->key=="trash_days") {
         return "expected days, 0 or more (at most 36500): 0 turns the Trash off";
     } else if (cfgwaitkey(k)) {
-        return "expected seconds, 0 or more: 0 waits until answered";
+        return "expected seconds, 0 or more, such as 90 or 15m: 0 waits until answered";
     } else if (k->kind=="model" && k->key=="effort_as") {
         return "expected reasoning_effort, reasoning.effort, template.NAME or none";
     } else if (k->kind=="model" && k->key=="effort_map") {
@@ -1530,8 +1583,12 @@ static Str cfgproblem(Arena *a, CfgKey *k, Str v, b32 shared)
     switch (k->type) {
     case CFG_INT:     print(&b, "expected a whole number");             break;
     case CFG_NUMBER:  print(&b, "expected a number");                   break;
-    case CFG_SECONDS: print(&b, "expected seconds, a number above 0");  break;
-    case CFG_TIMES:   print(&b, "expected seconds, numbers above 0");   break;
+    case CFG_SECONDS:
+        print(&b, "expected seconds above 0, such as 90, 15m or 1h30m");
+        break;
+    case CFG_TIMES:
+        print(&b, "expected seconds above 0, separated by blanks, such as 30 5m 1h");
+        break;
     case CFG_BOOL:    print(&b, "expected true or false");              break;
     case CFG_COLOR:   print(&b, "expected a color, #rgb or #rrggbb");   break;
     case CFG_URL:
@@ -2037,7 +2094,7 @@ static Str cfgown(Config *c, Str kind, Str name, Str key)
 // A seconds setting (CFG_SECONDS) in milliseconds, at least 1.
 static i64 cfgms(Config *c, Str kind, Str name, Str key, b32 local)
 {
-    Float f  = parsefloat(trim(cfgget(c, kind, name, key, local)));
+    Float f  = parsesecs(trim(cfgget(c, kind, name, key, local)));
     i64   ms = f.ok ? (i64)(f.val * 1000) : 0;
     return ms>0 ? ms : 1;
 }
@@ -2046,7 +2103,7 @@ static i64 cfgms(Config *c, Str kind, Str name, Str key, b32 local)
 // answered.
 static i64 cfgwaitms(Config *c, Str kind, Str key)
 {
-    Float f = parsefloat(trim(cfgget(c, kind, {}, key, 0)));
+    Float f = parsesecs(trim(cfgget(c, kind, {}, key, 0)));
     if (f.ok && f.val==0) {
         return 0;
     }

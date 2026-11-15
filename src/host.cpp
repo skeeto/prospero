@@ -2056,9 +2056,9 @@ static i32 servemain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
             return 2;
         }
     }
-    Float secs = parsefloat(idle);
+    Float secs = parsesecs(idle);
     if (idle.len && (!secs.ok || secs.val<=0)) {
-        os_print(os, 2, "prospero: --idle must be a number of seconds above 0\n");
+        os_print(os, 2, "prospero: --idle must be seconds above 0, such as 600 or 10m\n");
         return 2;
     }
     // The lock first, so that a second host never starts an engine, nor

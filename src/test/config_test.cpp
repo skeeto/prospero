@@ -86,8 +86,14 @@ static void testcfgschema(Test *t)
         {"model", "effort_map", "high", CFG_BAD, 0},
         {"model", "effort_map", "high:", CFG_BAD, 0},
         {"endpoint", "idle_timeout", " 30 ", CFG_OK, 0},
-        {"endpoint", "idle_timeout", "30s", CFG_BAD, 0},
+        {"endpoint", "idle_timeout", "30s", CFG_OK, 0},
+        {"endpoint", "idle_timeout", "1h30m", CFG_OK, 0},
+        {"endpoint", "idle_timeout", "30m1h", CFG_BAD, 0},
+        {"endpoint", "idle_timeout", "0m", CFG_BAD, 0},
+        {"guard", "ask_timeout", "0m", CFG_OK, 0},
         {"endpoint", "slow_retry", "60 120, 0.5", CFG_OK, 0},
+        {"endpoint", "slow_retry", "1m 5m 1h", CFG_OK, 0},
+        {"endpoint", "slow_retry", "1m 5x", CFG_BAD, 0},
         {"endpoint", "slow_retry", "60 x", CFG_BAD, 0},
         {"endpoint", "slow_retry", "60 0", CFG_BAD, 0},
         {"endpoint", "key", "env:API_KEY", CFG_OK, 1},
@@ -437,8 +443,8 @@ static void testcfgvalidate(Test *t)
     Config *c = newconfig(v.os, &a, v.scratch, "/c/prospero.ini", 0);
     expect(t, "validate.diags", inidiags(&a, c->ini),
         "/c/prospero.ini:4:1: warning: unknown key \"color\" at the top level\n"
-        "/c/prospero.ini:7:16: error: expected seconds, a number above 0, so "
-        "the default applies\n"
+        "/c/prospero.ini:7:16: error: expected seconds above 0, such as 90, 15m or "
+        "1h30m, so the default applies\n"
         "/c/prospero.ini:8:1: warning: unknown key \"idle_timout\" in "
         "[endpoint]; did you mean idle_timeout?\n"
         "/c/prospero.ini:9:7: warning: a plaintext secret: write env:NAME and "
@@ -667,7 +673,7 @@ static void testcfgset(Test *t)
     static struct { Str kind, name, key, value, err; } bad[] = {
         {"endpoint", "local", "colour", "x", "unknown key"},
         {"endpoint", "local", "idle_timeout", "soon",
-         "expected seconds, a number above 0, so the default applies"},
+         "expected seconds above 0, such as 90, 15m or 1h30m, so the default applies"},
         {"endpoint", "local", "key", "sk-x",
          "a secret must be a reference such as env:NAME or file:PATH"},
         {"endpoint", "local", "key", "file:rel/k", "expected file:PATH, with "
@@ -2534,6 +2540,56 @@ static void testcfgtheme(Test *t)
     cfgfree(c);
 }
 
+// Seconds in units as well as plain (#59): read alike wherever seconds
+// go, kept as typed, and written plain for another computer's engine.
+static void testcfgsecs(Test *t)
+{
+    Arena a = t->perm;
+
+    // In milliseconds
+    static struct { Str in, want; } secs[] = {
+        {"90", "90000"}, {"2.5", "2500"}, {"1e3", "1000000"}, {"0", "0"},
+        {"90s", "90000"}, {"15m", "900000"}, {"1h30m", "5400000"},
+        {"1.5h", "5400000"}, {"2d", "172800000"}, {"1d2h3m4s", "93784000"},
+        {"0.5s", "500"},
+        {"30m1h", "fail"}, {"1h1h", "fail"}, {"1h30", "fail"}, {"h", "fail"},
+        {"1x", "fail"}, {"1 h", "fail"}, {"-1m", "fail"}, {".5m", "fail"},
+        {"1ms", "fail"}, {"", "fail"}, {"1H", "fail"},
+    };
+    for (iz i = 0; i < countof(secs); i++) {
+        Float f   = parsesecs(secs[i].in);
+        Str   got = f.ok ? istr(&a, (i64)(f.val*1000 + 0.5)) : Str("fail");
+        expect(t, concat(&a, "secs ", secs[i].in), got, secs[i].want);
+    }
+    static struct { Str in, want; } plain[] = {
+        {"90", "90"}, {"2.5", "2.5"}, {"15m", "900"}, {"1h30m", "5400"},
+        {"0.5s", "0.5"}, {"soon", "soon"},
+    };
+    for (iz i = 0; i < countof(plain); i++) {
+        expect(t, concat(&a, "plain ", plain[i].in), secsplain(&a, plain[i].in), plain[i].want);
+    }
+
+    CfgEnv v = newcfgenv(&a);
+    os_write(v.os, a, "/c/prospero.ini",
+             "[endpoint e]\n"
+             "url = http://e/\n"
+             "idle_timeout = 1h30m\n"
+             "first_byte_timeout = 30m1h\n"
+             "slow_retry = 30 5m 1.5h\n"
+             "[guard]\n"
+             "ask_timeout = 0s\n"
+             "question_timeout = 2m\n");
+    Config *c = newconfig(v.os, &a, v.scratch, "/c/prospero.ini", 0);
+    expect(t, "secs.diags", inidiags(&a, c->ini),
+           "/c/prospero.ini:4:22: error: expected seconds above 0, such as 90, "
+           "15m or 1h30m, so the default applies");
+    expect(t, "secs.idle", istr(&a, cfgms(c, "endpoint", "e", "idle_timeout", 0)), "5400000");
+    expect(t, "secs.firstbyte", istr(&a, cfgms(c, "endpoint", "e", "first_byte_timeout", 0)), "300000");
+    expect(t, "secs.list", cfgget(c, "endpoint", "e", "slow_retry", 0), "30 5m 1.5h");
+    expect(t, "secs.ask", istr(&a, cfgwaitms(c, "guard", "ask_timeout")), "0");
+    expect(t, "secs.question", istr(&a, cfgwaitms(c, "guard", "question_timeout")), "120000");
+}
+
 static void test_config(Test *t)
 {
     testcfgeffort(t);
@@ -2555,4 +2611,5 @@ static void test_config(Test *t)
     testcfglike(t);
     testcfgqualified(t);
     testcfgpath(t);
+    testcfgsecs(t);
 }

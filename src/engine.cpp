@@ -2968,7 +2968,7 @@ static b32 slowwait(Session *s, Arena scratch, i32 cls, i32 status, Str msg,
     i32     n    = 0;
     Str     list = cfgget(e->cfg, "endpoint", name, "slow_retry", 0);
     for (Str rest = list; rest.len;) {
-        Float f = parsefloat(cfgnextword(&rest));
+        Float f = parsesecs(cfgnextword(&rest));
         if (f.ok && f.val>0) {
             wait = (i64)(f.val * (f64)SEC);
             if (n++ == s->slown) break;

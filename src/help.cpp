@@ -568,14 +568,14 @@ static Str helptype(Arena *a, CfgKey *k)
     case CFG_STRING:   return "text";
     case CFG_INT:      return "a whole number";
     case CFG_NUMBER:   return "a number";
-    case CFG_SECONDS:  return "seconds";
+    case CFG_SECONDS:  return "seconds, or a time such as 15m or 1h30m";
     case CFG_BOOL:     return "true or false";
     case CFG_ENUM:     return concat(a, "one of: ", k->choices);
     case CFG_URL:      return "an http:// or https:// URL";
     case CFG_SECRET:   return "env:NAME or file:PATH";
     case CFG_LIST:     return concat(a, "any of: ", k->choices);
     case CFG_PATHS:    return "paths separated by ;";
-    case CFG_TIMES:    return "seconds separated by blanks";
+    case CFG_TIMES:    return "seconds or times such as 5m, separated by blanks";
     case CFG_TEMPLATE: return "a chat template's argument";
     }
     return "text";
