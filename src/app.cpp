@@ -1039,6 +1039,7 @@ struct CfgRow {
     Str        sentval;
     b32        typed;    // the field edited since, not yet sent (loadcfg)
     b32        active;   // the field has the focus, as last drawn
+    b32        read;     // its seconds shown as a time, as last drawn
     Rect       page;     // the first of a section's: its page in the list
 };
 
@@ -14415,6 +14416,8 @@ enum : i32 {
     CHK_NOHSCROLL,
     CHK_PAGE,
     CHK_CFGVAL,   // text "KIND NAME KEY=VALUE": that row's value in effect
+    CHK_CFGREAD,  // text "KIND NAME KEY=TIME": that row's seconds shown as
+                  // that time, or none shown if TIME is "" (#59)
     CHK_ROOTS,
     CHK_DELINCLUDE,
     CHK_DELMODAL,
@@ -14824,6 +14827,7 @@ static Str chknames[] = {
     "the settings have nothing to scroll to sideways",
     "the settings page picked is shown",
     "the setting has the value given",
+    "the setting's seconds read as the time given",
     "the roots, one a line, were saved joined by \"; \"",
     "a section only an include defines cannot be deleted, which says where it is",
     "Delete asks first",
@@ -18050,6 +18054,22 @@ static DriveOp settingsops[] = {
     {OP_UP, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_CFGFIND, 0, 0, 0, ""},
     {OP_CHECK, CHK_PAGE, 0, 0, 0, "endpoint fake"},
+    // Seconds read as a time at the field's end, of the text as typed,
+    // and a list of them under its field; none under a minute (#59)
+    {OP_CHECK, CHK_CFGREAD, 0, 0, 0, "endpoint fake idle_timeout="},
+    {OP_CHECK, CHK_CFGREAD, 0, 0, 0, "endpoint fake slow_retry_budget=2 h"},
+    {OP_CHECK, CHK_CFGREAD, 0, 0, 0, "endpoint fake slow_retry="
+                                      "1 min, 2 min, 5 min, 10 min, 15 min"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "cfg endpoint fake idle_timeout"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 200, ""},
+    {OP_TEXT, 0, 0, 0, 300, "5400"},
+    {OP_CHECK, CHK_CFGREAD, 0, 0, 0, "endpoint fake idle_timeout=1 h 30 min"},
+    {OP_SHOT, 0, 0, 0, 300, "settings-secs"},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},  // back as it was: no edit
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_CHECK, CHK_CFGREAD, 0, 0, 0, "endpoint fake idle_timeout="},
+    {OP_CHECK, CHK_CFGVAL, 0, 0, 0, "endpoint fake idle_timeout=10"},
     // The long value: whole in its field, and whole once edited there
     {OP_SHOWPAGE, 0, 0, 0, 300, "role long"},
     {OP_MOVE, T_PAGEITEM, 0, 0, 100, "role long"},
@@ -26129,6 +26149,20 @@ static b32 drivecheck(Gui *g, i32 chk)
             CfgRow *r = &g->cfgrows[i];
             if (r->kind==kind.head && r->name==name.head && r->key==key.head) {
                 return r->value == key.tail;
+            }
+        }
+        return 0;
+    }
+    case CHK_CFGREAD: {
+        Cut kind = cut(g->ops[g->drivepc-1].text, ' ');
+        Cut name = cut(kind.tail, ' ');
+        Cut key  = cut(name.tail, '=');
+        for (iz i = 0; i < g->cfgrows.len; i++) {
+            CfgRow *r = &g->cfgrows[i];
+            if (r->kind==kind.head && r->name==name.head && r->key==key.head) {
+                Arena a    = g->frame;
+                Str   read = r->read ? cfgrowread(&a, r) : Str{};
+                return read == key.tail;
             }
         }
         return 0;

@@ -13064,6 +13064,63 @@ static Str provenance(Gui *g, Arena *a, CfgRow *r, i64 now)
 // and booleans (true or false) are picked from their choices, paths
 // edited one a line, and the rest typed. The checklist's target row
 // records its field's rectangle (RECT_*, or -1 for none).
+// Seconds read as a time, "1 h 30 min", or null when they are not
+// seconds or under a minute, which reads as well as it is (#59).
+// Fractions round to the nearest second.
+static Str secsread(Arena *a, Str v)
+{
+    Float f = parsefloat(trim(v));
+    if (!f.ok || f.val<59.5 || f.val>=1e7) {
+        return {};
+    }
+    Buf b(a, 32);
+    printsecs(&b, (i64)(f.val + 0.5));
+    return finish(&b);
+}
+
+// A row's field as it shows: the text typed, else the hint under it.
+static Str cfgrowshown(CfgRow *r)
+{
+    Str typed = {(u8 *)r->buf, (iz)__builtin_strlen(r->buf)};
+    if (trim(typed).len) {
+        return typed;
+    }
+    return r->isdflt || r->like.len ? r->value : Str{};
+}
+
+// A list of seconds read as times, "1 min, 2 min, 5 min", or null when
+// one is not seconds, or none reaches a minute.
+static Str timesread(Arena *a, Str v)
+{
+    Buf b(a, 64);
+    b32 long_ = 0;
+    for (Str rest = v; rest.len;) {
+        Str w = cfgnextword(&rest);
+        if (!w.len) {
+            continue;
+        }
+        Float f = parsefloat(w);
+        if (!f.ok || f.val<=0 || f.val>=1e7) {
+            return {};
+        }
+        long_ |= f.val >= 59.5;
+        print(&b, b.len ? Str(", ") : Str(""));
+        print(&b, duration(a, (i64)(f.val*1000 + 0.5)));
+    }
+    return long_ ? finish(&b) : Str{};
+}
+
+// What a seconds setting's field comes to as a time, else null.
+static Str cfgrowread(Arena *a, CfgRow *r)
+{
+    if (r->type == "seconds") {
+        return secsread(a, cfgrowshown(r));
+    } else if (r->type == "times") {
+        return timesread(a, cfgrowshown(r));
+    }
+    return {};
+}
+
 // A setting's tooltip: its description, type and default.
 static Str cfgrowtip(Arena *a, CfgRow *r)
 {
@@ -13226,6 +13283,23 @@ static void drawcfgrow(Gui *g, CfgRow *r, i32 target, b32 wide)
         b32 enter = ImGui::InputTextWithHint("##v", hint.len ? cstr0(&a, hint) : "", r->buf, (uz)r->cap,
                                              ImGuiInputTextFlags_EnterReturnsTrue|ImGuiInputTextFlags_AutoSelectAll);
         axname(g, r->key);
+        // What the seconds come to, dimmed at the field's right end,
+        // while there is room beside the text
+        Str read = cfgrowread(&a, r);
+        r->read  = 0;
+        if (read.len && r->type!="times") {
+            ImVec2 fmin  = ImGui::GetItemRectMin();
+            ImVec2 fmax  = ImGui::GetItemRectMax();
+            ImVec2 pad   = ImGui::GetStyle().FramePadding;
+            f32    readw = ImGui::CalcTextSize(cstr0(&a, read)).x;
+            f32    textw = ImGui::CalcTextSize(cstr0(&a, cfgrowshown(r))).x;
+            if (textw + readw + 4*pad.x <= fmax.x - fmin.x) {
+                ImVec2 at = v2(fmax.x - pad.x - readw, fmin.y + pad.y);
+                ImGui::GetWindowDrawList()->AddText(at, ImGui::GetColorU32(ImGuiCol_TextDisabled),
+                                                    read.cdata, read.cdata+read.len);
+                r->read = 1;
+            }
+        }
         if (swatch) {
             ImVec2 fmin = ImGui::GetItemRectMin();
             ImVec2 fmax = ImGui::GetItemRectMax();
@@ -13252,6 +13326,13 @@ static void drawcfgrow(Gui *g, CfgRow *r, i32 target, b32 wide)
                 r->sentval = clone(&g->cfgmem, v);
                 guiconfigset(g, r->kind, r->name, r->key, v.len ? v : Str{});
             }
+        }
+        if (read.len && r->type=="times") {
+            // A list, too long for the field's end: a line under it
+            ImGui::PushTextWrapPos(0);
+            ImGui::TextDisabled("%.*s", (int)read.len, read.cdata);
+            ImGui::PopTextWrapPos();
+            r->read = 1;
         }
     }
     if (target>=0 && target==g->reveal) {
