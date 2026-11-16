@@ -3729,19 +3729,9 @@ static void drawsessbar(Gui *g)
             "fold it again as the settings say (%s)",
             v->showthink ? "on, all of it shown" : "off, as the settings say",
             shortcutname(g, 1));
-    // Info opens a popup, not a toggle: apart from them, filled while open
+    // Apart from the toggles of what the transcript shows: the
+    // Permissions pane, shown and hidden as the branch shows Changes
     ImGui::SameLine(0, 2*gap);
-    if (togglebutton(g, ICON_INFO, ImGui::IsPopupOpen("##sessinfo"))) {
-        ImGui::OpenPopup("##sessinfo");
-    }
-    itemrect(g, RECT_INFOBTN);
-    itemtip("Info: the session's model, role and instruction files");
-    if (ImGui::BeginPopup("##sessinfo")) {
-        drawinfo(g, s, v);
-        ImGui::EndPopup();
-    }
-    // The Permissions pane, shown and hidden as the branch shows Changes
-    ImGui::SameLine();
     Str  why  = hostwhy(g, s, "grants");
     b32  open = g->panes[PANE_PERMISSIONS];
     ImGui::BeginDisabled(why.len > 0);
@@ -3760,6 +3750,18 @@ static void drawsessbar(Gui *g)
             navjump(g);
         }
         setpane(g, PANE_PERMISSIONS, !open);
+    }
+    // Info opens a popup, not a toggle, filled while open: last, in the
+    // corner, which the popup opens from
+    ImGui::SameLine();
+    if (togglebutton(g, ICON_INFO, ImGui::IsPopupOpen("##sessinfo"))) {
+        ImGui::OpenPopup("##sessinfo");
+    }
+    itemrect(g, RECT_INFOBTN);
+    itemtip("Info: the session's model, role and instruction files");
+    if (ImGui::BeginPopup("##sessinfo")) {
+        drawinfo(g, s, v);
+        ImGui::EndPopup();
     }
 }
 
