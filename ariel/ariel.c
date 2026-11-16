@@ -4834,7 +4834,7 @@ static void oscdispatch(ariel_Term *t)
         if (!rest.len) return;
         u8  k = rest.data[0];
         i32 v = -1;
-        if (k<'A' || k>'D') return;
+        if (k<'A' || k>'D' || (rest.len>1 && rest.data[1]!=';')) return;
         if (k=='A') {
             // A line attribute, kept on its first row
             i32 y = t->c.y;
@@ -4852,7 +4852,7 @@ static void oscdispatch(ariel_Term *t)
             Cut a = cut((ariel_Str){rest.data+2, rest.len-2}, ';');
             v = parseint(a.head);
         }
-        event(t, ARIEL_EV_MARK, k, v, 0, 0);
+        event(t, ARIEL_EV_MARK, k, v, rest.data, rest.len);
     } return;
     }
 }

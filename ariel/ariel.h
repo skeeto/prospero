@@ -82,7 +82,8 @@ enum {
     ARIEL_EV_CLIPGET,   // OSC 52 read (ARIEL_F_CLIPREAD): ariel_clipreply
     ARIEL_EV_NOTIFY,    // OSC 9 or 777: data title, more body
     ARIEL_EV_PROGRESS,  // OSC 9;4: arg state 0-4, value percent
-    ARIEL_EV_MARK,      // OSC 133: arg 'A'-'D', value exit status or -1
+    ARIEL_EV_MARK,      // OSC 133: arg 'A'-'D', value exit status or -1,
+                        //   data all after "133;" ("D;0;aid=1"), options too
     ARIEL_EV_SYNC,      // mode 2026: arg 1 begun, 0 ended
 };
 enum { ARIEL_PART_BEGIN = 1, ARIEL_PART_DATA, ARIEL_PART_END, ARIEL_PART_ABORT };

@@ -159,7 +159,7 @@ static void logevent(Tester *s, ariel_Event *e)
     case ARIEL_EV_CLIPGET:  snprintf(b, 256, "clipget %d", e->arg); break;
     case ARIEL_EV_NOTIFY:   snprintf(b, 256, "notify %.*s|%.*s", n, d, m, o); break;
     case ARIEL_EV_PROGRESS: snprintf(b, 256, "progress %d %d", e->arg, e->value); break;
-    case ARIEL_EV_MARK:     snprintf(b, 256, "mark %c %d", e->arg, e->value); break;
+    case ARIEL_EV_MARK:     snprintf(b, 256, "mark %c %d %.*s", e->arg, e->value, n, d); break;
     case ARIEL_EV_SYNC:     snprintf(b, 256, "sync %d", e->arg); break;
     default:                snprintf(b, 256, "kind %d", e->kind); break;
     }
