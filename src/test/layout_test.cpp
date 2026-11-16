@@ -121,6 +121,15 @@ static void test_layout(Test *t)
         {"layout.tablewide", "| abcd | abcdefghijklmnop |\n|---|---|\n| x | y |", 120,
          "8:8[abcd] 8:64[abcd] 28:64[efgh] 48:64[ijkl] 68:64[mnop] 104:8[x] 104:64[y] h=132"},
         {"layout.empty", "", 200, "h=0"},
+        // A key cap has room at each end, 0.45 em (9), and is not
+        // broken at its spaces; with no break before it on the line,
+        // its room goes to the next line with it
+        {"layout.kbd", "a <kbd>bc</kbd> d", 200,
+         "0:0[a ]20[/]29[bc]49[/]58[ d] h=20"},
+        {"layout.kbdwhole", "a <kbd>b c</kbd>", 50,
+         "0:0[a ] 20:0[/]9[b c]39[/] h=40"},
+        {"layout.kbdroom", "ab<kbd>cd</kbd>", 35,
+         "0:0[ab] 20:0[/]9[cd]29[/] h=40"},
         // CJK breaks between its characters, not only at spaces, but
         // never before a closing mark (kinsoku)
         {"layout.cjk", "aa 中文字句", 50, "0:0[aa 中文] 20:0[字句] h=40"},

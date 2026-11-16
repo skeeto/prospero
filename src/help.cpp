@@ -298,6 +298,27 @@ static Str helpsnippet(Str body, Str query)
     return best;
 }
 
+// A snippet without its <kbd> tags, which the pages put around keys
+// (doc.cpp), as the snippet is shown as text
+static Str dropkbd(Arena *a, Str s)
+{
+    if (findfold(s, "kbd>") < 0) {
+        return s;
+    }
+    Buf b(a, s.len);
+    for (iz i = 0; i < s.len;) {
+        Str rest = cuthead(s, i);
+        iz  n    = rest.len>=5 && equalfold(takehead(rest, 5), "<kbd>")  ? 5 :
+                   rest.len>=6 && equalfold(takehead(rest, 6), "</kbd>") ? 6 : 0;
+        if (n) {
+            i += n;
+        } else {
+            putbyte(&b, s[i++]);
+        }
+    }
+    return finish(&b);
+}
+
 static b32 hitbefore(HelpHit *a, HelpHit *b)
 {
     return a->rank < b->rank;
@@ -332,7 +353,7 @@ static Slice<HelpHit> helpsearch(Arena *a, Str query, iz max)
                 HelpHit h = {};
                 h.page    = p;
                 h.head    = head;
-                h.snippet = helpsnippet(body, query);
+                h.snippet = dropkbd(a, helpsnippet(body, query));
                 h.rank    = rank;
                 r = push(a, r, h);
             }

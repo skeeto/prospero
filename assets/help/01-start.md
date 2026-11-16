@@ -4,8 +4,8 @@
 
 The field above these topics searches every page: type words, and the
 sections that have them all take the topics' place, headings that
-match first. Click one to go there, or press Enter for the first.
-Escape, or the X, brings the topics back.
+match first. Click one to go there, or press <kbd>Enter</kbd> for the first.
+<kbd>Esc</kbd>, or the X, brings the topics back.
 
 Buttons drawn as icons say what they do in their tooltips: hold the
 mouse over one to see its name.
@@ -32,7 +32,7 @@ setting is first saved. Its configuration file then starts from a
 built-in copy that documents every setting, with an endpoint for a
 llama.cpp server on this machine as an example.
 
-1. Open the Settings pane: Ctrl+, (Cmd+, on macOS), or Settings... in
+1. Open the Settings pane: <kbd>Ctrl+,</kbd> (<kbd>Cmd+,</kbd> on macOS), or Settings... in
    the Session menu (on macOS, the Prospero menu too), or View →
    Settings. The line at its top says which file its edits go to,
    usually `~/.config/prospero/prospero.ini` (see
@@ -59,10 +59,10 @@ Remotes, or with Add remote... in the Hosts pane; see
 
 ## Starting a session
 
-Session → New session... (Ctrl+N, Cmd+N on macOS) asks for the working
+Session → New session... (<kbd>Ctrl+N</kbd>, <kbd>Cmd+N</kbd> on macOS) asks for the working
 directory and, optionally, a model from those the endpoints list. The
 prompt box at the bottom then has the keyboard: type a prompt and press
-Enter. Shift+Enter starts a new line.
+<kbd>Enter</kbd>. <kbd>Shift+Enter</kbd> starts a new line.
 
 From a terminal, `prospero DIR`, such as `prospero .`, opens a new
 session in that directory, in Build mode with the default model. If
@@ -73,8 +73,8 @@ window in the terminal).
 ## Layouts
 
 View → Layout, the first item of View, arranges every pane at once.
-Ctrl+1 to Ctrl+9 (Cmd on macOS) pick its layouts in the order listed,
-so Ctrl+1 is Standard and Ctrl+4 the first you saved:
+<kbd>Ctrl+1</kbd> to <kbd>Ctrl+9</kbd> (<kbd>Cmd</kbd> on macOS) pick its layouts in the order listed,
+so <kbd>Ctrl+1</kbd> is Standard and <kbd>Ctrl+4</kbd> the first you saved:
 
 - **Standard**: sessions on the left over the todo list, the
   transcript over the prompt in the middle, and the jobs over the
@@ -84,7 +84,7 @@ so Ctrl+1 is Standard and Ctrl+4 the first you saved:
   under the prompt, as tall as it.
 - **Focus**: one session only. The transcript, todo list and plan are
   tabs over the prompt, and nothing else is open. A file opened shows
-  Files as another tab beside the plan, and Ctrl+` brings the terminal
+  Files as another tab beside the plan, and <kbd>Ctrl+\`</kbd> brings the terminal
   back, under the prompt.
 
 Files stays hidden until a file is opened, then shows where the

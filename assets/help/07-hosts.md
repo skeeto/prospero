@@ -166,7 +166,7 @@ background hangs up this window's terminal tabs.
 
 The Files pane shows a file on another host, a remote, a container or
 a WSL distro, as that host's engine reads it there, a part at a time:
-Open file... (Ctrl+O) with such a session shown asks for a path there,
+Open file... (<kbd>Ctrl+O</kbd>) with such a session shown asks for a path there,
 completed and checked there, and a link to a file in such a session's
 transcript, or the path in its read, edit or write row, opens the file
 there, its tooltip saying on which host. While the connection is

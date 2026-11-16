@@ -10,7 +10,10 @@
 // a re-parse, and be copied as text or as markdown. Text md4c makes up
 // (break newlines, indentation, U+FFFD) is synthetic: len 0, at the
 // nearest source offset. md4c's dialect is GitHub's, with raw HTML off
-// so that text like Vec<T> or <thinking> stays visible.
+// so that text like Vec<T> or <thinking> stays visible. The one tag
+// read is <kbd>, a key or a shortcut, as <kbd>Ctrl+,</kbd>: its text
+// is drawn as a key cap (STYLE_KBD), the tags themselves hidden. Not in
+// what the user typed, which is shown as written.
 //
 // Code blocks go through the highlighter, which splits their pieces at
 // token boundaries. Concatenated, a code block's piece texts are its
@@ -41,6 +44,7 @@ enum : i32 {
     STYLE_LINK   = 1<<4,
     STYLE_HEADER = 1<<5,   // table header cell
     STYLE_DIM    = 1<<6,   // de-emphasized: reasoning, notes
+    STYLE_KBD    = 1<<7,   // a key or shortcut, drawn as a key cap
     STYLE_HSHIFT = 8,      // heading level 1-6 in bits 8-10
     STYLE_HMASK  = 7<<STYLE_HSHIFT,
 };
@@ -50,6 +54,8 @@ enum : u8 {
     PIECE_HARD  = 1<<1,  // a hard line break
     PIECE_SOFT  = 1<<2,  // a soft line break: a space when wrapped
     PIECE_CAND  = 1<<3,  // an inline-code span that may name a file
+    PIECE_KBD0  = 1<<4,  // the first piece of a <kbd> span
+    PIECE_KBD1  = 1<<5,  // and its last
 };
 
 enum : i32 {
@@ -137,6 +143,9 @@ struct DocParse {
     u8       align;
     b32      header;
     b32      hardbreaks;  // a soft line break is a hard one, as typed
+    b32      kbdtags;  // <kbd> spans are read (not in what was typed)
+    b32      kbd;      // in a <kbd> span
+    b32      kbd0;     // its first piece is still to come
 };
 
 static i32 clampdepth(i32 d)
@@ -153,6 +162,7 @@ static i32 curstyle(DocParse *p)
     s |= p->strike ? STYLE_STRIKE : 0;
     s |= p->link>=0 ? STYLE_LINK  : 0;
     s |= p->header ? STYLE_HEADER : 0;
+    s |= p->kbd    ? STYLE_KBD    : 0;
     return s;
 }
 
@@ -311,10 +321,51 @@ static b32 rawindent(DocParse *p, i32 off, i32 cols, Piece *pc)
     return 0;
 }
 
+// The length of the tag, <kbd> (open) or </kbd>, that s starts with, in
+// any case, or 0 if none.
+static i32 kbdtag(Str s, b32 open)
+{
+    Str tag = open ? Str("<kbd>") : Str("</kbd>");
+    return s.len>=tag.len && equalfold(takehead(s, tag.len), tag) ? (i32)tag.len : 0;
+}
+
 static int mdtext(MD_TEXTTYPE type, MD_CHAR const *text, MD_SIZE size, void *ud)
 {
     DocParse *p = (DocParse *)ud;
     u8       *s = (u8 *)text;
+
+    // A <kbd> tag in plain text (with raw HTML off, md4c passes it on as
+    // text): the text around it goes on as before, and the tag only
+    // switches the style. A </kbd> with none open is text.
+    if (type==MD_TEXT_NORMAL && p->kbdtags && insource(p, s)) {
+        for (iz i = 0; i < (iz)size; i++) {
+            if (s[i] != '<') {
+                continue;
+            }
+            Str rest  = {s+i, (iz)size-i};
+            i32 open  = kbdtag(rest, 1);
+            i32 close = p->kbd ? kbdtag(rest, 0) : 0;
+            if (!open && !close) {
+                continue;
+            }
+            if (i) {
+                mdtext(type, text, (MD_SIZE)i, ud);
+            }
+            Doc *d = p->doc;
+            if (close && !p->kbd0 && d->pieces.len) {
+                d->pieces[d->pieces.len-1].flags |= PIECE_KBD1;
+            }
+            p->kbd     = open>0;
+            p->kbd0    = open>0;
+            iz n       = open ? open : close;
+            p->lastoff = (i32)(s + i + n - p->base);
+            if (i+n < (iz)size) {
+                mdtext(type, text+i+n, (MD_SIZE)(size-i-n), ud);
+            }
+            return 0;
+        }
+    }
+
     Piece    pc = {};
     pc.style = curstyle(p);
     if (p->cur>=0 && p->doc->blocks[p->cur].type==DOC_HEADING) {
@@ -322,12 +373,16 @@ static int mdtext(MD_TEXTTYPE type, MD_CHAR const *text, MD_SIZE size, void *ud)
     }
     pc.link  = p->link;
     pc.text  = {s, (iz)size};
+    if (p->kbd && p->kbd0) {
+        pc.flags |= PIECE_KBD0;
+        p->kbd0   = 0;
+    }
     if (insource(p, s)) {
         pc.off = (i32)(s - p->base);
         pc.len = (i32)size;
     } else {
-        pc.off   = p->lastoff;
-        pc.flags = PIECE_SYNTH;
+        pc.off    = p->lastoff;
+        pc.flags |= PIECE_SYNTH;
     }
 
     switch (type) {
@@ -469,6 +524,8 @@ static void closeblock(DocParse *p)
         highlightblock(p, b);
     }
     p->indent0 = -1;
+    p->kbd     = 0;  // a <kbd> left open ends with its block
+    p->kbd0    = 0;
     if (!b->npiece && (b->type==DOC_HR || b->type==DOC_CODE)) {
         b->off0    = nextline({p->base, p->size}, b->off0);
         b->off1    = lineend({p->base, p->size}, b->off0);
@@ -881,6 +938,7 @@ static Doc *parsedoc(Arena *perm, Str src, HlMemo **memo, b32 hardbreaks = 0)
     p.cand    = -1;
     p.indent0 = -1;
     p.hardbreaks = hardbreaks;
+    p.kbdtags    = !hardbreaks;
     d->src    = src;
 
     MD_PARSER parser = {};

@@ -14,8 +14,8 @@ first save, from Settings or by the agent, writes the file from its
 built-in copy, whose comments document every section and key: read it
 there for the full list. Changes take effect while Prospero runs.
 
-The Settings pane ([View → Settings](view:settings), or Ctrl+, and
-Cmd+, on macOS) edits the file in place, a page for each section,
+The Settings pane ([View → Settings](view:settings), or <kbd>Ctrl+,</kbd> and
+<kbd>Cmd+,</kbd> on macOS) edits the file in place, a page for each section,
 changing only the lines it sets and keeping your comments. The model
 and shell lists on the Prompt's status line end with Endpoints and models...
 and Shells..., which show their pages. Its top line says which file it edits.
@@ -24,11 +24,11 @@ problem found in the files, with where it is; a bad value falls back to
 its default. Select text there to copy it, or Copy all for every one,
 a line each, to paste into a bug report or an editor.
 
-The search field above the pages (Ctrl+F, or Cmd+F on macOS, while
+The search field above the pages (<kbd>Ctrl+F</kbd>, or <kbd>Cmd+F</kbd> on macOS, while
 Settings has the focus) finds a setting by name: keys that match come
 first, then those whose section's name matches, then those whose
 description does. Every word typed must match. Pick a result, or press
-Enter for the first, to go to that setting on its page. Escape, or
+<kbd>Enter</kbd> for the first, to go to that setting on its page. <kbd>Esc</kbd>, or
 the X at the field's end, empties it.
 
 **Open in editor**, beside Reload, opens the file itself in your
@@ -276,7 +276,7 @@ fails with a link to sign up for Copilot Free.
   missing, rather than asking to install them. The branch on the
   session bar needs no git. A remote host's engine uses its own
   configuration's.
-- **[`[ui] editor`](settings:ui#editor)**: the command that opens a draft (Ctrl+G), a plan
+- **[`[ui] editor`](settings:ui#editor)**: the command that opens a draft (<kbd>Ctrl+G</kbd>), a plan
   or the configuration file in an editor, given the file as one more
   word, and the editor of the Files pane's Open in editor. For a
   draft, a plan or the configuration file it must wait until you are

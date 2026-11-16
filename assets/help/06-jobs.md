@@ -15,7 +15,7 @@ command in the background at once. It reads a job's output while it
 runs, and is told when it ends.
 
 You need not wait for the timeout: Run in background, on the running
-command's row, or Ctrl+B, moves it to the background as a job now,
+command's row, or <kbd>Ctrl+B</kbd>, moves it to the background as a job now,
 and the agent goes on, so that you can talk to it while the command
 runs. The agent is told that you moved it, and is told when it ends,
 as for any job. Only you can do this; the agent cannot. With 16 jobs
@@ -86,7 +86,7 @@ large job in pieces can size the next piece by it.
 ### Subagents in the background
 
 The parent waits for its subagents to report. Run in background, on a
-task row at work, moves that subagent to the background, and Ctrl+B
+task row at work, moves that subagent to the background, and <kbd>Ctrl+B</kbd>
 every subagent the turn waits for: the parent's call ends at once,
 saying so, and the parent goes on while the subagent works. When the
 subagent is done, its report (or how it failed, or that it was

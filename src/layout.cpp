@@ -14,7 +14,9 @@
 //
 // Wrapping is greedy at spaces, breaking within a word only when the
 // word alone overflows a line. Code wraps at any character. Tabs in
-// code advance to the next multiple of four spaces.
+// code advance to the next multiple of four spaces. A key cap (a <kbd>
+// span) is not broken at its spaces, and has room at each end, empty
+// runs the renderer draws its cap around.
 //
 // This is free and unencumbered software released into the public domain.
 
@@ -31,7 +33,14 @@ struct Measure {
 
 enum : u32 {
     RUN_NODRAW = 1u<<0,  // a tab or break: occupies space, draws nothing
+    RUN_KBD0   = 1u<<1,  // the room before a key cap (also RUN_NODRAW)
+    RUN_KBD1   = 1u<<2,  // and after it
 };
+
+// A key cap's room at each end, in ems of the base font: its margin
+// outside the cap, then its padding inside
+static f32 const KBD_MARGIN = 0.15f;
+static f32 const KBD_PAD    = 0.3f;
 
 struct Run {
     f32 x, w;
@@ -233,6 +242,11 @@ static void wrappieces(Wrap *w, i32 p0, i32 p1)
             endline(w);
             continue;
         }
+        f32 kbdroom = (KBD_MARGIN + KBD_PAD) * m->font(m->ctx, 0).lineh;
+        b32 kbd     = pc->style & STYLE_KBD;
+        if (pc->flags & PIECE_KBD0) {
+            addrun(w, p, 0, 0, kbdroom, RUN_NODRAW|RUN_KBD0);
+        }
         if (pc->flags & PIECE_SOFT) {
             f32 adv = m->advance(m->ctx, pc->style, ' ');
             addrun(w, p, 0, pc->text.len, adv, RUN_NODRAW);
@@ -268,7 +282,7 @@ static void wrappieces(Wrap *w, i32 p0, i32 p1)
             }
 
             b32 empty = (i32)w->bl->runs.len == w->run0;
-            if (!empty && !w->code && cjkbreak(w->prev, cp)) {
+            if (!empty && !w->code && !kbd && cjkbreak(w->prev, cp)) {
                 w->canbreak = 1;  // before this one
                 w->bpiece   = p;
                 w->bbyte    = start;
@@ -300,17 +314,31 @@ static void wrappieces(Wrap *w, i32 p0, i32 p1)
                     wrapfont(w, pc->style);
                     continue;
                 }
+                // No break on the line: the cap's room before it goes
+                // with it to the next
+                Run pad = w->bl->runs[w->bl->runs.len-1];
+                b32 kbd0 = pad.flags & RUN_KBD0;
+                if (kbd0) {
+                    w->bl->runs.len--;
+                    w->x -= pad.w;
+                }
                 endline(w);
+                if (kbd0) {
+                    addrun(w, pad.piece, pad.b0, pad.b1, pad.w, pad.flags);
+                }
             }
 
             addrun(w, p, start, i, adv, flags);
             w->prev = cp;
-            if (piecespace(cp) && !w->code) {
+            if (piecespace(cp) && !w->code && !kbd) {
                 w->canbreak = 1;
                 w->bpiece   = p;
                 w->bbyte    = i;
                 w->bruns    = (i32)w->bl->runs.len;
             }
+        }
+        if (pc->flags & PIECE_KBD1) {
+            addrun(w, p, pc->text.len, pc->text.len, kbdroom, RUN_NODRAW|RUN_KBD1);
         }
         nextpiece:;
     }

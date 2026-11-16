@@ -1010,6 +1010,19 @@ static void drawmarks(Gui *g, ImDrawList *dl, Marks *mk, Piece *pieces, Run *r,
     }
 }
 
+// A key cap from x0 to x1 on a line, under its text.
+static void drawkbd(Gui *g, ImDrawList *dl, f32 x0, f32 x1, f32 ly, f32 lh, f32 alpha)
+{
+    f32    sc  = g->scale;
+    ImVec2 a   = v2(x0, ly + 1*sc);
+    ImVec2 z   = v2(x1, ly + lh - 1*sc);
+    f32    rnd = 3*sc;
+    dl->AddRectFilled(a, z, fade(g->pal->codebg, alpha), rnd);
+    dl->AddRect(a, z, fade(g->pal->rule, alpha), rnd, 1*sc);
+    // Its lower edge thicker, as a key's
+    dl->AddLine(v2(a.x+rnd, z.y - 1*sc), v2(z.x-rnd, z.y - 1*sc), fade(g->pal->rule, alpha), 1*sc);
+}
+
 // Draw one placed block of a message whose content starts at origin.
 // Its inline code that names a file found from where the text is (from,
 // null for nowhere) is drawn as a link.
@@ -1073,6 +1086,31 @@ static void drawblock(Gui *g, ImDrawList *dl, ImDrawListSplitter *sp,
         f32   ly = oy + l->y;
         if (ly+l->h<cliptop || ly>clipbot) {
             continue;
+        }
+        // Key caps, from the room before one to the room after, less
+        // their margins; one broken by the wrap, to the line's end
+        f32 margin = KBD_MARGIN * g->measure.font(g->measure.ctx, 0).lineh;
+        f32 cap0   = -1, cap1 = 0;
+        sp->SetCurrentChannel(dl, CH_BG);
+        for (i32 k = 0; k < l->nrun; k++) {
+            Run *r  = &bl->runs[l->run0+k];
+            b32  in = pieces[r->piece].style & STYLE_KBD;
+            if (cap0>=0 && (!in || r->flags&RUN_KBD0)) {
+                drawkbd(g, dl, ox+cap0, ox+cap1, ly, l->h, alpha);
+                cap0 = -1;
+            }
+            if (!in) {
+                continue;
+            }
+            cap0 = cap0>=0 ? cap0 : r->flags&RUN_KBD0 ? r->x+margin : r->x;
+            cap1 = r->flags&RUN_KBD1 ? r->x+r->w-margin : r->x+r->w;
+            if (r->flags & RUN_KBD1) {
+                drawkbd(g, dl, ox+cap0, ox+cap1, ly, l->h, alpha);
+                cap0 = -1;
+            }
+        }
+        if (cap0 >= 0) {
+            drawkbd(g, dl, ox+cap0, ox+cap1, ly, l->h, alpha);
         }
         for (i32 k = 0; k < l->nrun; k++) {
             Run   *r  = &bl->runs[l->run0+k];

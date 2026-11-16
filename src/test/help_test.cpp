@@ -191,6 +191,18 @@ static void test_help(Test *t)
         }
         expect(t, "help.find.snippet", istr(&a, card), "1");
 
+        // Keys are marked <kbd> in the pages, which a snippet, shown as
+        // text, leaves out
+        h = helpsearch(&a, "settings pane", 50);
+        b32 tags = 0, keys = 0;
+        for (iz i = 0; i < h.len; i++) {
+            tags |= findfold(h[i].snippet, "kbd>") >= 0;
+            keys |= findfold(h[i].snippet, "Ctrl+,") >= 0;
+        }
+        expect(t, "help.find.kbd", istr(&a, tags*10 + keys), "1");
+        expect(t, "help.dropkbd", dropkbd(&a, "<kbd>Ctrl+,</kbd> or <KBD>Esc</Kbd>, a <b>"),
+               "Ctrl+, or Esc, a <b>");
+
         h = helpsearch(&a, "keyboard", 50);
         b32 top = 0;
         for (iz i = 0; i < h.len; i++) {

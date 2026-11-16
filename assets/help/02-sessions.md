@@ -2,7 +2,7 @@
 
 ## New sessions
 
-Session → New session... (Ctrl+N, Cmd+N on macOS), or New session
+Session → New session... (<kbd>Ctrl+N</kbd>, <kbd>Cmd+N</kbd> on macOS), or New session
 here... in a host's menu in the sidebar, opens the New session dialog:
 
 - **Host**, when more than one is ready: where the session runs.
@@ -27,7 +27,7 @@ here... in a host's menu in the sidebar, opens the New session dialog:
   default first, then each endpoint's, its `[model]` sections first.
   An endpoint that cannot be reached shows why, greyed out. Type in
   the field at the top to filter the list, or type a model it lacks,
-  `MODEL` or `ENDPOINT/MODEL`, and press Enter. The pick holds for
+  `MODEL` or `ENDPOINT/MODEL`, and press <kbd>Enter</kbd>. The pick holds for
   later sessions while the endpoint still lists it.
 - **Role**, when the configuration has roles: start in one, with its
   instructions, model and tools (see [Subagents](help:jobs)). A
@@ -37,7 +37,7 @@ here... in a host's menu in the sidebar, opens the New session dialog:
 Once the session is made, the prompt box has the keyboard, so its first
 message may be typed at once.
 
-Session → New session, no folder (Ctrl+Shift+N, Cmd+Shift+N on macOS)
+Session → New session, no folder (<kbd>Ctrl+Shift+N</kbd>, <kbd>Cmd+Shift+N</kbd> on macOS)
 skips the dialog: a No folder session on this computer, with the
 default model, its prompt box ready. Type `/plan` there for Plan mode.
 
@@ -90,28 +90,28 @@ remembers the choice.
 
 ## Going to a session
 
-Session → Go to... (Ctrl+K, Cmd+K on macOS) opens a palette over the
+Session → Go to... (<kbd>Ctrl+K</kbd>, <kbd>Cmd+K</kbd> on macOS) opens a palette over the
 window, in any layout, Focus too, where the sidebar is hidden. Type
 words from a session's title, group, folder or host, or a piece of its
-id: every word must match, and title matches rank first. Up and Down
-move the pick, Enter shows it with its prompt box ready, and Esc, a
-click outside, or Ctrl+K again closes the palette.
+id: every word must match, and title matches rank first. <kbd>Up</kbd> and <kbd>Down</kbd>
+move the pick, <kbd>Enter</kbd> shows it with its prompt box ready, and <kbd>Esc</kbd>, a
+click outside, or <kbd>Ctrl+K</kbd> again closes the palette.
 
 What you type finds more than sessions, each kind under its own
 heading after the sessions: layouts and panes ("focus layout", "show
 jobs"), settings, as the Settings pane's search finds them, and Help's
-sections. Enter applies the layout, shows the pane, opens Settings at
+sections. <kbd>Enter</kbd> applies the layout, shows the pane, opens Settings at
 the setting, or Help at the section.
 
 With nothing typed, it lists the sessions viewed in this window, the
 latest first, then the rest by recent activity, leaving out the one
-shown: Ctrl+K then Enter goes back to the previous session. Subagents
+shown: <kbd>Ctrl+K</kbd> then <kbd>Enter</kbd> goes back to the previous session. Subagents
 and archived sessions are listed only when typed words match them, and
 sessions in the Trash never are.
 
 ## Talking to the agent
 
-Enter sends the prompt. The transcript shows your messages as
+<kbd>Enter</kbd> sends the prompt. The transcript shows your messages as
 Markdown, as it does the agent's: code fences, `inline code`, lists and
 emphasis render, while each line break stays as you typed it and HTML
 tags show as text. The agent gets exactly what you typed. With the
@@ -121,7 +121,7 @@ buttons beside the prompt box are icons in two columns, named in their
 tooltips: Send (a paper plane), Stop (a square) and Pause (two bars)
 on the left; Attach (a paper clip), Open working folder (a folder) and
 Terminal on the right, which shows the Terminal pane with the
-session's shell in its folder, as Ctrl+` does, on whatever host the
+session's shell in its folder, as <kbd>Ctrl+\`</kbd> does, on whatever host the
 session runs ([Hosts](help:hosts)). Each is always there, dimmed when
 it can do nothing, so none moves as a turn begins or ends. While the
 agent works, Send becomes Steer (a curved arrow). The status line
@@ -131,8 +131,8 @@ the transcript, dimmed and marked "Next step", until the agent reads
 it at its next step (or marked "Queued", for a turn of its own, as it
 is when sent too late for this turn), and its Withdraw button takes it
 back into the box. Stop cancels the turn and kills any command it
-runs, and so does Esc, once nothing is left for it to close: from the
-prompt box, the first Esc leaves the box, and the second stops the
+runs, and so does <kbd>Esc</kbd>, once nothing is left for it to close: from the
+prompt box, the first <kbd>Esc</kbd> leaves the box, and the second stops the
 turn.
 
 Pause holds the agent before its next model request, without ending
@@ -213,7 +213,7 @@ word after `@` lists other sessions too, by title: picked, the agent is
 given that session's id, to message it with `send_message`.
 
 A long command or subagent keeps the agent from reading what you
-send until it ends. Run in background, on its row, or Ctrl+B (also in
+send until it ends. Run in background, on its row, or <kbd>Ctrl+B</kbd> (also in
 the Session menu and as `/background`) lets it go on by itself while
 the agent goes on with you; the agent is told when it ends. See
 [Jobs, todo and subagents](help:jobs).
@@ -224,7 +224,7 @@ command alone: the agent gets what it printed so far, is told you
 stopped it, and goes on. The row says "stopped".
 
 A message starting with a command runs it instead of going to the
-agent (Tab completes the name):
+agent (<kbd>Tab</kbd> completes the name):
 
 - `/compact [focus]` summarizes older messages now, keeping what the
   focus names;
@@ -238,7 +238,7 @@ agent (Tab completes the name):
 - `/export [raw]` saves the transcript as Markdown, or its raw log;
 - `/plan` and `/plan off` turn Plan mode on and off;
 - `/background` moves the running command or subagents to the
-  background, as Ctrl+B does;
+  background, as <kbd>Ctrl+B</kbd> does;
 - `/pause` pauses the agent, as Pause does, and `/continue` resumes it,
   or goes on after a turn cut short, as Continue does;
 - `/NAME [args]` uses the skill NAME (see
@@ -301,9 +301,9 @@ host's git run there.
 The Files pane shows files, each in a tab of the session shown (a
 subagent's are its session's), up to eight, the one opened least
 recently closing for a ninth. It stays hidden until a file opens:
-Session → Open file... (Ctrl+O) asks for a path on the session's
+Session → Open file... (<kbd>Ctrl+O</kbd>) asks for a path on the session's
 host, this computer or [another](help:hosts), starting from the
-session's folder, which Tab completes. After the
+session's folder, which <kbd>Tab</kbd> completes. After the
 path, `:N` goes to line N and `:A-B` to lines A to B, marked with a
 band until text is selected; opening it again goes there again. A file
 dropped on the pane opens in a tab too, rather than being attached,
@@ -320,10 +320,10 @@ host, as a turn is rewound, as the window or the pane takes the focus
 and as its tab is picked or a link to it clicked, never by polling, at
 most once a second; the text stays at the same line. Reload (the
 circular arrow) reads it again at once, and a tab's menu closes tabs or
-copies the path. Ctrl+W (Cmd+W) closes the front tab while the pane
-has the focus, and Ctrl+F (Cmd+F) there finds in the file shown, its
-text or its Markdown as rendered (Edit → Find in file... too). Ctrl+G
-(Ctrl on macOS too) goes to a line (`N`, `N:C` or `A-B`), banded like
+copies the path. <kbd>Ctrl+W</kbd> (<kbd>Cmd+W</kbd>) closes the front tab while the pane
+has the focus, and <kbd>Ctrl+F</kbd> (<kbd>Cmd+F</kbd>) there finds in the file shown, its
+text or its Markdown as rendered (Edit → Find in file... too). <kbd>Ctrl+G</kbd>
+(<kbd>Ctrl</kbd> on macOS too) goes to a line (`N`, `N:C` or `A-B`), banded like
 a link's lines (Edit → Go to line... too). Reveal (the folder) shows
 the file in the file manager, and Open in editor opens it in your
 editor (`[ui] editor`, or
@@ -358,9 +358,9 @@ it looks for the path. A file on a share or mount that stops answering
 says "The file system is not responding" after ten seconds; other
 files still open, and that file, or the rest of its network share, is
 refused at once until it answers again, when Retry reads it. Folders
-are listed off to the side as well, for Open file's Tab, the new
+are listed off to the side as well, for Open file's <kbd>Tab</kbd>, the new
 session's folder field and the folders of an '@' mention: "Listing..."
-shows if that takes more than a moment, and a Tab pressed meanwhile
+shows if that takes more than a moment, and a <kbd>Tab</kbd> pressed meanwhile
 completes once the listing comes.
 
 An editor that runs in a terminal (`vim`, `nvim`, `nano`, `hx`,
@@ -375,7 +375,7 @@ Linux with no editor set at all, the tab runs the login shell's
 the file, as `vim notes.txt`. When the editor exits with status 0, as
 after `:wq`, its tab closes and Files shows the file again, read
 again, with the focus. Any other exit (`:cq`) leaves the tab with a
-banner saying how it ended, and its Restart (or Enter) runs the editor
+banner saying how it ended, and its Restart (or <kbd>Enter</kbd>) runs the editor
 on the file again. Open in editor on a file already open in a tab
 shows that tab. Drafts, plans and the configuration file still need an
 editor with a window of its own.
@@ -431,7 +431,7 @@ Right-click a session in the sidebar, or open the Session menu, for:
   offers Archive, New group... (named as you drop it) and Move to Trash,
   however long the list. Hold the drag just above it, or just under the
   pane's top, to scroll the list; an arrow over the strip says there is
-  more below. Escape cancels a drag. A session never moves
+  more below. <kbd>Esc</kbd> cancels a drag. A session never moves
   to another host, and dropping it never changes the sidebar's order.
 - **Fork**: a new session with a copy of this conversation, titled
   "(fork)", which starts in Build mode. A No folder session's fork gets
@@ -484,7 +484,7 @@ Right-click a session in the sidebar, or open the Session menu, for:
   `[ui] terminal`, else Terminal on macOS, Windows Terminal (or a
   console) on Windows, and elsewhere `$TERMINAL` or the first of the
   usual ones found.
-- **New terminal tab** (Ctrl+Shift+`): another shell in its folder, in
+- **New terminal tab** (<kbd>Ctrl+Shift+\`</kbd>): another shell in its folder, in
   a tab of the Terminal pane. A session has at most 8 tabs, and a host
   16 open, an editor's tab from Files' Open in editor among them. An
   editor's tab has a file open: quitting asks first, as for a tab
@@ -532,7 +532,7 @@ A code block in the agent's reply tagged with a shell (`sh`, `bash`,
 `zsh`, `ksh`, `powershell`, `pwsh`, or on Windows `cmd`) has a Run
 button beside Copy while the mouse is over it, and Run in Terminal on
 the right-click menu. It types the block at the prompt of one of the
-session's Terminal tabs, as a paste and Enter, so that it runs in your
+session's Terminal tabs, as a paste and <kbd>Enter</kbd>, so that it runs in your
 shell, and stays in its history: a tab whose shell is of the block's
 family (a POSIX shell for `sh`, `bash`, `zsh` and `ksh`, PowerShell for
 `powershell` and `pwsh`, cmd.exe for `cmd`) waiting at its prompt with
@@ -546,7 +546,7 @@ While the block runs, Run shows its tab and types nothing again; once
 it is over, Run types it again. A tab waits at its prompt when its
 shell has said so: zsh, bash and PowerShell, with `[terminal]
 integration` on, mark each prompt and each command they run. Another
-shell waits at its prompt when the last thing typed in it was Enter
+shell waits at its prompt when the last thing typed in it was <kbd>Enter</kbd>
 and nothing runs; a line half typed, or a quote left open (`quote>`),
 keeps a tab from taking a block. Where its shell marks its commands,
 the agent hears how the block ended, its exit code and its last lines

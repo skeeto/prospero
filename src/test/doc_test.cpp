@@ -3,9 +3,10 @@
 
 // Render a document compactly, one block per line:
 //   TYPE[attrs]: piece|piece|...
-// with each piece as "styles:text", styles from "bicslhd" (bold,
-// italic, code, strike, link, header, dim), "~" for synthetic text,
-// "/class" for a highlighted token, and newlines shown as \n.
+// with each piece as "styles:text", styles from "bicslhdk" (bold,
+// italic, code, strike, link, header, dim, key), "~" for synthetic
+// text, "[" and "]" for a <kbd> span's first and last pieces, "/class"
+// for a highlighted token, and newlines shown as \n.
 static Str docshow(Arena *a, Doc *d)
 {
     Buf b(a, 256);
@@ -37,15 +38,17 @@ static Str docshow(Arena *a, Doc *d)
         for (i32 j = 0; j < k->npiece; j++) {
             Piece *p = &d->pieces[k->piece0+j];
             putbyte(&b, j ? '|' : ' ');
-            static char const names[] = "bicslhd";
+            static char const names[] = "bicslhdk";
             b32 any = 0;
-            for (i32 s = 0; s < 7; s++) {
+            for (i32 s = 0; s < 8; s++) {
                 if (p->style & (1<<s)) {
                     putbyte(&b, (u8)names[s]);
                     any = 1;
                 }
             }
             if (p->flags & PIECE_SYNTH) { putbyte(&b, '~'); any = 1; }
+            if (p->flags & PIECE_KBD0)  { putbyte(&b, '['); any = 1; }
+            if (p->flags & PIECE_KBD1)  { putbyte(&b, ']'); any = 1; }
             if (p->hl) {
                 putbyte(&b, '/');
                 print(&b, hlclasses[p->hl]);
@@ -215,6 +218,18 @@ static void test_doc(Test *t)
          "P: go to |l:https://example.com|.\n"},
         {"doc.nohtml", "a <b>bold</b> Vec<T> <thinking>",
          "P: a <b>bold</b> Vec<T> <thinking>\n"},
+        // <kbd> alone is read, its tags hidden; a stray </kbd> is text,
+        // and one left open ends with its block
+        {"doc.kbd", "press <kbd>Ctrl+,</kbd> now",
+         "P: press |k[]:Ctrl+,| now\n"},
+        {"doc.kbdcase", "<KBD>Page Up</Kbd>", "P: k[]:Page Up\n"},
+        {"doc.kbdpieces", "<kbd>Ctrl</kbd>+<kbd>&lt;</kbd>",
+         "P: k[]:Ctrl|+|k[]:<\n"},
+        {"doc.kbdstyled", "<kbd>a *b*</kbd>", "P: k[:a |ik]:b\n"},
+        {"doc.kbdstray", "a </kbd> b", "P: a </kbd> b\n"},
+        {"doc.kbdopen", "<kbd>x\n\ny", "P: k[:x\nP: y\n"},
+        {"doc.kbdempty", "<kbd></kbd>x", "P: x\n"},
+        {"doc.kbdcode", "`<kbd>x</kbd>`", "P: c:<kbd>x</kbd>\n"},
         {"doc.entity", "&amp; &lt;x&gt; &#65;&#x42; &nbsp; &bogus;",
          "P: &| |<|x|>| |A|B| |&nbsp;| |&bogus;\n"},
         {"doc.escape", "\\*not\\*", "P: *|not|*\n"},
@@ -309,6 +324,8 @@ static void test_doc(Test *t)
                                              n[1][0]*10 + n[1][1]), "1001");
         expect(t, "doc.typed", docshow(&a, d1),
                "P: one|~:\\n|two <thinking>\nC: c:x|c~:\\n\n");
+        Doc *d2 = parsedoc(&a, "<kbd>x</kbd>", 0, 1);
+        expect(t, "doc.typedkbd", docshow(&a, d2), "P: <kbd>x</kbd>\n");
     }
 
     // The layout key follows content, not position
