@@ -3,10 +3,11 @@
 // Compiled only into the patched copy of imgui_widgets.cpp that
 // cmake/FetchGui.cmake makes, which includes this just ahead of
 // InputTextEx, so these see its static helpers: stb_textedit's undo
-// records, the input filter, and the line index. InputTextEx calls them
-// only while the context has TestEngineHookItems set, which
-// a11y_imgui.cpp turns on with the rest of its hooks. The two halves
-// are prospero_axedit and prospero_axfield (imconfig.h).
+// records, the input filter, and the line index. InputTextEx calls the
+// accessibility hooks only while the context has TestEngineHookItems
+// set, which a11y_imgui.cpp turns on with the rest of its hooks. The two
+// halves are prospero_axedit and prospero_axfield (imconfig.h). The
+// others (selection color, composition, word drags) always run.
 //
 // This is free and unencumbered software released into the public domain.
 
@@ -282,4 +283,159 @@ static void prospero_seldraw(ImGuiContext &g, ImGuiInputTextState *state, ImDraw
                            ImVec4(r.Min.x, r.Min.y, r.Max.x, r.Max.y), lb, le, 0.0f,
                            ImDrawTextFlags_CpuFineClip);
     }
+}
+
+// A double-click selects a word and a triple-click a line (InputTextEx),
+// and a drag from either extends the selection by whole words or lines,
+// as the transcript's does, where ImGui extends it by characters (#70).
+// The click keeps the unit and the word or line selected, and each drag
+// after ImGui's snaps the selection out to the unit's ends, the first
+// word or line always in it, whichever way the mouse goes. Lines are
+// logical, with their newline, as ImGui's triple-click selects them.
+// Words are as the transcript's: a run of word characters or of blanks,
+// or one separator. ImGui's double-click took the separators after a
+// word with it ("again," of "again, please"), so the double-click is
+// redone by that rule too, so that it and the drag agree.
+enum { PROSPERO_DRAG_CHAR, PROSPERO_DRAG_WORD, PROSPERO_DRAG_LINE };
+static struct {
+    ImGuiContext *ctx;
+    ImGuiID       id;
+    int           unit;
+    int           lo, hi;
+} prospero_drag;
+
+// 0 blank, 1 separator, 2 word, 3 newline (no word's)
+static int prospero_charclass(ImGuiInputTextState *state, int i)
+{
+    unsigned c = 0;
+    ImTextCharFromUtf8(&c, state->TextSrc + i, state->TextSrc + state->TextLen);
+    return c=='\n' ? 3 : ImCharIsBlankW(c) ? 0 : ImStb::ImCharIsSeparatorW(c) ? 1 : 2;
+}
+
+// The end of the unit holding the character before p
+static int prospero_unitend(ImGuiInputTextState *state, int unit, int p)
+{
+    char const *s   = state->TextSrc;
+    int         len = state->TextLen;
+    if (p<=0 || p>=len || s[p-1]=='\n') {
+        return p;
+    }
+    if (unit == PROSPERO_DRAG_LINE) {
+        while (p<len && s[p]!='\n') p++;
+        return p<len ? p+1 : p;
+    }
+    int cls = prospero_charclass(state, ImStb::IMSTB_TEXTEDIT_GETPREVCHARINDEX(state, p));
+    while (cls!=1 && p<len && prospero_charclass(state, p)==cls) {
+        p = ImStb::IMSTB_TEXTEDIT_GETNEXTCHARINDEX(state, p);
+    }
+    return p<len ? p : len;
+}
+
+// The start of the unit holding the character at p
+static int prospero_unitstart(ImGuiInputTextState *state, int unit, int p)
+{
+    char const *s = state->TextSrc;
+    if (p<=0 || p>=state->TextLen) {
+        return p;
+    }
+    if (unit == PROSPERO_DRAG_LINE) {
+        while (p>0 && s[p-1]!='\n') p--;
+        return p;
+    }
+    int cls = prospero_charclass(state, p);
+    while (p>0 && (cls==0 || cls==2)) {
+        int q = ImStb::IMSTB_TEXTEDIT_GETPREVCHARINDEX(state, p);
+        if (prospero_charclass(state, q) != cls) {
+            break;
+        }
+        p = q;
+    }
+    return p;
+}
+
+// The word at the place p nearest the mouse: of the characters either
+// side, the one that is a word's over a separator, over a blank. None,
+// on an empty line, is an empty word there.
+static void prospero_wordat(ImGuiInputTextState *state, int p, int *lo, int *hi)
+{
+    int len = state->TextLen;
+    int at  = -1, best = -1;
+    if (p > 0) {
+        int q   = ImStb::IMSTB_TEXTEDIT_GETPREVCHARINDEX(state, p);
+        int cls = prospero_charclass(state, q);
+        if (cls != 3) {
+            at = q, best = cls;
+        }
+    }
+    if (p < len) {
+        int cls = prospero_charclass(state, p);
+        if (cls!=3 && cls>best) {
+            at = p, best = cls;
+        }
+    }
+    if (at < 0) {
+        *lo = *hi = p;
+        return;
+    }
+    *lo = prospero_unitstart(state, PROSPERO_DRAG_WORD, at);
+    *hi = prospero_unitend(state, PROSPERO_DRAG_WORD,
+                           ImStb::IMSTB_TEXTEDIT_GETNEXTCHARINDEX(state, at));
+    if (*hi > len) *hi = len;
+}
+
+// After InputTextEx's mouse handling, in the active field, at the
+// mouse's place in its text as InputTextEx found it
+static void prospero_dragunit(ImGuiContext &g, ImGuiInputTextState *state, ImGuiID id,
+                              bool hovered, float mouse_x, float mouse_y)
+{
+    ImGuiIO            &io  = g.IO;
+    ImStbTexteditState *stb = state->Stb;
+    if (io.MouseClicked[0]) {
+        prospero_drag.unit = PROSPERO_DRAG_CHAR;
+        if (hovered && io.MouseClickedCount[0]>=2 && !io.KeyShift &&
+            !state->SelectedAllMouseLock && !(state->Flags & ImGuiInputTextFlags_Password)) {
+            prospero_drag.ctx  = &g;
+            prospero_drag.id   = id;
+            prospero_drag.unit = (io.MouseClickedCount[0] - 2)%2 ? PROSPERO_DRAG_LINE
+                                                                 : PROSPERO_DRAG_WORD;
+            if (prospero_drag.unit == PROSPERO_DRAG_WORD) {
+                int side = 0;
+                int p    = ImStb::stb_text_locate_coord(state, mouse_x,
+                                                        stb->single_line ? 0.0f : mouse_y, &side);
+                int lo, hi;
+                prospero_wordat(state, p, &lo, &hi);
+                stb->select_start = lo;
+                stb->cursor = stb->select_end = hi;
+            }
+            prospero_drag.lo = ImMin(stb->select_start, stb->select_end);
+            prospero_drag.hi = ImMax(stb->select_start, stb->select_end);
+        }
+        return;
+    }
+    if (!prospero_drag.unit || prospero_drag.ctx!=&g || prospero_drag.id!=id) {
+        return;
+    }
+    if (!io.MouseDown[0]) {
+        prospero_drag.unit = PROSPERO_DRAG_CHAR;
+        return;
+    }
+    if (io.MouseDelta.x==0 && io.MouseDelta.y==0) {
+        return;  // ImGui dragged nothing
+    }
+    int unit = prospero_drag.unit;
+    int lo   = ImMin(prospero_drag.lo, state->TextLen);
+    int hi   = ImMin(prospero_drag.hi, state->TextLen);
+    int p    = stb->cursor;
+    if (p > hi) {
+        stb->select_start = lo;
+        stb->cursor       = prospero_unitend(state, unit, p);
+    } else if (p < lo) {
+        stb->select_start = hi;
+        stb->cursor       = prospero_unitstart(state, unit, p);
+    } else {
+        stb->select_start = lo;
+        stb->cursor       = hi;
+    }
+    stb->select_end      = stb->cursor;
+    stb->has_preferred_x = 0;
 }

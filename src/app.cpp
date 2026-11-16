@@ -14515,6 +14515,7 @@ enum : i32 {
     T_SHOWNSESS,   // the shown session's row in the sidebar
     T_KIDROW,      // the sidebar row of the shown session's latest subagent
     T_TOPTEXT,     // near the transcript's top edge
+    T_PROMPTTEXT,  // the compose box's first character of text, unwrapped
     T_SESSTITLE,   // the sidebar's session whose title starts with text
     T_ADDNAME,     // the new endpoint's name field
     T_ADDBTN,      // "Add endpoint"
@@ -14783,6 +14784,7 @@ enum : i32 {
     CHK_COMPOSEQUIET,
     CHK_CMENU,        // its context menu, enabling dy of the items dx
     CHK_SELALL,
+    CHK_PROMPTSEL,    // the compose box's selection is text
     CHK_CLIPBOARD,    // the clipboard holds text
     CHK_EDITING,
     CHK_NOTEDITING,
@@ -15208,6 +15210,7 @@ static Str chknames[] = {
     "no frames once typing is done, the draft kept",
     "the box's context menu, its items enabled as they should be",
     "the box's text all selected",
+    "the box's selection is as said",
     "the clipboard holds what was cut",
     "the box is read-only, saying an editor is at work",
     "no editor at work, and the box is writable",
@@ -22464,6 +22467,32 @@ static DriveOp composeops[] = {
     SELALL,
     SHIFTPASTE,
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, "Say hello again, please. Thanks.\nline two"},
+    // A drag from a double-click selects by words, either way, and from
+    // a triple-click by lines (#70); the double-click time longer, as
+    // for the terminal's
+    {OP_CHECK, CHK_DCLICKTIME, 1, 0, 0, ""},
+    {OP_MOVE, T_PROMPTTEXT, 0, 0, 100, "hello"},
+    {OP_DOWN, 0, 0, 0, 30, ""}, {OP_UP, 0, 0, 0, 30, ""},
+    {OP_DOWN, 0, 0, 0, 100, ""},
+    {OP_CHECK, CHK_PROMPTSEL, 0, 0, 0, "hello"},
+    {OP_MOVE, T_PROMPTTEXT, 0, 0, 100, "gain"},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_PROMPTSEL, 0, 0, 0, "hello again"},
+    {OP_MOVE, T_PROMPTTEXT, 0, 0, 1200, "gain"},  // past a double-click
+    {OP_DOWN, 0, 0, 0, 30, ""}, {OP_UP, 0, 0, 0, 30, ""},
+    {OP_DOWN, 0, 0, 0, 100, ""},
+    {OP_MOVE, T_PROMPTTEXT, 0, 0, 100, "ay"},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_PROMPTSEL, 0, 0, 0, "Say hello again"},
+    {OP_MOVE, T_PROMPTTEXT, 0, 0, 1200, "ine two"},
+    {OP_DOWN, 0, 0, 0, 30, ""}, {OP_UP, 0, 0, 0, 30, ""},
+    {OP_DOWN, 0, 0, 0, 30, ""}, {OP_UP, 0, 0, 0, 30, ""},
+    {OP_DOWN, 0, 0, 0, 100, ""},
+    {OP_MOVE, T_PROMPTTEXT, 0, 0, 100, "ank"},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_PROMPTSEL, 0, 0, 0, "Say hello again, please. Thanks.\nline two"},
+    {OP_CHECK, CHK_DCLICKTIME, 0.3f, 0, 0, ""},
+    CLICK(T_PROMPT, "", 1200),
     // The editor, by Ctrl+G: read-only meanwhile, saying so, then the
     // draft as it saved it, kept at once
     CTRLG(300),
@@ -24000,6 +24029,33 @@ static ImVec2 namedpos(Gui *g, Str text)
 }
 
 static GuiSession *drivekid(Gui *, b32);
+static Str         promptstr(Gui *);
+
+// The middle of the first character of text in the compose box, as
+// drawn by lines with no wrap or scroll, so a short draft's.
+static ImVec2 prompttextat(Gui *g, Str text)
+{
+    Str  d  = promptstr(g);
+    iz   at = find(d, text);
+    Rect r  = g->rects[RECT_PROMPT];
+    if (at<0 || !text.len || r.x1<=r.x0) {
+        return v2(-1, -1);
+    }
+    iz bol  = 0;
+    i32 row = 0;
+    for (iz i = 0; i < at; i++) {
+        if (d[i] == '\n') {
+            bol = i + 1;
+            row++;
+        }
+    }
+    ImGuiStyle &st = ImGui::GetStyle();
+    f32 fs = ImGui::GetFontSize();
+    f32 x  = ImGui::CalcTextSize(d.cdata+bol, d.cdata+at).x;
+    f32 w  = ImGui::CalcTextSize(d.cdata+at, d.cdata+at+1).x;
+    return v2(r.x0 + st.FramePadding.x + x + w/2,
+              r.y0 + st.FramePadding.y + ((f32)row + 0.5f)*fs);
+}
 
 static ImVec2 targetpos(Gui *g, i32 t)
 {
@@ -24069,6 +24125,8 @@ static ImVec2 targetpos(Gui *g, i32 t)
     }
     case T_TERMTEXT:
         return termtextat(g, g->ops[g->drivepc-1].text);
+    case T_PROMPTTEXT:
+        return prompttextat(g, g->ops[g->drivepc-1].text);
     case T_TERMGRID: {
         ImRect r = g->termgrid;
         return r.Max.x>r.Min.x ? v2((r.Min.x+r.Max.x)/2, (r.Min.y+r.Max.y)/2) : v2(-1, -1);
@@ -25915,6 +25973,16 @@ static b32 composecheck(Gui *g, i32 chk, DriveOp *op)
         iz n = promptstr(g).len;
         ok = st && n>0 && st->GetSelectionStart()==0 && st->GetSelectionEnd()==n;
     } break;
+    case CHK_PROMPTSEL: {
+        ImGuiInputTextState *st = ImGui::GetInputTextState(s->draftid);
+        Str text = promptstr(g);
+        if (st) {
+            iz lo = ImMin(st->GetSelectionStart(), st->GetSelectionEnd());
+            iz hi = ImMax(st->GetSelectionStart(), st->GetSelectionEnd());
+            got = hi<=text.len ? cuthead(cuttail(text, text.len-hi), lo) : Str{};
+        }
+        ok = st && got==want;
+    } break;
     case CHK_CLIPBOARD:
         got = driveclipboard(g, want);
         ok  = got == want;
@@ -26497,6 +26565,7 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_CARET:
     case CHK_CMENU:
     case CHK_SELALL:
+    case CHK_PROMPTSEL:
     case CHK_CLIPBOARD:
     case CHK_NOTE:
     case CHK_MARK:

@@ -197,6 +197,13 @@ imgui_splice(imgui_widgets_text
   "    if (is_password && !is_displaying_hint)\n        PopPasswordFont();"
   "    if (prospero_composing)  // prospero\n        g.PlatformImeData.InputPos = prospero_imepos;\n\n"
   "InputTextEx's password font pop after the caret")
+# A double-click selects a word as the transcript's, and a drag from it
+# or a triple-click extends the selection by words or lines
+# (src/imgui_a11y.h, prospero_dragunit).
+imgui_splice(imgui_widgets_text
+  "        if (state->SelectedAllMouseLock && !io.MouseDown[0])"
+  "        prospero_dragunit(g, state, id, hovered, mouse_x, mouse_y);  // prospero\n"
+  "InputTextEx's mouse-lock release after its drag")
 # A combo box tells its label, value and state, which BeginCombo, unlike
 # other widgets, never gives ImGui's item info.
 imgui_splice(imgui_widgets_text
