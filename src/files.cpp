@@ -2366,6 +2366,7 @@ static void fileaskopen(Gui *g)
     p->title = "Open file";
     p->open  = 1;
     fieldput(p->buf, at);
+    g->fask.atend = 1;
     GuiHost *h = fileaskhost(g);
     g->fask.host   = h ? h->uid : 0;
     g->fask.statid = 0;

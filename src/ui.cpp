@@ -11293,7 +11293,9 @@ struct PathCb {
     Slice<PathPick> picks;
     Arena           scratch;   // past the picks, for pathcb and pathafter
     b32             accepted;  // Tab accepted a pick
+    b32             again;     // ...a folder, with files listed: its files are next
     b32             wsl;       // a Windows path typed becomes the distro's
+    b32             files;     // files are listed too, as Open file's
 };
 
 struct PathField {
@@ -11323,6 +11325,7 @@ static i32 pathcb(ImGuiInputTextCallbackData *d)
             d->DeleteChars(0, d->BufTextLen);
             d->InsertChars(0, t.cdata, t.cdata+t.len);
             c->accepted = 1;
+            c->again    = c->files && c->picks[pc->sel>=0 ? pc->sel : 0].dir;
         }
     } else if (d->EventFlag == ImGuiInputTextFlags_CallbackCompletion) {
         pc->tabwait = 1;  // the folder still being listed: once it comes
@@ -11367,6 +11370,7 @@ static PathField pathbefore(Gui *g, GuiHost *h, char *buf, b32 *enter, b32 off,
     f.id    = ImGui::GetID("##cwd");
     f.flags = ImGuiInputTextFlags_AutoSelectAll;
     f.cb.wsl = hostwsl(g, h);
+    f.cb.files = files;
     if (f.cb.wsl) {
         f.flags |= ImGuiInputTextFlags_CallbackEdit;  // C:\ typed is /mnt/c/
     }
@@ -11419,6 +11423,7 @@ static PathField pathbefore(Gui *g, GuiHost *h, char *buf, b32 *enter, b32 off,
         if (n) {
             pathput(&f, buf, f.cb.picks[pc->sel>=0 ? pc->sel : 0], f.cb.scratch);
             f.cb.accepted = 1;
+            f.cb.again    = files && f.cb.picks[pc->sel>=0 ? pc->sel : 0].dir;
             return f;
         }
     }
@@ -11460,7 +11465,7 @@ static void pathafter(Gui *g, PathField *f, char *buf)
 {
     PathComp *pc = &g->pc;
     if (f->cb.accepted) {
-        pc->shown = 0;
+        pc->shown = f->cb.again;  // a folder among files: its files next
         pc->sel   = -1;
         pc->accepts++;
     } else if (ImGui::IsItemEdited()) {
@@ -11621,12 +11626,32 @@ static void drawpathask(Gui *g, PathAsk *pa, char const *pid, char const *name, 
         }
         ImGui::SetNextItemWidth(560*sc);
         PathField pf = pathbefore(g, far ? far : g->main, pa->buf, &enter, 0, 1);
+        if (openfile) {
+            // Appending to the folder in it, not replacing it
+            pf.flags &= ~ImGuiInputTextFlags_AutoSelectAll;
+        }
         if (openfile && g->fask.dropped) {
             // A file dropped filled the field (droproute): shown as typed,
             // the caret at its end, for a line after it
             g->fask.dropped = 0;
             ImGuiInputTextState *st = ImGui::GetInputTextState(pf.id);
             if (st && ImGui::GetActiveID()==pf.id) {
+                st->ReloadUserBufAndMoveToEnd();
+            }
+        }
+        if (openfile && g->fask.selall) {
+            // The checklist types a whole path: over the default, as a person selects it
+            g->fask.selall = 0;
+            ImGuiInputTextState *st = ImGui::GetInputTextState(pf.id);
+            if (st) {
+                st->ReloadUserBufAndSelectAll();
+            }
+        }
+        if (openfile && g->fask.atend) {
+            // Appended to, not replaced: the caret at the end, no selection
+            ImGuiInputTextState *st = ImGui::GetInputTextState(pf.id);
+            if (st && ImGui::GetActiveID()==pf.id) {
+                g->fask.atend = 0;
                 st->ReloadUserBufAndMoveToEnd();
             }
         }

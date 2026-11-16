@@ -1265,6 +1265,8 @@ struct FileAsk {
     iz      answerlen;
     b32     stated;   // an answer came from there, for the checklist
     b32     dropped;  // a file dropped filled the field: its state to reload
+    b32     atend;    // just opened: the caret to the end, once the field is active
+    b32     selall;   // the checklist types a whole path over the field: select it first
 };
 
 enum : i64 {
@@ -28429,6 +28431,7 @@ static void drivestep(Gui *g)
         break;
     case OP_TEXTCWD:
         e.kind = GEV_TEXT;
+        g->fask.selall = g->fask.p.shown;
         e.text = g->drivecwd;  // null-terminated, from the command line
         if (op->text.len) {
             Str t = drivepath(g, &g->perm, op->text);
@@ -29065,6 +29068,7 @@ static void drivestep(Gui *g)
         break;
     case OP_TEXTRCWD:
         e.kind = GEV_TEXT;
+        g->fask.selall = g->fask.p.shown;
         e.text = g->driverwd;  // null-terminated, from the command line
         os_guiinject(g->os, &e);
         break;
