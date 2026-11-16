@@ -1,0 +1,82 @@
+# Prospero's terminal integration for zsh, which a terminal tab reads in
+# place of ~/.zshenv (ZDOTDIR points here). Each of these files runs the
+# user's own file of the same name, from their ZDOTDIR or else HOME, then
+# points ZDOTDIR back here if another file follows; the last restores
+# their ZDOTDIR and adds the hooks (finish).
+#
+# This is free and unencumbered software released into the public domain.
+
+typeset -g __prospero_dir=$ZDOTDIR __prospero_nonce=${PROSPERO_TERM_NONCE-}
+unset PROSPERO_TERM_NONCE
+if (( ${+PROSPERO_USER_ZDOTDIR} )); then
+    typeset -g __prospero_uzd=$PROSPERO_USER_ZDOTDIR __prospero_uzx=1
+    unset PROSPERO_USER_ZDOTDIR
+else
+    typeset -g __prospero_uzx=0
+fi
+
+# Into the user's ZDOTDIR, as they had it, before their file runs
+__prospero_theirs() {
+    if (( ${+__prospero_uzd} )); then
+        ZDOTDIR=$__prospero_uzd
+        if (( __prospero_uzx )); then
+            export ZDOTDIR
+        else
+            typeset +x ZDOTDIR
+        fi
+    else
+        unset ZDOTDIR
+    fi
+}
+
+# Back to ours after their file, keeping what it left: more follows
+__prospero_ours() {
+    if (( ${+ZDOTDIR} )); then
+        typeset -g __prospero_uzd=$ZDOTDIR
+        [[ ${(t)ZDOTDIR} == *export* ]] && __prospero_uzx=1 || __prospero_uzx=0
+    else
+        unset __prospero_uzd
+    fi
+    if [[ -o rcs ]]; then
+        ZDOTDIR=$__prospero_dir
+        typeset +x ZDOTDIR
+    fi
+}
+
+# The last file's end: their ZDOTDIR, and the hooks
+__prospero_finish() {
+    __prospero_theirs
+    unfunction __prospero_theirs __prospero_ours __prospero_finish
+    [[ -n $__prospero_nonce ]] || return 0
+    typeset -gi __prospero_ran=0 __prospero_seen=0
+    __prospero_mark() {
+        builtin printf '\033]133;%s;nonce=%s\007' "$1" "$__prospero_nonce"
+    }
+    __prospero_precmd() {
+        local s=$?
+        if (( __prospero_ran )); then
+            __prospero_mark "D;$s"
+        elif (( __prospero_seen )); then
+            __prospero_mark D
+        fi
+        __prospero_ran=0
+        __prospero_seen=1
+        return $s
+    }
+    __prospero_prompt() {
+        local s=$?
+        __prospero_mark A
+        return $s
+    }
+    __prospero_preexec() {
+        __prospero_ran=1
+        __prospero_mark C
+    }
+    typeset -ga precmd_functions preexec_functions
+    precmd_functions=(__prospero_precmd "${precmd_functions[@]}" __prospero_prompt)
+    preexec_functions+=(__prospero_preexec)
+}
+
+__prospero_theirs
+[[ -r ${ZDOTDIR:-$HOME}/.zshenv ]] && builtin source "${ZDOTDIR:-$HOME}/.zshenv"
+__prospero_ours

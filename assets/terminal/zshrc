@@ -1,0 +1,13 @@
+# Prospero's terminal integration for zsh: see zshenv.
+
+__prospero_theirs
+# /etc/zshrc may have put the history in our ZDOTDIR (macOS)
+if [[ ${HISTFILE-} == $__prospero_dir/.zsh_history ]]; then
+    HISTFILE=${ZDOTDIR:-$HOME}/.zsh_history
+fi
+[[ -r ${ZDOTDIR:-$HOME}/.zshrc ]] && builtin source "${ZDOTDIR:-$HOME}/.zshrc"
+if [[ -o login ]]; then
+    __prospero_ours
+else
+    __prospero_finish
+fi

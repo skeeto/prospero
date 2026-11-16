@@ -5,8 +5,10 @@
 // shell's settings, while the frontend emulates the terminal (ariel).
 // The engine is only a flow-controlled pipe of bytes between the two:
 //
-//   term.open {sid, cols, rows, xpx?, ypx?, cwd?, scrollback?, edit? | run?}
-//       replies {tid, shell, argv, cwd, editor?} before any output
+//   term.open {sid, cols, rows, xpx?, ypx?, cwd?, scrollback?,
+//              edit? | run? | shell?}
+//       replies {tid, shell, kind, nonce?, argv, cwd, editor?} before
+//       any output
 //   term.input {tid, data}            typed bytes, base64, 16 KiB at most
 //   term.resize {tid, cols, rows, xpx?, ypx?}
 //   term.ack {tid, off, resend?}      output taken up to off
@@ -116,6 +118,21 @@
 // (the session's, else pwsh, else powershell.exe) by psrunhead, and sh
 // in the session's sh or busybox.
 //
+// A tab's shell, unless edit or run, takes hooks where it is zsh or bash
+// on POSIX (alone or with -l) or PowerShell (alone or with -NoLogo), and
+// [terminal] integration is on: scripts from assets/terminal, written
+// once to <state>/terminal/hooks/HASH (termhookdir), which run the
+// shell's usual startup files and then print OSC 133 marks with the
+// tab's nonce (termmarkparse), given in PROSPERO_TERM_NONCE, which they
+// unset first. zsh reads them by ZDOTDIR (the user's own, if any, in
+// PROSPERO_USER_ZDOTDIR), bash by --init-file (PROSPERO_TERM_LOGIN=1 for
+// -l, whose files it runs itself), and PowerShell runs psmarkboot with
+// -NoProfile, hooks.ps1 named by PROSPERO_TERM_HOOKS. The reply's nonce
+// is the tab's, if hooked, and its kind the program's family (termkind:
+// sh, ps, cmd, else empty). With shell, a code block's language
+// (termrunlang), the tab runs an interactive shell of its family
+// (termrunpick), and the reply's shell names that program.
+//
 // A terminal that ends, its tab still open, keeps its slot and screen
 // (kept) for read_terminal, until term.close, a hang-up of all, or a
 // term.open finding no free slot, which takes the kept one unused
@@ -191,6 +208,9 @@ struct Term {
     iz          shelllen;
     u8          cwd[TERM_CWDCAP];
     iz          cwdlen;
+    u8          nonce[32];  // its hooks' marks', when hooked
+    b32         hooked;
+    i32         lastmark;   // the last verified mark's letter, 0 for none
 
     // A Run's (term.open's run): what ran, for labels and its notice
     b32 run;
@@ -731,6 +751,279 @@ static Str termrunfirst(Str text, i32 *lines)
     return first.len>TERM_RUNLINE ? utf8head(first, TERM_RUNLINE) : first;
 }
 
+// Shell integration: hooks that the engine puts in a tab's zsh, bash or
+// PowerShell print OSC 133 marks, each with the tab's nonce, so that a
+// mark a program prints, not knowing it, never counts:
+//
+//   ESC ] 133;A;nonce=N BEL       at each prompt
+//   ESC ] 133;C;nonce=N BEL       a command line is about to run
+//   ESC ] 133;D;CODE;nonce=N BEL  it ran, and its status
+//   ESC ] 133;D;nonce=N BEL       a prompt with nothing run before it
+
+enum : i32 {
+    HOOK_NONE,
+    HOOK_ZSH,
+    HOOK_BASH,
+    HOOK_PS,
+};
+
+// Whether ConPTY passes OSC 133 through, in order, as it does on
+// Windows 11 build 26200 (a spike's probe, 2026-11-16).
+#define TERM_HOOKWIN 1
+
+// The hooks' scripts (assets/terminal), which termhookdir writes out
+#ifdef __clang__
+#  pragma clang diagnostic push
+#  pragma clang diagnostic ignored "-Wc23-extensions"
+#endif
+static u8 const hookzshenv[] = {
+    #embed "../assets/terminal/zshenv"
+};
+static u8 const hookzprofile[] = {
+    #embed "../assets/terminal/zprofile"
+};
+static u8 const hookzshrc[] = {
+    #embed "../assets/terminal/zshrc"
+};
+static u8 const hookzlogin[] = {
+    #embed "../assets/terminal/zlogin"
+};
+static u8 const hookbashrc[] = {
+    #embed "../assets/terminal/bashrc"
+};
+static u8 const hookps1[] = {
+    #embed "../assets/terminal/hooks.ps1"
+};
+#ifdef __clang__
+#  pragma clang diagnostic pop
+#endif
+
+// How a hooked PowerShell starts (-NoProfile -NoExit -Command): it runs
+// hooks.ps1, named by PROSPERO_TERM_HOOKS, as a script block, which no
+// execution policy stops, and which loads the profiles; failing that,
+// it loads them itself.
+static char const psmarkboot[] =
+    "try{. ([ScriptBlock]::Create([IO.File]::ReadAllText($env:PROSPERO_TERM_HOOKS)))}"
+    "catch{Remove-Item Env:PROSPERO_TERM_NONCE,Env:PROSPERO_TERM_HOOKS -EA 0;"
+    "foreach($__p in $PROFILE.AllUsersAllHosts,$PROFILE.AllUsersCurrentHost,"
+    "$PROFILE.CurrentUserAllHosts,$PROFILE.CurrentUserCurrentHost)"
+    "{if($__p -and (Test-Path -LiteralPath $__p)){. $__p}}}";
+
+// A program's file name, without .exe and the like, compared as the
+// platform would.
+static b32 termprogis(Str prog, Str name, b32 win)
+{
+    Str base = termeditname(prog);
+    return win ? equalfold(base, name) : base==name;
+}
+
+// A terminal program's family, as term.open's reply gives it (kind):
+// "sh" for a POSIX shell, "ps" for PowerShell, "cmd" for cmd.exe on
+// Windows, else empty.
+static Str termkind(Slice<Str> argv, b32 win)
+{
+    if (!argv.len) {
+        return {};
+    }
+    Str shs[] = {"sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "yash"};
+    for (iz i = 0; i < countof(shs); i++) {
+        if (termprogis(argv[0], shs[i], win)) {
+            return "sh";
+        }
+    }
+    if (termprogis(argv[0], "busybox", win)) {
+        return argv.len>1 && argv[1]=="sh" ? Str("sh") : Str{};
+    } else if (termprogis(argv[0], "pwsh", win) || termprogis(argv[0], "powershell", win)) {
+        return "ps";
+    } else if (win && termprogis(argv[0], "cmd", win)) {
+        return "cmd";
+    }
+    return {};
+}
+
+// Which hooks a terminal's argv takes: zsh or bash on POSIX, alone or
+// with -l (*login), or PowerShell, alone or with -NoLogo. Any other
+// argument may change how it starts, so it gets none.
+static i32 termhookable(Slice<Str> argv, b32 win, b32 *login)
+{
+    *login = 0;
+    if (!argv.len || argv.len>2) {
+        return HOOK_NONE;
+    }
+    Str arg  = argv.len>1 ? argv[1] : Str{};
+    Str base = basename(argv[0]);
+    if (!win && (base=="zsh" || base=="bash")) {
+        if (argv.len==1 || arg=="-l") {
+            *login = argv.len > 1;
+            return base=="zsh" ? HOOK_ZSH : HOOK_BASH;
+        }
+    } else if (termprogis(argv[0], "pwsh", win) || termprogis(argv[0], "powershell", win)) {
+        b32 ok = argv.len==1 || (win ? equalfold(arg, "-NoLogo") : arg=="-NoLogo");
+        if (ok && (!win || TERM_HOOKWIN)) {
+            return HOOK_PS;
+        }
+    }
+    return HOOK_NONE;
+}
+
+struct TermMark {
+    i32 kind;     // 'A' to 'D', 0 for none
+    b32 hascode;  // D's status is given
+    i32 code;
+    b32 ok;       // its nonce is the tab's
+};
+
+// An OSC 133 mark's payload (all after "133;"), checked against a tab's
+// nonce: a field "nonce=N" must equal it, and no nonce matches none.
+static TermMark termmarkparse(Str payload, Str nonce)
+{
+    TermMark r = {};
+    if (!payload.len || payload[0]<'A' || payload[0]>'D' ||
+        (payload.len>1 && payload[1]!=';')) {
+        return r;
+    }
+    r.kind = payload[0];
+    Cut c  = cut(payload, ';');
+    for (i32 field = 0; c.ok; field++) {
+        c = cut(c.tail, ';');
+        Str f = c.head;
+        if (startswith(f, "nonce=")) {
+            r.ok |= nonce.len>0 && cuthead(f, 6)==nonce;
+        } else if (field==0 && r.kind=='D') {
+            b32 neg = f.len && f[0]=='-';
+            Str ds  = neg ? cuthead(f, 1) : f;
+            b32 num = ds.len>0 && ds.len<=10;
+            i64 v   = 0;
+            for (iz i = 0; num && i < ds.len; i++) {
+                num = digit(ds[i]);
+                v   = v*10 + (ds[i] - '0');
+            }
+            if (num) {
+                v = neg ? -v : v;
+                i64 hi = 0x7fffffff;
+                v = v<-hi-1 ? -hi-1 : v>hi ? hi : v;
+                r.hascode = 1;
+                r.code    = (i32)v;
+            }
+        }
+    }
+    return r;
+}
+
+// A program's path, by name on a PATH, else null: findprog on Windows,
+// findpathext elsewhere.
+typedef Str TermWhich(void *ctx, Arena *, Str name);
+
+// The PowerShell a terminal runs: the session's if that is its shell,
+// else pwsh, else powershell(.exe), else null.
+static Str termpsprog(Arena *a, Str shkind, Str shpath, b32 win, TermWhich *which, void *ctx)
+{
+    if ((shkind=="pwsh" || shkind=="powershell") && shpath.len) {
+        return shpath;
+    }
+    Str names[] = {win ? Str("pwsh.exe") : Str("pwsh"),
+                   win ? Str("powershell.exe") : Str("powershell")};
+    for (iz i = 0; i < countof(names); i++) {
+        Str p = which(ctx, a, names[i]);
+        if (p.len) {
+            return p;
+        }
+    }
+    return {};
+}
+
+// cmd.exe by a full path: COMSPEC if it is one, else on PATH, else null.
+static Str termcmdprog(Arena *a, Str comspec, TermWhich *which, void *ctx)
+{
+    comspec = trim(comspec);
+    return pathroot(comspec, 1) ? comspec : which(ctx, a, "cmd.exe");
+}
+
+struct TermPickAsk {
+    Str        lang;     // term.open's shell: a fence language
+    Slice<Str> dflt;     // the terminal's usual argv (termargv)
+    Str        shkind;   // the session's shell
+    Str        shpath;
+    Str        comspec;  // the environment's
+    b32        win;
+    b32        login;    // a POSIX sh as a login shell
+    TermWhich *which;
+    void      *ctx;
+};
+
+struct TermPick {
+    Slice<Str> argv;
+    Str        why;  // a refusal
+};
+
+// The interactive shell of a terminal for a block of lang (term.open's
+// shell), by family: the usual one if it is of it, else for sh the
+// block's own bash, zsh or ksh, then bash, then zsh, else /bin/sh (on
+// Windows the session's sh or busybox); for PowerShell termpsprog; for
+// cmd termcmdprog, only on Windows.
+static TermPick termrunpick(Arena *a, TermPickAsk *k)
+{
+    TermPick r    = {};
+    i32      kind = termrunlang(k->lang);
+    Str      want = kind==RUN_SH ? Str("sh") : kind==RUN_PS ? Str("ps") : Str("cmd");
+    if (!kind) {
+        r.why = "shell names no shell: sh, bash, zsh, ksh, powershell, pwsh or cmd";
+        return r;
+    } else if (kind==RUN_CMD && !k->win) {
+        r.why = "shell: cmd runs only on Windows";
+        return r;
+    } else if (termkind(k->dflt, k->win) == want) {
+        r.argv = k->dflt;
+        return r;
+    }
+    switch (kind) {
+    case RUN_SH:
+        if (k->win) {
+            if (k->shkind!="sh" && k->shkind!="busybox") {
+                r.why = concat(a, "shell: sh blocks run in this session's POSIX shell, sh "
+                                  "or busybox, and its shell is ", k->shkind);
+                return r;
+            }
+            r.argv = termshell(a, k->shkind, k->shpath, 1);
+            r.why  = r.argv.len ? Str{} : Str("shell: this session's shell has no path");
+        } else {
+            Str lang  = trim(k->lang);
+            Str names[] = {
+                equalfold(lang, "bash") ? Str("bash") : equalfold(lang, "zsh") ? Str("zsh")
+                    : equalfold(lang, "ksh") ? Str("ksh") : Str{},
+                "bash", "zsh",
+            };
+            Str prog = {};
+            for (iz i = 0; !prog.len && i < countof(names); i++) {
+                prog = names[i].len ? k->which(k->ctx, a, names[i]) : Str{};
+            }
+            r.argv = push(a, r.argv, prog.len ? prog : Str("/bin/sh"));
+            if (k->login) {
+                r.argv = push(a, r.argv, Str("-l"));
+            }
+        }
+        return r;
+    case RUN_PS: {
+        Str prog = termpsprog(a, k->shkind, k->shpath, k->win, k->which, k->ctx);
+        if (!prog.len) {
+            r.why = "shell: no PowerShell on this computer";
+            return r;
+        }
+        r.argv = push(a, r.argv, prog);
+        r.argv = push(a, r.argv, Str("-NoLogo"));
+    } return r;
+    case RUN_CMD: {
+        Str prog = termcmdprog(a, k->comspec, k->which, k->ctx);
+        if (!prog.len) {
+            r.why = "shell: cmd.exe is not on PATH";
+            return r;
+        }
+        r.argv = push(a, r.argv, prog);
+    } return r;
+    }
+    return r;
+}
+
 // A session as the walk to its terminals' owner sees it.
 struct TermNode {
     b32 found;
@@ -778,6 +1071,50 @@ static Str termrootwalk(Arena *a, Str sid, TermLook *look, void *ctx)
 static b32 termagent(Engine *e)
 {
     return cfgbool(cfgget(e->cfg, "terminal", {}, "agent", 0)) != 0;
+}
+
+// Whether tabs' shells take the hooks: [terminal] integration.
+static b32 termintegrate(Engine *e)
+{
+    return cfgbool(cfgget(e->cfg, "terminal", {}, "integration", 0)) != 0;
+}
+
+// The hooks' folder, <state>/terminal/hooks/HASH, written once for its
+// scripts' content (as skillcopy writes a skill), older ones removed.
+// Null if it cannot be had.
+static Str termhookdir(Engine *e, Arena *a)
+{
+    static struct {
+        Str        path;
+        u8 const  *data;
+        iz         len;
+    } const scripts[] = {
+        {"zsh/.zshenv", hookzshenv, countof(hookzshenv)},
+        {"zsh/.zprofile", hookzprofile, countof(hookzprofile)},
+        {"zsh/.zshrc", hookzshrc, countof(hookzshrc)},
+        {"zsh/.zlogin", hookzlogin, countof(hookzlogin)},
+        {"bashrc", hookbashrc, countof(hookbashrc)},
+        {"hooks.ps1", hookps1, countof(hookps1)},  // last: written, all are
+    };
+    Slice<SkillFile> files = {};
+    for (iz i = 0; i < countof(scripts); i++) {
+        SkillFile f = {scripts[i].path, Str{(u8 *)scripts[i].data, scripts[i].len}};
+        files = push(a, files, f);
+    }
+    Str   top  = join(a, join(a, e->statedir, "terminal"), "hooks");
+    Str   hash = skillhash(a, files);
+    Str   dir  = join(a, top, hash);
+    Arena t    = *a;
+    Str   last = join(&t, dir, "hooks.ps1");
+    if (os_stat(e->os, t, last).type == STAT_FILE) {
+        return dir;
+    }
+    b32 ok = os_mkdirs(e->os, t, top) && dirwhole(e->os, t, top, dir, files);
+    if (!ok && os_stat(e->os, t, last).type!=STAT_FILE) {
+        return {};  // not even another engine's
+    }
+    skillprune(e->os, t, top, hash);
+    return dir;
 }
 
 // For status: the screens, the output they were fed, and those kept
@@ -920,6 +1257,10 @@ static void termfeedbytes(Term *t, Str data)
             return;
         } else if (f.ev.kind==ARIEL_EV_TITLE && !f.ev.arg) {
             t->titlelen = termtitle(t->title, {f.ev.data.data, f.ev.data.len});
+        } else if (f.ev.kind==ARIEL_EV_MARK && t->hooked) {
+            TermMark m = termmarkparse({f.ev.data.data, f.ev.data.len},
+                                       {t->nonce, countof(t->nonce)});
+            t->lastmark = m.ok ? m.kind : t->lastmark;
         }
     }
 }
@@ -1236,6 +1577,25 @@ static i32 termfound(void *ctx, Arena *a, Str prog)
     return exe.len ? EDITOR_FOUND : EDITOR_MISSING;
 }
 
+// A shell's program on PATH (TermWhich): on Windows by findprog, else
+// in an absolute directory of it.
+struct TermWhere {
+    Os *os;
+    Str path;
+    b32 win;
+};
+
+static Str termwhere(void *ctx, Arena *a, Str name)
+{
+    TermWhere *w = (TermWhere *)ctx;
+    if (w->win) {
+        return findprog(w->os, a, carve(a, 1<<20), w->path, name, {}, 1);
+    }
+    Str        none[] = {{}};
+    Slice<Str> exts   = {none, 1, 1};
+    return findpathext(w->os, a, carve(a, 1<<20), w->path, name, exts, 0, 1);
+}
+
 // The editor's command line on Windows, an edit's, by cmd.exe in env:
 // the first of the window's editor, %VISUAL%, %EDITOR% and vi found on
 // PATH (editpick), its line (editorjump) with the program by its full
@@ -1323,15 +1683,12 @@ static Str termeditwin(Engine *e, Arena *a, TermEditAsk *ed, Slice<Str> env,
 static Str termrunwin(Engine *e, Arena *a, TermRunAsk *run, Shell *sh, Slice<Str> *env,
                       Slice<Str> *argv, Str *cmdline)
 {
-    Str path = envpath(*env, 1);
-    Str kind = shellkinds[sh->kind];
+    TermWhere w    = {e->os, envpath(*env, 1), 1};
+    Str       kind = shellkinds[sh->kind];
     *argv = {};
     switch (run->kind) {
     case RUN_CMD: {
-        Str comspec = trim(envget(*env, "COMSPEC", 1));
-        if (!pathroot(comspec, 1)) {
-            comspec = findprog(e->os, a, carve(a, 1<<20), path, "cmd.exe", {}, 1);
-        }
+        Str comspec = termcmdprog(a, envget(*env, "COMSPEC", 1), termwhere, &w);
         if (!comspec.len) {
             return "cannot run the command: cmd.exe is not on PATH";
         }
@@ -1346,11 +1703,7 @@ static Str termrunwin(Engine *e, Arena *a, TermRunAsk *run, Shell *sh, Slice<Str
         *env     = envset(a, *env, "NoDefaultCurrentDirectoryInExePath", "1", 1);
     } break;
     case RUN_PS: {
-        Str prog = kind=="pwsh" || kind=="powershell" ? sh->path : Str{};
-        Str exes[] = {"pwsh.exe", "powershell.exe"};
-        for (iz i = 0; !prog.len && i < countof(exes); i++) {
-            prog = findprog(e->os, a, carve(a, 1<<20), path, exes[i], {}, 1);
-        }
+        Str prog = termpsprog(a, kind, sh->path, 1, termwhere, &w);
         if (!prog.len) {
             return "cannot run the command: neither pwsh nor powershell.exe is on PATH";
         }
@@ -1400,15 +1753,22 @@ static Str termstart(Engine *e, Arena *scratch, i64 id, Json *j, Session *s, Str
     b32         win = s->te.windows;
     TermRunAsk  run = termrunask(scratch, j, win);
     TermEditAsk ed  = termeditask(j, win);
+    Json       *shj = jsonget(j, "shell");  // a fence language, for Run
+    Str         ask = jsonstr(shj);
     if (run.why.len) {
         return run.why;
     } else if (ed.why.len) {
         return ed.why;
-    } else if ((ed.on || run.on) && win!=HOST_WINDOWS) {
+    } else if (shj->type!=JSON_MISSING && (shj->type!=JSON_STRING || !ask.len)) {
+        return "shell must be a code block's language";
+    } else if (ask.len && (ed.on || run.on)) {
+        return "term.open takes one of shell, run and edit";
+    } else if ((ed.on || run.on || ask.len) && win!=HOST_WINDOWS) {
         // A container's kept subagent on Windows: Linux's paths, in a
         // folder gone, with no editor here to take them
-        return ed.on ? Str("edit: this session's files are not on this machine")
-                     : Str("run: this session's files are not on this machine");
+        return ed.on  ? Str("edit: this session's files are not on this machine") :
+               run.on ? Str("run: this session's files are not on this machine") :
+                        Str("shell: this session's files are not on this machine");
     }
 
     // In its folder, or the one asked for if it is one
@@ -1436,6 +1796,7 @@ static Str termstart(Engine *e, Arena *scratch, i64 id, Json *j, Session *s, Str
     Slice<Str> argv    = {};
     Str        cmdline = {};
     Str        editor  = {};  // the reply's, on Windows
+    Str        picked  = {};  // the program shell picked, by name
     if (run.on && win) {
         Str why = termrunwin(e, scratch, &run, &sh, &env, &argv, &cmdline);
         if (why.len) {
@@ -1480,6 +1841,27 @@ static Str termstart(Engine *e, Arena *scratch, i64 id, Json *j, Session *s, Str
         if (!argv.len) {
             return "[terminal] shell: a quote is left open";
         }
+        if (ask.len) {
+            // The block's family's interactive shell, labeled by its name
+            TermWhere   w = {e->os, envpath(env, win), win};
+            TermPickAsk k = {};
+            k.lang    = ask;
+            k.dflt    = argv;
+            k.shkind  = shellkinds[sh.kind];
+            k.shpath  = sh.path;
+            k.comspec = win ? envget(env, "COMSPEC", 1) : Str{};
+            k.win     = win;
+            k.login   = login;
+            k.which   = termwhere;
+            k.ctx     = &w;
+            TermPick p = termrunpick(scratch, &k);
+            if (p.why.len) {
+                return p.why;
+            } else if (!(p.argv[0] == argv[0])) {
+                picked = termeditname(p.argv[0]);
+            }
+            argv = p.argv;
+        }
     }
     Str term = termname(e, *scratch, win);  // a literal
     env = termenv(scratch, env, win, PTY_MAC, term);
@@ -1522,6 +1904,60 @@ static Str termstart(Engine *e, Arena *scratch, i64 id, Json *j, Session *s, Str
         env = envset(scratch, env, names[5], login ? Str("1") : Str("0"), 0);
     }
 
+    // The hooks, in a tab's zsh, bash or PowerShell as it would start,
+    // with a nonce of its own
+    Str hookvars[] = {
+        "PROSPERO_TERM_NONCE", "PROSPERO_TERM_HOOKS", "PROSPERO_TERM_LOGIN",
+        "PROSPERO_USER_ZDOTDIR",
+    };
+    for (iz i = 0; i < countof(hookvars); i++) {
+        env = envdel(scratch, env, hookvars[i], win);
+    }
+    Str kind  = ed.on || run.on ? Str{} : termkind(argv, win);
+    b32 hlog  = 0;
+    i32 hook  = ed.on || run.on || !termintegrate(e) ? (i32)HOOK_NONE
+                                                    : termhookable(argv, win, &hlog);
+    Str hdir  = hook ? termhookdir(e, scratch) : Str{};
+    Str nonce = {};
+    if (hdir.len) {
+        Buf nb(scratch, 32);
+        printhex(&nb, os_random(e->os), 16);
+        printhex(&nb, os_random(e->os), 16);
+        nonce = finish(&nb);
+        env   = envset(scratch, env, hookvars[0], nonce, win);
+        switch (hook) {
+        case HOOK_ZSH: {
+            // Its startup files are ours, each running the user's
+            Str uzd = envget(env, "ZDOTDIR", win);
+            if (uzd.len) {
+                env = envset(scratch, env, hookvars[3], uzd, win);
+            }
+            env = envset(scratch, env, "ZDOTDIR", join(scratch, hdir, "zsh"), win);
+        } break;
+        case HOOK_BASH: {
+            // Ours in place of ~/.bashrc, running a login's files
+            Slice<Str> v = {};
+            v = push(scratch, v, argv[0]);
+            v = push(scratch, v, Str("--init-file"));
+            v = push(scratch, v, join(scratch, hdir, "bashrc"));
+            argv = v;
+            if (hlog) {
+                env = envset(scratch, env, hookvars[2], Str("1"), win);
+            }
+        } break;
+        case HOOK_PS: {
+            Str        words[] = {"-NoLogo", "-NoProfile", "-NoExit", "-Command", psmarkboot};
+            Slice<Str> v       = {};
+            v = push(scratch, v, argv[0]);
+            for (iz i = 0; i < countof(words); i++) {
+                v = push(scratch, v, words[i]);
+            }
+            argv = v;
+            env  = envset(scratch, env, hookvars[1], join(scratch, hdir, "hooks.ps1"), win);
+        } break;
+        }
+    }
+
     Spawn sp   = {};
     sp.argv    = argv;
     sp.cmdline = cmdline;
@@ -1544,11 +1980,13 @@ static Str termstart(Engine *e, Arena *scratch, i64 id, Json *j, Session *s, Str
     t->proc   = p;
     t->procid = sp.id;
     t->used   = os_ticks(e->os);
-    Str label = ed.on && editor.len ? editor : sh.name;
+    Str label = ed.on && editor.len ? editor : picked.len ? picked : sh.name;
     t->shelllen = label.len<TERM_SHELLCAP ? label.len : 0;
     copybytes(t->shell, label.data, t->shelllen);
     t->cwdlen = cwd.len<TERM_CWDCAP ? cwd.len : 0;
     copybytes(t->cwd, cwd.data, t->cwdlen);
+    t->hooked = nonce.len > 0;
+    copybytes(t->nonce, nonce.data, nonce.len);
     if (run.on) {
         Str first = termrunfirst(run.text, &t->runlines);
         t->run        = 1;
@@ -1573,7 +2011,11 @@ static Str termstart(Engine *e, Arena *scratch, i64 id, Json *j, Session *s, Str
     putintkey(&w.json, "id", id);
     putintkey(&w.json, "ok", 1);
     putintkey(&w.json, "tid", t->tid);
-    putstrkey(&w.json, "shell", sh.name);
+    putstrkey(&w.json, "shell", picked.len ? picked : sh.name);
+    putstrkey(&w.json, "kind", kind);
+    if (nonce.len) {
+        putstrkey(&w.json, "nonce", nonce);
+    }
     putkey(&w.json, "argv");
     putarray(&w.json);
     for (iz i = 0; i < argv.len; i++) {

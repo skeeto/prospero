@@ -1147,6 +1147,7 @@ static void testcfgjson(Test *t)
         "terminal//scrollback=10000*\n"
         "terminal//copy_on_select=false*\n"
         "terminal//agent=true*\n"
+        "terminal//integration=true*\n"
         "desktop//offer=all*\n"
         "desktop//ask=true*\n"
         "desktop//ask_timeout=60*\n"

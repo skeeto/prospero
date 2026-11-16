@@ -1,0 +1,117 @@
+# Prospero's terminal integration for bash, which a terminal tab reads by
+# --init-file in place of ~/.bashrc. A login shell's startup files run
+# here, as bash would run them (PROSPERO_TERM_LOGIN), since a login
+# shell would not read this file; then the hooks go in, around the
+# user's PROMPT_COMMAND, by PS0 where bash has it (4.4), else a DEBUG
+# trap, or by bash-preexec's arrays where it is loaded.
+#
+# This is free and unencumbered software released into the public domain.
+
+__prospero_nonce=${PROSPERO_TERM_NONCE-}
+__prospero_login=${PROSPERO_TERM_LOGIN-}
+unset PROSPERO_TERM_NONCE PROSPERO_TERM_LOGIN
+
+if [ "$__prospero_login" = 1 ]; then
+    if [ -r /etc/profile ]; then
+        . /etc/profile
+    fi
+    if [ -r "$HOME/.bash_profile" ]; then
+        . "$HOME/.bash_profile"
+    elif [ -r "$HOME/.bash_login" ]; then
+        . "$HOME/.bash_login"
+    elif [ -r "$HOME/.profile" ]; then
+        . "$HOME/.profile"
+    fi
+    # Not a login shell to bash, which would refuse this
+    if ! declare -F logout >/dev/null; then
+        logout() { builtin exit "$@"; }
+    fi
+elif [ -r "$HOME/.bashrc" ]; then
+    . "$HOME/.bashrc"
+fi
+unset __prospero_login
+
+if [ -n "$__prospero_nonce" ]; then
+    __prospero_ran=0
+    __prospero_seen=0
+    __prospero_armed=0
+    __prospero_mark() {
+        builtin printf '\033]133;%s;nonce=%s\007' "$1" "$__prospero_nonce"
+    }
+    __prospero_precmd() {
+        local s=$?
+        if [ "$__prospero_ran" = 1 ]; then
+            __prospero_mark "D;$s"
+        elif [ "$__prospero_seen" = 1 ]; then
+            __prospero_mark D
+        fi
+        __prospero_ran=0
+        __prospero_seen=1
+        return $s
+    }
+    __prospero_preexec() {
+        __prospero_ran=1
+        __prospero_mark C
+    }
+
+    if [ -n "${bash_preexec_imported-}${__bp_imported-}" ]; then
+        # bash-preexec runs these with the command's status in $?
+        __prospero_prompt() {
+            local s=$?
+            __prospero_mark A
+            return $s
+        }
+        precmd_functions=(__prospero_precmd "${precmd_functions[@]}" __prospero_prompt)
+        preexec_functions+=(__prospero_preexec)
+    else
+        if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )); then
+            # PS0 shows once a line is read, before it runs: set ran by
+            # a subscript's side effect, in this shell, and mark C
+            __prospero_ps0='${__prospero_none[__prospero_ran=1]-}\e]133;C;nonce='$__prospero_nonce'\a'
+            PS0=${PS0-}$__prospero_ps0
+        else
+            # The first simple command after a prompt (A arms it), but
+            # not completion's, a bind -x's, nor PROMPT_COMMAND's
+            __prospero_debug() {
+                if [ "$__prospero_armed" = 1 ] && [ -z "${COMP_LINE-}" ] &&
+                   [ -z "${READLINE_POINT-}" ]; then
+                    case $BASH_COMMAND in
+                    __prospero_precmd*) __prospero_armed=0 ;;
+                    __prospero_*) ;;
+                    *) __prospero_armed=0
+                       __prospero_preexec ;;
+                    esac
+                fi
+            }
+            __prospero_trap=$(trap -p DEBUG)
+            if [ -n "$__prospero_trap" ]; then
+                # trap -- 'its command' DEBUG
+                eval "__prospero_trapof() { __prospero_trap=\$2; }; __prospero_trapof ${__prospero_trap#trap }"
+                unset -f __prospero_trapof
+                trap '__prospero_debug "$_"; '"$__prospero_trap" DEBUG
+            else
+                trap '__prospero_debug "$_"' DEBUG
+            fi
+            unset __prospero_trap
+        fi
+        __prospero_prompt() {
+            local s=$?
+            if [ -n "${__prospero_ps0-}" ]; then
+                case ${PS0-} in
+                *"$__prospero_ps0"*) ;;
+                *) PS0=${PS0-}$__prospero_ps0 ;;
+                esac
+            fi
+            __prospero_armed=1
+            __prospero_mark A
+            return $s
+        }
+        # First and last, each passing $_ on, as the user's command left it
+        if [[ "$(declare -p PROMPT_COMMAND 2>/dev/null)" == "declare -a"* ]]; then
+            PROMPT_COMMAND=('__prospero_precmd "$_"' "${PROMPT_COMMAND[@]}"
+                            '__prospero_prompt "$_"')
+        else
+            PROMPT_COMMAND='__prospero_precmd "$_"'$'\n'${PROMPT_COMMAND-}$'\n''__prospero_prompt "$_"'
+        fi
+    fi
+fi

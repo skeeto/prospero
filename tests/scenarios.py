@@ -18850,6 +18850,349 @@ def term_kept(t):
         h.close()
 
 
+def marksof(tt):
+    """The marks in a tab's output that carry its nonce, in order, each
+    without it: "A", "C", "D", "D;3"."""
+    nonce = tt.reply.get("nonce")
+    out = []
+    for m in re.finditer(rb"\x1b\]133;([^\x07\x1b]*)(?:\x07|\x1b\\)", bytes(tt.data)):
+        fields = m.group(1).decode(errors="replace").split(";")
+        if nonce and f"nonce={nonce}" in fields[1:]:
+            out.append(";".join(f for f in fields if not f.startswith("nonce=")))
+    return out
+
+
+def markline(tt, prefix, timeout=20):
+    """The next line of output starting with prefix, the marks taken out
+    (a command's output follows its C on the same line)."""
+    found = []
+
+    def has(x):
+        start = getattr(x, "mcur", 0)
+        text = re.sub(rb"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]", b"",
+                      bytes(x.data[start:]))
+        for line in text.split(b"\n")[:-1]:
+            line = line.replace(b"\r", b"").decode(errors="replace")
+            if line.startswith(prefix):
+                found.append(line)
+                x.mcur = len(x.data)
+                return True
+        return False
+    tt.pump(has, timeout, repr(prefix))
+    return found[0]
+
+
+def markwait(tt, n, timeout=20):
+    """The tab's marks, once it has n of them."""
+    tt.pump(lambda x: len(marksof(x)) >= n, timeout, f"{n} marks")
+    return marksof(tt)
+
+
+def markrun(tt, line, want, timeout=20):
+    """Type a line at the prompt; the marks it leaves, through the next
+    prompt's A, must be want."""
+    tt.pump(lambda x: marksof(x)[-1:] == ["A"], timeout, "a prompt")
+    have = len(marksof(tt))
+    tt.type(line + "\r")
+    got = markwait(tt, have + len(want), timeout)[have:]
+    tt.t.check(got == want, f"{line!r}: marks {got}, want {want}")
+
+
+def shellbin(*names):
+    """The first of these programs found, else None."""
+    for n in names:
+        p = n if n.startswith("/") else shutil.which(n)
+        if p and os.path.exists(p):
+            return p
+    return None
+
+
+def hookhome(t, name, files):
+    """A home folder of startup files, for a tab's shell."""
+    home = t.host.join(t.base, name)
+    for rel, data in files.items():
+        path = t.host.join(home, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        t.host.write(path, data)
+    return home
+
+
+def termconf(t, shell, extra=""):
+    t.host.write(t.config, (t.host.read(t.config) or "") +
+                 f"[terminal]\nshell = {shell}\n{extra}")
+
+
+def startorder(tt, prefix="user-"):
+    """The user's startup files' markers, in the order they ran."""
+    return re.findall(r"^" + prefix + r"(\w+)", bytes(tt.data).decode(errors="replace"),
+                      re.M)
+
+
+@scenario(bound=60, posix=True)
+def term_marks_zsh(t):
+    """A zsh tab runs the hooks around the user's startup files, in
+    zsh's order, login or not, from their ZDOTDIR as the environment or
+    their .zshenv sets it: marks with the tab's nonce at each prompt and
+    command, with its status; no nonce, nor our ZDOTDIR, for children."""
+    zsh = shellbin("/bin/zsh", "/usr/bin/zsh", "zsh")
+    if not zsh:
+        raise Skip("no zsh")
+    names = ["zshenv", "zprofile", "zshrc", "zlogin"]
+
+    def files(dot):
+        r = {f"{dot}/.{n}": f"echo user-{n} ZDOTDIR=${{ZDOTDIR-unset}}\n" for n in names}
+        r[f"{dot}/.zshrc"] += "PS1='p%# '\n"
+        return r
+    home = hookhome(t, "home", files("."))
+    zd = t.host.join(t.base, "zd")
+    hookhome(t, "zd", files("."))
+    termconf(t, f"{zsh} -l")
+    h = t.headless(env={"HOME": home, "ZDOTDIR": ""})
+    try:
+        sid = termsession(t, h)
+        tt = Tty(t, h, sid)
+        r = tt.reply
+        t.check(r.get("kind") == "sh", f"kind {r.get('kind')}")
+        t.check(re.fullmatch(r"[0-9a-f]{32}", r.get("nonce") or ""), f"nonce {r.get('nonce')}")
+        t.check(r.get("argv") == [zsh, "-l"], f"argv {r.get('argv')}")
+        t.check(markwait(tt, 1) == ["A"], f"marks {marksof(tt)}")
+        t.check(startorder(tt) == names, f"order {startorder(tt)}")
+        text = bytes(tt.data).decode(errors="replace")
+        t.check("ZDOTDIR=unset" in text and "terminal/hooks" not in text,
+                "the user's files see no ZDOTDIR")
+        markrun(tt, "echo hi", ["C", "D;0", "A"])
+        markrun(tt, "", ["D", "A"])
+        markrun(tt, "(exit 3)", ["C", "D;3", "A"])
+        markrun(tt, "false; true", ["C", "D;0", "A"])
+        tt.type("zsh -c 'echo child:${PROSPERO_TERM_NONCE-none}:${ZDOTDIR-unset}'\r")
+        got = markline(tt, "child:")
+        t.check(got.strip() == "child:none:unset", got)
+        tt.type("echo hist:${HISTFILE-}\r")
+        got = markline(tt, "hist:")
+        t.check("terminal/hooks" not in got, got)
+        tt.type("exit 0\r")
+        tt.ended()
+
+        # Not a login shell: .zshenv, then .zshrc
+        h.close()
+        t.host.write(t.config, t.host.read(t.config).replace(f"{zsh} -l", zsh))
+        h = t.headless(env={"HOME": home, "ZDOTDIR": ""})
+        sid = termsession(t, h)
+        tt = Tty(t, h, sid)
+        markwait(tt, 1)
+        t.check(startorder(tt) == ["zshenv", "zshrc"], f"order {startorder(tt)}")
+        markrun(tt, "true", ["C", "D;0", "A"])
+        tt.type("exit 0\r")
+        tt.ended()
+        h.close()
+
+        # The user's ZDOTDIR, from the environment: their files there,
+        # and theirs for a nested zsh
+        t.host.write(t.config, t.host.read(t.config).replace(f"shell = {zsh}", f"shell = {zsh} -l"))
+        h = t.headless(env={"HOME": home, "ZDOTDIR": zd})
+        sid = termsession(t, h)
+        tt = Tty(t, h, sid)
+        markwait(tt, 1)
+        text = bytes(tt.data).decode(errors="replace")
+        t.check(startorder(tt) == names and text.count(f"ZDOTDIR={zd}") == 4,
+                f"from ZDOTDIR: {text[:400]!r}")
+        tt.type("zsh -c 'echo nested:$ZDOTDIR'\r")
+        got = markline(tt, "nested:")
+        t.check(got.strip() == f"nested:{zd}", got)
+        markrun(tt, "true", ["C", "D;0", "A"])
+        tt.type("exit 0\r")
+        tt.ended()
+        h.close()
+
+        # ZDOTDIR set by ~/.zshenv: the rest from there
+        t.host.write(t.host.join(home, ".zshenv"),
+                     f"echo user-zshenv\nZDOTDIR={zd}\n")
+        h = t.headless(env={"HOME": home, "ZDOTDIR": ""})
+        sid = termsession(t, h)
+        tt = Tty(t, h, sid)
+        markwait(tt, 1)
+        text = bytes(tt.data).decode(errors="replace")
+        t.check(startorder(tt) == names and text.count(f"ZDOTDIR={zd}") == 3,
+                f"from .zshenv's ZDOTDIR: {text[:400]!r}")
+        tt.type("echo mine:$ZDOTDIR\r")
+        got = markline(tt, "mine:")
+        t.check(got.strip() == f"mine:{zd}", got)
+        tt.type("exit 0\r")
+        tt.ended()
+    finally:
+        h.close()
+
+
+@scenario(bound=90, posix=True)
+def term_marks_bash(t):
+    """A bash tab, each bash here (macOS's 3.2 by a DEBUG trap, 4.4 and
+    later by PS0), runs a login's startup files, then the hooks around
+    the user's PROMPT_COMMAND: one C for a line of commands, its status,
+    a bare D for an empty line, $_ kept, and logout."""
+    bashes = []
+    for b in ["/bin/bash", "/opt/homebrew/bin/bash", "/usr/local/bin/bash", "/usr/bin/bash"]:
+        if os.path.exists(b) and os.path.realpath(b) not in [os.path.realpath(x) for x in bashes]:
+            bashes.append(b)
+    if not bashes:
+        raise Skip("no bash")
+    home = hookhome(t, "home", {
+        ".bash_profile": "echo user-bash_profile\n. ~/.bashrc\n",
+        ".bashrc": "echo user-bashrc\nPS1='p$ '\nuserpc=0\n"
+                   "PROMPT_COMMAND='userpc=$((userpc+1))'\n"
+                   "export BASH_SILENCE_DEPRECATION_WARNING=1\n",
+    })
+    for i, bash in enumerate(bashes):
+        h = None
+        try:
+            t.host.write(t.config, re.sub(r"\[terminal\]\nshell = .*\n", "",
+                                          t.host.read(t.config) or ""))
+            termconf(t, f"{bash} -l")
+            h = t.headless(env={"HOME": home, "BASH_SILENCE_DEPRECATION_WARNING": "1"})
+            sid = termsession(t, h)
+            tt = Tty(t, h, sid)
+            r = tt.reply
+            t.check(r.get("kind") == "sh" and r.get("nonce"), f"{bash}: reply {r}")
+            argv = r.get("argv") or []
+            t.check(len(argv) == 3 and argv[:2] == [bash, "--init-file"] and
+                    argv[2].endswith("/bashrc"), f"{bash}: argv {argv}")
+            t.check(markwait(tt, 1) == ["A"], f"{bash}: marks {marksof(tt)}")
+            t.check(startorder(tt) == ["bash_profile", "bashrc"], f"{bash}: {startorder(tt)}")
+            tt.type("echo v=${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}\r")
+            v = markline(tt, "v=").strip()[2:]
+            ps0 = tuple(int(x) for x in v.split(".")) >= (4, 4)
+            t.note(f"{bash} {v}: {'PS0' if ps0 else 'DEBUG trap'}")
+            markwait(tt, 4)
+            markrun(tt, "echo one; echo two", ["C", "D;0", "A"])
+            markrun(tt, "", ["D", "A"])
+            markrun(tt, "false", ["C", "D;1", "A"])
+            # A subshell alone is no simple command for the DEBUG trap
+            markrun(tt, "(exit 3)", ["C", "D;3", "A"] if ps0 else ["D", "A"])
+            markrun(tt, "echo zz", ["C", "D;0", "A"])
+            tt.type('echo "last=$_ pc=$userpc"\r')
+            got = markline(tt, "last=")
+            t.check(got.startswith("last=zz pc="), f"{bash}: {got}")
+            pc = int(got.split("pc=")[1])
+            t.check(pc >= 7, f"{bash}: the user's PROMPT_COMMAND ran {pc} times")
+            tt.type('bash -c \'echo child:${PROSPERO_TERM_NONCE-none}${PROSPERO_TERM_LOGIN-}\'\r')
+            got = markline(tt, "child:")
+            t.check(got.strip() == "child:none", got)
+            tt.type("logout\r")
+            end = tt.ended()
+            t.check(end.get("code") == 0, f"{bash}: logout {end}")
+        finally:
+            if h:
+                h.close()
+
+
+@scenario(bound=60, posix=True)
+def term_marks_bashpreexec(t):
+    """With bash-preexec loaded, the hooks go in its arrays."""
+    bp = shellbin("/usr/share/bash-preexec/bash-preexec.sh",
+                  "/opt/homebrew/share/bash-preexec/bash-preexec.sh",
+                  "/opt/homebrew/etc/profile.d/bash-preexec.sh")
+    bash = shellbin("/opt/homebrew/bin/bash", "/usr/bin/bash", "/bin/bash")
+    if not bp or not bash:
+        raise Skip("no bash-preexec")
+    home = hookhome(t, "home", {".bashrc": f"PS1='p$ '\n. {bp}\n"})
+    termconf(t, bash)
+    h = t.headless(env={"HOME": home})
+    try:
+        sid = termsession(t, h)
+        tt = Tty(t, h, sid)
+        markwait(tt, 1)
+        markrun(tt, "echo one; echo two", ["C", "D;0", "A"])
+        markrun(tt, "", ["D", "A"])
+        markrun(tt, "(exit 3)", ["C", "D;3", "A"])
+        tt.type("exit 0\r")
+        tt.ended()
+    finally:
+        h.close()
+
+
+@scenario(bound=40, posix=True)
+def term_marks_off(t):
+    """No hooks for a shell with other arguments, a shell of no family
+    the hooks know, an inherited nonce, nor with [terminal] integration
+    off: no nonce in the reply, and no marks."""
+    bash = shellbin("/bin/bash", "/usr/bin/bash")
+    if not bash:
+        raise Skip("no bash")
+    home = hookhome(t, "home", {".bashrc": "PS1='p$ '\n"})
+    termconf(t, f"{bash} --norc --noprofile")
+    h = t.headless(env={"HOME": home, "PROSPERO_TERM_NONCE": "abc",
+                        "PROSPERO_TERM_LOGIN": "1"})
+    try:
+        sid = termsession(t, h)
+        tt = Tty(t, h, sid)
+        r = tt.reply
+        t.check(r.get("kind") == "sh" and "nonce" not in r, f"reply {r}")
+        tt.type("echo n=${PROSPERO_TERM_NONCE-none}${PROSPERO_TERM_LOGIN-}\r")
+        got = markline(tt, "n=")
+        t.check(got.strip() == "n=none", got)
+        t.check(b"133;" not in tt.data, "no marks")
+        tt.type("exit 0\r")
+        tt.ended()
+        h.close()
+
+        t.host.write(t.config, t.host.read(t.config).replace(
+            f"{bash} --norc --noprofile", bash) + "integration = false\n")
+        h = t.headless(env={"HOME": home})
+        sid = termsession(t, h)
+        tt = Tty(t, h, sid)
+        t.check("nonce" not in tt.reply and tt.reply.get("argv") == [bash],
+                f"integration off: {tt.reply}")
+        tt.type("echo ok\r")
+        markline(tt, "ok")
+        t.check(b"133;" not in tt.data, "no marks")
+        tt.type("exit 0\r")
+        tt.ended()
+    finally:
+        h.close()
+
+
+@scenario(bound=40, posix=True)
+def term_shell_lang(t):
+    """term.open's shell picks an interactive shell of the block's
+    family: the usual one if it is of it, else the block's own, labeled
+    by its name; refusals for a language of no shell, cmd here, and with
+    run or edit."""
+    bash = shellbin("/bin/bash", "/usr/bin/bash")
+    if not bash:
+        raise Skip("no bash")
+    home = hookhome(t, "home", {".bashrc": "PS1='p$ '\n"})
+    bindir = t.host.join(t.base, "bin")
+    os.makedirs(bindir, exist_ok=True)
+    fish = os.path.join(bindir, "fish")
+    os.symlink("/bin/cat", fish)
+    termconf(t, fish)
+    path = os.environ.get("PATH", "/usr/bin:/bin")
+    h = t.headless(env={"HOME": home, "PATH": path})
+    try:
+        sid = termsession(t, h)
+        tt = Tty(t, h, sid, shell="bash")
+        r = tt.reply
+        t.check(r.get("kind") == "sh" and os.path.basename(r["argv"][0]) == "bash" and
+                r.get("shell") == "bash" and r.get("nonce"), f"bash: {r}")
+        markwait(tt, 1)
+        h.send("term.close", tid=tt.tid, kill=True)
+        tt = Tty(t, h, sid, shell="sh")
+        t.check(os.path.basename(tt.reply["argv"][0]) in ("bash", "zsh"), f"sh: {tt.reply}")
+        h.send("term.close", tid=tt.tid, kill=True)
+        for ask, why in [("python", "names no shell"), ("cmd", "only on Windows"),
+                         ("", "must be"), (3, "must be")]:
+            r = h.call("term.open", sid=sid, cols=80, rows=24, shell=ask)
+            t.check(not r.get("ok") and why in (r.get("err") or ""), f"{ask!r}: {r}")
+        r = h.call("term.open", sid=sid, cols=80, rows=24, shell="sh",
+                   run={"text": "true", "lang": "sh"})
+        t.check(not r.get("ok") and "one of" in (r.get("err") or ""), f"with run: {r}")
+        tt = Tty(t, h, sid)
+        t.check(tt.reply.get("argv") == [fish] and tt.reply.get("kind") == "" and
+                "nonce" not in tt.reply, f"the usual: {tt.reply}")
+        h.send("term.close", tid=tt.tid, kill=True)
+    finally:
+        h.close()
+
+
 @scenario(bound=60, posix=True)
 def term_run(t):
     """term.open's run shows a code block of the agent's, dimmed, then runs

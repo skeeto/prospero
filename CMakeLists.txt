@@ -160,8 +160,9 @@ endif()
 # and Wayland, its window icon (gui_sdl.cpp), which not every compiler
 # lists as dependencies.
 file(GLOB prospero_help CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/assets/help/*.md)
+file(GLOB prospero_hooks CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/assets/terminal/*)
 set_property(SOURCE src/main_posix.cpp src/main_win32.cpp src/main_test.cpp
-  APPEND PROPERTY OBJECT_DEPENDS ${prospero_help}
+  APPEND PROPERTY OBJECT_DEPENDS ${prospero_help} ${prospero_hooks}
   ${PROJECT_SOURCE_DIR}/assets/skills/prospero/SKILL.md
   ${PROJECT_SOURCE_DIR}/assets/greeting.md
   ${PROJECT_SOURCE_DIR}/assets/prospero.ini

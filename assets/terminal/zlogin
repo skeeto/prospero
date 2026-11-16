@@ -1,0 +1,5 @@
+# Prospero's terminal integration for zsh: see zshenv.
+
+__prospero_theirs
+[[ -r ${ZDOTDIR:-$HOME}/.zlogin ]] && builtin source "${ZDOTDIR:-$HOME}/.zlogin"
+__prospero_finish

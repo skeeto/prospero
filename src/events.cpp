@@ -406,6 +406,12 @@ static Str capnames[] = {
                        // block's shell, its screen kept after it ends,
                        // and the agent told of its end by a notice
                        // "terminal" to from at its next request
+    "term.marks",      // term.open {shell: LANG}, a tab of that shell's
+                       // family; its reply's kind, and nonce where the
+                       // shell's hooks mark its prompts (OSC 133);
+                       // term.input {run: {from, key, first, lines}}, a
+                       // block typed at a prompt, whose end the agent
+                       // hears by a notice "terminal" (ptyhost.cpp)
 };
 
 static Str evname(i32 ev)

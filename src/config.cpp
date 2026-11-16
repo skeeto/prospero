@@ -827,6 +827,11 @@ static CfgKey cfgschema[] = {
      "Whether the agent may read the session's terminal tabs "
      "(read_terminal), for which the engine keeps a copy of each "
      "screen. Text typed at password prompts is hidden from it"},
+    {"terminal", "integration", CFG_BOOL, "true", {}, {}, "terminal",
+     "Whether a tab's zsh, bash or PowerShell runs Prospero's hooks, "
+     "which mark its prompts and commands, so that Run in Terminal knows "
+     "when a tab is at its prompt and the agent hears how a command it "
+     "wrote ended. Off, Run goes by the last key typed"},
 
     {"host", "idle_exit", CFG_SECONDS, "600", {}, {}, "host",
      "Seconds a host waits with no client connected and nothing running, "

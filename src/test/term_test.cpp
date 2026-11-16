@@ -632,3 +632,166 @@ static void test_termsecret(Test *t)
         expect(t, "termrootwalk unknown", termrootwalk(&s, "who", termlookrows, rows), "who");
     }
 }
+
+// A PATH of these programs, for termrunpick: '|'-separated names, each
+// found in /usr/bin, or C:/bin for an .exe.
+static Str termmarkswhich(void *ctx, Arena *a, Str name)
+{
+    Str *have = (Str *)ctx;
+    for (Cut c = {{}, *have, have->len>0}; c.ok;) {
+        c = cut(c.tail, '|');
+        if (c.head == name) {
+            return concat(a, endswith(name, ".exe") ? Str("C:/bin/") : Str("/usr/bin/"), name);
+        }
+    }
+    return {};
+}
+
+static void test_termmarks(Test *t)
+{
+    Arena *a = &t->perm;
+
+    {
+        struct {
+            Str words;
+            b32 win;
+            Str kind;
+            i32 hook;
+            b32 login;
+        } cases[] = {
+            {"/bin/zsh|-l", 0, "sh", HOOK_ZSH, 1},
+            {"/bin/zsh", 0, "sh", HOOK_ZSH, 0},
+            {"zsh", 0, "sh", HOOK_ZSH, 0},
+            {"/opt/homebrew/bin/bash|-l", 0, "sh", HOOK_BASH, 1},
+            {"/bin/bash|--norc|--noprofile", 0, "sh", HOOK_NONE, 0},
+            {"/bin/bash|-i", 0, "sh", HOOK_NONE, 0},
+            {"/bin/sh|-l", 0, "sh", HOOK_NONE, 0},
+            {"/usr/bin/dash", 0, "sh", HOOK_NONE, 0},
+            {"/usr/bin/fish", 0, "", HOOK_NONE, 0},
+            {"/usr/bin/pwsh|-NoLogo", 0, "ps", HOOK_PS, 0},
+            {"/usr/bin/pwsh|-NoProfile", 0, "ps", HOOK_NONE, 0},
+            {"C:/bin/busybox.exe|sh|-l", 1, "sh", HOOK_NONE, 0},
+            {"C:/bin/busybox.exe", 1, "", HOOK_NONE, 0},
+            {"C:/Windows/System32/WindowsPowerShell/v1.0/PowerShell.EXE|-nologo", 1, "ps",
+             TERM_HOOKWIN ? HOOK_PS : HOOK_NONE, 0},
+            {"C:/Program Files/PowerShell/7/pwsh.exe", 1, "ps",
+             TERM_HOOKWIN ? HOOK_PS : HOOK_NONE, 0},
+            {"C:/Windows/System32/cmd.exe", 1, "cmd", HOOK_NONE, 0},
+            {"C:/Program Files/Git/bin/bash.exe", 1, "sh", HOOK_NONE, 0},
+            {"/usr/bin/cmd", 0, "", HOOK_NONE, 0},
+            {"", 0, "", HOOK_NONE, 0},
+        };
+        for (iz i = 0; i < countof(cases); i++) {
+            Arena      s     = *a;
+            Slice<Str> argv  = termlist(&s, cases[i].words);
+            b32        login = 0;
+            i32        hook  = termhookable(argv, cases[i].win, &login);
+            expect(t, concat(&s, "termkind ", cases[i].words), termkind(argv, cases[i].win),
+                   cases[i].kind);
+            expect(t, concat(&s, "termhookable ", cases[i].words), istr(&s, hook),
+                   istr(&s, cases[i].hook));
+            expect(t, concat(&s, "termhookable login ", cases[i].words), istr(&s, login),
+                   istr(&s, cases[i].login));
+        }
+    }
+
+    {
+        struct {
+            Str payload;
+            Str nonce;
+            Str want;  // kind, hascode, code, ok
+        } cases[] = {
+            {"A;nonce=ab12", "ab12", "A 0 0 1"},
+            {"A;nonce=ab12", "ab13", "A 0 0 0"},
+            {"A;nonce=ab12", "", "A 0 0 0"},
+            {"A;nonce=", "", "A 0 0 0"},
+            {"A", "ab12", "A 0 0 0"},
+            {"C;nonce=x", "x", "C 0 0 1"},
+            {"D;3;nonce=x", "x", "D 1 3 1"},
+            {"D;-1073741819;nonce=x", "x", "D 1 -1073741819 1"},
+            {"D;99999999999;nonce=x", "x", "D 0 0 1"},
+            {"D;4294967295;nonce=x", "x", "D 1 2147483647 1"},
+            {"D;nonce=x", "x", "D 0 0 1"},
+            {"D;0", "x", "D 1 0 0"},
+            {"D;0;aid=1;nonce=x", "x", "D 1 0 1"},
+            {"D;x1;nonce=x", "x", "D 0 0 1"},
+            {"A;nonce=xy", "x", "A 0 0 0"},
+            {"AB;nonce=x", "x", "0 0 0 0"},
+            {"P;k=i", "x", "0 0 0 0"},
+            {"", "x", "0 0 0 0"},
+        };
+        for (iz i = 0; i < countof(cases); i++) {
+            Arena    s = *a;
+            TermMark m = termmarkparse(cases[i].payload, cases[i].nonce);
+            Buf      b(&s, 64);
+            if (m.kind) {
+                putbyte(&b, (u8)m.kind);
+            } else {
+                print(&b, "0");
+            }
+            print(&b, " ");
+            print(&b, (i64)m.hascode);
+            print(&b, " ");
+            print(&b, (i64)m.code);
+            print(&b, " ");
+            print(&b, (i64)m.ok);
+            expect(t, concat(&s, "termmarkparse ", cases[i].payload), finish(&b),
+                   cases[i].want);
+        }
+    }
+
+    {
+        struct {
+            Str lang;
+            Str dflt;
+            Str shkind;
+            Str shpath;
+            Str have;
+            b32 win;
+            b32 login;
+            Str want;  // the argv, or "why: ..."
+        } cases[] = {
+            {"bash", "/bin/zsh|-l", "sh", "/bin/zsh", "bash|zsh", 0, 1, "/bin/zsh|-l"},
+            {"sh", "/usr/bin/fish", "sh", "", "bash|zsh", 0, 1, "/usr/bin/bash|-l"},
+            {"zsh", "/usr/bin/fish", "sh", "", "bash|zsh", 0, 0, "/usr/bin/zsh"},
+            {"ksh", "/usr/bin/fish", "sh", "", "bash|zsh", 0, 0, "/usr/bin/bash"},
+            {"shell", "/usr/bin/fish", "sh", "", "zsh", 0, 0, "/usr/bin/zsh"},
+            {"sh", "/usr/bin/fish", "sh", "", "", 0, 1, "/bin/sh|-l"},
+            {"pwsh", "/bin/zsh|-l", "sh", "", "bash|pwsh", 0, 1, "/usr/bin/pwsh|-NoLogo"},
+            {"powershell", "/bin/zsh|-l", "sh", "", "bash", 0, 1,
+             "why: shell: no PowerShell on this computer"},
+            {"cmd", "/bin/zsh|-l", "sh", "", "bash", 0, 1, "why: shell: cmd runs only on Windows"},
+            {"python", "/bin/zsh|-l", "sh", "", "bash", 0, 1,
+             "why: shell names no shell: sh, bash, zsh, ksh, powershell, pwsh or cmd"},
+            {"sh", "C:/w/busybox.exe|sh|-l", "busybox", "C:/w/busybox.exe", "", 1, 0,
+             "C:/w/busybox.exe|sh|-l"},
+            {"bash", "C:/w/pwsh.exe|-NoLogo", "busybox", "C:/w/busybox.exe", "", 1, 0,
+             "C:/w/busybox.exe|sh|-l"},
+            {"sh", "C:/w/pwsh.exe|-NoLogo", "pwsh", "C:/w/pwsh.exe", "", 1, 0,
+             "why: shell: sh blocks run in this session's POSIX shell, sh or busybox, "
+             "and its shell is pwsh"},
+            {"ps1", "C:/w/busybox.exe|sh|-l", "busybox", "C:/w/busybox.exe",
+             "powershell.exe", 1, 0, "C:/bin/powershell.exe|-NoLogo"},
+            {"pwsh", "C:/w/busybox.exe|sh|-l", "busybox", "C:/w/busybox.exe",
+             "pwsh.exe|powershell.exe", 1, 0, "C:/bin/pwsh.exe|-NoLogo"},
+            {"cmd", "C:/w/busybox.exe|sh|-l", "busybox", "C:/w/busybox.exe", "cmd.exe", 1, 0,
+             "C:/Windows/system32/cmd.exe"},
+        };
+        for (iz i = 0; i < countof(cases); i++) {
+            Arena       s = *a;
+            TermPickAsk k = {};
+            k.lang    = cases[i].lang;
+            k.dflt    = termlist(&s, cases[i].dflt);
+            k.shkind  = cases[i].shkind;
+            k.shpath  = cases[i].shpath;
+            k.comspec = cases[i].win ? Str("C:/Windows/system32/cmd.exe") : Str{};
+            k.win     = cases[i].win;
+            k.login   = cases[i].login;
+            k.which   = termmarkswhich;
+            k.ctx     = &cases[i].have;
+            TermPick p   = termrunpick(&s, &k);
+            Str      got = p.why.len ? concat(&s, "why: ", p.why) : termwords(&s, p.argv);
+            expect(t, concat(&s, "termrunpick ", istr(&s, i)), got, cases[i].want);
+        }
+    }
+}

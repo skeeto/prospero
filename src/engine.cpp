@@ -10242,6 +10242,29 @@ static void skillprune(Os *os, Arena scratch, Str top, Str keep)
     }
 }
 
+// A folder of files, made whole in top under a temporary name, then
+// renamed to dir. Returns 0, leaving nothing, if it could not be.
+static b32 dirwhole(Os *os, Arena t, Str top, Str dir, Slice<SkillFile> files)
+{
+    Buf b(&t, 64);
+    print(&b, ".tmp-");
+    printhex(&b, os_random(os), 16);
+    Str tmp = join(&t, top, finish(&b));
+    b32 ok  = os_mkdirs(os, t, tmp);
+    for (iz i = 0; ok && i < files.len; i++) {
+        Str data = files[i].data;
+        Str path = join(&t, tmp, files[i].path);
+        b32 exec = startswith(data, "#!") || startswith(data, "\x7f" "ELF");
+        ok = os_mkdirs(os, t, parentdir(path)) &&
+             os_writemode(os, t, path, data, exec ? 0700 : 0600);
+    }
+    ok = ok && os_rename(os, t, tmp, dir);
+    if (!ok) {
+        os_removetree(os, t, tmp);
+    }
+    return ok;
+}
+
 // Copy a package into the session's directory, its folder for this
 // version made whole under a temporary name and then renamed, or kept if
 // it is there. Its folder, else null, with why.
@@ -10256,21 +10279,7 @@ static Str skillcopy(Session *s, Arena *a, Str name, SkillPack *p, Str *why)
     if (os_stat(os, t, md).type == STAT_FILE) {
         return dir;
     }
-    Buf b(&t, 64);
-    print(&b, ".tmp-");
-    printhex(&b, os_random(os), 16);
-    Str tmp = join(&t, top, finish(&b));
-    b32 ok  = os_mkdirs(os, t, tmp);
-    for (iz i = 0; ok && i < p->files.len; i++) {
-        Str data = p->files[i].data;
-        Str path = join(&t, tmp, p->files[i].path);
-        b32 exec = startswith(data, "#!") || startswith(data, "\x7f" "ELF");
-        ok = os_mkdirs(os, t, parentdir(path)) &&
-             os_writemode(os, t, path, data, exec ? 0700 : 0600);
-    }
-    ok = ok && os_rename(os, t, tmp, dir);
-    if (!ok) {
-        os_removetree(os, t, tmp);
+    if (!dirwhole(os, t, top, dir, p->files)) {
         *why = "its copy could not be written here";
         return {};
     }
