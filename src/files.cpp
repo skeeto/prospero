@@ -3415,9 +3415,10 @@ static void drawfiles(Gui *g)
     ImVec2      wp   = ImGui::GetWindowPos();
     ImVec2      ws   = ImGui::GetWindowSize();
     g->rects[RECT_FILESPANE] = {wp.x, wp.y, wp.x + ws.x, wp.y + ws.y};
-    g->fshown.v   = 0;
-    g->fnoteslen  = 0;
-    g->fimgshown  = 0;
+    g->fshown.v     = 0;
+    g->fnoteslen    = 0;
+    g->fnotesserial = 0;
+    g->fimgshown    = 0;
     if (!set->n) {
         g->fshowing = 0;
         filesempty(g);
@@ -3575,7 +3576,10 @@ static void drawfiles(Gui *g)
         itemnamed(g, "file path");
     }
 
-    // Notes
+    // Notes, and what they were for (drivefileready)
+    g->fnotesserial = ft->serial;
+    g->fnotesstate  = ft->state;
+    g->fnotesbody   = b;
     if (ft->state == FTAB_FAILED) {
         filenote(g, ft->err, 1);
         if (ImGui::Button("Retry")) {

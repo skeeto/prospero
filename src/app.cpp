@@ -2151,6 +2151,9 @@ struct Gui {
     FileBody          *fshowingbody; // and its body
     u8                 fnotes[256];  // the notes it showed, for the checklist
     i32                fnoteslen;
+    u32                fnotesserial; // the tab they were for, 0 if none
+    i32                fnotesstate;  // its state then (FTAB_*)
+    FileBody          *fnotesbody;   // and its body
     i32                fmarktop;     // a top line the checklist remembered
     b32                filesdrawn;   // the pane was drawn this frame
     ImGuiWindow       *fileswindow;  // its window, as last drawn, else null
@@ -24688,6 +24691,11 @@ static b32 drivefileready(Gui *g)
     if (g->fask.statid || g->fask.opening) {
         return 0;
     } else if (!ft || !g->filesdrawn || ft->state==FTAB_UNREAD || ft->state==FTAB_READING) {
+        return 0;
+    } else if (g->fnotesserial!=ft->serial || g->fnotesstate!=ft->state ||
+               g->fnotesbody!=ft->body) {
+        // Read, or failed, since the pane was drawn (a worker's answer
+        // comes between frames): its notes are still the frame before's
         return 0;
     }
     FileWatch *w    = &ft->watch;
