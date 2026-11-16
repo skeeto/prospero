@@ -858,6 +858,7 @@ int main()
     test_termmarks(&t);
     test_termrunstep(&t);
     test_termset(&t);
+    test_termrunto(&t);
     test_dbus(&t);
     test_door(&t);
     #if PROSPERO_GUI

@@ -116,6 +116,154 @@ static void termsetorder(TermSet *s, TermTab **order, i32 n)
     }
 }
 
+// Run in Terminal's rules: which tab of a set a code block may be typed
+// into, when a Run still has its tab, and when a new tab is ready for
+// the block it opened for. A tab is available when it waits at its
+// shell's prompt with nothing running: by its shell's marks where its
+// shell is hooked (ptyhost.cpp), else by what was typed last (a line
+// entered, or nothing) and the engine's busy, which it polls each
+// second. Times are µs (os_ticks).
+
+enum : i32 {
+    TERMK_OTHER,  // a shell the rules know nothing of (fish), an editor
+    TERMK_SH,     // as RUN_SH: a POSIX shell
+    TERMK_PS,     // PowerShell
+    TERMK_CMD,    // cmd.exe
+};
+
+enum : i64 {
+    TERM_HOOKWAIT = 10*1000*1000,  // for a hooked shell's first mark
+    TERM_HOLD     = 1500*1000,     // after typing: busy may not be in yet
+    TERM_RAN      = 1000*1000,     // a Run just over still has its tab
+    TERM_PENDHOOK = 100*1000,      // quiet after the first prompt's mark
+    TERM_PENDQUIET = 500*1000,     // quiet before an unhooked tab's Run
+    TERM_PENDMAX  = 15*1000*1000,  // a Run waits for its new tab no more
+};
+
+// What the rules know of a tab (term.cpp keeps it, from term.open's
+// reply, the shell's output, and what the user types).
+struct TermState {
+    b32 live;      // its shell runs, and its host takes input
+    i32 kind;      // TERMK_*
+    b32 hooked;    // its reply had a nonce
+    b32 marked;    // a mark with it came
+    i64 liveat;
+    b32 busy;      // a program has the terminal (term.busy)
+    b32 typed;     // anything typed since it went live
+    b32 typedcr;   // the last typed input ended in Enter
+    i64 typedat;
+    b32 prompted;  // a prompt's A since the last typing, and no C
+    i64 outat;     // its last output
+    b32 queued;    // a Run waits to be typed into it
+    u64 runkey;    // the last Run typed into it, else 0
+    i64 sentat;
+    i64 doneat;    // its prompt came back after that Run, else 0
+};
+
+// Whether its marks can be trusted to come: a hooked shell that marked
+// a prompt, or whose first prompt may yet.
+static b32 termhooked(TermState *st, i64 now)
+{
+    return st->hooked && (st->marked || now<st->liveat+TERM_HOOKWAIT);
+}
+
+// Whether a code block of kind may be typed into the tab now.
+static b32 termavail(TermState *st, i32 kind, i64 now)
+{
+    if (!st->live || !kind || st->kind!=kind || st->busy || st->queued) {
+        return 0;
+    } else if (termhooked(st, now)) {
+        // At a prompt, whatever the last key: a ^C there redraws it, but
+        // a quote left open (PS2) never brings an A
+        return st->prompted;
+    }
+    i64 since = st->typedat>st->liveat ? st->typedat : st->liveat;
+    return (!st->typed || st->typedcr) && now>=since+TERM_HOLD;
+}
+
+// Of a set's tabs, whose states are sts in the set's order, the one a
+// block of kind goes to: the front one if available, else the right-
+// most available; -1 if none.
+static i32 termsetpick(TermSet *s, TermState *sts, i32 kind, i64 now)
+{
+    if (s->n && termavail(&sts[s->front], kind, now)) {
+        return s->front;
+    }
+    for (i32 i = s->n-1; i >= 0; i--) {
+        if (termavail(&sts[i], kind, now)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+enum : i32 {
+    TERMHELD_NONE,
+    TERMHELD_RUNS,  // the block was typed into it and runs still
+    TERMHELD_RAN,   // it was, and its prompt just came back
+};
+
+// Whether a tab still has a block's Run (by its key): a click on its
+// Run button then shows the tab, and runs nothing again. Typing into
+// the tab since lets it go.
+static i32 termrunheld(TermState *st, u64 key, i64 now)
+{
+    if (!key || st->runkey!=key || !st->live || (st->typed && st->typedat>st->sentat)) {
+        return TERMHELD_NONE;
+    } else if (termhooked(st, now)) {
+        return !st->doneat ? TERMHELD_RUNS :
+               now<st->doneat+TERM_RAN ? TERMHELD_RAN : TERMHELD_NONE;
+    }
+    return st->busy || now<st->sentat+TERM_HOLD ? TERMHELD_RUNS : TERMHELD_NONE;
+}
+
+enum : i32 {
+    TERMPEND_WAIT,
+    TERMPEND_GO,    // type it now
+    TERMPEND_DROP,  // it waited too long, or the tab is no longer for it
+};
+
+// Whether a new tab is ready for the Run it opened for, queued at
+// pendat: at its first prompt, once its output has paused (zsh turns on
+// bracketed paste just after drawing its prompt), or, unhooked, live,
+// idle and quiet. Typing first, or the tab's end, drops it.
+static i32 termpendgo(TermState *st, b32 ended, i64 pendat, i64 now)
+{
+    if (ended || st->typed) {
+        return TERMPEND_DROP;
+    } else if (now >= pendat+TERM_PENDMAX) {
+        return TERMPEND_DROP;
+    } else if (!st->live) {
+        return TERMPEND_WAIT;
+    } else if (termhooked(st, now)) {
+        return st->prompted && now>=st->outat+TERM_PENDHOOK ? TERMPEND_GO : TERMPEND_WAIT;
+    }
+    i64 since = st->outat>st->liveat ? st->outat : st->liveat;
+    return !st->busy && now>=since+TERM_PENDQUIET ? TERMPEND_GO : TERMPEND_WAIT;
+}
+
+// The next time, after now, at which the rules may answer otherwise for
+// a tab with nothing new from its shell, else 0: for a tooltip or a
+// waiting Run to look again.
+static i64 termlookdue(TermState *st, i64 now)
+{
+    i64 at[] = {
+        st->liveat + TERM_HOOKWAIT,
+        (st->typedat>st->liveat ? st->typedat : st->liveat) + TERM_HOLD,
+        st->sentat + TERM_HOLD,
+        st->doneat ? st->doneat+TERM_RAN : 0,
+        st->outat + TERM_PENDHOOK,
+        (st->outat>st->liveat ? st->outat : st->liveat) + TERM_PENDQUIET,
+    };
+    i64 next = 0;
+    for (iz i = 0; i < countof(at); i++) {
+        if (at[i]>now && (!next || at[i]<next)) {
+            next = at[i];
+        }
+    }
+    return next;
+}
+
 // [terminal] scrollback as a tab's history lines, 0 to 100000, the
 // default for what isn't a number.
 static i32 termscrollparse(Str v)
