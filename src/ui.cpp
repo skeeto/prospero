@@ -92,6 +92,8 @@ static void axrole(Gui *, AxRole);
 static void axmenu(Gui *);
 static void axfocusable(Gui *);
 static b32  axmenuasked(Gui *, u32);
+// A text field's context menu, after the field (defined below)
+static void fieldmenu(Gui *, Arena, char const *, b32 = 0);
 static void axexpanded(Gui *, b32 open);
 // The Metrics pane's section for them
 static void axmetrics(Gui *);
@@ -2576,6 +2578,7 @@ static f32 questionform(Gui *g, GuiSession *s, ViewMsg *m, f32 width, b32 draw,
             b32 typed = ImGui::InputTextWithHint("##own", "Other: answer in your own words",
                                                  f->own[i], FIELD_MAX);
             touched |= typed;
+            fieldmenu(g, a, f->own[i]);
             if (typed && f->own[i][0]) {
                 f->other[i] = 1;
                 for (iz j = 0; j<4 && !q->multi; j++) {
@@ -2610,6 +2613,7 @@ static f32 questionform(Gui *g, GuiSession *s, ViewMsg *m, f32 width, b32 draw,
                                             f->note, FIELD_MAX);
         g->askactive |= ImGui::IsItemActive();
         itemnamed(g, "question note");
+        fieldmenu(g, a, f->note);
         ImGui::EndDisabled();
     }
     y += frame + gap;
@@ -5051,6 +5055,7 @@ static void drawfind(Gui *g, View *v, f64 scrolly, ImVec2 r0, ImVec2 r1)
                                          FIELD_MAX, ImGuiInputTextFlags_EnterReturnsTrue|
                                                     ImGuiInputTextFlags_AutoSelectAll);
     itemrect(g, RECT_FINDFIELD);
+    fieldmenu(g, a, g->findbuf);
     b32 again = ImGui::IsItemEdited() || s->v!=v;
     b32 esc   = ImGui::IsKeyPressed(ImGuiKey_Escape, false) &&
                 (ImGui::IsItemDeactivated() || held);
@@ -6129,6 +6134,7 @@ static void drawtranscript(Gui *g)
         b32 go = ImGui::InputText("##note", g->denynote, FIELD_MAX,
                                   ImGuiInputTextFlags_EnterReturnsTrue);
         axname(g, "Note for the agent");
+        fieldmenu(g, g->frame, g->denynote);
         // Opening the note, then writing it, starts the ask's clock over,
         // so its deadline cannot deny the call mid-sentence
         if (g->denytimed && (ImGui::IsWindowAppearing() || ImGui::IsItemEdited())) {
@@ -6760,6 +6766,106 @@ static void composechord(Gui *g, i32 act)
     io.AddKeyEvent(mod, false);
 }
 
+// A text field's context menu items: Undo, Redo, Cut, Copy, Paste and
+// Select all, the Prompt's and every other field's (fieldmenu). A fixed
+// field (read-only, or the Prompt while an editor has it) takes only
+// Copy and Select all. A pick waits for field id, active again, to do
+// it as its chord (fieldchord), from the selection it had: the menu
+// took the keyboard from it, and its return may select all of it.
+static void fieldmenuitems(Gui *g, Arena a, ImGuiID id, b32 fixed, b32 any)
+{
+    ImGuiInputTextState *st = ImGui::GetInputTextState(id);
+    b32 sel  = st && st->HasSelection();
+    b32 undo = st && st->Stb->undostate.undo_point>0;
+    b32 redo = st && st->Stb->undostate.redo_point<IMSTB_TEXTEDIT_UNDOSTATECOUNT;
+    b32 clip = ImGui::GetClipboardText() && *ImGui::GetClipboardText();
+    i32 act  = CM_NONE;
+    g->cmenushown = 1;
+    act = ImGui::MenuItem("Undo", cmdkey(g, &a, "Z"), false, undo && !fixed) ? CM_UNDO : act;
+    itemrect(g, RECT_CMUNDO);
+    act = ImGui::MenuItem("Redo", g->mac ? "Cmd+Shift+Z" : "Ctrl+Y", false, redo && !fixed) ? CM_REDO : act;
+    itemrect(g, RECT_CMREDO);
+    ImGui::Separator();
+    act = ImGui::MenuItem("Cut", cmdkey(g, &a, "X"), false, sel && !fixed) ? CM_CUT : act;
+    itemrect(g, RECT_CMCUT);
+    act = ImGui::MenuItem("Copy", cmdkey(g, &a, "C"), false, sel) ? CM_COPY : act;
+    itemrect(g, RECT_CMCOPY);
+    act = ImGui::MenuItem("Paste", cmdkey(g, &a, "V"), false, clip && !fixed) ? CM_PASTE : act;
+    itemrect(g, RECT_CMPASTE);
+    act = ImGui::MenuItem("Select all", cmdkey(g, &a, "A"), false, any) ? CM_SELALL : act;
+    itemrect(g, RECT_CMSELALL);
+    g->cmenustate = (undo ? 1 : 0) | (redo ? 2 : 0) | (sel ? 4 : 0) | (clip ? 8 : 0);
+    if (act) {
+        g->menuact    = act;
+        g->menuid     = id;
+        g->menuwait   = 0;
+        g->menusel[0] = st ? st->Stb->select_start : -1;
+        g->menusel[1] = st ? st->Stb->select_end : -1;
+        g->menusel[2] = st ? st->Stb->cursor : -1;
+        ImGui::ActivateItemByID(id);
+        scheddirty(&g->sched);
+    }
+}
+
+// After field id: a context menu pick waiting for it, done once it is
+// active again. The frame it comes back, its selection as the menu
+// found it, or its caret at the end if it had none.
+static void fieldchord(Gui *g, ImGuiID id)
+{
+    if (!g->menuact || g->menuid!=id) {
+        return;
+    }
+    ImGuiContext        &c  = *GImGui;
+    ImGuiInputTextState *st = ImGui::GetInputTextState(id);
+    if (c.ActiveId==id && st && c.ActiveIdIsJustActivated) {
+        i32 n = st->TextLen;
+        i32 s = g->menusel[0], e = g->menusel[1], k = g->menusel[2];
+        if (s < 0) {
+            s = e = k = n;
+        }
+        st->Stb->select_start = s<n ? s : n;
+        st->Stb->select_end   = e<n ? e : n;
+        st->Stb->cursor       = k<n ? k : n;
+        st->CursorAnimReset();
+        scheddirty(&g->sched);
+    } else if (c.ActiveId==id && st) {
+        composechord(g, g->menuact);
+        g->menuact = 0;
+    } else if (++g->menuwait > 30) {
+        g->menuact = 0;  // the field never came back
+    } else {
+        scheddirty(&g->sched);
+    }
+}
+
+// The last item, a text field holding buf, its context menu (#66): on a
+// right click in it, or as asked by the keyboard or an assistive tool
+// (uirclicked). Called after the field's other marks (axname, itemrect),
+// since the menu's items come after it.
+static void fieldmenu(Gui *g, Arena a, char const *buf, b32 fixed)
+{
+    ImGuiID id = ImGui::GetItemID();
+    if (!id) {
+        return;
+    }
+    b32 hover = ImGui::IsMouseReleased(ImGuiMouseButton_Right) &&
+                ImGui::IsMouseHoveringRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax()) &&
+                ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows) &&
+                !(GImGui->LastItemData.ItemFlags & ImGuiItemFlags_Disabled);
+    axmenu(g);
+    b32 open = hover || axmenuasked(g, id);
+    ImGui::PushOverrideID(id);
+    if (open) {
+        ImGui::OpenPopup("##fieldmenu");
+    }
+    if (ImGui::BeginPopup("##fieldmenu")) {
+        fieldmenuitems(g, a, id, fixed, buf && *buf);
+        ImGui::EndPopup();
+    }
+    ImGui::PopID();
+    fieldchord(g, id);
+}
+
 // Run a slash command typed in the box (parseslash). Sent commands
 // clear the box, keeping the text to put back if the command fails.
 static void runslash(Gui *g, GuiSession *s, Slash sl, Str text)
@@ -7256,7 +7362,6 @@ static void drawprompt(Gui *g)
     Str         waspath  = keepstr(&g->mentionpath);   // its pick, to keep
     Str         wasquery = keepstr(&g->mentionquery);  // and its query
     g->slashshown   = 0;
-    g->cmenushown   = 0;
     g->histshown    = 0;
     g->attshown     = 0;
     g->attready     = 0;
@@ -7398,16 +7503,6 @@ static void drawprompt(Gui *g)
         editing = g->edsess==s && !g->edplan;
     }
 
-    // A context menu pick, once the box is active again: as its chord
-    if (g->menuact && active && !GImGui->ActiveIdIsJustActivated) {
-        composechord(g, g->menuact);
-        g->menuact = 0;
-    } else if (g->menuact && ++g->menuwait>30) {
-        g->menuact = 0;  // the box never came back
-    } else if (g->menuact) {
-        scheddirty(&g->sched);
-    }
-
     ComposeCb cb = {};
     cb.s          = s;
     cb.v          = v;
@@ -7453,6 +7548,7 @@ static void drawprompt(Gui *g)
     b32 edited = ImGui::IsItemEdited();
     g->promptend = g->promptend==2 ? 0 : g->promptend;
     ImGui::PopID();
+    fieldchord(g, id);  // a pick from its context menu, below
     axkey(g, AXKEY_PROMPT);  // the same to a tool in every session
     axname(g, "Prompt");
     axmenu(g);  // its context menu, opened below
@@ -7615,27 +7711,7 @@ static void drawprompt(Gui *g)
         ImGui::OpenPopup("##composemenu");
     }
     if (ImGui::BeginPopup("##composemenu")) {
-        g->cmenushown = 1;
-        st = ImGui::GetInputTextState(id);
-        b32 sel  = st && st->HasSelection();
-        b32 undo = st && st->Stb->undostate.undo_point>0;
-        b32 redo = st && st->Stb->undostate.redo_point<IMSTB_TEXTEDIT_UNDOSTATECOUNT;
-        b32 clip = ImGui::GetClipboardText() && *ImGui::GetClipboardText();
-        b32 any  = draftstr(s).len > 0;
-        i32 act  = CM_NONE;
-        act = ImGui::MenuItem("Undo", cmdkey(g, &a, "Z"), false, undo && !editing) ? CM_UNDO : act;
-        itemrect(g, RECT_CMUNDO);
-        act = ImGui::MenuItem("Redo", g->mac ? "Cmd+Shift+Z" : "Ctrl+Y", false, redo && !editing) ? CM_REDO : act;
-        itemrect(g, RECT_CMREDO);
-        ImGui::Separator();
-        act = ImGui::MenuItem("Cut", cmdkey(g, &a, "X"), false, sel && !editing) ? CM_CUT : act;
-        itemrect(g, RECT_CMCUT);
-        act = ImGui::MenuItem("Copy", cmdkey(g, &a, "C"), false, sel) ? CM_COPY : act;
-        itemrect(g, RECT_CMCOPY);
-        act = ImGui::MenuItem("Paste", cmdkey(g, &a, "V"), false, clip && !editing) ? CM_PASTE : act;
-        itemrect(g, RECT_CMPASTE);
-        act = ImGui::MenuItem("Select all", cmdkey(g, &a, "A"), false, any) ? CM_SELALL : act;
-        itemrect(g, RECT_CMSELALL);
+        fieldmenuitems(g, a, id, editing, draftstr(s).len>0);
         ImGui::Separator();
         Str edwhy = editorwhy(g, s, &a);
         b32 ed    = !edwhy.len;
@@ -7646,13 +7722,7 @@ static void drawprompt(Gui *g)
         if (edwhy.len) {
             whytip(edwhy);
         }
-        g->cmenustate = (undo ? 1 : 0) | (redo ? 2 : 0) | (sel ? 4 : 0) | (clip ? 8 : 0) | (ed ? 16 : 0);
-        if (act) {
-            g->menuact  = act;
-            g->menuwait = 0;
-            ImGui::ActivateItemByID(id);
-            scheddirty(&g->sched);
-        }
+        g->cmenustate |= ed ? 16 : 0;
         ImGui::EndPopup();
     }
 
@@ -8410,6 +8480,7 @@ static void listitems(Gui *g, Arena a, GuiSession *s)
             ImGui::CloseCurrentPopup();
         }
     }
+    fieldmenu(g, a, g->modelbuf);
     filter = trim({(u8 *)g->modelbuf, (iz)__builtin_strlen(g->modelbuf)});
     if (!h->listgot) {
         ImGui::TextDisabled("Asking the endpoints for their models...");
@@ -8481,6 +8552,7 @@ static void modelpicks(Gui *g, Arena a, GuiSession *s)
             ImGui::CloseCurrentPopup();
         }
     }
+    fieldmenu(g, a, g->modelbuf);
 }
 
 // Those, then for a session on this computer's endpoints (Settings edits
@@ -10337,6 +10409,7 @@ static void drawsessdialogs(Gui *g)
                                      ImGuiInputTextFlags_AutoSelectAll);
         itemnamed(g, "name field");
         axname(g, g->nameask==NAME_RENAME ? Str("Session name") : Str("Group name"));
+        fieldmenu(g, a, g->namebuf);
         Str name = trim({(u8 *)g->namebuf, (iz)__builtin_strlen(g->namebuf)});
         ImGui::BeginDisabled(!name.len);
         b32 ok = ImGui::Button("OK", v2(120*sc, 0));
@@ -11664,6 +11737,7 @@ static void drawpathask(Gui *g, PathAsk *pa, char const *pid, char const *name, 
                                  pf.flags, pathcb, &pf.cb);
         axname(g, "Path");
         itemnamed(g, concat(&a, nm, " field"));
+        fieldmenu(g, a, pa->buf);
         if (openfile) {
             dragplace(g, DROPTO_FIELD);
         }
@@ -11738,6 +11812,7 @@ static void drawnewmodel(Gui *g, Arena a, GuiHost *host)
                            dflt.len ? cstr0(&a, concat(&a, "configured: ", dflt)) :
                            "the model's name";
         ImGui::InputTextWithHint("##model", hint, g->newmodel, FIELD_MAX);
+        fieldmenu(g, a, g->newmodel);
         g->newep[0] = 0;
         return;
     }
@@ -11799,6 +11874,7 @@ static void drawnewmodel(Gui *g, Arena a, GuiHost *host)
         }
         itemnamed(g, "model filter");
         axname(g, "Filter models");
+        fieldmenu(g, a, g->newfilter);
         Str filter = trim({(u8 *)g->newfilter, (iz)__builtin_strlen(g->newfilter)});
         if (host->listid) {
             ImGui::TextDisabled("Asking the endpoints for their models...");
@@ -11846,6 +11922,7 @@ static b32 wtfields(Gui *g, Arena a, GuiHost *host, Str cwd)
     itemnamed(g, "worktree name");
     itemtip("Its folder's name in .prospero/worktrees, and its branch's after "
                           "the prefix: lowercase letters, digits and single hyphens");
+    fieldmenu(g, a, g->wtname);
     if (!have) {
         ImGui::TextDisabled("Looking at the folder\xe2\x80\xa6");
         return 1;
@@ -11994,6 +12071,7 @@ static void drawmove(Gui *g)
     ImGui::InputText("##cwd", g->newcwd, FIELD_MAX, pf.flags, pathcb, &pf.cb);
     axname(g, "Folder");
     itemrect(g, RECT_NEWCWD);
+    fieldmenu(g, a, g->newcwd);
     pathafter(g, &pf, g->newcwd);
     ImGui::SameLine();
     b32 remote = host->kind == GH_REMOTE;
@@ -12073,6 +12151,7 @@ static b32 drawnewctr(Gui *g, Arena a, b32 *enter)
     itemnamed(g, "new image");
     itemtip("A Linux image, as the runtime names it: pulled first if "
                           "it is not here");
+    fieldmenu(g, a, g->newimage);
     Slice<Str> imgs = ctrimagelist(&a, ctrset(g, "images"));
     for (iz i = 0; i < g->ctrimgs.len; i++) {
         b32 dup = g->ctrimgs[i].len>0 && g->ctrimgs[i][0]=='<';  // <none>:<none>
@@ -12132,6 +12211,7 @@ static b32 drawnewctr(Gui *g, Arena a, b32 *enter)
     axname(g, "Folder");
     itemrect(g, RECT_NEWCWD);
     dragplace(g, DROPTO_NEWSESSION);
+    fieldmenu(g, a, g->newcwd);
     pathafter(g, &pf, g->newcwd);
     ImGui::SameLine();
     if (ImGui::Button(browse)) {
@@ -12291,6 +12371,7 @@ static void drawnew(Gui *g)
         axname(g, "Working directory");
         itemrect(g, RECT_NEWCWD);
         dragplace(g, DROPTO_NEWSESSION);  // not drawmove's: a folder starts New session
+        fieldmenu(g, a, g->newcwd);
         pathafter(g, &pf, g->newcwd);
         ImGui::SameLine();
         b32 remote = host->kind == GH_REMOTE;
@@ -12673,6 +12754,7 @@ static void drawoutput(Gui *g)
         ImGui::InputTextMultiline("##out", (char *)t.data, (size_t)t.len + 1, v2(-FLT_MIN, -FLT_MIN),
                                   ImGuiInputTextFlags_ReadOnly);
         axname(g, "Output");
+        fieldmenu(g, a, (char const *)t.data, 1);
         g->outshown = 1;
     }
     ImGui::PopFont();
@@ -13343,6 +13425,7 @@ static void drawcfgrow(Gui *g, CfgRow *r, i32 target, b32 wide)
         ImGui::InputTextMultiline("##v", r->buf, (uz)r->cap, v2(-1, h));
         axname(g, r->key);
         r->typed |= ImGui::IsItemEdited();
+        fieldmenu(g, a, r->buf);
         r->active = ImGui::IsItemActive();
         if (target >= 0) {
             itemrect(g, target);
@@ -13390,6 +13473,7 @@ static void drawcfgrow(Gui *g, CfgRow *r, i32 target, b32 wide)
         b32 enter = ImGui::InputTextWithHint("##v", hint.len ? cstr0(&a, hint) : "", r->buf, (uz)r->cap,
                                              ImGuiInputTextFlags_EnterReturnsTrue|ImGuiInputTextFlags_AutoSelectAll);
         axname(g, r->key);
+        fieldmenu(g, a, r->buf);
         // What the seconds come to, dimmed at the field's right end,
         // while there is room beside the text
         Str read = cfgrowread(&a, r);
@@ -13953,11 +14037,13 @@ static void drawcfgtemplate(Gui *g, Str model)
     f32 fw    = row ? (avail - bw - 2*st.ItemSpacing.x)/2 : -1;
     ImGui::SetNextItemWidth(fw);
     ImGui::InputTextWithHint("##tplname", "template.NAME", g->tplname, FIELD_MAX);
+    fieldmenu(g, a, g->tplname);
     if (row) {
         ImGui::SameLine();
     }
     ImGui::SetNextItemWidth(fw);
     ImGui::InputTextWithHint("##tplval", "value", g->tplval, FIELD_MAX);
+    fieldmenu(g, a, g->tplval);
     if (row) {
         ImGui::SameLine();
     }
@@ -14726,6 +14812,7 @@ static void drawcfgadd(Gui *g)
                                          ImGuiInputTextFlags_EnterReturnsTrue);
     axname(g, "Name");
     itemrect(g, RECT_ADDNAME);
+    fieldmenu(g, a, g->addname);
     if (ep) {
         // By kind (EP_*)
         static char const *kinds[] = {
@@ -14792,12 +14879,14 @@ static void drawcfgadd(Gui *g)
                              "shell; it needs /bin/sh there"
                            : "user@host, user@host:port for another port, or a "
                              "host from ~/.ssh/config");
+        fieldmenu(g, a, g->remdest);
         ImGui::SetNextItemWidth(-1);
         enter |= ImGui::InputTextWithHint("##rempath", "prospero there (optional)",
                                           g->rempath, FIELD_MAX,
                                           ImGuiInputTextFlags_EnterReturnsTrue);
         axname(g, "Path to prospero there");
         itemrect(g, RECT_ADDPATH);
+        fieldmenu(g, a, g->rempath);
     }
     if (g->adderr.len) {
         ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
@@ -15072,6 +15161,7 @@ static void drawsettings(Gui *g)
                                          ImGuiInputTextFlags_EnterReturnsTrue|
                                          ImGuiInputTextFlags_EscapeClearsAll);
     itemrect(g, RECT_CFGFIND);
+    fieldmenu(g, a, g->cfgfind);
     g->cfgfindon = ImGui::IsItemActive();
     if (ImGui::IsItemActivated() || ImGui::IsItemEdited()) {
         g->cfgfindhid = 0;
@@ -15361,6 +15451,7 @@ static void drawhelp(Gui *g)
                                          ImGuiInputTextFlags_EnterReturnsTrue|
                                          ImGuiInputTextFlags_EscapeClearsAll);
     itemnamed(g, "help search");
+    fieldmenu(g, a, g->helpfind);
     if (*g->helpfind) {
         ImVec2 mx = ImGui::GetItemRectMax();
         ImVec2 mn = ImGui::GetItemRectMin();
@@ -15934,6 +16025,7 @@ static void drawpalette(Gui *g)
                              ImGuiInputTextFlags_CallbackEdit, palcb, &cb);
     itemnamed(g, "palette query");
     axname(g, "Go to");
+    fieldmenu(g, a, p->q);
     if (cb.edited) {
         palbuild(g, 0);
         p->follow = 1;
@@ -16634,6 +16726,7 @@ static void drawlayoutdialogs(Gui *g)
                                              ImGuiInputTextFlags_EnterReturnsTrue);
         axname(g, "Layout name");
         itemnamed(g, "layout name");
+        fieldmenu(g, a, g->layoutbuf);
         Str name = trim({(u8 *)g->layoutbuf, (iz)__builtin_strlen(g->layoutbuf)});
         Str why  = docknamewhy(name);
         b32 dup  = 0;

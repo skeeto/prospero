@@ -2039,8 +2039,11 @@ struct Gui {
                                      //   the source's status, without its keys
     GuiSession        *pickmodel;  // /model's list is open for it
     GuiSession        *pickshell;  // /shell's list is open for it
-    i32                menuact;    // a context menu pick waiting for the box
+    i32                menuact;    // a context menu pick waiting for its field
+    u32                menuid;     // that field (fieldmenu)
     i32                menuwait;   // frames it has waited
+    i32                menusel[3]; // the field's selection as the menu opened:
+                                   //   start, end and cursor, or -1 for none
     i32                draftsout;  // drafts sent, not yet answered
 
     // Menu bar, toolbar and layout
@@ -2341,7 +2344,7 @@ struct Gui {
     b32                mentionhold;  // the '@' index's walk is held, not put,
                                      //   so the picker lists a folder
                                      //   (OP_MENTIONHOLD)
-    b32                cmenushown;   // the compose box's context menu drew
+    b32                cmenushown;   // a field's context menu drew (fieldmenu)
     u32                cmenustate;   // and what it enabled: 1 undo, 2 redo,
                                      // 4 cut and copy, 8 paste, 16 editor
     i32                histshown;    // the box showed history entry N/M
@@ -13843,6 +13846,7 @@ static void gui_frame(Gui *g)
     }
     uishiftpaste(g);
     ImGui::NewFrame();
+    g->cmenushown = 0;
     droproute(g);  // what was where, as NewFrame knows, before any is drawn
     dragwhere(g);  // likewise, where a drag would go
     i64 t1 = os_ticks(g->os);
@@ -18496,6 +18500,33 @@ static DriveOp settingsops[] = {
     {OP_CHECK, CHK_CFGFIND, 0, 0, 0, "ask_timeout question_timeout job_timeout "
                                       "job_timeout_max ask_timeout connect_timeout"},
     {OP_SHOT, 0, 0, 0, 300, "settings-find"},
+    // Its context menu, as the Prompt's (#66): no text on the
+    // clipboard, so no Paste, and nothing selected; Select all, then
+    // Cut empties it, and Paste puts it back
+    {OP_CLIPPNG, 0, 8, 8, 100, ""},
+    {OP_MOVE, T_CFGFIND, 0, 0, 100, ""},
+    {OP_RDOWN, 0, 0, 0, 60, ""}, {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_CMENU, 1|4|8, 1, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "settings-find-menu"},
+    {OP_MOVE, T_CMSELALL, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""}, {OP_UP, 0, 0, 0, 100, ""},
+    {OP_WAIT, W_PICKED, 0, 0, 5000, ""},
+    {OP_MOVE, T_CFGFIND, 0, 0, 100, ""},
+    {OP_RDOWN, 0, 0, 0, 60, ""}, {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_CMENU, 4, 4, 0, ""},
+    {OP_MOVE, T_CMCUT, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""}, {OP_UP, 0, 0, 0, 100, ""},
+    {OP_WAIT, W_PICKED, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_CFGFIND, 0, 0, 0, ""},
+    {OP_CHECK, CHK_CLIPBOARD, 0, 0, 0, "timeout"},
+    {OP_MOVE, T_CFGFIND, 0, 0, 100, ""},
+    {OP_RDOWN, 0, 0, 0, 60, ""}, {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_CMPASTE, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""}, {OP_UP, 0, 0, 0, 100, ""},
+    {OP_WAIT, W_PICKED, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_CFGFIND, 0, 0, 0, "ask_timeout question_timeout job_timeout "
+                                      "job_timeout_max ask_timeout connect_timeout"},
+    {OP_CLIPBACK, 0, 0, 0, 100, ""},
     {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
     {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
     {OP_TEXT, 0, 0, 0, 500, "silence"},  // in a description only
@@ -18541,6 +18572,26 @@ static DriveOp settingsops[] = {
     {OP_UP, 0, 0, 0, 200, ""},
     {OP_TEXT, 0, 0, 0, 300, "90m"},
     {OP_CHECK, CHK_CFGREAD, 0, 0, 0, "endpoint fake idle_timeout=1 h 30 min"},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_CHECK, CHK_CFGVAL, 0, 0, 0, "endpoint fake idle_timeout=10"},
+    // Its menu's Copy takes what was selected, "1" of "10", not the
+    // whole that coming back to the field would select
+    {OP_CLIPPNG, 0, 8, 8, 100, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "cfg endpoint fake idle_timeout"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 200, ""},
+    {OP_KEYDOWN, 0, GKEY_SHIFT, KEY_SHIFT, 50, ""},
+    {OP_KEYDOWN, 0, GKEY_LEFT, KEY_SHIFT, 50, ""},
+    {OP_KEYUP, 0, GKEY_LEFT, KEY_SHIFT, 50, ""},
+    {OP_KEYUP, 0, GKEY_SHIFT, 0, 200, ""},
+    {OP_RDOWN, 0, 0, 0, 60, ""}, {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_CMENU, 4, 4, 0, ""},
+    {OP_MOVE, T_CMCOPY, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""}, {OP_UP, 0, 0, 0, 100, ""},
+    {OP_WAIT, W_PICKED, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_CLIPBOARD, 0, 0, 0, "1"},
+    {OP_CLIPBACK, 0, 0, 0, 100, ""},
     {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
     {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
     {OP_CHECK, CHK_CFGVAL, 0, 0, 0, "endpoint fake idle_timeout=10"},
@@ -21261,6 +21312,11 @@ static DriveOp termops[] = {
     {OP_A11Y, 0, 0, 0, 0, "pending 0"},
     {OP_A11Y, 0, 0, 0, 0, "focus group Terminal"},
     {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    // and its context menu, which gives the grid the keyboard back
+    {OP_A11Y, 0, 0, 0, 300, "menu group Terminal"},
+    {OP_A11Y, 0, 0, 0, 0, "has menuitem Select all"},
+    TERMKEY(GKEY_ESCAPE, 300),
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
     CTRLKEY(GKEY_GRAVE, 500),
     {OP_CHECK, CHK_NEWTYPED, 0, 0, 0, ""},
     CTRLKEY(GKEY_GRAVE, 500),
@@ -21289,7 +21345,7 @@ static DriveOp termops[] = {
     {OP_A11Y, 0, 0, 0, 300, "nav group Terminal"},
     TERMKEY(GKEY_ENTER, 300),
     {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
-    {OP_A11Y, 0, 0, 0, 0, "can focus group Terminal"},
+    {OP_A11Y, 0, 0, 0, 0, "can focus,menu group Terminal"},
     {OP_TEXT, 0, 0, 0, 100, "X"},
     TERMKEY(GKEY_ENTER, 100),
     {OP_WAIT, W_TERM, 0, 0, 5000, "\nnav42X"},
@@ -21467,6 +21523,41 @@ static DriveOp termops[] = {
     TERMPASTE(300),
     TERMKEY(GKEY_ENTER, 100),
     {OP_WAIT, W_TERM, 0, 0, 5000, "\npasted:pick selword here"},
+    // The same by its context menu (#66), the grid keyed again once it
+    // closes: Copy, Paste, and Select all
+    {OP_MOVE, T_TERMTEXT, 2, 0, 1200, "selword here"},  // past a double-click
+    {OP_DOWN, 0, 0, 0, 30, ""}, {OP_UP, 0, 0, 0, 30, ""},
+    {OP_DOWN, 0, 0, 0, 30, ""}, {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_TERMSEL, 0, 0, 0, "selword"},
+    {OP_MOVE, T_TERMGRID, 0, 0, 100, ""},
+    {OP_RDOWN, 0, 0, 0, 60, ""}, {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_CMENU, 4|8, 4|8, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "terminal-menu"},
+    {OP_MOVE, T_CMCOPY, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""}, {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_CLIPBOARD, 0, 0, 0, "selword"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 100, "echo menu:"},
+    {OP_MOVE, T_TERMGRID, 0, 0, 100, ""},
+    {OP_RDOWN, 0, 0, 0, 60, ""}, {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_CMENU, 8, 8, 0, ""},
+    {OP_MOVE, T_CMPASTE, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""}, {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\nmenu:selword"},
+    {OP_MOVE, T_TERMGRID, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 30, ""}, {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_TERMSEL, 0, 0, 1200, ""},
+    {OP_RDOWN, 0, 0, 0, 60, ""}, {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_CMENU, 4, 0, 0, ""},
+    {OP_MOVE, T_CMSELALL, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""}, {OP_UP, 0, 0, 0, 300, ""},
+    {OP_MOVE, T_TERMGRID, 0, 0, 100, ""},
+    {OP_RDOWN, 0, 0, 0, 60, ""}, {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_CMENU, 4, 4, 0, ""},
+    TERMKEY(GKEY_ESCAPE, 300),
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
     // Lines selected, by a triple-click and a Shift+click, and pasted
     // where they aren't taken as a paste (cat's), ask first
     {OP_TEXT, 0, 0, 0, 100, "printf 'echo l1\\necho l2\\n'"},

@@ -82,6 +82,8 @@ struct TermTab {
     b32         busy;      // a program runs in the shell
     b32         selecting; // the left button drags a local selection
     b32         copyc;     // C, held since Ctrl+C copied (Windows)
+    b32         menuopen;  // its context menu drew (termmenu)
+    b32         refocus;   // and closed: the grid takes the keyboard back
     i32         histlines; // its history, as [terminal] scrollback said
     Palette    *pal;       // the colors given ariel
     i32         code;      // the end's exit code, or -1
@@ -1733,6 +1735,60 @@ static void termmouse(Gui *g, TermTab *tt, TermMetrics *m, ImVec2 pos, ImGuiID i
     }
 }
 
+// The grid's context menu (#66): Copy, Paste and Select all, whose
+// keys off macOS are not a text field's. On a right click the program
+// doesn't take (no mouse mode, or Shift held, which keeps the mouse
+// local as termmouse does), or as an assistive tool asks. Its picks act
+// at once, Paste as its keys do (termpaste, which may ask first). The
+// grid has the keyboard back as it closes, but for a click elsewhere.
+static void termmenu(Gui *g, TermTab *tt, ImGuiID id, b32 hovered, Arena a)
+{
+    ImGuiIO    &io   = ImGui::GetIO();
+    ariel_Modes mo   = ariel_modes(tt->t);
+    b32         live = tt->state == TT_LIVE;
+    b32         rep  = live && mo.mouse && !io.KeyShift;
+    // a11y: a tool asks for it by axmenuasked (axmenu marks the grid)
+    b32         open = (hovered && !rep && ImGui::IsMouseReleased(ImGuiMouseButton_Right)) ||
+                       axmenuasked(g, id);
+    ImGui::PushOverrideID(id);
+    if (open) {
+        ImGui::OpenPopup("##termmenu");
+    }
+    b32 shown = ImGui::BeginPopup("##termmenu");
+    if (shown) {
+        b32 sel  = termselected(tt);
+        b32 clip = live && ImGui::GetClipboardText() && *ImGui::GetClipboardText();
+        g->cmenushown = 1;
+        g->cmenustate = (sel ? 4 : 0) | (clip ? 8 : 0);
+        if (ImGui::MenuItem("Copy", g->mac ? "Cmd+C" : "Ctrl+Shift+C", false, sel)) {
+            termcopy(g, tt);
+        }
+        itemrect(g, RECT_CMCOPY);
+        if (ImGui::MenuItem("Paste", g->mac ? "Cmd+V" : "Ctrl+Shift+V", false, clip)) {
+            termpaste(g, tt, a);
+        }
+        itemrect(g, RECT_CMPASTE);
+        if (ImGui::MenuItem("Select all")) {
+            ariel_select(tt->t, ARIEL_SEL_ALL, 0, 0);
+            if (g->termcopysel) {
+                termcopy(g, tt);
+            }
+        }
+        itemrect(g, RECT_CMSELALL);
+        ImGui::EndPopup();
+    }
+    ImGui::PopID();
+    // a11y: no control: only whether a click closed the menu, so the
+    // grid doesn't take the keyboard back from where it went
+    b32 elsewhere = ImGui::IsMouseClicked(0) || ImGui::IsMouseClicked(1) ||
+                    ImGui::IsMouseClicked(2);
+    if (tt->menuopen && !shown) {
+        tt->refocus = live && !elsewhere;
+        scheddirty(&g->sched);
+    }
+    tt->menuopen = shown;
+}
+
 // Whether the key event at i in the trail typed text: a character comes
 // after it, before another key goes down. The character may wait in the
 // queue for the next frame: ImGui trickles text that follows a modifier
@@ -2404,6 +2460,7 @@ static void drawterm(Gui *g)
     axname(g, "Terminal");
     axrole(g, AX_GROUP);  // no field: its text model is to come
     axfocusable(g);
+    axmenu(g);  // termmenu
     // History's scrollbar, over the grid's right edge, taking no column:
     // the grid hovers apart from it
     ariel_View view  = ariel_view(tt->t);
@@ -2427,8 +2484,10 @@ static void drawterm(Gui *g)
                 !ImGui::IsKeyDown(ImGuiKey_Space);
     // Focused so, or by a click off the scrollbar (a11y: not uiclicked,
     // which takes that in)
-    if (g->termfocus || (g->termnavgo && keyup) || (hovered && ImGui::IsMouseClicked(0))) {
+    if (g->termfocus || tt->refocus || (g->termnavgo && keyup) ||
+            (hovered && ImGui::IsMouseClicked(0))) {
         g->termfocus = 0;
+        tt->refocus  = 0;
         g->termnavgo = 0;
         ImGui::SetActiveID(id, win);
         ImGui::SetFocusID(id, win);
@@ -2494,6 +2553,7 @@ static void drawterm(Gui *g)
     g->termverts = dl->VtxBuffer.Size;
     if (tt->state==TT_LIVE || tt->state==TT_ENDED) {
         termmouse(g, tt, &m, pos, id, hovered);
+        termmenu(g, tt, id, hovered, a);
     }
 
     if (active) {

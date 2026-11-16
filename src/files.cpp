@@ -3179,6 +3179,7 @@ static void filelinebar(Gui *g, FileTab *ft, FileBody *b, ImVec2 r0, ImVec2 r1,
                                          ImGuiInputTextFlags_AutoSelectAll);
     axname(g, "Go to line");
     itemnamed(g, "file line field");
+    fieldmenu(g, a, fb->line);
     if (ImGui::IsItemEdited()) {
         fb->bad = 0;
     }
@@ -3294,6 +3295,7 @@ static void filefindbar(Gui *g, FileTab *ft, FileBody *b, ImVec2 r0, ImVec2 r1)
                                          ImGuiInputTextFlags_AutoSelectAll);
     axname(g, "Find in the file");
     itemnamed(g, "file find field");
+    fieldmenu(g, a, fb->q);
     b32 edited = ImGui::IsItemEdited();
     esc |= ImGui::IsKeyPressed(ImGuiKey_Escape, false) && (ImGui::IsItemDeactivated() || held);
     fb->active = ImGui::IsItemActive();
