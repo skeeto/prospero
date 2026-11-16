@@ -247,6 +247,7 @@ enum : i32 {
     RECT_CUTUNDO,    // the rewound conversation's Undo
     RECT_CUTFILES,   // the rewind confirmation's files checkbox
     RECT_INFOBTN,    // the session's Info
+    RECT_PERMSBTN,   // the session bar's Permissions
     RECT_COMPACTHDR, // the latest compaction card's header
     RECT_THINKHDR,   // the latest reasoning's header drawn
     RECT_RAIL,       // the latest fold rail drawn
@@ -1015,6 +1016,48 @@ struct Changes {
     byte            *base;
 };
 
+// A row of the Permissions pane (onperms): a "root" of the workspace (why from where), a "path"
+// granted or denied (access read, write or deny, or none, turned off
+// here), and the other kinds: "desktop" (name, a class), "mcp" (name, a
+// server, or an older grant's tool or project key), "web" (name search,
+// or fetch with host) and "image".
+struct PermRow {
+    Str kind;
+    Str name;
+    Str host;
+    Str access;
+    Str why;
+    b32 on;
+    b32 pane;    // given in the pane
+    b32 config;  // a write grant on a configuration file
+    b32 holds;   // a folder holding configuration files, which still ask
+};
+
+// The Permissions pane's: see onperms.
+struct Perms {
+    GuiSession    *s;        // whose these are, else none yet
+    i64            id;       // the grants in flight, else 0
+    i64            sending;  // a grant in flight, else 0
+    u32            rev;      // the view's permrev, and the configuration's
+    i64            cfgrev;   // rev, when asked
+    b32            stale;    // to ask again, a change sent
+    Str            err;      // why there are none
+    Slice<PermRow> rows;
+    b32            desktop;  // what may be granted: the desktop tool,
+    b32            search;   // web search, web fetch, and containers
+    b32            fetch;
+    b32            containers;
+    Slice<Str>     mcp;      // the session's MCP servers
+    Slice<Str>     images;   // [container] images
+    Arena          mem;
+    byte          *base;
+    char           add[1024];  // the add row's path, and its access:
+    i32            addas;      // 0 read, 1 write, 2 deny
+    char           host[256];  // a fetch host to add
+    char           image[256]; // an image to add
+    char           fail[512];  // why the latest change was refused
+};
+
 // A folder probed for a worktree session (guiwtprobe): whether one can
 // start there, from what, and a name the engine suggests.
 struct WtProbe {
@@ -1762,6 +1805,8 @@ struct Gui {
     i64                planreads;  // its replies, for the checklist
     b32                planreadhold; // the checklist's: it waits to ask
     Changes            changes;    // the Changes pane's
+    Perms              perms;      // the Permissions pane's
+    b32                permsshown; // and whether it drew this frame
     i32                helppage;   // the Help window's topic (HELP_*)
     DocView           *helpdoc;    // and its page, null until first shown
     DocView           *diagdoc;    // Settings' diagnostics, null until shown
@@ -6503,6 +6548,7 @@ static void onimport(Gui *, GuiHost *, Arena, Request *, EvRec *);
 enum : iz {
     CHANGES_MEM  = (iz)1<<24,  // the pane's reservation
     CHANGES_ROWS = 1<<14,      // the most files it lists
+    PERMS_MEM    = (iz)1<<22,  // the Permissions pane's reservation
 };
 
 static void gitstale(Gui *g, GuiSession *s)
@@ -6608,6 +6654,183 @@ static void ongit(Gui *g, GuiSession *s, i64 id, Json *j, b32 ok)
         w->statusat = gitstatusat(w->sent, jsonint(jsonget(st, "ms"), 0), good);
         gitchanges(g, s, st);
     }
+}
+
+// The Permissions pane's (grants and grant)
+//
+// The permissions of the session shown, as its latest grants reply gave
+// them (onperms), in a reservation of their own emptied for each reply,
+// asked for again as its view's permrev moves (a grant, revoke, deny or
+// prefix record), as the configuration does, and after each change sent.
+// Rows turned off here stay listed, off, while the pane shows the same
+// session, so that an undo is a click.
+
+static b32 permsame(PermRow *a, PermRow *b)
+{
+    return a->kind==b->kind && a->name==b->name && a->host==b->host;
+}
+
+static void onperms(Gui *g, GuiSession *s, Json *j, b32 ok, Str err)
+{
+    Perms *p = &g->perms;
+    if (!p->base) {
+        p->mem  = newarena(os_reserve(g->os, PERMS_MEM));
+        p->base = p->mem.beg;
+    }
+    // The rows turned off here, which stay while it is the same session
+    Arena          t   = newarena(g->cmdr);
+    Slice<PermRow> old = {};
+    for (iz i = 0; p->s==s && i < p->rows.len; i++) {
+        PermRow r = p->rows[i];
+        if (r.kind!="root" && r.kind!="desktop" && r.kind!="mcp" && r.name!="search") {
+            r.kind   = clone(&t, r.kind);
+            r.name   = clone(&t, r.name);
+            r.host   = clone(&t, r.host);
+            r.access = {};
+            r.why    = {};
+            r.on     = 0;
+            r.config = r.holds = 0;
+            old = push(&t, old, r);
+        }
+    }
+    p->mem.beg = p->base;
+    Arena *m = &p->mem;
+    p->s     = s;
+    p->rows  = {};
+    p->mcp   = {};
+    p->images = {};
+    p->err   = ok ? Str{} : clone(m, err.len ? err : Str("cannot list the permissions"));
+    if (!ok) {
+        return;
+    }
+    for (Json *k = jsonget(j, "roots")->child; k; k = k->next) {
+        PermRow r = {};
+        r.kind   = "root";
+        r.name   = clone(m, jsonstr(jsonget(k, "path")));
+        r.access = clone(m, jsonstr(jsonget(k, "access")));
+        r.why    = clone(m, jsonstr(jsonget(k, "why")));
+        r.on     = 1;
+        p->rows  = push(m, p->rows, r);
+    }
+    for (Json *k = jsonget(j, "grants")->child; k; k = k->next) {
+        PermRow r = {};
+        Str     d = jsonstr(jsonget(k, "desktop"));
+        Str     c = jsonstr(jsonget(k, "mcp"));
+        Str     w = jsonstr(jsonget(k, "web"));
+        Str     i = jsonstr(jsonget(k, "image"));
+        r.kind = d.len ? Str("desktop") : c.len ? Str("mcp") : w.len ? Str("web") :
+                 i.len ? Str("image") : Str("path");
+        r.name = clone(m, d.len ? d : c.len ? c : w.len ? w : i.len ? i :
+                          jsonstr(jsonget(k, "path")));
+        r.host   = r.kind=="web" ? clone(m, jsonstr(jsonget(k, "host"))) : Str{};
+        r.access = clone(m, jsonstr(jsonget(k, "access")));
+        r.on     = 1;
+        r.pane   = jsonint(jsonget(k, "pane"), 0) != 0;
+        r.config = jsonint(jsonget(k, "config"), 0) != 0;
+        r.holds  = jsonint(jsonget(k, "holds_config"), 0) != 0;
+        // A path both read and written by two grants is one row, written
+        b32 dup = 0;
+        for (iz n = 0; n < p->rows.len && !dup; n++) {
+            PermRow *e = &p->rows[n];
+            if (e->kind=="path" && r.kind=="path" && e->name==r.name) {
+                e->access  = r.access=="write" ? r.access : e->access;
+                e->pane   |= r.pane;
+                e->config |= r.config;
+                e->holds  |= r.holds;
+                dup = 1;
+            }
+        }
+        if (!dup) {
+            p->rows = push(m, p->rows, r);
+        }
+    }
+    for (Json *k = jsonget(j, "denies")->child; k; k = k->next) {
+        PermRow r = {};
+        r.kind   = "path";
+        r.name   = clone(m, jsonstr(k));
+        r.access = "deny";
+        r.on     = 1;
+        r.pane   = 1;
+        p->rows  = push(m, p->rows, r);
+    }
+    for (iz i = 0; i < old.len; i++) {
+        b32 there = 0;
+        for (iz n = 0; n<p->rows.len && !there; n++) {
+            there = permsame(&p->rows[n], &old[i]);
+        }
+        if (!there) {
+            PermRow r = old[i];
+            r.kind = clone(m, r.kind);
+            r.name = clone(m, r.name);
+            r.host = clone(m, r.host);
+            r.access = r.kind=="path" ? Str("none") : Str{};
+            p->rows = push(m, p->rows, r);
+        }
+    }
+    Json *o = jsonget(j, "offers");
+    p->desktop    = jsonflag(jsonget(o, "desktop"), 0);
+    p->search     = jsonflag(jsonget(o, "search"), 0);
+    p->fetch      = jsonflag(jsonget(o, "fetch"), 0);
+    p->containers = jsonflag(jsonget(o, "containers"), 0);
+    for (Json *k = jsonget(o, "mcp")->child; k; k = k->next) {
+        p->mcp = push(m, p->mcp, clone(m, jsonstr(k)));
+    }
+    for (Json *k = jsonget(o, "images")->child; k; k = k->next) {
+        p->images = push(m, p->images, clone(m, jsonstr(k)));
+    }
+}
+
+// Each frame, after drawing: the shown session's permissions asked for,
+// while the pane shows, once they may have changed.
+static void guiperms(Gui *g)
+{
+    Perms      *p = &g->perms;
+    GuiSession *s = g->sess;
+    if (!g->permsshown || !s || s->gone || g->quitting || p->id || p->sending ||
+            !hostcap(s->host, "grants") || !hostlive(g, s)) {
+        return;
+    }
+    u32 rev    = s->view ? s->view->permrev : 0;
+    i64 cfgrev = g->cfg ? jsonint(jsonget(g->cfg, "rev"), 0) : 0;
+    if (p->s==s && p->rev==rev && p->cfgrev==cfgrev && !p->stale) {
+        return;
+    }
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 128);
+    EvOut w = cmdopen(g, &b, CMD_GRANTS, s);
+    p->id     = g->nextid;
+    p->rev    = rev;
+    p->cfgrev = cfgrev;
+    p->stale  = 0;
+    cmdsend(g, &w, a);
+}
+
+// A path's state set in the pane: none, read, write or deny.
+static void guigrantpath(Gui *g, GuiSession *s, Str path, Str access)
+{
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 256 + path.len);
+    EvOut w = cmdopen(g, &b, CMD_GRANT, s);
+    putstrkey(&w.json, "path", path);
+    putstrkey(&w.json, "access", access);
+    g->perms.sending = g->nextid;
+    cmdsend(g, &w, a);
+}
+
+// Another kind given or taken back in the pane: key one of desktop,
+// mcp, web and image, with a fetch grant's host.
+static void guigrantkind(Gui *g, GuiSession *s, Str key, Str name, Str host, b32 on)
+{
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 256 + name.len + host.len);
+    EvOut w = cmdopen(g, &b, CMD_GRANT, s);
+    putstrkey(&w.json, key, name);
+    if (host.len) {
+        putstrkey(&w.json, "host", host);
+    }
+    putintkey(&w.json, "on", on);
+    g->perms.sending = g->nextid;
+    cmdsend(g, &w, a);
 }
 
 static void sessgone(Gui *, GuiSession *);
@@ -6734,6 +6957,23 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
         if (q.s && q.s->fetchid==id) {
             onskillfetch(g, q.s, ok, err);
         }
+        return;
+
+    case CMD_GRANTS:
+        if (q.s && g->perms.id==id) {
+            g->perms.id = 0;
+            onperms(g, q.s, j, ok, err);
+        }
+        return;
+
+    case CMD_GRANT:
+        g->perms.sending = g->perms.sending==id ? 0 : g->perms.sending;
+        g->perms.stale   = 1;
+        fieldput(g->perms.fail, ok ? Str{} : err.len ? err : Str("cannot change the permission"));
+        if (!ok) {
+            guilog(g, concat(&scratch, "grant: ", err));
+        }
+        scheddirty(&g->sched);
         return;
 
     case CMD_GIT:
@@ -8863,6 +9103,12 @@ static void reissue(Gui *g)
         case CMD_CONFIGGET: g->cfgget = 0; guiconfigget(g); break;
         case CMD_OPEN:      if (q.s && q.s->openid==q.id) guiopen(g, q.s); break;
         case CMD_NEW:       g->newid = 0; break;  // it shows in the list
+        case CMD_GRANTS:
+        case CMD_GRANT:
+            g->perms.id      = g->perms.id==q.id ? 0 : g->perms.id;
+            g->perms.sending = g->perms.sending==q.id ? 0 : g->perms.sending;
+            g->perms.stale   = 1;
+            break;
         case CMD_GIT:
             if (g->wtp.id == q.id) {
                 g->wtp.id  = 0;  // asked again when wanted
@@ -10311,6 +10557,10 @@ static void sessgone(Gui *g, GuiSession *s)
     }
     if (g->changes.s == s) {
         g->changes.s = 0;
+    }
+    if (g->perms.s == s) {
+        g->perms.s    = 0;
+        g->perms.rows = {};
     }
     if (g->exp.s == s) {
         g->exp.s     = 0;
@@ -13881,6 +14131,7 @@ static void gui_frame(Gui *g)
     }
     draftpoll(g, s);
     guigit(g);
+    guiperms(g);
     if (g->ctrs) {
         ctrpurge(g, os_time(g->os));
     }
@@ -16560,6 +16811,55 @@ static DriveOp m3ops[] = {
     {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
     {OP_CHECK, CHK_ALWAYSPATH, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "2-allowedalways"},
+    // The Permissions pane, from the session bar's shield: a folder
+    // added there for reads, then checked for writes on its row, lets
+    // the agent write in it unasked; unchecked, the next write asks.
+    // Hidden from the shield, shown again from the Session menu.
+    {OP_MOVE, T_NAMED, 0, 0, 100, "permissions"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Permissions"},
+    {OP_WAIT, W_NAMED, 0, 0, 10000, "perm path"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "perm path"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_TEXTCWD, 0, 0, 0, 300, "/../gui-perms"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "perm add"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_NAMED, 0, 0, 10000, "perm write "},
+    {OP_MARK, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "perm write "},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1000, ""},
+    {OP_SHOT, 0, 0, 0, 300, "2-permissions"},
+    {OP_PROMPT, 0, 0, 0, 100, "Write where the pane granted."},
+    {OP_WAIT, W_SAID, 0, 0, 10000, "Written unasked."},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "perm write "},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1000, ""},
+    {OP_PROMPT, 0, 0, 0, 100, "Write where the pane granted."},
+    {OP_WAIT, W_ASK, 0, 0, 10000, ""},
+    {OP_MARK, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_DENY, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_SAID, 0, 0, 10000, "Not written"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "permissions"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PANECLOSED, 0, 0, 0, "Permissions"},
+    {OP_MOVE, T_SESSMENU, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Permissions..."},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Permissions"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "permissions"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PANECLOSED, 0, 0, 0, "Permissions"},
     // The agent's questions, while the window has no focus: a toast
     // tells of them, and of their deadline. The form, drawn at the
     // height reserved, starts with the recommended options picked;
@@ -24478,6 +24778,7 @@ static b32 docktreecheck(Gui *g)
         {PANE_TERMINAL,   right->ChildNodes[1]},
         {PANE_CHANGES,    right->ChildNodes[1]},
         {PANE_FILES,      right->ChildNodes[1]},
+        {PANE_PERMISSIONS, right->ChildNodes[1]},
         {PANE_HELP,       rtop},
         {PANE_SETTINGS,   rtop},
         {PANE_HOSTS,      rtop},
@@ -24555,6 +24856,7 @@ static b32 compactcheck(Gui *g)
         {PANE_PLAN,       top},
         {PANE_CHANGES,    top},
         {PANE_FILES,      top},
+        {PANE_PERMISSIONS, top},
         {PANE_HELP,       top},
         {PANE_SETTINGS,   top},
         {PANE_HOSTS,      top},

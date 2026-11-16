@@ -692,6 +692,10 @@ struct View {
     b32             endresume;   // the next turn began by itself
     b32             endcompact;  // a compaction's turn (compact) ended
     b32             paused;      // the user paused it (pause records)
+    u32             permrev;     // counts its grant, revoke and deny
+                                 // records, and prefix records (MCP
+                                 // servers): the Permissions pane's
+                                 // cue to list them again
     i32             contmsg;     // 1 + the note of a turn cut short, which
                                  // offers Continue while idle; 0 if none
     b32             turncompact; // the running turn is one
@@ -2432,9 +2436,16 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         v->msgs[i].from = v->endpoint;
     } return 1;
 
+    case EV_GRANT:
+    case EV_REVOKE:
+    case EV_DENY:
+        v->permrev++;  // nothing shows in the transcript
+        return 0;
+
     case EV_PREFIX:
         // The shell it began in, until a shell record: a prefix record
         // written again later (MCP tools) names that one still
+        v->permrev++;
         if (!v->shellset) {
             Str path = jsonstr(jsonget(j, "shell"));
             Str name = jsonstr(jsonget(j, "shell_name"));

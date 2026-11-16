@@ -95,13 +95,14 @@ static Str fontemoji()   { return {(u8 *)emojittf, countof(emojittf)}; }
 #define ICON_UNARCHIVE  "\xee\xb1\xb6"  // U+EC76
 #define ICON_GRIPPER    "\xee\xac\x84"  // U+EB04
 #define ICON_NEWFOLDER  "\xee\xaa\x80"  // U+EA80, new-folder
+#define ICON_SHIELD     "\xee\xad\x93"  // U+EB53
 
 // Their characters, for the unit tests
 static Str fonticonsused =
     ICON_ADD ICON_TRASH ICON_HISTORY ICON_CHECK ICON_DISCARD ICON_EXTERNAL ICON_LIGHTBULB ICON_INFO ICON_CLOSE ICON_FILE ICON_REPLY
     ICON_TERMINAL ICON_DISCONNECT ICON_STOP ICON_PAUSE ICON_CONTINUE ICON_FOLDER ICON_PLUG
     ICON_REFRESH ICON_TOOLS ICON_COPY ICON_SEND ICON_ATTACH ICON_UP ICON_SESSION ICON_SORT ICON_TREE
-    ICON_ARCHIVE ICON_UNARCHIVE ICON_GRIPPER ICON_NEWFOLDER ICON_PLAY;
+    ICON_ARCHIVE ICON_UNARCHIVE ICON_GRIPPER ICON_NEWFOLDER ICON_PLAY ICON_SHIELD;
 
 // Symbols models commonly write in prose: arrows, check marks and
 // crosses, bullets, math, shapes, ballot boxes, keyboard symbols, box

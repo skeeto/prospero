@@ -350,7 +350,7 @@ static Slice<HelpHit> helpsearch(Arena *a, Str query, iz max)
 // The panes a view: link shows, in the order of app.cpp's PANE_*.
 static Str viewnames[] = {
     "sessions", "transcript", "prompt", "todo", "plan", "changes", "jobs", "log",
-    "terminal", "files", "hosts", "settings", "help", "metrics",
+    "terminal", "files", "hosts", "permissions", "settings", "help", "metrics",
 };
 
 // %XX as the byte it stands for, the rest as it is.

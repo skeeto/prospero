@@ -3097,6 +3097,7 @@ GUI_PROMPTS = ("Stream slowly", "Run the tools", "be allowed", "wait for nobody"
                "Read the big files", "Fail over", "Stream in the background",
                "Stream for the link", "Look at the desktop", "Think slowly",
                "Think briefly", "Answer at length", "Write outside for good",
+               "Write where the pane granted",
                "Start a desktop subagent", "Type on the desktop as a subagent",
                "Start a subagent that messages", "Message the parent as a subagent",
                "Describe the images", "Ask on the side", "Run a long command",
@@ -3606,6 +3607,16 @@ def sc_gui(model, n, req):
             ok = len(res) == 2 and all(r.startswith(("Created", "Replaced")) for r in res)
             yield from answer(model, "Written twice, allowed for good." if ok
                               else "Not written: " + " / ".join(res))
+    elif "Write where the pane granted" in prompt:
+        # ../gui-perms (tests/gui.py makes it), granted in the Permissions
+        # pane, or not
+        if step == 0:
+            yield from tool(model, n, "write", {"path": "../gui-perms/p.txt",
+                                                "content": "granted\n"})
+        else:
+            res = tool_results(req)[0]
+            yield from answer(model, "Written unasked." if res.startswith(("Created", "Replaced"))
+                              else "Not written: " + res[:60])
     elif "Start a desktop subagent" in prompt:
         if step == 0:
             yield from tool(model, n, "task", {"description": "Desktop",

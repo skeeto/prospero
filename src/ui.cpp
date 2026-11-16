@@ -3235,6 +3235,7 @@ static Str  sessparent(GuiSession *);
 static Str  sessside(GuiSession *);
 static b32  menuitem(Gui *, Arena, Str label, Str why, char const *key);
 static void whytip(Str);
+static Str  hostwhy(Gui *, GuiSession *, Str cap);
 static void itemnamed(Gui *, Str);
 static b32  planwaits(View *);
 static Str  modewhy(Gui *, GuiSession *, Str mode);
@@ -3640,7 +3641,7 @@ static void drawsessbar(Gui *g)
     char const *sl    = ICON_SHELL;      // Shell output
     char const *tl    = ICON_TOOLS;      // Tool output
     char const *rl    = ICON_LIGHTBULB;  // Reasoning
-    f32         rest  = (gw>0 ? gw + gap : 0) + 4*iconw() + 4*gap;
+    f32         rest  = (gw>0 ? gw + gap : 0) + 5*iconw() + 5*gap;
     b32         lead  = 0;  // something on the line before the branch
     f32         right = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - rest;
     if (sessparent(s).len || sessside(s).len) {
@@ -3738,6 +3739,27 @@ static void drawsessbar(Gui *g)
     if (ImGui::BeginPopup("##sessinfo")) {
         drawinfo(g, s, v);
         ImGui::EndPopup();
+    }
+    // The Permissions pane, shown and hidden as the branch shows Changes
+    ImGui::SameLine();
+    Str  why  = hostwhy(g, s, "grants");
+    b32  open = g->panes[PANE_PERMISSIONS];
+    ImGui::BeginDisabled(why.len > 0);
+    b32 click = togglebutton(g, ICON_SHIELD "##perms", open);
+    ImGui::EndDisabled();
+    itemrect(g, RECT_PERMSBTN);
+    itemnamed(g, "permissions");
+    if (why.len) {
+        whytip(why);
+    } else {
+        itemtip("Permissions: what the agent may reach without asking, in this "
+                "session and its subagents");
+    }
+    if (click) {
+        if (!open) {
+            navjump(g);
+        }
+        setpane(g, PANE_PERMISSIONS, !open);
     }
 }
 
@@ -8671,6 +8693,15 @@ static void sessitems(Gui *g, Arena a, GuiSession *s)
         shellitems(g, a, s, ImGui::IsWindowAppearing());
         ImGui::EndMenu();
     }
+    if (menutip(g, &a, "Permissions...", hostwhy(g, s, "grants"),
+                "What the agent may reach without asking, in this session and "
+                "its subagents: grant ahead, take back, or deny")) {
+        if (g->sess != s) {
+            setcur(g, s);
+        }
+        setpane(g, PANE_PERMISSIONS, 1);
+    }
+    older |= !hostcap(h, "grants");
     sub = ImGui::BeginMenu("Export");
     itemnamed(g, "Export");
     if (sub) {
@@ -13048,6 +13079,378 @@ static void drawremote(Gui *g, Arena a, Str name, i32 rect)
     ImGui::PopID();
 }
 
+// Where a workspace root of the Permissions pane comes from, in words.
+static Str permwhy(Str why)
+{
+    return why=="cwd"     ? Str("The session's folder") :
+           why=="session" ? Str("A folder added to this session") :
+           why=="config"  ? Str("[guard] roots in the configuration") :
+           why=="scratch" ? Str("The session's scratch folder") :
+           why=="memory"  ? Str("The agent's memory, which only its memory tool writes") :
+           why=="temp"    ? Str("The system's temporary folder") : why;
+}
+
+// The row of p's of a kind and name (and host), else null.
+static PermRow *permrow(Perms *p, Str kind, Str name, Str host = {})
+{
+    for (iz i = 0; i < p->rows.len; i++) {
+        PermRow *r = &p->rows[i];
+        if (r->kind==kind && r->name==name && r->host==host) {
+            return r;
+        }
+    }
+    return 0;
+}
+
+// A checkbox of the pane, named for a tool: whether it was clicked.
+static b32 permcheck(Gui *g, char const *label, b32 on, Str name)
+{
+    bool v = on;
+    b32  r = ImGui::Checkbox(label, &v);
+    itemnamed(g, name);
+    return r;
+}
+
+// The Permissions pane: what the agent of the session shown may reach
+// without asking, in it and its subagents, each a toggle (onperms).
+// The paths' rows set read, write or deny; the other kinds' grant or
+// take back. Its controls wait while a change is under way.
+static void drawperms(Gui *g)
+{
+    GuiSession *s    = g->sess;
+    Perms      *p    = &g->perms;
+    Arena       a    = g->frame;
+    Palette    *pal  = g->pal;
+    View       *v    = s ? s->view : 0;
+    Str         note = s ? hostwhy(g, s, "grants") : Str("No session");
+    if (!note.len && p->s!=s) {
+        note = "Reading\xe2\x80\xa6";
+    } else if (!note.len && p->err.len) {
+        note = p->err;
+    }
+    if (note.len) {
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextDisabled("%s", cstr0(&a, note));
+        ImGui::PopTextWrapPos();
+        return;
+    }
+    ImGuiStyle &st   = ImGui::GetStyle();
+    b32         busy = p->sending || p->id;
+    b32         ro   = s->readonly;
+
+    ImGui::PushTextWrapPos(0);
+    ImGui::TextDisabled("For this session and its subagents. These rules hold the "
+                        "file tools, not shell commands. The agent is told of each "
+                        "change before its next step.");
+    if (v && v->bypass) {
+        ImGui::PushStyleColor(ImGuiCol_Text, pal->amber);
+        ImGui::TextUnformatted("Bypass mode: nothing asks, but denied paths are refused.");
+        ImGui::PopStyleColor();
+    } else if (v && v->plan) {
+        ImGui::TextDisabled("Plan mode: the agent writes nothing but its plan, "
+                            "whatever is granted.");
+    }
+    if (ro) {
+        ImGui::PushStyleColor(ImGuiCol_Text, pal->amber);
+        ImGui::TextUnformatted("Another process has this session open: "
+                               "its permissions can only be read here.");
+        ImGui::PopStyleColor();
+    }
+    ImGui::PopTextWrapPos();
+    ImGui::BeginDisabled(busy || ro);
+
+    // Paths: the workspace, fixed, then each grant and deny
+    ImGui::SeparatorText("Folders and files");
+    for (iz i = 0; i < p->rows.len; i++) {
+        PermRow *r = &p->rows[i];
+        if (r->kind != "root") {
+            continue;
+        }
+        ImGui::PushID((i32)i);
+        ImGui::BeginDisabled();
+        bool rd = 1, wr = r->access=="write", dn = 0;
+        ImGui::Checkbox("##r", &rd);
+        ImGui::SameLine();
+        ImGui::Checkbox("##w", &wr);
+        ImGui::SameLine();
+        ImGui::Checkbox("##d", &dn);
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        f32 w   = ImGui::GetContentRegionAvail().x;
+        Str tip = concat(&a, permwhy(r->why), wr ? Str(": read and written")
+                                                 : Str(": read only"));
+        textfit(a, r->name, w, 0, tip);
+        ImGui::PopID();
+    }
+    // Sorted, so that a deny sits under the folder it is in
+    Slice<iz> order = {};
+    for (iz i = 0; i < p->rows.len; i++) {
+        if (p->rows[i].kind == "path") {
+            iz k = order.len;
+            order = push(&a, order, i);
+            for (; k>0 && compare(p->rows[order[k-1]].name, p->rows[i].name)>0; k--) {
+                order[k] = order[k-1];
+            }
+            order[k] = i;
+        }
+    }
+    for (iz n = 0; n < order.len; n++) {
+        PermRow *r  = &p->rows[order[n]];
+        b32      rd = r->access=="read" || r->access=="write";
+        b32      wr = r->access=="write";
+        b32      dn = r->access=="deny";
+        Str      to = {};
+        ImGui::PushID((i32)order[n]);
+        if (permcheck(g, "##r", rd, concat(&a, "perm read ", r->name))) {
+            to = rd ? Str("none") : Str("read");
+        }
+        itemtip("Read: the agent may read it, and everything in it, without asking");
+        ImGui::SameLine();
+        if (permcheck(g, "##w", wr, concat(&a, "perm write ", r->name))) {
+            to = wr ? Str("read") : Str("write");
+        }
+        itemtip("Write: the agent may change it too, and everything in it, "
+                "without asking");
+        ImGui::SameLine();
+        if (permcheck(g, "##d", dn, concat(&a, "perm deny ", r->name))) {
+            to = dn ? Str("none") : Str("deny");
+        }
+        itemtip("Deny: the agent's file tools ask here, even inside its folder "
+                "or a grant, never offering Always; searches leave it out, and "
+                "Bypass mode refuses it");
+        ImGui::SameLine();
+        Str src = r->access=="none" ? Str("Off: check a box to grant it again") :
+                  dn                ? Str("Denied here") :
+                  r->pane           ? Str("Granted here") :
+                                      Str("Allowed always, when the agent asked");
+        Str mark = r->config ? Str("configuration") :
+                   r->holds && wr ? Str("its configuration files still ask") : Str{};
+        f32 mw   = mark.len ? ImGui::CalcTextSize(cstr0(&a, mark)).x + st.ItemSpacing.x : 0;
+        f32 w    = ImGui::GetContentRegionAvail().x - mw;
+        u32 col  = r->access=="none" ? ImGui::GetColorU32(ImGuiCol_TextDisabled) : 0;
+        textfit(a, r->name, w, col, src);
+        if (mark.len) {
+            ImGui::SameLine();
+            if (r->config) {
+                ImGui::PushStyleColor(ImGuiCol_Text, pal->amber);
+                text(mark);
+                ImGui::PopStyleColor();
+                itemtip("Prospero's own configuration: the agent may write it "
+                        "unasked, and each write reloads it");
+            } else {
+                ImGui::TextDisabled("%s", cstr0(&a, mark));
+                itemtip("A write to Prospero's configuration still asks, unless "
+                        "the file itself is granted");
+            }
+        }
+        ImGui::PopID();
+        if (to.len) {
+            guigrantpath(g, s, r->name, to);
+        }
+    }
+
+    // The add row: a path, what it gets, and Add (or Enter)
+    char const *as[] = {"Read", "Write", "Deny"};
+    char const *add  = "Add";
+    f32 cw = ImGui::CalcTextSize("Write").x + ImGui::GetFrameHeight() + 2*st.FramePadding.x;
+    f32 aw = ImGui::CalcTextSize(add).x + 2*st.FramePadding.x;
+    b32 enter = 0;
+    ImGui::SetNextItemWidth(-(cw + aw + 2*st.ItemSpacing.x));
+    PathField pf = pathbefore(g, s->host, p->add, &enter, busy || ro);
+    b32 typed = ImGui::InputTextWithHint("##cwd", "A folder or file to add",
+                                         p->add, sizeof(p->add),
+                                         pf.flags | ImGuiInputTextFlags_EnterReturnsTrue,
+                                         pathcb, &pf.cb);
+    axname(g, "Path to add");
+    itemnamed(g, "perm path");
+    pathafter(g, &pf, p->add);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(cw);
+    ImGui::Combo("##as", &p->addas, as, countof(as));
+    axname(g, "Access to add");
+    itemnamed(g, "perm access");
+    ImGui::SameLine();
+    Str path = trim(Str{(u8 *)p->add, (iz)__builtin_strlen(p->add)});
+    ImGui::BeginDisabled(!path.len);
+    b32 go = ImGui::Button(add) || (typed && !enter && path.len);
+    ImGui::EndDisabled();
+    itemnamed(g, "perm add");
+    if (go && path.len) {
+        Str to = p->addas==2 ? Str("deny") : p->addas==1 ? Str("write") : Str("read");
+        guigrantpath(g, s, path, to);
+        p->add[0] = 0;
+    }
+    if (p->fail[0]) {
+        ImGui::PushStyleColor(ImGuiCol_Text, pal->bad);
+        ImGui::TextWrapped("%s", p->fail);
+        ImGui::PopStyleColor();
+    }
+
+    // Desktop: its classes, input covering observe
+    ImGui::SeparatorText("Desktop");
+    if (!p->desktop && !permrow(p, "desktop", "observe") && !permrow(p, "desktop", "input") &&
+            !permrow(p, "desktop", "windows")) {
+        ImGui::TextDisabled("The desktop tool is not offered to this session.");
+    } else {
+        struct { char const *label; Str name; char const *tip; } cls[] = {
+            {"Observe", "observe", "Screenshots, and listing windows, without asking"},
+            {"Input",   "input",   "Clicks, keys and typing, and observing, without asking"},
+            {"Windows", "windows", "Focusing and closing windows without asking"},
+        };
+        b32 input = permrow(p, "desktop", "input") != 0;
+        for (i32 i = 0; i < countof(cls); i++) {
+            b32 on      = permrow(p, "desktop", cls[i].name) != 0;
+            b32 covered = i==0 && input && !on;
+            ImGui::BeginDisabled(covered);
+            if (permcheck(g, cls[i].label, on || covered,
+                          concat(&a, "perm desktop ", cls[i].name))) {
+                guigrantkind(g, s, "desktop", cls[i].name, {}, !on);
+            }
+            ImGui::EndDisabled();
+            itemtip("%s", covered ? "Input covers it" : cls[i].tip);
+            if (i+1 < countof(cls)) {
+                ImGui::SameLine();
+            }
+        }
+        ImGui::TextDisabled("Starting programs always asks.");
+    }
+
+    // MCP servers: each of the session's, and grants of servers gone
+    ImGui::SeparatorText("MCP servers");
+    b32 anymcp = 0;
+    for (iz i = 0; i < p->mcp.len; i++) {
+        Str every = concat(&a, "mcp__", p->mcp[i]);
+        b32 on    = permrow(p, "mcp", every) != 0;
+        ImGui::PushID((i32)i);
+        if (permcheck(g, cstr0(&a, p->mcp[i]), on, concat(&a, "perm mcp ", p->mcp[i]))) {
+            guigrantkind(g, s, "mcp", p->mcp[i], {}, !on);
+        }
+        itemtip("Every tool of this server, without asking");
+        ImGui::PopID();
+        anymcp = 1;
+    }
+    for (iz i = 0; i < p->rows.len; i++) {
+        PermRow *r = &p->rows[i];
+        b32 listed = 0;
+        for (iz k = 0; r->kind=="mcp" && k < p->mcp.len && !listed; k++) {
+            listed = r->name == concat(&a, "mcp__", p->mcp[k]);
+        }
+        if (r->kind!="mcp" || listed || !r->on) {
+            continue;
+        }
+        ImGui::PushID((i32)(1000 + i));
+        b32 proj = startswith(r->name, "project");
+        Str label = proj ? Str("A project's servers (.mcp.json)") : r->name;
+        if (permcheck(g, cstr0(&a, label), 1, concat(&a, "perm mcp ", r->name))) {
+            guigrantkind(g, s, "mcp", r->name, {}, 0);
+        }
+        itemtip("%s", proj ? "Approved when asked: uncheck to be asked again"
+                           : "A grant of one tool, or of a server not in this session: "
+                             "uncheck to take it back");
+        ImGui::PopID();
+        anymcp = 1;
+    }
+    if (!anymcp) {
+        ImGui::TextDisabled("No MCP servers in this session.");
+    }
+
+    // The web: searches, and pages of each host
+    ImGui::SeparatorText("Web");
+    PermRow *srch = permrow(p, "web", "search");
+    if (p->search || srch) {
+        if (permcheck(g, "Searches", srch!=0, "perm web search")) {
+            guigrantkind(g, s, "web", "search", {}, !srch);
+        }
+        itemtip("Web searches without asking");
+    } else {
+        ImGui::TextDisabled("Web search is not set up.");
+    }
+    for (iz i = 0; i < p->rows.len; i++) {
+        PermRow *r = &p->rows[i];
+        if (r->kind!="web" || r->name!="fetch") {
+            continue;
+        }
+        ImGui::PushID((i32)(2000 + i));
+        Str label = concat(&a, "Pages of ", r->host);
+        if (permcheck(g, cstr0(&a, label), r->on, concat(&a, "perm fetch ", r->host))) {
+            guigrantkind(g, s, "web", "fetch", r->host, !r->on);
+        }
+        ImGui::PopID();
+    }
+    if (p->fetch) {
+        f32 bw = ImGui::CalcTextSize("Add##host").x + 2*st.FramePadding.x;
+        ImGui::SetNextItemWidth(-(bw + st.ItemSpacing.x));
+        b32 hent = ImGui::InputTextWithHint("##host", "A site whose pages to fetch",
+                                            p->host, sizeof(p->host),
+                                            ImGuiInputTextFlags_EnterReturnsTrue);
+        axname(g, "Site to add");
+        itemnamed(g, "perm host");
+        ImGui::SameLine();
+        Str host = trim(Str{(u8 *)p->host, (iz)__builtin_strlen(p->host)});
+        ImGui::BeginDisabled(!host.len);
+        b32 hgo = ImGui::Button("Add##host") || (hent && host.len);
+        ImGui::EndDisabled();
+        itemnamed(g, "perm host add");
+        if (hgo && host.len) {
+            guigrantkind(g, s, "web", "fetch", host, 1);
+            p->host[0] = 0;
+        }
+    } else {
+        ImGui::TextDisabled("Web fetch is off.");
+    }
+
+    // Containers: the images subagents may run in
+    ImGui::SeparatorText("Containers");
+    b32 anyimg = 0;
+    for (iz i = 0; i < p->rows.len; i++) {
+        PermRow *r = &p->rows[i];
+        if (r->kind != "image") {
+            continue;
+        }
+        ImGui::PushID((i32)(3000 + i));
+        if (permcheck(g, cstr0(&a, r->name), r->on, concat(&a, "perm image ", r->name))) {
+            guigrantkind(g, s, "image", r->name, {}, !r->on);
+        }
+        itemtip("Subagents in this image without asking");
+        ImGui::PopID();
+        anyimg = 1;
+    }
+    if (p->images.len) {
+        Buf b(&a, 256);
+        print(&b, "In the configuration ([container] images): ");
+        for (iz i = 0; i < p->images.len; i++) {
+            print(&b, i ? Str(", ") : Str(""));
+            print(&b, p->images[i]);
+        }
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextDisabled("%s", cstr0(&a, finish(&b)));
+        ImGui::PopTextWrapPos();
+        anyimg = 1;
+    }
+    if (p->containers) {
+        f32 bw = ImGui::CalcTextSize("Add##image").x + 2*st.FramePadding.x;
+        ImGui::SetNextItemWidth(-(bw + st.ItemSpacing.x));
+        b32 ient = ImGui::InputTextWithHint("##image", "An image for subagents",
+                                            p->image, sizeof(p->image),
+                                            ImGuiInputTextFlags_EnterReturnsTrue);
+        axname(g, "Image to add");
+        itemnamed(g, "perm image");
+        ImGui::SameLine();
+        Str image = trim(Str{(u8 *)p->image, (iz)__builtin_strlen(p->image)});
+        ImGui::BeginDisabled(!image.len);
+        b32 igo = ImGui::Button("Add##image") || (ient && image.len);
+        ImGui::EndDisabled();
+        itemnamed(g, "perm image add");
+        if (igo && image.len) {
+            guigrantkind(g, s, "image", image, {}, 1);
+            p->image[0] = 0;
+        }
+    } else if (!anyimg) {
+        ImGui::TextDisabled("Subagents in containers are not available here.");
+    }
+    ImGui::EndDisabled();
+}
+
 // This process's engine, the background hosts on this machine, and the
 // remote ones of the configuration: how each is, connecting and leaving
 // them, and Add remote, which opens Settings' dialog for one.
@@ -17406,6 +17809,20 @@ static void dockwindows(Gui *g)
     if (show[PANE_SETTINGS]) {
         if (beginpane(g, PANE_SETTINGS)) {
             drawsettings(g);
+        }
+        ImGui::End();
+    }
+    g->permsshown = 0;
+    if (show[PANE_PERMISSIONS]) {
+        // A layout saved before it lacks it: beside Changes, or Plan
+        near = saveddock("Changes");
+        near = near ? near : saveddock("Plan");
+        if (near) {
+            ImGui::SetNextWindowDockID(near, ImGuiCond_FirstUseEver);
+        }
+        g->permsshown = beginpane(g, PANE_PERMISSIONS);
+        if (g->permsshown) {
+            drawperms(g);
         }
         ImGui::End();
     }

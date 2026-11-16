@@ -52,7 +52,7 @@ static void test_dock(Test *t)
            "Tabs=Prompt\n"
            "Split=Y,0.5\n"
            "Tabs=*Jobs,Log,Help,Settings,Hosts\n"
-           "Tabs=*Plan,Terminal,Changes,Files\n");
+           "Tabs=*Plan,Terminal,Changes,Files,Permissions\n");
 
     // Compact keeps the left column's width, with no right column, and
     // the terminal a tab behind the prompt, its tab bar shown
@@ -64,7 +64,7 @@ static void test_dock(Test *t)
            "Tabs=Sessions\n"
            "Tabs=*Todo,Jobs,Log\n"
            "Split=Y,0.72\n"
-           "Center=*Transcript,Plan,Changes,Files,Help,Settings,Hosts\n"
+           "Center=*Transcript,Plan,Changes,Files,Permissions,Help,Settings,Hosts\n"
            "Tabs=*Prompt,Terminal\n");
 
     // Focus shows four panes, and is home to the rest above the prompt
@@ -72,7 +72,7 @@ static void test_dock(Test *t)
     expect(t, "dock.focus", dockstr(&a, &focus),
            "Shown=Transcript,Prompt,Todo,Plan\n"
            "Split=Y,0.72\n"
-           "Center=*Transcript,Todo,Plan,Changes,Files,Sessions,Jobs,Log,Help,Settings,Hosts\n"
+           "Center=*Transcript,Todo,Plan,Changes,Files,Permissions,Sessions,Jobs,Log,Help,Settings,Hosts\n"
            "Tabs=Prompt\n"
            "TabBar=Hidden\n");
 
@@ -151,7 +151,7 @@ static void test_dock(Test *t)
            "Shown=Transcript,Prompt,Todo,Plan\n"
            "Split=Y,0.6\n"
            "Split=Y,0.72\n"
-           "Center=*Transcript,Todo,Plan,Changes,Files,Sessions,Jobs,Log,Help,Settings,Hosts\n"
+           "Center=*Transcript,Todo,Plan,Changes,Files,Permissions,Sessions,Jobs,Log,Help,Settings,Hosts\n"
            "Tabs=Prompt\n"
            "TabBar=Hidden\n"
            "Tabs=Terminal\n");
@@ -192,7 +192,7 @@ static void test_dock(Test *t)
     }
     // Files comes after Terminal in the panes' order, and the layout
     // file names them all
-    expect(t, "dock.panes", istr(&a, PANE_COUNT), "14");
+    expect(t, "dock.panes", istr(&a, PANE_COUNT), "15");
     expect(t, "dock.filesname", panestr(PANE_FILES), "Files");
     expect(t, "dock.filesafter", istr(&a, PANE_FILES == PANE_TERMINAL+1), "1");
 

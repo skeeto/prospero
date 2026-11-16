@@ -548,6 +548,7 @@ static struct { Str glyph, name; } const axicons[] = {
     {ICON_GRIPPER,    "Drag handle"},
     {ICON_NEWFOLDER,  "New folder"},
     {ICON_TREE,       "Tree"},
+    {ICON_SHIELD,     "Permissions"},
 };
 
 // The name of an icon's code point, or empty for one unknown.

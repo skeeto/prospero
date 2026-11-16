@@ -2290,6 +2290,7 @@ def main():
                        f"editor_line = sh {shword(editor)} +{{line}} {{file}}\n")
         # A directory for the ask allowed always
         host.mkdir(host.path("gui-always"))
+        host.mkdir(host.path("gui-perms"))  # and one the Permissions pane grants
         # Instruction files for the info popup, and files to compact over
         host.write(host.path("work", "AGENTS.md"), "# Checklist rules\n\nKeep it short.\n")
         bigfiles(host, "small-", 8, 160)

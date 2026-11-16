@@ -65,6 +65,7 @@ enum : i32 {
     PANE_TERMINAL,
     PANE_FILES,
     PANE_HOSTS,
+    PANE_PERMISSIONS,
     PANE_SETTINGS,
     PANE_HELP,
     PANE_METRICS,
@@ -74,17 +75,18 @@ static_assert(PANE_COUNT <= 32);  // as bits of a u32
 
 static char const *panenames[] = {
     "Sessions", "Transcript", "Prompt", "Todo", "Plan", "Changes", "Jobs", "Log",
-    "Terminal", "Files", "Hosts", "Settings", "Help", "Metrics",
+    "Terminal", "Files", "Hosts", "Permissions", "Settings", "Help", "Metrics",
 };
 static_assert(countof(panenames) == PANE_COUNT);
 
 // The panes hidden until asked for: the metrics; the changes, which a
 // click on the session bar's branch shows (ui.cpp drawbranch); and the
-// terminal, which Ctrl+` shows; and the files, which a file opened shows.
+// terminal, which Ctrl+` shows; and the files, which a file opened
+// shows; and the permissions, which the session bar's shield shows.
 static b32 panehidden(i32 pane)
 {
     return pane==PANE_METRICS || pane==PANE_CHANGES || pane==PANE_TERMINAL ||
-           pane==PANE_FILES;
+           pane==PANE_FILES || pane==PANE_PERMISSIONS;
 }
 
 #ifndef PROSPERO_DEVTOOLS
@@ -511,7 +513,7 @@ static DockLayout dockpreset(i32 preset)
         dockline(&l, "Tabs", "Prompt");
         docksplit(&l, DOCK_Y, 1 - LAYOUT_PLAN);
         dockline(&l, "Tabs", "*Jobs,Log,Help,Settings,Hosts");
-        dockline(&l, "Tabs", "*Plan,Terminal,Changes,Files");
+        dockline(&l, "Tabs", "*Plan,Terminal,Changes,Files,Permissions");
         l.keep = extras | 1u<<PANE_FILES;
         break;
     case PRESET_COMPACT:
@@ -522,15 +524,16 @@ static DockLayout dockpreset(i32 preset)
         dockline(&l, "Tabs", "Sessions");
         dockline(&l, "Tabs", "*Todo,Jobs,Log");
         docksplit(&l, DOCK_Y, 1 - LAYOUT_PROMPT);
-        dockline(&l, "Center", "*Transcript,Plan,Changes,Files,Help,Settings,Hosts");
+        dockline(&l, "Center", "*Transcript,Plan,Changes,Files,Permissions,Help,"
+                               "Settings,Hosts");
         dockline(&l, "Tabs", "*Prompt,Terminal");
         l.keep = extras | 1u<<PANE_FILES;
         break;
     case PRESET_FOCUS:
         dockline(&l, "Shown", "Transcript,Prompt,Todo,Plan");
         docksplit(&l, DOCK_Y, 1 - LAYOUT_PROMPT);
-        dockline(&l, "Center", "*Transcript,Todo,Plan,Changes,Files,Sessions,Jobs,Log,"
-                               "Help,Settings,Hosts");
+        dockline(&l, "Center", "*Transcript,Todo,Plan,Changes,Files,Permissions,"
+                               "Sessions,Jobs,Log,Help,Settings,Hosts");
         dockline(&l, "Tabs", "Prompt");
         dockline(&l, "TabBar", "Hidden");
         break;
