@@ -856,6 +856,7 @@ int main()
     test_termsecret(&t);
     test_termrun(&t);
     test_termmarks(&t);
+    test_termrunstep(&t);
     test_termset(&t);
     test_dbus(&t);
     test_door(&t);

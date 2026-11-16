@@ -795,3 +795,79 @@ static void test_termmarks(Test *t)
         }
     }
 }
+
+// A Run's marks as its shell prints them, from its arming at 0 ms: each
+// "MS:EV", EV a mark (A, C, D, D3 for D;3) or T, a line typed. Then
+// how it stands at ms at: its state (N, A, R, E), whether it has a
+// code, the code, unrun, due, how many times C began it, and how long
+// it ran (endat - startat) in ms.
+static void test_termrunstep(Test *t)
+{
+    Arena *a = &t->perm;
+    struct {
+        Str evs;
+        i64 at;
+        Str want;
+    } cases[] = {
+        {"", 0, "A 0 0 0 0 0 0"},
+        {"100:C 900:D3 950:A", 1900, "E 1 3 0 0 1 800"},
+        {"100:C 900:D3 950:A", 1950, "E 1 3 0 1 1 800"},          // A + 1 s
+        {"100:C 900:D0", 2899, "E 1 0 0 0 1 800"},
+        {"100:C 900:D0", 2900, "E 1 0 0 1 1 800"},                // D + 2 s
+        {"100:C 900:D", 2900, "E 0 0 0 1 1 800"},                 // no code
+        {"100:C 900:A", 1900, "E 0 0 0 1 1 800"},                 // A, no D
+        {"100:D 150:A", 1150, "E 0 0 1 1 0 0"},                   // nothing ran
+        {"100:A", 1100, "E 0 0 1 1 0 0"},
+        {"100:C 200:C 300:C 900:D1", 900, "E 1 1 0 0 1 800"},     // PS0 per line
+        // Without bracketed paste: each line a command of its own
+        {"100:C 200:D0 210:A 220:C 900:D2 910:A", 1000, "E 1 2 0 0 1 800"},
+        {"100:C 200:D0 210:A 220:C 900:D2 910:A", 1910, "E 1 2 0 1 1 800"},
+        // The user's next command, typed: no more of the block
+        {"100:C 200:D0 210:A 300:T 400:C 500:D0", 500, "E 1 0 0 1 1 100"},
+        {"100:C 200:D0 210:A 2000:C", 2000, "E 1 0 0 1 1 100"},   // past settle
+        {"100:C 500:T 900:D0", 900, "E 1 0 0 0 1 800"},           // typed while it ran
+        {"100:T 200:C 900:D0", 900, "E 1 0 0 0 1 700"},           // typed before it began
+        {"100:D 150:A 160:C 900:D4", 900, "E 1 4 0 0 0 740"},     // a first line of none
+    };
+    for (iz i = 0; i < countof(cases); i++) {
+        Arena     s     = *a;
+        PromptRun r     = {};
+        i32       began = 0;
+        r.state   = TRUN_ARMED;
+        r.armedat = 0;
+        for (Cut c = {{}, cases[i].evs, cases[i].evs.len>0}; c.ok;) {
+            c = cut(c.tail, ' ');
+            Cut ev  = cut(c.head, ':');
+            i64 ms  = 0;
+            for (iz k = 0; k < ev.head.len; k++) {
+                ms = ms*10 + (ev.head[k] - '0');
+            }
+            Str      e = ev.tail;
+            TermMark m = {};
+            if (e == Str("T")) {
+                termrunstep(&r, TRUN_TYPED, m, ms*MS);
+                continue;
+            }
+            m.kind    = e[0];
+            m.ok      = 1;
+            m.hascode = e.len > 1;
+            m.code    = m.hascode ? e[1] - '0' : 0;
+            began    += termrunstep(&r, TRUN_MARK, m, ms*MS);
+        }
+        Buf b(&s, 64);
+        putbyte(&b, (u8)"NARE"[r.state]);
+        print(&b, " ");
+        print(&b, (i64)r.hascode);
+        print(&b, " ");
+        print(&b, (i64)r.code);
+        print(&b, " ");
+        print(&b, (i64)r.unrun);
+        print(&b, " ");
+        print(&b, (i64)termrundue(&r, cases[i].at*MS));
+        print(&b, " ");
+        print(&b, (i64)began);
+        print(&b, " ");
+        print(&b, (r.endat - r.startat) / MS);
+        expect(t, concat(&s, "termrunstep ", cases[i].evs), finish(&b), cases[i].want);
+    }
+}

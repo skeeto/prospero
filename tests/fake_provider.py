@@ -6646,6 +6646,7 @@ def sc_term_run(model, n, req):
 
 sc_term_run_windows = sc_term_run
 sc_term_run_parked = sc_term_run
+sc_term_marks_run = sc_term_run
 
 
 SCENARIOS = {name[3:]: fn for name, fn in globals().items()

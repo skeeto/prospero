@@ -1834,10 +1834,12 @@ static void userinput(Session *s)
 // subagent's follows its parent's.
 static void planheed(Session *, Arena);
 static void shellheed(Session *, Arena);
+static void termheed(Session *, Arena);
 static void deliver(Session *s, Arena scratch)
 {
     planheed(s, scratch);
     shellheed(s, scratch);
+    termheed(s, scratch);
     for (iz i = 0; i < s->notices.len; i++) {
         Notice *n = &s->notices[i];
         Arena   a = scratch;

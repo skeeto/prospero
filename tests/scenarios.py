@@ -19193,6 +19193,120 @@ def term_shell_lang(t):
         h.close()
 
 
+def runtype(tt, sid, text, key):
+    """A Run typed at the tab's prompt, as the window sends it: pasted,
+    bracketed if the shell asked for that, then Enter, with run."""
+    data = text.replace("\n", "\r").encode()
+    raw = bytes(tt.data)
+    if raw.rfind(b"\x1b[?2004h") > raw.rfind(b"\x1b[?2004l"):
+        data = b"\x1b[200~" + data + b"\x1b[201~"
+    lines = text.split("\n")
+    tt.h.send("term.input", tid=tt.tid, data=base64.b64encode(data + b"\r").decode(),
+              run={"from": sid, "key": key, "first": lines[0], "lines": len(lines)})
+
+
+def termnotices(evs):
+    return [e for e in evs if e.get("ev") == "notice" and e.get("kind") == "terminal"]
+
+
+@scenario(bound=90, posix=True)
+def term_marks_run(t):
+    """A Run typed at a hooked bash's prompt: read_terminal shows it
+    running, with no notice meanwhile; once its prompt is back and
+    settles, the agent hears how it ended at its next request, with what
+    it printed and nothing from before it. A syntax error ran nothing;
+    one that just ended is told at once; a tab closed while it ran."""
+    bashes = []
+    for b in ["/opt/homebrew/bin/bash", "/bin/bash", "/usr/bin/bash"]:
+        if os.path.exists(b) and os.path.realpath(b) not in [os.path.realpath(x) for x in bashes]:
+            bashes.append(b)
+    if not bashes:
+        raise Skip("no bash")
+    home = hookhome(t, "home", {".bashrc": "PS1='p$ '\n",
+                                ".bash_profile": ". ~/.bashrc\n"})
+    base = t.host.read(t.config) or ""
+    # Each other bash: 3.2 has no bracketed paste, and runs the block's
+    # lines as commands of their own, one notice all the same
+    for bash in bashes[1:]:
+        t.host.write(t.config, base)
+        termconf(t, f"{bash} -l")
+        h = t.headless(env={"HOME": home, "BASH_SILENCE_DEPRECATION_WARNING": "1"})
+        try:
+            sid = readsession(t, h)
+            tt = Tty(t, h, sid)
+            markwait(tt, 1)
+            runtype(tt, sid, "echo run-start\nsleep 1\necho run-end\nsh -c 'exit 3'",
+                    "00000000000000b1")
+            markline(tt, "run-end")
+            waitstatus(t, h, "runs", 0, within=10)
+            notes = termnotices(turnof(h, sid))
+            note = notes[0].get("text", "") if notes else ""
+            t.check(len(notes) == 1 and "It exited with code 3" in note and "run-start" in note,
+                    f"{bash}: {notes}")
+        finally:
+            h.close()
+    bash = bashes[0]
+    t.host.write(t.config, base)
+    termconf(t, f"{bash} -l")
+    h = t.headless(env={"HOME": home, "BASH_SILENCE_DEPRECATION_WARNING": "1"})
+    try:
+        sid = readsession(t, h)
+        tt = Tty(t, h, sid)
+        t.check(tt.reply.get("nonce"), f"hooked: {tt.reply}")
+        markwait(tt, 1)
+        markrun(tt, "echo before-run", ["C", "D;0", "A"])
+
+        text = "echo run-start\nsleep 2\necho run-end\nsh -c 'exit 3'"
+        runtype(tt, sid, text, "00000000000000a1")
+        markline(tt, "run-start")
+        waitstatus(t, h, "runs", 1)
+        evs = turnof(h, sid)
+        read = toolends(evs)[0].get("text", "") if toolends(evs) else ""
+        t.check(f"terminal {tt.tid}: " in read and ", running `echo run-start`... (the user "
+                "ran it from your message)" in read and "do not poll" in read, f"read: {read!r}")
+        t.check(not termnotices(evs), "no notice while it runs")
+        markline(tt, "run-end")
+        waitstatus(t, h, "runs", 0, within=10)
+        evs = turnof(h, sid)
+        notes = termnotices(evs)
+        note = notes[0].get("text", "") if notes else ""
+        t.check(len(notes) == 1 and notes[0].get("code") == 3 and notes[0].get("tid") == tt.tid
+                and notes[0].get("ms", 0) >= 1500, f"notices {notes}")
+        t.check(note.startswith("The user ran `echo run-start`... (4 lines) from your message "
+                                f"at the prompt of terminal {tt.tid}'s shell. It exited with "
+                                "code 3 after ") and "run-end" in note and
+                "before-run" not in note and "read_terminal reads" in note, f"notice {note!r}")
+
+        # A syntax error: nothing ran
+        runtype(tt, sid, "fi", "00000000000000a2")
+        waitstatus(t, h, "runs", 0, within=10)
+        notes = termnotices(turnof(h, sid))
+        note = notes[0].get("text", "") if notes else ""
+        t.check(len(notes) == 1 and "ran nothing of it" in note and "syntax error" in note,
+                f"syntax error: {note!r}")
+
+        # Just ended, not settled: told with the next request all the same
+        markwait(tt, 1)
+        runtype(tt, sid, "echo quick", "00000000000000a3")
+        markline(tt, "quick")
+        notes = termnotices(turnof(h, sid))
+        t.check(len(notes) == 1 and "It exited with code 0" in (notes[0].get("text") or ""),
+                f"at once: {notes}")
+        waitstatus(t, h, "runs", 0)
+
+        # Closed while it runs
+        tt.pump(lambda x: marksof(x)[-1:] == ["A"], 10, "a prompt")
+        runtype(tt, sid, "echo started; sleep 30", "00000000000000a4")
+        markline(tt, "started")
+        h.send("term.close", tid=tt.tid)
+        waitstatus(t, h, "runs", 0, within=10)
+        notes = termnotices(turnof(h, sid))
+        t.check(len(notes) == 1 and "closed while it ran" in (notes[0].get("text") or "") and
+                notes[0].get("code") == -1, f"closed: {notes}")
+    finally:
+        h.close()
+
+
 @scenario(bound=60, posix=True)
 def term_run(t):
     """term.open's run shows a code block of the agent's, dimmed, then runs

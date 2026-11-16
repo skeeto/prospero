@@ -9,7 +9,8 @@
 //              edit? | run? | shell?}
 //       replies {tid, shell, kind, nonce?, argv, cwd, editor?} before
 //       any output
-//   term.input {tid, data}            typed bytes, base64, 16 KiB at most
+//   term.input {tid, data, run?}      typed bytes, base64, 16 KiB at most
+//                                     (TERM_RUNINPUT with run)
 //   term.resize {tid, cols, rows, xpx?, ypx?}
 //   term.ack {tid, off, resend?}      output taken up to off
 //   term.close {tid, kill?}           a hang-up, or with kill a sweep
@@ -133,6 +134,19 @@
 // (termrunlang), the tab runs an interactive shell of its family
 // (termrunpick), and the reply's shell names that program.
 //
+// A Run (the Run button) is typed at a hooked shell's prompt, a paste
+// and Enter in one term.input whose run {from, key, first, lines} names
+// the session told of its end, the block's hash in 16 hex digits, its
+// first line and how many it has. It is tracked (PromptRun) if the tab's
+// screen is kept ([terminal] agent), its last mark was A, and no other
+// Run of the tab's still goes, else it is only typing: running from its
+// C, its own screen fed from there; ended at D (or A); over TRUN_SETTLE
+// seconds after D, or TRUN_PROMPT after the prompt's A, or at once when
+// a line is typed, before the session's next request, or when its tab
+// closes or shell ends. A C soon after its end, nothing typed, is more
+// of it: a shell without bracketed paste runs each line on its own. Its
+// notice "terminal" (termrunend) says how it ended and what it printed.
+//
 // A terminal that ends, its tab still open, keeps its slot and screen
 // (kept) for read_terminal, until term.close, a hang-up of all, or a
 // term.open finding no free slot, which takes the kept one unused
@@ -164,6 +178,57 @@ enum : i32 {
     TERM_RUNTEXT  = 16 << 10,   // a Run's text, in bytes, at most
     TERM_RUNCMD   = 8191,       // a cmd line's UTF-16 units: cmd.exe's most
     TERM_RUNLINE  = 120,        // bytes of its first line kept, for labels
+    TERM_RUNINPUT = TERM_RUNTEXT + 64,  // a Run typed: its text, pasted
+    TERM_RUNHIST  = 500,        // lines a Run's own screen keeps
+};
+
+// A Run typed at a hooked shell's prompt (term.input's run), as its
+// marks tell it: armed once sent, running from its C, ended at its D
+// (or an A with none), and over once it settles, when the next
+// request, the tab's end, or another Run would not wait for it.
+enum : i32 {
+    TRUN_NONE,
+    TRUN_ARMED,    // sent at a prompt, not yet begun
+    TRUN_RUNNING,
+    TRUN_ENDED,    // over at settleat, unless more of it runs first
+};
+
+enum : i32 {
+    TRUN_MARK,     // a verified mark
+    TRUN_TYPED,    // a line typed (CR or LF) other than the Run's
+};
+
+enum : i32 {
+    TRUN_SETTLE  = 2,  // seconds after D for more of a block to run
+    TRUN_PROMPT  = 1,  // or after the prompt's A, if sooner
+};
+
+struct PromptRun {
+    i32 state;
+    b32 hascode;   // its status, if the shell gave it
+    i32 code;
+    b32 unrun;     // a prompt came back with nothing run (bare D or A)
+    b32 typed;     // a line typed since it ended: what runs is not it
+    i64 armedat;   // ticks
+    i64 startat;   // its first C, else when it ended
+    i64 endat;
+    i64 settleat;
+};
+
+// How a Run ended, as its notice tells (termrunend): as its marks said,
+// or not knowing how.
+enum : i32 {
+    TEND_DONE,
+    TEND_CUT,    // its tab closed
+    TEND_EXIT,   // its shell ended
+};
+
+// A screen of the engine's, in a block of its own.
+struct TermScreen {
+    Region     *region;
+    ariel_Term *screen;
+    i32         capcols;
+    i32         caprows;
 };
 
 struct Term {
@@ -189,10 +254,8 @@ struct Term {
 
     // The screen read_terminal reads, while [terminal] agent is on, fed
     // the output ahead of what is sent (termscan): fed >= sent >= acked
-    Region     *region;   // the screen's block, alone in it
-    ariel_Term *screen;
-    i32         capcols;
-    i32         caprows;
+    TermScreen  scr;
+    ariel_Term *screen;   // scr's
     i32         hist;
     i64         fed;
     i64         readfed;  // fed as of the agent's last read of it
@@ -226,6 +289,14 @@ struct Term {
     i32 runlines;
     u8  from[64];   // the session its notice goes to
     iz  fromlen;
+
+    // A Run typed at the shell's prompt (term.input's run), with the
+    // run fields above but run, and its own screen, fed from its C on,
+    // so that its notice holds only what it printed
+    PromptRun     srun;
+    TermScreen  rscreen;
+    i32         cols;  // the terminal's size, for a Run's screen
+    i32         rows;
 };
 
 struct Terms {
@@ -910,6 +981,67 @@ static TermMark termmarkparse(Str payload, Str nonce)
     return r;
 }
 
+// One step of a Run's: a mark, or a line typed. Returns 1 when its C
+// begins it, so that what it prints is all its screen holds.
+static i32 termrunstep(PromptRun *r, i32 ev, TermMark m, i64 now)
+{
+    i64 settle = (i64)TRUN_SETTLE * SEC;
+    i64 prompt = (i64)TRUN_PROMPT * SEC;
+    if (ev == TRUN_TYPED) {
+        if (r->state == TRUN_ENDED) {
+            r->typed    = 1;
+            r->settleat = now;
+        }
+        return 0;
+    }
+    switch (r->state) {
+    case TRUN_ARMED:
+        if (m.kind == 'C') {
+            r->state   = TRUN_RUNNING;
+            r->startat = now;
+            return 1;
+        } else if (m.kind=='D' || m.kind=='A') {
+            // Nothing ran: a syntax error, or a line taken as none
+            r->state    = TRUN_ENDED;
+            r->hascode  = m.hascode;
+            r->code     = m.code;
+            r->unrun    = !m.hascode;
+            r->startat  = r->endat = now;
+            r->settleat = now + (m.hascode ? settle : prompt);
+        }
+        return 0;
+    case TRUN_RUNNING:
+        if (m.kind=='D' || m.kind=='A') {
+            r->state    = TRUN_ENDED;
+            r->hascode  = m.kind=='D' && m.hascode;
+            r->code     = r->hascode ? m.code : 0;
+            r->endat    = now;
+            r->settleat = now + (m.kind=='D' ? settle : prompt);
+        }
+        return 0;  // a C: the next line of the block
+    case TRUN_ENDED:
+        if (m.kind == 'A') {
+            r->settleat = r->settleat<now+prompt ? r->settleat : now+prompt;
+        } else if (m.kind=='C' && !r->typed && now<r->settleat) {
+            // The block's next line, which a shell without bracketed
+            // paste reads as a command of its own
+            r->state   = TRUN_RUNNING;
+            r->startat = r->unrun ? now : r->startat;
+            r->unrun   = 0;
+        } else if (m.kind == 'C') {
+            r->settleat = now;  // the user's own command
+        }
+        return 0;
+    }
+    return 0;
+}
+
+// Whether a Run is over, its notice due.
+static b32 termrundue(PromptRun *r, i64 now)
+{
+    return r->state==TRUN_ENDED && now>=r->settleat;
+}
+
 // A program's path, by name on a PATH, else null: findprog on Windows,
 // findpathext elsewhere.
 typedef Str TermWhich(void *ctx, Arena *, Str name);
@@ -1121,16 +1253,18 @@ static Str termhookdir(Engine *e, Arena *a)
 // after their terminals ended, for tests.
 static void termstatus(Engine *e, JsonOut *w)
 {
-    i64 screens = 0, fed = 0, kept = 0;
+    i64 screens = 0, fed = 0, kept = 0, runs = 0;
     for (i32 i = 0; e->terms && i < TERM_MAX; i++) {
         Term *t = &e->terms->slots[i];
         screens += t->tid && t->screen;
         fed     += t->tid ? t->fed : 0;
         kept    += t->tid && t->kept;
+        runs    += t->tid && t->srun.state;
     }
     putintkey(w, "screens", screens);
     putintkey(w, "fed", fed);
     putintkey(w, "kept", kept);
+    putintkey(w, "runs", runs);
 }
 
 static Term *termbytid(Engine *e, i64 tid, i64 peer)
@@ -1168,12 +1302,19 @@ static i32 termcount(Engine *e, i64 peer)
 
 // Hang up, or with kill sweep the tree. The terminal says nothing more,
 // and its slot goes once the shell's exit and EOF are in.
+static void termblockfree(Engine *e, TermScreen *sc)
+{
+    if (sc->region) {
+        os_release(e->os, sc->region);
+    }
+    *sc = {};
+}
+
 // Free a slot, and its screen.
 static void termfree(Engine *e, Term *t)
 {
-    if (t->region) {
-        os_release(e->os, t->region);
-    }
+    termblockfree(e, &t->scr);
+    termblockfree(e, &t->rscreen);
     *t = {};
 }
 
@@ -1187,7 +1328,7 @@ static i32 termscreencap(i32 n, i32 least)
 
 // A screen's block, fresh or moved into from the one it had, with room
 // for cols by rows. Returns 0, keeping what it had, if it cannot be had.
-static b32 termscreenblock(Engine *e, Term *t, i32 cols, i32 rows)
+static b32 termblock(Engine *e, TermScreen *sc, i32 hist, i32 cols, i32 rows)
 {
     static char  name[] = "Prospero(" PROSPERO_VERSION ")";
     ariel_Config c      = {};
@@ -1195,8 +1336,8 @@ static b32 termscreenblock(Engine *e, Term *t, i32 cols, i32 rows)
     c.rows      = rows;
     c.capcols   = termscreencap(cols, 200);
     c.caprows   = termscreencap(rows, 80);
-    c.histlines = t->hist ? t->hist : -1;  // ariel's 0 is its default
-    c.histbytes = termscrollbytes(t->hist);
+    c.histlines = hist ? hist : -1;  // ariel's 0 is its default
+    c.histbytes = termscrollbytes(hist);
     c.flags     = ARIEL_F_NOREPLY;
     c.name.data = (u8 *)name;
     c.name.len  = countof(name) - 1;
@@ -1211,21 +1352,38 @@ static b32 termscreenblock(Engine *e, Term *t, i32 cols, i32 rows)
     Arena a = newarena(r);
     allocbytes(&a, -(uz)a.beg & 15);
     void       *mem = allocbytes(&a, size);
-    ariel_Term *st  = t->screen ? ariel_move(t->screen, mem, size, &c)
-                                : ariel_init(mem, size, &c);
+    ariel_Term *st  = sc->screen ? ariel_move(sc->screen, mem, size, &c)
+                                 : ariel_init(mem, size, &c);
     if (!st) {
         os_release(e->os, r);
         return 0;
     }
-    if (t->region) {
-        os_release(e->os, t->region);
+    if (sc->region) {
+        os_release(e->os, sc->region);
     }
-    t->region  = r;
-    t->screen  = st;
-    t->capcols = c.capcols;
-    t->caprows = c.caprows;
+    sc->region  = r;
+    sc->screen  = st;
+    sc->capcols = c.capcols;
+    sc->caprows = c.caprows;
     return 1;
 }
+
+static b32 termscreenblock(Engine *e, Term *t, i32 cols, i32 rows)
+{
+    b32 ok = termblock(e, &t->scr, t->hist, cols, rows);
+    t->screen = t->scr.screen;
+    return ok;
+}
+
+// A screen's size changed: room first, if it needs more.
+static void termblocksize(Engine *e, TermScreen *sc, i32 hist, PtySize z)
+{
+    if (z.cols>sc->capcols || z.rows>sc->caprows) {
+        termblock(e, sc, hist, z.cols, z.rows);
+    }
+    ariel_resize(sc->screen, z.cols, z.rows, z.xpx/z.cols, z.ypx/z.rows);
+}
+
 
 // The screen's text on the cursor's row, left of the cursor, into buf.
 static Str termcursorrow(Term *t, u8 *buf, iz cap)
@@ -1247,11 +1405,26 @@ static Str termcursorrow(Term *t, u8 *buf, iz cap)
     return {buf, len};
 }
 
-static void termfeedbytes(Term *t, Str data)
+// Output to a screen whose events nobody wants.
+static void termfeedquiet(ariel_Term *screen, Str data)
+{
+    ariel_Str in = {data.data, data.len};
+    while (in.len) {
+        in = ariel_feed(screen, in).rest;
+    }
+}
+
+// Output to the screen, and to a Run's while it runs: its title, and a
+// hooked shell's marks, which move its Run along.
+static void termfeedbytes(Engine *e, Term *t, Str data)
 {
     ariel_Str in = {data.data, data.len};
     for (;;) {
         ariel_Fed f = ariel_feed(t->screen, in);
+        i32 st = t->srun.state;
+        if (t->rscreen.screen && (st==TRUN_ARMED || st==TRUN_RUNNING)) {
+            termfeedquiet(t->rscreen.screen, Str{in.data, in.len - f.rest.len});
+        }
         in = f.rest;
         if (f.ev.kind == ARIEL_EV_NONE) {
             return;
@@ -1260,7 +1433,13 @@ static void termfeedbytes(Term *t, Str data)
         } else if (f.ev.kind==ARIEL_EV_MARK && t->hooked) {
             TermMark m = termmarkparse({f.ev.data.data, f.ev.data.len},
                                        {t->nonce, countof(t->nonce)});
-            t->lastmark = m.ok ? m.kind : t->lastmark;
+            if (!m.ok) {
+                continue;
+            }
+            t->lastmark = m.kind;
+            if (st!=TRUN_NONE && termrunstep(&t->srun, TRUN_MARK, m, os_ticks(e->os))) {
+                ariel_reset(t->rscreen.screen, ARIEL_RESET_FULL);
+            }
         }
     }
 }
@@ -1273,14 +1452,14 @@ static void termfeedbytes(Term *t, Str data)
 static void termfeedscreen(Engine *e, Term *t, Str data)
 {
     if (!t->candlen || os_ticks(e->os)-t->candat>(i64)TERM_TYPEAHEAD*SEC) {
-        termfeedbytes(t, data);
+        termfeedbytes(e, t, data);
         return;
     }
     u8 row[1024];
     for (iz i = 0; t->candlen;) {
         iz j = i;
         for (; j<data.len && data[j]!='\r' && data[j]!='\n'; j++) {}
-        termfeedbytes(t, Str{data.data+i, j-i});
+        termfeedbytes(e, t, Str{data.data+i, j-i});
         if (termprompt(termcursorrow(t, row, countof(row)))) {
             termsecretadd(&e->terms->secrets, {t->cand, t->candlen}, 2);
             t->candlen = 0;
@@ -1288,13 +1467,13 @@ static void termfeedscreen(Engine *e, Term *t, Str data)
         if (j == data.len) {
             return;
         }
-        termfeedbytes(t, Str{data.data+j, 1});
+        termfeedbytes(e, t, Str{data.data+j, 1});
         i = j + 1;
         if (i == data.len) {
             return;
         }
         if (!t->candlen) {
-            termfeedbytes(t, cuthead(data, i));
+            termfeedbytes(e, t, cuthead(data, i));
             return;
         }
     }
@@ -1987,6 +2166,8 @@ static Str termstart(Engine *e, Arena *scratch, i64 id, Json *j, Session *s, Str
     copybytes(t->cwd, cwd.data, t->cwdlen);
     t->hooked = nonce.len > 0;
     copybytes(t->nonce, nonce.data, nonce.len);
+    t->cols   = termsize(j).cols;
+    t->rows   = termsize(j).rows;
     if (run.on) {
         Str first = termrunfirst(run.text, &t->runlines);
         t->run        = 1;
@@ -2058,6 +2239,51 @@ static void termopen(Engine *e, Arena scratch, i64 id, Json *j)
     }
 }
 
+static void termrunend(Engine *, Arena, Term *, i32);
+static void termrunheed(Engine *, Arena, Term *, i64);
+
+// A Run typed at the prompt (term.input's run {from, key, first,
+// lines}): tracked by its marks, if the shell is hooked, its screen
+// kept, it is no term.open run, and the last mark was a prompt with
+// nothing of another Run's still going; one of them over is told
+// first. Else it is only typing.
+static void termrunarm(Engine *e, Arena scratch, Term *t, Json *rj)
+{
+    Str from  = jsonstr(jsonget(rj, "from"));
+    Str key   = jsonstr(jsonget(rj, "key"));
+    Str first = jsonstr(jsonget(rj, "first"));
+    i64 lines = jsonint(jsonget(rj, "lines"), 0);
+    u64 k     = 0;
+    b32 ok    = key.len==16 && validsid(from) && from.len<=countof(t->from) &&
+                lines>=1 && lines<=TERM_RUNTEXT;
+    for (iz i = 0; ok && i < key.len; i++) {
+        i32 v = hexval(key[i]);
+        ok = v >= 0;
+        k  = k<<4 | (u64)(v<0 ? 0 : v);
+    }
+    if (!ok || !t->hooked || !t->screen || t->run || t->exited || t->lastmark!='A') {
+        return;
+    } else if (t->srun.state==TRUN_ARMED || t->srun.state==TRUN_RUNNING) {
+        return;
+    } else if (t->srun.state == TRUN_ENDED) {
+        termrunend(e, scratch, t, TEND_DONE);
+    }
+    if (!termblock(e, &t->rscreen, TERM_RUNHIST, t->cols, t->rows)) {
+        return;
+    }
+    first = first.len>TERM_RUNLINE ? utf8head(first, TERM_RUNLINE) : first;
+    first = cut(first, '\n').head;
+    t->srun         = {};
+    t->srun.state   = TRUN_ARMED;
+    t->srun.armedat = os_ticks(e->os);
+    t->runkey       = k;
+    t->runlines     = (i32)lines;
+    t->runlinelen   = first.len;
+    copybytes(t->runline, first.data, first.len);
+    t->fromlen      = from.len;
+    copybytes(t->from, from.data, from.len);
+}
+
 // A command of a terminal's (term.input, term.resize, term.ack and
 // term.close), none of them with a reply: one naming no terminal of the
 // frontend's is dropped, as after its end.
@@ -2081,10 +2307,17 @@ static void termcmd(Engine *e, Arena scratch, i32 cmd, Json *j)
     }
     switch (cmd) {
     case CMD_TERMINPUT: {
-        Unbase64 u = unbase64(&scratch, jsonstr(jsonget(j, "data")));
-        if (u.ok && u.data.len && u.data.len<=TERM_INPUT) {
-            termtyped(e, scratch, t, u.data);
+        Json    *rj  = jsonget(j, "run");
+        b32      run = rj->type == JSON_OBJECT;
+        Unbase64 u   = unbase64(&scratch, jsonstr(jsonget(j, "data")));
+        if (u.ok && u.data.len && u.data.len<=(run ? TERM_RUNINPUT : TERM_INPUT)) {
+            termtyped(e, scratch, t, u.data);  // scans first: the last mark
             t->used = os_ticks(e->os);
+            if (run) {
+                termrunarm(e, scratch, t, rj);
+            } else if (cut(u.data, '\r').ok || cut(u.data, '\n').ok) {
+                termrunstep(&t->srun, TRUN_TYPED, {}, t->used);
+            }
             os_procwrite(e->os, t->proc, u.data);
         }
     } break;
@@ -2093,11 +2326,14 @@ static void termcmd(Engine *e, Arena scratch, i32 cmd, Json *j)
         PtySize z = termsize(j);
         if (t->screen) {
             termscan(e, t);
-            if (z.cols>t->capcols || z.rows>t->caprows) {
-                termscreenblock(e, t, z.cols, z.rows);
-            }
-            ariel_resize(t->screen, z.cols, z.rows, z.xpx/z.cols, z.ypx/z.rows);
+            termblocksize(e, &t->scr, t->hist, z);
+            t->screen = t->scr.screen;
         }
+        if (t->rscreen.screen) {
+            termblocksize(e, &t->rscreen, TERM_RUNHIST, z);
+        }
+        t->cols = z.cols;
+        t->rows = z.rows;
         os_ptyresize(e->os, t->proc, z);
     } break;
     case CMD_TERMACK: {
@@ -2152,6 +2388,12 @@ static b32 termrecord(Engine *e, Arena scratch, Record r)
         termscan(e, t);
         termnotice(e, scratch, t);
     }
+    if (t->srun.state && t->exited && t->eof) {
+        // Hung up (closed), the screen was read up to its end already
+        termscan(e, t);
+        i32 why = t->srun.state==TRUN_ENDED ? TEND_DONE : t->closed ? TEND_CUT : TEND_EXIT;
+        termrunend(e, scratch, t, why);
+    }
     if (t->closed) {
         termsettle(e, t);  // frees or keeps it once both are in
     } else {
@@ -2180,6 +2422,7 @@ static void termtick(Engine *e, Arena scratch)
             continue;
         }
         termpump(e, scratch, t);
+        termrunheed(e, scratch, t, now);
         if (look && t->proc && !t->exited) {
             b32 busy = os_ptybusy(e->os, t->proc);
             if (busy != t->busy) {
@@ -2212,6 +2455,9 @@ static i64 termnext(Engine *e, i64 now)
         Term *t = &e->terms->slots[i];
         if (t->tid && !t->closed && t->stallat && t->stallat<next) {
             next = t->stallat;
+        }
+        if (t->tid && t->srun.state==TRUN_ENDED && t->srun.settleat<next) {
+            next = t->srun.settleat;
         }
     }
     return next;
@@ -2318,6 +2564,11 @@ static void termlistline(Buf *b, Arena *a, Term *t, TermSecrets *ss, iz *hidden)
         print(b, (i64)t->code);
     } else if (t->run) {
         print(b, ", running");
+    } else if (t->srun.state==TRUN_ARMED || t->srun.state==TRUN_RUNNING) {
+        print(b, ", running `");
+        print(b, termmask(a, {t->runline, t->runlinelen}, ss, hidden));
+        print(b, t->runlines>1 ? Str("`... (the user ran it from your message)")
+                               : Str("` (the user ran it from your message)"));
     } else if (t->busy) {
         print(b, ", a program is running");
     } else {
@@ -2361,13 +2612,13 @@ static Str termlast(Arena *a, Str text, i64 n, iz max, b32 *more)
 
 // A screen's whole text, wrapped rows joined, with the secrets hidden
 // before anything cuts it, so that none is cut in two.
-static Str termscreentext(Arena *a, Term *t, TermSecrets *ss, iz *hidden)
+static Str termscreentext(Arena *a, ariel_Term *screen, TermSecrets *ss, iz *hidden)
 {
-    ariel_select(t->screen, ARIEL_SEL_ALL, 0, 0);
-    iz  len = ariel_copy(t->screen, 0, 0);
+    ariel_select(screen, ARIEL_SEL_ALL, 0, 0);
+    iz  len = ariel_copy(screen, 0, 0);
     u8 *raw = len>0 ? alloc<u8>(a, len) : 0;
-    len     = len>0 ? ariel_copy(t->screen, raw, len) : 0;
-    ariel_select(t->screen, ARIEL_SEL_CLEAR, 0, 0);
+    len     = len>0 ? ariel_copy(screen, raw, len) : 0;
+    ariel_select(screen, ARIEL_SEL_CLEAR, 0, 0);
     return termmask(a, trimright(Str{raw, len}), ss, hidden);
 }
 
@@ -2401,6 +2652,20 @@ static Session *termnoticeto(Engine *e, Arena scratch, Str sid)
         s->closed = 1;  // as it was: no frontend has it open
     }
     return s;
+}
+
+// A notice "terminal" for a session, at its next request, never
+// starting a turn: one of the same Run not yet delivered gives way.
+static void termnoticeput(Session *s, Notice n)
+{
+    n.text = clone(&s->perm, n.text);
+    for (iz i = 0; i < s->notices.len; i++) {
+        if (s->notices[i].kind=="terminal" && s->notices[i].key==n.key) {
+            s->notices[i] = n;
+            return;
+        }
+    }
+    s->notices = push(&s->perm, s->notices, n);
 }
 
 // A Run ended, or its tab closed while it ran: tell the session whose
@@ -2449,7 +2714,7 @@ static void termnotice(Engine *e, Arena scratch, Term *t)
     }
     printelapsed(&b, ms);
     print(&b, ".");
-    Str  text = t->screen ? termscreentext(&scratch, t, ss, &hidden) : Str{};
+    Str  text = t->screen ? termscreentext(&scratch, t->screen, ss, &hidden) : Str{};
     b32  more = 0;
     Str  last = termlast(&scratch, text, 20, 2<<10, &more);
     if (last.len) {
@@ -2466,18 +2731,133 @@ static void termnotice(Engine *e, Arena scratch, Term *t)
     }
     Notice n = {};
     n.kind = "terminal";
-    n.text = clone(&s->perm, finish(&b));
+    n.text = finish(&b);
     n.tid  = t->tid;
     n.code = t->cut ? -1 : t->signal ? 128+t->signal : t->code;
     n.ms   = ms;
     n.key  = t->runkey;
-    for (iz i = 0; i < s->notices.len; i++) {
-        if (s->notices[i].kind=="terminal" && s->notices[i].key==n.key) {
-            s->notices[i] = n;
-            return;
+    termnoticeput(s, n);
+}
+
+// A Run typed at the shell's prompt is over, as its marks said (why
+// TEND_DONE), or not knowing how: its tab closed, or its shell ended.
+// Tell the session it came from, as termnotice does, with what it
+// printed (its own screen), and let it go.
+static void termrunend(Engine *e, Arena scratch, Term *t, i32 why)
+{
+    PromptRun r = t->srun;
+    t->srun = {};
+    if (r.state==TRUN_NONE || !termagent(e)) {
+        termblockfree(e, &t->rscreen);
+        return;
+    }
+    Session *s = termnoticeto(e, scratch, {t->from, t->fromlen});
+    if (!s) {
+        termblockfree(e, &t->rscreen);
+        return;
+    }
+    TermSecrets *ss     = &e->terms->secrets;
+    iz           hidden = 0;
+    i64          now    = os_ticks(e->os);
+    b32          begun  = r.state==TRUN_RUNNING || (r.state==TRUN_ENDED && !r.unrun);
+    i64          ms     = ((r.state==TRUN_ENDED ? r.endat : now) -
+                           (begun ? r.startat : r.armedat)) / MS;
+    Buf          b(&scratch, 4096);
+    print(&b, "The user ran `");
+    print(&b, termmask(&scratch, {t->runline, t->runlinelen}, ss, &hidden));
+    print(&b, "`");
+    if (t->runlines > 1) {
+        print(&b, "... (");
+        print(&b, (i64)t->runlines);
+        print(&b, " lines)");
+    }
+    print(&b, " from your message at the prompt of terminal ");
+    print(&b, t->tid);
+    print(&b, "'s shell. ");
+    i32 code = -1;
+    if (why==TEND_CUT && !begun) {
+        print(&b, "Its tab was closed before it ran.");
+    } else if (why==TEND_EXIT && !begun) {
+        print(&b, "Its shell ended before it ran.");
+    } else if (why == TEND_CUT) {
+        print(&b, "Its tab was closed while it ran, after ");
+        printelapsed(&b, ms);
+        print(&b, ".");
+    } else if (why==TEND_EXIT && r.state!=TRUN_ENDED) {
+        print(&b, "Its shell ended while it ran, after ");
+        printelapsed(&b, ms);
+        if (t->exited && !t->signal) {
+            print(&b, ", with code ");
+            print(&b, (i64)t->code);
+        }
+        print(&b, ".");
+    } else if (r.unrun) {
+        print(&b, "The shell ran nothing of it: a syntax error, or a line it took as no "
+                  "command.");
+    } else if (r.hascode) {
+        code = r.code;
+        print(&b, "It exited with code ");
+        print(&b, (i64)r.code);
+        print(&b, " after ");
+        printelapsed(&b, ms);
+        print(&b, ".");
+    } else {
+        print(&b, "It ended after ");
+        printelapsed(&b, ms);
+        print(&b, ", but its shell did not say with what status.");
+    }
+    Str  text = t->rscreen.screen ? termscreentext(&scratch, t->rscreen.screen, ss, &hidden)
+                                  : Str{};
+    b32  more = 0;
+    Str  last = termlast(&scratch, text, 20, 2<<10, &more);
+    if (last.len) {
+        print(&b, r.unrun ? Str(" Its terminal shows:\n") : Str(" Its output ends with:\n"));
+        print(&b, last);
+    } else if (begun) {
+        print(&b, " It printed nothing.\n");
+    } else {
+        print(&b, "\n");
+    }
+    if (hidden) {
+        print(&b, "[secrets typed at password prompts are hidden as [hidden]]\n");
+    }
+    if (why==TEND_DONE && t->screen && !t->closed) {
+        print(&b, "read_terminal reads the terminal while its tab is open.\n");
+    }
+    termblockfree(e, &t->rscreen);
+    Notice n = {};
+    n.kind = "terminal";
+    n.text = finish(&b);
+    n.tid  = t->tid;
+    n.code = code;
+    n.ms   = ms;
+    n.key  = t->runkey;
+    termnoticeput(s, n);
+}
+
+// A Run's end, if it is over.
+static void termrunheed(Engine *e, Arena scratch, Term *t, i64 now)
+{
+    if (termrundue(&t->srun, now)) {
+        termrunend(e, scratch, t, TEND_DONE);
+    }
+}
+
+// Before a request: every Run of the session's that ended goes in now,
+// settled or not, so that none misses it.
+static void termheed(Session *s, Arena scratch)
+{
+    Engine *e = s->e;
+    for (i32 i = 0; e->terms && i < TERM_MAX; i++) {
+        Term *t = &e->terms->slots[i];
+        if (!t->tid || !t->srun.state || !(Str{t->from, t->fromlen}==s->sid)) {
+            continue;
+        }
+        termscan(e, t);  // its prompt may be in, not yet read
+        if (t->srun.state == TRUN_ENDED) {
+            termrunend(e, scratch, t, TEND_DONE);
         }
     }
-    s->notices = push(&s->perm, s->notices, n);
 }
 
 static void toolreadterm(Session *s, Arena scratch, Args *args)
@@ -2544,7 +2924,7 @@ static void toolreadterm(Session *s, Arena scratch, Args *args)
         // the secrets before it is cut, so that none is cut in two
         termscan(e, pick);
         iz  h    = 0;
-        Str text = termscreentext(&scratch, pick, ss, &h);
+        Str text = termscreentext(&scratch, pick->screen, ss, &h);
         hidden  += h;
         b32 more = 0;
         Str last = termlast(&scratch, text, args->lines ? args->lines : (i64)TERM_READLINES,
@@ -2565,7 +2945,9 @@ static void toolreadterm(Session *s, Arena scratch, Args *args)
         if (pick->readfed && pick->fed==pick->readfed) {
             print(&b, "[no new output since you last read it]\n");
         }
-        if (pick->run && !pick->exited && !pick->closed && pick->fromlen) {
+        i32  st  = pick->srun.state;
+        b32  ours = (pick->run || st==TRUN_ARMED || st==TRUN_RUNNING) && pick->fromlen;
+        if (ours && !pick->exited && !pick->closed) {
             print(&b, "[it still runs: you are told when it ends, at your next "
                       "request, so do not poll it]\n");
         }
