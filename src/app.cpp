@@ -14505,6 +14505,7 @@ enum : i32 {
     T_CLOSECANCEL,
     T_OTHERSESS,   // the first session in the sidebar not shown
     T_SHOWNSESS,   // the shown session's row in the sidebar
+    T_KIDROW,      // the sidebar row of the shown session's latest subagent
     T_TOPTEXT,     // near the transcript's top edge
     T_SESSTITLE,   // the sidebar's session whose title starts with text
     T_ADDNAME,     // the new endpoint's name field
@@ -14905,6 +14906,8 @@ enum : i32 {
                       // saying that its asks are denied
     CHK_FARSHOWN,     // the subagent on far is shown, linked to its parent
     CHK_FARCLOSED,    // the parent closed, and its subagents' views on far
+    CHK_FARKIDCLOSED, // its subagent on far closed from its row's menu, the
+                      // parent still open and shown
     CHK_TOAST,        // a toast since OP_TOASTMARK, the latest with text in
                       // its title or body
     CHK_NOTOAST,      // no toast since OP_TOASTMARK
@@ -15301,6 +15304,7 @@ static Str chknames[] = {
     "a host the user disconnected stays so, the task row saying so",
     "Open subagent connected again and showed it, linked to its parent",
     "closing the parent closed its subagent's view on far",
+    "its row's Close closed the subagent on far, its parent still shown",
     "a toast told of it", "no toast told of anything",
     "the toast was withdrawn", "the toast's click showed its session",
     "[ui] notify is as set",
@@ -20742,9 +20746,10 @@ static DriveOp thinops[] = {
 // the parent's engine, this window's, starts each on the remote far (the
 // Far stand-in), and the window reaches it there by the same name. One
 // that asks: opened here and nested under its parent, its ask answered
-// from its card. One that sleeps: far disconnected by the user stays so,
-// the task row saying so, until Open subagent connects again; its link
-// leads back. Closing the parent closes its subagents' views.
+// from its card, then closed from its row's menu. One that sleeps: far
+// disconnected by the user stays so, the task row saying so, until Open
+// subagent connects again; its link leads back. Closing the parent
+// closes its subagents' views.
 static DriveOp hosttaskops[] = {
     {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
     {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
@@ -20772,6 +20777,14 @@ static DriveOp hosttaskops[] = {
     {OP_WAIT, W_IDLE, 0, 0, 30000, ""},
     {OP_CHECK, CHK_FARREPORT, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "hosttask-3-report"},
+    // Closed from its row's menu, whose row is drawn on after the menu
+    {OP_MOVE, T_KIDROW, 0, 0, 100, ""},
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Close"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_FARKIDCLOSED, 0, 0, 0, ""},
     // Disconnected by the user while one sleeps there
     {OP_PROMPT, 0, 0, 0, 0, "Start a slow subagent on far."},
     {OP_WAIT, W_FARKID, 0, 0, 60000, ""},
@@ -23795,6 +23808,8 @@ static ImVec2 namedpos(Gui *g, Str text)
     return v2(-1, -1);
 }
 
+static GuiSession *drivekid(Gui *, b32);
+
 static ImVec2 targetpos(Gui *g, i32 t)
 {
     switch (t) {
@@ -23821,6 +23836,10 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_CLOSECANCEL: return rectcenter(g->rects[RECT_CLOSECANCEL]);
     case T_OTHERSESS:   return rectcenter(g->rects[RECT_OTHERSESS]);
     case T_SHOWNSESS:   return g->sess ? rectcenter(g->sess->row) : v2(-1, -1);
+    case T_KIDROW: {
+        GuiSession *k = drivekid(g, 0);
+        return k ? rectcenter(k->row) : v2(-1, -1);
+    }
     case T_THEMECOMBO:  return rectcenter(g->rects[RECT_THEMECOMBO]);
     case T_LONGFIELD:   return rectcenter(g->rects[RECT_LONGFIELD]);
     case T_TASKLINK:    return rectcenter(g->rects[RECT_TASKLINK]);
@@ -27056,6 +27075,16 @@ static b32 drivecheck(Gui *g, i32 chk)
             open += s->view && s->host->kind==GH_REMOTE && sessup(g, s)==g->drivemain;
         }
         return g->drivemain && !g->drivemain->view && !open;
+    }
+    case CHK_FARKIDCLOSED: {
+        i32 kids = 0, open = 0;
+        for (GuiSession *s = g->sessions; s; s = s->next) {
+            b32 kid = s->host->kind==GH_REMOTE && sessup(g, s)==g->drivemain;
+            kids += kid;
+            open += kid && s->view;
+        }
+        return g->drivemain && g->drivemain->view && g->sess==g->drivemain &&
+               kids && !open;
     }
     case CHK_PARENTSHOWN:
         return g->sess && g->sess==g->drivemain;

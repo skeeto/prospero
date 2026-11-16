@@ -9513,6 +9513,9 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other, 
         sessitems(g, a, s);
         ImGui::EndPopup();
     }
+    // Its menu's Close lets its view go (sessclose), arenas and all
+    v     = s->view;
+    state = v ? v->state : s->state;
     dragsource(g, a, s);
     droptarget(g, a, s->host, r->group, r->archived,
                r->archived ? Str("Archived") : r->group.len ? r->group : Str("out of groups"));
