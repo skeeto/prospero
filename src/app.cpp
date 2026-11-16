@@ -21177,7 +21177,11 @@ static DriveOp termops[] = {
     {OP_KEYDOWN, 0, GKEY_LEFT, KEY_ALT, 50, ""},
     {OP_KEYUP, 0, GKEY_LEFT, KEY_ALT, 300, ""},
     TERMKEY(GKEY_ENTER, 100),
+#if !defined(_WIN32)
+    // Windows' console reads a key in cooked mode as nothing, so there
+    // cat -v cannot show it: only that Back did not take it is checked
     {OP_WAIT, W_TERM, 0, 0, 5000, "[1;3D"},
+#endif
     CTRLKEY(GKEY_C, 300),
     {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
     {OP_CHECK, CHK_NAVDEPTH, 0, 0, 0, "kept"},

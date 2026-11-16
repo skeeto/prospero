@@ -1681,7 +1681,7 @@ def fs_late(t):
     slow = os.path.join(t.work, "slowfile.txt")
     hello = os.path.join(t.work, "hello.txt")
     for path, text in [(slow, "slow\n"), (hello, "hello\n")]:
-        with open(path, "w") as f:
+        with open(path, "w", newline="") as f:  # LF on Windows too
             f.write(text)
     c = Client(t)
     s = c.attach(env=env)
@@ -3429,7 +3429,7 @@ def relay_skill(t):
         for line in text.split("\n"):
             if line.startswith("Base directory for this skill: "):
                 base = line.split(": ", 1)[1]
-        t.check(os.sep.join(["sessions", sid, "skills", "notes"]) in base and
+        t.check(os.sep.join(["sessions", sid, "skills", "notes"]) in os.path.normpath(base) and
                 "copy of one from testbox" in text and "ARGUMENTS: the args" in text,
                 f"the skill's text {text!r}")
         t.check(len(te) == 2 and te[1]["status"] == "ok" and "the reference" in te[1]["text"],
@@ -3473,8 +3473,8 @@ def relay_skill(t):
             u = c.stream.wait(lambda r: r.get("ev") == "user" and r.get("sid") == sid and
                               f'<skill name="{name}"' in r.get("text", ""), timeout=30,
                               what=f"the user record of {name}")
-            want = os.sep.join(["sessions", sid, "skills", name])
-            t.check(want in u["text"] and "copy of one from testbox" in u["text"],
+            want = "/".join(["sessions", sid, "skills", name])
+            t.check(want in u["text"].replace("\\", "/") and "copy of one from testbox" in u["text"],
                     f"names the copy: {u['text'][:200]!r}")
             c.stream.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid
                           and r.get("ts", 0) >= u.get("ts", 0), timeout=30, what="turn.end")
