@@ -21895,6 +21895,7 @@ static DriveOp termops[] = {
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_WAIT, W_TERM, 0, 0, 10000, "\nrun-end-2"},
     {OP_CHECK, CHK_TERMCOUNT, 2, 0, 0, ""},
+    {OP_WAIT, W_RUNTO, 0, 0, 10000, "send"},  // its prompt back: it ended
     {OP_PROMPT, 0, 0, 0, 0, "Tell me how it ran."},
     {OP_WAIT, W_SAID, 0, 0, 20000, "Heard: exited with code 3"},
     // A quote left open: its continuation prompt, where no mark comes,
@@ -21943,9 +21944,12 @@ static DriveOp termops[] = {
     {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "terminal-run"},
     {OP_WAIT, W_TERM, 0, 0, 10000, "\nrun-end-1"},
+    {OP_WAIT, W_RUNTO, 0, 0, 10000, "send"},  // its prompt back: it ended
     {OP_PROMPT, 0, 0, 0, 0, "Tell me how it ran."},
     {OP_WAIT, W_SAID, 0, 0, 20000, "Heard: exited with code 3"},
-    CTRLKEY(GKEY_GRAVE, 500),
+    {OP_MOVE, T_TERMGRID, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
     {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
 #endif
     // Its shell's clean exit closes the new tab, the first one in front

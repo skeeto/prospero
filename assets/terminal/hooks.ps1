@@ -24,6 +24,7 @@ if ($global:__prospero_nonce) {
     $global:__prospero_ran  = $false  # a line was read since the last prompt
     $global:__prospero_seen = $false  # a prompt was shown
     $global:__prospero_code = $null   # LASTEXITCODE when it was read
+    $global:__prospero_err  = $null   # and the latest error record
     $global:__prospero_rl   = $null   # our PSConsoleHostReadLine
     $global:__prospero_prev = $function:prompt
 
@@ -43,6 +44,7 @@ if ($global:__prospero_nonce) {
             if ($line -and $line.Trim()) {
                 $global:__prospero_ran  = $true
                 $global:__prospero_code = $global:LASTEXITCODE
+                $global:__prospero_err  = if ($global:Error.Count) { $global:Error[0] } else { $null }
                 __prospero_mark 'C'
             }
             $line
@@ -54,7 +56,14 @@ if ($global:__prospero_nonce) {
         $ok   = $global:?
         $code = $global:LASTEXITCODE
         if ($global:__prospero_ran) {
-            $s = if ($ok) { 0 } elseif ($code -and $code -ne $global:__prospero_code) { $code } else { 1 }
+            # Failed: a native program's status if it set one, which it
+            # did if it changed, or if no cmdlet's error was recorded
+            # (the same status again); else a cmdlet's failure, 1
+            $e = if ($global:Error.Count) { $global:Error[0] } else { $null }
+            $new = $e -and ![object]::ReferenceEquals($e, $global:__prospero_err)
+            $s = if ($ok) { 0 }
+                 elseif ($code -and ($code -ne $global:__prospero_code -or !$new)) { $code }
+                 else { 1 }
             __prospero_mark "D;$s"
         } elseif ($global:__prospero_seen) {
             __prospero_mark 'D'

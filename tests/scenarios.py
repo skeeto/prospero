@@ -19209,6 +19209,58 @@ def termnotices(evs):
     return [e for e in evs if e.get("ev") == "notice" and e.get("kind") == "terminal"]
 
 
+@scenario(bound=150)
+def term_marks_pwsh(t):
+    """On Windows a PowerShell tab is hooked, and ConPTY passes its marks
+    through with its nonce: a native program's status, a failed cmdlet's
+    1, success 0, a bare D for an empty line; the nonce and the hooks'
+    path are gone from its environment, and PSReadLine still edits. A
+    Run typed there is told to the agent with its exit code."""
+    if not t.host.windows:
+        raise Skip("Windows only (term_marks_bash, term_marks_zsh on POSIX)")
+    h = t.headless()
+    try:
+        # As the window opens a tab for a PowerShell block, the session's
+        # shell sh
+        sid = readsession(t, h)
+        tt = Tty(t, h, sid, cols=200, shell="powershell")
+        t.check(tt.reply.get("nonce") and tt.reply.get("kind") == "ps", f"hooked: {tt.reply}")
+        markwait(tt, 1, 60)
+        # At its first prompt, as the window types a block into a new tab
+        text = ("echo run-start\n$n = [int](Get-Content runs -EA 0) + 1; Set-Content runs $n; "
+                "\"run-$n\"; Start-Sleep 2; \"run-end-$n\"; cmd /c exit 3")
+        runtype(tt, sid, text, "00000000000000c0")
+        markline(tt, "run-end-1", 30)
+        waitstatus(t, h, "runs", 0, within=15)
+        notes = termnotices(turnof(h, sid))
+        note = notes[0].get("text", "") if notes else ""
+        t.check(len(notes) == 1 and "It exited with code 3" in note, f"first prompt: {notes}, "
+                f"marks {marksof(tt)}")
+        markrun(tt, "cmd /c exit 3", ["C", "D;3", "A"], 30)
+        markrun(tt, "Get-Item C:/no-such-file-here", ["C", "D;1", "A"], 30)
+        markrun(tt, "Write-Output ok", ["C", "D;0", "A"], 30)
+        markrun(tt, "", ["D", "A"], 30)
+        markrun(tt, 'Write-Output "n=[$env:PROSPERO_TERM_NONCE] k=[$env:PROSPERO_TERM_HOOKS]"',
+                ["C", "D;0", "A"], 30)
+        got = markline(tt, "n=")
+        t.check(got.strip() == "n=[] k=[]", f"environment: {got!r}")
+        markrun(tt, 'Write-Output "psrl=$([bool](Get-Module PSReadLine))"', ["C", "D;0", "A"], 30)
+        got = markline(tt, "psrl=")
+        t.check(got.strip() == "psrl=True", f"PSReadLine: {got!r}")
+
+        text = "Write-Output run-start\nStart-Sleep 1\nWrite-Output run-end\ncmd /c exit 3"
+        runtype(tt, sid, text, "00000000000000c1")
+        markline(tt, "run-end", 30)
+        waitstatus(t, h, "runs", 0, within=15)
+        notes = termnotices(turnof(h, sid))
+        note = notes[0].get("text", "") if notes else ""
+        t.check(len(notes) == 1 and "It exited with code 3" in note and "run-end" in note,
+                f"notices {notes}")
+        h.send("term.close", tid=tt.tid, kill=True)
+    finally:
+        h.close()
+
+
 @scenario(bound=90, posix=True)
 def term_marks_run(t):
     """A Run typed at a hooked bash's prompt: read_terminal shows it
