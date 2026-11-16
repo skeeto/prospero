@@ -32,7 +32,8 @@ ssh destination as `{host}`.
 The agent can change the file too, through Prospero's own skill (see
 Skills). A write or edit of the file, or of a local file it includes,
 asks every time, with no "always", even inside an allowed directory
-(Bypass mode aside); once written, the configuration is read again at
+(Bypass mode aside), unless the file itself is granted for writes in
+the Permissions pane; once written, the configuration is read again at
 once, the agent is told of any problem in what it wrote, and the
 window takes up the change.
 

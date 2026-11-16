@@ -58,6 +58,11 @@ language picks, or the files `[ui] fonts` names. View → Layout, View's first i
 Standard, Compact (no right column, Terminal a tab beside Prompt) or Focus (one session), or as a layout
 saved under a name of its own, kept with the window's layout in the state
 directory; Ctrl+1 to Ctrl+9 (Cmd on macOS) pick them in that order.
+Session → Permissions... (or the shield at the session bar's right end)
+shows the Permissions pane: the paths the agent's file tools may read or
+write without asking, or never, and its desktop, MCP, web and container
+grants, each granted ahead or taken back for the session and its
+subagents, which the agent is told of.
 Session → Open file... (Ctrl+O, Cmd+O) shows a file on the session's host
 (this computer, or another whose engine reads it for the window) in the
 Files pane, hidden until then: in a tab of the session shown, its lines

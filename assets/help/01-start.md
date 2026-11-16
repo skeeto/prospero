@@ -88,7 +88,9 @@ so Ctrl+1 is Standard and Ctrl+4 the first you saved:
   back, under the prompt.
 
 Files stays hidden until a file is opened, then shows where the
-layout puts it, beside the plan, whichever layout is picked.
+layout puts it, beside the plan, whichever layout is picked. So do
+Changes and Permissions, shown from the session bar's branch and its
+shield.
 
 Arrange the panes as you like, by dragging their tabs and the borders
 between them, then View → Layout → Save layout... keeps that

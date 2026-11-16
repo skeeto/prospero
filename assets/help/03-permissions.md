@@ -40,8 +40,45 @@ A write or edit of Prospero's own configuration (its file, and the
 local files it includes) asks every time, even inside the working
 directory, the roots or a directory you always allowed, and offers no
 Always: the file chooses what runs and where the agent may go. Only
-Bypass mode writes it unasked. See
+Bypass mode writes it unasked, or a write grant on the file itself in
+the [Permissions pane](help:permissions#the-permissions-pane). See
 [Configuration](help:config#the-agent-changes-it).
+
+## The Permissions pane
+
+The shield at the top right of the Transcript, or **Permissions...**
+in the Session menu, shows the [Permissions](view:permissions) pane:
+what the agent may reach without asking, in this session and its
+subagents. Grant ahead what you expect it to need, or take back what
+it no longer does. The agent is told of each change before its next
+step. These rules hold the file tools, not shell commands, which the
+agent is told to keep to them too.
+
+Under **Folders and files**, the workspace comes first: the session's
+folder, the roots and the temporary directories, which you cannot
+change here. Then each path granted or denied, with three boxes:
+
+- **Read**: read it, and everything in it, without asking.
+- **Write**: write there too.
+- **Deny**: the file tools ask there every time, with no Always, even
+  inside the session's folder or a grant; grep and glob leave it out of
+  their results; and Bypass mode refuses it. A grant inside a denied
+  folder opens that part of it again: the deepest rule wins.
+
+Grants made by Always show here too, and can be taken back. Add a path
+in the field at the end, typed with completion. A folder granted for
+writes that holds Prospero's configuration still asks for it; grant
+the file itself for writes to let the agent change it unasked, each
+write reloading it.
+
+The other sections grant the desktop tool's classes (Input covers
+Observe; starting programs always asks), each MCP server's tools, web
+searches and the pages of a site, and container images for subagents,
+as far as the session offers them.
+
+Changes reach the session and its subagents open in this window or
+process. One not open keeps what it had until you change it in its
+own pane.
 
 ## Attended and unattended
 
@@ -79,6 +116,7 @@ cannot ask to plan, so that it neither waits on you nor leaves Bypass),
 and the harness still refuses:
 
 - writes under the state directory, other than the plan file;
+- paths denied in the [Permissions pane](help:permissions#the-permissions-pane);
 - a path that names nothing (one with a NUL byte);
 - a web page whose address never appeared in the conversation, or a
   local one.

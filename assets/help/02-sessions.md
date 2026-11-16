@@ -267,6 +267,14 @@ Only you turn on Bypass, from this list. A subagent has its parent's
 mode. Plan mode turns on or off only while the session is idle or
 waiting on an ask.
 
+## Permissions
+
+The shield at the session bar's right end shows the Permissions pane,
+and hides it again: what the agent may read, write, or never touch
+without asking, granted ahead or taken back, in this session and its
+subagents. The Session menu's **Permissions...** shows it too. See
+[Permissions and asks](help:permissions#the-permissions-pane).
+
 ## The branch and its changes
 
 In a git repository, the session bar shows the branch the session's
