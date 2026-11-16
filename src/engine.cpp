@@ -280,13 +280,32 @@ static i32 modefind(Str name)
     return -1;
 }
 
+// An "always allow" from the user, or a grant from the Permissions pane:
+// a path (a directory, or a file) the file tools may use from then on,
+// for reads alone or for writes too, or a class of desktop actions, in
+// the session and every session of its tree (see "Grants").
+struct Grant {
+    Str path;   // null for a desktop, MCP or web grant
+    b32 write;
+    u32 desk;   // a desktop grant's class, as its bit (1<<DESKC_*)
+    Str mcp;    // an MCP tool's name (mcp__SERVER__TOOL), or every tool
+                // of a server (mcp__SERVER)
+    Str web;    // "search" for every search, "fetch" for every page of
+    Str host;   // a host; for an MCP grant, its server's url by its
+                // SHA-256 (mcpurlkey), as it holds only while that stays
+    Str image;  // a container image subagents may run in (the task tool's)
+    b32 pane;   // given in the Permissions pane, not by an ask's answer:
+                // the agent is told of it (grantheed)
+};
+
 // Something for the agent to read before its next request: a job that
 // ended, files rewound, instructions for a directory, skills changed,
 // the mode, a message from another session, the report of a subagent
-// in the background.
+// in the background, its permissions changed.
 struct Notice {
     Str kind;    // "job", "rewind", "instructions", "skills", "budget",
-                 // "mode", "message", "task", "shell", "terminal"
+                 // "mode", "message", "task", "shell", "terminal",
+                 // "grants"
     Str text;
     i64 job;     // for "job"
     i32 mode;    // for "mode": MODE_*, the one it tells
@@ -301,6 +320,8 @@ struct Notice {
     i32 code;    // (-1 for its tab closed while it ran, 128+N for
     i64 ms;      // signal N), how long it ran, and its text's hash, by
     u64 key;     // which a newer one replaces it
+    Slice<Grant> grants;  // for "grants": what the agent knows of once
+    Slice<Str>   denies;  // told, whole (grantheed)
 };
 
 enum : i32 {
@@ -627,22 +648,6 @@ struct Ask {
     b32       held;     // the user chose to wait for it: no deadline (ask.hold)
 };
 
-// An "always allow" from the user: a path (a directory, or a file) the
-// file tools may use from then on, for reads alone or for writes too,
-// or a class of desktop actions, in the session and every session of
-// its tree (see "Grants").
-struct Grant {
-    Str path;   // null for a desktop, MCP or web grant
-    b32 write;
-    u32 desk;   // a desktop grant's class, as its bit (1<<DESKC_*)
-    Str mcp;    // an MCP tool's name (mcp__SERVER__TOOL), or every tool
-                // of a server (mcp__SERVER)
-    Str web;    // "search" for every search, "fetch" for every page of
-    Str host;   // a host; for an MCP grant, its server's url by its
-                // SHA-256 (mcpurlkey), as it holds only while that stays
-    Str image;  // a container image subagents may run in (the task tool's)
-};
-
 // A summary compaction under way (REQ_COMPACT).
 struct Compact {
     Endpoint  ep;        // the compactor
@@ -733,7 +738,12 @@ struct Session {
                             // instructions, memory and prefix wait for it
     Str          scratch;   // its scratch directory, null if none: a
                             // subagent's is its parent's
-    Slice<Grant> grants;    // "always allow" answers, inherited too
+    Slice<Grant> grants;    // "always allow" answers, inherited too, and
+                            // the Permissions pane's
+    Slice<Str>   denies;    // paths the user keeps the file tools out of
+                            // (the Permissions pane): holes in the guard
+    Slice<Grant> grantsheard;  // the grants the agent knows of, and the
+    Slice<Str>   deniesheard;  // denies (grantheed)
     Str          model;
     Str          title;
     b32          usertitle;  // the user named it (rename), not its prompt
@@ -1835,15 +1845,26 @@ static void userinput(Session *s)
 static void planheed(Session *, Arena);
 static void shellheed(Session *, Arena);
 static void termheed(Session *, Arena);
+static void grantheed(Session *, Arena);
+static void putgrant(JsonOut *, Grant);
+static iz   grantsize(Grant);
 static void deliver(Session *s, Arena scratch)
 {
     planheed(s, scratch);
     shellheed(s, scratch);
     termheed(s, scratch);
+    grantheed(s, scratch);
     for (iz i = 0; i < s->notices.len; i++) {
         Notice *n = &s->notices[i];
         Arena   a = scratch;
-        Buf     b(&a, 256 + n->text.len);
+        iz      size = 256 + n->text.len;
+        for (iz k = 0; k < n->grants.len; k++) {
+            size += grantsize(n->grants[k]);
+        }
+        for (iz k = 0; k < n->denies.len; k++) {
+            size += 16 + n->denies[k].len;
+        }
+        Buf     b(&a, size);
         EvOut   w = sbegin(s, &b, EV_NOTICE);
         putstrkey(&w.json, "kind", n->kind);
         if (n->job) {
@@ -1874,6 +1895,22 @@ static void deliver(Session *s, Arena scratch)
             putstrkey(&w.json, "shell", n->shell.name);
             putstrkey(&w.json, "path", n->shell.path);
         }
+        if (n->kind == "grants") {
+            putkey(&w.json, "grants");
+            putarray(&w.json);
+            for (iz k = 0; k < n->grants.len; k++) {
+                putobject(&w.json);
+                putgrant(&w.json, n->grants[k]);
+                putend(&w.json);
+            }
+            putend(&w.json);
+            putkey(&w.json, "denies");
+            putarray(&w.json);
+            for (iz k = 0; k < n->denies.len; k++) {
+                putstr(&w.json, n->denies[k]);
+            }
+            putend(&w.json);
+        }
         putstrkey(&w.json, "text", n->text);
         if (n->skills) {
             putskills(&w.json, s->skillseen, 0);
@@ -1893,6 +1930,10 @@ static void deliver(Session *s, Arena scratch)
             s->shellheard = n->shell;
             s->shellmiss  = {};
             s->shelluser  = 0;
+        }
+        if (n->kind == "grants") {
+            s->grantsheard = n->grants;
+            s->deniesheard = n->denies;
         }
     }
     s->notices = {};
@@ -2539,6 +2580,7 @@ static void farmail(Engine *, Arena, HostLink *, Record);
 static void farreoffer(Engine *, Arena);
 static b32  farctrok(Engine *, Arena);
 static Str  farctrimages(Engine *, Arena *, Arena);
+static Slice<Str> ctrimagelist(Arena *, Str);
 static b32  farctrlisted(Engine *, Arena, Str);
 static void farctrmail(Engine *, Arena, Record);
 
@@ -5145,6 +5187,30 @@ static b32 cfgfile(Session *s, Arena scratch, Str path)
     return 0;
 }
 
+// Whether a grant is a path's, not one of a class, a tool, the web or
+// an image.
+static b32 grantispath(Grant g)
+{
+    return !g.desk && !g.mcp.len && !g.web.len && !g.image.len;
+}
+
+// Whether the user let the agent write a configuration file unasked: a
+// write grant of the Permissions pane's that names the file itself. No
+// ask offers one (askcall), and a grant of a directory holding the file
+// leaves it asked about.
+static b32 cfggranted(Session *s, Arena scratch, Str path)
+{
+    Str real = cfgreal(s, &scratch, path);
+    for (iz i = 0; i < s->grants.len; i++) {
+        Grant *g = &s->grants[i];
+        if (g->pane && g->write && grantispath(*g) && g->path.len &&
+                cfgsame(s, cfgreal(s, &scratch, g->path), real)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 // A load of the configuration put to use: by the sessions, and by the
 // window, which a config event tells to ask for it again.
 static void reconfigure(Engine *, Arena);
@@ -5234,6 +5300,7 @@ struct PatchGuard {
     b32       many;
     Str       nul;
     Str       state;
+    GuardPath deny;  // in Bypass, a file the user denied: refused
 };
 
 static PatchGuard patchguard(Session *s, Arena *a, Patch *p, Str allowed)
@@ -5250,7 +5317,8 @@ static PatchGuard patchguard(Session *s, Arena *a, Patch *p, Str allowed)
             } else {
                 f->file = g.path;
             }
-            g.config = !bypassing(s) && cfgfile(s, *a, g.path);
+            g.config = !bypassing(s) && cfgfile(s, *a, g.path) &&
+                       !cfggranted(s, *a, g.path);
             if ((g.inside && !g.config) || g.path==allowed || g.path==r.out.path ||
                     isplanfile(s, g.path)) {
                 continue;
@@ -5262,6 +5330,8 @@ static PatchGuard patchguard(Session *s, Arena *a, Patch *p, Str allowed)
                 r.nul = g.path;
             } else if (!r.state.data && bypassrefuses(s, *a, g.path)) {
                 r.state = g.path;
+            } else if (!r.deny.path.data && g.deny.data && bypassing(s)) {
+                r.deny = g;
             }
         }
     }
@@ -5294,6 +5364,11 @@ static void runpatch(Session *s, Arena scratch, Args *args, Str allowed)
     } else if (pg.state.data) {
         Str text = guardstatedenial(&scratch, toolnames[TOOL_EDIT], pg.state,
                                     e->statedir, s->guard.cwd);
+        toolend(s, scratch, "denied", text, 0, 0, {}, 0);
+        return;
+    } else if (pg.deny.path.data) {
+        Str text = guarddenyrefusal(&scratch, toolnames[TOOL_EDIT], pg.deny.path,
+                                    pg.deny.deny);
         toolend(s, scratch, "denied", text, 0, 0, {}, 0);
         return;
     } else if (pg.out.path.data && !bypassing(s)) {
@@ -5360,8 +5435,17 @@ static b32 readpdf(Session *, Arena, Str, Args *);
 // if the call finished, 0 if it goes on (a search).
 static b32 runfile(Session *s, Arena scratch, i32 tool, Str path, Args *args)
 {
+    Str deny = {};
+    if (bypassing(s) && !(tool==TOOL_EDIT && s->te.edit==EDIT_PATCH)) {
+        // Bypass asks about nothing, but keeps out of the user's denies
+        deny = guardpath(s->e->os, &scratch, &s->guard, path, toolreads(tool)).deny;
+    }
     if (cut(path, 0).ok && bypassing(s)) {
         toolend(s, scratch, "denied", NULREFUSAL, 0, 0, {}, 0);
+        return 1;
+    } else if (deny.data) {
+        Str text = guarddenyrefusal(&scratch, toolnames[tool], path, deny);
+        toolend(s, scratch, "denied", text, 0, 0, {}, 0);
         return 1;
     } else if (tool==TOOL_GREP || tool==TOOL_GLOB) {
         return startsearch(s, scratch, tool, path, args);
@@ -5435,6 +5519,18 @@ static_assert(countof(bynames) == DENY_COUNT);
 // its root too, by "subagent". Every grant is given to every session of
 // the tree in memory, and logged by "parent" in those it was new to.
 // The frozen system prompt never names a grant.
+//
+// The Permissions pane gives grants too, by "user" with pane set, and
+// takes them back: a revoke record drops the grants it names, a path's
+// whatever their access, in every session of the tree in memory, as a
+// grant spreads. A session not in memory keeps what its log gave it.
+// The pane also keeps the file tools out of paths (deny records):
+// holes in the guard, where each use is asked about with no always,
+// Bypass refuses it, and searches leave the files out, unless a grant
+// inside opens a part again, as the deepest decision holds. The agent
+// is told of the pane's changes (grantheed), and learns of the rest
+// from its asks' answers. Engines before these records skip them, so
+// there a revoke or a deny does not hold.
 
 // The desktop classes a session's grants cover, as bits.
 static u32 deskgranted(Session *s)
@@ -5448,13 +5544,6 @@ static u32 deskgranted(Session *s)
     return r;
 }
 
-// Whether a grant is a path's, not one of a class, a tool, the web or
-// an image.
-static b32 grantispath(Grant g)
-{
-    return !g.desk && !g.mcp.len && !g.web.len && !g.image.len;
-}
-
 // A grant's strings in an arena.
 static Grant grantclone(Arena *a, Grant g)
 {
@@ -5464,6 +5553,13 @@ static Grant grantclone(Arena *a, Grant g)
     g.host  = g.host.len ? clone(a, g.host) : Str{};
     g.image = g.image.len ? clone(a, g.image) : Str{};
     return g;
+}
+
+// Whether two grants give the same, wherever they came from.
+static b32 grantsame(Grant a, Grant b)
+{
+    return a.path==b.path && !a.write==!b.write && a.desk==b.desk &&
+           a.mcp==b.mcp && a.web==b.web && a.host==b.host && a.image==b.image;
 }
 
 static b32 hasgrant(Session *s, Grant want)
@@ -5503,6 +5599,22 @@ static void guardgrants(Session *s, Arena *perm, Guard *g)
     }
 }
 
+// Note a grant the agent knows of without being told: one an ask of its
+// own was answered with (always), a skill's, or a copy of either. Of
+// the Permissions pane's, it hears from a notice (grantheed).
+static void grantknown(Session *s, Grant g)
+{
+    if (g.pane) {
+        return;
+    }
+    for (iz i = 0; i < s->grantsheard.len; i++) {
+        if (grantsame(s->grantsheard[i], g)) {
+            return;
+        }
+    }
+    s->grantsheard = push(&s->perm, s->grantsheard, grantclone(&s->perm, g));
+}
+
 // Give a session in memory a grant, from its next call on. Whether it
 // is new to the session.
 static b32 addgrant(Session *s, Grant g)
@@ -5512,11 +5624,278 @@ static b32 addgrant(Session *s, Grant g)
     }
     g = grantclone(&s->perm, g);
     s->grants = push(&s->perm, s->grants, g);
+    grantknown(s, g);
     if (grantispath(g)) {
         i32 flags = ROOT_HIDDEN | ROOT_MISSING | (g.write ? 0 : ROOT_READ);
         guardadd(s->e->os, &s->perm, &s->guard, g.path, flags);
     }
     return 1;
+}
+
+// Whether a revoke of r takes back grant g: a path's grant, whatever its
+// access, a class, an MCP grant by its name, whatever its url, the web
+// grant or the image.
+static b32 grantrevokes(Grant r, Grant g)
+{
+    if (r.desk) {
+        return g.desk == r.desk;
+    } else if (r.image.len) {
+        return g.image == r.image;
+    } else if (r.web.len) {
+        return g.web==r.web && g.host==r.host;
+    } else if (r.mcp.len) {
+        return g.mcp == r.mcp;
+    }
+    return grantispath(g) && r.path.len && g.path==r.path;
+}
+
+// Drop the grants that a revoke of r takes back: how many.
+static iz grantsdrop(Slice<Grant> *gs, Grant r)
+{
+    iz n = 0;
+    for (iz i = 0; i < gs->len; i++) {
+        if (!grantrevokes(r, (*gs)[i])) {
+            (*gs)[n++] = (*gs)[i];
+        }
+    }
+    iz dropped = gs->len - n;
+    gs->len = n;
+    return dropped;
+}
+
+// Where a list of denies has a path, as the pane gave it, else -1.
+static iz denyat(Slice<Str> denies, Str path)
+{
+    for (iz i = 0; i < denies.len; i++) {
+        if (denies[i] == path) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// Add a deny to a list, or with on false drop it: whether it changed.
+static b32 denyset(Arena *perm, Slice<Str> *denies, Str path, b32 on)
+{
+    iz at = denyat(*denies, path);
+    if (on && at<0) {
+        *denies = push(perm, *denies, clone(perm, path));
+        return 1;
+    } else if (!on && at>=0) {
+        for (iz i = at+1; i < denies->len; i++) {
+            (*denies)[i-1] = (*denies)[i];
+        }
+        denies->len--;
+        return 1;
+    }
+    return 0;
+}
+
+// Take back a session in memory's grants that r names, from its next
+// call on, its guard made anew without them. Whether it had any.
+static Guard sessionguard(Session *, Arena *);
+static b32 revokegrant(Session *s, Grant r)
+{
+    if (!grantsdrop(&s->grants, r)) {
+        return 0;
+    }
+    if (grantispath(r)) {
+        s->guard = sessionguard(s, &s->perm);
+    }
+    return 1;
+}
+
+// A session in memory's deny of a path, from its next call on, or with
+// on false its end: its guard made anew. Whether it changed.
+static b32 denypath(Session *s, Str path, b32 on)
+{
+    if (!denyset(&s->perm, &s->denies, path, on)) {
+        return 0;
+    }
+    s->guard = sessionguard(s, &s->perm);
+    return 1;
+}
+
+// A path's state among grants and denies, as the Permissions pane sets
+// it: "deny", "write", "read" or "none".
+static Str grantsat(Slice<Grant> gs, Slice<Str> denies, Str path)
+{
+    if (denyat(denies, path) >= 0) {
+        return "deny";
+    }
+    Str r = "none";
+    for (iz i = 0; i < gs.len; i++) {
+        if (grantispath(gs[i]) && gs[i].path==path) {
+            r = gs[i].write ? Str("write") : r=="write" ? r : Str("read");
+        }
+    }
+    return r;
+}
+
+// Whether a list holds a grant the same as g.
+static b32 grantin(Slice<Grant> gs, Grant g)
+{
+    for (iz i = 0; i < gs.len; i++) {
+        if (grantsame(gs[i], g)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// What the agent knows of its permissions after a summary, which may
+// have left out what it was told: the grants it knew of without being
+// told (grantknown), the pane's to be told again.
+static void grantforget(Session *s)
+{
+    s->grantsheard  = {};
+    s->deniesheard  = {};
+    for (iz i = 0; i < s->grants.len; i++) {
+        grantknown(s, s->grants[i]);
+    }
+}
+
+static Str grantclass(Grant);
+
+// One line of a "grants" notice: what changed of a grant of a kind other
+// than a path's, g, given or (on false) taken back.
+static void grantline(Buf *b, Grant g, b32 on)
+{
+    print(b, "\n- ");
+    if (g.desk) {
+        print(b, on ? Str("You may now use the desktop tool's ")
+                    : Str("The desktop tool's "));
+        print(b, grantclass(g));
+        print(b, on ? Str(" actions without asking.") : Str(" actions ask again."));
+    } else if (g.mcp.len) {
+        Str name = cuthead(g.mcp, 5);  // past "mcp__"
+        Cut c    = cut(name, '_');
+        b32 one  = c.ok && startswith(c.tail, "_");
+        print(b, on ? Str("You may now call ") : Str("Calls to "));
+        if (one) {
+            print(b, "the MCP tool ");
+            print(b, g.mcp);
+        } else {
+            print(b, "the tools of the MCP server ");
+            print(b, name);
+        }
+        print(b, on ? Str(" without asking.") : Str(" ask again."));
+    } else if (g.web == "search") {
+        print(b, on ? Str("You may now search the web without asking.")
+                    : Str("Web searches ask again."));
+    } else if (g.web.len) {
+        print(b, on ? Str("You may now fetch pages of ") : Str("Fetching pages of "));
+        print(b, g.host);
+        print(b, on ? Str(" without asking.") : Str(" asks again."));
+    } else if (g.image.len) {
+        print(b, on ? Str("You may now start subagents in the container image ")
+                    : Str("Subagents in the container image "));
+        print(b, g.image);
+        print(b, on ? Str(" without asking.") : Str(" ask again."));
+    }
+}
+
+// One line of a "grants" notice: a path's state, from was to now.
+static void grantpathline(Session *s, Arena scratch, Buf *b, Str path, Str was, Str now)
+{
+    print(b, "\n- ");
+    if (now == "write") {
+        print(b, "You may now read and write ");
+        print(b, path);
+        print(b, " (and everything under it) without asking.");
+        if (cfgfile(s, scratch, path)) {
+            print(b, " It is Prospero's own configuration: a write there "
+                     "reloads it.");
+        }
+    } else if (now == "read") {
+        print(b, was=="write" ? Str("You may now only read ")
+                              : Str("You may now read "));
+        print(b, path);
+        print(b, was=="write" ? Str(" (and everything under it): writes there ask.")
+                              : Str(" (and everything under it) without asking."));
+    } else if (now == "deny") {
+        print(b, path);
+        print(b, " is denied: keep out of it by any route, the shell too. "
+                 "The file tools ask there, and searches leave it out.");
+    } else if (was == "deny") {
+        print(b, path);
+        print(b, " is no longer denied.");
+    } else {
+        print(b, "Your permission for ");
+        print(b, path);
+        print(b, " was taken back: the file tools ask there again, unless "
+                 "it is in your workspace.");
+    }
+}
+
+// Queue the notice of the user's changes in the Permissions pane, unless
+// the agent knows its permissions as they are: one notice for all the
+// changes since it was last told, a notice of them queued before gone.
+// Its record carries the whole set it leaves the agent knowing.
+static void grantheed(Session *s, Arena scratch)
+{
+    iz n = 0;
+    for (iz i = 0; i < s->notices.len; i++) {
+        if (!(s->notices[i].kind == "grants")) {
+            s->notices[n++] = s->notices[i];
+        }
+    }
+    s->notices.len = n;
+
+    Slice<Grant> was = s->grantsheard;
+    Slice<Str>   wasd = s->deniesheard;
+    Slice<Str>   paths = {};
+    for (iz i = 0; i < s->grants.len + was.len; i++) {
+        Grant g = i<s->grants.len ? s->grants[i] : was[i-s->grants.len];
+        if (grantispath(g) && g.path.len) {
+            paths = push(&scratch, paths, g.path);
+        }
+    }
+    for (iz i = 0; i < s->denies.len + wasd.len; i++) {
+        paths = push(&scratch, paths, i<s->denies.len ? s->denies[i]
+                                                       : wasd[i-s->denies.len]);
+    }
+
+    Buf b(&scratch, 1024);
+    print(&b, "The user changed your permissions in the Permissions pane:");
+    iz lines = 0;
+    for (iz i = 0; i < paths.len; i++) {
+        b32 seen = 0;
+        for (iz k = 0; k<i && !seen; k++) {
+            seen = paths[k] == paths[i];
+        }
+        Str from = grantsat(was, wasd, paths[i]);
+        Str to   = grantsat(s->grants, s->denies, paths[i]);
+        if (!seen && from!=to) {
+            grantpathline(s, scratch, &b, paths[i], from, to);
+            lines++;
+        }
+    }
+    for (i32 on = 1; on >= 0; on--) {
+        Slice<Grant> a = on ? s->grants : was;
+        Slice<Grant> z = on ? was : s->grants;
+        for (iz i = 0; i < a.len; i++) {
+            Grant g = a[i];
+            b32   proj = startswith(g.mcp, "project");
+            if (!grantispath(g) && !proj && !grantin(z, g)) {
+                grantline(&b, g, on);
+                lines++;
+            }
+        }
+    }
+    if (!lines) {
+        return;
+    }
+    print(&b, "\nThese hold for this session and its subagents, and cover "
+              "the file tools, not shell commands: keep to them there too.");
+    notify(s, "grants", finish(&b), 0);
+    Notice *t = &s->notices[s->notices.len-1];
+    for (iz i = 0; i < s->grants.len; i++) {
+        t->grants = push(&s->perm, t->grants, grantclone(&s->perm, s->grants[i]));
+    }
+    for (iz i = 0; i < s->denies.len; i++) {
+        t->denies = push(&s->perm, t->denies, clone(&s->perm, s->denies[i]));
+    }
 }
 
 // A grant record's grant, not cloned: zero (no path, no class) if it
@@ -5546,6 +5925,7 @@ static Grant grantof(Json *j)
         g.path  = jsonstr(jsonget(j, "path"));
         g.write = jsonstr(jsonget(j, "access")) == "write";
     }
+    g.pane = jsonint(jsonget(j, "pane"), 0) != 0;
     return g;
 }
 
@@ -5560,32 +5940,49 @@ static Str grantclass(Grant g)
     return {};
 }
 
-// The durable record of a grant: by "user" (req, the ask it answered),
-// "parent" (inherited) or "subagent" (from, the subagent it answered).
+// A grant's own keys, as its record has them (grantof): its kind's, and
+// a path's access.
+static void putgrant(JsonOut *w, Grant g)
+{
+    if (g.image.len) {
+        putstrkey(w, "image", g.image);
+    } else if (g.web.len) {
+        putstrkey(w, "web", g.web);
+        if (g.host.len) {
+            putstrkey(w, "host", g.host);
+        }
+    } else if (g.mcp.len) {
+        putstrkey(w, "mcp", g.mcp);
+        if (g.host.len) {
+            putstrkey(w, "sha256", g.host);
+        }
+    } else if (g.desk) {
+        putstrkey(w, "desktop", grantclass(g));
+    } else {
+        putstrkey(w, "path", g.path);
+        putstrkey(w, "access", g.write ? Str("write") : Str("read"));
+    }
+}
+
+// The size a record of g needs, besides its other keys.
+static iz grantsize(Grant g)
+{
+    return 64 + g.path.len + g.mcp.len + g.web.len + g.host.len + g.image.len;
+}
+
+// The durable record of a grant: by "user" (req, the ask it answered, or
+// pane, given in the Permissions pane), "parent" (inherited) or
+// "subagent" (from, the subagent it answered).
 static void loggrant(Session *s, Arena scratch, Grant g, Str by, Str req, Str from)
 {
     if (s->readonly) {
         return;
     }
-    Buf   b(&scratch, 256 + g.path.len + g.host.len + g.image.len + req.len + from.len);
+    Buf   b(&scratch, 256 + grantsize(g) + req.len + from.len);
     EvOut w = sbegin(s, &b, EV_GRANT);
-    if (g.image.len) {
-        putstrkey(&w.json, "image", g.image);
-    } else if (g.web.len) {
-        putstrkey(&w.json, "web", g.web);
-        if (g.host.len) {
-            putstrkey(&w.json, "host", g.host);
-        }
-    } else if (g.mcp.len) {
-        putstrkey(&w.json, "mcp", g.mcp);
-        if (g.host.len) {
-            putstrkey(&w.json, "sha256", g.host);
-        }
-    } else if (g.desk) {
-        putstrkey(&w.json, "desktop", grantclass(g));
-    } else {
-        putstrkey(&w.json, "path", g.path);
-        putstrkey(&w.json, "access", g.write ? Str("write") : Str("read"));
+    putgrant(&w.json, g);
+    if (g.pane) {
+        putintkey(&w.json, "pane", 1);
     }
     putstrkey(&w.json, "by", by);
     if (req.len) {
@@ -5625,6 +6022,106 @@ static void usergrant(Session *s, Arena scratch, Grant g, Str req, Str by)
             loggrant(t, scratch, g, "parent", {}, {});
         }
     }
+}
+
+// The durable record of a revoke of r's grants, or with deny of the
+// deny of r's path, by and from as for a grant's (loggrant). A path's
+// has no access, as it takes back every grant of the path.
+static void logrevoke(Session *s, Arena scratch, Grant r, b32 deny, Str by, Str from)
+{
+    if (s->readonly) {
+        return;
+    }
+    Buf   b(&scratch, 256 + grantsize(r) + from.len);
+    EvOut w = sbegin(s, &b, EV_REVOKE);
+    if (grantispath(r)) {
+        putstrkey(&w.json, "path", r.path);
+        if (deny) {
+            putintkey(&w.json, "deny", 1);
+        }
+    } else {
+        putgrant(&w.json, r);
+    }
+    putstrkey(&w.json, "by", by);
+    if (from.len) {
+        putstrkey(&w.json, "from", from);
+    }
+    ssend(s, &w);
+}
+
+// The durable record of a deny of a path, by and from as for a grant's.
+static void logdeny(Session *s, Arena scratch, Str path, Str by, Str from)
+{
+    if (s->readonly) {
+        return;
+    }
+    Buf   b(&scratch, 256 + path.len + from.len);
+    EvOut w = sbegin(s, &b, EV_DENY);
+    putstrkey(&w.json, "path", path);
+    putstrkey(&w.json, "by", by);
+    if (from.len) {
+        putstrkey(&w.json, "from", from);
+    }
+    ssend(s, &w);
+}
+
+// Who changed a grant or a deny, as a session t of s's tree logs it: by
+// "user" in s itself, "subagent" in its root (from s), "parent" in the
+// rest.
+struct TreeBy {
+    Str by;
+    Str from;
+};
+
+static TreeBy treeby(Session *s, Session *t)
+{
+    Session *root = treeroot(s);
+    b32      top  = root!=s && !root->psid.len;
+    TreeBy   r    = {};
+    r.by   = t==s ? Str("user") : t==root && top ? Str("subagent") : Str("parent");
+    r.from = t!=s && t==root && top ? s->sid : Str{};
+    return r;
+}
+
+// The user's revoke in the Permissions pane, from s: r's grants taken
+// back in each session of the tree in memory that had any, and logged
+// there (treeby). Whether any session had them.
+static b32 userrevoke(Session *s, Arena scratch, Grant r)
+{
+    Session *root = treeroot(s);
+    b32      any  = 0;
+    for (Session *t = s->e->sessions; t; t = t->next) {
+        if (treeroot(t)==root && revokegrant(t, r)) {
+            TreeBy b = treeby(s, t);
+            logrevoke(t, scratch, r, 0, b.by, b.from);
+            any = 1;
+        }
+    }
+    return any;
+}
+
+// The user's deny of a path in the Permissions pane, from s, or with on
+// false its end: in each session of the tree in memory that it changes,
+// and logged there (treeby). Whether any session changed.
+static b32 userdeny(Session *s, Arena scratch, Str path, b32 on)
+{
+    Session *root = treeroot(s);
+    b32      any  = 0;
+    for (Session *t = s->e->sessions; t; t = t->next) {
+        if (treeroot(t)!=root || !denypath(t, path, on)) {
+            continue;
+        }
+        TreeBy b = treeby(s, t);
+        if (on) {
+            logdeny(t, scratch, path, b.by, b.from);
+        } else {
+            Grant r = {};
+            r.path = path;
+            logrevoke(t, scratch, r, 1, b.by, b.from);
+        }
+        any = 1;
+    }
+    return any;
 }
 
 // Resolve the current call's ask: log the answer, then run the call, or
@@ -5775,10 +6272,12 @@ static b32 askcall(Session *s, Arena scratch, i32 tool, GuardPath *gp)
         h = guardhint(e->os, &scratch, &s->guard, gp->path, read, tool==TOOL_WRITE);
     }
     // What "always" would allow: a search's directory itself, else the
-    // directory the path is in
+    // directory the path is in; nothing in a path the user denied, which
+    // only the Permissions pane opens again
     b32 search = tool==TOOL_GREP || tool==TOOL_GLOB;
     b32 isdir  = search && os_stat(e->os, scratch, gp->path).type==STAT_DIR;
-    Str grant  = gp->config ? Str{} : guardgrant(&scratch, &s->guard, gp, isdir);
+    Str grant  = gp->config || gp->deny.data ? Str{}
+                 : guardgrant(&scratch, &s->guard, gp, isdir);
 
     Ask *k = &s->ask;
     *k = {};
@@ -5791,6 +6290,7 @@ static b32 askcall(Session *s, Arena scratch, i32 tool, GuardPath *gp)
     k->gp.inside   = gp->inside;
     k->gp.diverged = gp->diverged;
     k->gp.config   = gp->config;
+    k->gp.deny     = gp->deny.data ? clone(&s->perm, gp->deny) : Str{};
     k->hint.path   = h.path.data ? clone(&s->perm, h.path) : Str{};
     k->hint.exists = h.exists;
     k->opened      = os_ticks(e->os);
@@ -6905,6 +7405,7 @@ static void finishshell(Session *s, Arena scratch, b32 cancelled, b32 stopped = 
         se.ignorecase = s->sh.fold;
         se.windows    = s->te.windows;
         se.tagged     = s->te.edit == EDIT_HASHLINE;
+        se.guard      = &s->guard;
         ToolOut o = searchresult(e->os, &scratch, s->sh.spill, &se);
         Str status = cancelled ? Str("cancelled") : o.ok ? Str("ok") : Str("error");
         toolend(s, scratch, status, o.text, 0, 0, s->sh.rel, n);
@@ -14653,7 +15154,7 @@ static b32 runtool(Session *s, Arena scratch)
         b32       mine = isplanfile(s, g.path);  // the harness's own file
         b32       plan = planning(s) && !toolreads(tool);  // refused
         g.config = !toolreads(tool) && !mine && !plan && !bypass &&
-                   cfgfile(s, scratch, g.path);
+                   cfgfile(s, scratch, g.path) && !cfggranted(s, scratch, g.path);
         if ((!g.inside || g.config) && !mine && !plan && !bypass) {
             return askcall(s, scratch, tool, &g);
         }
@@ -15163,6 +15664,8 @@ static void compacted(Session *s, Arena scratch, Partial *p)
     planheed(s, scratch);
     s->shellheard = s->shellpre;  // and a shell other than the tool's
     shellheed(s, scratch);
+    grantforget(s);  // and the Permissions pane's changes
+    grantheed(s, scratch);
     wtheed(s, scratch);  // and a side chat in a worktree, where it works
     moveheed(s, scratch);  // and a fork into another folder, where it moved
     compactheed(s, scratch);  // and what it was told of its instructions
@@ -16348,36 +16851,70 @@ static Str lockpath(Arena *a, Session *s)
     return join(a, s->dir, "lock");
 }
 
+// A root of a session's workspace (wsroots), and where it comes from:
+// "cwd", "session" (its own extra roots), "config" ([guard] roots),
+// "scratch", "memory" or "temp".
+struct WsRoot {
+    Str path;
+    i32 flags;  // ROOT_*
+    Str why;
+};
+
 // The session's workspace: its working directory, its own extra roots,
 // and those of the configuration ("[guard] roots = A; B"). Then hidden
 // roots, which the system prompt leaves out: its scratch directory,
 // named in a section of its own, the system's temporary directories
-// unless "[guard] temp = ask", and the user's grants.
-static Guard sessionguard(Session *s, Arena *perm)
+// unless "[guard] temp = ask". Its guard (sessionguard) and the
+// Permissions pane (grants) both list them from here.
+static Slice<WsRoot> wsroots(Session *s, Arena *a)
 {
-    Engine    *e     = s->e;
-    Slice<Str> roots = {};
-    Slice<Str> conf  = cfgpaths(e->cfg, perm, "guard", "", "roots", e->home);
+    Engine        *e = s->e;
+    Slice<WsRoot>  r = {};
+    r = push(a, r, WsRoot{s->cwd, 0, "cwd"});
     for (iz i = 0; i < s->roots.len; i++) {
-        roots = push(perm, roots, s->roots[i]);
+        r = push(a, r, WsRoot{s->roots[i], 0, "session"});
     }
+    Slice<Str> conf = cfgpaths(e->cfg, a, "guard", "", "roots", e->home);
     for (iz i = 0; i < conf.len; i++) {
-        roots = push(perm, roots, conf[i]);
+        r = push(a, r, WsRoot{conf[i], 0, "config"});
     }
-    Guard g = newguard(e->os, perm, s->cwd, e->home, roots, s->dir, s->te.windows);
     if (s->scratch.len) {
-        guardadd(e->os, perm, &g, s->scratch, ROOT_HIDDEN|ROOT_MISSING);
+        r = push(a, r, WsRoot{s->scratch, ROOT_HIDDEN|ROOT_MISSING, "scratch"});
     }
     if (s->memdir.len) {
         // Read freely: the memory tool alone writes there
-        guardadd(e->os, perm, &g, s->memdir, ROOT_HIDDEN|ROOT_MISSING|ROOT_READ);
+        r = push(a, r, WsRoot{s->memdir, ROOT_HIDDEN|ROOT_MISSING|ROOT_READ, "memory"});
     }
     if (!s->tempask && trim(cfgget(e->cfg, "guard", "", "temp", 0))!="ask") {
         for (iz i = 0; i < e->tempdirs.len; i++) {
-            guardadd(e->os, perm, &g, e->tempdirs[i], ROOT_HIDDEN);
+            r = push(a, r, WsRoot{e->tempdirs[i], ROOT_HIDDEN, "temp"});
+        }
+    }
+    return r;
+}
+
+// The session's guard: its workspace (wsroots), the user's grants, then
+// the holes: the user's denies, and other sessions' worktrees.
+static Guard sessionguard(Session *s, Arena *perm)
+{
+    Engine       *e  = s->e;
+    Slice<WsRoot> ws = wsroots(s, perm);
+    Slice<Str>    roots = {};
+    for (iz i = 0; i < ws.len; i++) {
+        if (ws[i].why=="session" || ws[i].why=="config") {
+            roots = push(perm, roots, ws[i].path);
+        }
+    }
+    Guard g = newguard(e->os, perm, s->cwd, e->home, roots, s->dir, s->te.windows);
+    for (iz i = 0; i < ws.len; i++) {
+        if (ws[i].flags & ROOT_HIDDEN) {
+            guardadd(e->os, perm, &g, ws[i].path, ws[i].flags);
         }
     }
     guardgrants(s, perm, &g);
+    for (iz i = 0; i < s->denies.len; i++) {
+        guarddeny(e->os, perm, &g, s->denies[i]);
+    }
     if (!s->nofolder) {
         // The worktrees of its repository, other sessions' (worktree.cpp)
         Str root = instrroot(e->os, perm, s->cwd, s->te.windows);
@@ -17696,11 +18233,16 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err)
     for (iz i = 0; i < p->roots.len; i++) {
         s->roots = push(&s->perm, s->roots, clone(&s->perm, p->roots[i]));
     }
-    // The parent's scratch directory, and its grants (logged below)
+    // The parent's scratch directory, its grants and its denies (logged
+    // below): it hears of the pane's at its first request (grantheed)
     s->scratch = p->scratch.len ? clone(&s->perm, p->scratch) : Str{};
     for (iz i = 0; i < p->grants.len; i++) {
         Grant g = grantclone(&s->perm, p->grants[i]);
         s->grants = push(&s->perm, s->grants, g);
+        grantknown(s, g);
+    }
+    for (iz i = 0; i < p->denies.len; i++) {
+        s->denies = push(&s->perm, s->denies, clone(&s->perm, p->denies[i]));
     }
     s->model = clone(&s->perm, model);
     endpointconf(e, &s->perm, which, &s->ep);
@@ -17744,6 +18286,9 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err)
     }
     for (iz i = 0; i < s->grants.len; i++) {
         loggrant(s, scratch, s->grants[i], "parent", {}, {});
+    }
+    for (iz i = 0; i < s->denies.len; i++) {
+        logdeny(s, scratch, s->denies[i], "parent", {});
     }
     if (planning(p)) {
         setmode(s, scratch, MODE_PLAN, "parent");  // read-only for its task
@@ -20049,6 +20594,19 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
                 s->shellheard.path = clone(&s->perm, jsonstr(jsonget(j, "path")));
                 s->shellmiss       = {};
                 s->shelluser       = 0;
+            } else if (jsonstr(jsonget(j, "kind")) == "grants") {
+                // The whole set it left the agent knowing
+                s->grantsheard = {};
+                s->deniesheard = {};
+                for (Json *x = jsonget(j, "grants")->child; x; x = x->next) {
+                    Grant g = grantof(x);
+                    s->grantsheard = push(&s->perm, s->grantsheard,
+                                          grantclone(&s->perm, g));
+                }
+                for (Json *x = jsonget(j, "denies")->child; x; x = x->next) {
+                    s->deniesheard = push(&s->perm, s->deniesheard,
+                                          clone(&s->perm, jsonstr(x)));
+                }
             }
             break;
         case EV_SHELL: {
@@ -20062,11 +20620,30 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
         } break;
         case EV_GRANT: {
             // "Always allow", as the guard has it from then on, or a
-            // class of desktop actions
+            // class of desktop actions; known to the agent unless it was
+            // the pane's, or the cut took what it heard of it
             Grant g = grantof(j);
             if ((g.desk || g.path.len || g.mcp.len || g.web.len || g.image.len) &&
                     !hasgrant(s, g)) {
                 s->grants = push(&s->perm, s->grants, grantclone(&s->perm, g));
+                if (!gone) {
+                    grantknown(s, g);
+                }
+            }
+        } break;
+        case EV_REVOKE: {
+            // Taken back in the Permissions pane: grants, or a deny
+            Grant g = grantof(j);
+            if (jsonint(jsonget(j, "deny"), 0)) {
+                denyset(&s->perm, &s->denies, g.path, 0);
+            } else if (g.desk || g.path.len || g.mcp.len || g.web.len || g.image.len) {
+                grantsdrop(&s->grants, g);
+            }
+        } break;
+        case EV_DENY: {
+            Str path = jsonstr(jsonget(j, "path"));
+            if (path.len && !cut(path, 0).ok) {
+                denyset(&s->perm, &s->denies, path, 1);
             }
         } break;
         case EV_TASKREPORT:
@@ -20112,6 +20689,7 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             s->thinkfrom = r.seq;
             s->modeheard  = MODE_BUILD;  // told again (compacted)
             s->shellheard = s->shellpre;
+            grantforget(s);
         } break;
         case EV_ASSISTANT:
             m.seq  = r.seq;
@@ -20743,14 +21321,14 @@ static Notice noticecopy(Arena *a, Notice n)
 // its conversation changed (cut, uncut), so that it is as a revival, or
 // a restart, would make it: parked, then revived at once. What it was
 // to tell the agent next, which no log has yet, goes along, but for
-// its mode and shell, which a revival tells anew if need be. Null if
-// it cannot be read again, which leaves it parked.
+// its mode, shell and permissions, which a revival tells anew if need
+// be. Null if it cannot be read again, which leaves it parked.
 static Session *reload(Engine *e, Arena scratch, Session *s)
 {
     Slice<Notice> keep = {};
     for (iz i = 0; i < s->notices.len; i++) {
         Notice n = s->notices[i];
-        if (!(n.kind=="mode") && !(n.kind=="shell")) {
+        if (!(n.kind=="mode") && !(n.kind=="shell") && !(n.kind=="grants")) {
             keep = push(&scratch, keep, noticecopy(&scratch, n));
         }
     }
@@ -22134,6 +22712,285 @@ static void cmdshells(Engine *e, Arena scratch, i64 id)
     }
     putend(&w.json);
     emit(e, evend(&w));
+}
+
+// The Permissions pane (grants and grant)
+//
+// The pane lists a session's workspace, its grants and its denies, and
+// changes the grants and denies. Its changes reach the session's whole
+// tree in memory, as an "always" does (usergrant, userrevoke, userdeny),
+// and the agent hears of them before its next request (grantheed).
+// They hold the file tools, never the shell.
+
+// Whether a write grant's path holds one of the configuration's files,
+// other than as the file itself: those still ask (cfggranted).
+static b32 grantholdscfg(Session *s, Arena scratch, Str path)
+{
+    Config *c = s->e->cfg;
+    if (!c || !c->path.len) {
+        return 0;
+    }
+    b32 win  = s->te.windows;
+    Str real = cfgreal(s, &scratch, path);
+    for (iz i = 0; i < c->watch.len; i++) {
+        Str f = cfgreal(s, &scratch, c->watch[i]);
+        if (!cfgsame(s, f, real) && within(real, f, win)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// grants {sid}: the session's permissions, as the pane lists them.
+static void cmdgrants(Engine *e, Session *s, Arena scratch, i64 id)
+{
+    Slice<WsRoot> ws = wsroots(s, &scratch);
+    Buf   b(&scratch, 1<<14);
+    EvOut w = evbegin(&b, s->sid, 0, os_time(e->os), EV_REPLY);
+    putintkey(&w.json, "id", id);
+    putintkey(&w.json, "ok", 1);
+
+    putkey(&w.json, "roots");
+    putarray(&w.json);
+    for (iz i = 0; i < ws.len; i++) {
+        putobject(&w.json);
+        putstrkey(&w.json, "path", normpath(&scratch, s->cwd, ws[i].path, s->te.windows));
+        putstrkey(&w.json, "access", ws[i].flags&ROOT_READ ? Str("read") : Str("write"));
+        putstrkey(&w.json, "why", ws[i].why);
+        putend(&w.json);
+    }
+    putend(&w.json);
+
+    putkey(&w.json, "grants");
+    putarray(&w.json);
+    for (iz i = 0; i < s->grants.len; i++) {
+        Grant g = s->grants[i];
+        putobject(&w.json);
+        putgrant(&w.json, g);
+        if (g.pane) {
+            putintkey(&w.json, "pane", 1);
+        }
+        if (grantispath(g) && g.write) {
+            if (cfgfile(s, scratch, g.path)) {
+                putintkey(&w.json, "config", 1);
+            } else if (grantholdscfg(s, scratch, g.path)) {
+                putintkey(&w.json, "holds_config", 1);
+            }
+        }
+        putend(&w.json);
+    }
+    putend(&w.json);
+
+    putkey(&w.json, "denies");
+    putarray(&w.json);
+    for (iz i = 0; i < s->denies.len; i++) {
+        putstr(&w.json, s->denies[i]);
+    }
+    putend(&w.json);
+
+    // What else may be granted here, each kind's offer
+    putkey(&w.json, "offers");
+    putobject(&w.json);
+    putkey(&w.json, "desktop");
+    putbool(&w.json, !(s->te.deny & TOOL_OFFMASK));
+    putkey(&w.json, "mcp");
+    putarray(&w.json);
+    for (iz i = 0; i < s->mcpsrvs.len; i++) {
+        putstr(&w.json, s->mcpsrvs[i]->name);
+    }
+    putend(&w.json);
+    putkey(&w.json, "search");
+    putbool(&w.json, !(s->te.deny & (u32)1<<TOOL_WEBSEARCH));
+    putkey(&w.json, "fetch");
+    putbool(&w.json, !(s->te.deny & (u32)1<<TOOL_WEBFETCH));
+    putkey(&w.json, "containers");
+    putbool(&w.json, !(s->te.deny & (u32)1<<TOOL_TASK) && farctrok(e, scratch));
+    putkey(&w.json, "images");
+    putarray(&w.json);
+    Slice<Str> imgs = ctrimagelist(&scratch, cfgget(e->cfg, "container", "", "images", 0));
+    for (iz i = 0; i < imgs.len; i++) {
+        putstr(&w.json, imgs[i]);
+    }
+    putend(&w.json);
+    putend(&w.json);
+    emit(e, evend(&w));
+}
+
+// A path the pane names: absolute, normalized, "~" for the home
+// directory. Null, with err set, if it may not be granted or denied.
+static Str grantpath(Session *s, Arena *a, Str raw, Str *err)
+{
+    Engine  *e   = s->e;
+    b32      win = s->te.windows;
+    HomePath hp  = tildepath(a, trim(raw), e->home, win);
+    if (hp.err.len) {
+        *err = hp.err;
+        return {};
+    } else if (!hp.path.len || cut(hp.path, 0).ok) {
+        *err = "path is required";
+        return {};
+    }
+    Str path = win ? msysdrive(a, hp.path) : hp.path;
+    if (!pathroot(path, win)) {
+        *err = "the path must be absolute";
+        return {};
+    }
+    path = normpath(a, {}, path, win);
+    Str dir  = normpath(a, s->guard.cwd, e->statedir, win);
+    Str real = realpathof(e->os, a, dir, win);
+    Str want = realpathof(e->os, a, path, win);
+    if (within(dir, path, win) || (real.data && want.data && within(real, want, win))) {
+        *err = "Prospero's own state directory is never granted";
+        return {};
+    }
+    return path;
+}
+
+// A path's state in a session, as the pane shows it: "deny", "write",
+// "read" or "none".
+static Str grantstate(Session *s, Str path)
+{
+    return grantsat(s->grants, s->denies, path);
+}
+
+// A host for a fetch grant, lowercased, or null if it is not a site's
+// name that web_fetch could read.
+static Str granthost(Arena *a, Str raw)
+{
+    Str host = trim(raw);
+    if (!host.len || host.len>253) {
+        return {};
+    }
+    Str low = clone(a, host);
+    for (iz i = 0; i < low.len; i++) {
+        u8 c = low[i];
+        c = c>='A' && c<='Z' ? (u8)(c + 32) : c;
+        if (!(c>='a' && c<='z') && !digit(c) && c!='.' && c!='-') {
+            return {};
+        }
+        low.data[i] = c;
+    }
+    Str url = concat(a, concat(a, "https://", low), "/");
+    return webrefuse(url).len ? Str{} : low;
+}
+
+// grant {sid, path, access}: the path's state set to access, one of
+// none, read, write or deny, in place of what it had; or grant {sid,
+// desktop|mcp|web|image, host?, on}: one of the other kinds given, or
+// with on false taken back. By "user", as given in the pane.
+static void cmdgrant(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
+{
+    Json *path  = jsonget(j, "path");
+    Json *desk  = jsonget(j, "desktop");
+    Json *mcp   = jsonget(j, "mcp");
+    Json *web   = jsonget(j, "web");
+    Json *image = jsonget(j, "image");
+    b32   on    = jsonflag(jsonget(j, "on"), 1);
+    Grant g     = {};
+    g.pane = 1;
+
+    if (path->type != JSON_MISSING) {
+        Str err = {};
+        Str p   = grantpath(s, &scratch, jsonstr(path), &err);
+        Str to  = jsonstr(jsonget(j, "access"));
+        if (!p.data) {
+            reply(e, scratch, id, 0, err, s->sid);
+            return;
+        } else if (to!="none" && to!="read" && to!="write" && to!="deny") {
+            reply(e, scratch, id, 0, "access must be none, read, write or deny", s->sid);
+            return;
+        }
+        if (to == "deny") {
+            b32           win  = s->te.windows;
+            Slice<WsRoot> ws   = wsroots(s, &scratch);
+            Str           real = realpathof(e->os, &scratch, p, win);
+            for (iz i = 0; i < ws.len; i++) {
+                Str root = normpath(&scratch, s->cwd, ws[i].path, win);
+                Str rr   = realpathof(e->os, &scratch, root, win);
+                if (!(ws[i].flags & ROOT_HIDDEN) &&
+                        (root==p || (rr.data && real.data && rr==real))) {
+                    reply(e, scratch, id, 0, "a workspace folder cannot be denied: "
+                          "deny a folder inside it", s->sid);
+                    return;
+                }
+            }
+        }
+        if (grantstate(s, p) != to) {
+            Grant r = {};
+            r.path = p;
+            userrevoke(s, scratch, r);
+            userdeny(s, scratch, p, 0);
+            if (to=="read" || to=="write") {
+                g.path  = p;
+                g.write = to == "write";
+                usergrant(s, scratch, g, {}, "user");
+            } else if (to == "deny") {
+                userdeny(s, scratch, p, 1);
+            }
+        }
+        reply(e, scratch, id, 1, {}, s->sid);
+        return;
+    }
+
+    if (desk->type != JSON_MISSING) {
+        i32 c = deskclassfind(jsonstr(desk));
+        if (c<0 || !deskcovers(c)) {
+            reply(e, scratch, id, 0, "desktop must be observe, input or windows: "
+                  "starting programs always asks", s->sid);
+            return;
+        }
+        g.desk = 1u << c;
+    } else if (mcp->type != JSON_MISSING) {
+        Str name = jsonstr(mcp);
+        if (!on && (startswith(name, "mcp__") || startswith(name, "project"))) {
+            g.mcp = name;  // an older grant of one tool, or a project's
+        } else {
+            McpServer *m = mcpsrvof(s, name);
+            if (!m) {
+                reply(e, scratch, id, 0, "no such MCP server in this session", s->sid);
+                return;
+            }
+            g.mcp  = mcpevery(&scratch, name);
+            g.host = mcpurlkey(&scratch, m);
+        }
+    } else if (web->type != JSON_MISSING) {
+        Str kind = jsonstr(web);
+        if (kind == "search") {
+            g.web = kind;
+        } else if (kind == "fetch") {
+            g.web  = kind;
+            g.host = granthost(&scratch, jsonstr(jsonget(j, "host")));
+            if (!g.host.len) {
+                reply(e, scratch, id, 0, "host must be a site's name, such as "
+                      "example.com, not an address or a local name", s->sid);
+                return;
+            }
+        } else {
+            reply(e, scratch, id, 0, "web must be search or fetch", s->sid);
+            return;
+        }
+    } else if (image->type != JSON_MISSING) {
+        Str name = trim(jsonstr(image));
+        b32 ok   = name.len>0 && name.len<=256;
+        for (iz i = 0; ok && i < name.len; i++) {
+            ok = name[i]>' ' && name[i]<0x7f;
+        }
+        if (!ok) {
+            reply(e, scratch, id, 0, "image must be an image's name", s->sid);
+            return;
+        }
+        g.image = name;
+    } else {
+        reply(e, scratch, id, 0, "one of path, desktop, mcp, web or image "
+              "is required", s->sid);
+        return;
+    }
+    if (on) {
+        usergrant(s, scratch, g, {}, "user");
+    } else {
+        userrevoke(s, scratch, g);
+    }
+    reply(e, scratch, id, 1, {}, s->sid);
 }
 
 // compact {sid, focus?}: compact now, in a turn of its own (via
@@ -24835,7 +25692,8 @@ static void command(Engine *e, Arena scratch, Str line)
     if (!s) {
         reply(e, scratch, id, 0, "no such open session", sid);
         return;
-    } else if (s->readonly && cmd!=CMD_CLOSE && cmd!=CMD_FILE && cmd!=CMD_SKILLS) {
+    } else if (s->readonly && cmd!=CMD_CLOSE && cmd!=CMD_FILE && cmd!=CMD_SKILLS &&
+               cmd!=CMD_GRANTS) {
         reply(e, scratch, id, 0, "read-only: another process has this "
               "session open; open it again once that one has closed it", sid);
         return;
@@ -24886,6 +25744,12 @@ static void command(Engine *e, Arena scratch, Str line)
         return;
     case CMD_SKILLFETCH:
         cmdskillfetch(e, s, scratch, id, j);
+        return;
+    case CMD_GRANTS:
+        cmdgrants(e, s, scratch, id);
+        return;
+    case CMD_GRANT:
+        cmdgrant(e, s, scratch, id, j);
         return;
     case CMD_SKILLS: {
         // What the user may invoke as /name: every skill, theirs too

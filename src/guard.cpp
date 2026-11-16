@@ -485,13 +485,15 @@ struct GuardRoot {
     b32 read;    // only for reads
     b32 hidden;  // never named to the agent, nor hinted at: the system's
                  // temporary directories, and grants from the user
+    b32 deny;    // a hole the user made (a deny, the Permissions pane)
 };
 
 // The workspace of one session.
 struct Guard {
     Slice<GuardRoot> roots;
     Slice<GuardRoot> holes;  // carved out of the roots holding them: the
-                             // worktrees of a repository (worktree.cpp)
+                             // worktrees of a repository (worktree.cpp),
+                             // and the user's denies (guarddeny)
     Str              cwd;    // normalized
     Str              home;   // for "~", empty if unknown
     b32              win;
@@ -538,6 +540,67 @@ static void guardhole(Os *os, Arena *perm, Guard *g, Str path)
     g->holes = push(perm, g->holes, h);
 }
 
+// A path the user keeps the file tools out of (a deny): a hole, which
+// also judges what lies under it outside the roots (guarddenyof).
+static void guarddeny(Os *os, Arena *perm, Guard *g, Str path)
+{
+    guardhole(os, perm, g, path);
+    g->holes[g->holes.len-1].deny = 1;
+}
+
+// The user's deny that holds a path, by the lexical or real form of its
+// paths and the roots', else null: the deepest deny the path lies in,
+// unless a root inside that deny (a grant, opening a part again) holds
+// the path too, for reads, or with read false for writes.
+static Str guarddenyform(Guard *g, Str path, b32 read, b32 real)
+{
+    GuardRoot *d = 0;
+    for (iz i = 0; i < g->holes.len; i++) {
+        GuardRoot *h  = &g->holes[i];
+        Str        at = real ? h->real : h->lex;
+        if (h->deny && within(at, path, g->win) &&
+                (!d || at.len>(real ? d->real : d->lex).len)) {
+            d = h;
+        }
+    }
+    if (!d) {
+        return {};
+    }
+    Str dat = real ? d->real : d->lex;
+    for (iz i = 0; i < g->roots.len; i++) {
+        GuardRoot *t  = &g->roots[i];
+        Str        at = real ? t->real : t->lex;
+        if ((!t->read || read) && within(dat, at, g->win) && !(at == dat) &&
+                within(at, path, g->win)) {
+            return {};
+        }
+    }
+    return d->lex;
+}
+
+// Whether the guard has a deny of the user's.
+static b32 guardhasdeny(Guard *g)
+{
+    for (iz i = 0; i < g->holes.len; i++) {
+        if (g->holes[i].deny) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// The user's deny that holds a path lexically, by either form of the
+// denies and roots: for the many paths a search lists, which cost no
+// look at the file system.
+static Str guarddenylex(Guard *g, Str path)
+{
+    if (!guardhasdeny(g)) {
+        return {};
+    }
+    Str d = guarddenyform(g, path, 1, 0);
+    return d.data ? d : guarddenyform(g, path, 1, 1);
+}
+
 // Whether a hole takes path out of root t.
 static b32 guardholed(Guard *g, GuardRoot *t, Str real)
 {
@@ -579,6 +642,8 @@ struct GuardPath {
     b32 inside;    // allowed without asking
     b32 diverged;  // inside lexically, but a symlink leads out
     b32 config;    // Prospero's own configuration: asked about each time
+    Str deny;      // the user's deny holding it, when not inside: asked
+                   // about each time, never always, and refused in Bypass
 };
 
 // Resolve a tool's path argument and judge it.
@@ -601,7 +666,12 @@ static GuardPath guardpath(Os *os, Arena *a, Guard *g, Str path, b32 read)
                 (within(t->lex, r.path, g->win) || within(t->real, r.path, g->win));
     }
     if (!lexok) {
-        return r;  // the real path is not needed, nor looked for
+        // The real path is not needed, nor looked for, but for a deny
+        if (guardhasdeny(g)) {
+            Str real = realpathof(os, a, r.path, g->win);
+            r.deny = guarddenyform(g, real.data ? real : r.path, read, 1);
+        }
+        return r;
     }
 
     r.real = realpathof(os, a, r.path, g->win);
@@ -614,6 +684,9 @@ static GuardPath guardpath(Os *os, Arena *a, Guard *g, Str path, b32 read)
         r.inside = in && !cut;
     }
     r.diverged = !r.inside && !holed;
+    if (!r.inside && guardhasdeny(g)) {
+        r.deny = guarddenyform(g, r.real.data ? r.real : r.path, read, 1);
+    }
     return r;
 }
 
@@ -727,6 +800,19 @@ static Str guardwhy(Arena *a, Str tool, GuardPath *gp, Str cwd)
     print(&b, tool);
     print(&b, " of ");
     print(&b, gp->path);
+    if (gp->deny.data) {
+        // Inside the working directory or not: the user keeps it out
+        print(&b, " is denied in the Permissions pane");
+        if (!(gp->deny == gp->path)) {
+            print(&b, " (");
+            print(&b, gp->deny);
+            putbyte(&b, ')');
+        }
+        print(&b, gp->config ? Str(", and changes Prospero's own configuration")
+                             : Str(""));
+        print(&b, ", so each use of it is asked about");
+        return finish(&b);
+    }
     if (gp->config && gp->inside) {
         // Inside the working directory, yet asked about
         print(&b, " changes Prospero's own configuration");
@@ -831,5 +917,27 @@ static Str guardstatedenial(Arena *a, Str tool, Str path, Str statedir, Str cwd)
               "somewhere else instead, for example inside ");
     print(&b, cwd);
     putbyte(&b, '.');
+    return finish(&b);
+}
+
+// The tool result for a path the user denied in the Permissions pane,
+// which Bypass mode refuses, though it asks about nothing else.
+static Str guarddenyrefusal(Arena *a, Str tool, Str path, Str deny)
+{
+    Buf b(a, 512 + path.len + deny.len);
+    print(&b, "Permission denied: ");
+    print(&b, tool);
+    print(&b, " of ");
+    print(&b, path);
+    print(&b, " is denied in the Permissions pane");
+    if (!(deny == path)) {
+        print(&b, " (");
+        print(&b, deny);
+        putbyte(&b, ')');
+    }
+    print(&b, ". Bypass mode lets the file tools go anywhere else, but the "
+              "user keeps you out of there, so nothing was done. Do not "
+              "retry this path, and do not reach it or anything in it "
+              "another way, as with the shell. Continue without it.");
     return finish(&b);
 }

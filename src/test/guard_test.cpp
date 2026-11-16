@@ -437,6 +437,56 @@ static void test_guard(Test *t)
     GuardHint nh = guardhint(os, a, &h, "/q/near/x.c", 1, 0);
     expect(t, "no hint in a hidden root", nh.path.data ? nh.path : Str("(none)"), "(none)");
 
+    // The user's denies (the Permissions pane): a hole in the working
+    // directory and in a grant, a grant inside a deny opening it again,
+    // and the deny holding each path that is not inside, through a link
+    // too; searches leave out what a deny holds, lexically
+    os_mkdirs(os, *a, "/w/sec");
+    os_mkdirs(os, *a, "/w/sec/open");
+    os_mkdirs(os, *a, "/g/hid");
+    vlink(os, "/w/tosec", "/w/sec");
+    Guard dg = newguard(os, a, "/w", "/home/u", {}, "", 0);
+    guardadd(os, a, &dg, "/g", ROOT_HIDDEN|ROOT_MISSING);
+    guardadd(os, a, &dg, "/w/sec/open", ROOT_HIDDEN|ROOT_MISSING|ROOT_READ);
+    expect(t, "no denies", istr(a, guardhasdeny(&dg)), "0");
+    guarddeny(os, a, &dg, "/w/sec");
+    guarddeny(os, a, &dg, "/g/hid");
+    guarddeny(os, a, &dg, "/elsewhere");
+    expect(t, "denies", istr(a, guardhasdeny(&dg)), "1");
+    struct { Str path; b32 read; Str want; } denies[] = {
+        {"/w/x.c",            0, "/w/x.c I"},
+        {"/w/sec/s.txt",      1, "/w/sec/s.txt O /w/sec"},
+        {"/w/sec",            1, "/w/sec O /w/sec"},
+        {"/w/secret.txt",     0, "/w/secret.txt I"},
+        {"/w/sec/open/o.txt", 1, "/w/sec/open/o.txt I"},
+        {"/w/sec/open/o.txt", 0, "/w/sec/open/o.txt O /w/sec"},
+        {"/w/tosec/s.txt",    1, "/w/tosec/s.txt O /w/sec"},
+        {"/g/f.txt",          0, "/g/f.txt I"},
+        {"/g/hid/f.txt",      0, "/g/hid/f.txt O /g/hid"},
+        {"/elsewhere/f",      0, "/elsewhere/f O /elsewhere"},
+        {"/other/f",          0, "/other/f O"},
+    };
+    for (iz i = 0; i < countof(denies); i++) {
+        GuardPath gp = guardpath(os, a, &dg, denies[i].path, denies[i].read);
+        Str got = concat(a, gp.path, gp.inside ? Str(" I") : gp.diverged ? Str(" D") : Str(" O"));
+        got = gp.deny.data ? concat(a, concat(a, got, " "), gp.deny) : got;
+        expect(t, concat(a, "deny ", denies[i].path), got, denies[i].want);
+    }
+    struct { Str path; Str want; } lex[] = {
+        {"/w/sec/s.txt",      "/w/sec"},
+        {"/w/sec/open/o.txt", "-"},
+        {"/w/tosec/s.txt",    "-"},  // searches follow no links
+        {"/w/x.c",            "-"},
+        {"/g/hid",            "/g/hid"},
+    };
+    for (iz i = 0; i < countof(lex); i++) {
+        Str got = guarddenylex(&dg, lex[i].path);
+        expect(t, concat(a, "denylex ", lex[i].path), got.data ? got : Str("-"), lex[i].want);
+    }
+    GuardPath dp = guardpath(os, a, &dg, "/w/sec/s.txt", 1);
+    Str why = guardwhy(a, "read", &dp, "/w");
+    expect(t, "deny why", istr(a, find(why, "denied in the Permissions pane") >= 0), "1");
+
     // Devices: what opening a path on a Windows host could reach instead
     // of a file. On POSIX only the stat can tell.
     struct { Str path; b32 win; b32 want; } devices[] = {

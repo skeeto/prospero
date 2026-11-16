@@ -639,9 +639,9 @@ static void test_events(Test *t)
                "session title user turn attempt assistant tool.start "
                "tool.end ask answer retry nudge turn.end note compact job.start "
                "job.end todo snap rewind instructions notice prefix model grant mode "
-               "task.host task.report memory shell ask.deadline cut uncut pause ");
+               "task.host task.report memory shell ask.deadline cut uncut pause revoke deny ");
         expect(t, "synced events", finish(&sync),
-               "tool.start ask answer turn.end rewind task.report cut uncut pause ");
+               "tool.start ask answer turn.end rewind task.report cut uncut pause revoke deny ");
         expect(t, "unknown event", istr(a, evfind("tool")), istr(a, EV_NONE));
         expect(t, "empty event", istr(a, evfind("")), istr(a, EV_NONE));
         for (i32 cmd = 1; cmd < CMD_COUNT; cmd++) {
@@ -671,7 +671,8 @@ static void test_events(Test *t)
                "\"relay.more\",\"relay.peer\",\"relay.call\",\"offer\",\"ask.touch\",\"ask.hold\",\"shell.env\",\"call.stop\","
                "\"cut\",\"uncut\",\"approve\",\"endpoint.auth\",\"endpoint.logout\","
                "\"term.open\",\"term.input\",\"term.resize\",\"term.ack\",\"term.close\","
-               "\"fs.read\",\"fs.stat\",\"pause\",\"continue\",\"skill.fetch\"],"
+               "\"fs.read\",\"fs.stat\",\"pause\",\"continue\",\"skill.fetch\","
+               "\"grants\",\"grant\"],"
                "\"caps\":[\"close.forget\",\"config.refresh\",\"file.base64\",\"desktop\","
                "\"subagents\",\"rename\",\"title.by\",\"archive\",\"group\",\"draft\","
                "\"compact\",\"model\",\"gauge\",\"answer.always\",\"scratch\","
@@ -680,7 +681,8 @@ static void test_events(Test *t)
                "\"git\",\"answer.trust\",\"web\",\"question\",\"files\",\"worktree\",\"worktree.side\","
                "\"trash\",\"relay\",\"question.deadline\",\"ask.deadline\",\"ask.hold\",\"shell.env\",\"call.stop\","
                "\"cut\",\"approve\",\"files.path\",\"sessions.mention\",\"fork.cwd\",\"endpoint.auth\",\"endpoint.copilot\","
-               "\"term\",\"term.host\",\"pdf\",\"fs\",\"pause\",\"skill.fetch\",\"term.edit\",\"term.run\",\"term.marks\"]}");
+               "\"term\",\"term.host\",\"pdf\",\"fs\",\"pause\",\"skill.fetch\",\"term.edit\",\"term.run\",\"term.marks\","
+               "\"grants\"]}");
         b.len = 0;
         w = {&b};
         putobject(&w);
@@ -1289,7 +1291,8 @@ static void test_events(Test *t)
                "tool.start=1 tool.end=0 ask=1 answer=1 retry=0 nudge=0 "
                "turn.end=1 note=0 compact=0 job.start=0 job.end=0 todo=0 snap=0 "
                "rewind=1 instructions=0 notice=0 prefix=0 model=0 grant=0 mode=0 "
-               "task.host=0 task.report=1 memory=0 shell=0 ask.deadline=0 cut=1 uncut=1 pause=1 ");
+               "task.host=0 task.report=1 memory=0 shell=0 ask.deadline=0 cut=1 uncut=1 pause=1 "
+               "revoke=1 deny=1 ");
         logclose(&log);
 
         Str start = "{\"sid\":\"s13\",\"seq\":1,\"ts\":0,\"ev\":\"tool.start\",\"call\":\"a\"}\n";

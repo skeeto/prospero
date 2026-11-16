@@ -1260,6 +1260,42 @@ def sc_config_write(model, n, req):
         yield from answer(model, "Done.")
 
 
+sc_perms_pane = sc_config_write
+sc_perms_deny = sc_config_write
+sc_perms_config = sc_config_write
+
+
+def sc_perms_heard(model, n, req):
+    # "read them": the eight big files, then an answer; any other prompt
+    # is answered at once (notices are user messages too)
+    msgs = req.get("messages", [])
+    at = max((i for i, m in enumerate(msgs) if m.get("role") == "user" and
+              m.get("content") in ("read them", "after")), default=-1)
+    k = sum(m.get("role") == "tool" for m in msgs[at+1:])
+    if at < 0 or msgs[at]["content"] != "read them" or k >= 8:
+        yield from real_answer(model, req, "Done.")
+    else:
+        yield from real_tool(model, req, n, "read", {"path": f"f{k}.txt"})
+
+
+def sc_perms_tree(model, n, req):
+    # A parent that starts a subagent (the _b model), which writes where
+    # the pane granted
+    if "# Subagent" in system_of(req):
+        if step(req) == 0:
+            yield from tool(model, n, "write", {"path": "../pext/child.txt", "content": "c\n"})
+        else:
+            yield from answer(model, "Child done.")
+    elif step(req) == 0:
+        yield from tool(model, n, "task", {"description": "Child", "prompt": "Write.",
+                                           "model": second(model)})
+    else:
+        yield from answer(model, "Parent done.")
+
+
+sc_perms_tree_b = sc_perms_tree
+
+
 def sc_skill_task(model, n, req):
     if step(req) == 0:
         yield from tool(model, n, "task", {"description": "Use a skill",

@@ -3054,6 +3054,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
                        kind=="moved"        ? Str("To the agent: another folder") :
                        kind=="worktree"     ? Str("To the agent: a worktree") :
                        kind=="memory"       ? Str("To the agent: memory") :
+                       kind=="grants"       ? Str("To the agent: permissions") :
                        Str("To the agent");
         }
     } return 1;

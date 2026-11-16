@@ -4111,7 +4111,8 @@ def hello_caps(t):
                                                    "term.input", "term.resize",
                                                    "term.ack", "term.close",
                                                    "fs.read", "fs.stat",
-                                                   "pause", "continue", "skill.fetch"]
+                                                   "pause", "continue", "skill.fetch",
+                                                   "grants", "grant"]
         t.check(cmds == want, f"cmds: {cmds}")
         caps = hello.get("caps", [])
         t.check(isinstance(caps, list) and all(isinstance(c, str) for c in caps) and
@@ -4123,7 +4124,7 @@ def hello_caps(t):
                  "mcp", "mcp.auth", "task.remote", "task.host", "memory", "shell",
                  "git", "answer.trust", "trash", "cut", "endpoint.auth",
                  "endpoint.copilot", "term", "ask.hold", "fs", "pause", "skill.fetch",
-                 "term.edit", "term.run"} <= set(caps)
+                 "term.edit", "term.run", "grants"} <= set(caps)
                 and "host" not in caps,
                 f"caps: {caps}")
         want = 0 if isinstance(t.host, XpHost) else 1  # ConPTY, from 10 1809
@@ -8888,6 +8889,296 @@ def always(t):
         if a:
             a.close()
         rc = b.close() if b else 0
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+# The Permissions pane (grants, grant): grants and denies given ahead
+# of the agent's calls, and its notices of them
+
+def grantnotices(h, sid):
+    return [e for e in h.all("notice", sid) if e.get("kind") == "grants"]
+
+
+def permsgo(h, sid, *calls):
+    h.send("prompt", sid=sid, text=json.dumps(calls))
+
+
+@scenario(bound=40)
+def perms_pane(t):
+    """A write grant given in the pane lets a write outside go unasked,
+    and one notice tells the agent; downgraded to read, a write asks;
+    taken back, a read asks. Changes made together tell the agent once,
+    and a change undone tells it nothing. Opened again in another
+    process, the agent is not told again. Paths that may not be granted
+    are refused."""
+    ext = t.host.join(t.base, "pext")
+    t.host.mkdir(ext)
+    t.host.write(t.host.join(ext, "a.txt"), "a\n")
+    a = t.headless()
+    b = None
+    try:
+        sid = a.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        r = a.call("grant", sid=sid, path=ext, access="write")
+        t.check(r.get("ok") == 1, f"granted: {r}")
+        g = a.all("grant", sid)[-1]
+        t.check(g.get("path") == ext and g.get("access") == "write" and
+                g.get("pane") == 1 and g.get("by") == "user", f"the record: {g}")
+        lst = a.call("grants", sid=sid)
+        t.check(any(x.get("path") == ext and x.get("access") == "write" and x.get("pane")
+                    for x in lst.get("grants", [])), f"listed: {lst}")
+        t.check(any(x.get("why") == "cwd" for x in lst.get("roots", [])), f"roots: {lst}")
+
+        permsgo(a, sid, ["write", {"path": "../pext/b.txt", "content": "b\n"}])
+        ended(a, sid, 1)
+        t.check(not a.all("ask", sid), f"no ask: {a.all('ask', sid)}")
+        t.check(t.host.read(t.host.join(ext, "b.txt")) == "b\n", "written")
+        ns = grantnotices(a, sid)
+        t.check(len(ns) == 1 and ext in ns[0]["text"] and "read and write" in ns[0]["text"]
+                and ns[0].get("grants"), f"told once: {ns}")
+
+        a.call("grant", sid=sid, path=ext, access="read")
+        permsgo(a, sid, ["write", {"path": "../pext/c.txt", "content": "c\n"}])
+        ask = nextask(a, sid)
+        t.check(ask.get("tool") == "write", f"a write asks: {ask}")
+        a.call("answer", sid=sid, req=ask["req"], decision="deny")
+        ended(a, sid, 2)
+        ns = grantnotices(a, sid)
+        t.check(len(ns) == 2 and "only read" in ns[-1]["text"], f"downgraded: {ns}")
+
+        a.call("grant", sid=sid, path=ext, access="none")
+        t.check(any(e.get("path") == ext for e in a.all("revoke", sid)), "a revoke record")
+        permsgo(a, sid, ["read", {"path": "../pext/a.txt"}])
+        ask = nextask(a, sid, ask["seq"])
+        t.check(ask.get("tool") == "read", f"a read asks: {ask}")
+        a.call("answer", sid=sid, req=ask["req"], decision="deny")
+        ended(a, sid, 3)
+        ns = grantnotices(a, sid)
+        t.check(len(ns) == 3 and "taken back" in ns[-1]["text"], f"revoked: {ns}")
+
+        # Undone before the next request: nothing to tell
+        a.call("grant", sid=sid, path=ext, access="write")
+        a.call("grant", sid=sid, path=ext, access="none")
+        permsgo(a, sid, ["read", {"path": "../pext/a.txt"}])
+        ask = nextask(a, sid, ask["seq"])
+        a.call("answer", sid=sid, req=ask["req"], decision="deny")
+        ended(a, sid, 4)
+        t.check(len(grantnotices(a, sid)) == 3, "an undone change is not told")
+
+        # Two changes, one notice
+        a.call("grant", sid=sid, path=ext, access="read")
+        a.call("grant", sid=sid, path=ext, access="write")
+        asks = len(a.all("ask", sid))
+        permsgo(a, sid, ["read", {"path": "../pext/a.txt"}])
+        ended(a, sid, 5)
+        ns = grantnotices(a, sid)
+        t.check(len(ns) == 4 and "read and write" in ns[-1]["text"], f"one notice: {ns}")
+        t.check(len(a.all("ask", sid)) == asks, "no ask")
+
+        # The other kinds: given, listed, taken back; and what is refused
+        for kw in ({"desktop": "input"}, {"web": "search"},
+                   {"web": "fetch", "host": "Example.COM"}, {"image": "alpine:3"}):
+            r = a.call("grant", sid=sid, on=1, **kw)
+            t.check(r.get("ok") == 1, f"granted {kw}: {r}")
+        gs = a.call("grants", sid=sid).get("grants", [])
+        t.check({"desktop": "input", "pane": 1} in gs and {"web": "search", "pane": 1} in gs
+                and {"web": "fetch", "host": "example.com", "pane": 1} in gs and
+                {"image": "alpine:3", "pane": 1} in gs, f"listed: {gs}")
+        for kw in ({"desktop": "input"}, {"web": "search"},
+                   {"web": "fetch", "host": "example.com"}, {"image": "alpine:3"}):
+            a.call("grant", sid=sid, on=0, **kw)
+        gs = a.call("grants", sid=sid).get("grants", [])
+        t.check(len(gs) == 1 and gs[0].get("path") == ext, f"taken back: {gs}")
+        t.check(len(a.all("revoke", sid)) == 8, f"revokes: {a.all('revoke', sid)}")
+        for kw in ({"desktop": "run"}, {"web": "fetch", "host": "127.0.0.1"},
+                   {"web": "fetch", "host": "printer.local"}, {"mcp": "nosuch"},
+                   {"web": "crawl"}, {}):
+            r = a.call("grant", sid=sid, on=1, **kw)
+            t.check(r.get("ok") == 0, f"refused {kw}: {r}")
+
+        for bad in ("relative/dir", "~nobody/x", ""):
+            r = a.call("grant", sid=sid, path=bad, access="read")
+            t.check(r.get("ok") == 0, f"refused {bad!r}: {r}")
+        r = a.call("grant", sid=sid, path=t.work, access="deny")
+        t.check(r.get("ok") == 0 and "workspace" in r.get("err", ""),
+                f"the working directory is not denied: {r}")
+        r = a.call("grant", sid=sid, path=ext, access="all")
+        t.check(r.get("ok") == 0, f"an unknown access: {r}")
+        t.check(a.close() == 0, "the first exits")
+        a = None
+
+        b = t.headless()
+        t.check(b.call("open", sid=sid, attended=1).get("ok") == 1, "opened")
+        last = max(e["seq"] for e in grantnotices(b, sid))
+        asks = len(b.all("ask", sid))
+        permsgo(b, sid, ["write", {"path": "../pext/d.txt", "content": "d\n"}])
+        ended(b, sid, 6)
+        new = [e for e in grantnotices(b, sid) if e["seq"] > last]
+        t.check(not new, f"not told again: {new}")
+        t.check(len(b.all("ask", sid)) == asks, "the grant holds")
+        t.check(t.host.read(t.host.join(ext, "d.txt")) == "d\n", "written")
+    finally:
+        if a:
+            a.close()
+        rc = b.close() if b else 0
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=40)
+def perms_deny(t):
+    """A folder denied in the pane: a read there asks, inside the working
+    directory, with no always; searches over it leave it out and say so;
+    Bypass refuses it; a grant inside the deny opens that folder again;
+    and with the deny gone the folder is the workspace's again."""
+    sec = t.host.join(t.work, "secret")
+    t.host.mkdir(sec)
+    t.host.mkdir(t.host.join(sec, "open"))
+    t.put("top.txt", "hello top\n")
+    t.put("secret/s.txt", "hello secret\n")
+    t.put("secret/open/o.txt", "hello open\n")
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        r = h.call("grant", sid=sid, path=sec, access="deny")
+        t.check(r.get("ok") == 1, f"denied: {r}")
+        d = h.all("deny", sid)
+        t.check(len(d) == 1 and d[0].get("path") == sec and d[0].get("by") == "user",
+                f"the record: {d}")
+        t.check(h.call("grants", sid=sid).get("denies") == [sec], "listed")
+
+        permsgo(h, sid, ["read", {"path": "secret/s.txt"}])
+        ask = nextask(h, sid)
+        t.check(ask.get("tool") == "read" and "always" not in ask and
+                "Permissions pane" in ask.get("detail", ""), f"asked, no always: {ask}")
+        h.call("answer", sid=sid, req=ask["req"], decision="deny")
+        ended(h, sid, 1)
+        ns = grantnotices(h, sid)
+        t.check(len(ns) == 1 and "is denied" in ns[0]["text"], f"told: {ns}")
+
+        asks = len(h.all("ask", sid))
+        permsgo(h, sid, ["grep", {"pattern": "hello", "path": "."}],
+                ["glob", {"pattern": "**/*.txt"}])
+        ended(h, sid, 2)
+        te = h.all("tool.end", sid)[-2:]
+        t.check(len(h.all("ask", sid)) == asks, "searches do not ask")
+        t.check(all("top.txt" in e["text"] and "s.txt" not in e["text"] and
+                    "left out" in e["text"] for e in te), f"left out: {te}")
+
+        h.call("grant", sid=sid, path=t.host.join(sec, "open"), access="read")
+        permsgo(h, sid, ["read", {"path": "secret/open/o.txt"}])
+        ended(h, sid, 3)
+        t.check(len(h.all("ask", sid)) == asks and
+                "hello open" in h.all("tool.end", sid)[-1]["text"], "reopened inside")
+
+        t.check(h.call("mode", sid=sid, mode="bypass").get("ok") == 1, "bypass")
+        permsgo(h, sid, ["read", {"path": "secret/s.txt"}])
+        ended(h, sid, 4)
+        end = h.all("tool.end", sid)[-1]
+        t.check(len(h.all("ask", sid)) == asks and "hello secret" not in end["text"] and
+                "Permissions pane" in end["text"], f"Bypass refuses: {end}")
+        h.call("mode", sid=sid, mode="build")
+
+        h.call("grant", sid=sid, path=sec, access="none")
+        permsgo(h, sid, ["read", {"path": "secret/s.txt"}])
+        ended(h, sid, 5)
+        t.check(len(h.all("ask", sid)) == asks and
+                "hello secret" in h.all("tool.end", sid)[-1]["text"], "free again")
+        t.check("no longer denied" in grantnotices(h, sid)[-1]["text"], "told")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=30)
+def perms_tree(t):
+    """A pane grant holds for a subagent started after it, logged there
+    by "parent" and told to it at its first request; one taken back is
+    taken back in the subagent too, by "parent"."""
+    ext = t.host.join(t.base, "pext")
+    t.host.mkdir(ext)
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.call("grant", sid=sid, path=ext, access="write")
+        h.send("prompt", sid=sid, text="go")
+        ended(h, sid, 1)
+        t.check(not h.all("ask"), f"no ask: {h.all('ask')}")
+        t.check(t.host.read(t.host.join(ext, "child.txt")) == "c\n", "the subagent wrote")
+        kids = {e["sid"] for e in h.all("grant") if e["sid"] != sid}
+        t.check(len(kids) == 1, f"one subagent: {kids}")
+        kid = kids.pop()
+        g = h.all("grant", kid)
+        t.check(g and g[0].get("by") == "parent" and g[0].get("pane") == 1, f"copied: {g}")
+        t.check(grantnotices(h, kid), "the subagent is told")
+        h.call("grant", sid=sid, path=ext, access="none")
+        rv = h.all("revoke", kid)
+        t.check(rv and rv[0].get("by") == "parent", f"taken back there too: {rv}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=30)
+def perms_config(t):
+    """A write grant on a folder holding the configuration file leaves
+    the file asked about; one on the file itself lets the agent edit it
+    unasked, and the file is still read again."""
+    conf = t.config
+    cut = max(conf.rfind("/"), conf.rfind("\\"))
+    folder = conf[:cut]
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.call("grant", sid=sid, path=folder, access="write")
+        lst = h.call("grants", sid=sid)
+        t.check(any(x.get("path") == folder and x.get("holds_config")
+                    for x in lst.get("grants", [])), f"holds it: {lst}")
+        permsgo(h, sid, ["edit", {"path": conf, "old_string": "[guard]",
+                                  "new_string": "[ui]\ntheme = dark\n\n[guard]"}])
+        ask = nextask(h, sid)
+        t.check(ask.get("tool") == "edit" and "always" not in ask, f"asked: {ask}")
+        h.call("answer", sid=sid, req=ask["req"], decision="allow")
+        ended(h, sid, 1)
+
+        h.call("grant", sid=sid, path=conf, access="write")
+        lst = h.call("grants", sid=sid)
+        t.check(any(x.get("path") == conf and x.get("config")
+                    for x in lst.get("grants", [])), f"the file: {lst}")
+        asks = len(h.all("ask", sid))
+        permsgo(h, sid, ["edit", {"path": conf, "old_string": "theme = dark",
+                                  "new_string": "theme = light"}])
+        ended(h, sid, 2)
+        end = h.all("tool.end", sid)[-1]
+        t.check(len(h.all("ask", sid)) == asks and end["status"] == "ok" and
+                "Prospero read its configuration again" in end["text"], f"unasked: {end}")
+        t.check("theme = light" in (t.host.read(conf) or ""), "written")
+        t.check("configuration" in grantnotices(h, sid)[-1]["text"], "told what it is")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf=BIG, bound=40, alone=True)
+def perms_heard(t):
+    """After a summary, the agent is told its pane grants again."""
+    ext = t.host.join(t.base, "pext")
+    t.host.mkdir(ext)
+    bigfiles(t, 8, 256)
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.call("grant", sid=sid, path=ext, access="read")
+        h.send("prompt", sid=sid, text="read them")
+        ended(h, sid, 1)
+        t.check(len(grantnotices(h, sid)) == 1, "told")
+        r = h.call("compact", sid=sid)
+        t.check(r.get("ok") == 1, f"compact: {r}")
+        ended(h, sid, 2)
+        h.send("prompt", sid=sid, text="after")
+        ended(h, sid, 3)
+        ns = grantnotices(h, sid)
+        t.check(len(ns) == 2 and ext in ns[-1]["text"], f"told again: {ns}")
+    finally:
+        rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")
 
 

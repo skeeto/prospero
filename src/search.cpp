@@ -1345,7 +1345,19 @@ struct SearchEnd {
     b32 ignorecase;
     b32 windows;
     b32 tagged;     // grep lists the tags of its files (hashline edits)
+    Guard *guard;   // if any: results under the user's denies left out
 };
+
+// Whether a search leaves out a result, a path relative to its root:
+// one under a path the user denied (guarddenylex).
+static b32 searchdenied(Arena scratch, SearchEnd *e, Str rel)
+{
+    if (!e->guard) {
+        return 0;
+    }
+    Str abs = normpath(&scratch, e->root, rel, e->windows);
+    return guarddenylex(e->guard, abs).data != 0;
+}
 
 // A result path as the agent sees it: relative to the working directory
 // when inside it.
@@ -1377,8 +1389,12 @@ static ToolOut searchresult(Os *os, Arena *a, Str spill, SearchEnd *e)
     Buf        diag(a, 256);
     iz         shown = 0;
     iz         total = 0;
+    iz         left  = 0;  // results under the user's denies, left out
     Slice<Str> globs = e->tool==TOOL_GLOB ? globexpand(a, e->glob) : Slice<Str>{};
     Slice<Str> files = {};  // grep's, shown, for their tags
+    if (e->guard && !guardhasdeny(e->guard)) {
+        e->guard = 0;  // nothing to leave out
+    }
     if (e->tool == TOOL_GREP) {
         for (Str rest = data; rest.len;) {
             Cut c = cut(rest, '\n');
@@ -1393,6 +1409,10 @@ static ToolOut searchresult(Os *os, Arena *a, Str spill, SearchEnd *e)
             }
             if (!c.ok && e->limited) {
                 break;  // the last line was cut off
+            }
+            if (searchdenied(*a, e, p.head)) {
+                left++;
+                continue;
             }
             total++;
             if (shown == SEARCH_RESULTS) {
@@ -1439,6 +1459,9 @@ static ToolOut searchresult(Os *os, Arena *a, Str spill, SearchEnd *e)
                 }
             }
             if (!globmatch(globs, slashed)) {
+                continue;
+            } else if (searchdenied(*a, e, rel)) {
+                left++;
                 continue;
             }
             total++;
@@ -1547,6 +1570,11 @@ static ToolOut searchresult(Os *os, Arena *a, Str spill, SearchEnd *e)
         if (b.len && b.data[b.len-1]!='\n') putbyte(&b, '\n');
         print(&b, "[the search was stopped after 30 seconds, so results may "
                   "be missing: search a smaller directory]");
+    }
+    if (left && !e->cancelled) {
+        if (b.len && b.data[b.len-1]!='\n') putbyte(&b, '\n');
+        print(&b, "[results under paths the user denied in the Permissions "
+                  "pane were left out]");
     }
     r.text = finish(&b);
     return r;
