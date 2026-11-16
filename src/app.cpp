@@ -14975,6 +14975,7 @@ enum : i32 {
     CHK_FILENOTE,     // the pane's notes have text, or none for ""; or
                       // with dx 1, they do not have text
     CHK_FILEASKERR,   // Open file is up, saying text
+    CHK_FILEASKFIELD, // Open file is up, its field ending in text (driveendsep)
     CHK_FILESHOWN,    // Files is hidden (dx 0), shown (1), or shown central (2)
     CHK_FILEBODIES,   // the bodies fit the budget, dx files read at least,
                       // and dy at most if dy > 0
@@ -15343,7 +15344,8 @@ static Str chknames[] = {
     "the file's lines are where they should be", "the file's band is as said",
     "the file's line takes its rows", "the file tabs are as said",
     "the file is shown in its mode", "the Files pane's notes are as said",
-    "Open file says why not", "the Files pane is where it should be",
+    "Open file says why not", "Open file's field is as typed",
+    "the Files pane is where it should be",
     "the files read fit their budget", "no frames while idle, a file shown",
     "the link's tooltip is as said", "the front file is the one said",
     "the clipboard ends with the path said", "the file's top line is as said",
@@ -17601,8 +17603,28 @@ static DriveOp m3ops[] = {
     // Two files of one name, told apart by their folders
     {OP_OPENFILE, 0, 0, 0, 300, "files/a/x.c"},
     {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
-    {OP_OPENFILE, 0, 0, 0, 300, "files/b/x.c"},
+    // The second by Ctrl/Cmd+O, typed on from the session's folder (its
+    // caret at the end, nothing selected): Tab completes the folder b/,
+    // whose files are then listed with no separator typed, and Tab again
+    // completes its one file
+    CMDKEY(GKEY_O, 500),
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 300, "files/b"},
+    {OP_WAIT, W_FSIDLE, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEASKFIELD, 0, 0, 0, "/files/b"},
+    {OP_KEYDOWN, 0, GKEY_TAB, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_TAB, 0, 300, ""},
+    {OP_WAIT, W_FSIDLE, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEASKFIELD, 0, 0, 0, "/files/b/"},
+    {OP_CHECK, CHK_PATHPICK, 1, 0, 0, "x.c"},
+    {OP_KEYDOWN, 0, GKEY_TAB, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_TAB, 0, 300, ""},
+    {OP_CHECK, CHK_FILEASKFIELD, 0, 0, 0, "/files/b/x.c"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
     {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_FILEPATH, 0, 0, 0, "files/b/x.c"},
     {OP_CHECK, CHK_FILETABS, 0, 0, 0, "lines.txt|long.txt|a/x.c|*b/x.c"},
     {OP_SHOT, 0, 0, 0, 300, "files-tabs"},
     // Markdown shows as Markdown; as text, the top line is kept
@@ -24809,6 +24831,12 @@ static b32 drivefilecheck(Gui *g, i32 chk)
         print(&b, g->fask.p.err);
         ok = g->fask.p.shown && g->fask.p.err==op->text;
         break;
+    case CHK_FILEASKFIELD: {
+        Str f = {(u8 *)g->fask.p.buf, (iz)__builtin_strlen(g->fask.p.buf)};
+        print(&b, "drive: Open file's field is ");
+        print(&b, f);
+        ok = g->fask.p.shown && driveendsep(f, op->text);
+    } break;
     case CHK_FILESHOWN: {
         // dx 0 hidden, 1 shown, 2 shown in the central node
         ImGuiWindow   *w = ImGui::FindWindowByName(panenames[PANE_FILES]);
@@ -27473,6 +27501,7 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_FILEMODE:
     case CHK_FILENOTE:
     case CHK_FILEASKERR:
+    case CHK_FILEASKFIELD:
     case CHK_FILESHOWN:
     case CHK_FILEBODIES:
     case CHK_FILEQUIET:
