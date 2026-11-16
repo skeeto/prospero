@@ -641,9 +641,21 @@ static void axquote(Buf *b, Str s)
     putbyte(b, '"');
 }
 
+// The integer at or below v, without libm: __builtin_floorf is a call
+// to floorf on x86-64, which the unit tests don't link. 0 for NaN and
+// for what no pixel coordinate reaches.
+static i64 axfloor(f32 v)
+{
+    if (!(v>-1e15f && v<1e15f)) {
+        return 0;
+    }
+    i64 i = (i64)v;
+    return i - (v < (f32)i);
+}
+
 static i64 axround(f32 v)
 {
-    return (i64)__builtin_floorf(v + 0.5f);
+    return axfloor(v + 0.5f);
 }
 
 static void axdumpnode(Buf *b, AxTree *t, i32 i, i32 depth, b32 rects)
@@ -1251,7 +1263,8 @@ static i32 axlineaty(A11y *x, f32 py, AxSpan *line)
     Str     s = x->text.text;
     i32     k = 0;
     if (g->lineh > 0) {
-        k = (i32)__builtin_floorf((py - g->y) / g->lineh);
+        i64 f = axfloor((py - g->y) / g->lineh);
+        k = f<0 ? 0 : f>(1<<30) ? 1<<30 : (i32)f;  // clamped below
     }
     k     = axclamp(k, 0, axlinecount(x)-1);
     *line = axlinespan(x, k);
