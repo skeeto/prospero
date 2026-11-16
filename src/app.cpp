@@ -619,6 +619,8 @@ struct GuiSession {
     ImGuiWindow *win;       // its transcript's child window, last frame
     Rect         row;       // where the sidebar drew it last
     b32          stick;     // the transcript follows its bottom
+    View        *sizeview;  // a new text size puts back sizeat in this
+    Anchor       sizeat;    //   view when next drawn (fontsize), else null
     b32          readonly;  // another process holds it: replayed only
     Str          kept;      // or the container it ran in, gone (ctrkeep)
     b32          listed;    // in the latest sessions list
@@ -2305,7 +2307,8 @@ struct Gui {
                                      // alone (no window known)
     i32                drivecodemsg; // the code block selectcode chose, or
     i32                drivecodeblk; //   -1 for any
-    Anchor             driveanchor;  // the top edge before a resize
+    Anchor             driveanchor;  // the top edge before a resize or zoom
+    f32                drivesize;    //   at this text size (zoom)
     i32                drivefound;   // the find hit first current
     b32                shotshown;    // the Screenshot window drew its image
     ImVec2             shotsize;     // at this size
@@ -13384,20 +13387,63 @@ static void gui_modal(Gui *g, b32 inmodal)
 
 static void addsysfonts(Gui *);
 
+// Before a new text size: what is at the top edge of a session's
+// transcript, found in the old size's layouts, for drawtranscript to put
+// back in the new ones, as a new width does. Not if it follows its end,
+// nor if it was never drawn. A place still waiting from an earlier size
+// stays, as no layout of its scroll's size is left.
+static void sizekeep(Gui *g, GuiSession *gs, f32 charw, f32 lineh)
+{
+    View        *v = gs->view;
+    ImGuiWindow *w = gs->win;
+    if (gs->sizeview || !v || !w || gs->stick || v->lastw<=0) {
+        return;
+    }
+    f32 y = w->Scroll.y;
+    if (w->ScrollTarget.y < FLT_MAX) {
+        y = w->ScrollTarget.y;
+    }
+    y = y<0 ? 0 : y>w->ScrollMax.y ? w->ScrollMax.y : y;
+    viewtops(v, v->lastw, charw, lineh);
+    Anchor an = viewanchor(v, &g->measure, v->lastw, g->scale, v->head, y);
+    if (an.msg >= 0) {
+        gs->sizeview = v;
+        gs->sizeat   = an;
+    }
+}
+
 // Text at its size: [ui] font_size, zoomed, at the display's scale, in
 // ImGui's widgets and the transcript alike, whose layouts for the old
-// size go. Never inside a frame, which would mix sizes (setzoom).
+// size go, each transcript keeping its place (sizekeep). Never inside a
+// frame, which would mix sizes (setzoom).
 static void fontsize(Gui *g)
 {
+    // Only for a new size: fonts merely added (addsysfonts) leave the
+    // place be, and are not to be measured until a frame begins.
+    f32 was = g->fonts.size;
+    if (was>0 && was!=g->fontbase*g->zoom*g->scale) {
+        FontMetrics fm    = fontmetrics(&g->fonts, 0);
+        f32         charw = fontadvance(&g->fonts, 0, 'n');
+        for (GuiSession *s = g->sessions; s; s = s->next) {
+            sizekeep(g, s, charw, fm.lineh);
+        }
+        sizekeep(g, &g->nosession, charw, fm.lineh);
+    }
+
     ImGuiStyle &st = ImGui::GetStyle();
     st.FontSizeBase  = g->fontbase;
     st.FontScaleMain = g->zoom;
     st.FontScaleDpi  = g->scale;
     g->fonts.size    = g->fontbase * g->zoom * g->scale;
+    g->fonts.gen++;  // sizekeep's bakes, of the old size (stylebaked)
     g->fontdirty     = 0;
+    // How far into its line the top edge is grows with the text
+    f64 ratio = was>0 ? g->fonts.size/was : 1;
     for (GuiSession *s = g->sessions; s; s = s->next) {
+        s->sizeat.dy *= ratio;
         if (s->view) s->view->topsdirty = 1;
     }
+    g->nosession.sizeat.dy *= ratio;
     g->nosession.view->topsdirty = 1;
     cachereset(g->vcache, 1);  // layouts for the old font size
     filesfont(g);
@@ -14985,6 +15031,7 @@ enum : i32 {
     CHK_CODECOPIED,
     CHK_COPYQUIET,
     CHK_REFLOW,
+    CHK_FRESHLAYOUT,
     CHK_TOOLSOPEN,
     CHK_TOOLSFOLD,
     CHK_TOOLSAUTO,
@@ -15412,7 +15459,8 @@ static Str chknames[] = {
     "a shell's code block shows its Run button, enabled, while the mouse is over it",
     "its Copy put its code on the clipboard byte for byte, and said so",
     "Copied went back to Copy on its deadline, and little else drew",
-    "a new width kept the line at the top edge there",
+    "a new width or zoom kept the line at the top edge there",
+    "the transcript's layouts are as fresh ones, none measured at an old size",
     "tools = open: every tool row open but those the user chose",
     "tools = fold: every tool row folded but those the user chose",
     "tools = auto: tool rows folded by kind and outcome again",
@@ -16634,6 +16682,23 @@ static DriveOp m3ops[] = {
     {OP_ANCHOR, 0, 0, 0, 0, ""},
     {OP_RESIZE, 0, 0, 0, 800, ""},
     {OP_CHECK, CHK_REFLOW, 0, 0, 0, ""},
+    // And a zoom in and back out, as a new width does
+    {OP_ANCHOR, 0, 0, 0, 0, ""},
+    {OP_KEYDOWN, 0, GKEY_CMD, KEY_CMD, 50, ""},
+    {OP_KEYDOWN, 0, GKEY_EQUAL, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_EQUAL, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_CMD, 0, 500, ""},
+    {OP_CHECK, CHK_ZOOM, 0, 0, 0, "110"},
+    {OP_CHECK, CHK_REFLOW, 0, 0, 0, ""},
+    {OP_CHECK, CHK_FRESHLAYOUT, 0, 0, 0, ""},
+    {OP_ANCHOR, 0, 0, 0, 0, ""},
+    {OP_KEYDOWN, 0, GKEY_CMD, KEY_CMD, 50, ""},
+    {OP_KEYDOWN, 0, GKEY_MINUS, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_MINUS, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_CMD, 0, 500, ""},
+    {OP_CHECK, CHK_ZOOM, 0, 0, 0, "100"},
+    {OP_CHECK, CHK_REFLOW, 0, 0, 0, ""},
+    {OP_CHECK, CHK_FRESHLAYOUT, 0, 0, 0, ""},
     // tools = open, fold and auto again, as the settings would set it
     {OP_MOVE, T_EMPTY, 0, 0, 100, ""},
     {OP_TOOLS, 0, TOOLS_OPEN, 0, 300, ""},
@@ -26677,14 +26742,56 @@ static b32 drivecheck(Gui *g, i32 chk)
         // Copied back to Copy at its deadline: that frame and its settling,
         // the probe's, and the checklist's own at the mark and the check
         return !g->copiedshown && drivequiet(g, "after Copied", 5);
+    case CHK_FRESHLAYOUT: {
+        // Each message laid out at this width and size, laid out again
+        // with no cache: the same runs where the same, so that none was
+        // measured at another size (as a zoom once left inline code)
+        Arena a   = g->frame;
+        i32   bad = -1, n = 0;
+        for (i32 i = 0; i<v->msgs.len && bad<0; i++) {
+            ViewMsg *m = &v->msgs[i];
+            if (!m->measured || m->layoutgen!=v->c->gen || m->layoutw!=v->lastw ||
+                    m->layoutver!=m->ver || !m->layout.blocks.len) {
+                continue;
+            }
+            LayoutCache *nc    = 0;
+            MsgLayout    fresh = layoutmsg(&nc, &a, &g->measure, msgdoc(v, i),
+                                           v->lastw, g->scale);
+            MsgLayout   *ml    = &m->layout;
+            b32 same = fresh.h==ml->h && fresh.blocks.len==ml->blocks.len;
+            for (iz k = 0; same && k < ml->blocks.len; k++) {
+                BlockLayout *x = ml->blocks[k].bl, *y = fresh.blocks[k].bl;
+                same = x->runs.len == y->runs.len;
+                for (iz r = 0; same && r < x->runs.len; r++) {
+                    same = x->runs[r].x==y->runs[r].x && x->runs[r].w==y->runs[r].w;
+                }
+            }
+            bad = same ? -1 : i;
+            n++;
+        }
+        Buf b(&a, 128);
+        print(&b, "drive: ");
+        print(&b, (i64)n);
+        print(&b, " layouts compared");
+        if (bad >= 0) {
+            print(&b, ", message ");
+            print(&b, (i64)bad);
+            print(&b, "'s not as fresh");
+        }
+        guilog(g, finish(&b));
+        return n>0 && bad<0;
+    }
     case CHK_REFLOW: {
         GuiSession *gs  = g->sess;
         Anchor      was = g->driveanchor;
         if (!gs || !gs->win || was.msg<0) {
             return 0;
         }
+        // A new text size scales how far into its line the edge is
+        f64 r = g->drivesize>0 ? g->fonts.size/g->drivesize : 1;
+        was.dy *= r;
         Anchor now = viewanchor(v, &g->measure, v->lastw, g->scale, v->head, gs->win->Scroll.y);
-        b32    ok  = now.msg==was.msg && now.dy-was.dy<1.5 && was.dy-now.dy<1.5;
+        b32    ok  = now.msg==was.msg && now.dy-was.dy<1.5*r && was.dy-now.dy<1.5*r;
         if (ok && was.off>=0) {
             Doc       *d  = msgdoc(v, now.msg);
             MsgLayout *ml = msglayout(v, now.msg, &g->measure, v->lastw, g->scale);
@@ -29662,6 +29769,7 @@ static void drivestep(Gui *g)
         View       *v  = g->view;
         GuiSession *gs = g->sess;
         g->driveanchor = {-1, -1, 0};
+        g->drivesize   = g->fonts.size;
         if (gs && gs->win) {
             g->driveanchor = viewanchor(v, &g->measure, v->lastw, g->scale, v->head,
                                         gs->win->Scroll.y);

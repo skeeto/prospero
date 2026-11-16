@@ -5738,9 +5738,10 @@ static void drawtranscript(Gui *g)
     // coordinates): what was at the top edge stays there. Its place is
     // found with the old width's heights and layouts, before the new
     // width discards them, and put back with the new.
+    b32 sized = gs->sizeview==v && gs->sizeat.msg<v->msgs.len;
     if (width != v->lastw) {
         Anchor an = {-1, -1, 0};
-        if (v->lastw>0 && last && !bottom) {
+        if (v->lastw>0 && last && !bottom && !sized) {
             viewtops(v, v->lastw, charw, fm.lineh);
             an = viewanchor(v, &g->measure, v->lastw, sc, head, scrolly);
         }
@@ -5753,6 +5754,15 @@ static void drawtranscript(Gui *g)
             scrolly = (f32)anchory(v, an, &g->measure, width, sc, head);
         }
     }
+    // A new text size (fontsize, sizekeep): the place found in the old
+    // size's layouts put back in the new ones, the same way
+    if (sized && !bottom) {
+        msglayout(v, gs->sizeat.msg, &g->measure, width, sc);
+        viewtops(v, width, charw, fm.lineh);
+        scrolly = (f32)anchory(v, gs->sizeat, &g->measure, width, sc, head);
+        scrolly = scrolly<0 ? 0 : scrolly;
+    }
+    gs->sizeview = 0;
     viewtops(v, width, charw, fm.lineh);
 
     // Going to a find hit: its message and the screen above it laid out
