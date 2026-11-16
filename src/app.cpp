@@ -22358,6 +22358,11 @@ static DriveOp launchops[] = {
     {OP_KEYDOWN, 0, GKEY_SHIFT, KEY_CMD|KEY_SHIFT, 50, ""}, \
     KEY(GKEY_V, KEY_CMD|KEY_SHIFT, 50), \
     {OP_KEYUP, 0, GKEY_SHIFT, KEY_CMD, 50, ""}, {OP_KEYUP, 0, GKEY_CMD, 0, 200, ""}
+// A new line in the box, which a bare Enter would send
+#define SHIFTENTER \
+    {OP_KEYDOWN, 0, GKEY_SHIFT, KEY_SHIFT, 50, ""}, \
+    KEY(GKEY_ENTER, KEY_SHIFT, 50), \
+    {OP_KEYUP, 0, GKEY_SHIFT, 0, 200, ""}
 // One character typed into the box: a mention's query goes in a
 // character at a time, since a burst of bytes is a paste to the box,
 // which dismisses the picker for that word (drawprompt)
@@ -22836,6 +22841,27 @@ static DriveOp composeops[] = {
     TYPE1("x"),
     {OP_CHECK, CHK_MENTION, -1, 0, 0, ""},
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, "hi @mention-a.txt @mentionx"},
+    // On a middle line, Up and Down are the picker's, not the caret's,
+    // though there is a line for the caret to go to either way (#69)
+    SELALL,
+    {OP_TEXT, 0, 0, 0, 300, "one"},
+    SHIFTENTER, SHIFTENTER,
+    {OP_TEXT, 0, 0, 0, 300, "three"},
+    KEY(GKEY_UP, 0, 300),
+    TYPE1("@"),
+    TYPE1("m"), TYPE1("e"), TYPE1("n"), TYPE1("t"), TYPE1("i"), TYPE1("o"),
+    TYPE1("n"),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "one\n@mention\nthree"},
+    {OP_CHECK, CHK_MENTION, 3, 0, 0, ""},
+    {OP_CHECK, CHK_MENTIONSEL, 0, 0, 0, "mention-a.txt"},
+    KEY(GKEY_DOWN, 0, 300),
+    {OP_CHECK, CHK_MENTION, 3, 0, 0, ""},
+    {OP_CHECK, CHK_MENTIONSEL, 0, 0, 0, "mention-b.txt"},
+    KEY(GKEY_UP, 0, 300),
+    {OP_CHECK, CHK_MENTION, 3, 0, 0, ""},
+    {OP_CHECK, CHK_MENTIONSEL, 0, 0, 0, "mention-a.txt"},
+    KEY(GKEY_ESCAPE, 0, 400),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "one\n@mention\nthree"},
     // Mid-text: the pick replaces the token alone, the words after it
     // staying. They are typed first, since Up is the only key here that
     // moves the caret to the start of the line; the token brings a

@@ -6616,6 +6616,8 @@ struct ComposeCb {
     i32         mention;   // and the '@' popup's rows, 0 if it is closed
     MentionEdit *edit;     // a pick's edit, queued for this frame to apply
     i32         cursor;    // the caret before this frame's keys, -1 if inactive
+    i32         selbeg;    // and the selection, for the '@' popup to put back
+    i32         selend;
     b32         hadsel;
     b32         recalled;  // history replaced the text
     b32         tab;       // Tab, kept out of the text, completes the pick
@@ -6693,10 +6695,15 @@ static i32 composecb(ImGuiInputTextCallbackData *d)
         return 0;
     }
     // The '@' popup's rows, claimed as the slash popup's are, before
-    // histkey reads the same keys as history
+    // histkey reads the same keys as history. The box has already moved
+    // the caret a line for them, which would take it out of the mention
+    // and close the popup (#69), so that move is undone.
     if (c->mention) {
         i32 n = c->mention;
         *c->mentionsel = (*c->mentionsel + (up ? n-1 : 1)) % n;
+        d->CursorPos      = c->cursor;
+        d->SelectionStart = c->selbeg;
+        d->SelectionEnd   = c->selend;
         return 0;
     }
     b32     edge = d->CursorPos==c->cursor && !c->hadsel;
@@ -7509,6 +7516,8 @@ static void drawprompt(Gui *g)
     st = ImGui::GetInputTextState(id);
     if (st && active) {
         cb.cursor = st->GetCursorPos();
+        cb.selbeg = st->GetSelectionStart();
+        cb.selend = st->GetSelectionEnd();
         cb.hadsel = st->HasSelection();
     }
 
