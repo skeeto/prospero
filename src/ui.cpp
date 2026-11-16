@@ -7385,6 +7385,9 @@ static void drawprompt(Gui *g)
     b32         can = g->sess && g->sess->view && !g->sess->readonly && !g->quitting &&
                       (hostlive(g, g->sess) || g->enginekind==ENGINE_FAKE);
     b32         editing = g->edsess && g->edsess==s && !g->edplan;
+    // With no session open, the box has nowhere to send its text, so
+    // it is disabled rather than taking a draft it can never use (#67)
+    b32         none    = !g->sess;
     char       *buf     = draftbuf(g, s);
     Arena       a       = g->frame;
     b32         wasshown = g->mentionshown;  // last frame's: the Esc test's
@@ -7531,7 +7534,7 @@ static void drawprompt(Gui *g)
     // here (the transcript's find bar takes its own Ctrl+G).
     ImGuiIO &io   = ImGui::GetIO();
     ImGuiKey ctrl = g->mac ? ImGuiMod_Super : ImGuiMod_Ctrl;
-    if (!editing && io.KeyMods==ctrl && ImGui::IsKeyPressed(ImGuiKey_G, false) &&
+    if (!editing && !none && io.KeyMods==ctrl && ImGui::IsKeyPressed(ImGuiKey_G, false) &&
             ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows)) {
         editstart(g, a, s);
         editing = g->edsess==s && !g->edplan;
@@ -7580,7 +7583,9 @@ static void drawprompt(Gui *g)
                      ImGui::GetContentRegionAvail().y);
     i32 selbefore = g->mentionsel;  // the pick before this frame's keys
     ImGui::PushID(s);
+    ImGui::BeginDisabled(none);
     b32 send = ImGui::InputTextMultiline("##prompt", buf, DRAFT_MAX+1, size, flags, composecb, &cb);
+    ImGui::EndDisabled();
     b32 edited = ImGui::IsItemEdited();
     g->promptend = g->promptend==2 ? 0 : g->promptend;
     ImGui::PopID();
@@ -7607,7 +7612,10 @@ static void drawprompt(Gui *g)
         drafttyped(&s->dclock, g->sched.now);
     }
     // Not from under a dialog: the focus waits until it closes
-    if (cb.escaped || (g->promptfocus && g->sess==s && !ImGui::GetTopMostPopupModal())) {
+    if (none && ImGui::GetActiveID()==id) {
+        ImGui::ClearActiveID();  // the session it was in has closed
+    }
+    if (!none && (cb.escaped || (g->promptfocus && g->sess==s && !ImGui::GetTopMostPopupModal()))) {
         ImGui::ActivateItemByID(id);
         g->promptfocus = 0;
         g->promptend   = g->promptend ? 2 : 0;  // the caret moved next frame
@@ -7742,8 +7750,8 @@ static void drawprompt(Gui *g)
     }
 
     // The context menu, on the box (a11y: axmenu marks it, above)
-    if ((ImGui::IsMouseReleased(ImGuiMouseButton_Right) && ImGui::IsMouseHoveringRect(r0, r1) &&
-            ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows)) || axmenuasked(g, id)) {
+    if (!none && ((ImGui::IsMouseReleased(ImGuiMouseButton_Right) && ImGui::IsMouseHoveringRect(r0, r1) &&
+            ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows)) || axmenuasked(g, id))) {
         ImGui::OpenPopup("##composemenu");
     }
     if (ImGui::BeginPopup("##composemenu")) {
