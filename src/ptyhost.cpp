@@ -936,7 +936,7 @@ static Str termpsprog(Arena *a, Str shkind, Str shpath, b32 win, TermWhich *whic
 static Str termcmdprog(Arena *a, Str comspec, TermWhich *which, void *ctx)
 {
     comspec = trim(comspec);
-    return pathroot(comspec, 1) ? comspec : which(ctx, a, "cmd.exe");
+    return pathroot(comspec, 1) ? comspec : which(ctx, a, Str("cmd.exe"));
 }
 
 struct TermPickAsk {
