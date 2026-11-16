@@ -523,22 +523,28 @@ before a password prompt may be hidden too.
 A code block in the agent's reply tagged with a shell (`sh`, `bash`,
 `zsh`, `ksh`, `powershell`, `pwsh`, or on Windows `cmd`) has a Run
 button beside Copy while the mouse is over it, and Run in Terminal on
-the right-click menu. It runs the block in a Terminal tab of the
-session, in its folder, labeled by its first line: in your shell, as
-you would paste it (a POSIX shell reads its interactive startup files;
-another, such as fish, runs the block in its own shell, else sh), in
-PowerShell, or cmd.exe with one line. The command shows first, dimmed.
-A block whose lines are prompts and output, or that holds characters
-that would not show, has none. It gets your terminal's environment
-less the variables secret settings name, with `PROSPERO_TAB=run`.
+the right-click menu. It types the block at the prompt of one of the
+session's Terminal tabs, as a paste and Enter, so that it runs in your
+shell, and stays in its history: a tab whose shell is of the block's
+family (a POSIX shell for `sh`, `bash`, `zsh` and `ksh`, PowerShell for
+`powershell` and `pwsh`, cmd.exe for `cmd`) waiting at its prompt with
+nothing running, the tab shown if it is one, else the right-most,
+which comes to the front. With none, a new tab opens, in the session's
+folder, with your shell if it is of that family, else one that is, and
+the block goes in at its first prompt. A block whose lines are prompts
+and output, or that holds characters that would not show, has none.
 
-The tab keeps its output when the command ends, under a banner with
-its exit code: Run again (Enter, after a moment) runs it in the same
-tab, as does the button again, and Close closes it. The agent hears
-how it ended, with its last lines (secrets hidden), with its next
-request; it is not woken for it. The agent is asked to put commands
-that only you can run, such as one that asks for your password, in
-such blocks.
+While the block runs, Run shows its tab and types nothing again; once
+it is over, Run types it again. A tab waits at its prompt when its
+shell has said so: zsh, bash and PowerShell, with `[terminal]
+integration` on, mark each prompt and each command they run. Another
+shell waits at its prompt when the last thing typed in it was Enter
+and nothing runs; a line half typed, or a quote left open (`quote>`),
+keeps a tab from taking a block. Where its shell marks its commands,
+the agent hears how the block ended, its exit code and its last lines
+(secrets hidden), with its next request; it is not woken for it. The
+agent is asked to put commands that only you can run, such as one that
+asks for your password, in such blocks.
 
 ## Side chats
 

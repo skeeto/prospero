@@ -2235,6 +2235,19 @@ def main():
         # bash without the user's rc files, for its line editing (Ubuntu's
         # /bin/sh, dash, has none), with a known prompt; else a plain sh
         shell = "/bin/bash --norc --noprofile" if os.path.exists("/bin/bash") else "/bin/sh"
+        if args.mode == "terminal" and os.name != "nt" and not args.host and \
+                os.path.exists("/bin/bash"):
+            # A plain /bin/bash, which the engine hooks for its prompt's
+            # marks (Run in Terminal), its rc file a home of its own's,
+            # here and on r (through the fake ssh), for the same prompt
+            os.environ.setdefault("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
+            termhome = host.path("termhome")
+            for home in (termhome, os.path.join(host.root, "fakehome")):
+                host.mkdir(home)
+                host.write(os.path.join(home, ".bashrc"),
+                           "PS1='tty$ '\nPS2='tty> '\nHISTFILE=\n")
+            os.environ["HOME"] = termhome
+            shell = "/bin/bash"
         if os.name == "nt":
             # busybox's sh from w64devkit, with its vim, less, seq and tr
             shell = shword(shutil.which("sh").replace("\\", "/"))

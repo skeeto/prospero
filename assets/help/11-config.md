@@ -290,9 +290,8 @@ fails with a link to sign up for Copilot Free.
   ([Files](help:sessions#files)), on Linux and macOS through your login
   shell, so `$PATH` and the rest of your profile apply; a profile that
   starts something interactive, such as `exec tmux`, can skip it where
-  `PROSPERO_TAB` is set: to `edit` there, and to `run` in a tab that
-  runs a command for you (`PROSPERO_EDIT_FILE` works too, in an editor's
-  tab). On Windows, which has no login shell, it
+  `PROSPERO_TAB` is set: to `edit` there (`PROSPERO_EDIT_FILE` works
+  too). On Windows, which has no login shell, it
   is found on PATH and runs through cmd.exe. Another host's file (over
   ssh, in WSL or in a container) opens in a Terminal tab there
   ([Hosts](help:hosts#sessions-on-a-remote)), with this editor only if
@@ -346,6 +345,11 @@ fails with a link to sign up for Copilot Free.
   may read the session's Terminal pane tabs (read_terminal), for which
   the engine keeps a copy of each tab's screen. What is typed at
   password prompts is hidden from it ([Sessions](help:sessions)).
+- **[`[terminal] integration`](settings:terminal#integration)**: whether
+  a tab's zsh, bash or PowerShell runs Prospero's hooks around your
+  startup files, marking its prompts and commands: Run in Terminal then
+  knows when a tab waits at its prompt, and the agent hears how a block
+  it ran ended ([Sessions](help:sessions#running-the-agents-commands)).
 - **[`[ui] notify`](settings:ui#notify)**: desktop notifications while the window is in the
   background, minimized, or showing another session: `allow` when a
   permission ask waits for your answer, `done` when a session stops by

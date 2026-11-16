@@ -3882,7 +3882,7 @@ struct CodeRun {
     Str lang;
     Str text;
     Str why;
-    u64 key;    // its tab's (termrunkey)
+    u64 key;    // termrunkey
 };
 
 // Message msg's block as a Run: one of the agent's, committed, in the
@@ -3921,20 +3921,13 @@ static CodeRun coderun(Gui *g, View *v, Arena *a, i32 msg, i32 block)
     return r;
 }
 
-// Run's tooltip: what runs it, and where.
+// Run's tooltip: where it goes (termruntip), else why it can't.
 static Str coderuntip(Gui *g, Arena *a, CodeRun *cr)
 {
     if (cr->why.len) {
         return concat(a, "Can't run it: ", cr->why);
     }
-    Buf b(a, 256);
-    print(&b, "Run in a Terminal tab (");
-    print(&b, cr->kind==RUN_PS ? Str("PowerShell") : cr->kind==RUN_CMD ? Str("cmd.exe")
-                               : cr->lang);
-    print(&b, "), in ");
-    print(&b, termrunfolder(g, g->sess));
-    print(&b, ". The agent hears how it ended at its next request.");
-    return finish(&b);
+    return termruntip(g, a, g->sess, cr->kind, cr->lang, cr->key);
 }
 
 // A code block's Copy button, at its top right while the mouse is over

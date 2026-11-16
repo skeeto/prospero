@@ -29,14 +29,15 @@
 // any other end leaves its banner, whose Restart runs the editor again.
 // While open it counts as busy, so quitting asks first.
 //
-// A tab may run a code block of the agent's in place of a shell
-// (termrun, the transcript's Run button; term.open's run, cap
-// term.run): one per block of a message, labeled by its first line,
-// its titles (OSC 0, 2) ignored. Its end, clean or not, leaves its
-// screen under a banner, whose Run again (Enter, after RUN_GRACE, so
-// that a reflexive Enter never runs a command twice) runs it again in
-// the tab; the engine tells the agent how it ended. While it runs, or
-// waits to, it counts as busy, as an editor does.
+// The transcript's Run button types a code block of the agent's at a
+// shell's prompt (termrun, cap term.marks): of a tab of its shell's
+// family that waits there with nothing running, the front one, else the
+// right-most; else a new tab, asked for a shell of that family
+// (term.open's shell), into which it goes at its first prompt. A tab
+// knows its prompt by the OSC 133 marks of its hooked shell (ptyhost.cpp),
+// else by what was typed last and term.busy (termset.cpp's rules). The
+// engine tells the agent how it ended, if its shell is hooked. While it
+// runs, a click shows its tab and types nothing.
 //
 // This is free and unencumbered software released into the public domain.
 
@@ -51,8 +52,7 @@ enum : i32 {
 };
 
 enum : i32 {
-    RUN_GRACE      = 1000*1000, // µs a Run tab's banner ignores Enter
-    TERMTAB_TEXT   = 160,       // bytes kept of its shell's name and errors
+    TERMTAB_TEXT  = 160,       // bytes kept of its shell's name and errors
     TERMTAB_RESIZE = 100*1000,  // µs a new size waits to settle
     TERMTAB_INPUT  = 16 << 10,  // bytes per term.input (ptyhost's TERM_INPUT)
     TERMTAB_OPEN   = 16,        // open on one engine (ptyhost's TERM_PERPEER)
@@ -104,17 +104,32 @@ struct TermTab {
     i32         edcol;     // 0 for none
     b32         edpane;    // the Terminal pane was hidden as it opened
     b32         ednamed;   // title names the editor (OSC 1, or the reply)
-    // A code block run in place of a shell (termrun): the request, kept
-    // through a restart, and its text's buffer through the tab's reuse
-    b32         run;
-    Str         runtext;
-    iz          runtextcap;
-    u8          runlang[16];   // the fence's language
-    iz          runlanglen;
-    u8          runfrom[64];   // the session its end is told to
-    iz          runfromlen;
-    u64         runkey;        // its block's: termrunkey
-    i64         endedat;       // sched µs its banner appeared
+    // What Run in Terminal knows of its shell (termstate), times in µs
+    // (os_ticks): from term.open's reply, its marks, and what was typed
+    i32         kind;      // TERMK_*
+    u8          nonce[32]; // its marks', if its shell is hooked
+    b32         hooked;
+    b32         marked;    // a mark with its nonce came
+    i64         liveat;
+    i64         outat;     // its last output
+    b32         prompted;  // an A since the last typing, and no C
+    b32         typed;     // anything typed since it went live
+    b32         typedcr;   //   ending in Enter
+    i64         typedat;
+    u64         runkey;    // the last Run typed into it (termrunkey)
+    i64         sentat;
+    i64         doneat;    // its prompt came back after it, else 0
+    // A Run waiting for this new tab's first prompt (termpend), its
+    // text's buffer kept through the tab's reuse; and the language its
+    // shell was asked for (term.open's shell), kept through a restart
+    Str         pend;
+    iz          pendcap;
+    u64         pendkey;
+    i64         pendat;
+    u8          pendfrom[64];  // the session its end is told to
+    iz          pendfromlen;
+    u8          asklang[16];
+    iz          asklanglen;
 };
 
 // Files' side of an editor tab (files.cpp): its file shown again, read
@@ -148,18 +163,9 @@ static Str termeditname(TermTab *tt)
 // A tab's label, to b: its program's title, else its shell's name.
 // ConPTY titles a console with its program's path, which names it as a
 // shell's would be (C:\...\sh.EXE is sh). An editor's tab is 'NAME
-// FILE', FILE its file's name, alone until the editor is named; a
-// Run's, its command's first line.
+// FILE', FILE its file's name, alone until the editor is named.
 static void termlabel(Buf *b, TermTab *tt)
 {
-    if (tt->run) {
-        i32 lines = 0;
-        u8  buf[TERMTITLECAP];
-        iz  n = termtitle(buf, termrunfirst(tt->runtext, &lines));
-        print(b, Str{buf, n});
-        print(b, lines>1 ? Str("...") : Str(""));
-        return;
-    }
     if (tt->edit) {
         Str name = termeditname(tt);
         print(b, name);
@@ -300,9 +306,10 @@ static b32 termblock(Gui *g, TermTab *tt, i32 cols, i32 rows)
     return 1;
 }
 
-// Let go of a terminal's block and state, keeping its tab, and an
-// editor's or a Run's request, so that a restart runs it again (an
-// editor named anew by it).
+// Let go of a terminal's block and state, keeping its tab, an editor's
+// request, so that a restart runs it again (an editor named anew by
+// it), and the language its shell was asked for. A Run waiting for it
+// is dropped.
 static void termfree(Gui *g, TermTab *tt)
 {
     if (tt->region) {
@@ -319,14 +326,10 @@ static void termfree(Gui *g, TermTab *tt)
     tt->edline    = was.edline;
     tt->edcol     = was.edcol;
     tt->edpane    = was.edpane;
-    tt->run        = was.run;
-    tt->runtext    = was.runtext;
-    tt->runtextcap = was.runtextcap;
-    tt->runlanglen = was.runlanglen;
-    tt->runfromlen = was.runfromlen;
-    tt->runkey     = was.runkey;
-    copybytes(tt->runlang, was.runlang, was.runlanglen);
-    copybytes(tt->runfrom, was.runfrom, was.runfromlen);
+    tt->pend       = {was.pend.data, 0};
+    tt->pendcap    = was.pendcap;
+    tt->asklanglen = was.asklanglen;
+    copybytes(tt->asklang, was.asklang, was.asklanglen);
 }
 
 // Begin a terminal's command, which has no reply. Finish it with cmdsend.
@@ -471,11 +474,11 @@ static GuiSession *termowner(Gui *g, TermTab *tt)
     return 0;
 }
 
-// Whether a tab runs a request in place of a shell, an editor or a
-// Run, which waits (TT_NONE) to start at the pane's size.
+// Whether a tab waits (TT_NONE) to start at the pane's size: an
+// editor's, or a new shell's for a Run.
 static b32 termasks(TermTab *tt)
 {
-    return tt->edit || tt->run;
+    return tt->edit || tt->pend.len;
 }
 
 // Why a root can have no new tab now, else empty.
@@ -516,21 +519,15 @@ static b32 termediting(TermTab *tt)
     return tt->edit && tt->state<=TT_LIVE;
 }
 
-// Whether a tab's Run runs, or is about to.
-static b32 termrunning(TermTab *tt)
-{
-    return tt->run && tt->state<=TT_LIVE;
-}
-
-// Tabs whose shell runs a program, or with an editor or a Run, which
-// quitting would hang up.
+// Tabs whose shell runs a program, or with an editor, which quitting
+// would hang up.
 static i32 termbusy(Gui *g)
 {
     i32 n = 0;
     for (GuiSession *s = g->sessions; s; s = s->next) {
         for (i32 i = 0; i < s->terms.n; i++) {
             TermTab *tt = s->terms.tabs[i];
-            n += (tt->state==TT_LIVE && tt->busy) || termediting(tt) || termrunning(tt);
+            n += (tt->state==TT_LIVE && tt->busy) || termediting(tt);
         }
     }
     return n;
@@ -603,6 +600,121 @@ static void termcloseengine(Gui *g)
     cmdsend(g, &w, a);
 }
 
+// What Run in Terminal's rules (termset.cpp) know of a tab now.
+static TermState termstate(TermTab *tt)
+{
+    TermState st = {};
+    st.live     = tt->state==TT_LIVE && tt->tid && termup(tt);
+    st.kind     = tt->kind;
+    st.hooked   = tt->hooked;
+    st.marked   = tt->marked;
+    st.liveat   = tt->liveat;
+    st.busy     = tt->busy;
+    st.typed    = tt->typed;
+    st.typedcr  = tt->typedcr;
+    st.typedat  = tt->typedat;
+    st.prompted = tt->prompted;
+    st.outat    = tt->outat;
+    st.queued   = tt->pend.len > 0;
+    st.runkey   = tt->runkey;
+    st.sentat   = tt->sentat;
+    st.doneat   = tt->doneat;
+    return st;
+}
+
+// Bytes typed into a tab, by the user or a Run (not replies, nor mouse
+// or focus reports): its prompt no longer waits empty, and a Run that
+// waited for it gives way.
+static void termkeyed(Gui *g, TermTab *tt, Str sent)
+{
+    if (!sent.len) {
+        return;
+    }
+    u8 last = sent[sent.len-1];
+    tt->typed    = 1;
+    tt->typedcr  = last=='\r' || last=='\n';
+    tt->typedat  = os_ticks(g->os);
+    tt->prompted = 0;
+    if (tt->pend.len) {
+        guilog(g, "terminal: typing came first: the Run waiting for its new tab is dropped");
+        tt->pend.len = 0;
+    }
+}
+
+// A Run's text typed at tab tt's prompt, as one paste and an Enter, in
+// one term.input whose run tells the engine whose it is: the top of
+// session from, told how it ended (ptyhost.cpp's termrunarm).
+static void termrunsend(Gui *g, TermTab *tt, Str text, u64 key, Str from)
+{
+    if (tt->state!=TT_LIVE || !tt->tid || !termup(tt)) {
+        return;
+    }
+    Arena a   = newarena(g->cmdr);
+    iz    cap = text.len + 32;
+    u8   *out = allocbytes(&a, cap);
+    iz    n   = ariel_paste(tt->t, out, cap-1, {text.data, text.len},
+                            ARIEL_PASTE_BEGIN|ARIEL_PASTE_END);
+    out[n++] = '\r';
+    Str   data  = {out, n};
+    i32   lines = 0;
+    Str   first = termrunfirst(text, &lines);
+    if (data.len > TERM_RUNINPUT) {
+        return;  // termrunblock keeps a Run's text under this
+    }
+    if (ariel_view(tt->t).offset) {
+        ariel_scrollto(tt->t, ARIEL_TO_BOTTOM);
+    }
+    Buf   b(&a, 256 + data.len/3*4 + 4 + first.len*6 + from.len);
+    EvOut w = termbegin(g, &b, CMD_TERMINPUT, tt);
+    putstrkey(&w.json, "data", base64(&a, data));
+    putkey(&w.json, "run");
+    putobject(&w.json);
+    putstrkey(&w.json, "from", from);
+    Buf kb(&a, 16);
+    printhex(&kb, key, 16);
+    putstrkey(&w.json, "key", finish(&kb));
+    putstrkey(&w.json, "first", first);
+    putintkey(&w.json, "lines", lines);
+    putend(&w.json);
+    cmdsend(g, &w, a);
+    termkeyed(g, tt, data);
+    tt->runkey = key;
+    tt->sentat = tt->typedat;
+    tt->doneat = 0;
+    scheddirty(&g->sched);
+}
+
+// A new tab's Run, typed once its shell is ready for it (termpendgo),
+// else dropped if it waited too long, or the tab ended.
+static void termpend(Gui *g, TermTab *tt)
+{
+    if (!tt->pend.len) {
+        return;
+    }
+    i64       now   = os_ticks(g->os);
+    TermState st    = termstate(tt);
+    b32       ended = tt->state==TT_ENDED || tt->state==TT_FAILED;
+    switch (termpendgo(&st, ended, tt->pendat, now)) {
+    case TERMPEND_WAIT: {
+        i64 due = termlookdue(&st, now);
+        i64 max = tt->pendat + TERM_PENDMAX;
+        schedat(&g->sched, due && due<max ? due : max, DUE_CLOCK);
+    } break;
+    case TERMPEND_DROP:
+        if (!ended) {
+            guilog(g, "terminal: its new shell never came to a prompt: the Run is dropped");
+        }
+        tt->pend.len = 0;
+        scheddirty(&g->sched);
+        break;
+    case TERMPEND_GO: {
+        Str text = tt->pend;
+        tt->pend.len = 0;
+        termrunsend(g, tt, text, tt->pendkey, {tt->pendfrom, tt->pendfromlen});
+    } break;
+    }
+}
+
 static void termlaunch(Gui *, GuiSession *, TermTab *, i32, i32);
 
 // An editor's or a Run's tab that waits to start (TT_NONE), started at
@@ -649,18 +761,20 @@ static void termsweep(Gui *g)
                 i32 rows = g->termlastrows ? g->termlastrows : 24;
                 termeditgo(g, s, tt, cols, rows);
             }
+            termpend(g, tt);
         }
     }
 }
 
 // Start a shell in a tab of root s, at a size, or an editor tab's
-// editor (term.open's edit), or a Run (run), which an engine without
-// term.edit or term.run would take for a shell.
+// editor (term.open's edit), which an engine without term.edit would
+// take for a shell. A shell asked for by a Run's language (asklang)
+// is of that language's family (term.open's shell).
 static void termlaunch(Gui *g, GuiSession *s, TermTab *tt, i32 cols, i32 rows)
 {
     tt->host = s->host;
-    Str why  = tt->edit ? hostwhy(g, s, "term.edit") :
-               tt->run  ? hostwhy(g, s, "term.run")  : Str{};
+    Str why  = tt->edit       ? hostwhy(g, s, "term.edit")  :
+               tt->asklanglen ? hostwhy(g, s, "term.marks") : Str{};
     if (why.len) {
         tt->state  = TT_FAILED;
         tt->errlen = termkeep(tt->err, why);
@@ -708,15 +822,8 @@ static void termlaunch(Gui *g, GuiSession *s, TermTab *tt, i32 cols, i32 rows)
         }
         putend(&w.json);
     }
-    if (tt->run) {
-        putkey(&w.json, "run");
-        putobject(&w.json);
-        putstrkey(&w.json, "text", tt->runtext);
-        putstrkey(&w.json, "lang", Str{tt->runlang, tt->runlanglen});
-        if (tt->runfromlen) {
-            putstrkey(&w.json, "from", Str{tt->runfrom, tt->runfromlen});
-        }
-        putend(&w.json);
+    if (!tt->edit && tt->asklanglen) {
+        putstrkey(&w.json, "shell", Str{tt->asklang, tt->asklanglen});
     }
     tt->openid = g->nextid;
     cmdsend(g, &w, a);
@@ -732,13 +839,13 @@ static TermTab *termalloc(Gui *g)
         g->termspare = tt->next;
         Str buf  = tt->edpath;
         iz  cap  = tt->edpathcap;
-        Str rbuf = tt->runtext;
-        iz  rcap = tt->runtextcap;
+        Str pbuf = tt->pend;
+        iz  pcap = tt->pendcap;
         *tt = {};
-        tt->edpath     = {buf.data, 0};
-        tt->edpathcap  = cap;
-        tt->runtext    = {rbuf.data, 0};
-        tt->runtextcap = rcap;
+        tt->edpath    = {buf.data, 0};
+        tt->edpathcap = cap;
+        tt->pend      = {pbuf.data, 0};
+        tt->pendcap   = pcap;
     } else {
         tt = alloc<TermTab>(&g->perm);
     }
@@ -838,8 +945,9 @@ static TermTab *termedit(Gui *g, GuiSession *s, Str path, i32 line, i32 col)
     return tt;
 }
 
-// The key of a message's code block, by which its Run has one tab: the
-// session's, the message's record and the block's index.
+// The key of a message's code block, by which a tab knows the last Run
+// typed into it: the session's, the message's record and the block's
+// index.
 static u64 termrunkey(Str sid, i64 seq, i32 block)
 {
     u64 h = hash(sid);
@@ -848,77 +956,179 @@ static u64 termrunkey(Str sid, i64 seq, i32 block)
     return h;
 }
 
-// Root s's Run tab of a block, by its key, else null.
-static TermTab *termrunof(GuiSession *s, u64 key)
-{
-    for (i32 i = 0; i < s->terms.n; i++) {
-        TermTab *tt = s->terms.tabs[i];
-        if (tt->run && tt->runkey==key) {
-            return tt;
-        }
-    }
-    return 0;
-}
-
-// The folder a session's Run runs in: its root's.
+// The folder a session's Run runs in, in a new tab: its root's.
 static Str termrunfolder(Gui *g, GuiSession *s)
 {
     return termcwd(termroot(g, s));
 }
 
-// Why session s cannot run a code block of kind in a terminal now, its
-// block's tab by key aside, else empty.
-static Str termrunwhy(Gui *g, GuiSession *s, i32 kind, u64 key)
+enum : i32 {
+    TROUTE_NONE,  // it can't run now (why)
+    TROUTE_SHOW,  // its Run has a tab still: shown, nothing typed
+    TROUTE_SEND,  // typed at the prompt of an available tab
+    TROUTE_NEW,   // typed into a new tab, once its shell is ready
+};
+
+struct TermRoute {
+    i32      how;    // TROUTE_*
+    TermTab *tt;     // SHOW's and SEND's
+    i32      held;   // SHOW's: TERMHELD_*, or 0 for a new tab's waiting
+    Str      why;    // NONE's
+    i64      until;  // when it may go otherwise, else 0 (os_ticks µs)
+};
+
+// Where Run in Terminal takes a code block of kind (RUN_*), by key,
+// from session from: to the tab that has its Run still, shown; else
+// typed into an available tab of its shell's family in from's root
+// (termsetpick: the front one, else the right-most); else a new tab.
+static TermRoute termroute(Gui *g, GuiSession *from, i32 kind, u64 key)
 {
-    Str why = termwhy(g, s);
-    if (why.len) {
-        return why;
+    TermRoute r   = {};
+    Str       why = termwhy(g, from);
+    why = why.len ? why : hostwhy(g, from, "term.marks");
+    if (!why.len && kind==RUN_CMD && !hostwin(from->host)) {
+        why = "cmd blocks run only on Windows";
     }
-    why = hostwhy(g, s, "term.run");
     if (why.len) {
-        return why;
-    } else if (kind==RUN_CMD && !hostwin(s->host)) {
-        return "cmd blocks run only on Windows";
+        r.why = why;
+        return r;
     }
-    GuiSession *r = termroot(g, s);
-    return termrunof(r, key) ? Str{} : termfull(g, r);
+    GuiSession *s   = termroot(g, from);
+    TermSet    *set = &s->terms;
+    i64         now = os_ticks(g->os);
+    TermState   sts[TERMTABS];
+    for (i32 i = 0; i < set->n; i++) {
+        sts[i] = termstate(set->tabs[i]);
+        i64 due = termlookdue(&sts[i], now);
+        r.until = due && (!r.until || due<r.until) ? due : r.until;
+    }
+    for (i32 i = 0; i < set->n; i++) {
+        TermTab *tt   = set->tabs[i];
+        i32      held = termrunheld(&sts[i], key, now);
+        if (held || (tt->pend.len && tt->pendkey==key)) {
+            r.how  = TROUTE_SHOW;
+            r.tt   = tt;
+            r.held = held;
+            return r;
+        }
+    }
+    i32 i = termsetpick(set, sts, kind, now);
+    if (i >= 0) {
+        r.how = TROUTE_SEND;
+        r.tt  = set->tabs[i];
+        return r;
+    }
+    why = termfull(g, s);
+    if (why.len) {
+        r.why = why;
+        return r;
+    }
+    r.how = TROUTE_NEW;
+    return r;
 }
 
-// The Run button's: a code block of the agent's run in a Terminal tab
-// of the root of from, the session whose transcript shows it, whose
-// top on its host (termtop) is told how it ended. Its block's tab, if
-// open: shown, running still, or run again if it ended; else a new tab,
-// which waits for drawterm to size it, or starts at the last size for
-// a root not shown. The pane shows it, with the keyboard. The caller
-// checked it can (termrunwhy).
+// Why session s cannot run a code block of kind in a terminal now, else
+// empty.
+static Str termrunwhy(Gui *g, GuiSession *s, i32 kind, u64 key)
+{
+    return termroute(g, s, kind, key).why;
+}
+
+// The Run button's tooltip, for a code block it can run (termrunwhy):
+// where it goes, and whether the agent will hear how it ends.
+static Str termruntip(Gui *g, Arena *a, GuiSession *from, i32 kind, Str lang, u64 key)
+{
+    TermRoute r = termroute(g, from, kind, key);
+    if (r.until) {
+        schedat(&g->sched, r.until, DUE_CLOCK);
+    }
+    Buf b(a, 512);
+    if (r.how==TROUTE_SHOW || r.how==TROUTE_SEND) {
+        Buf lb(a, TERMTITLECAP + 8);
+        termlabel(&lb, r.tt);
+        Str label = finish(&lb);
+        if (r.how == TROUTE_SEND) {
+            print(&b, "Run at the prompt of ");
+        } else if (r.held == TERMHELD_RAN) {
+            print(&b, "It just ran: show ");
+        } else {
+            print(&b, "It runs in ");
+        }
+        if (r.tt->tid) {
+            print(&b, "Terminal ");
+            print(&b, r.tt->tid);
+        } else {
+            print(&b, "a new Terminal tab");
+        }
+        print(&b, " (");
+        print(&b, label);
+        print(&b, r.how==TROUTE_SEND || r.held==TERMHELD_RAN ? Str(")") : Str("): show it"));
+        print(&b, ".");
+        if (r.how == TROUTE_SEND) {
+            TermState st = termstate(r.tt);
+            if (termhooked(&st, os_ticks(g->os))) {
+                print(&b, " The agent hears how it ended at its next request.");
+            }
+        }
+        return finish(&b);
+    }
+    print(&b, "Run in a new Terminal tab (");
+    print(&b, kind==RUN_PS ? Str("PowerShell") : kind==RUN_CMD ? Str("cmd.exe") : lang);
+    print(&b, "), in ");
+    print(&b, termrunfolder(g, from));
+    print(&b, ".");
+    // Whether its shell will be hooked is known only once it starts:
+    // by another tab of that family on the same host
+    GuiSession *s = termroot(g, from);
+    for (i32 i = 0; i < s->terms.n; i++) {
+        TermTab *tt = s->terms.tabs[i];
+        if (tt->kind==kind && tt->hooked && tt->marked) {
+            print(&b, " The agent hears how it ended at its next request.");
+            break;
+        }
+    }
+    return finish(&b);
+}
+
+// The Run button's: a code block of the agent's typed at a shell's
+// prompt in a Terminal tab of the root of from, the session whose
+// transcript shows it, whose top on its host (termtop) is told how it
+// ended (termroute). A new tab waits for drawterm to size it, or starts
+// at the last size for a root not shown, and the block waits for its
+// shell's first prompt (termpend). The pane shows the tab, with the
+// keyboard. Returns the tab, else null if it cannot run now.
 static TermTab *termrun(Gui *g, GuiSession *from, Str lang, Str text, u64 key)
 {
+    TermRoute r = termroute(g, from, termrunlang(lang), key);
+    if (r.how == TROUTE_NONE) {
+        return 0;
+    }
     navjump(g);
-    GuiSession *s  = termroot(g, from);
-    TermTab    *tt = termrunof(s, key);
-    if (tt) {
-        termsetshow(&s->terms, termsetfind(&s->terms, tt));
-        if (tt->state==TT_ENDED || tt->state==TT_FAILED) {
-            termclose(g, tt, 0);  // waits again, as TT_NONE
-        }
-    } else {
+    GuiSession *s   = termroot(g, from);
+    Str         top = termtop(g, from)->sid;
+    TermTab    *tt  = r.tt;
+    if (r.how == TROUTE_NEW) {
         tt = termalloc(g);
-        if (tt->runtextcap >= text.len) {
-            copybytes(tt->runtext.data, text.data, text.len);
-            tt->runtext = {tt->runtext.data, text.len};
+        if (tt->pendcap >= text.len) {
+            copybytes(tt->pend.data, text.data, text.len);
+            tt->pend = {tt->pend.data, text.len};
         } else {
-            tt->runtext    = clone(&g->perm, text);
-            tt->runtextcap = text.len;
+            tt->pend    = clone(&g->perm, text);
+            tt->pendcap = text.len;
         }
-        Str top = termtop(g, from)->sid;
-        tt->run        = 1;
-        tt->runkey     = key;
-        tt->runlanglen = lang.len<countof(tt->runlang) ? lang.len : 0;
-        copybytes(tt->runlang, lang.data, tt->runlanglen);
-        tt->runfromlen = top.len<=countof(tt->runfrom) ? top.len : 0;
-        copybytes(tt->runfrom, top.data, tt->runfromlen);
+        tt->pendkey     = key;
+        tt->pendat      = os_ticks(g->os);
+        tt->pendfromlen = top.len<=countof(tt->pendfrom) ? top.len : 0;
+        copybytes(tt->pendfrom, top.data, tt->pendfromlen);
+        tt->asklanglen  = lang.len<=countof(tt->asklang) ? lang.len : 0;
+        copybytes(tt->asklang, lang.data, tt->asklanglen);
         tt->host = s->host;
         termsetadd(&s->terms, tt);
+    } else {
+        termsetshow(&s->terms, termsetfind(&s->terms, tt));
+        if (r.how == TROUTE_SEND) {
+            termrunsend(g, tt, text, key, top);
+        }
     }
     setpane(g, PANE_TERMINAL, 1);
     g->termfocus = 1;
@@ -955,14 +1165,22 @@ static void termopened(Gui *g, GuiSession *s, i64 id, Json *j, b32 ok, Str err)
     }
     tt->openid = 0;
     if (!ok) {
-        tt->state   = TT_FAILED;
-        tt->endedat = g->sched.now;
-        tt->errlen  = termkeep(tt->err, err);
+        tt->state  = TT_FAILED;
+        tt->errlen = termkeep(tt->err, err);
         return;
     }
     tt->tid      = jsonint(jsonget(j, "tid"), 0);
     tt->state    = TT_LIVE;
+    tt->liveat   = os_ticks(g->os);
     tt->shelllen = termkeep(tt->shell, jsonstr(jsonget(j, "shell")));
+    Str kind     = jsonstr(jsonget(j, "kind"));
+    Str nonce    = jsonstr(jsonget(j, "nonce"));
+    tt->kind     = kind==Str("sh") ? TERMK_SH : kind==Str("ps") ? TERMK_PS :
+                   kind==Str("cmd") ? TERMK_CMD : TERMK_OTHER;
+    tt->hooked   = nonce.len == countof(tt->nonce);
+    if (tt->hooked) {
+        copybytes(tt->nonce, nonce.data, nonce.len);
+    }
     Str editor   = jsonstr(jsonget(j, "editor"));  // Windows names it here
     if (tt->edit && editor.len && !tt->ednamed) {
         tt->titlelen = termtitle(tt->title, editor);
@@ -1014,6 +1232,30 @@ static void termfeed(Gui *g, TermTab *tt, Str data)
         case ARIEL_EV_REPLY:
             terminput(g, tt, {f.ev.data.data, f.ev.data.len});
             break;
+        case ARIEL_EV_MARK: {
+            // Its hooked shell's (OSC 133 with its nonce): at a prompt
+            // (A), and a command line begun (C), which Run goes by
+            Str      nonce = {tt->nonce, tt->hooked ? countof(tt->nonce) : 0};
+            TermMark m     = termmarkparse({f.ev.data.data, f.ev.data.len}, nonce);
+            if (!m.ok) {
+                break;
+            }
+            tt->marked = 1;
+            if (m.kind == 'A') {
+                tt->prompted = 1;
+                if (tt->runkey && !tt->doneat) {
+                    tt->doneat = os_ticks(g->os);
+                }
+                scheddirty(&g->sched);
+            } else if (m.kind == 'C') {
+                // A Run's next line, if nothing was typed since it, as
+                // where a shell without bracketed paste (bash 3.2) runs
+                // its lines one by one: it runs still
+                tt->prompted = 0;
+                tt->doneat   = tt->typedat>tt->sentat ? tt->doneat : 0;
+                scheddirty(&g->sched);
+            }
+        } break;
         case ARIEL_EV_TITLE:
             if (tt->edit) {
                 // Its editor's name, by OSC 1 (the helper's), once; no
@@ -1077,9 +1319,11 @@ static b32 termapply(Gui *g, GuiHost *h, Arena scratch, EvRec *r)
         }
         Str fresh = cuthead(u.data, (iz)(tt->fed - off));
         termfeed(g, tt, fresh);
-        tt->fed += fresh.len;
+        tt->fed   += fresh.len;
+        tt->outat  = os_ticks(g->os);
         termack(g, tt, tt->fed, 0);
-        return termshown(g, tt, 1);  // hidden tabs parse, unseen
+        // Hidden tabs parse, unseen; a Run waiting for one looks again
+        return termshown(g, tt, 1) || tt->pend.len;
     }
 
     case EV_TERMEND: {
@@ -1092,7 +1336,7 @@ static b32 termapply(Gui *g, GuiHost *h, Arena scratch, EvRec *r)
             termack(g, tt, off<tt->fed ? off : tt->fed, 0);
         }
         GuiSession *o = termowner(g, tt);
-        if (!tt->run && !tt->code && !tt->signal && !err.len && off==tt->fed) {
+        if (!tt->code && !tt->signal && !err.len && off==tt->fed) {
             // A clean exit closes its tab; an editor's goes back to its
             // file, which has the focus (editdone), not the prompt
             if (tt->edit) {
@@ -1109,9 +1353,8 @@ static b32 termapply(Gui *g, GuiHost *h, Arena scratch, EvRec *r)
             }
             return 1;
         }
-        tt->state   = TT_ENDED;
-        tt->endedat = g->sched.now;
-        tt->errlen  = termkeep(tt->err, err);
+        tt->state  = TT_ENDED;
+        tt->errlen = termkeep(tt->err, err);
         if (tt->edit && o) {
             termeditstale(g, o, tt);
         }
@@ -1121,7 +1364,8 @@ static b32 termapply(Gui *g, GuiHost *h, Arena scratch, EvRec *r)
     case EV_TERMBUSY: {
         b32 was  = tt->busy;
         tt->busy = jsonflag(jsonget(j, "busy"), 0);
-        return was!=tt->busy && termshown(g, tt, 0);  // its dot
+        // Its dot, and where Run goes
+        return was!=tt->busy && (termshown(g, tt, 0) || tt->pend.len || tt->runkey);
     }
     }
     return 0;
@@ -1377,6 +1621,7 @@ static void termpress(Gui *g, TermTab *tt, ImGuiKey k, b32 repeat)
     }
     ariel_Str s = ariel_key(tt->t, &key);
     termsend(g, tt, {s.data, s.len});
+    termkeyed(g, tt, {s.data, s.len});
     if (HOST_WINDOWS && !key.key) {
         // Windows translated the chord's key too, and a dead key's stays
         // pending (Alt+^ on German): the next key would compose with it.
@@ -1404,6 +1649,7 @@ static void termpastenow(Gui *g, TermTab *tt, Str text, Arena a)
         u8   *out = allocbytes(&t, cap);
         iz    n   = ariel_paste(tt->t, out, cap, {part.data, part.len}, flags);
         termsend(g, tt, {out, n});
+        termkeyed(g, tt, {out, n});
         in = cuthead(in, part.len);
     }
 }
@@ -1877,6 +2123,7 @@ static void termkeys(Gui *g, TermTab *tt, Arena a)
                 iz        n = utf8encode(buf, (i32)cp);
                 ariel_Str s = ariel_text(tt->t, {buf, n});
                 termsend(g, tt, {s.data, s.len});
+                termkeyed(g, tt, {s.data, s.len});
             }
         }
     }
@@ -2001,33 +2248,12 @@ static void termgrab(Gui *g)
 // The pane
 
 // What the banner over an ended or failed tab says: for an editor's,
-// naming it ("The editor" until it is named); for a Run's, its command.
+// naming it ("The editor" until it is named).
 static Str termbannertext(Arena *a, TermTab *tt)
 {
     Str name = termeditname(tt);
     Str who  = tt->edit ? Str("The editor") : Str("The terminal");
     Buf b(a, 256);
-    if (tt->run) {
-        Buf lb(a, TERMTITLECAP + 8);
-        termlabel(&lb, tt);
-        print(&b, "`");
-        print(&b, finish(&lb));
-        print(&b, "`");
-        if (tt->state == TT_FAILED) {
-            print(&b, " could not start: ");
-            print(&b, termerr(tt));
-        } else if (tt->errlen) {
-            print(&b, " ended: ");
-            print(&b, termerr(tt));
-        } else if (tt->signal) {
-            print(&b, " was killed by signal ");
-            print(&b, (i64)tt->signal);
-        } else {
-            print(&b, " exited with code ");
-            print(&b, (i64)tt->code);
-        }
-        return finish(&b);
-    }
     if (tt->state == TT_FAILED) {
         print(&b, who);
         print(&b, " could not start: ");
@@ -2055,11 +2281,9 @@ static void termbanner(Gui *g, GuiSession *s, TermTab *tt, Arena a, i32 cols, i3
     ImGui::PushStyleColor(ImGuiCol_Text, g->pal->amber);
     ImGui::TextWrapped("%s", cstr0(&a, termbannertext(&a, tt)));
     ImGui::PopStyleColor();
-    b32 restart = ImGui::Button(tt->run ? "Run again" : "Restart");
+    b32 restart = ImGui::Button("Restart");
     itemnamed(g, "term banner restart");
-    if (tt->run) {
-        itemtip("Run the command again in this tab (Enter)");
-    } else if (tt->edit) {
+    if (tt->edit) {
         Str name = termeditname(tt);
         Buf b(&a, 64 + tt->edpath.len);
         print(&b, "Run ");
@@ -2074,13 +2298,7 @@ static void termbanner(Gui *g, GuiSession *s, TermTab *tt, Arena a, i32 cols, i3
     ImGui::SameLine();
     b32 close = ImGui::Button("Close");
     itemnamed(g, "term banner close");
-    // A Run's Enter waits a moment, lest one meant for the command as it
-    // ended runs it again
-    b32 grace = tt->run && g->sched.now < tt->endedat + RUN_GRACE;
-    if (grace) {
-        schedat(&g->sched, tt->endedat + RUN_GRACE, DUE_APP);
-    }
-    restart |= !grace && ImGui::IsWindowFocused() && ImGui::IsKeyPressed(ImGuiKey_Enter, false);
+    restart |= ImGui::IsWindowFocused() && ImGui::IsKeyPressed(ImGuiKey_Enter, false);
     if (restart) {
         termrestart(g, s, tt, cols, rows);
         g->termfocus = 1;
@@ -2201,22 +2419,6 @@ static TermBar termtabs(Gui *g, GuiSession *s)
                 if (menutip(g, &a, "Kill", live,
                             concat(&a, concat(&a, "Close it, ending ", name),
                                    " and what it started"))) {
-                    r.closed = i;
-                    r.kill   = 1;
-                }
-            } else if (tt->run) {
-                Str live = tt->state==TT_LIVE ? Str{} : Str("Its command has ended");
-                Str why  = termwhy(g, s);
-                why = why.len ? why : hostwhy(g, s, "term.run");
-                if (menutip(g, &a, "Close", {}, "Hang up its command")) {
-                    r.closed = i;
-                }
-                if (menutip(g, &a, "Run again", why,
-                            "Hang up its command and run it again in this tab")) {
-                    r.restart = i;
-                }
-                if (menutip(g, &a, "Kill", live,
-                            "Close it, ending every process its command started")) {
                     r.closed = i;
                     r.kill   = 1;
                 }
@@ -2397,8 +2599,8 @@ static void drawterm(Gui *g)
         g->termaddto = 0;
         termnew(g, s, cols, rows);
     }
-    // Editors' and Runs' tabs waiting to start, as a new shell does,
-    // once the size holds
+    // Editors' tabs, and new shells' for a Run, waiting to start, as a
+    // new shell does, once the size holds
     for (i32 i = 0; held && i<s->terms.n; i++) {
         TermTab *p = s->terms.tabs[i];
         if (termasks(p) && p->state==TT_NONE) {
@@ -2408,7 +2610,7 @@ static void drawterm(Gui *g)
 
     TermTab *tt = termsetfront(&s->terms);
     if (tt && termasks(tt) && tt->state==TT_NONE) {
-        return;  // its editor or Run starts once the size holds, not a shell
+        return;  // it starts once the size holds, as asked
     } else if (!tt || tt->state==TT_NONE) {
         if (g->termfocus && !held) {
             return;

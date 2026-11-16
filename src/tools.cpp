@@ -1170,9 +1170,11 @@ static Str systemprompt(Arena *a, Str cwd, ToolEnv *te, b32 nofolder = 0,
                   "shell (");
         print(&b, te->windows ? Str("powershell, cmd, or sh") : Str("sh, bash, or zsh"));
         print(&b, "), with no prompt and no output. They can run it with one "
-                  "click; you hear how it ended at your next request, and "
-                  "read_terminal shows its output. Run everything else "
-                  "yourself.\n");
+                  "click, which types it at a prompt of their shell in their "
+                  "Terminal, so it must not exit the shell or set options "
+                  "such as set -e. You hear how it ended at your next request "
+                  "if their shell reports it, and read_terminal shows its "
+                  "output. Run everything else yourself.\n");
     }
     print(&b, "\nWorking directory: ");
     print(&b, cwd);

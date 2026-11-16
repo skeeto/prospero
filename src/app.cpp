@@ -6662,6 +6662,7 @@ static u64  termrunkey(Str, i64, i32);
 static Str  termrunfolder(Gui *, GuiSession *);
 static Str  termrunwhy(Gui *, GuiSession *, i32, u64);
 static TermTab *termrun(Gui *, GuiSession *, Str, Str, u64);
+static Str  termruntip(Gui *, Arena *, GuiSession *, i32, Str, u64);
 static void termadd(Gui *, GuiSession *);
 static void termgrab(Gui *);
 static Str  termscreen(Gui *, Arena *);
@@ -14947,7 +14948,9 @@ enum : i32 {
     CHK_MENTIONSEL,   // its pick's path is text, from the path not the row
     CHK_MENTIONTAG,   // its pick was drawn marked attached (dx 1) or not (0)
     CHK_TERMFOCUS,    // the terminal has the keyboard
-    CHK_TERMSCREEN,   // the terminal's screen has text
+    CHK_TERMSCREEN,   // the terminal's screen has text, or not with dx 1
+    CHK_RUNTO,        // Run takes the aimed block as text: none, show, send, new
+    CHK_TERMKIND,     // the front tab's shell's family is text; dx 1: hooked, marked
     CHK_TERMSIZE,     // the terminal fills its pane, the engine told its size
     CHK_TERMNONE,     // the session shown has no terminal
     CHK_TERMCOUNT,    // dx terminals are open, in every session
@@ -15332,7 +15335,8 @@ static Str chknames[] = {
     "the '@' picker's one line, as drawn",
     "the '@' picker's pick is the path it should be",
     "the '@' picker's pick says it is attached, or does not",
-    "the terminal has the keyboard", "the terminal shows the text",
+    "the terminal has the keyboard", "the terminal shows the text, or not, as said",
+    "Run in Terminal takes the block as said", "the front tab's shell is of that family, hooked as said",
     "the terminal fills its pane", "the terminal is closed",
     "that many terminals are open", "the terminal tabs are as said",
     "a subagent shows its root's terminal tabs",
@@ -15468,7 +15472,7 @@ enum : i32 {
     W_CTR,        // the container runtime, or the first container, is as
                   // text says (ctrwait)
     W_TERM,       // the shown session's terminal shows text
-    W_TERMBANNER, // the front terminal tab ended or failed, its banner up
+    W_RUNTO,      // Run in Terminal takes the aimed block (OP_SELRUN) as text says
     W_TERMBUSY,   // its front tab runs a program, or not with "idle"
     W_TERMCOUNT,  // dx terminals are open, in every session
     W_FILEREADY,  // the front file is read and drawn, jumped or restored
@@ -15508,7 +15512,7 @@ static Str waitnames[] = {
     "the subagent on far", "the subagent on far shown", "a toast",
     "the changes", "the folder's probe", "the worktree's branch",
     "the thin remote", "a relayed stream", "the thin remote's skill", "the container",
-    "the terminal's text", "the terminal's banner", "the terminal's program", "the terminals' count",
+    "the terminal's text", "Run in Terminal's route", "the terminal's program", "the terminals' count",
     "the file", "the file checked", "the file's find", "the pause",
     "Open file's check", "the file work",
     "Files tabs of the remote attached or dropped",
@@ -21845,14 +21849,23 @@ static DriveOp termops[] = {
     {OP_CHECK, CHK_FILEFOCUS, 0, 0, 0, ""},
     // The Run button on a block of the agent's tagged with its shell
     // (the fake provider's: sh, or powershell on Windows), shown while
-    // the mouse is over it: a Terminal tab runs it, labeled by its first
-    // line, with the keyboard; its exit, 3, leaves a banner whose Enter
-    // does nothing for a moment, then runs it again in the same tab;
-    // the button runs it again too, in that tab; the agent hears how it
-    // ended at its next request; the banner's Close closes it
+    // the mouse is over it, types it at the prompt of a tab of its
+    // shell's family waiting there with nothing running, else into a new
+    // tab of that shell; while it runs a click only shows its tab; the
+    // agent hears how it ended at its next request
     {OP_PROMPT, 0, 0, 0, 0, "Give me commands to run."},
     {OP_WAIT, W_SAID, 0, 0, 20000, "Run this:"},
     {OP_SELRUN, 0, 0, 0, 0, ""},
+#if !defined(_WIN32)
+    // gui.py's bash is hooked: its marks say where its prompt waits. A
+    // line half typed keeps it; ^C there brings the prompt back
+    CTRLKEY(GKEY_GRAVE, 500),
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMKIND, 1, 0, 0, "sh"},
+    {OP_TEXT, 0, 0, 0, 300, "echo half"},
+    {OP_CHECK, CHK_RUNTO, 0, 0, 0, "new"},
+    CTRLKEY(GKEY_C, 100),
+    {OP_WAIT, W_RUNTO, 0, 0, 5000, "send"},
     {OP_SHOWCODE, 0, 0, 0, 500, ""},
     {OP_MOVE, T_CODEBLOCK, 0, 0, 400, ""},
     {OP_CHECK, CHK_RUNBTN, 0, 0, 0, ""},
@@ -21860,38 +21873,92 @@ static DriveOp termops[] = {
     {OP_MOVE, T_CODERUN, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
-    {OP_WAIT, W_TERM, 0, 0, 20000, "run-1"},
-    {OP_WAIT, W_TERMBANNER, 0, 0, 10000, ""},
+    {OP_WAIT, W_TERM, 0, 0, 10000, "\nrun-1"},
     {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
-    {OP_CHECK, CHK_TERMCOUNT, 3, 0, 0, ""},
-    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, TERMSH "|*echo run-start..."},
-    TERMKEY(GKEY_ENTER, 300),  // too soon: ignored
-    {OP_CHECK, CHK_TERMBANNER, 0, 0, 1200, "`echo run-start...` exited with code 3"},
+    {OP_CHECK, CHK_TERMCOUNT, 2, 0, 0, ""},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*" TERMSH},
+    {OP_CHECK, CHK_RUNTO, 0, 0, 0, "show"},
     {OP_SHOT, 0, 0, 0, 300, "terminal-run"},
-    // Under the banner the wheel still scrolls its output (a notch may
-    // be lost to XWayland, so only back at all)
-    {OP_MOVE, T_TERMGRID, 0, 0, 100, ""},
-    {OP_WHEEL, 0, 0, 1, 50, ""},
-    {OP_WHEEL, 0, 0, 1, 300, ""},
-    {OP_CHECK, CHK_TERMVIEW, 1, 0, 0, ""},
-    TERMKEY(GKEY_ENTER, 300),
-    {OP_WAIT, W_TERM, 0, 0, 20000, "run-2"},
-    {OP_WAIT, W_TERMBANNER, 0, 0, 10000, ""},
-    {OP_CHECK, CHK_TERMCOUNT, 3, 0, 0, ""},
     {OP_SHOWCODE, 0, 0, 0, 500, ""},
     {OP_MOVE, T_CODEBLOCK, 0, 0, 400, ""},
     {OP_MOVE, T_CODERUN, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
-    {OP_WAIT, W_TERM, 0, 0, 20000, "run-3"},
-    {OP_WAIT, W_TERMBANNER, 0, 0, 10000, ""},
-    {OP_CHECK, CHK_TERMCOUNT, 3, 0, 0, ""},
-    {OP_PROMPT, 0, 0, 0, 0, "Tell me how it ran."},
-    {OP_WAIT, W_SAID, 0, 0, 20000, "Heard: exited with code 3"},
-    {OP_MOVE, T_NAMED, 0, 0, 100, "term banner close"},
+    {OP_WAIT, W_TERM, 0, 0, 10000, "\nrun-end-1"},
+    {OP_CHECK, CHK_TERMSCREEN, 1, 0, 0, "\nrun-2"},  // not run again
+    {OP_CHECK, CHK_TERMCOUNT, 2, 0, 0, ""},
+    {OP_WAIT, W_RUNTO, 0, 0, 5000, "send"},
+    {OP_SHOWCODE, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_CODEBLOCK, 0, 0, 400, ""},
+    {OP_MOVE, T_CODERUN, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
-    {OP_WAIT, W_TERMCOUNT, 2, 0, 5000, ""},
+    {OP_WAIT, W_TERM, 0, 0, 10000, "\nrun-end-2"},
+    {OP_CHECK, CHK_TERMCOUNT, 2, 0, 0, ""},
+    {OP_PROMPT, 0, 0, 0, 0, "Tell me how it ran."},
+    {OP_WAIT, W_SAID, 0, 0, 20000, "Heard: exited with code 3"},
+    // A quote left open: its continuation prompt, where no mark comes,
+    // is no place for a Run, until ^C; nor is a tab running a program,
+    // so a new one opens for it, with that shell, and has it. A click
+    // on the grid gives it the keyboard, wherever that was
+    {OP_MOVE, T_TERMGRID, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 100, "echo \"unclosed"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\ntty>"},
+    {OP_MARK, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_RUNTO, 0, 0, 0, "new"},
+    CTRLKEY(GKEY_C, 100),
+    {OP_WAIT, W_RUNTO, 0, 0, 5000, "send"},
+    {OP_TEXT, 0, 0, 0, 100, "sleep 8"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERMBUSY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_RUNTO, 0, 0, 0, "new"},
+    {OP_SHOWCODE, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_CODEBLOCK, 0, 0, 400, ""},
+    {OP_MOVE, T_CODERUN, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_TERMCOUNT, 3, 0, 10000, ""},
+    {OP_WAIT, W_TERM, 0, 0, 15000, "\nrun-3"},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, TERMSH "|*" TERMSH},
+    {OP_CHECK, CHK_TERMKIND, 1, 0, 0, "sh"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_WAIT, W_TERM, 0, 0, 10000, "\nrun-end-3"},
+#else
+    // No PowerShell tab yet: a new one has it
+    {OP_CHECK, CHK_RUNTO, 0, 0, 0, "new"},
+    {OP_SHOWCODE, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_CODEBLOCK, 0, 0, 400, ""},
+    {OP_CHECK, CHK_RUNBTN, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "terminal-runbutton"},
+    {OP_MOVE, T_CODERUN, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_TERMCOUNT, 3, 0, 10000, ""},
+    {OP_WAIT, W_TERM, 0, 0, 20000, "\nrun-1"},
+    {OP_CHECK, CHK_TERMKIND, 1, 0, 0, "ps"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "terminal-run"},
+    {OP_WAIT, W_TERM, 0, 0, 10000, "\nrun-end-1"},
+    {OP_PROMPT, 0, 0, 0, 0, "Tell me how it ran."},
+    {OP_WAIT, W_SAID, 0, 0, 20000, "Heard: exited with code 3"},
+    CTRLKEY(GKEY_GRAVE, 500),
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+#endif
+    // Its shell's clean exit closes the new tab, the first one in front
+    // again, which says where it was (as the root's other checks below)
+    {OP_TEXT, 0, 0, 0, 100, "exit 0"},
+    TERMKEY(GKEY_ENTER, 300),
+    {OP_WAIT, W_TERMCOUNT, 2, 0, 10000, ""},
+    {OP_CHECK, CHK_TERMTABS, 0, 0, 0, "*" TERMSH},
+    {OP_WAIT, W_TERMBUSY, 0, 0, 10000, "idle"},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 100, "echo rootthree"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\nrootthree"},
     // A session on a remote host (tests/gui.py's fake ssh, --rcwd its
     // folder) has its own tabs there, its shell run by that host's
     // engine: busy comes back through the host, a dropped link shows
@@ -21981,7 +22048,7 @@ static DriveOp termops[] = {
     {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Start subagents."},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 800, ""},
-    {OP_CHECK, CHK_TERMSCREEN, 0, 0, 0, "\nrootwo"},
+    {OP_CHECK, CHK_TERMSCREEN, 0, 0, 0, "\nrootthree"},
     CTRLKEY(GKEY_GRAVE, 500),
     {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
     // Quitting hangs up the shell, whose trap leaves a file (gui.py), but
@@ -24759,6 +24826,32 @@ static Str lastmark(Gui *g, Arena *a)
 }
 
 // Terminals open, in every session.
+// Whether Run in Terminal takes the block OP_SELRUN aimed at as want
+// says: none, show, send or new (termroute), logged with log.
+static b32 driverunto(Gui *g, Str want, b32 log)
+{
+    Arena a = g->frame;
+    if (!g->sess || !g->view || g->drivecodemsg<0 || g->drivecodemsg>=g->view->msgs.len) {
+        guilog(g, "drive: no block aimed at to run");
+        return 0;
+    }
+    CodeRun   cr  = coderun(g, g->view, &a, g->drivecodemsg, g->drivecodeblk);
+    TermRoute r   = cr.kind ? termroute(g, g->sess, cr.kind, cr.key) : TermRoute{};
+    Str       got = r.how==TROUTE_SHOW ? Str("show") : r.how==TROUTE_SEND ? Str("send") :
+                    r.how==TROUTE_NEW  ? Str("new")  : Str("none");
+    if (log) {
+        Buf b(&a, 128 + r.why.len);
+        print(&b, "drive: Run in Terminal would ");
+        print(&b, got);
+        if (r.why.len) {
+            print(&b, ": ");
+            print(&b, r.why);
+        }
+        guilog(g, finish(&b));
+    }
+    return got == want;
+}
+
 static i64 drivetermcount(Gui *g)
 {
     i64 n = 0;
@@ -25386,10 +25479,8 @@ static b32 drivewaitdone(Gui *g)
         Arena a = g->frame;
         return find(termscreen(g, &a), g->ops[g->drivepc-1].text) >= 0;
     }
-    case W_TERMBANNER: {
-        TermTab *tt = termfront(g);
-        return tt && (tt->state==TT_ENDED || tt->state==TT_FAILED);
-    }
+    case W_RUNTO:
+        return driverunto(g, g->ops[g->drivepc-1].text, 0);
     case W_TERMBUSY: {
         TermTab *tt   = termfront(g);
         b32      idle = g->ops[g->drivepc-1].text == Str("idle");
@@ -27482,7 +27573,8 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_TERMSCREEN: {
         Arena a      = g->frame;
         Str   screen = termscreen(g, &a);
-        b32   ok     = find(screen, g->ops[g->drivepc-1].text) >= 0;
+        b32   absent = g->ops[g->drivepc-1].dx != 0;
+        b32   ok     = (find(screen, g->ops[g->drivepc-1].text) >= 0) != absent;
         if (!ok) {
             guilog(g, concat(&a, "drive: the terminal shows:\n", screen));
         }
@@ -27622,6 +27714,23 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_TERMCOUNT:
         return (f32)drivetermcount(g) == g->ops[g->drivepc-1].dx;
+    case CHK_RUNTO:
+        return driverunto(g, g->ops[g->drivepc-1].text, 1);
+    case CHK_TERMKIND: {
+        TermTab *tt   = termfront(g);
+        Str      want = g->ops[g->drivepc-1].text;
+        i32      kind = want=="sh" ? TERMK_SH : want=="ps" ? TERMK_PS :
+                        want=="cmd" ? TERMK_CMD : TERMK_OTHER;
+        b32      hook = g->ops[g->drivepc-1].dx != 0;
+        Arena    a    = g->frame;
+        Buf      b(&a, 128);
+        print(&b, "drive: the front tab's shell's kind ");
+        print(&b, tt ? (i64)tt->kind : -1);
+        print(&b, tt && tt->hooked ? Str(", hooked") : Str(""));
+        print(&b, tt && tt->marked ? Str(", marked") : Str(""));
+        guilog(g, finish(&b));
+        return tt && tt->kind==kind && (!hook || (tt->hooked && tt->marked));
+    }
     case CHK_FILELINE:
     case CHK_FILEBAND:
     case CHK_FILEROWS:
