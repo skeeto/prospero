@@ -388,6 +388,27 @@ inline void arenafault(u8 *buf, iz len)
 
 // Hooks
 
+// After a carved [lo, hi) from itself: each granule's hint becomes a's
+// own, exactly, not sampled as an allocation's are. Otherwise hints
+// older than the carve, such as a grandparent's from the carve that a
+// came from (nested carves), would show as an overlap of the carve's
+// allocations over that grandparent's claim, which only its lender is
+// exempt from.
+inline void arenacheck_lend(Arena *a, byte *lo, byte *hi)
+{
+    if (lo>=hi || a->aid==ARENA_DEAD) {
+        return;
+    }
+    arenalock();
+    ArenaRec *r = arenaown(a);
+    if (r) {
+        for (uz g = (uz)lo >> 4; g <= (uz)(hi - 1) >> 4; g++) {
+            *arenahint((byte *)(g << 4)) = r->aid;
+        }
+    }
+    arenaunlock();
+}
+
 // Before a moves its frontier past [p, p+n), from a->beg.
 inline void arenacheck_alloc(Arena *a, byte *p, iz n, void *pc)
 {

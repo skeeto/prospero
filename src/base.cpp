@@ -76,6 +76,7 @@ static b32 os_commit(Region *, iz upto);
 
 #if PROSPERO_ARENACHECK
 inline void arenacheck_alloc(Arena *, byte *, iz, void *pc);
+inline void arenacheck_lend(Arena *, byte *, byte *);
 inline void arenafresh(Region *, byte *, byte *);
 #endif
 
@@ -155,6 +156,7 @@ static Arena carve(Arena *a, iz cap ARENASITE)
     r.beg = (byte *)allocbytes(a, cap);
     r.end = r.beg + cap;
 #if PROSPERO_ARENACHECK
+    arenacheck_lend(a, r.beg, r.end);
     r.lender = a->aid;
     r.lentlo = r.beg;
     r.lenthi = r.end;
