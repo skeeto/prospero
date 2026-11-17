@@ -10,6 +10,11 @@
   [Configuration](help:config)) keeps the same messages across runs.
   A window launched from a terminal, which goes on detached, writes its
   errors there too; `prospero -f` keeps it in the terminal instead.
+  A crash leaves a line there, "prospero: crashed with" what it was
+  (SIGSEGV, an access violation) and where. A window that crashes
+  before it opens prints that line in the terminal it was launched
+  from. On macOS the system keeps a fuller report in
+  `~/Library/Logs/DiagnosticReports`.
 - **Settings → Diagnostics** lists each problem in the configuration
   files, with where it is, and copies them with Copy all.
 - **The transcript** notes each retry of a failed request, and the

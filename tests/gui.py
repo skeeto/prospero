@@ -1155,6 +1155,8 @@ def detaching(host, plain):
             except (OSError, P.Refused):
                 pass
     p, more = barelaunch(host)
+    problems, lines = problems + p, lines + more
+    p, more = crashlaunch(host)
     return problems + p, lines + more
 
 
@@ -1232,6 +1234,59 @@ def barelaunch(host):
                 P.signal_ours(pid, P.KILL, lambda q: ours(q, host.root))
             except (OSError, P.Refused):
                 pass
+    return problems, lines
+
+
+def crashlaunch(host):
+    """barelaunch's launch again, with its window crashing before it
+    opens (PROSPERO_TEST_CRASH=detached): the launch says what the crash
+    was, from the window's own line in gui.log, rather than pointing at
+    a log with nothing in it (#74). A sanitizer keeps out of SIGSEGV, so
+    that the line is the program's."""
+    problems, lines = [], []
+    exe = host.path("work", "bare", "prospero")
+    xdg = host.path("xdg")
+    env = dict(os.environ, XDG_CONFIG_HOME=os.path.join(xdg, "config"),
+               XDG_STATE_HOME=os.path.join(xdg, "state"),
+               PROSPERO_TEST_CRASH="detached",
+               ASAN_OPTIONS="handle_segv=0:handle_abort=0")
+    master, slave = os.openpty()
+    p = subprocess.Popen([exe], cwd=host.path("work", "four"), env=env,
+                         stdin=subprocess.DEVNULL, stdout=slave, stderr=slave,
+                         start_new_session=True)
+    os.close(slave)
+    # Read while it runs: macOS drops what a pty holds once its last
+    # writer is gone, where Linux keeps it to be read
+    out, deadline = b"", time.monotonic() + 30
+    while time.monotonic() < deadline:
+        if select.select([master], [], [], 0.2)[0]:
+            try:
+                got = os.read(master, 1 << 16)
+            except OSError:
+                got = b""
+            if got:
+                out += got
+                continue
+        if p.poll() is not None:
+            break
+        time.sleep(0.05)  # at EOF, select says readable at once
+    if p.poll() is None:
+        P.signal_group(p, P.KILL)
+        p.wait()
+        problems.append("the crashing launch did not return")
+    os.close(master)
+    for line in out.decode(errors="replace").splitlines():
+        lines.append(f"[c] {line.rstrip()}\n")
+        print(lines[-1], end="", flush=True)
+    said = [l for l in lines if "prospero: crashed with SIGSEGV" in l]
+    if p.returncode != 1:
+        problems.append(f"the crashing launch: exit status {p.returncode}, not 1")
+    if not said:
+        problems.append("the crashing launch did not say the window crashed with SIGSEGV")
+    elif "0x44" not in said[0]:
+        problems.append(f"the crashing launch did not name the address: {said[0].strip()}")
+    if any("gui.log" in l for l in lines):
+        problems.append("the crashing launch pointed at gui.log, not at the crash")
     return problems, lines
 
 

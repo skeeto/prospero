@@ -104,7 +104,8 @@ have every word typed, headings first, and a click goes to that section.
 
 Launched from a terminal, `prospero` goes on detached, as gvim does,
 and the shell has its prompt back once the window is up; should the
-window fail to start, its errors print there first, with exit status 1.
+window fail to start, its errors print there first, with exit status 1,
+a crash's too ("prospero: crashed with SIGSEGV ...").
 Its messages then go to `gui.log` in the state directory. `-f`
 (`--foreground`) keeps it in the terminal, with its messages there and
 Ctrl+C to stop it. A launch whose standard error is not a terminal, as

@@ -891,6 +891,35 @@ def bytewise(t):
     t.check(not r.all("retry"), "no retries")
 
 
+@scenario(bound=10)
+def crash_said(t):
+    """A fatal fault says what it was on standard error, which is all a
+    detached window's launch can report of it (#74), and the process
+    still dies of it. PROSPERO_TEST_CRASH faults on purpose; "detached"
+    only in a --detached window. A sanitizer's handler goes first, so it
+    is told to keep out of SIGSEGV here."""
+    env = dict(t.tmpenv, ASAN_OPTIONS="handle_segv=0:handle_abort=0")
+
+    def run(value):
+        p = t.host.popen(["--version"], t.work, env=dict(env, PROSPERO_TEST_CRASH=value))
+        out, err = p.communicate(timeout=20)
+        return p.returncode, out, err
+    rc, out, err = run("1")
+    t.check(rc != 0, f"the process died of it: exit {rc}")
+    line = next((l for l in err.splitlines() if l.startswith("prospero: crashed with")), "")
+    t.check(line, f"it said so: {rc} {out!r} {err!r}")
+    t.check(("access violation" if t.host.windows else "SIGSEGV") in line,
+            f"named the fault: {line!r}")
+    t.check("0x44" in line, f"named the address: {line!r}")
+    if not t.host.windows:
+        # Killed by the signal, as without the note: a core or the
+        # system's crash report sees the same fault
+        t.check(rc in (-11, 128+11, 139), f"killed by SIGSEGV: {rc}")
+    rc, out, err = run("detached")
+    t.check(rc == 0 and "prospero" in out and "crashed" not in err,
+            f"not a detached window: no crash: {rc} {out!r} {err!r}")
+
+
 @scenario(conf={"idle_timeout": 3, "progress_timeout": 5}, bound=20)
 def pings(t):
     r = t.run()

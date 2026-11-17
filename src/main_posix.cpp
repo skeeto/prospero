@@ -4873,6 +4873,113 @@ static void ttyprobe(char **argv)
 extern "C" int prospero_desktop(int argc, char **argv);
 #endif
 
+// A fatal fault says what it was on standard error before the process
+// dies of it, as it would anyway. A window launched from a terminal
+// runs detached, its standard error in gui.log, and nobody waits on it:
+// this line is all its launch can report of a crash (#74). Only what is
+// safe in a signal handler: write, raise. A fault returns to fault
+// again, with the default action back (SA_RESETHAND), so that the
+// system's crash report or core sees the very same fault; one sent with
+// kill is raised again instead. A handler already there (a sanitizer's)
+// is left alone.
+static u8 crashstack[1<<16];
+
+static void crashhex(u8 *buf, iz *len, uz v)
+{
+    buf[(*len)++] = '0';
+    buf[(*len)++] = 'x';
+    i32 shift = (i32)sizeof(uz)*8 - 4;
+    while (shift>0 && !(v>>shift & 15)) shift -= 4;
+    for (; shift >= 0; shift -= 4) {
+        buf[(*len)++] = (u8)"0123456789abcdef"[v>>shift & 15];
+    }
+}
+
+static void crashsig(int sig, siginfo_t *si, void *)
+{
+    Str name = {}, what = {};
+    switch (sig) {
+    case SIGSEGV: name = "SIGSEGV"; what = "a bad memory access";    break;
+    case SIGBUS:  name = "SIGBUS";  what = "a bad memory access";    break;
+    case SIGILL:  name = "SIGILL";  what = "an illegal instruction"; break;
+    case SIGFPE:  name = "SIGFPE";  what = "an arithmetic fault";    break;
+    case SIGTRAP: name = "SIGTRAP"; what = "a trap";                 break;
+    case SIGABRT: name = "SIGABRT"; what = "an abort";               break;
+    }
+    b32 sent = si->si_code==SI_USER || si->si_code==SI_QUEUE;
+    #ifdef SI_TKILL
+    sent |= si->si_code==SI_TKILL;
+    #endif
+
+    u8  buf[256];
+    iz  len    = 0;
+    Str part[] = {"prospero: crashed with ", name, ", ", what};
+    for (i32 i = 0; i < countof(part); i++) {
+        copybytes(buf+len, part[i].data, part[i].len);
+        len += part[i].len;
+    }
+    if (sig!=SIGABRT && !sent) {
+        Str at = " at address ";
+        copybytes(buf+len, at.data, at.len);
+        len += at.len;
+        crashhex(buf, &len, (uz)si->si_addr);
+    }
+    #ifdef __APPLE__
+    Str report = "; macOS keeps its report in ~/Library/Logs/DiagnosticReports";
+    copybytes(buf+len, report.data, report.len);
+    len += report.len;
+    #endif
+    buf[len++] = '\n';
+    writeall(2, Str(buf, len));
+
+    if (sig==SIGABRT || sent) {
+        raise(sig);  // the default action, back already
+    }
+}
+
+static void crashnote()
+{
+    stack_t ss = {};
+    ss.ss_sp    = crashstack;
+    ss.ss_size  = sizeof(crashstack);
+    sigaltstack(&ss, 0);  // so that a stack overflow is said too
+
+    int sigs[] = {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP, SIGABRT};
+    for (i32 i = 0; i < countof(sigs); i++) {
+        int              sig = sigs[i];
+        struct sigaction old = {};
+        sigaction(sig, 0, &old);
+        // Null is the default whatever the flags: a parent's spawn may
+        // leave SA_SIGINFO set on it (as uv's Python does)
+        if (old.sa_handler == SIG_DFL) {
+            struct sigaction sa = {};
+            sa.sa_sigaction = crashsig;
+            sa.sa_flags     = SA_SIGINFO | SA_RESETHAND | SA_ONSTACK | SA_NODEFER;
+            sigemptyset(&sa.sa_mask);
+            sigaction(sig, &sa, 0);
+        }
+    }
+}
+
+// PROSPERO_TEST_CRASH: crash on purpose, with a bad memory access, for
+// the checks of what a crash says. "detached" crashes only the window a
+// launch from a terminal starts, and not the launch.
+static void crashtest(i32 argc, char **argv)
+{
+    char *v = getenv("PROSPERO_TEST_CRASH");
+    if (!v || !*v) {
+        return;
+    }
+    b32 detached = 0;
+    for (i32 i = 1; i < argc; i++) {
+        detached |= !__builtin_strcmp(argv[i], "--detached");
+    }
+    if (__builtin_strcmp(v, "detached") || detached) {
+        u8 *volatile bad = (u8 *)(uz)0x44;  // opaque, or GCC warns
+        *bad = 0;
+    }
+}
+
 int main(int argc, char **argv)
 {
     if (argc>1 && reapmode(argv[1])) {
@@ -4899,6 +5006,8 @@ int main(int argc, char **argv)
         fd = dup(fd);
     }
     signal(SIGPIPE, SIG_IGN);
+    crashnote();
+    crashtest(argc, argv);
 
     Os os = {};
     i32 life[2];

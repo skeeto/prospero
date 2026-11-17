@@ -4571,6 +4571,110 @@ static uz probenap(Os *os, Arena scratch, i64 ms, b32 detach)
     ExitProcess(code);
 }
 
+// A crash says what it was on standard error before the process dies of
+// it, as it would anyway: a window launched from a console runs
+// detached, its standard error in gui.log, and this line is all its
+// launch can report of a crash (#74). A vectored handler, since built
+// without unwind tables (-fno-asynchronous-unwind-tables) no exception
+// unwinds past this program's frames to the top-level filter. It sees
+// every exception first, those that some code handles on purpose too,
+// so it speaks only for a fault inside this executable's own image,
+// where nothing handles one (no SEH here), and only once. It declines,
+// and the process ends with the exception's code, as without it.
+struct CrashRecord {
+    u32          code;
+    u32          flags;
+    CrashRecord *next;
+    void        *addr;
+    u32          nparams;
+    uz           params[15];
+};
+struct CrashPointers {
+    CrashRecord *record;
+    void        *context;
+};
+typedef i32 (__stdcall *CrashHandler)(CrashPointers *);
+W32(void *, AddVectoredExceptionHandler(u32, CrashHandler));
+static uz crashlo, crashhi;  // this executable's image
+static i32 crashsaid;
+
+static void crashhex(u8 *buf, i32 *len, uz v, i32 digits)
+{
+    buf[(*len)++] = '0';
+    buf[(*len)++] = 'x';
+    i32 shift = (i32)sizeof(uz)*8 - 4;
+    while (shift>=digits*4 && !(v>>shift & 15)) shift -= 4;
+    for (; shift >= 0; shift -= 4) {
+        buf[(*len)++] = (u8)"0123456789ABCDEF"[v>>shift & 15];
+    }
+}
+
+static i32 __stdcall crashfilter(CrashPointers *p)
+{
+    CrashRecord *r    = p->record;
+    Str          what = {};
+    switch (r->code) {
+    case 0xc0000005: what = "an access violation";       break;
+    case 0xc00000fd: what = "a stack overflow";          break;
+    case 0xc000001d: what = "an illegal instruction";    break;
+    case 0xc0000094: what = "an integer division by 0";  break;
+    case 0xc0000095: what = "an integer overflow";       break;
+    case 0x80000003: what = "a breakpoint";              break;
+    case 0xc0000409: what = "a fail-fast";               break;
+    }
+    uz pc = (uz)r->addr;
+    if (!what.len || pc<crashlo || pc>=crashhi || crashsaid++) {
+        return 0;  // EXCEPTION_CONTINUE_SEARCH
+    }
+    u8  buf[256];
+    i32 len    = 0;
+    Str part[] = {"prospero: crashed with ", what, ", code "};
+    for (i32 i = 0; i < countof(part); i++) {
+        copybytes(buf+len, part[i].data, part[i].len);
+        len += (i32)part[i].len;
+    }
+    crashhex(buf, &len, r->code, 8);
+    Str at = r->code==0xc0000005 && r->nparams>=2 ? Str(", at address ") : Str(", at ");
+    copybytes(buf+len, at.data, at.len);
+    len += (i32)at.len;
+    crashhex(buf, &len, at.len>5 ? r->params[1] : pc, 1);
+    buf[len++] = '\n';
+    i32 n = 0;
+    WriteFile(GetStdHandle(-12), buf, len, &n, 0);
+    return 0;
+}
+
+static void crashnote()
+{
+    u8 *base = (u8 *)GetModuleHandleW(0);
+    i32 nt   = 0;
+    copybytes(&nt, base+0x3c, 4);  // e_lfanew
+    u32 size = 0;
+    copybytes(&size, base+nt+0x50, 4);  // OptionalHeader.SizeOfImage
+    crashlo = (uz)base;
+    crashhi = (uz)base + size;
+    AddVectoredExceptionHandler(0, crashfilter);
+}
+
+// PROSPERO_TEST_CRASH: crash on purpose, with an access violation, for
+// the checks of what a crash says. "detached" crashes only the window a
+// launch from a console starts, and not the launch.
+static void crashtest(Os *os, Arena a, Slice<Str> args)
+{
+    Str v = os_getenv(os, &a, "PROSPERO_TEST_CRASH");
+    if (!v.len) {
+        return;
+    }
+    b32 detached = 0;
+    for (iz i = 1; i < args.len; i++) {
+        detached |= args[i] == "--detached";
+    }
+    if (!(v == "detached") || detached) {
+        u8 *volatile bad = (u8 *)(uz)0x44;  // opaque, or GCC warns
+        *bad = 0;
+    }
+}
+
 #if PROSPERO_GUI
 // GUI builds start in the CRT, whose wWinMain (gui_win32.cpp) calls this.
 extern "C" void prospero_main()
@@ -4595,6 +4699,7 @@ void mainCRTStartup()
     // No dialogs from a crashing child, or from a missing disk
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX |
                  SEM_NOOPENFILEERRORBOX);
+    crashnote();
 
     // A 32-bit process has 2 GiB of address space, which XP fragments
     // into pieces of at most 1 GiB: every reservation is small there.
@@ -4609,6 +4714,7 @@ void mainCRTStartup()
     iz   len = 0;
     for (; cmd[len]; len++) {}
     Slice<Str> args = splitcmdline(&a, fromwide(&a, cmd, len));
+    crashtest(&os, a, args);
 
     if (args.len>2 && args[1]=="--tty-nap") {
         Sleep((i32)parseint(args[2]).val);

@@ -30352,15 +30352,15 @@ static i32 detachgui(Gui *g, Str *args, i32 nargs, Str here)
         }
         mailwait(mb, 20);
     }
+    // What it wrote, a crash's own line among it (os main's crashnote).
+    // Nothing means a death too sudden to say anything (SIGKILL, the
+    // system's out-of-memory killer), and the empty log no place to look.
     Read r = os_readat(os, &a, log, from, 1<<12);
     if (r.data.len) {
         os_print(os, 2, r.data);
     } else {
-        Buf b(&a, 128 + log.len);
-        print(&b, "prospero: the window's process ended before its window opened; see ");
-        print(&b, log);
-        putbyte(&b, '\n');
-        os_print(os, 2, finish(&b));
+        os_print(os, 2, "prospero: the window's process ended before its window "
+                        "opened, with nothing said: killed, perhaps\n");
     }
     return 1;
 }
