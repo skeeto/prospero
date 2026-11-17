@@ -18146,6 +18146,24 @@ def task_worktree(t):
 
 
 @scenario(bound=60)
+def task_worktree_run(t):
+    """prospero run, whose one turn starts a subagent in a worktree and
+    merges its branch: the run stops right after that turn, but not
+    before the worktree and the branch are gone."""
+    env = gitrepo(t)
+    path = os.path.join(os.path.realpath(t.work), ".prospero", "worktrees", "merge-it")
+    r = t.run("go", env=wtkeep(env), timeout=60)
+    t.check(r.rc == 0, f"run exit {r.rc}: {r.stderr[-2000:]}")
+    ends = r.all("tool.end")
+    t.check(any("merged" in e.get("text", "") for e in ends), f"merged: {ends}")
+    news = [e for e in r.all("worktree") if e.get("path") == path]
+    t.check(not os.path.exists(path) and
+            "prospero/merge-it" not in gitrun(t, env, "branch"),
+            f"gone before the run stopped: {news}")
+    t.check(gitrun(t, env, "status", "--porcelain") == "", "the main checkout clean")
+
+
+@scenario(bound=60)
 def task_worktree_two(t):
     """Two subagents in worktrees, started in one response, change the
     same file each its own way, on branches of their own, the second

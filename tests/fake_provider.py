@@ -1941,6 +1941,24 @@ def sc_task_worktree_b(model, n, req):
     yield from wt_child(model, n, req)
 
 
+def sc_task_worktree_run(model, n, req):
+    # One turn: a subagent in a worktree commits, and its branch is merged
+    name = last_call(req)[0]
+    if req["messages"][-1].get("role") == "tool" and name == "task":
+        yield from tool(model, n, "shell", {
+            "command": "git merge -q --ff-only prospero/merge-it && echo merged"})
+    elif req["messages"][-1].get("role") == "tool":
+        yield from answer(model, "Parent heard: " + " / ".join(tool_results(req)))
+    else:
+        yield from wt_parent(model, n, req, [
+            ("Merge it", "run echo 'int y;' >> src/main.c && git commit -qam y && "
+                         "git rev-parse --abbrev-ref HEAD")])
+
+
+def sc_task_worktree_run_b(model, n, req):
+    yield from wt_child(model, n, req)
+
+
 EDIT = "run echo {} > ../README && git commit -qam {} && git rev-parse --abbrev-ref HEAD"
 
 

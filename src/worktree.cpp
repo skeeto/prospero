@@ -2184,3 +2184,21 @@ static void wtquit(Engine *e)
         mailpoke(w->req);
     }
 }
+
+// The engine stops, and waits a while for removals: subagents' trees
+// whose branches a turn just merged (wtends), as `prospero run` stops
+// right after that turn, and the jobs removing them. A job to make or
+// check a worktree, which a hook may slow, stops it all at once
+// (wtquit). Whether to wait for git still.
+static b32 wtquitting(Engine *e)
+{
+    GitWork *w       = e->wt;
+    b32      stopped = w && w->started && gitquitting(w);
+    for (iz i = 0; !stopped && i<e->wtjobs.len; i++) {
+        if (e->wtjobs[i].kind != WT_REMOVE) {
+            wtquit(e);
+            stopped = 1;
+        }
+    }
+    return !stopped && (e->wtjobs.len || e->wtends.len);
+}

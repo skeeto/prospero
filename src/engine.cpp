@@ -2633,6 +2633,7 @@ static void gitquit(Engine *);
 static void wtdone(Engine *, Arena, Str);
 static b32  wtbusy(Engine *);
 static void wtquit(Engine *);
+static b32  wtquitting(Engine *);
 static void wtprobe(Engine *, Arena, i64, Json *);
 static b32  wtexists(Engine *, Arena, WtSess *);
 static b32  wtgate(Session *, Arena, b32 turn = 1);
@@ -25692,7 +25693,7 @@ static void command(Engine *e, Arena scratch, Str line)
         }
         farstop(e, scratch, 1);
         termhangupall(e, -1, {});
-        wtquit(e);  // a job under way is asked to stop, and waited for
+        wtquitting(e);  // a job under way is asked to stop, but removals
         reply(e, scratch, id, 1, {}, {});
     } return;
     case CMD_CONFIGGET:
@@ -26450,13 +26451,15 @@ static void enginethread(void *arg)
             e->trashat = os_ticks(e->os) + TRASH_EVERY*(i64)MS;
         }
         b32 ends = e->wtends.len && os_ticks(e->os)>=e->wtendsat;
-        if ((e->wtdue.len || e->wtgone.len || ends) && !e->quitting) {
+        b32 wtq  = e->quitting && wtquitting(e);  // merged trees still go
+        if ((e->wtdue.len || e->wtgone.len || ends) && (!e->quitting || (ends && wtq))) {
             wtsweep(e, newarena(e->scratch));  // worktrees no session needs
         }
 
         // Cancelling ends turns at once, but should a turn linger, the
         // engine stops anyway once the wait is over
-        if (e->quitting && ((allidle(e) && !farbusy(e) && !wtbusy(e)) || now>=e->quitby)) {
+        wtq = e->quitting && wtquitting(e);
+        if (e->quitting && ((allidle(e) && !farbusy(e) && !wtbusy(e) && !wtq) || now>=e->quitby)) {
             for (Session *s = e->sessions; s; s = s->next) {
                 logclose(&s->log);
                 if (s->lock >= 0) {
