@@ -69,7 +69,9 @@ there too.
 - <kbd>Ctrl+1</kbd> to <kbd>Ctrl+9</kbd>: a layout, as View → Layout lists them:
   Standard, Compact, Focus, then those you saved.
 - <kbd>Ctrl+=</kbd> and <kbd>Ctrl+-</kbd> zoom the text in and out, and <kbd>Ctrl+0</kbd>
-  resets it; so does the mouse wheel with <kbd>Ctrl</kbd> held. The zoom lasts
+  resets it; so does the mouse wheel with <kbd>Ctrl</kbd> held, and View's
+  Zoom in, Zoom out and Actual size. A note at the top of the window says
+  the new zoom for a moment, and how to go back. The zoom lasts
   until Prospero exits: `[ui] font_size` sets the size for good.
 - <kbd>Ctrl+Q</kbd> quits, on Linux. macOS has <kbd>Cmd+Q</kbd>, and Windows <kbd>Alt+F4</kbd>.
 - <kbd>Ctrl+Tab</kbd>, held, switches between panes.

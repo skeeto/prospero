@@ -95,9 +95,11 @@ what it printed meanwhile once it's back, and quitting hangs it up too.
 
 Every checklist starts as a first run, its state directory fresh: the
 window at its first size, and Help in front, then View → Layout → Standard. The
-firstrun mode's configuration names no model and no remote host, so
-Settings and Hosts are in front with Help, and its display is too
-small for the first size (--display), so the window opens maximized.
+firstrun mode's configuration has no endpoint, no model and no remote
+host, so Settings is in front with Help, the empty transcript
+offers to set up a model, and its button opens the Add endpoint dialog;
+its display is too small for the first size (--display), so the window
+opens maximized.
 
 On Linux without a display it makes a desktop of its own
 (tests/headless.py: Xvfb at --screen, openbox or --wm, and a session
@@ -277,16 +279,9 @@ def config(url, model, ask=3, extra=""):
 
 
 def firstconfig(url):
-    """The firstrun mode's: an endpoint, but no model and no remote, and
-    the endpoint lists none, nothing listening there (one that listed a
-    model would be enough to start with, closing Settings and Hosts)."""
-    return (
-        "# A first run's configuration: nothing says which model, and the\n"
-        "# endpoint lists none\n"
-        "[endpoint fake]\n"
-        "url = http://127.0.0.1:9/\n"
-        "connect_timeout = 2\n"
-    )
+    """The firstrun mode's: nothing configured, no endpoint, no model and
+    no remote, as Prospero's own first run has it."""
+    return "# A first run's configuration: nothing set up\n"
 
 
 def m4config(url, nonce):

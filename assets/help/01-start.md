@@ -27,6 +27,9 @@ The agent needs an endpoint, a server of models, and a model there.
 Prospero speaks the OpenAI Chat Completions API (llama.cpp, vLLM,
 LiteLLM and others) and Anthropic's Messages API.
 
+Until an endpoint is set up, the empty transcript says so, and its Set
+up a model... button opens the Add endpoint dialog: step 2 below.
+
 Prospero starts with nothing configured, and writes no file until a
 setting is first saved. Its configuration file then starts from a
 built-in copy that documents every setting, with an endpoint for a

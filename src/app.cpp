@@ -1820,6 +1820,7 @@ struct Gui {
     i64                logn;       // lines logged so far
     i64                logshown;   // logn when logdoc was set
     DocView           *greeting;   // the Community Edition's, null until shown
+    DocView           *setupdoc;   // no endpoint yet: how to set one up, likewise
     i32                helpshown;  // the topic in helpdoc, plus one
     b32                helpnarrow; // its topics were a combo, not a list
     i64                helpframe;  // the frame they were last drawn in
@@ -2116,9 +2117,11 @@ struct Gui {
     ImVec2             floatsize;  // its size floating, 0 wide to dock back
     ImGuiID            floatdock;  // the dock node it was in, to go back to
     b32                floating;   // floatdock is saved
+    b32                settingswide; // Settings to float wide if cramped (setupmodel)
     b32                openabout;
     f32                fontbase;   // [ui] font_size
     f32                zoom;       // the View menu's, for this run only
+    i64                zoomat;     // when it last changed, for its hint
     f32                zoomwheel;  // Ctrl+wheel notches short of a step
     b32                fontdirty;  // the size changed: fontsize next frame
     WinGeom            geom;       // the window's, as last placed
@@ -2128,7 +2131,7 @@ struct Gui {
     b32                firstrun;   // no layout file: Help floats in front
     b32                restored;   // read the layout file: the panes as they
                                    // first appear leave its tabs selected
-    b32                firstextras;  // and Settings and Hosts with it, till
+    b32                firstextras;  // and Settings with it, till
                                      // the main host's endpoints list a model
     b32                configured; // a model or remote host (cfgconfigured)
     i32                helpfocus;  // frames until Help is focused, on a first run
@@ -3785,8 +3788,8 @@ static ModelPick modeltyped(GuiHost *h, Str text)
 }
 
 // The main host's first listing, on a first run that showed Settings
-// and Hosts because nothing was configured: a default model, as the
-// endpoints listed one, is enough to start with, so they close again.
+// because nothing was configured: a default model, as the endpoints
+// listed one, is enough to start with, so it closes again.
 static void firstlisted(Gui *g, GuiHost *h)
 {
     if (!g->firstextras) {
@@ -3796,7 +3799,6 @@ static void firstlisted(Gui *g, GuiHost *h)
     if (h->modeldflt.len) {
         g->configured           = 1;
         g->panes[PANE_SETTINGS] = 0;
-        g->panes[PANE_HOSTS]    = 0;
     }
 }
 
@@ -13494,6 +13496,7 @@ static void setzoom(Gui *g, f32 zoom)
     zoom = zoom<lo ? lo : zoom>hi ? hi : zoom;
     if (zoom != g->zoom) {
         g->zoom      = zoom;
+        g->zoomat    = g->sched.now;
         g->fontdirty = 1;
         scheddirty(&g->sched);
     }
@@ -15182,14 +15185,15 @@ enum : i32 {
                       // or with dx, ends with text
     CHK_SESSDIR,      // the session shown works in a directory ending in text
     CHK_FIRSTSIZE,    // the window opened at its first size, or maximized
-    CHK_FIRSTRUN,     // Help floats centered, selected; Settings and Hosts
-                      // with it if dx, else closed
+    CHK_FIRSTRUN,     // Help floats centered, selected; Settings with it if
+                      // dx, else closed; Hosts closed
     CHK_DOCKTREE,     // the docked layout, as built, Jobs selected
     CHK_COMPACT,      // the Compact layout, as built
     CHK_FOCUSED,      // the Focus layout, as built
     CHK_LAYOUTBACK,   // the layout saved as text is back as saved
     CHK_HELPPAGE,     // Help shows the topic whose page starts with text
     CHK_HELPNARROW,   // dx 1: Help's topics are a combo above the page; 0 a list
+    CHK_PANEFLOATS,   // the pane named by text floats, wide enough for two panes
     CHK_HELPCOPY,     // the clipboard has Help's page, selected whole
     CHK_DEPLOYOFFER,  // the remote "missing" failed with no engine there,
                       // Deploy engine offered; "bad" not offered it
@@ -15613,6 +15617,7 @@ static Str chknames[] = {
     "the layout saved is back as it was saved",
     "Help shows the topic picked, its page from the top",
     "Help's topics are a combo when narrow, else a list beside the page",
+    "the pane floats, wide enough for its list beside its page",
     "Help's page, selected whole, copied as its text",
     "a remote with no engine there failed, and Deploy engine is offered",
     "Deploy engine deployed one and connected, which is older, offering Update engine",
@@ -15968,8 +15973,8 @@ struct DriveOp {
     {OP_MOVE, T_NAMED, 0, 0, 100, "layout " name}, {OP_DOWN, 0, 0, 0, 60, ""}, \
     {OP_UP, 0, 0, 0, 800, ""}
 // A first run, as every checklist's is (in a fresh state directory):
-// the window at its first size, Help in front with Settings and Hosts
-// if extras (nothing configured), else they are closed. Then the
+// the window at its first size, Help in front with Settings if extras
+// (nothing configured), else it is closed; Hosts closed. Then the
 // Standard layout docks it all as built, Help and the rest with the jobs.
 #define FIRSTRUN(extras) \
     {OP_CHECK, CHK_FIRSTSIZE, 0, 0, 0, ""}, \
@@ -16125,6 +16130,7 @@ static DriveOp driveops[] = {
     {OP_KEYUP, 0, GKEY_MINUS, KEY_CMD, 50, ""},
     {OP_KEYUP, 0, GKEY_CMD, 0, 500, ""},
     {OP_CHECK, CHK_ZOOM, 0, 0, 0, "90"},
+    {OP_WAIT, W_NAMED, 0, 0, 1000, "zoom hint"},  // what it is now, a while (#67)
     {OP_KEYDOWN, 0, GKEY_CMD, KEY_CMD, 50, ""},
     {OP_WHEEL, 0, 0, 1, 50, ""},
     {OP_WHEEL, 0, 0, 1, 50, ""},
@@ -16534,6 +16540,7 @@ static DriveOp m3ops[] = {
     {OP_KEYUP, 0, GKEY_MINUS, KEY_CMD, 50, ""},
     {OP_KEYUP, 0, GKEY_CMD, 0, 500, ""},
     {OP_CHECK, CHK_ZOOM, 0, 0, 0, "90"},
+    {OP_WAIT, W_NAMED, 0, 0, 1000, "zoom hint"},  // what it is now, a while (#67)
     {OP_KEYDOWN, 0, GKEY_CMD, KEY_CMD, 50, ""},
     {OP_WHEEL, 0, 0, 1, 50, ""},
     {OP_WHEEL, 0, 0, 1, 50, ""},
@@ -23799,13 +23806,22 @@ static DriveOp compose2ops[] = {
 };
 // A first run with nothing configured, on a display too small for the
 // first size (--display): maximized, Help in front with Settings and
-// Hosts, which the Standard layout puts with the jobs.
+// Hosts, which the Standard layout puts with the jobs. The empty
+// transcript offers to set up a model, whose button opens the Add
+// endpoint dialog (#67).
 static DriveOp firstops[] = {
     {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
     {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
     {OP_MARK, 0, 0, 0, 1500, ""},
     FIRSTRUN(1),
     {OP_SHOT, 0, 0, 0, 300, "firstrun-reset"},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "setup model"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 700, ""},
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_PANEFLOATS, 0, 0, 0, "Settings"},  // not in the narrow column
+    {OP_SHOT, 0, 0, 0, 300, "firstrun-setup"},
     {OP_SUMMARY, 0, 0, 0, 0, ""},
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
@@ -24889,7 +24905,8 @@ static b32 firstsizecheck(Gui *g)
 }
 
 // A first run's pane: Help's floating node, centered on the dock space,
-// Help selected, with Settings and Hosts in it if extras, else closed.
+// Help selected, with Settings in it if extras, else closed; Hosts closed,
+// and the Terminal shown.
 static b32 firstruncheck(Gui *g, b32 extras)
 {
     ImGuiWindow   *h    = ImGui::FindWindowByName("Help");
@@ -24922,12 +24939,10 @@ static b32 firstruncheck(Gui *g, b32 extras)
     f32 dx = nc.x - c.x;
     f32 dy = nc.y - c.y;
     b32 ok = dx>-2 && dx<2 && dy>-2 && dy<2 && tabselected("Help") &&
-             n->Windows.Size==(extras ? 3 : 1);
-    i32 more[] = {PANE_SETTINGS, PANE_HOSTS};
-    for (i32 i = 0; i < countof(more); i++) {
-        ok &= g->panes[more[i]] == extras;
-        ok &= (panedock(more[i]) == n->ID) == extras;
-    }
+             n->Windows.Size==(extras ? 2 : 1) && !g->panes[PANE_HOSTS];
+    ok &= g->panes[PANE_SETTINGS] == extras;
+    ok &= (panedock(PANE_SETTINGS) == n->ID) == extras;
+    ok &= g->panes[PANE_TERMINAL] != 0;  // as Standard has it, beside Plan
     // In front of the docked panes
     ImGuiWindow *front = 0;
     ImGuiContext &ctx = *GImGui;
@@ -28531,6 +28546,14 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_HELPNARROW:
         return g->helpframe+3>=g->total.frames &&
                g->helpnarrow==(g->ops[g->drivepc-1].dx!=0);
+    case CHK_PANEFLOATS: {
+        Str          name = g->ops[g->drivepc-1].text;
+        ImGuiWindow *w    = 0;
+        for (i32 i = 0; i < PANE_COUNT; i++) {
+            w = name==inistr(panenames[i]) ? ImGui::FindWindowByName(panenames[i]) : w;
+        }
+        return w && w->Active && !w->DockIsActive && w->Size.x >= (CFG_TWOPANE+40)*g->scale;
+    }
     case CHK_HELPCOPY: {
         // Copied as text, and as Markdown the page's file, byte for byte
         Arena    a = g->frame;
@@ -31142,8 +31165,9 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
         }
     }
     if (g->firstrun) {
+        // Not Hosts, which is for later, when there is a remote (#67)
         g->panes[PANE_SETTINGS] = !g->configured;
-        g->panes[PANE_HOSTS]    = !g->configured;
+        g->panes[PANE_HOSTS]    = 0;
         g->firstextras          = !g->configured;
     }
 

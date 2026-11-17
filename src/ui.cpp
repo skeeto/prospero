@@ -5630,6 +5630,69 @@ static void drawtrashtoast(Gui *g, i32 pane, f32 lift)
     w->DC.CursorMaxPos = maxp;
 }
 
+static void addsection(Gui *, Str);
+
+// The Add endpoint dialog, from a Set up a model... button, over the
+// Settings pane, which floats wide if its place would be cramped: a
+// newcomer is shown it whole, not squeezed in the right column (#67).
+static void setupmodel(Gui *g)
+{
+    g->settingswide = 1;
+    addsection(g, "endpoint");
+}
+
+// Nothing to run a session with: this computer's configuration, as
+// loaded, has no endpoint, and no remote, whose own it would use (#67).
+static b32 nosetup(Gui *g)
+{
+    if (!g->cfg) {
+        return 0;  // not yet known
+    }
+    for (iz i = 0; i < g->cfgrows.len; i++) {
+        Str k = g->cfgrows[i].kind;
+        if (k=="endpoint" || k=="remote") {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+// In an empty transcript while nothing is set up (nosetup), in place of
+// any greeting: what is missing, and a button to the Add endpoint
+// dialog. Someone just starting needs that before anything else.
+static void drawsetup(Gui *g, ImVec2 wpos, f32 winh, f32 width)
+{
+    f32   sc   = g->scale;
+    f32   wrap = width<480*sc ? width : 480*sc;
+    Arena a    = g->frame;
+    if (!g->setupdoc) {
+        Str md = concat(&a, concat(&a,
+            "**Prospero needs a model to work with.**\n\n"
+            "Set up an endpoint, a server of models: llama.cpp or another "
+            "server on this computer, or a service such as OpenAI's or "
+            "Anthropic's API, ChatGPT or GitHub Copilot. Then start a "
+            "session with Session \xe2\x86\x92 New session... (<kbd>",
+            g->mac ? Str("Cmd+N") : Str("Ctrl+N")),
+            "</kbd>). [First-time setup](help:start#first-time-setup), in "
+            "Help, says more.");
+        g->setupdoc = newdocview(&g->perm, g->os, g->vcache);
+        docset(g->setupdoc, clone(&g->perm, md));
+    }
+    f32 x = wpos.x + (width - wrap)/2;
+    ImGui::SetCursorScreenPos(v2(x, wpos.y + winh/3));
+    Str link = drawdoc(g, g->setupdoc, "##setup", "Set up", wrap);
+    if (link.len) {
+        followlink(g, link);
+    }
+    ImGui::SetCursorScreenPos(v2(x + 4*sc, ImGui::GetCursorScreenPos().y + 4*sc));
+    if (ImGui::Button("Set up a model...")) {
+        setupmodel(g);
+    }
+    itemnamed(g, "setup model");
+    itemtip("Add an endpoint in the settings: the API it speaks, then its "
+            "URL and key on its page");
+}
+
 #if !PROSPERO_ITCH
 #ifdef __clang__
 #  pragma clang diagnostic push
@@ -6166,11 +6229,13 @@ static void drawtranscript(Gui *g)
     if (shows.len) {
         drawqueue(g, g->sess, shows, tail0, wpos, scrolly, winh, width, pad);
     }
+    if (!v->msgs.len && !shows.len && nosetup(g)) {
+        drawsetup(g, wpos, winh, width + 2*pad);
 #if !PROSPERO_ITCH
-    if (!v->msgs.len && !shows.len) {
+    } else if (!v->msgs.len && !shows.len) {
         drawgreeting(g, wpos, winh, width + 2*pad);
-    }
 #endif
+    }
     textkeys(g, v);
 
     gs->stick = scrolly >= ImGui::GetScrollMaxY()-2 || total<=winh;
@@ -7635,6 +7700,18 @@ static void drawprompt(Gui *g)
     dragplace(g, DROPTO_ATTACH);
     ImVec2 r0 = ImGui::GetItemRectMin();
     ImVec2 r1 = ImGui::GetItemRectMax();
+    if (none && !buf[0]) {
+        // Disabled, and why: what to do first (#67)
+        Str hint = nosetup(g) ? Str("Set up a model first: see the transcript")
+                   : g->mac   ? Str("Start a session to write a prompt: Session "
+                                    "\xe2\x86\x92 New session... (Cmd+N)")
+                              : Str("Start a session to write a prompt: Session "
+                                    "\xe2\x86\x92 New session... (Ctrl+N)");
+        ImVec2 fp   = ImGui::GetStyle().FramePadding;
+        ImGui::GetWindowDrawList()->AddText(v2(r0.x + fp.x, r0.y + fp.y),
+                                            ImGui::GetColorU32(ImGuiCol_TextDisabled),
+                                            hint.cdata, hint.cdata + hint.len);
+    }
     if (cb.recalled) {
         imedrop(g, s->draftid);
         axtextput(g, s->draftid, {(u8 *)buf, (iz)__builtin_strlen(buf)});
@@ -12544,6 +12621,20 @@ static void drawnew(Gui *g)
         g->newlisted = host;  // asked, or else again once it can be
     }
     drawnewmodel(g, a, host);
+    if (host==g->main && nosetup(g)) {
+        // Nothing to pick from: say so, and where to fix it (#67)
+        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->amber);
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextUnformatted("No endpoint is set up, so a session here has no "
+                               "model to use.");
+        ImGui::PopTextWrapPos();
+        ImGui::PopStyleColor();
+        if (ImGui::Button("Set up a model...")) {
+            ImGui::CloseCurrentPopup();
+            setupmodel(g);
+        }
+        itemnamed(g, "new setup model");
+    }
 
     // A role, as the host's configuration has them, or none: the usual
     // session, with its usual tools
@@ -16911,7 +17002,7 @@ static char const *dockguests[] = {"Output", "Screenshot"};
 // at pos: its tree, each pane's home in it, shown or not, and each
 // leaf's front tab. The panes it does not place float, at its place
 // for them if it has one, as they are next drawn (beginpane). On a
-// first run, Help and those of Settings and Hosts shown float in front
+// first run, Help and Settings (Hosts) if shown float in front
 // instead, centered, Help selected.
 static void applylayout(Gui *g, ImGuiID id, ImVec2 pos, ImVec2 size)
 {
@@ -17665,6 +17756,26 @@ static b32 beginpane(Gui *g, i32 pane)
         g->panefocus = 0;
         ImGui::SetNextWindowFocus();
     }
+    if (pane==PANE_SETTINGS && g->settingswide) {
+        // Asked for whole (setupmodel): floated as the first run floats
+        // Help, if docked too narrow for its list beside its page, or
+        // never placed yet; else left where it is
+        g->settingswide = 0;
+        ImGuiWindow *w  = ImGui::FindWindowByName(panenames[pane]);
+        f32          sc = g->scale;
+        if (!w || !w->WasActive || (w->DockIsActive && w->Size.x < (CFG_TWOPANE+40)*sc)) {
+            ImGuiViewport *vp = ImGui::GetMainViewport();
+            ImVec2 fs = v2(vp->WorkSize.x*0.6f, vp->WorkSize.y*0.7f);
+            fs.x = fs.x<(CFG_TWOPANE+40)*sc ? (CFG_TWOPANE+40)*sc : fs.x;
+            fs.x = fs.x<1100*sc ? fs.x : 1100*sc;
+            fs.x = fs.x<vp->WorkSize.x ? fs.x : vp->WorkSize.x;
+            fs.y = fs.y<800*sc ? fs.y : 800*sc;
+            ImGui::SetNextWindowDockID(0, ImGuiCond_Always);
+            ImGui::SetNextWindowSize(fs, ImGuiCond_Always);
+            ImGui::SetNextWindowPos(vp->GetWorkCenter(), ImGuiCond_Always, v2(0.5f, 0.5f));
+        }
+        ImGui::SetNextWindowFocus();
+    }
     if (g->floatpane == pane+1) {
         // The checklist's sizing of a pane: floating, then docked back
         g->floatpane = 0;
@@ -17745,6 +17856,41 @@ static void panehome(Gui *g, i32 pane)
     }
 }
 
+// For a while after the zoom changes: what it is now and how to go
+// back, over the top of the window, so that a zoom by a stray key is
+// seen and undone (#67). It takes no input.
+enum : i64 { ZOOMHINT_LIFE = 2500*1000 };  // µs
+static void drawzoomhint(Gui *g)
+{
+    if (!g->zoomat || g->sched.now-g->zoomat >= ZOOMHINT_LIFE) {
+        return;
+    }
+    schedat(&g->sched, g->zoomat + ZOOMHINT_LIFE, DUE_CLOCK);
+    Arena a = g->frame;
+    Buf   b(&a, 64);
+    print(&b, "Zoom ");
+    print(&b, (i64)(g->zoom*100 + 0.5f));
+    putbyte(&b, '%');
+    if (g->zoom != 1) {
+        print(&b, " \xc2\xb7 ");
+        print(&b, g->mac ? Str("Cmd+0") : Str("Ctrl+0"));
+        print(&b, " for actual size");
+    }
+    Str             s   = finish(&b);
+    f32             sc  = g->scale;
+    ImGuiViewportP *vp  = (ImGuiViewportP *)ImGui::GetMainViewport();
+    ImRect          wr  = vp->GetWorkRect();
+    ImVec2          ts  = ImGui::CalcTextSize(s.cdata, s.cdata+s.len);
+    ImVec2          pad = v2(12*sc, 6*sc);
+    ImVec2          p0  = v2(wr.Min.x + (wr.GetWidth() - ts.x)/2 - pad.x, wr.Min.y + 48*sc);
+    ImVec2          p1  = v2(p0.x + ts.x + 2*pad.x, p0.y + ts.y + 2*pad.y);
+    ImDrawList     *dl  = ImGui::GetForegroundDrawList();
+    dl->AddRectFilled(p0, p1, g->pal->tabbaron, 6*sc);
+    dl->AddRect(p0, p1, g->pal->border, 6*sc, 1*sc);
+    dl->AddText(v2(p0.x + pad.x, p0.y + pad.y), g->pal->paneltext, s.cdata, s.cdata+s.len);
+    namedrect(g, "zoom hint", p0, p1);
+}
+
 static void dockwindows(Gui *g)
 {
     termsweep(g);
@@ -17754,6 +17900,7 @@ static void dockwindows(Gui *g)
     menukeys(g);
     termgrab(g);
     drawmenubar(g);
+    drawzoomhint(g);
     ImGuiViewportP *vp   = (ImGuiViewportP *)ImGui::GetMainViewport();
     ImRect          work = vp->GetBuildWorkRect();
 

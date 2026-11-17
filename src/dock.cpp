@@ -80,13 +80,14 @@ static char const *panenames[] = {
 static_assert(countof(panenames) == PANE_COUNT);
 
 // The panes hidden until asked for: the metrics; the changes, which a
-// click on the session bar's branch shows (ui.cpp drawbranch); and the
-// terminal, which Ctrl+` shows; and the files, which a file opened
-// shows; and the permissions, which the session bar's shield shows.
+// click on the session bar's branch shows (ui.cpp drawbranch); the
+// files, which a file opened shows; and the permissions, which the
+// session bar's shield shows. The terminal is shown, as Standard shows
+// it, so that a first run finds it beside Plan (#67).
 static b32 panehidden(i32 pane)
 {
-    return pane==PANE_METRICS || pane==PANE_CHANGES || pane==PANE_TERMINAL ||
-           pane==PANE_FILES || pane==PANE_PERMISSIONS;
+    return pane==PANE_METRICS || pane==PANE_CHANGES || pane==PANE_FILES ||
+           pane==PANE_PERMISSIONS;
 }
 
 #ifndef PROSPERO_DEVTOOLS
