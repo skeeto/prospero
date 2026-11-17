@@ -1104,6 +1104,55 @@ static Str wttask(Engine *e, Arena *a, Arena scratch, Str cwd, Str desc,
     return {};
 }
 
+// Whether task may start a subagent in a worktree from a folder: one in
+// a repository with a main checkout, not a submodule's or a bare
+// repository's worktree. What may change, as an operation under way or
+// an unborn HEAD, is checked when it is called (wttask).
+static b32 wtoffer(Os *os, Arena scratch, Str cwd, b32 win)
+{
+    GitHead h = githead(os, &scratch, cwd, {}, win);
+    if (!h.repo || h.reftable) {
+        return 0;
+    }
+    Str root = normpath(&scratch, h.root, ".", win);
+    Str gd   = normpath(&scratch, h.gitdir, ".", win);
+    Str own  = normpath(&scratch, root, ".git", win);
+    return (win ? equalfold(gd, own) : gd==own) || memmain(os, &scratch, root, win).len;
+}
+
+// A path of a session's, whose checkout is from (null if none), as the
+// worktree subagent to has it (wtinto): to any other, as it is.
+static Str wtfor(Session *to, Arena *a, Str from, Str path)
+{
+    if (!to->wt.name.len || !to->psid.len || to->wt.from.len || !path.len) {
+        return path;
+    }
+    return wtinto(a, path, from, to->wt.main, to->wt.path, HOST_WINDOWS);
+}
+
+// A worktree subagent, s, started by p: listed with its parent and their
+// parent, whose turns' ends may find its branch merged.
+static void wtkidput(Session *s, Session *p)
+{
+    Engine *e = s->e;
+    WtKid   k = {};
+    k.sid    = clone(&e->perm, s->sid);
+    k.parent = clone(&e->perm, p->sid);
+    k.grand  = p->psid.len ? clone(&e->perm, p->psid) : Str{};
+    e->wtkids = push(&e->perm, e->wtkids, k);
+}
+
+// Whether a session has a worktree subagent below it, as wtkids lists.
+static b32 wtkidof(Engine *e, Str sid)
+{
+    for (iz i = 0; i < e->wtkids.len; i++) {
+        if (e->wtkids[i].parent==sid || e->wtkids[i].grand==sid) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 // A new session's worktree (new {worktree: {name?}}), from the folder
 // chosen: null if it can be, else why not, in the session's arena.
 static Str wtnew(Session *s, Arena scratch, Json *ask, Str cwd)

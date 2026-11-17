@@ -9643,7 +9643,10 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other, 
             print(&tip, s->wtname);
             print(&tip, ", on ");
             print(&tip, s->wtbranch);
-            print(&tip, s->wtgone ? Str(" (removed: made again as it is opened)") : Str{});
+            // A subagent's comes back with a turn, not as it opens
+            Str again = s->parent.len ? Str(" (removed: made again when it works again)")
+                                      : Str(" (removed: made again as it is opened)");
+            print(&tip, s->wtgone ? again : Str{});
         }
         putbyte(&tip, '\n');
         print(&tip, s->sid);

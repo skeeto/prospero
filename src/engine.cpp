@@ -1034,6 +1034,15 @@ struct WtName {
     Str name;
 };
 
+// A subagent in a worktree of its own (task {worktree}), with its
+// parent and their parent: a turn's end of any of the three may find
+// its branch merged (wtends).
+struct WtKid {
+    Str sid;
+    Str parent;
+    Str grand;
+};
+
 // Engine functions take scratch by value, so that whatever a caller has
 // allocated in its own scratch stays intact below them.
 struct Terms;  // ptyhost.cpp
@@ -1116,6 +1125,9 @@ struct Engine {
     i64         wtserial;
     Slice<Str>  wtdue;    // sessions whose worktrees may go now, "" for all
     Slice<WtSess> wtgone; // worktrees of sessions deleted
+    Slice<WtKid> wtkids;  // subagents in worktrees of their own
+    Slice<Str>  wtends;   // sessions whose own and descendants' worktrees
+                          // may go once merged
     i64         trashat;  // ticks: when the Trash is next purged (trashpurge)
     PrefillLine plines[16];  // prompt processing's lines, by endpoint and model
     u64         pserial;
@@ -2605,6 +2617,13 @@ static b32  wtexists(Engine *, Arena, WtSess *);
 static b32  wtgate(Session *, Arena, b32 turn = 1);
 static Str  wtmainof(Os *, Arena *, Str path, b32 win);
 static Str  wtnew(Session *, Arena, Json *, Str cwd);
+static Slice<WtName> wtrecords(Engine *, Arena *);
+static Str  wttask(Engine *, Arena *, Arena, Str cwd, Str desc, Slice<WtName> *,
+                   WtSess *, Str *wcwd);
+static b32  wtoffer(Os *, Arena, Str cwd, b32 win);
+static Str  wtfor(Session *to, Arena *, Str from, Str path);
+static void wtkidput(Session *, Session *parent);
+static b32  wtkidof(Engine *, Str sid);
 static void wtrecord(Session *, JsonOut *);
 static void wtload(Session *, Json *);
 static Str  wtpromptline(Session *, Arena *);
@@ -17500,6 +17519,7 @@ static void buildprefix(Session *s, Arena scratch)
         s->te.hosts = farhostsdesc(e, &s->perm, scratch);
         s->te.ctr   = farctrok(e, scratch);
         s->te.ctrimages = s->te.ctr ? farctrimages(e, &s->perm, scratch) : Str{};
+        s->te.wt = !s->nofolder && wtoffer(e->os, scratch, s->cwd, HOST_WINDOWS);
     }
     // Links to files in replies, where a frontend shows them: a session
     // opened attended, and its subagents (whose parent is not linked yet
@@ -18196,8 +18216,11 @@ static Str submodel(Engine *e, Arena *perm, Arena scratch, Str model, Str which,
 }
 
 // The session for task call k, its turn not begun. Null if it cannot be
-// made, with why in *err, in the parent's arena.
-static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err)
+// made, with why in *err, in the parent's arena. In a worktree of its
+// own (task {worktree}), it is named apart from those that sessions
+// record, recs (wtrecords).
+static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err,
+                         Slice<WtName> *recs)
 {
     Engine *e    = p->e;
     Block  *c    = &p->calls[k];
@@ -18244,20 +18267,41 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err)
         *err = "No subagent was started: the harness is out of memory.";
         return 0;
     }
-    s->cwd = clone(&s->perm, p->cwd);
-    for (iz i = 0; i < p->roots.len; i++) {
-        s->roots = push(&s->perm, s->roots, clone(&s->perm, p->roots[i]));
+    s->cwd   = clone(&s->perm, p->cwd);
+    Str from = {};  // the parent's checkout, in a worktree of its own
+    if (args->worktree) {
+        Str desc = args->desc.len ? args->desc : args->prompt;
+        Str why  = wttask(e, &s->perm, scratch, p->cwd, desc, recs, &s->wt, &s->cwd);
+        if (why.len) {
+            dropsession(e, s);
+            *err = concat(&p->perm, "No subagent was started: ", why);
+            return 0;
+        }
+        from = s->wt.src;
+        s->wt.src = {};  // only a side chat's original has one
     }
-    // The parent's scratch directory, its grants and its denies (logged
-    // below): it hears of the pane's at its first request (grantheed)
+    // The parent's extra roots, scratch directory, grants and denies
+    // (logged below), what is in its checkout as in the worktree, if
+    // any, the denies there too: it hears of the pane's grants at its
+    // first request (grantheed)
+    for (iz i = 0; i < p->roots.len; i++) {
+        Str root = clone(&s->perm, wtfor(s, &scratch, from, p->roots[i]));
+        s->roots = push(&s->perm, s->roots, root);
+    }
     s->scratch = p->scratch.len ? clone(&s->perm, p->scratch) : Str{};
     for (iz i = 0; i < p->grants.len; i++) {
         Grant g = grantclone(&s->perm, p->grants[i]);
+        g.path  = wtfor(s, &s->perm, from, g.path);
         s->grants = push(&s->perm, s->grants, g);
         grantknown(s, g);
     }
     for (iz i = 0; i < p->denies.len; i++) {
-        s->denies = push(&s->perm, s->denies, clone(&s->perm, p->denies[i]));
+        Str deny = clone(&s->perm, p->denies[i]);
+        Str in   = wtfor(s, &s->perm, from, deny);
+        s->denies = push(&s->perm, s->denies, in);
+        if (in.data != deny.data) {
+            s->denies = push(&s->perm, s->denies, deny);
+        }
     }
     s->model = clone(&s->perm, model);
     endpointconf(e, &s->perm, which, &s->ep);
@@ -18295,7 +18339,9 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err)
     logsession(s, scratch);
     instrlogstart(s, scratch);
     memlogstart(s, scratch);
-    logprefix(s, scratch);
+    if (!s->wtdefer) {
+        logprefix(s, scratch);  // else once its worktree is there (wtready)
+    }
     if (s->shellwarn.len) {
         note(s, scratch, "warn", s->shellwarn);
     }
@@ -18304,6 +18350,12 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err)
     }
     for (iz i = 0; i < s->denies.len; i++) {
         logdeny(s, scratch, s->denies[i], "parent", {});
+    }
+    if (s->wt.name.len) {
+        wtkidput(s, p);
+    }
+    if (s->wtdefer) {
+        wtgate(s, scratch, 0);  // made now: its first turn waits for it
     }
     if (planning(p)) {
         setmode(s, scratch, MODE_PLAN, "parent");  // read-only for its task
@@ -18326,6 +18378,18 @@ static void starttasks(Session *s, Arena scratch)
 
     cool(s);  // the next step waits for every report
     s->tasks = {};
+
+    // The worktree names that sessions record, read once for the batch
+    Slice<WtName> recs = {};
+    for (iz k = s->callidx; k < end; k++) {
+        Arena a    = scratch;
+        Args  args = parseargs(&a, TOOL_TASK, s->calls[k].args, s->te.edit);
+        if (args.worktree && s->te.wt) {
+            recs = wtrecords(e, &scratch);
+            break;
+        }
+    }
+
     for (iz k = s->callidx; k < end; k++) {
         Arena a = scratch;
         toolstartat(s, a, k);
@@ -18346,10 +18410,16 @@ static void starttasks(Session *s, Arena scratch)
         } else if (k-s->callidx >= TASK_BATCH) {
             t.text = "Not started: one response may start at most 16 "
                      "subagents. Start the rest once these have reported.";
+        } else if (args.worktree && !s->te.wt) {
+            t.text = "Not started: worktree is offered only in a git "
+                     "repository's folder.";
+        } else if (args.worktree && planning(s)) {
+            t.text = "Not started: a subagent of plan mode only reads, so it "
+                     "needs no worktree.";
         } else if (args.host.len || args.image.len) {
             far = farstart(s, a, k, &args, &t);  // on another host, or in a container
         } else {
-            c = newchild(s, a, k, &args, &t.text);
+            c = newchild(s, a, k, &args, &t.text, &recs);
         }
         if (c) {
             t.child = clone(&s->perm, c->sid);
@@ -20827,8 +20897,12 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
     if (!prefixed && !s->wtdefer) {
         logprefix(s, scratch);  // a log from before prefix records
     }
-    if (s->wtdefer && !sidecarget(e, &scratch, s->sid, "archived", 16).data) {
-        wtgate(s, scratch, 0);  // its worktree gone: made again, ahead of a turn
+    // Its worktree gone: made again, ahead of a turn, unless it is archived,
+    // or a subagent's, which a turn makes again (turnready), as opening
+    // one to read it would undo the removal of its merged branch
+    if (s->wtdefer && !s->psid.len &&
+            !sidecarget(e, &scratch, s->sid, "archived", 16).data) {
+        wtgate(s, scratch, 0);
     }
     if (s->rparent.len && !reported && !s->readonly) {
         // Its engine stopped before it reported: its parent waits still
