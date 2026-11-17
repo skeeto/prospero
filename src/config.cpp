@@ -829,9 +829,10 @@ static CfgKey cfgschema[] = {
      "screen. Text typed at password prompts is hidden from it"},
     {"terminal", "integration", CFG_BOOL, "true", {}, {}, "terminal",
      "Whether a tab's zsh, bash or PowerShell runs Prospero's hooks, "
-     "which mark its prompts and commands, so that Run in Terminal knows "
-     "when a tab is at its prompt and the agent hears how a command it "
-     "wrote ended. Off, Run goes by the last key typed"},
+     "which mark its prompts and commands and say its folder, so that "
+     "Run in Terminal knows when a tab is at its prompt, the agent hears "
+     "how a command it wrote ended, and a tab keeps a record of its "
+     "commands. Off, Run goes by the last key typed"},
 
     {"host", "idle_exit", CFG_SECONDS, "600", {}, {}, "host",
      "Seconds a host waits with no client connected and nothing running, "

@@ -15251,6 +15251,8 @@ enum : i32 {
     CHK_TERMSCREEN,   // the terminal's screen has text, or not with dx 1
     CHK_RUNTO,        // Run takes the aimed block as text: none, show, send, new
     CHK_TERMKIND,     // the front tab's shell's family is text; dx 1: hooked, marked
+    CHK_TERMCWD,      // the front tab's folder by OSC 7 ends with text; dx 1: doesn't
+    CHK_TERMCMD,      // its command dx back, 0 the newest run: "cmd|code|output"
     CHK_TERMSIZE,     // the terminal fills its pane, the engine told its size
     CHK_TERMNONE,     // the session shown has no terminal
     CHK_TERMCOUNT,    // dx terminals are open, in every session
@@ -15639,6 +15641,7 @@ static Str chknames[] = {
     "the '@' picker's pick says it is attached, or does not",
     "the terminal has the keyboard", "the terminal shows the text, or not, as said",
     "Run in Terminal takes the block as said", "the front tab's shell is of that family, hooked as said",
+    "the front tab's folder is as its shell said", "the front tab's command line is as said",
     "the terminal fills its pane", "the terminal is closed",
     "that many terminals are open", "the terminal tabs are as said",
     "a subagent shows its root's terminal tabs",
@@ -22230,6 +22233,27 @@ static DriveOp termops[] = {
     CTRLKEY(GKEY_GRAVE, 500),
     {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
     {OP_CHECK, CHK_TERMKIND, 1, 0, 0, "sh"},
+    // Its hooks' OSC 7 and marks give its folder and its command lines:
+    // a failing one's line, status and output. A restart once the shell
+    // ended starts where it was
+    {OP_TEXT, 0, 0, 0, 100, "mkdir -p cmdtest && cd cmdtest && sh -c 'echo out-4; exit 4'"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "\nout-4"},
+    {OP_WAIT, W_RUNTO, 0, 0, 5000, "send"},
+    {OP_CHECK, CHK_TERMCWD, 0, 0, 0, "/cmdtest"},
+    {OP_CHECK, CHK_TERMCMD, 0, 0, 0,
+     "mkdir -p cmdtest && cd cmdtest && sh -c 'echo out-4; exit 4'|4|out-4"},
+    {OP_TEXT, 0, 0, 0, 100, "exit 5"},
+    TERMKEY(GKEY_ENTER, 1000),
+    {OP_CHECK, CHK_TERMBANNER, 0, 0, 0, "The shell exited with code 5"},
+    TERMKEY(GKEY_ENTER, 500),
+    {OP_WAIT, W_RUNTO, 0, 0, 10000, "send"},
+    {OP_CHECK, CHK_TERMCWD, 0, 0, 0, "/cmdtest"},
+    {OP_CHECK, CHK_TERMCMD, 0, 0, 0, "-"},
+    {OP_TEXT, 0, 0, 0, 100, "cd .."},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_RUNTO, 0, 0, 5000, "send"},
+    {OP_CHECK, CHK_TERMCWD, 1, 0, 0, "/cmdtest"},
     {OP_TEXT, 0, 0, 0, 300, "echo half"},
     {OP_CHECK, CHK_RUNTO, 0, 0, 0, "new"},
     CTRLKEY(GKEY_C, 100),
@@ -22319,6 +22343,15 @@ static DriveOp termops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    // Its hooks' OSC 7 and marks give its folder and its command lines:
+    // a failing one's line, status and output
+    {OP_TEXT, 0, 0, 0, 100, "mkdir -Force cmdtest >$null; cd cmdtest; cmd /c \"echo out-4& exit 4\""},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 10000, "\nout-4"},
+    {OP_WAIT, W_RUNTO, 0, 0, 10000, "send"},
+    {OP_CHECK, CHK_TERMCWD, 0, 0, 0, "/cmdtest"},
+    {OP_CHECK, CHK_TERMCMD, 0, 0, 0,
+     "mkdir -Force cmdtest >$null; cd cmdtest; cmd /c \"echo out-4& exit 4\"|4|out-4"},
 #endif
     // Its shell's clean exit closes the new tab, the first one in front
     // again, which says where it was (as the root's other checks below)
@@ -28224,6 +28257,21 @@ static b32 drivecheck(Gui *g, i32 chk)
         return (f32)drivetermcount(g) == g->ops[g->drivepc-1].dx;
     case CHK_RUNTO:
         return driverunto(g, g->ops[g->drivepc-1].text, 1);
+    case CHK_TERMCWD: {
+        TermTab *tt  = termfront(g);
+        Str      cwd = tt ? Str{tt->cmds->cwd, tt->cmds->cwdlen} : Str{};
+        Arena    a   = g->frame;
+        guilog(g, concat(&a, "drive: the front tab's folder ", cwd));
+        b32 ends = cwd.len>0 && endswith(cwd, g->ops[g->drivepc-1].text);
+        return g->ops[g->drivepc-1].dx!=0 ? cwd.len>0 && !ends : ends;
+    }
+    case CHK_TERMCMD: {
+        TermTab *tt = termfront(g);
+        Arena    a  = g->frame;
+        Str      got = tt ? termcmddrive(&a, tt, (i64)g->ops[g->drivepc-1].dx) : Str("-");
+        guilog(g, concat(&a, "drive: the front tab's command ", got));
+        return got == g->ops[g->drivepc-1].text;
+    }
     case CHK_TERMKIND: {
         TermTab *tt   = termfront(g);
         Str      want = g->ops[g->drivepc-1].text;

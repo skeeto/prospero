@@ -1598,9 +1598,78 @@ static void hfilltest(void)
     alignedfree(mem2);
 }
 
+// A row's text by line number, blanks trimmed
+static int linetext(ariel_Term *t, int64_t line, char *buf, int cap)
+{
+    ariel_Cell cells[64];
+    int n = ariel_line(t, line, cells, countof(cells));
+    int len = 0;
+    for (int x = 0; x<n && len<cap-1; x++) {
+        if (cells[x].width) buf[len++] = cells[x].cp ? (char)cells[x].cp : ' ';
+    }
+    for (; len>0 && buf[len-1]==' '; len--) {}
+    buf[len] = 0;
+    return n;
+}
+
+// ariel_lines and ariel_line: the main screen and its history by line,
+// whatever the viewport, and on the alternate screen
+static void linestest(void)
+{
+    checks++;
+    ariel_Config cfg = {0};
+    cfg.cols      = 10;
+    cfg.rows      = 3;
+    cfg.histlines = 4;
+    iz    size = ariel_size(&cfg);
+    void *mem  = alignedalloc((size_t)size);
+    ariel_Term *t = ariel_init(mem, size, &cfg);
+    char buf[64];
+    int  bad = 0;
+
+    feedstr(t, "l0\r\nl1\r\n\x1b]133;A\x07$ l2\r\nl3\r\nl4");
+    ariel_Lines ls = ariel_lines(t);
+    bad |= ls.first!=0 || ls.end!=5 || ls.cursor!=4;
+    linetext(t, 0, buf, sizeof(buf));
+    bad |= strcmp(buf, "l0") != 0;
+    linetext(t, 2, buf, sizeof(buf));
+    bad |= strcmp(buf, "$ l2") != 0;
+    bad |= !(ariel_lineinfo(t, 2).flags & ARIEL_R_PROMPT);
+    bad |= !!(ariel_lineinfo(t, 3).flags & ARIEL_R_PROMPT);
+    bad |= ariel_line(t, 5, 0, 0)!=0 || ariel_line(t, -1, 0, 0)!=0;
+
+    // Scrolled back: the same
+    ariel_scroll(t, -2);
+    linetext(t, 4, buf, sizeof(buf));
+    bad |= strcmp(buf, "l4") != 0;
+    ariel_scrollto(t, ARIEL_TO_BOTTOM);
+
+    // The oldest dropped: numbers stay with their rows
+    feedstr(t, "\r\nl5\r\nl6\r\nl7");
+    ls = ariel_lines(t);
+    bad |= ls.first!=1 || ls.end!=8 || ls.cursor!=7;
+    linetext(t, 2, buf, sizeof(buf));
+    bad |= strcmp(buf, "$ l2") != 0 || !(ariel_lineinfo(t, 2).flags & ARIEL_R_PROMPT);
+
+    // The alternate screen: the main one's rows still, no cursor
+    feedstr(t, "\x1b[?1049hALT");
+    ls = ariel_lines(t);
+    bad |= ls.cursor != -1;
+    linetext(t, 7, buf, sizeof(buf));
+    bad |= strcmp(buf, "l7") != 0;
+    feedstr(t, "\x1b[?1049l");
+
+    if (bad) {
+        failures++;
+        fprintf(stderr, "linestest: lines read wrong\n");
+    }
+    alignedfree(mem);
+}
+
 int main(int argc, char **argv)
 {
     movetest();
+    linestest();
     hfilltest();
     for (int i = 1; i < argc; i++) {
         char *name = argv[i];

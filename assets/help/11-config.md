@@ -347,9 +347,10 @@ fails with a link to sign up for Copilot Free.
   password prompts is hidden from it ([Sessions](help:sessions)).
 - **[`[terminal] integration`](settings:terminal#integration)**: whether
   a tab's zsh, bash or PowerShell runs Prospero's hooks around your
-  startup files, marking its prompts and commands: Run in Terminal then
-  knows when a tab waits at its prompt, and the agent hears how a block
-  it ran ended ([Sessions](help:sessions#running-the-agents-commands)).
+  startup files, marking its prompts and commands and saying its folder:
+  Run in Terminal then knows when a tab waits at its prompt, the agent
+  hears how a block it ran ended, and a tab keeps a record of its
+  commands ([Sessions](help:sessions#shell-integration)).
 - **[`[ui] notify`](settings:ui#notify)**: desktop notifications while the window is in the
   background, minimized, or showing another session: `allow` when a
   permission ask waits for your answer, `done` when a session stops by

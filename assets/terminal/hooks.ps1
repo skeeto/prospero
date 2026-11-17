@@ -32,6 +32,26 @@ if ($global:__prospero_nonce) {
         [Console]::Write([char]27 + ']133;' + $m + ';nonce=' + $global:__prospero_nonce + [char]7)
     }
 
+    # The folder (OSC 7), a file system's only, percent-encoded where it
+    # must be: C:\x as /C:/x, \\server\share as //server/share
+    function global:__prospero_cwd {
+        $l = $ExecutionContext.SessionState.Path.CurrentLocation
+        if ($l.Provider.Name -ne 'FileSystem') {
+            return
+        }
+        $p = $l.ProviderPath.Replace('\', '/').Replace('%', '%25').Replace('?', '%3F').Replace('#', '%23')
+        $p = [regex]::Replace($p, '[\x00-\x1f\x7f]',
+            [Text.RegularExpressions.MatchEvaluator]{ param($m) '%{0:X2}' -f [int]$m.Value[0] })
+        if (!$p.StartsWith('/')) {
+            $p = '/' + $p
+        }
+        [Console]::Write([char]27 + ']7;file://' + [Environment]::MachineName + $p +
+                         '?nonce=' + $global:__prospero_nonce + [char]7)
+    }
+
+    # B ends the prompt, in what it returns
+    $global:__prospero_b = [char]27 + ']133;B;nonce=' + $global:__prospero_nonce + [char]7
+
     # PSReadLine's, once it is loaded, which may be after this runs
     function global:__prospero_wrap {
         $f = Get-Item Function:\PSConsoleHostReadLine -ErrorAction SilentlyContinue
@@ -76,8 +96,9 @@ if ($global:__prospero_nonce) {
             Write-Error '' -ErrorAction Ignore
         }
         $p = if ($global:__prospero_prev) { & $global:__prospero_prev } else { 'PS ' + $PWD + '> ' }
+        __prospero_cwd
         __prospero_mark 'A'
-        $p
+        (-join @($p)) + $global:__prospero_b
     }
     __prospero_wrap
 }

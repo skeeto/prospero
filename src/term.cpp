@@ -130,6 +130,9 @@ struct TermTab {
     iz          pendfromlen;
     u8          asklang[16];
     iz          asklanglen;
+    // Its command lines (termcmd.cpp), and its shell's folder by OSC 7,
+    // in a block kept through its reuse; the folder through a restart
+    TermCmds   *cmds;
 };
 
 // Files' side of an editor tab (files.cpp): its file shown again, read
@@ -330,6 +333,7 @@ static void termfree(Gui *g, TermTab *tt)
     tt->pendcap    = was.pendcap;
     tt->asklanglen = was.asklanglen;
     copybytes(tt->asklang, was.asklang, was.asklanglen);
+    tt->cmds       = was.cmds;
 }
 
 // Begin a terminal's command, which has no reply. Finish it with cmdsend.
@@ -803,6 +807,11 @@ static void termlaunch(Gui *g, GuiSession *s, TermTab *tt, i32 cols, i32 rows)
     putintkey(&w.json, "cols", cols);
     putintkey(&w.json, "rows", rows);
     putintkey(&w.json, "scrollback", tt->histlines);  // the engine's screen's
+    if (!tt->edit && !tt->asklanglen && tt->cmds->cwdlen) {
+        // A restart, in the folder its shell was last in
+        putstrkey(&w.json, "cwd", Str{tt->cmds->cwd, tt->cmds->cwdlen});
+    }
+    termcmdreset(tt->cmds);
     if (tt->edit) {
         // The editor as the settings are now, a Restart's too
         EditAsk ask = editask(g, &a, s->host);
@@ -841,13 +850,17 @@ static TermTab *termalloc(Gui *g)
         iz  cap  = tt->edpathcap;
         Str pbuf = tt->pend;
         iz  pcap = tt->pendcap;
+        TermCmds *cmds = tt->cmds;
         *tt = {};
         tt->edpath    = {buf.data, 0};
         tt->edpathcap = cap;
         tt->pend      = {pbuf.data, 0};
         tt->pendcap   = pcap;
+        tt->cmds      = cmds;
+        *cmds = {};
     } else {
         tt = alloc<TermTab>(&g->perm);
+        tt->cmds = alloc<TermCmds>(&g->perm);
     }
     tt->serial = ++g->termserial;
     return tt;
@@ -1219,6 +1232,33 @@ static b32 termshown(Gui *g, TermTab *tt, b32 front)
     return front ? termsetfront(&s->terms)==tt : termsetfind(&s->terms, tt)>=0;
 }
 
+// A tab's command run i back, 0 the newest, as the checklist checks
+// it: "cmd|code|output", the code "-" if none was given; "-" if none.
+static Str termcmddrive(Arena *a, TermTab *tt, i64 i)
+{
+    TermCmd *c = 0;
+    for (i64 k = 0, n = 0; !c && k < TERMCMD_MAX; k++) {
+        TermCmd *o = termcmdat(tt->cmds, k);
+        c = o && o->state!=TC_PROMPT && n++==i ? o : 0;
+    }
+    if (!c || !tt->t) {
+        return "-";
+    }
+    b32 gone = 0;
+    Str out  = termcmdoutput(a, tt->cmds, tt->t, c, &gone);
+    Buf b(a, 256);
+    print(&b, termcmdstr(c));
+    putbyte(&b, '|');
+    if (c->hascode) {
+        print(&b, (i64)c->code);
+    } else {
+        putbyte(&b, '-');
+    }
+    putbyte(&b, '|');
+    print(&b, gone ? Str("(gone)") : out);
+    return finish(&b);
+}
+
 // Feed the shell's output to ariel, sending its replies back.
 static void termfeed(Gui *g, TermTab *tt, Str data)
 {
@@ -1232,11 +1272,19 @@ static void termfeed(Gui *g, TermTab *tt, Str data)
         case ARIEL_EV_REPLY:
             terminput(g, tt, {f.ev.data.data, f.ev.data.len});
             break;
+        case ARIEL_EV_CWD: {
+            // Its hooked shell's folder (OSC 7 with its nonce)
+            Str nonce = {tt->nonce, tt->hooked ? countof(tt->nonce) : 0};
+            termcmdfolder(tt->cmds, {f.ev.data.data, f.ev.data.len}, nonce, hostwin(tt->host));
+        } break;
         case ARIEL_EV_MARK: {
-            // Its hooked shell's (OSC 133 with its nonce): at a prompt
-            // (A), and a command line begun (C), which Run goes by
+            // Any prompt mark counts a line (termcmd.cpp). Its hooked
+            // shell's (OSC 133 with its nonce) keep its command lines,
+            // and at a prompt (A), and a command line begun (C), Run
+            // goes by them
             Str      nonce = {tt->nonce, tt->hooked ? countof(tt->nonce) : 0};
-            TermMark m     = termmarkparse({f.ev.data.data, f.ev.data.len}, nonce);
+            TermMark m     = termcmdmark(tt->cmds, tt->t, {f.ev.data.data, f.ev.data.len},
+                                         nonce, os_ticks(g->os));
             if (!m.ok) {
                 break;
             }
@@ -2719,6 +2767,7 @@ static void drawterm(Gui *g)
                 if (fits || termblock(g, tt, cols, rows)) {
                     if (ariel_resize(tt->t, cols, rows, (i32)roundf(m.cw*m.density),
                                      (i32)roundf(m.ch*m.density))) {
+                        termcmdresized(tt->cmds);
                         tt->cols = cols;
                         tt->rows = rows;
                         if (tt->tid) {

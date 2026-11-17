@@ -63,9 +63,29 @@ __prospero_finish() {
         __prospero_seen=1
         return $s
     }
+    # The folder (OSC 7), percent-encoded where it must be
+    __prospero_cwd() {
+        emulate -L zsh
+        local p=${PWD//\%/%25} q= c i
+        p=${p//\?/%3F}
+        p=${p//\#/%23}
+        if [[ $p == *[[:cntrl:]]* ]]; then
+            for (( i = 1; i <= ${#p}; i++ )); do
+                c=${p[i]}
+                [[ $c == [[:cntrl:]] ]] && c=$(builtin printf '%%%02X' "'$c")
+                q+=$c
+            done
+            p=$q
+        fi
+        builtin printf '\033]7;file://%s%s?nonce=%s\007' "${HOST-}" "$p" "$__prospero_nonce"
+    }
+    # B ends the prompt, in it, so that it comes again as it is redrawn
+    typeset -g __prospero_b=$'%{\e]133;B;nonce='$__prospero_nonce$'\a%}'
     __prospero_prompt() {
         local s=$?
+        __prospero_cwd
         __prospero_mark A
+        PS1=${PS1//"$__prospero_b"/}$__prospero_b
         return $s
     }
     __prospero_preexec() {

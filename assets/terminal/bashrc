@@ -38,6 +38,30 @@ if [ -n "$__prospero_nonce" ]; then
     __prospero_mark() {
         builtin printf '\033]133;%s;nonce=%s\007' "$1" "$__prospero_nonce"
     }
+    # The folder (OSC 7), percent-encoded where it must be
+    __prospero_cwd() {
+        local p=${PWD//\%/%25} q= c i
+        p=${p//\?/%3F}
+        p=${p//\#/%23}
+        case $p in
+        *[[:cntrl:]]*)
+            local LC_ALL=C
+            for (( i = 0; i < ${#p}; i++ )); do
+                c=${p:i:1}
+                case $c in
+                [[:cntrl:]]) builtin printf -v c '%%%02X' "'$c" ;;
+                esac
+                q+=$c
+            done
+            p=$q ;;
+        esac
+        builtin printf '\033]7;file://%s%s?nonce=%s\007' "${HOSTNAME-}" "$p" "$__prospero_nonce"
+    }
+    # B ends the prompt, in it, so that it comes again as it is redrawn
+    __prospero_b='\[\e]133;B;nonce='$__prospero_nonce'\a\]'
+    __prospero_ps1() {
+        PS1=${PS1//"$__prospero_b"/}$__prospero_b
+    }
     __prospero_precmd() {
         local s=$?
         if [ "$__prospero_ran" = 1 ]; then
@@ -58,7 +82,9 @@ if [ -n "$__prospero_nonce" ]; then
         # bash-preexec runs these with the command's status in $?
         __prospero_prompt() {
             local s=$?
+            __prospero_cwd
             __prospero_mark A
+            __prospero_ps1
             return $s
         }
         precmd_functions=(__prospero_precmd "${precmd_functions[@]}" __prospero_prompt)
@@ -102,8 +128,10 @@ if [ -n "$__prospero_nonce" ]; then
                 *) PS0=${PS0-}$__prospero_ps0 ;;
                 esac
             fi
+            __prospero_cwd
             __prospero_armed=1
             __prospero_mark A
+            __prospero_ps1
             return $s
         }
         # First and last, each passing $_ on, as the user's command left it

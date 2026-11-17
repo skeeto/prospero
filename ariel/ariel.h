@@ -154,6 +154,18 @@ typedef struct {
 } ariel_RowInfo;
 ariel_RowInfo ariel_rowinfo(ariel_Term *, int32_t y);
 
+// The main screen and its history by row, apart from the viewport and
+// the alternate screen: rows numbered from the oldest ever kept, so
+// that a number stays with its row as rows scroll and the oldest are
+// dropped, until a resize reflows them.
+typedef struct {
+    int64_t first, end; // rows kept, [first, end)
+    int64_t cursor;     // the cursor's, -1 on the alternate screen
+} ariel_Lines;
+ariel_Lines   ariel_lines(ariel_Term *);
+int32_t       ariel_line(ariel_Term *, int64_t row, ariel_Cell *, int32_t cap);  // as ariel_row
+ariel_RowInfo ariel_lineinfo(ariel_Term *, int64_t row);
+
 // Changes whenever anything visible does.
 uint32_t ariel_gen(ariel_Term *);
 

@@ -859,6 +859,7 @@ static u32     os_guilimits(Os *);
 #include "../ariel/ariel.h"
 #include "termset.cpp"
 #include "termsecret.cpp"
+#include "termcmd.cpp"   // after edit.cpp and mcp.cpp: utf8head, hexval
 #include "ptyhost.cpp"  // after relay.cpp
 #include "git.cpp"
 #include "worktree.cpp"

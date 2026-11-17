@@ -51,6 +51,7 @@ import tempfile
 import threading
 import time
 import traceback
+import urllib.parse
 import zlib
 
 sys.dont_write_bytecode = True
@@ -19141,16 +19142,60 @@ def term_kept(t):
         h.close()
 
 
-def marksof(tt):
+def marksof(tt, b=False):
     """The marks in a tab's output that carry its nonce, in order, each
-    without it: "A", "C", "D", "D;3"."""
+    without it: "A", "C", "D", "D;3"; "B" too if b."""
     nonce = tt.reply.get("nonce")
     out = []
     for m in re.finditer(rb"\x1b\]133;([^\x07\x1b]*)(?:\x07|\x1b\\)", bytes(tt.data)):
         fields = m.group(1).decode(errors="replace").split(";")
-        if nonce and f"nonce={nonce}" in fields[1:]:
+        if nonce and f"nonce={nonce}" in fields[1:] and (b or fields[0] != "B"):
             out.append(";".join(f for f in fields if not f.startswith("nonce=")))
     return out
+
+
+def cwdsof(tt):
+    """The folders in a tab's OSC 7s that carry its nonce, decoded, in
+    order; on Windows /C:/x as C:/x."""
+    nonce = tt.reply.get("nonce")
+    out = []
+    for m in re.finditer(rb"\x1b\]7;file://[^/\x07\x1b]*(/[^\x07\x1b]*)\?nonce=([0-9a-f]*)"
+                         rb"(?:\x07|\x1b\\)", bytes(tt.data)):
+        if nonce and m.group(2).decode() == nonce:
+            path = urllib.parse.unquote_to_bytes(m.group(1)).decode(errors="replace")
+            if re.match(r"/[A-Za-z]:", path):
+                path = path[1:]
+            out.append(path)
+    return out
+
+
+def promptsof(tt):
+    """What each prompt drew between its A and its B, escapes taken out."""
+    nonce = tt.reply.get("nonce")
+    a = f"\x1b]133;A;nonce={nonce}\x07".encode()
+    b = f"\x1b]133;B;nonce={nonce}\x07".encode()
+    out = []
+    for m in re.finditer(re.escape(a) + rb"(.*?)" + re.escape(b), bytes(tt.data), re.S):
+        text = re.sub(rb"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]|[\r\x08]", b"",
+                      m.group(1))
+        out.append(text.decode(errors="replace"))
+    return out
+
+
+def markfolder(tt, path, timeout=20):
+    """cd to path at the prompt: the prompt after it says so by OSC 7."""
+    tt.pump(lambda x: marksof(x)[-1:] == ["A"], timeout, "a prompt")
+    have = len(cwdsof(tt))
+    if tt.reply.get("kind") == "ps":
+        q = path.replace("'", "''")
+        tt.type(f"Set-Location -LiteralPath '{q}'\r")
+    else:
+        # $'...', so that a control character isn't a key to the editor
+        q = "".join(c if c.isalnum() or c in "/._- %?#" else f"\\x{ord(c):02x}" for c in path)
+        tt.type(f"cd $'{q}'\r")
+    tt.pump(lambda x: len(cwdsof(x)) > have and marksof(x)[-1:] == ["A"], timeout, "a folder")
+    got = cwdsof(tt)[-1]
+    tt.t.check(samedir(tt.t, got, path), f"cd {path!r}: OSC 7 says {got!r}")
 
 
 def markline(tt, prefix, timeout=20):
@@ -19255,6 +19300,18 @@ def term_marks_zsh(t):
         markrun(tt, "", ["D", "A"])
         markrun(tt, "(exit 3)", ["C", "D;3", "A"])
         markrun(tt, "false; true", ["C", "D;0", "A"])
+        # Its folder at each prompt (OSC 7), percent-encoded where it
+        # must be; B where each prompt ends, once in PS1
+        t.check(cwdsof(tt)[:1] and samedir(t, cwdsof(tt)[0], t.work), f"folder {cwdsof(tt)}")
+        odd = os.path.join(t.base, "odd %?#\x01 dir")
+        os.makedirs(odd)
+        markfolder(tt, odd)
+        markfolder(tt, t.work)
+        t.check(set(promptsof(tt)) == {"p% "}, f"prompts {promptsof(tt)}")
+        tt.pump(lambda x: marksof(x, b=True)[-2:] == ["A", "B"], 20, "the prompt's B")
+        tt.type('echo "b=$(print -r -- "$PS1" | grep -o "133;B" | wc -l | tr -d " ")"\r')
+        got = markline(tt, "b=")
+        t.check(got.strip() == "b=1", f"B in PS1: {got}")
         tt.type("zsh -c 'echo child:${PROSPERO_TERM_NONCE-none}:${ZDOTDIR-unset}'\r")
         got = markline(tt, "child:")
         t.check(got.strip() == "child:none:unset", got)
@@ -19359,6 +19416,19 @@ def term_marks_bash(t):
             # A subshell alone is no simple command for the DEBUG trap
             markrun(tt, "(exit 3)", ["C", "D;3", "A"] if ps0 else ["D", "A"])
             markrun(tt, "echo zz", ["C", "D;0", "A"])
+            # Its folder at each prompt (OSC 7), and B where each ends,
+            # once in PS1
+            odd = os.path.join(t.base, f"odd{i} %?#\x01 dir")
+            os.makedirs(odd)
+            markfolder(tt, odd)
+            markfolder(tt, t.work)
+            # (the first has what was typed before it showed)
+            t.check(all(p.endswith("p$ ") for p in promptsof(tt)) and
+                    set(promptsof(tt)[1:]) == {"p$ "}, f"{bash}: prompts {promptsof(tt)}")
+            tt.type('echo "b=$(printf %s "$PS1" | grep -o "133;B" | wc -l | tr -d " ")"\r')
+            got = markline(tt, "b=")
+            t.check(got.strip() == "b=1", f"{bash}: B in PS1: {got}")
+            markrun(tt, "echo zz", ["C", "D;0", "A"])
             tt.type('echo "last=$_ pc=$userpc"\r')
             got = markline(tt, "last=")
             t.check(got.startswith("last=zz pc="), f"{bash}: {got}")
@@ -19394,6 +19464,8 @@ def term_marks_bashpreexec(t):
         markrun(tt, "echo one; echo two", ["C", "D;0", "A"])
         markrun(tt, "", ["D", "A"])
         markrun(tt, "(exit 3)", ["C", "D;3", "A"])
+        markfolder(tt, t.base)
+        t.check(set(promptsof(tt)) == {"p$ "}, f"prompts {promptsof(tt)}")
         tt.type("exit 0\r")
         tt.ended()
     finally:
@@ -19531,6 +19603,16 @@ def term_marks_pwsh(t):
         markrun(tt, "Get-Item C:/no-such-file-here", ["C", "D;1", "A"], 30)
         markrun(tt, "Write-Output ok", ["C", "D;0", "A"], 30)
         markrun(tt, "", ["D", "A"], 30)
+        # Its folder at each prompt (OSC 7), a file system's only, and B
+        # where each prompt ends
+        odd = t.host.join(t.base, "odd %#")
+        t.host.sh(f"mkdir -p {shlex.quote(odd)}")
+        markfolder(tt, odd, 30)
+        markrun(tt, "Set-Location Env:", ["C", "D;0", "A"], 30)
+        t.check(samedir(t, cwdsof(tt)[-1], odd), f"Env: keeps the folder: {cwdsof(tt)[-3:]}")
+        markfolder(tt, t.work, 30)
+        t.check(promptsof(tt) and all(p.startswith("PS ") and p.endswith("> ")
+                                      for p in promptsof(tt)), f"prompts {promptsof(tt)[-3:]}")
         markrun(tt, 'Write-Output "n=[$env:PROSPERO_TERM_NONCE] k=[$env:PROSPERO_TERM_HOOKS]"',
                 ["C", "D;0", "A"], 30)
         got = markline(tt, "n=")

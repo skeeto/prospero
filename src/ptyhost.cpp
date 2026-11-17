@@ -273,7 +273,9 @@ struct Term {
     iz          cwdlen;
     u8          nonce[32];  // its hooks' marks', when hooked
     b32         hooked;
-    i32         lastmark;   // the last verified mark's letter, 0 for none
+    b32         win;        // its shell is on Windows: OSC 7's paths are
+    i32         lastmark;   // the last verified mark's letter but B, 0 for none
+    TermCmds    cmds;       // its command lines, while its screen is kept
 
     // A Run's (term.open's run): what ran, for labels and its notice
     b32 run;
@@ -823,13 +825,9 @@ static Str termrunfirst(Str text, i32 *lines)
 }
 
 // Shell integration: hooks that the engine puts in a tab's zsh, bash or
-// PowerShell print OSC 133 marks, each with the tab's nonce, so that a
-// mark a program prints, not knowing it, never counts:
-//
-//   ESC ] 133;A;nonce=N BEL       at each prompt
-//   ESC ] 133;C;nonce=N BEL       a command line is about to run
-//   ESC ] 133;D;CODE;nonce=N BEL  it ran, and its status
-//   ESC ] 133;D;nonce=N BEL       a prompt with nothing run before it
+// PowerShell print OSC 133 marks and OSC 7, each with the tab's nonce
+// (termcmd.cpp), so that a mark a program prints, not knowing it, never
+// counts.
 
 enum : i32 {
     HOOK_NONE,
@@ -935,50 +933,6 @@ static i32 termhookable(Slice<Str> argv, b32 win, b32 *login)
         }
     }
     return HOOK_NONE;
-}
-
-struct TermMark {
-    i32 kind;     // 'A' to 'D', 0 for none
-    b32 hascode;  // D's status is given
-    i32 code;
-    b32 ok;       // its nonce is the tab's
-};
-
-// An OSC 133 mark's payload (all after "133;"), checked against a tab's
-// nonce: a field "nonce=N" must equal it, and no nonce matches none.
-static TermMark termmarkparse(Str payload, Str nonce)
-{
-    TermMark r = {};
-    if (!payload.len || payload[0]<'A' || payload[0]>'D' ||
-        (payload.len>1 && payload[1]!=';')) {
-        return r;
-    }
-    r.kind = payload[0];
-    Cut c  = cut(payload, ';');
-    for (i32 field = 0; c.ok; field++) {
-        c = cut(c.tail, ';');
-        Str f = c.head;
-        if (startswith(f, "nonce=")) {
-            r.ok |= nonce.len>0 && cuthead(f, 6)==nonce;
-        } else if (field==0 && r.kind=='D') {
-            b32 neg = f.len && f[0]=='-';
-            Str ds  = neg ? cuthead(f, 1) : f;
-            b32 num = ds.len>0 && ds.len<=10;
-            i64 v   = 0;
-            for (iz i = 0; num && i < ds.len; i++) {
-                num = digit(ds[i]);
-                v   = v*10 + (ds[i] - '0');
-            }
-            if (num) {
-                v = neg ? -v : v;
-                i64 hi = 0x7fffffff;
-                v = v<-hi-1 ? -hi-1 : v>hi ? hi : v;
-                r.hascode = 1;
-                r.code    = (i32)v;
-            }
-        }
-    }
-    return r;
 }
 
 // One step of a Run's: a mark, or a line typed. Returns 1 when its C
@@ -1430,13 +1384,24 @@ static void termfeedbytes(Engine *e, Term *t, Str data)
             return;
         } else if (f.ev.kind==ARIEL_EV_TITLE && !f.ev.arg) {
             t->titlelen = termtitle(t->title, {f.ev.data.data, f.ev.data.len});
-        } else if (f.ev.kind==ARIEL_EV_MARK && t->hooked) {
-            TermMark m = termmarkparse({f.ev.data.data, f.ev.data.len},
-                                       {t->nonce, countof(t->nonce)});
+        } else if (f.ev.kind == ARIEL_EV_CWD) {
+            // Its folder, as the hooks say it at each prompt
+            Str nonce = {t->nonce, t->hooked ? countof(t->nonce) : 0};
+            if (termcmdfolder(&t->cmds, {f.ev.data.data, f.ev.data.len}, nonce, t->win)) {
+                iz n = t->cmds.cwdlen<TERM_CWDCAP ? t->cmds.cwdlen : 0;
+                t->cwdlen = n ? n : t->cwdlen;
+                copybytes(t->cwd, t->cmds.cwd, n);
+            }
+        } else if (f.ev.kind == ARIEL_EV_MARK) {
+            // Any prompt mark counts a line (termcmd.cpp); its own move
+            // its records, and its Run
+            Str      nonce = {t->nonce, t->hooked ? countof(t->nonce) : 0};
+            TermMark m     = termcmdmark(&t->cmds, t->screen, {f.ev.data.data, f.ev.data.len},
+                                         nonce, os_ticks(e->os));
             if (!m.ok) {
                 continue;
             }
-            t->lastmark = m.kind;
+            t->lastmark = m.kind=='B' ? t->lastmark : m.kind;  // B: at its prompt still
             if (st!=TRUN_NONE && termrunstep(&t->srun, TRUN_MARK, m, os_ticks(e->os))) {
                 ariel_reset(t->rscreen.screen, ARIEL_RESET_FULL);
             }
@@ -2165,7 +2130,9 @@ static Str termstart(Engine *e, Arena *scratch, i64 id, Json *j, Session *s, Str
     t->cwdlen = cwd.len<TERM_CWDCAP ? cwd.len : 0;
     copybytes(t->cwd, cwd.data, t->cwdlen);
     t->hooked = nonce.len > 0;
+    t->win    = win;
     copybytes(t->nonce, nonce.data, nonce.len);
+    termcmdreset(&t->cmds);
     t->cols   = termsize(j).cols;
     t->rows   = termsize(j).rows;
     if (run.on) {
@@ -2328,6 +2295,7 @@ static void termcmd(Engine *e, Arena scratch, i32 cmd, Json *j)
             termscan(e, t);
             termblocksize(e, &t->scr, t->hist, z);
             t->screen = t->scr.screen;
+            termcmdresized(&t->cmds);
         }
         if (t->rscreen.screen) {
             termblocksize(e, &t->rscreen, TERM_RUNHIST, z);

@@ -871,3 +871,226 @@ static void test_termrunstep(Test *t)
         expect(t, concat(&s, "termrunstep ", cases[i].evs), finish(&b), cases[i].want);
     }
 }
+
+// A terminal of cols by rows, its history hist lines, for termcmd.cpp.
+static ariel_Term *termcmdscreen(Arena *a, i32 cols, i32 rows, i32 hist)
+{
+    ariel_Config c = {};
+    c.cols      = cols;
+    c.rows      = rows;
+    c.capcols   = 80;
+    c.caprows   = 40;
+    c.histlines = hist;
+    c.flags     = ARIEL_F_NOREPLY;
+    iz size = ariel_size(&c);
+    allocbytes(a, -(uz)a->beg & 15);
+    return ariel_init(allocbytes(a, size), size, &c);
+}
+
+// Output, its marks and folders to the records, as the engine and the
+// window feed them. "{A}" is the tab's mark A, "{D;3}" D with status 3,
+// "{7:/path}" its folder, "{a}" an A of no nonce; "\n" is CR LF.
+static void termcmdfeed(Arena scratch, ariel_Term *t, TermCmds *cs, Str text, i64 now)
+{
+    Str nonce = "n0";
+    Buf b(&scratch, 1024);
+    for (iz i = 0; i < text.len; i++) {
+        if (text[i] == '\n') {
+            print(&b, "\r\n");
+        } else if (text[i] == '{') {
+            iz j = i + 1;
+            for (; text[j] != '}'; j++) {}
+            Str in = {text.data+i+1, j-i-1};
+            if (startswith(in, "7:")) {
+                print(&b, "\x1b]7;file://host");
+                print(&b, cuthead(in, 2));
+                print(&b, "?nonce=n0\x07");
+            } else if (in == "a") {
+                print(&b, "\x1b]133;A\x07");
+            } else {
+                print(&b, "\x1b]133;");
+                print(&b, in);
+                print(&b, ";nonce=n0\x07");
+            }
+            i = j;
+        } else {
+            putbyte(&b, text[i]);
+        }
+    }
+    ariel_Str in = {b.data, b.len};
+    for (;;) {
+        ariel_Fed f = ariel_feed(t, in);
+        in = f.rest;
+        if (f.ev.kind == ARIEL_EV_NONE) {
+            return;
+        } else if (f.ev.kind == ARIEL_EV_MARK) {
+            termcmdmark(cs, t, {f.ev.data.data, f.ev.data.len}, nonce, now);
+        } else if (f.ev.kind == ARIEL_EV_CWD) {
+            termcmdfolder(cs, {f.ev.data.data, f.ev.data.len}, nonce, 0);
+        }
+    }
+}
+
+// A record as "cmd|cwd|state|code|output", "-" for none.
+static Str termcmdshow(Arena *a, TermCmds *cs, ariel_Term *t, i64 i)
+{
+    TermCmd *c = termcmdat(cs, i);
+    if (!c) {
+        return "-";
+    }
+    b32 gone = 0;
+    Str out  = termcmdoutput(a, cs, t, c, &gone);
+    Buf b(a, 256);
+    print(&b, termcmdstr(c));
+    print(&b, "|");
+    print(&b, termcmdcwd(c));
+    print(&b, "|");
+    print(&b, c->state==TC_PROMPT ? Str("prompt") : c->state==TC_RUNNING ? Str("running")
+                                                                         : Str("done"));
+    print(&b, "|");
+    if (c->hascode) {
+        print(&b, (i64)c->code);
+    } else {
+        print(&b, "-");
+    }
+    print(&b, "|");
+    print(&b, gone ? Str("(gone)") : out);
+    return finish(&b);
+}
+
+static void test_termcmds(Test *t)
+{
+    Arena *a = &t->perm;
+
+    {
+        struct {
+            Str uri;
+            b32 win;
+            Str want;
+        } cases[] = {
+            {"file://host/home/u?nonce=n0", 0, "/home/u"},
+            {"file:///home/u?nonce=n0", 0, "/home/u"},
+            {"file://host/a%20b/%25x?nonce=n0", 0, "/a b/%x"},
+            {"file://host/a%3Fb%23c?nonce=n0", 0, "/a?b#c"},
+            {"file://host/a?b?nonce=n0", 0, "/a?b"},
+            {"file://host/a%0Ab?nonce=n0", 0, "/a\nb"},
+            {"file://host/a%zz?nonce=n0", 0, "/a%zz"},
+            {"file://host/a%00b?nonce=n0", 0, ""},
+            {"file://host/home/u?nonce=n1", 0, ""},
+            {"file://host/home/u?x=1&nonce=n0", 0, "/home/u"},
+            {"file://host/home/u", 0, ""},
+            {"file://host?nonce=n0", 0, ""},
+            {"http://host/u?nonce=n0", 0, ""},
+            {"file://host/C:/Users/u?nonce=n0", 1, "C:/Users/u"},
+            {"file://host//srv/share/d?nonce=n0", 1, "//srv/share/d"},
+            {"file://host/C:/Users/u?nonce=n0", 0, "/C:/Users/u"},
+        };
+        for (iz i = 0; i < countof(cases); i++) {
+            Arena s = *a;
+            u8    buf[64];
+            Str   got = termcwdparse(cases[i].uri, "n0", cases[i].win, buf, countof(buf));
+            expect(t, concat(&s, "termcwdparse ", cases[i].uri), got, cases[i].want);
+        }
+        u8 buf[4];
+        expect(t, "termcwdparse past its buffer",
+               termcwdparse("file://h/abcdef?nonce=n0", "n0", 0, buf, countof(buf)), "");
+    }
+
+    {
+        // Two commands and a prompt; one runs on, and one is cleared
+        Arena       s  = *a;
+        ariel_Term *tm = termcmdscreen(&s, 20, 5, 100);
+        TermCmds    cs = {};
+        termcmdreset(&cs);
+        termcmdfeed(s, tm, &cs, "{7:/w}{A}p$ {B}echo hi\n{C}hi\nthere\n{D;0}"
+                                "{7:/w/x%20y}{A}p$ {B}false\n{C}{D;1}"
+                                "{A}p$ {B}\n{D}{A}p$ {B}", 0);
+        expect(t, "termcmds: prompt", termcmdshow(&s, &cs, tm, 0), "|/w/x y|prompt|-|");
+        expect(t, "termcmds: false", termcmdshow(&s, &cs, tm, 1), "false|/w/x y|done|1|");
+        expect(t, "termcmds: echo", termcmdshow(&s, &cs, tm, 2), "echo hi|/w|done|0|hi\nthere");
+        expect(t, "termcmds: no more", termcmdshow(&s, &cs, tm, 3), "-");
+        expect(t, "termcmds: prompts", istr(&s, (i32)cs.prompts), "4");
+
+        // By row: "there" (row 2) is echo's output, its prompt row not
+        b32      out = 0;
+        TermCmd *c   = termcmdatrow(&cs, tm, ariel_lines(tm).first+2, &out);
+        expect(t, "termcmdatrow output", c ? termcmdstr(c) : Str("-"), "echo hi");
+        expect(t, "termcmdatrow output in", istr(&s, out), "1");
+        c = termcmdatrow(&cs, tm, ariel_lines(tm).first, &out);
+        expect(t, "termcmdatrow prompt", c ? termcmdstr(c) : Str("-"), "echo hi");
+        expect(t, "termcmdatrow prompt in", istr(&s, out), "0");
+
+        // A program's A, no nonce, flags a line, which counts; a long
+        // line wraps; it runs on
+        termcmdfeed(s, tm, &cs, "cat f\n{C}one\n{a}fake$ two\n"
+                                "abcdefghijklmnopqrstuvwxyz\n", 0);
+        expect(t, "termcmds: running", termcmdshow(&s, &cs, tm, 0),
+               "cat f|/w/x y|running|-|one\nfake$ two\nabcdefghijklmnopqrstuvwxyz");
+        expect(t, "termcmds: running, echo", termcmdshow(&s, &cs, tm, 2),
+               "echo hi|/w|done|0|hi\nthere");
+
+        // Narrower: the wrapped lines reflow, the places hold
+        ariel_resize(tm, 12, 5, 8, 16);
+        termcmdresized(&cs);
+        expect(t, "termcmds: reflowed", termcmdshow(&s, &cs, tm, 0),
+               "cat f|/w/x y|running|-|one\nfake$ two\nabcdefghijklmnopqrstuvwxyz");
+        expect(t, "termcmds: reflowed, echo", termcmdshow(&s, &cs, tm, 2),
+               "echo hi|/w|done|0|hi\nthere");
+        termcmdfeed(s, tm, &cs, "{D;0}{A}p$ {B}a long command line\n{C}{D;2}{A}p$ {B}", 0);
+        expect(t, "termcmds: wrapped command", termcmdshow(&s, &cs, tm, 1),
+               "a long command line|/w/x y|done|2|");
+        expect(t, "termcmds: cat ended", termcmdshow(&s, &cs, tm, 2),
+               "cat f|/w/x y|done|0|one\nfake$ two\nabcdefghijklmnopqrstuvwxyz");
+
+        // Cleared with its history: gone, clear's own prompt too
+        termcmdfeed(s, tm, &cs, "clear\n{C}\x1b[H\x1b[2J\x1b[3J{D;0}{A}p$ {B}", 0);
+        expect(t, "termcmds: cleared, clear", termcmdshow(&s, &cs, tm, 1), "clear|/w/x y|done|0|(gone)");
+        expect(t, "termcmds: cleared, cat", termcmdshow(&s, &cs, tm, 3),
+               "cat f|/w/x y|done|0|(gone)");
+    }
+
+    {
+        // An A a second time on its line counts once; a C with no prompt
+        // of ours, a D with nothing running, change nothing
+        Arena       s  = *a;
+        ariel_Term *tm = termcmdscreen(&s, 20, 5, 100);
+        TermCmds    cs = {};
+        termcmdreset(&cs);
+        termcmdfeed(s, tm, &cs, "{A}{a}p$ {B}ls\n{C}x\n{D;0}{D;5}{C}{A}p$ ", 0);
+        expect(t, "termcmds: once a line", istr(&s, (i32)cs.prompts), "2");
+        expect(t, "termcmds: ls", termcmdshow(&s, &cs, tm, 1), "ls||done|0|x");
+        TermCmd *c = termcmdat(&cs, 0);
+        expect(t, "termcmds: stray C", istr(&s, c ? c->state : -1), istr(&s, TC_PROMPT));
+
+        // More than the ring holds: the newest kept
+        for (i32 i = 0; i < TERMCMD_MAX+3; i++) {
+            termcmdfeed(s, tm, &cs, "{A}p$ {B}true\n{C}{D;0}", 0);
+        }
+        termcmdfeed(s, tm, &cs, "{A}p$ {B}", 0);
+        expect(t, "termcmds: ring", termcmdshow(&s, &cs, tm, TERMCMD_MAX-1), "true||done|0|");
+        expect(t, "termcmds: ring end", termcmdshow(&s, &cs, tm, TERMCMD_MAX), "-");
+    }
+
+    {
+        struct {
+            Str text;
+            i32 head;
+            i32 tail;
+            iz  max;
+            Str want;
+        } cases[] = {
+            {"a\nb\nc", 1, 1, 100, "a\n[... 1 line left out ...]\nc\n"},
+            {"a\nb\nc", 2, 1, 100, "a\nb\nc\n"},
+            {"a\nb\nc\nd\ne", 1, 2, 100, "a\n[... 2 lines left out ...]\nd\ne\n"},
+            {"aa\nbb\ncc\ndd", 2, 2, 9, "aa\n[... 1 line left out ...]\ncc\ndd\n"},
+            {"aa\nbb\ncc\ndd\nee", 1, 4, 9, "aa\n[... 2 lines left out ...]\ndd\nee\n"},
+            {"", 1, 1, 100, ""},
+        };
+        for (iz i = 0; i < countof(cases); i++) {
+            Arena s = *a;
+            expect(t, concat(&s, "termclip ", cases[i].text),
+                   termclip(&s, cases[i].text, cases[i].head, cases[i].tail, 100, cases[i].max),
+                   cases[i].want);
+        }
+    }
+}

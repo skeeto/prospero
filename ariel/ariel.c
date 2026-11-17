@@ -5177,12 +5177,9 @@ static i64 vrow(ariel_Term *t, i32 y)
 
 static void selmark(ariel_Term *t, i64 abs, ariel_Cell *out, i32 n);
 
-int32_t ariel_row(ariel_Term *t, int32_t y, ariel_Cell *out, int32_t cap)
+// Virtual row v's cells, a history row's or else grid g's
+static int32_t rowout(ariel_Term *t, i64 v, i32 g, ariel_Cell *out, int32_t cap)
 {
-    affirm(t->magic == MAGIC);
-    settle(t);
-    if (y<0 || y>=t->rows) return 0;
-    i64 v = vrow(t, y);
     i32 n = imin(cap, t->cols);
     if (v < t->hrows) {
         Hrow  r = hlocate(t, v);
@@ -5208,7 +5205,8 @@ int32_t ariel_row(ariel_Term *t, int32_t y, ariel_Cell *out, int32_t cap)
         return t->cols;
     }
 
-    Cell *r = row(t, (i32)(v - t->hrows));
+    i32   y = (i32)(v - t->hrows);
+    Cell *r = gridcells(t, g) + (iz)gridmap(t, g)[y]*t->capcols;
     for (i32 x = 0; x < n; x++) {
         Cell *c = r + x;
         if (x && c->fg==c[-1].fg && c->bg==c[-1].bg && c->ul==c[-1].ul &&
@@ -5226,6 +5224,14 @@ int32_t ariel_row(ariel_Term *t, int32_t y, ariel_Cell *out, int32_t cap)
     }
     selmark(t, t->hevicted+v, out, n);
     return t->cols;
+}
+
+int32_t ariel_row(ariel_Term *t, int32_t y, ariel_Cell *out, int32_t cap)
+{
+    affirm(t->magic == MAGIC);
+    settle(t);
+    if (y<0 || y>=t->rows) return 0;
+    return rowout(t, vrow(t, y), t->scr, out, cap);
 }
 
 ptrdiff_t ariel_cluster(ariel_Term *t, int32_t x, int32_t y, uint32_t *out, ptrdiff_t cap)
@@ -5272,6 +5278,53 @@ ariel_RowInfo ariel_rowinfo(ariel_Term *t, int32_t y)
         return hrowinfo(t, &h);
     }
     Head *h = head(t, (i32)(v - t->hrows));
+    r.id    = (int64_t)h->id;
+    r.gen   = h->gen - t->hgen < 0x80000000u ? h->gen : t->hgen;
+    r.flags = h->flags;
+    return r;
+}
+
+// The main screen's virtual row for a line number, else -1
+static i64 lineat(ariel_Term *t, int64_t line)
+{
+    hsync(t);
+    i64 v = line - t->hevicted;
+    return v>=0 && v<t->hrows+t->rows ? v : -1;
+}
+
+ariel_Lines ariel_lines(ariel_Term *t)
+{
+    affirm(t->magic == MAGIC);
+    settle(t);
+    hsync(t);
+    ariel_Lines r = {0};
+    r.first  = t->hevicted;
+    r.end    = t->hevicted + t->hrows + t->rows;
+    r.cursor = t->scr ? -1 : t->hevicted + t->hrows + t->c.y;
+    return r;
+}
+
+int32_t ariel_line(ariel_Term *t, int64_t line, ariel_Cell *out, int32_t cap)
+{
+    affirm(t->magic == MAGIC);
+    settle(t);
+    i64 v = lineat(t, line);
+    return v<0 ? 0 : rowout(t, v, 0, out, cap);
+}
+
+ariel_RowInfo ariel_lineinfo(ariel_Term *t, int64_t line)
+{
+    affirm(t->magic == MAGIC);
+    settle(t);
+    ariel_RowInfo r = {0};
+    i64 v = lineat(t, line);
+    if (v < 0) {
+        return r;
+    } else if (v < t->hrows) {
+        Hrow h = hlocate(t, v);
+        return hrowinfo(t, &h);
+    }
+    Head *h = gridheads(t, 0) + gridmap(t, 0)[v - t->hrows];
     r.id    = (int64_t)h->id;
     r.gen   = h->gen - t->hgen < 0x80000000u ? h->gen : t->hgen;
     r.flags = h->flags;

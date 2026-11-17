@@ -554,6 +554,27 @@ the agent hears how the block ended, its exit code and its last lines
 agent is asked to put commands that only you can run, such as one that
 asks for your password, in such blocks.
 
+### Shell integration
+
+With `[terminal] integration` on (the default), a tab's zsh, bash or
+PowerShell runs Prospero's hooks around your own startup files. At each
+prompt they say which folder the shell is in, and they mark where the
+prompt begins and ends, each command line it runs, and that command's
+exit code. Each mark carries a secret of the tab's, so a program's
+output can't fake one. From the marks a tab keeps a record of its last
+32 commands: the line as you typed it, its folder, when it ran, its
+exit code, and where its output is in the tab's screen and history.
+Output scrolled out of the history, or cleared with it (`clear`), is
+gone from its record too. A tab whose shell ended starts again, with
+Restart, in the folder its shell was last in.
+
+The hooks go only into a shell started as itself: zsh or bash alone or
+with `-l`, PowerShell alone or with `-NoLogo`. Another shell (fish, sh,
+cmd.exe), or one given other arguments, runs as it would anywhere, and
+a tab of it knows only the folder it opened in. A shell started inside
+a tab (`bash` typed at its prompt, or `ssh`) has no hooks either: until
+it exits, the tab knows the outer shell's folder and command.
+
 ## Side chats
 
 A side chat asks about a session without disturbing it, even while its

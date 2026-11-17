@@ -857,6 +857,7 @@ int main()
     test_termrun(&t);
     test_termmarks(&t);
     test_termrunstep(&t);
+    test_termcmds(&t);
     test_termset(&t);
     test_termrunto(&t);
     test_dbus(&t);
