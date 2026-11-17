@@ -6702,6 +6702,14 @@ def sc_term_read_commands(model, n, req):
         yield from answer(model, "Read them.")
 
 
+def sc_term_wait(model, n, req):
+    k = step(req)
+    if k in (0, 3, 5):
+        yield from tool(model, n, "read_terminal", {"wait": True})
+    else:
+        yield from answer(model, f"Answer {k}.")
+
+
 sc_term_run_windows = sc_term_run
 sc_term_run_parked = sc_term_run
 sc_term_marks_run = sc_term_run

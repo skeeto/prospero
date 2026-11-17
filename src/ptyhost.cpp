@@ -277,6 +277,14 @@ struct Term {
     i32         lastmark;   // the last verified mark's letter but B, 0 for none
     TermCmds    cmds;       // its command lines, while its screen is kept
 
+    // A session waiting for its running command to end (read_terminal's
+    // wait): that record, by seq, or with an unhooked shell, until no
+    // program but the shell has the terminal (busy)
+    u8  waitsid[64];
+    iz  waitsidlen;  // 0 for none
+    i64 waitseq;     // 0 for busy
+    i64 waitat;      // ticks
+
     // A Run's (term.open's run): what ran, for labels and its notice
     b32 run;
     b32 keep;       // hung up, its screen kept once it ends
@@ -2208,6 +2216,8 @@ static void termopen(Engine *e, Arena scratch, i64 id, Json *j)
 
 static void termrunend(Engine *, Arena, Term *, i32);
 static void termrunheed(Engine *, Arena, Term *, i64);
+static void termwaitend(Engine *, Arena, Term *, i32);
+static void termwaitheed(Engine *, Arena, Term *);
 
 // A Run typed at the prompt (term.input's run {from, key, first,
 // lines}): tracked by its marks, if the shell is hooked, its screen
@@ -2362,6 +2372,13 @@ static b32 termrecord(Engine *e, Arena scratch, Record r)
         i32 why = t->srun.state==TRUN_ENDED ? TEND_DONE : t->closed ? TEND_CUT : TEND_EXIT;
         termrunend(e, scratch, t, why);
     }
+    if (t->waitsidlen && t->exited && t->eof) {
+        termscan(e, t);
+        termwaitheed(e, scratch, t);  // its D may have come in last
+        if (t->waitsidlen) {
+            termwaitend(e, scratch, t, t->closed ? TEND_CUT : TEND_EXIT);
+        }
+    }
     if (t->closed) {
         termsettle(e, t);  // frees or keeps it once both are in
     } else {
@@ -2391,6 +2408,9 @@ static void termtick(Engine *e, Arena scratch)
         }
         termpump(e, scratch, t);
         termrunheed(e, scratch, t, now);
+        if (t->waitseq) {
+            termwaitheed(e, scratch, t);
+        }
         if (look && t->proc && !t->exited) {
             b32 busy = os_ptybusy(e->os, t->proc);
             if (busy != t->busy) {
@@ -2401,6 +2421,9 @@ static void termtick(Engine *e, Arena scratch)
                 if (termemit(e, evend(&w))) {
                     t->busy = busy;
                 }
+            }
+            if (!t->waitseq) {
+                termwaitheed(e, scratch, t);
             }
         }
     }
@@ -2912,6 +2935,122 @@ static void termrunheed(Engine *e, Arena scratch, Term *t, i64 now)
     }
 }
 
+// A command a session waited for is over (TEND_DONE), or its shell
+// ended, or its tab closed: tell it, and wake it as a job's end does.
+static void termwaitend(Engine *e, Arena scratch, Term *t, i32 why)
+{
+    Str sid = {t->waitsid, t->waitsidlen};
+    i64 seq = t->waitseq;
+    t->waitsidlen = 0;
+    if (!sid.len || !termagent(e)) {
+        return;
+    }
+    Session *s = termnoticeto(e, scratch, sid);
+    if (!s) {
+        return;
+    }
+    TermSecrets *ss     = &e->terms->secrets;
+    iz           hidden = 0;
+    i64          now    = os_ticks(e->os);
+    TermCmd     *c      = 0;
+    for (iz i = 0; seq && i < t->cmds.n; i++) {
+        TermCmd *r = termcmdat(&t->cmds, i);
+        c = r->seq==seq ? r : c;
+    }
+    i32 code = -1;
+    Buf b(&scratch, TERM_READBYTES + 2048);
+    print(&b, "The command you waited for in terminal ");
+    print(&b, t->tid);
+    if (why == TEND_CUT) {
+        print(&b, " did not finish: its tab was closed while it ran.\n");
+    } else if (why == TEND_EXIT) {
+        print(&b, " did not finish: its shell ended while it ran");
+        if (t->exited && !t->signal) {
+            print(&b, ", with code ");
+            print(&b, (i64)t->code);
+        }
+        print(&b, ".\n");
+    } else if (c && c->state==TC_DONE) {
+        print(&b, " is over: ");
+        termcmdread(&b, &scratch, t, c, now, TERM_READBYTES, ss, &hidden);
+        code = c->hascode ? c->code : -1;
+    } else if (seq) {
+        print(&b, " is over, but its record is gone, and with it how it ended.\n");
+    } else {
+        print(&b, " is over: the terminal is back at its shell's prompt after ");
+        printelapsed(&b, (now - t->waitat) / MS);
+        print(&b, ". Its shell does not mark its commands, so how it ended is not known.");
+    }
+    if (t->screen && (why!=TEND_DONE || !(c && c->state==TC_DONE))) {
+        iz  h    = 0;
+        Str text = termscreentext(&scratch, t->screen, ss, &h);
+        hidden  += h;
+        b32 more = 0;
+        Str last = termlast(&scratch, text, 20, 2<<10, &more);
+        if (last.len) {
+            print(&b, " Its terminal ends with:\n");
+            print(&b, last);
+        } else {
+            putbyte(&b, '\n');
+        }
+    }
+    if (hidden) {
+        print(&b, "[secrets typed at password prompts are hidden as [hidden]]\n");
+    }
+    if (why==TEND_DONE && !t->closed) {
+        print(&b, "read_terminal reads the terminal while its tab is open.\n");
+    }
+    Notice n = {};
+    n.kind = "terminal";
+    n.text = finish(&b);
+    n.tid  = t->tid;
+    n.code = code;
+    n.ms   = (now - t->waitat) / MS;
+    n.key  = (u64)1<<63 | (u64)t->tid<<32 | (u32)seq;
+    termnoticeput(s, n);
+    s->wake = 1;
+    if (!busy(s) && !s->closed && canresume(s)) {
+        autoresume(s, scratch, "terminal");
+    } else if (!busy(s) && !s->closed && !e->quitting) {
+        Str why = resumespent(s, &scratch, "a terminal command it waited for");
+        note(s, scratch, "info", why);
+    }
+}
+
+// A wait's command, if it is over.
+static void termwaitheed(Engine *e, Arena scratch, Term *t)
+{
+    if (!t->waitsidlen) {
+        return;
+    } else if (!t->waitseq) {
+        if (!t->busy) {
+            termwaitend(e, scratch, t, TEND_DONE);
+        }
+        return;
+    }
+    TermCmd *c = 0;
+    for (iz i = 0; i < t->cmds.n; i++) {
+        TermCmd *r = termcmdat(&t->cmds, i);
+        c = r->seq==t->waitseq ? r : c;
+    }
+    if (!c || c->state!=TC_RUNNING) {
+        termwaitend(e, scratch, t, TEND_DONE);
+    }
+}
+
+// The session waits for a terminal's command: it may end its turn.
+static b32 termwaiting(Session *s)
+{
+    Engine *e = s->e;
+    for (i32 i = 0; e->terms && i < TERM_MAX; i++) {
+        Term *t = &e->terms->slots[i];
+        if (t->tid && t->waitsidlen && Str{t->waitsid, t->waitsidlen}==s->sid) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 // Before a request: every Run of the session's that ended goes in now,
 // settled or not, so that none misses it.
 static void termheed(Session *s, Arena scratch)
@@ -2984,7 +3123,57 @@ static void toolreadterm(Session *s, Arena scratch, Args *args)
     }
 
     putbyte(&b, '\n');
-    if (!pick->screen) {
+    if (args->wait) {
+        termscan(e, pick);
+        TermCmd *c   = termcmdrunning(pick);
+        b32      run = pick->screen && !pick->exited && !pick->closed &&
+                       (c || (!pick->cmds.hooked && pick->busy));
+        if (s->intask) {
+            print(&b, "A subagent cannot wait for a terminal: read it instead, "
+                      "or report, and leave the waiting to the main agent.");
+            Str text = finish(&b);
+            toolend(s, scratch, "error", text, 0, 0, {}, 0);
+            return;
+        } else if (!run) {
+            print(&b, "Nothing is running in terminal ");
+            print(&b, pick->tid);
+            print(&b, pick->exited || pick->closed ? Str(" (its shell has ended)")
+                                                   : Str(""));
+            print(&b, ", so there is nothing to wait for.\n");
+            if (pick->screen && pick->cmds.hooked && !pick->exited) {
+                termcmdsread(&b, &scratch, pick, 1, os_ticks(e->os), ss, &hidden);
+            }
+        } else {
+            if (pick->waitsidlen && !(Str{pick->waitsid, pick->waitsidlen}==s->sid)) {
+                // Another session waited: it hears nothing now, as if it
+                // had not, but this one does
+                pick->waitsidlen = 0;
+            }
+            pick->waitsidlen = s->sid.len<countof(pick->waitsid) ? s->sid.len : 0;
+            copybytes(pick->waitsid, s->sid.data, pick->waitsidlen);
+            pick->waitseq = c ? c->seq : 0;
+            pick->waitat  = os_ticks(e->os);
+            print(&b, "Waiting for terminal ");
+            print(&b, pick->tid);
+            if (c) {
+                iz h = 0;
+                print(&b, "'s `");
+                print(&b, termmask(&scratch, termcmdstr(c), ss, &h));
+                hidden += h;
+                print(&b, "`, running for ");
+                printelapsed(&b, (pick->waitat - c->startat) / MS);
+            } else {
+                print(&b, "'s program (its shell does not mark its commands, so "
+                          "until the terminal is back at its prompt)");
+            }
+            print(&b, canresume(s)
+                      ? Str(". End your turn now, without sleeping or reading it "
+                            "again: its end starts a new turn, with how it went.\n")
+                      : Str(". This session cannot start a turn by itself now "
+                            "([tools] auto_resume), so you hear how it went at "
+                            "the user's next prompt: end your turn.\n"));
+        }
+    } else if (!pick->screen) {
         print(&b, "Terminal ");
         print(&b, pick->tid);
         print(&b, " cannot be read: it opened while [terminal] agent was off.\n");

@@ -1845,6 +1845,7 @@ static void userinput(Session *s)
 static void planheed(Session *, Arena);
 static void shellheed(Session *, Arena);
 static void termheed(Session *, Arena);
+static b32  termwaiting(Session *);
 static void grantheed(Session *, Arena);
 static void putgrant(JsonOut *, Grant);
 static iz   grantsize(Grant);
@@ -6715,23 +6716,26 @@ static b32 jobwaiting(Session *s)
             return 1;
         }
     }
-    return 0;
+    return termwaiting(s);  // a terminal's command, as read_terminal's wait
 }
 
-// Start a turn to give the agent its notices, a session left idle.
-static void autoresume(Session *s, Arena scratch)
+// Start a turn to give the agent its notices, a session left idle: via
+// "job", or "terminal" for a terminal's command it waited for.
+static void autoresume(Session *s, Arena scratch, Str via = "job")
 {
     s->resumed = push(&s->perm, s->resumed, os_ticks(s->e->os));
     s->wake    = 0;
-    beginturn(s, scratch, "job");
+    beginturn(s, scratch, via);
 }
 
-// Why a job's end started no turn, and what to do about it.
-static Str resumespent(Session *s, Arena *a)
+// Why the end of what (a background job) started no turn, and what to
+// do about it.
+static Str resumespent(Session *s, Arena *a, Str what = "a background job")
 {
     i64 cap = resumecap(s->e);
     Buf b(a, 512);
-    print(&b, "a background job ended while this session was idle, ");
+    print(&b, what);
+    print(&b, " ended while this session was idle, ");
     if (cap == 0) {
         print(&b, "and [tools] auto_resume = 0 keeps it from starting a turn "
                   "by itself");
@@ -7534,7 +7538,7 @@ static b32 todoforgot(Session *s)
 static b32 todonudge(Session *s, Arena scratch)
 {
     Str left = todoleft(&scratch, s->todos);
-    if (!left.data || (jobsrunning(s) && canresume(s))) {
+    if (!left.data || (jobsrunning(s) && canresume(s)) || termwaiting(s)) {
         return 0;
     }
     iz  open   = 0;
@@ -16397,7 +16401,12 @@ static void endturn(Session *s, Arena scratch, Str why, Str err)
     } else if (s->closed) {
         stopjobs(s, scratch, 0);  // started after the session closed
     } else if (resume) {
-        autoresume(s, scratch);
+        // For a terminal's command when no job's end is among them
+        Str via = "terminal";
+        for (iz i = 0; i < s->notices.len; i++) {
+            via = s->notices[i].kind!="terminal" ? Str("job") : via;
+        }
+        autoresume(s, scratch, via);
     }
     if (!busy(s) && why=="done") {
         titlestart(s, scratch);

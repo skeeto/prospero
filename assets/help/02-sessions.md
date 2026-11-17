@@ -518,7 +518,16 @@ folder, exit code or that it still runs, how long it took, and its
 output, a long one cut to its first 20 and last 80 lines. This is how
 it sees how something you ran went, such as a build or the tests,
 without reading past it; the list of tabs says what each one is
-running. In a shell that marks none, it gets the tab's lines. It
+running. In a shell that marks none, it gets the tab's lines.
+
+Ask it to tell you when something running in a tab is done ("when the
+tests in terminal 2 finish, tell me if they failed"), and it waits for
+that command as for a background job: it ends its turn, and the
+command's end starts a new one, with its exit code and output, so it
+can answer without you prompting again. This counts toward `[tools]
+auto_resume`, as a job's end does; past it, the agent hears at your
+next prompt. Where the shell marks no commands, it waits until no
+program but the shell has the terminal. A subagent cannot wait. It
 cannot type, and runs nothing. A subagent reads its session's
 tabs, and a side chat in the same folder its original's. The tool is
 offered to sessions you open while `[terminal] agent` is on (the

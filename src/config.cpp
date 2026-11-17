@@ -483,7 +483,8 @@ static CfgKey cfgschema[] = {
      "Most seconds the agent may ask for a background job to run"},
     {"tools", "auto_resume", CFG_INT, "30", {}, {}, "tools",
      "Turns a session may start by itself in an hour, to report background "
-     "jobs that ended while it was idle; 0 for none, -1 for no limit"},
+     "jobs, or terminal commands it waited for, that ended while it was "
+     "idle; 0 for none, -1 for no limit"},
     {"tools", "stop_grace", CFG_SECONDS, "", {}, {}, "tools",
      "Seconds between asking a command to stop (SIGTERM, or CTRL_BREAK on "
      "Windows) and killing it (default: 2, or 3 on Windows)"},

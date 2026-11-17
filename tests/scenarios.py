@@ -19639,6 +19639,83 @@ def term_read_commands(t):
         h.close()
 
 
+@scenario(bound=120)
+def term_wait(t):
+    """read_terminal's wait: the agent ends its turn unnudged, and the
+    command's end starts a new turn ("terminal"), whose request has how
+    it went; a tab with nothing running has nothing to wait for; in a
+    shell that marks no commands, it waits for the terminal's program
+    to end."""
+    env = {}
+    if t.host.windows:
+        shell = "powershell"
+        line = 'Start-Sleep 3; cmd /c "echo done-x& exit 7"'
+        busy = "ping -n 4 127.0.0.1 >$null"
+    else:
+        shell = "bash"
+        env["HOME"] = hookhome(t, "home", {".bashrc": "PS1='p$ '\n"})
+        env["BASH_SILENCE_DEPRECATION_WARNING"] = "1"
+        line = "sh -c 'sleep 3; echo done-x; exit 7'"
+        busy = "sleep 3"
+    h = t.headless(env=env)
+    try:
+        sid = readsession(t, h)
+        tt = Tty(t, h, sid, cols=120, shell=shell)
+        t.check(tt.reply.get("nonce"), f"hooked: {tt.reply}")
+        markwait(tt, 1, 60)
+        tt.pump(lambda x: marksof(x)[-1:] == ["A"], 30, "a prompt")
+        have = len(marksof(tt))
+        tt.type(line + "\r")
+        tt.pump(lambda x: marksof(x)[have:] == ["C"], 30, "its C")
+
+        evs = turnof(h, sid, "tell me when it ends")
+        ends = toolends(evs)
+        said = ends[0].get("text", "") if ends else ""
+        t.check(len(ends) == 1 and f"Waiting for terminal {tt.tid}'s `{line}`, running for "
+                in said and "End your turn now" in said, f"waits: {said!r}")
+        t.check(sum(1 for e in evs if e.get("ev") == "attempt") == 2,
+                f"no nudge: {[e.get('ev') for e in evs]}")
+        resumed = h.wait(lambda e: e.get("ev") == "turn" and e.get("sid") == sid and
+                         e.get("n") == 2, 30)
+        t.check(resumed.get("via") == "terminal", f"its end resumes it: {resumed}")
+        ended(h, sid, 2)
+        last = json.dumps(t.requests()[-1]["body"].get("messages", [])[-1])
+        t.check("The command you waited for in terminal" in last and
+                "exited with code 7" in last and "done-x" in last, f"how it went: {last[-800:]}")
+
+        evs = turnof(h, sid, "and now?")
+        said = toolends(evs)[0].get("text", "")
+        t.check(f"Nothing is running in terminal {tt.tid}, so there is nothing to wait for"
+                in said and "exited with code 7" in said, f"idle: {said!r}")
+
+        h.send("term.close", tid=tt.tid, kill=True)
+        h.close()
+
+        t.host.write(t.config, (t.host.read(t.config) or "") +
+                     "[terminal]\nintegration = false\n")
+        h = t.headless(env=env)
+        sid = readsession(t, h)
+        pt = Tty(t, h, sid, shell=shell)
+        t.check(not pt.reply.get("nonce"), f"unhooked: {pt.reply}")
+        time.sleep(2)  # its prompt
+        pt.type(busy + "\r")
+        pt.pump(lambda x: bool(x.busy) and x.busy[-1], 15, "busy")
+        evs = turnof(h, sid, "and that one?")
+        said = toolends(evs)[0].get("text", "")
+        t.check(f"Waiting for terminal {pt.tid}'s program (its shell does not mark" in said,
+                f"unmarked: {said!r}")
+        resumed = h.wait(lambda e: e.get("ev") == "turn" and e.get("sid") == sid and
+                         e.get("n") == 2, 30)
+        t.check(resumed.get("via") == "terminal", f"unmarked resumes: {resumed}")
+        ended(h, sid, 2)
+        last = json.dumps(t.requests()[-1]["body"].get("messages", [])[-1])
+        t.check("is over: the terminal is back at its shell's prompt" in last,
+                f"unmarked end: {last[-600:]}")
+        h.send("term.close", tid=pt.tid, kill=True)
+    finally:
+        h.close()
+
+
 @scenario(bound=150)
 def term_marks_pwsh(t):
     """On Windows a PowerShell tab is hooked, and ConPTY passes its marks

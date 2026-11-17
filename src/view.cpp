@@ -2603,6 +2603,12 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
             v->msgs[i].seq        = r->seq;
             v->msgs[i].label      = "Resumed by itself";
             v->msgs[i].startsturn = v->turn;
+        } else if (via == "terminal") {
+            i32 i = addmsg(v, VIEW_NOTE, "A command in a terminal that the agent "
+                           "waited for ended, so the agent went on without a prompt.");
+            v->msgs[i].seq        = r->seq;
+            v->msgs[i].label      = "Resumed by itself";
+            v->msgs[i].startsturn = v->turn;
         } else if (via == "task") {
             i32 i = addmsg(v, VIEW_NOTE, "A subagent moved to the background "
                            "finished, so the agent went on without a prompt.");
