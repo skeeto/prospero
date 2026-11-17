@@ -1,6 +1,6 @@
 # Getting started
 
-**Close any pane you do not need, this one too: the View menu shows each again, and View → Layout → Standard puts them all back.**
+**Close any pane you do not need, this one too: <kbd>F1</kbd> (<kbd>Cmd+?</kbd> on macOS), or Help → Help, brings Help back, the View menu shows each of the others again, and View → Layout → Standard puts the window's layout back.**
 
 The field above these topics searches every page: type words, and the
 sections that have them all take the topics' place, headings that

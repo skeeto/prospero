@@ -16595,8 +16595,9 @@ static b32 filesfocused(Gui *g)
     return !ImGui::GetTopMostPopupModal() && g->fileswindow && nav;
 }
 
-// The text keys that may zoom (zoomkey), which the backends name by
-// their US position, all but digits, letters, Space and `.
+// The text keys that may zoom (zoomkey), or type ? for Help on macOS,
+// which the backends name by their US position, all but digits,
+// letters, Space and `.
 static ImGuiKey const zoomkeys[] = {
     ImGuiKey_Minus, ImGuiKey_Equal, ImGuiKey_LeftBracket, ImGuiKey_RightBracket,
     ImGuiKey_Semicolon, ImGuiKey_Apostrophe, ImGuiKey_Backslash, ImGuiKey_Comma,
@@ -16623,7 +16624,7 @@ static i32 zoomkey(Gui *g, ImGuiKey k, b32 shift)
 // The menus' shortcuts, wherever the focus is (a global route, which a
 // focused field's own use of a key goes ahead of): a new session, zoom
 // by key or by Ctrl+wheel (Cmd on macOS), find (the Files find while
-// Files has the focus) and the session's folding toggles, Settings, the
+// Files has the focus) and the session's folding toggles, Settings, Help, the
 // palette, up to a parent, and quitting on Linux, where no system
 // shortcut does (macOS has Cmd+Q, Windows Alt+F4). While the
 // terminal holds the keyboard, which culls global routes, the ones it
@@ -16677,6 +16678,19 @@ static void menukeys(Gui *g)
     }
     if (ImGui::Shortcut(ctrl|ImGuiKey_Comma, glob)) {
         opensettings(g);
+    }
+    // Help: F1, and on macOS Cmd+?, by the character typed, as macOS
+    // apps open theirs. Not from the terminal, whose F1 is its program's.
+    b32 help = ImGui::Shortcut(ImGuiKey_F1, glob);
+    for (iz i = 0; g->mac && i < countof(zoomkeys); i++) {
+        ImGuiKey k = zoomkeys[i];
+        if (os_guikeycp(g->os, k, 1)=='?' && ImGui::Shortcut(ctrl|ImGuiMod_Shift|k, glob)) {
+            help = 1;
+        }
+    }
+    if (help) {
+        navjump(g);
+        setpane(g, PANE_HELP, 1);
     }
     // Open file, never over another dialog; unavailable, saying why
     if (ImGui::Shortcut(ctrl|ImGuiKey_O, glob) && !ImGui::GetTopMostPopupModal()) {
@@ -17551,7 +17565,7 @@ static void drawmenubar(Gui *g)
     menu = ImGui::BeginMenu("Help");
     itemnamed(g, "menu Help");
     if (menu) {
-        b32 help = ImGui::MenuItem("Help");
+        b32 help = ImGui::MenuItem("Help", g->mac ? "Cmd+?" : "F1");
         itemnamed(g, "open Help");
         if (help) {
             navjump(g);

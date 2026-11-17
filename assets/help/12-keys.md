@@ -31,6 +31,8 @@ there too.
 - <kbd>Ctrl+F</kbd>: find in the transcript. In Help or Settings, while it has
   the focus, its search field instead, and in the Files pane its own
   find bar, over the file shown.
+- <kbd>F1</kbd>: Help, these pages; on macOS, <kbd>Cmd+?</kbd>. While
+  the Terminal has the keyboard, F1 is its program's.
 - <kbd>Ctrl+,</kbd>: the Settings pane, its search field taking the keyboard.
   On macOS, the Prospero menu's Settings... does the same.
 - <kbd>Alt+Up</kbd>: from a subagent or side chat, up to the session it

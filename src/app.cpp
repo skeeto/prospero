@@ -17503,6 +17503,10 @@ static DriveOp m3ops[] = {
     {OP_WAIT, W_EDITED, 0, 0, 10000, ""},
     {OP_WAIT, W_CONFIG, 0, 0, 5000, ""},
     {OP_CHECK, CHK_CFGEDITED, 0, 0, 0, "edited-by-hand"},
+    // F1 opens Help, its pane taking the focus (#67)
+    {OP_KEYDOWN, 0, GKEY_F1, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_F1, 0, 500, ""},
+    {OP_CHECK, CHK_PANEFOCUS, 0, 0, 0, "Help"},
     // Help, from its menu, floated wide: each topic in the list beside
     // the page shows its page from the top, which, selected whole from
     // its context menu, is copied as its text. Narrow, the topics are a

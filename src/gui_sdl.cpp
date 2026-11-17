@@ -2454,6 +2454,7 @@ static void os_guiinject(Os *os, GuiEvent *ge)
             {SDLK_LEFTBRACKET,  SDL_SCANCODE_LEFTBRACKET},
             {SDLK_RIGHTBRACKET, SDL_SCANCODE_RIGHTBRACKET},
             {SDLK_L,      SDL_SCANCODE_L},
+            {SDLK_F1,     SDL_SCANCODE_F1},
         };
         e.type         = ge->down ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
         e.key.windowID = id;

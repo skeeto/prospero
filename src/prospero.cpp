@@ -718,6 +718,7 @@ enum {
     GKEY_LBRACKET,
     GKEY_RBRACKET,
     GKEY_L,
+    GKEY_F1,     // Help
 };
 struct GuiEvent {
     i32 kind;
