@@ -614,6 +614,8 @@ static void test_termsecret(Test *t)
             "side - root 0 /p",
             "sidekid side - 0 /p",
             "wtside - root 1 /w",
+            "wtkid root - 1 /x",
+            "wtgrandkid wtkid - 0 /x",
             "away - root 0 /q",
             "orphan gone - 0 /p",
             "loop loop - 0 /p",
@@ -625,6 +627,10 @@ static void test_termsecret(Test *t)
         expect(t, "termrootwalk side", termrootwalk(&s, "sidekid", termlookrows, rows), "root");
         expect(t, "termrootwalk worktree", termrootwalk(&s, "wtside", termlookrows, rows),
                "wtside");
+        expect(t, "termrootwalk worktree kid", termrootwalk(&s, "wtkid", termlookrows, rows),
+               "wtkid");
+        expect(t, "termrootwalk below it", termrootwalk(&s, "wtgrandkid", termlookrows, rows),
+               "wtkid");
         expect(t, "termrootwalk folder", termrootwalk(&s, "away", termlookrows, rows), "away");
         expect(t, "termrootwalk orphan", termrootwalk(&s, "orphan", termlookrows, rows),
                "orphan");

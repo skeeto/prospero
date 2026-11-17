@@ -431,10 +431,11 @@ static Str termcwd(GuiSession *s)
 
 // The top of a session's parents on its own host: a subagent elsewhere,
 // on a remote or in a container of its own, has its own tabs there, as
-// Open in terminal opens its shell there.
+// Open in terminal opens its shell there. So does one in a worktree of
+// its own, in its worktree, where its commits go.
 static GuiSession *termtop(Gui *g, GuiSession *s)
 {
-    for (i32 n = 0; n < 16; n++) {
+    for (i32 n = 0; n < 16 && !s->wtname.len; n++) {
         GuiSession *up = sessup(g, s);
         if (!up || up==s || up->host!=s->host) {
             break;

@@ -1132,12 +1132,14 @@ typedef TermNode TermLook(void *ctx, Arena *, Str sid);
 // The session whose terminals a session shares, as the frontend files
 // them (term.cpp's termroot): the top of its parents on this host, then
 // a side chat's original's, if in the same folder, and so on. A
-// worktree session, in a folder of its own, has its own.
+// worktree session, in a folder of its own, has its own, and so does a
+// subagent in a worktree of its own, for its subagents too.
 static Str termrootwalk(Arena *a, Str sid, TermLook *look, void *ctx)
 {
     for (i32 side = 0; side < 8; side++) {
         TermNode n = look(ctx, a, sid);
-        for (i32 up = 0; up<16 && n.found && n.parent.len && !(n.parent==sid); up++) {
+        for (i32 up = 0; up<16 && n.found && n.parent.len && !n.worktree &&
+                         !(n.parent==sid); up++) {
             TermNode p = look(ctx, a, n.parent);
             if (!p.found) {
                 break;
