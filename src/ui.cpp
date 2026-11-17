@@ -14055,10 +14055,11 @@ static Str cfgpagekey(Arena *a, Str kind, Str name)
 
 // One page in the list: selected on a click. In the combo its label is
 // whole, the popup as wide as it needs; in the list it is cut to fit,
-// whole in its tooltip then. Its rectangle goes to rect, if not null.
-// Its scratch is a, after what the caller keeps there (label).
+// whole in its tooltip then, after its icon if it has one, which is not
+// in its name. Its rectangle goes to rect, if not null. Its scratch is
+// a, after what the caller keeps there (label).
 static b32 cfgitem(Gui *g, Arena a, b32 combo, Str label, b32 selected, Str tip,
-                   u32 color, Rect *rect)
+                   u32 color, Rect *rect, Str icon = {})
 {
     b32 click = 0;
     if (color) {
@@ -14076,12 +14077,21 @@ static b32 cfgitem(Gui *g, Arena a, b32 combo, Str label, b32 selected, Str tip,
         f32         w   = ImGui::GetContentRegionAvail().x;
         char const *beg = label.cdata;
         char const *end = label.cdata + label.len;
-        b32         cut = ImGui::CalcTextSize(beg, end).x > w;
+        f32         iw  = 0;
+        if (icon.len) {
+            iw = ImGui::CalcTextSize(icon.cdata, icon.cdata+icon.len).x +
+                 ImGui::GetStyle().ItemInnerSpacing.x;
+        }
+        b32 cut = ImGui::CalcTextSize(beg, end).x > w - iw;
         click = ImGui::Selectable("##page", selected);
         axname(g, label);
         f32 h = ImGui::GetTextLineHeight();
-        ImGui::RenderTextEllipsis(ImGui::GetWindowDrawList(), p, v2(p.x+w, p.y+h), p.x+w,
-                                  beg, end, 0);
+        if (icon.len) {
+            ImGui::GetWindowDrawList()->AddText(p, ImGui::GetColorU32(ImGuiCol_Text),
+                                                icon.cdata, icon.cdata+icon.len);
+        }
+        ImGui::RenderTextEllipsis(ImGui::GetWindowDrawList(), v2(p.x+iw, p.y),
+                                  v2(p.x+w, p.y+h), p.x+w, beg, end, 0);
         if (cut || tip.len) {
             Str t = cut && tip.len ? concat(&a, concat(&a, label, "\n"), tip) :
                     cut ? label : tip;
@@ -14118,11 +14128,22 @@ static void cfgreveal(Gui *g, Str key, b32 sel)
     }
 }
 
-static void cfgheading(Gui *g, Arena a, b32 combo, Str label)
+// A heading of the list, which sets its pages apart from those above:
+// bold, in the pane's text, a rule under it, room above it but at the
+// top. Not dimmed, as a page that cannot be picked would be (#67).
+static void cfgheading(Gui *g, Arena a, b32 combo, Str label, b32 first = 0)
 {
-    ImGui::Spacing();
-    textfit(a, label, combo ? 1e6f : ImGui::GetContentRegionAvail().x,
-            ImGui::GetColorU32(ImGuiCol_TextDisabled));
+    if (!first) {
+        ImGui::Dummy(v2(0, 0.5f*ImGui::GetTextLineHeight()));
+    }
+    ImGui::PushFont(g->fonts.bold, 0);
+    textfit(a, label, combo ? 1e6f : ImGui::GetContentRegionAvail().x, g->pal->paneltext);
+    ImGui::PopFont();
+    ImVec2 p  = ImGui::GetCursorScreenPos();
+    f32    w  = ImGui::GetContentRegionAvail().x;
+    ImGui::GetWindowDrawList()->AddLine(v2(p.x, p.y), v2(p.x+w, p.y), g->pal->border,
+                                        g->scale);
+    ImGui::Dummy(v2(0, 2*g->scale));
 }
 
 // The list of pages, in the list beside the page or in the combo above
@@ -14132,7 +14153,7 @@ static void drawcfglist(Gui *g, b32 combo)
     Arena a     = g->frame;
     f32   sc    = g->scale;
     Json *kinds = jsonget(g->cfg, "kinds");
-    cfgheading(g, a, combo, "General");
+    cfgheading(g, a, combo, "General", 1);
     ImGui::Indent(8*sc);
     for (Json *k = kinds->child; k; k = k->next) {
         Str kind = jsonstr(jsonget(k, "kind"));
@@ -14222,8 +14243,10 @@ static void drawcfglist(Gui *g, b32 combo)
         print(&ab, "...");
         Rect at   = {};
         Str  what = finish(&ab);
+        // In the link's color, with a +, as what can be clicked: dimmed,
+        // it read as not to be (#67)
         b32  add  = cfgitem(g, a, combo, what, 0, jsonstr(jsonget(k, "desc")),
-                            ImGui::GetColorU32(ImGuiCol_TextDisabled), &at);
+                            g->pal->link, &at, ICON_ADD);
         if (group < 7) {
             g->rects[RECT_ADDOPEN+group] = at;
         }
@@ -14244,7 +14267,12 @@ static void drawcfglist(Gui *g, b32 combo)
         b32 bad = jsonstr(jsonget(d, "severity")) == "error";
         color = bad || color==g->pal->bad ? g->pal->bad : g->pal->amber;
     }
-    ImGui::Spacing();
+    // Apart from the last kind's pages, as a heading sets each kind's
+    ImGui::Dummy(v2(0, 0.5f*ImGui::GetTextLineHeight()));
+    ImVec2 rp = ImGui::GetCursorScreenPos();
+    ImGui::GetWindowDrawList()->AddLine(rp, v2(rp.x + ImGui::GetContentRegionAvail().x, rp.y),
+                                        g->pal->border, g->scale);
+    ImGui::Dummy(v2(0, 2*g->scale));
     Buf db(&a, 32);
     print(&db, "Diagnostics");
     if (jsonlen(diags)) {
