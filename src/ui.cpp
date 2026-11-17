@@ -598,7 +598,9 @@ static void themestyle(ImGuiStyle *st, Palette *p)
     c[ImGuiCol_SliderGrab]       = v(p->accent);
     c[ImGuiCol_SliderGrabActive] = v(p->accent);
     c[ImGuiCol_NavCursor]        = v(p->accent);
-    c[ImGuiCol_DockingPreview]   = v(p->accent, 0.70f);
+    // A drag's destinations, as faint as the stock style has them: its
+    // dark style's are 0.70 opaque, but its light style's only 0.31*0.70
+    c[ImGuiCol_DockingPreview]   = v(p->accent, p->dark ? 0.70f : 0.22f);
     c[ImGuiCol_SeparatorHovered] = v(p->accent, 0.78f);
     c[ImGuiCol_SeparatorActive]  = v(p->accent);
     c[ImGuiCol_ResizeGrip]       = v(p->accent, 0.20f);
