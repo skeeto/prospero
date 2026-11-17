@@ -1192,7 +1192,12 @@ static Str wttask(Engine *e, Arena *a, Arena scratch, Str cwd, Str desc,
     b32     win  = HOST_WINDOWS;
     Arena   keep = carve(&scratch, 1<<16);
     WtPlace p    = wtplace(e->os, &keep, scratch, cwd, win);
-    if (p.err.len) {
+    if (p.err.len && !p.h.repo) {
+        // Offered before there was one (wtoffer): say how to make it
+        return concat(a, p.err, ": git init and commit, then start it again");
+    } else if (p.err.len && !p.oid.len && p.base.len) {
+        return concat(a, p.err, ": commit, then start it again");
+    } else if (p.err.len) {
         return clone(a, p.err);
     }
     Str name = wtslug(&keep, desc, WT_NAMEMAX);
@@ -1220,12 +1225,16 @@ static Str wttask(Engine *e, Arena *a, Arena scratch, Str cwd, Str desc,
 
 // Whether task may start a subagent in a worktree from a folder: one in
 // a repository with a main checkout, not a submodule's or a bare
-// repository's worktree. What may change, as an operation under way or
-// an unborn HEAD, is checked when it is called (wttask).
+// repository's worktree, or in none yet, which a new project's first
+// turn may make before it starts subagents. What may change, as the
+// repository itself, an operation under way or an unborn HEAD, is
+// checked when it is called (wttask).
 static b32 wtoffer(Os *os, Arena scratch, Str cwd, b32 win)
 {
     GitHead h = githead(os, &scratch, cwd, {}, win);
-    if (!h.repo || h.reftable) {
+    if (!h.repo) {
+        return 1;
+    } else if (h.reftable) {
         return 0;
     }
     Str root = normpath(&scratch, h.root, ".", win);

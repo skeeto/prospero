@@ -1984,6 +1984,34 @@ def sc_task_worktree_refused(model, n, req):
     yield from wt_parent(model, n, req, [("Try it", "run true")])
 
 
+def sc_task_worktree_cwd(model, n, req):
+    # A task with a cwd here, as at a worktree made by hand: refused
+    said = said_last(req)
+    if req["messages"][-1].get("role") == "user" and said == "go":
+        yield from tool(model, n, "task", {"description": "Try it", "prompt": "run true",
+                                           "cwd": "/somewhere/.worktrees/a"})
+    elif req["messages"][-1].get("role") == "user" and said == "nest":
+        # Its own folder as cwd, beside worktree: forgiven
+        yield from tool(model, n, "task", {"description": "Here", "worktree": True,
+                                           "model": second(model),
+                                           "prompt": "run git rev-parse --abbrev-ref HEAD",
+                                           "cwd": "./"})
+    else:
+        yield from answer(model, "Parent heard: " + " / ".join(tool_results(req)))
+
+
+def sc_task_worktree_cwd_b(model, n, req):
+    yield from wt_child(model, n, req)
+
+
+def sc_task_worktree_new(model, n, req):
+    yield from wt_parent(model, n, req, [("Start it", "run git rev-parse --abbrev-ref HEAD")])
+
+
+def sc_task_worktree_new_b(model, n, req):
+    yield from wt_child(model, n, req)
+
+
 def sc_task_worktree_nested(model, n, req):
     yield from wt_parent(model, n, req, [("Outer work", "nest")])
 

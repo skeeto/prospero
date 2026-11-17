@@ -551,7 +551,8 @@ static Str taskdesc(Arena *a, ToolEnv *te)
               "search, to keep your context small; not for a step of one or "
               "two calls. Several calls in one response run at once. "
               "Subagents share your files");
-    print(&b, te->wt ? Str(", unless they work in worktrees") : Str{});
+    print(&b, te->wt ? Str(", unless given worktree true, which makes each its own "
+                           "git worktree and branch (Worktrees, below)") : Str{});
     print(&b, ": never give two of them, or one and yourself, the same files "
               "to change.");
     if (te->roles.len) {
@@ -586,9 +587,13 @@ static Str taskdesc(Arena *a, ToolEnv *te)
     if (te->wt) {
         print(&b, "\nWorktrees: with worktree true, the subagent works in a new "
                   "git worktree, on a branch of its own cut from your HEAD, so "
-                  "subagents in worktrees may change the same files. Commit "
-                  "before you start it: your uncommitted changes don't go with "
-                  "it. Its result names the branch and what is on it. Review it "
+                  "subagents in worktrees may change the same files. The "
+                  "worktree is made for it, in the same folder of its own "
+                  "tree, and removed once merged: make none yourself (no git "
+                  "worktree add), and don't point it at one. It needs a git "
+                  "repository with a commit (git init and commit first if "
+                  "there is none), and your uncommitted changes don't go with "
+                  "it, so commit before you start it. Its result names the branch and what is on it. Review it "
                   "with git log and git diff, then merge it into your branch "
                   "from your own checkout (git merge), resolving any conflict "
                   "there. Your file tools ask before touching its worktree, so "
@@ -814,7 +819,8 @@ static Str tooljson(Arena *a, ToolEnv *te)
                 {te->ctr ? Str("network") : Str{}, "boolean",
                  "With image: give the container network access", 0, {}},
                 {te->wt ? Str("worktree") : Str{}, "boolean",
-                 "Run it in a git worktree and branch of its own", 0, {}},
+                 "Run it in a new git worktree and branch of its own, made "
+                 "for it: make none yourself", 0, {}},
             },
         },
         {
@@ -1297,6 +1303,7 @@ struct Args {
     Str             copy;       // task with image: a folder copied to /work
     b32             network;    // task with image: network access
     b32             worktree;   // task: in a git worktree of its own
+    b32             cwdhere;    // task: a cwd for a subagent here (refused)
     i64             offset;     // 0 if absent
     i64             limit;      // 0 if absent
     i64             timeout;    // -1 if absent
@@ -2403,6 +2410,7 @@ static Args parseargs(Arena *a, i32 tool, Str raw, i32 edit)
         } else if (r.cwd.len && !r.host.len && !r.image.len) {
             issue(a, &r, "cwd", "only with host or image: here, a subagent works "
                                 "in your working directory");
+            r.cwdhere = 1;
         }
         if (r.copy.len && !r.image.len) {
             issue(a, &r, "copy", "only with image: here, a subagent shares your files");

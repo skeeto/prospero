@@ -18325,9 +18325,10 @@ def task_worktree_empty(t):
 
 @scenario(bound=60)
 def task_worktree_refused(t):
-    """task {worktree} starts nothing in plan mode, in a folder outside any
-    repository, or in a session of no folder, where it is not offered,
-    nor in a repository with no commits yet."""
+    """task {worktree} starts nothing in plan mode, nor in a session of no
+    folder, where it is not offered. In a folder outside any repository,
+    where it is offered since a first turn may make one, and in a
+    repository with no commits yet, it says how to go on."""
     env = gitrepo(t)
     plain = t.host.join(t.base, "plain")
     unborn = t.host.join(t.base, "unborn")
@@ -18350,18 +18351,82 @@ def task_worktree_refused(t):
         end = go()
         t.check(end["status"] == "error" and "plan mode only reads" in end["text"],
                 f"in plan mode: {end}")
-        for what, new in [("outside", {"cwd": plain}), ("no folder", {"nofolder": 1})]:
-            sid, go = refused(what, **new)
-            end = go()
-            tools = t.requests()[-2]["body"].get("tools", [])
-            t.check(end["status"] == "error" and "only in a git repository" in end["text"] and
-                    "worktree" not in json.dumps(tools), f"{what}: {end}")
+        sid, go = refused("no folder", nofolder=1)
+        end = go()
+        tools = t.requests()[-2]["body"].get("tools", [])
+        t.check(end["status"] == "error" and "only in a git repository" in end["text"] and
+                "worktree" not in json.dumps(tools), f"no folder: {end}")
+        sid, go = refused("outside", cwd=plain)
+        end = go()
+        tools = t.requests()[-2]["body"].get("tools", [])
+        t.check(end["status"] == "error" and
+                end["text"] == "No subagent was started: the folder is not in a git "
+                               "repository: git init and commit, then start it again" and
+                "worktree" in json.dumps(tools), f"outside: {end}")
         sid, go = refused("unborn", cwd=unborn)
         end = go()
         t.check(end["status"] == "error" and
-                end["text"] == "No subagent was started: the branch main has no commits yet",
+                end["text"] == "No subagent was started: the branch main has no commits "
+                               "yet: commit, then start it again",
                 f"unborn: {end}")
         t.check(not [e for e in h.all("session") if e.get("parent")], "nothing started")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=60)
+def task_worktree_cwd(t):
+    """task with a cwd but no host or image, as a model that made its own
+    worktree gives it: refused, the refusal saying worktree true does it
+    where worktree is offered, and not in a session of no folder. A cwd
+    naming the session's own folder is forgiven: it starts."""
+    env = gitrepo(t)
+    h = t.headless(env=wtkeep(env))
+    try:
+        for what, new, hint in [("repo", {"cwd": t.work}, True),
+                                ("no folder", {"nofolder": 1}, False)]:
+            sid = h.call("new", model=t.model, endpoint="fake", attended=1, **new)["sid"]
+            wtturn(t, h, sid, "go")
+            ends = h.all("tool.end", sid)
+            text = ends[-1]["text"] if ends else ""
+            t.check(ends and ends[-1]["status"] == "error" and
+                    "- cwd: only with host or image" in text, f"{what}: refused: {ends}")
+            t.check(("drop cwd and give worktree true" in text) == hint, f"{what}: hint: {text!r}")
+            if hint:
+                own = sid
+        t.check(not [e for e in h.all("session") if e.get("parent")], "nothing started")
+        wtturn(t, h, own, "nest", timeout=60)
+        end = h.all("tool.end", own)[-1]
+        body, line = wtreport(end["text"])
+        t.check(body == "Report: prospero/here", f"its own folder forgiven: {end['text']!r}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=90)
+def task_worktree_new(t):
+    """A session that starts in a folder outside any repository, as a new
+    project's does, is offered worktree; once it has made a repository
+    with a commit, a subagent starts in a worktree of it."""
+    env = gitrepo(t)
+    plain = t.host.join(t.base, "newproj")
+    t.host.mkdir(plain)
+    h = t.headless(env=wtkeep(env))
+    try:
+        own = h.call("new", cwd=plain, model=t.model, endpoint="fake", attended=1)["sid"]
+        wtturn(t, h, own, "run git init -q -b main && git commit -q --allow-empty -m init "
+                          "&& echo made")
+        wtturn(t, h, own, "go", timeout=60)
+        tools = t.requests()[0]["body"].get("tools", [])
+        t.check("worktree" in json.dumps(tools), "offered from the start")
+        kids = [e for e in h.all("session") if e.get("parent") == own]
+        t.check(len(kids) == 1, f"one subagent: {kids}")
+        end = h.all("tool.end", own)[-1]
+        body, line = wtreport(end["text"])
+        t.check(body == "Report: prospero/start-it" and line and
+                line["branch"] == "prospero/start-it", f"in a worktree: {end['text']!r}")
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")

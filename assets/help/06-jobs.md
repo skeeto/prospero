@@ -105,9 +105,9 @@ told.
 ### Subagents in worktrees
 
 Subagents share their parent's files, so two of them must not change
-the same ones. In a folder in a git repository, the agent may instead
-start a subagent in a [worktree](help:sessions#worktree-sessions) of
-its own: a new worktree in `.prospero/worktrees`, on a branch of its
+the same ones. The agent may instead start a subagent in a
+[worktree](help:sessions#worktree-sessions) of its own, which is made
+for it: a new worktree in `.prospero/worktrees`, on a branch of its
 own (`prospero/NAME`, named after its task) cut from its parent's
 HEAD. Several such subagents may change the same files, each on its
 branch, and the parent reviews and merges their work, as you would
@@ -135,9 +135,11 @@ worktree sessions'.
 - **Grants**: the parent's grants and denies in its checkout hold in
   the subagent's worktree, at the same places.
 
-It is not offered in plan mode, in a session of no folder, outside a
-git repository, or on another host. The subagent's terminal tabs are
-its own, in its worktree.
+It needs a git repository with a commit. A session in a folder that
+is not in a repository yet may make one first, as a new project's may,
+and then start such subagents. It is not offered in plan mode, in a
+session of no folder, or on another host. The subagent's terminal tabs
+are its own, in its worktree.
 
 ### Subagents on other hosts
 

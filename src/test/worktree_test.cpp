@@ -163,6 +163,12 @@ static void test_worktree(Test *t)
                "err: a rebase is under way in the folder");
         expect(t, "place none", wtplacestr(os, a, "/n"),
                "err: the folder is not in a git repository");
+        // Offered in a repository's main checkout, its worktree, and in
+        // no repository yet; not in a submodule
+        expect(t, "offer", istr(a, wtoffer(os, *a, "/r/src", 0)*1000 +
+                                   wtoffer(os, *a, "/w/sub", 0)*100 +
+                                   wtoffer(os, *a, "/n", 0)*10 +
+                                   wtoffer(os, *a, "/r/m", 0)), "1110");
 
         // A branch only packed, in a packed-refs larger than the arena
         // the place is made in, as a large repository's is

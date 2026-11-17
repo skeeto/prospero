@@ -249,6 +249,7 @@ static void test_tools(Test *t)
         expect(t, "task cwd without host", tf.issues.len ? tf.issues[0] : Str{},
                "cwd: only with host or image: here, a subagent works in your working "
                "directory");
+        expect(t, "task cwd here", istr(a, tf.cwdhere*10 + td.cwdhere), "10");
         Args tg = parseargs(a, TOOL_TASK, "{\"prompt\":\"p\",\"host\":\"\"}", EDIT_REPLACE);
         expect(t, "task empty host", istr(a, !tg.host.data && !tg.issues.len), "1");
         // image: not with host; copy and network only with it
@@ -970,8 +971,13 @@ static void test_tools(Test *t)
         expect(t, "task worktree param", jsonstr(jsonget(jsonget(wp, "worktree"), "type")),
                "boolean");
         expect(t, "task worktree described", istr(a, find(wd, "Subagents share your files, "
-               "unless they work in worktrees: never")>0 && find(wd, "\nWorktrees: with "
-               "worktree true,")>0), "1");
+               "unless given worktree true, which makes each its own git worktree and "
+               "branch (Worktrees, below): never")>0 && find(wd, "\nWorktrees: with "
+               "worktree true,")>0 && find(wd, "make none yourself (no git worktree "
+               "add)")>0 && find(wd, "git init and commit first")>0), "1");
+        expect(t, "task worktree param made", jsonstr(jsonget(jsonget(wp, "worktree"),
+               "description")), "Run it in a new git worktree and branch of its own, "
+               "made for it: make none yourself");
         te.wt = 0;
 
         // With shells to pick: the shell tool lists them, and takes one

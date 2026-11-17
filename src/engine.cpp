@@ -2598,6 +2598,7 @@ static b32  pausehold(Session *);
 static i32  get32(Str);
 static i64  get64(Str);
 static void starttasks(Session *, Arena);
+static Args taskargs(Session *, Arena *, Str);
 static b32  taskasks(Session *, Arena);
 static void taskanswered(Session *, b32, i32, Str, i64);
 static void taskcancel(Session *, Arena);
@@ -18488,7 +18489,7 @@ static void starttasks(Session *s, Arena scratch)
     Slice<WtName> recs = {};
     for (iz k = s->callidx; k < end; k++) {
         Arena a    = scratch;
-        Args  args = parseargs(&a, TOOL_TASK, s->calls[k].args, s->te.edit);
+        Args  args = taskargs(s, &a, s->calls[k].args);
         if (args.worktree && s->te.wt) {
             recs = wtrecords(e, &scratch);
             break;
@@ -18501,7 +18502,7 @@ static void starttasks(Session *s, Arena scratch)
         TaskRun t = {};
         t.call  = k;
         t.start = os_ticks(e->os);
-        Args     args = parseargs(&a, TOOL_TASK, s->calls[k].args, s->te.edit);
+        Args     args = taskargs(s, &a, s->calls[k].args);
         Session *c    = 0;
         b32      far  = 0;
         TaskAsk *asked = 0;
@@ -18510,6 +18511,13 @@ static void starttasks(Session *s, Arena scratch)
         }
         if (args.issues.len) {
             t.text = argserror(&s->perm, "task", s->calls[k].args, &args);
+            if (args.cwdhere && s->te.wt) {
+                // A worktree made by hand, most likely: say what does it
+                t.text = concat(&s->perm, t.text, "\nFor a subagent in a git "
+                                "worktree of its own, drop cwd and give worktree "
+                                "true: a new worktree and branch are made for it, "
+                                "so any you made yourself are not needed.");
+            }
         } else if (asked && !asked->allow) {
             t.text = asked->text;
         } else if (k-s->callidx >= TASK_BATCH) {
@@ -18556,6 +18564,33 @@ static b32 taskneedsask(Session *s, Arena scratch, Args *args)
     return !ok;
 }
 
+// A task call's arguments. A cwd without host or image that names the
+// session's own folder asks for what a subagent here gets anyway, so it
+// is forgiven, not refused.
+static Args taskargs(Session *s, Arena *a, Str raw)
+{
+    Args r = parseargs(a, TOOL_TASK, raw, s->te.edit);
+    if (!r.cwdhere) {
+        return r;
+    }
+    b32 win  = HOST_WINDOWS;
+    Str to   = normpath(a, s->cwd, r.cwd, win);
+    Str here = normpath(a, s->cwd, ".", win);
+    if (win ? !equalfold(to, here) : to!=here) {
+        return r;
+    }
+    Slice<Str> rest = {};
+    for (iz i = 0; i < r.issues.len; i++) {
+        if (!startswith(r.issues[i], "cwd: ")) {
+            rest = push(a, rest, r.issues[i]);
+        }
+    }
+    r.issues  = rest;
+    r.cwd     = {};
+    r.cwdhere = 0;
+    return r;
+}
+
 // Before the task calls from the current one on start: ask the user
 // about the first whose container needs it and has no answer yet.
 // Returns whether every one is answered, so that they may start.
@@ -18565,7 +18600,7 @@ static b32 taskasks(Session *s, Arena scratch)
     for (iz k = s->callidx; k<s->calls.len && s->calls[k].name=="task"; k++) {
         Arena  a    = scratch;
         Block *c    = &s->calls[k];
-        Args   args = parseargs(&a, TOOL_TASK, c->args, s->te.edit);
+        Args   args = taskargs(s, &a, c->args);
         b32    seen = 0;
         for (iz i = 0; i < s->taskasks.len; i++) {
             seen |= s->taskasks[i].call == c->id;
