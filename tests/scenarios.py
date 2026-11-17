@@ -18172,12 +18172,16 @@ def task_worktree_two(t):
         t.check(t.file("README") == "hello\n" and gitrun(t, env, "status", "--porcelain") == "",
                 "the main checkout untouched")
 
-        wtturn(t, h, own, "run git merge -q --ff-only prospero/edit-the-file && sleep 0.5 && "
-                          f"test -d {one} && echo still")
-        t.check("still" in h.all("tool.end", own)[-1]["text"],
-                f"there in the turn that merged it: {h.all('tool.end', own)[-1]}")
+        if os.name == "nt":
+            end = wtturn(t, h, own, "run git merge -q --ff-only prospero/edit-the-file")
+        else:
+            end = wtturn(t, h, own, "run git merge -q --ff-only prospero/edit-the-file && "
+                                    f"sleep 0.5 && test -d {one} && echo still")
+            t.check("still" in h.all("tool.end", own)[-1]["text"],
+                    f"there in the turn that merged it: {h.all('tool.end', own)[-1]}")
         gone = h.wait(lambda e: e.get("ev") == "worktree" and e.get("path") == one and
                       e.get("did") != "made", 30)
+        t.check(gone["ts"] >= end["ts"], f"after that turn: {gone} {end}")
         t.check(gone.get("did") == "removed" and gone.get("branch") == "deleted",
                 f"removed after it: {gone}")
         t.check(t.file("README") == "A\n", "merged")
@@ -18422,9 +18426,10 @@ def task_worktree_grants(t):
         t.check(kids, f"started: {h.all('tool.end', own)}")
         kid = kids[0]["sid"]
         grants = h.call("grants", sid=kid)
-        t.check(os.path.join(tree, "other") in json.dumps(grants) and
-                sorted(grants.get("denies", [])) == sorted([os.path.join(main, "secret"),
-                                                            os.path.join(tree, "secret")]),
+        norm = lambda p: os.path.normcase(os.path.normpath(p))
+        t.check(norm(os.path.join(tree, "other")) in [norm(g["path"]) for g in grants["grants"]] and
+                sorted(map(norm, grants.get("denies", []))) ==
+                sorted([norm(os.path.join(main, "secret")), norm(os.path.join(tree, "secret"))]),
                 f"its grants and denies: {grants}")
         t.check(not h.all("ask", kid) and os.path.exists(os.path.join(tree, "other", "new.txt")),
                 f"no ask in its worktree's copy: {h.all('ask', kid)}")
@@ -18445,8 +18450,8 @@ def task_worktree_grants(t):
         # A revoke in the parent's pane reaches it, in its worktree
         h.call("grant", sid=own, path=other, access="none")
         grants = h.call("grants", sid=kid)
-        t.check(os.path.join(tree, "other") not in json.dumps(grants.get("grants", grants)),
-                f"revoked: {grants}")
+        t.check(norm(os.path.join(tree, "other")) not in
+                [norm(g["path"]) for g in grants.get("grants", [])], f"revoked: {grants}")
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")
