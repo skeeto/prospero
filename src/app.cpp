@@ -13444,9 +13444,12 @@ static void sizekeep(Gui *g, GuiSession *gs, f32 charw, f32 lineh)
 static void fontsize(Gui *g)
 {
     // Only for a new size: fonts merely added (addsysfonts) leave the
-    // place be, and are not to be measured until a frame begins.
+    // place be, and are not to be measured until a frame begins. Nor is
+    // the first size, as the window opens (gui_scale): no frame has
+    // begun (fonts.gen), so stylebaked's slots hold nothing yet, and no
+    // transcript has been drawn to keep a place in (#74).
     f32 was = g->fonts.size;
-    if (was>0 && was!=g->fontbase*g->zoom*g->scale) {
+    if (was>0 && g->fonts.gen && was!=g->fontbase*g->zoom*g->scale) {
         FontMetrics fm    = fontmetrics(&g->fonts, 0);
         f32         charw = fontadvance(&g->fonts, 0, 'n');
         for (GuiSession *s = g->sessions; s; s = s->next) {

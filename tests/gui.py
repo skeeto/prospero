@@ -1173,6 +1173,10 @@ def barelaunch(host):
         host.mkdir(d)
     shutil.copy2(host.prospero, exe)
     shutil.copy(host.path("prospero.ini"), os.path.join(xdg, "config", "prospero"))
+    # A text size other than the default's, as at another display scale:
+    # the window opens at it, before any frame (#74)
+    with open(os.path.join(xdg, "config", "prospero", "prospero.ini"), "a") as f:
+        f.write("\n[ui]\nfont_size = 19\n")
     env = dict(os.environ, XDG_CONFIG_HOME=os.path.join(xdg, "config"),
                XDG_STATE_HOME=os.path.join(xdg, "state"))
     master, slave = os.openpty()
