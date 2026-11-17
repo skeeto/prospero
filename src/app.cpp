@@ -15556,7 +15556,7 @@ static Str chknames[] = {
     "the session's title is as renamed",
     "the text went out as a message, not a command",
     "/model lists the configured models",
-    "/compact compacted the conversation, its focus on the card",
+    "/compact compacted the conversation, its focus and rebuilt prompt on the card",
     "word wrap breaks only at the blank",
     "a subagent whose parent is gone is a root, to trash",
     "the sidebar shows it",
@@ -27209,7 +27209,8 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_MODELS:
         return g->modelsshown;
     case CHK_COMPACTED: {
-        // The card, and the focus asked for on it, in full in its body
+        // The card, and the focus asked for on it, in full in its body,
+        // saying the summary rebuilt the system prompt (#57)
         Arena    a     = g->frame;
         ViewMsg *m     = lastof(v, VIEW_COMPACT);
         Str      focus = g->ops[g->drivepc-1].text;
@@ -27217,6 +27218,10 @@ static b32 drivecheck(Gui *g, i32 chk)
                                 startswith(m->text, concat(&a, "**Focus:** ", focus))));
         if (m && !ok) {
             guilog(g, concat(&a, "drive: the compaction card's focus: ", m->card->focus));
+        }
+        if (m && m->card->kind=="summary" && !m->card->rebuilt) {
+            guilog(g, "drive: the compaction card says no prompt rebuilt");
+            ok = 0;
         }
         return ok;
     }

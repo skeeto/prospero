@@ -8546,6 +8546,8 @@ def compact_manual(t):
         t.check(len(cps) == 1 and cps[0]["kind"] == "summary" and cps[0]["why"] == "manual"
                 and cps[0].get("focus") == "the numbers in f3.txt" and
                 cps[0]["after"] < cps[0]["before"], f"compacted {cps}")
+        t.check(cps[0].get("rebuilt") == 1 and cps[0].get("changed") == [],
+                f"its card: the prompt rebuilt, nothing new {cps}")
         sreq = t.compactions()
         t.check(len(sreq) == 1, f"one summary {len(sreq)}")
         user = sreq[0]["body"]["messages"][1]["content"]
@@ -8669,6 +8671,10 @@ def compact_heed(t):
     again = told(chat(t.requests()[-1]))
     t.check(len(t.requests()) > n and again == notes, f"told again: {again}")
     t.check(chat(t.requests()[-1])[0]["content"] == rebuilt, "the same prompt, byte for byte")
+    # Its cards: what each rebuilt prompt had new
+    cards = [(x.get("rebuilt"), x.get("changed")) for x in logged(t, sid)
+             if x.get("ev") == "compact" and x.get("kind") == "summary"]
+    t.check(cards == [(1, ["instructions", "memory"]), (1, [])], f"the cards: {cards}")
 
 
 @scenario(conf=BIG, bound=40, alone=True)

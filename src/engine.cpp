@@ -15629,7 +15629,16 @@ static void sendcompact(Session *s, Arena scratch)
     setstate(s, S_HEAD);
 }
 
-static void reprefix(Session *, Arena);
+// What a summary's rebuilt prefix has new (reprefix)
+enum {
+    PREFIX_REBUILT = 1<<0,
+    PREFIX_INSTR   = 1<<1,
+    PREFIX_MEMORY  = 1<<2,
+    PREFIX_SKILLS  = 1<<3,
+    PREFIX_TOOLS   = 1<<4,
+};
+
+static i32 reprefix(Session *, Arena);
 
 // The summary arrived: rebuild the history around it, log it, and carry
 // on with the step, unless the prompt is still above the goal after a
@@ -15714,7 +15723,7 @@ static void compacted(Session *s, Arena scratch, Partial *p)
         failcompact(s, scratch, CLASS_DETERMINISTIC, 0, why, -1);
         return;
     }
-    reprefix(s, scratch);
+    i32   pre = reprefix(s, scratch);
     Files f = summaryfiles(&scratch, s->summary);
     f = addfiles(&scratch, f, s->history, cp.start, cp.cut);
     Str summary = withfiles(&s->perm, text, f);
@@ -15732,6 +15741,24 @@ static void compacted(Session *s, Arena scratch, Partial *p)
     putintkey(&w.json, "ms", (os_ticks(e->os) - cp.began)/MS);
     if (cp.focus.len) {
         putstrkey(&w.json, "focus", cp.focus);
+    }
+    if (pre) {
+        // The system prompt rebuilt, and what it has new, for its card
+        struct { i32 bit; Str name; } parts[] = {
+            {PREFIX_INSTR,  "instructions"},
+            {PREFIX_MEMORY, "memory"},
+            {PREFIX_SKILLS, "skills"},
+            {PREFIX_TOOLS,  "tools"},
+        };
+        putintkey(&w.json, "rebuilt", 1);
+        putkey(&w.json, "changed");
+        putarray(&w.json);
+        for (iz i = 0; i < countof(parts); i++) {
+            if (pre & parts[i].bit) {
+                putstr(&w.json, parts[i].name);
+            }
+        }
+        putend(&w.json);
     }
     ssend(s, &w);
     s->thinkfrom = s->log.seq;
@@ -17702,12 +17729,17 @@ static void logprefix(Session *, Arena);
 // learns what it gained since it began. It keeps the shell commands run
 // in, and its MCP tools join it again before the next request (mcpgate),
 // as they do a new session's. Recorded before the summary, which takes
-// the prefix as told (shellheard).
-static void reprefix(Session *s, Arena scratch)
+// the prefix as told (shellheard). Returns what it did for the summary's
+// card (PREFIX_*): nothing, or rebuilt, and what came of it new.
+static i32 reprefix(Session *s, Arena scratch)
 {
     if (s->readonly || s->wtdefer || !s->system.data) {
-        return;
+        return 0;
     }
+    Str          instr  = s->instr;
+    Str          memsys = s->memsys;
+    Str          tools  = s->tools;
+    Slice<Skill> skills = s->skillsys;
     instrunstamp(s);
     s->instr = {};
     instrstart(s, scratch);
@@ -17743,6 +17775,18 @@ static void reprefix(Session *s, Arena scratch)
     s->mcpfixed = 0;
     s->mcpquiet = 1;
     logprefix(s, scratch);
+
+    i32 r = PREFIX_REBUILT;
+    r |= !(instr == s->instr)   ? PREFIX_INSTR  : 0;
+    r |= !(memsys == s->memsys) ? PREFIX_MEMORY : 0;
+    r |= !(tools == s->tools)   ? PREFIX_TOOLS  : 0;
+    b32 same = skills.len == s->skillsys.len;
+    for (iz i = 0; same && i < skills.len; i++) {
+        Skill *k = skillbyname(s->skillsys, skills[i].name);
+        same = k && k->desc==skills[i].desc;
+    }
+    r |= same ? 0 : PREFIX_SKILLS;
+    return r;
 }
 
 // The prefix's durable record, so that the session opened again, or

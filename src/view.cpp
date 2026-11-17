@@ -342,6 +342,8 @@ struct ViewCard {
     i64  after;
     Str  model;      // the summary's
     Str  focus;      // what a /compact asked it to keep, one line
+    b32  rebuilt;    // a summary's: the system prompt built again
+    Str  changed;    // and what it has new, "instructions, memory"
     i64  ms;
     i32  count;      // messages summarized, outputs elided, files rewound
     i32  conflicts;  // files a rewind left alone
@@ -3102,6 +3104,13 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
                 c->count += talk && m->seq>=v->cutseq && m->seq<cut && m->seq;
             }
             v->cutseq = cut>v->cutseq ? cut : v->cutseq;
+            c->rebuilt = jsonint(jsonget(j, "rebuilt"), 0) != 0;
+            Buf cb(&v->aux, 64);
+            for (Json *x = jsonget(j, "changed")->child; x; x = x->next) {
+                print(&cb, cb.len ? Str(", ") : Str(""));
+                print(&cb, jsonstr(x));
+            }
+            c->changed = finish(&cb);
             text = jsonstr(jsonget(j, "summary"));
             // A /compact's focus heads the card and its body, so what was
             // asked stays visible beside what came of it

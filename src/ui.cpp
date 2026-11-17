@@ -1485,6 +1485,14 @@ static ImVec2 drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
                 print(&b, "\xe2\x80\x9d");
             }
         }
+        if (c->rebuilt) {
+            // Instructions, memory, skills and tools read again (#57)
+            print(&b, "; system prompt rebuilt");
+            if (c->changed.len) {
+                print(&b, ", new ");
+                print(&b, c->changed);
+            }
+        }
         pen(p, finish(&b), 0, dim);
     } break;
     case VIEW_REWIND: {

@@ -249,6 +249,15 @@ static void prettyrecord(Cli *c, Arena scratch, EvRec *r)
         if (jsonstr(jsonget(j, "why")) == "overflow") {
             print(&b, ", since the server found the prompt too long");
         }
+        if (jsonint(jsonget(j, "rebuilt"), 0)) {
+            print(&b, "; system prompt rebuilt");
+            Str sep = Str(", new ");
+            for (Json *x = jsonget(j, "changed")->child; x; x = x->next) {
+                print(&b, sep);
+                print(&b, jsonstr(x));
+                sep = Str(", ");
+            }
+        }
         print(&b, "]\n");
     } break;
     case EV_NUDGE:
