@@ -269,6 +269,18 @@ static void test_tools(Test *t)
                             EDIT_REPLACE);
         expect(t, "task network without image", tk.issues.len ? tk.issues[0] : Str{},
                "network: only with image");
+        // worktree: here only
+        Args tw = parseargs(a, TOOL_TASK, "{\"prompt\":\"p\",\"worktree\":true}",
+                            EDIT_REPLACE);
+        expect(t, "task worktree", istr(a, tw.worktree*10 + tw.issues.len), "10");
+        Args tx = parseargs(a, TOOL_TASK, "{\"prompt\":\"p\",\"worktree\":true,"
+                            "\"host\":\"deb\"}", EDIT_REPLACE);
+        expect(t, "task worktree and host", tx.issues.len ? tx.issues[0] : Str{},
+               "worktree: not with host or image: a worktree is for a subagent here");
+        Args ty = parseargs(a, TOOL_TASK, "{\"prompt\":\"p\",\"worktree\":true,"
+                            "\"image\":\"debian:12\"}", EDIT_REPLACE);
+        expect(t, "task worktree and image", ty.issues.len ? ty.issues[0] : Str{},
+               "worktree: not with host or image: a worktree is for a subagent here");
 
         // send_message: a target and some text, at most 16 KiB of it
         Args ma = parseargs(a, TOOL_MESSAGE, "{\"to\":\" k1 \",\"text\":\"hi\"}", EDIT_REPLACE);
@@ -946,6 +958,21 @@ static void test_tools(Test *t)
                "own settings and permissions, in cwd, and only its report comes back; "
                "role and model are that host's.\n- deb: Linux (WSL) on this machine")), "1");
         te.hosts = {};
+
+        // In a git repository: worktree offered, and told of; else not
+        expect(t, "task no worktree", istr(a, jsonget(props, "worktree")->type==JSON_MISSING &&
+               find(jsonstr(jsonget(task, "description")), "worktree")<0), "1");
+        te.wt = 1;
+        JsonDoc w  = jsonparse(a, tooljson(a, &te));
+        Json   *wt = jsonget(jsonat(w.root, 2), "function");
+        Json   *wp = jsonget(jsonget(wt, "parameters"), "properties");
+        Str     wd = jsonstr(jsonget(wt, "description"));
+        expect(t, "task worktree param", jsonstr(jsonget(jsonget(wp, "worktree"), "type")),
+               "boolean");
+        expect(t, "task worktree described", istr(a, find(wd, "Subagents share your files, "
+               "unless they work in worktrees: never")>0 && find(wd, "\nWorktrees: with "
+               "worktree true,")>0), "1");
+        te.wt = 0;
 
         // With shells to pick: the shell tool lists them, and takes one
         // last, by its enum; else, no shell parameter

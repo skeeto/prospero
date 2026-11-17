@@ -180,6 +180,7 @@ struct ToolEnv {
     Str hosts;       // the other hosts task may run on, a line for each
     b32 ctr;         // task may start one in a container of an image
     Str ctrimages;   // [container] images, which it may use unasked
+    b32 wt;          // task may start one in a git worktree of its own
     i32 edit;        // EDIT_*: the edit tool's format (edit.cpp)
     i32 coords;      // COORDS_*: how the desktop tool takes points
     b32 vision;      // the model takes images, which read then shows
@@ -543,14 +544,16 @@ static Str deskdesc(Arena *a, ToolEnv *te)
 
 static Str taskdesc(Arena *a, ToolEnv *te)
 {
-    Buf b(a, 1024 + te->roles.len);
+    Buf b(a, 2048 + te->roles.len);
     print(&b, "Start a subagent, an agent with a fresh context that does a "
               "task alone; its report is this call's result. Use it for a "
               "part of a large task that stands on its own, or a broad "
               "search, to keep your context small; not for a step of one or "
               "two calls. Several calls in one response run at once. "
-              "Subagents share your files: never give two of them, or one "
-              "and yourself, the same files to change.");
+              "Subagents share your files");
+    print(&b, te->wt ? Str(", unless they work in worktrees") : Str{});
+    print(&b, ": never give two of them, or one and yourself, the same files "
+              "to change.");
     if (te->roles.len) {
         print(&b, " Roles:");
         print(&b, te->roles);
@@ -579,6 +582,21 @@ static Str taskdesc(Arena *a, ToolEnv *te)
         } else {
             print(&b, " Each image, and network, asks the user.");
         }
+    }
+    if (te->wt) {
+        print(&b, "\nWorktrees: with worktree true, the subagent works in a new "
+                  "git worktree, on a branch of its own cut from your HEAD, so "
+                  "subagents in worktrees may change the same files. Commit "
+                  "before you start it: your uncommitted changes don't go with "
+                  "it. Its result names the branch and what is on it. Review it "
+                  "with git log and git diff, then merge it into your branch "
+                  "from your own checkout (git merge), resolving any conflict "
+                  "there. Your file tools ask before touching its worktree, so "
+                  "to have it rebased or changed further, send the subagent a "
+                  "message; building and testing there with the shell is fine. "
+                  "After a turn of yours in which the branch got merged, the "
+                  "worktree and the branch are removed: leave them. Only a "
+                  "merge counts, not a squash or a cherry-pick.");
     }
     return finish(&b);
 }
@@ -795,6 +813,8 @@ static Str tooljson(Arena *a, ToolEnv *te)
                  "With image: a folder here to copy into /work", 0, {}},
                 {te->ctr ? Str("network") : Str{}, "boolean",
                  "With image: give the container network access", 0, {}},
+                {te->wt ? Str("worktree") : Str{}, "boolean",
+                 "Run it in a git worktree and branch of its own", 0, {}},
             },
         },
         {
@@ -1276,6 +1296,7 @@ struct Args {
     Str             image;      // task: a container's image, null if none
     Str             copy;       // task with image: a folder copied to /work
     b32             network;    // task with image: network access
+    b32             worktree;   // task: in a git worktree of its own
     i64             offset;     // 0 if absent
     i64             limit;      // 0 if absent
     i64             timeout;    // -1 if absent
@@ -2372,6 +2393,11 @@ static Args parseargs(Arena *a, i32 tool, Str raw, i32 edit)
         r.image  = r.image.len ? r.image : Str{};
         r.copy   = r.copy.len ? r.copy : Str{};
         r.network = argbool(a, &r, j, "network");
+        r.worktree = argbool(a, &r, j, "worktree");
+        if (r.worktree && (r.host.len || r.image.len)) {
+            issue(a, &r, "worktree", "not with host or image: a worktree is for "
+                                     "a subagent here");
+        }
         if (r.image.len && r.host.len) {
             issue(a, &r, "image", "not with host: a container is a host of its own");
         } else if (r.cwd.len && !r.host.len && !r.image.len) {
