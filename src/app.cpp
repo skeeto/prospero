@@ -1052,6 +1052,7 @@ struct Perms {
     b32            search;   // web search, web fetch, and containers
     b32            fetch;
     b32            containers;
+    b32            webask;   // [web] ask, false letting both go unasked
     Slice<Str>     mcp;      // the session's MCP servers
     Slice<Str>     images;   // [container] images
     Arena          mem;
@@ -6798,6 +6799,7 @@ static void onperms(Gui *g, GuiSession *s, Json *j, b32 ok, Str err)
     p->desktop    = jsonflag(jsonget(o, "desktop"), 0);
     p->search     = jsonflag(jsonget(o, "search"), 0);
     p->fetch      = jsonflag(jsonget(o, "fetch"), 0);
+    p->webask     = jsonflag(jsonget(o, "webask"), 1);
     p->containers = jsonflag(jsonget(o, "containers"), 0);
     for (Json *k = jsonget(o, "mcp")->child; k; k = k->next) {
         p->mcp = push(m, p->mcp, clone(m, jsonstr(k)));

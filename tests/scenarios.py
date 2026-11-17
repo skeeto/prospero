@@ -14101,6 +14101,23 @@ FENCE = re.compile(r"--- begin web content ([a-z0-9]{8}) ---\n(.*)\n--- end web 
                    re.S)
 
 
+@scenario(bound=20)
+def perms_webask(t):
+    """The Permissions pane's offers say whether [web] ask lets searches
+    and page reads go unasked, which no grant shows (#68)."""
+    for ask, want in ((None, True), ("false", False)):
+        webconf(t, ask=ask)
+        h = t.headless(env=webenv(t))
+        try:
+            sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+            o = h.call("grants", sid=sid).get("offers", {})
+            t.check(o.get("search") and o.get("webask") is want,
+                    f"[web] ask {ask}: {o}")
+        finally:
+            rc = h.close()
+        t.check(rc == 0, f"headless exit {rc}")
+
+
 @scenario(bound=30)
 def web_flow(t):
     """Searches and pages with [web] ask off: a page's text without its

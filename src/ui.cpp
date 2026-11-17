@@ -13518,14 +13518,25 @@ static void drawperms(Gui *g)
 
     // The web: searches, and pages of each host
     ImGui::SeparatorText("Web");
-    PermRow *srch = permrow(p, "web", "search");
+    PermRow *srch  = permrow(p, "web", "search");
+    b32      unask = !p->webask && (p->search || p->fetch);
     if (p->search || srch) {
-        if (permcheck(g, "Searches", srch!=0, "perm web search")) {
+        ImGui::BeginDisabled(unask);
+        if (permcheck(g, "Searches", srch!=0 || unask, "perm web search")) {
             guigrantkind(g, s, "web", "search", {}, !srch);
         }
-        itemtip("Web searches without asking");
+        ImGui::EndDisabled();
+        itemtip("%s", unask ? "[web] ask = false in the configuration"
+                            : "Web searches without asking");
     } else {
         ImGui::TextDisabled("Web search is not set up.");
+    }
+    if (unask) {
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextDisabled("The configuration's [web] ask = false lets every "
+                            "search and page read go unasked.");
+        ImGui::PopTextWrapPos();
+        itemnamed(g, "perm web unasked");
     }
     for (iz i = 0; i < p->rows.len; i++) {
         PermRow *r = &p->rows[i];

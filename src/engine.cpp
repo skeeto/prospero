@@ -23007,6 +23007,8 @@ static void cmdgrants(Engine *e, Session *s, Arena scratch, i64 id)
     putbool(&w.json, !(s->te.deny & (u32)1<<TOOL_WEBSEARCH));
     putkey(&w.json, "fetch");
     putbool(&w.json, !(s->te.deny & (u32)1<<TOOL_WEBFETCH));
+    putkey(&w.json, "webask");  // false: [web] ask = false, nothing asks
+    putbool(&w.json, cfgbool(trim(cfgget(e->cfg, "web", "", "ask", 0))) != 0);
     putkey(&w.json, "containers");
     putbool(&w.json, !(s->te.deny & (u32)1<<TOOL_TASK) && farctrok(e, scratch));
     putkey(&w.json, "images");
