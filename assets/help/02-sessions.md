@@ -655,6 +655,10 @@ session, which can then review and merge its branch.
   be deleted before the worktree can be made there again. Unarchiving
   or restoring the session, or starting a turn in it, checks the branch
   out again at the same place.
+- **Subagents** may get worktrees of their own too, from the agent's
+  task tool (see [Subagents in worktrees](help:jobs#subagents-in-worktrees)).
+  Those go once their branches are merged, or at once if they committed
+  nothing, as well as with their session's archive.
 
 ## The Trash
 

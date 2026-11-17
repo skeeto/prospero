@@ -166,7 +166,11 @@ git worktree Prospero makes in `.prospero/worktrees`, on a branch of
 its own, and removes once its sessions are archived or in the Trash,
 if clean. One
 started from a session begins fresh, nested under it, and reports its
-branch back to it with `send_message` when asked. The prompt box keeps a draft
+branch back to it with `send_message` when asked. The agent may start
+a subagent in a worktree of its own too (task's `worktree`), which
+commits on its branch for the agent to merge; its worktree and branch
+go after the agent's turn that merged them, or as it reports if it
+committed nothing. The prompt box keeps a draft
 per session, with the engine, has the session's earlier prompts on Up
 and Down, opens the draft in an editor with Ctrl+G (`[ui] editor`,
 else `$VISUAL` or `$EDITOR`, one with a window of its own: a terminal

@@ -78,7 +78,9 @@ as far as the session offers them.
 
 Changes reach the session and its subagents open in this window or
 process. One not open keeps what it had until you change it in its
-own pane.
+own pane. A subagent in a worktree of its own gets a grant or deny in
+its parent's checkout at the same place in its worktree, and a deny
+holds in both.
 
 ## Attended and unattended
 

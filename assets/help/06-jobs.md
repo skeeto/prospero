@@ -102,6 +102,43 @@ it does jobs: stop it from its own session. Quitting or restarting
 Prospero stops it as it stops any turn, and then its parent is not
 told.
 
+### Subagents in worktrees
+
+Subagents share their parent's files, so two of them must not change
+the same ones. In a folder in a git repository, the agent may instead
+start a subagent in a [worktree](help:sessions#worktree-sessions) of
+its own: a new worktree in `.prospero/worktrees`, on a branch of its
+own (`prospero/NAME`, named after its task) cut from its parent's
+HEAD. Several such subagents may change the same files, each on its
+branch, and the parent reviews and merges their work, as you would
+worktree sessions'.
+
+- **Its work**: the subagent is told to commit on its branch before it
+  reports, and its parent's uncommitted changes do not go with it.
+  After its report, the parent is told what git found there: the
+  worktree, the branch, its commits, and any files left uncommitted.
+- **Merging**: the parent merges the branch into its own from its own
+  checkout (`git merge`). Its file tools ask before they change the
+  subagent's worktree; it may build and test there with the shell, or
+  send the subagent a message to have it change or rebase its branch.
+- **Removal**: a subagent that committed nothing has its worktree and
+  branch removed once it reports. Otherwise they stay until a turn of
+  the parent's in which the branch got merged, and go when that turn
+  ends. Only a merge counts, not a squash or a cherry-pick: such a
+  branch stays until its session is archived or moved to the Trash,
+  which removes a clean worktree as for any worktree session, and
+  keeps a branch not merged. A worktree with uncommitted changes is
+  kept.
+- **Working again**: a message to a subagent whose worktree was removed
+  makes it again, from its branch, for that turn. Opening it only to
+  read does not.
+- **Grants**: the parent's grants and denies in its checkout hold in
+  the subagent's worktree, at the same places.
+
+It is not offered in plan mode, in a session of no folder, outside a
+git repository, or on another host. The subagent's terminal tabs are
+its own, in its worktree.
+
 ### Subagents on other hosts
 
 A task may run on one of your [remote hosts](help:hosts) instead: the
