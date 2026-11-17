@@ -201,6 +201,47 @@ static void test_termrunto(Test *t)
         expect(t, "pick.empty", istr(&a, termsetpick(&e, sts, TERMK_SH, 5000*ms)), "-1");
     }
 
+    // Folders: the same one, a trailing separator aside, on Windows of
+    // any case and either slash
+    expect(t, "samedir.same", istr(&a, termsamedir("/a/b", "/a/b", 0)), "1");
+    expect(t, "samedir.slash", istr(&a, termsamedir("/a/b/", "/a/b", 0)), "1");
+    expect(t, "samedir.root", istr(&a, termsamedir("/", "/", 0)), "1");
+    expect(t, "samedir.prefix", istr(&a, termsamedir("/a/bc", "/a/b", 0)), "0");
+    expect(t, "samedir.case", istr(&a, termsamedir("/a/B", "/a/b", 0)), "0");
+    expect(t, "samedir.back", istr(&a, termsamedir("/a\\b", "/a/b", 0)), "0");
+    expect(t, "samedir.win", istr(&a, termsamedir("C:/Users/X", "c:\\users\\x\\", 1)), "1");
+    expect(t, "samedir.win.drive", istr(&a, termsamedir("C:/", "c:\\", 1)), "1");
+    expect(t, "samedir.win.other", istr(&a, termsamedir("C:/a", "D:\\a", 1)), "0");
+
+    // Picking by folder: a tab known to be elsewhere is passed over, one
+    // whose folder is not known is not, unless any; no folder, any tab
+    {
+        TermSet   s = {};
+        TermState sts[3];
+        for (i32 i = 0; i < 3; i++) {
+            termsetadd(&s, (TermTab *)(uz)(i + 1));
+            sts[i] = sh;
+            sts[i].hooked = sts[i].marked = sts[i].prompted = 1;
+        }
+        termsetshow(&s, 2);
+        sts[0].dir = "/w";
+        sts[1].dir = "/w/sub";
+        sts[2].dir = "/w/sub";
+        expect(t, "pickdir.match", istr(&a, termsetpick(&s, sts, TERMK_SH, 5000*ms, "/w/", 0, 0)),
+               "0");
+        expect(t, "pickdir.front", istr(&a, termsetpick(&s, sts, TERMK_SH, 5000*ms, "/w/sub", 0, 0)),
+               "2");
+        expect(t, "pickdir.none", istr(&a, termsetpick(&s, sts, TERMK_SH, 5000*ms, "/x", 0, 0)),
+               "-1");
+        expect(t, "pickdir.any", istr(&a, termsetpick(&s, sts, TERMK_SH, 5000*ms, "/x", 0, 1)),
+               "2");
+        expect(t, "pickdir.nodir", istr(&a, termsetpick(&s, sts, TERMK_SH, 5000*ms, {}, 0, 0)),
+               "2");
+        sts[1].dir = {};
+        expect(t, "pickdir.unknown", istr(&a, termsetpick(&s, sts, TERMK_SH, 5000*ms, "/x", 0, 0)),
+               "1");
+    }
+
     // A Run's hold on its tab
     {
         TermState r = sh;

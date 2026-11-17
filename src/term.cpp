@@ -628,6 +628,7 @@ static TermState termstate(TermTab *tt)
     st.runkey   = tt->runkey;
     st.sentat   = tt->sentat;
     st.doneat   = tt->doneat;
+    st.dir      = tt->cmds ? Str{tt->cmds->cwd, tt->cmds->cwdlen} : Str{};
     return st;
 }
 
@@ -998,7 +999,9 @@ struct TermRoute {
 // Where Run in Terminal takes a code block of kind (RUN_*), by key,
 // from session from: to the tab that has its Run still, shown; else
 // typed into an available tab of its shell's family in from's root
-// (termsetpick: the front one, else the right-most); else a new tab.
+// (termsetpick: the front one, else the right-most) whose shell is in
+// the root's folder, or says no folder; else a new tab there; else, with
+// no room for one, an available tab in another folder.
 static TermRoute termroute(Gui *g, GuiSession *from, i32 kind, u64 key)
 {
     TermRoute r   = {};
@@ -1030,14 +1033,16 @@ static TermRoute termroute(Gui *g, GuiSession *from, i32 kind, u64 key)
             return r;
         }
     }
-    i32 i = termsetpick(set, sts, kind, now);
+    Str dir = termrunfolder(g, from);
+    b32 win = hostwin(s->host);
+    i32 i   = termsetpick(set, sts, kind, now, dir, win, 0);
+    why = i<0 ? termfull(g, s) : Str{};
+    i   = why.len ? termsetpick(set, sts, kind, now) : i;
     if (i >= 0) {
         r.how = TROUTE_SEND;
         r.tt  = set->tabs[i];
         return r;
-    }
-    why = termfull(g, s);
-    if (why.len) {
+    } else if (why.len) {
         r.why = why;
         return r;
     }
@@ -1081,9 +1086,15 @@ static Str termruntip(Gui *g, Arena *a, GuiSession *from, i32 kind, Str lang, u6
         print(&b, " (");
         print(&b, label);
         print(&b, r.how==TROUTE_SEND || r.held==TERMHELD_RAN ? Str(")") : Str("): show it"));
+        TermState st  = termstate(r.tt);
+        b32       win = hostwin(termroot(g, from)->host);
+        if (r.how==TROUTE_SEND && !termindir(&st, termrunfolder(g, from), win)) {
+            print(&b, ", in ");
+            print(&b, st.dir);
+            print(&b, ", not the session's folder");
+        }
         print(&b, ".");
         if (r.how == TROUTE_SEND) {
-            TermState st = termstate(r.tt);
             if (termhooked(&st, os_ticks(g->os))) {
                 print(&b, " The agent hears how it ended at its next request.");
             }

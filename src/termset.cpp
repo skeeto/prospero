@@ -158,7 +158,37 @@ struct TermState {
     u64 runkey;    // the last Run typed into it, else 0
     i64 sentat;
     i64 doneat;    // its prompt came back after that Run, else 0
+    Str dir;       // its shell's folder (OSC 7), else empty: not known
 };
+
+// Whether folders a and b, as a shell or a session gives them, are the
+// same: a trailing separator aside, on Windows of any case and either
+// slash.
+static b32 termsamedir(Str a, Str b, b32 win)
+{
+    for (i32 k = 0; k < 2; k++) {
+        Str *p = k ? &b : &a;
+        while (p->len>1 && ((*p)[p->len-1]=='/' || (win && (*p)[p->len-1]=='\\')) &&
+               !(win && p->len==3 && (*p)[1]==':')) {
+            p->len--;
+        }
+    }
+    if (a.len != b.len) {
+        return 0;
+    }
+    for (iz i = 0; i < a.len; i++) {
+        u8 x = a[i];
+        u8 y = b[i];
+        if (win) {
+            x = x=='\\' ? '/' : x>='A' && x<='Z' ? (u8)(x + 32) : x;
+            y = y=='\\' ? '/' : y>='A' && y<='Z' ? (u8)(y + 32) : y;
+        }
+        if (x != y) {
+            return 0;
+        }
+    }
+    return 1;
+}
 
 // Whether its marks can be trusted to come: a hooked shell that marked
 // a prompt, or whose first prompt may yet.
@@ -181,16 +211,26 @@ static b32 termavail(TermState *st, i32 kind, i64 now)
     return (!st->typed || st->typedcr) && now>=since+TERM_HOLD;
 }
 
-// Of a set's tabs, whose states are sts in the set's order, the one a
-// block of kind goes to: the front one if available, else the right-
-// most available; -1 if none.
-static i32 termsetpick(TermSet *s, TermState *sts, i32 kind, i64 now)
+// Whether a block for folder dir (empty: any) may go to the tab: its
+// shell's folder is that one, or not known.
+static b32 termindir(TermState *st, Str dir, b32 win)
 {
-    if (s->n && termavail(&sts[s->front], kind, now)) {
+    return !dir.len || !st->dir.len || termsamedir(st->dir, dir, win);
+}
+
+// Of a set's tabs, whose states are sts in the set's order, the one a
+// block of kind for folder dir goes to: the front one if available,
+// else the right-most available; -1 if none. A tab known to be in
+// another folder is passed over, unless any.
+static i32 termsetpick(TermSet *s, TermState *sts, i32 kind, i64 now, Str dir = {},
+                       b32 win = 0, b32 any = 1)
+{
+    if (s->n && termavail(&sts[s->front], kind, now) &&
+        (any || termindir(&sts[s->front], dir, win))) {
         return s->front;
     }
     for (i32 i = s->n-1; i >= 0; i--) {
-        if (termavail(&sts[i], kind, now)) {
+        if (termavail(&sts[i], kind, now) && (any || termindir(&sts[i], dir, win))) {
             return i;
         }
     }

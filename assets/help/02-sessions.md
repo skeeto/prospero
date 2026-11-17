@@ -564,10 +564,15 @@ session's Terminal tabs, as a paste and <kbd>Enter</kbd>, so that it runs in you
 shell, and stays in its history: a tab whose shell is of the block's
 family (a POSIX shell for `sh`, `bash`, `zsh` and `ksh`, PowerShell for
 `powershell` and `pwsh`, cmd.exe for `cmd`) waiting at its prompt with
-nothing running, the tab shown if it is one, else the right-most,
-which comes to the front. With none, a new tab opens, in the session's
-folder, with your shell if it is of that family, else one that is, and
-the block goes in at its first prompt. A block whose lines are prompts
+nothing running, in the session's folder, the tab shown if it is one,
+else the right-most, which comes to the front. With none, a new tab
+opens, in the session's folder, with your shell if it is of that
+family, else one that is, and the block goes in at its first prompt. A
+tab whose shell has gone to another folder (`cd`) is passed over, since
+the agent wrote the block for the session's folder; only when no more
+tabs can open does Run take it, and its tooltip says where it is. A
+shell without [shell integration](help:sessions#shell-integration)
+doesn't say its folder, and its tab is taken wherever it is. A block whose lines are prompts
 and output, or that holds characters that would not show, has none.
 
 While the block runs, Run shows its tab and types nothing again; once

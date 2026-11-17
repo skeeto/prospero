@@ -22245,7 +22245,7 @@ static DriveOp termops[] = {
     {OP_TEXT, 0, 0, 0, 100, "mkdir -p cmdtest && cd cmdtest && sh -c 'echo out-4; exit 4'"},
     TERMKEY(GKEY_ENTER, 100),
     {OP_WAIT, W_TERM, 0, 0, 5000, "\nout-4"},
-    {OP_WAIT, W_RUNTO, 0, 0, 5000, "send"},
+    {OP_WAIT, W_RUNTO, 0, 0, 5000, "ready"},
     {OP_CHECK, CHK_TERMCWD, 0, 0, 0, "/cmdtest"},
     {OP_CHECK, CHK_TERMCMD, 0, 0, 0,
      "mkdir -p cmdtest && cd cmdtest && sh -c 'echo out-4; exit 4'|4|out-4"},
@@ -22302,12 +22302,14 @@ static DriveOp termops[] = {
     {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
     {OP_TEXT, 0, 0, 0, 100, "cd cmdtest"},
     TERMKEY(GKEY_ENTER, 100),
-    {OP_WAIT, W_RUNTO, 0, 0, 5000, "send"},
+    {OP_WAIT, W_RUNTO, 0, 0, 5000, "ready"},
     {OP_TEXT, 0, 0, 0, 100, "exit 5"},
     TERMKEY(GKEY_ENTER, 1000),
     {OP_CHECK, CHK_TERMBANNER, 0, 0, 0, "The shell exited with code 5"},
     TERMKEY(GKEY_ENTER, 500),
-    {OP_WAIT, W_RUNTO, 0, 0, 10000, "send"},
+    {OP_WAIT, W_RUNTO, 0, 0, 10000, "ready"},
+    // Run takes no tab in another folder than the session's: a new one
+    {OP_CHECK, CHK_RUNTO, 0, 0, 0, "new"},
     {OP_CHECK, CHK_TERMCWD, 0, 0, 0, "/cmdtest"},
     {OP_CHECK, CHK_TERMCMD, 0, 0, 0, "-"},
     {OP_TEXT, 0, 0, 0, 100, "cd .."},
@@ -22408,7 +22410,8 @@ static DriveOp termops[] = {
     {OP_TEXT, 0, 0, 0, 100, "mkdir -Force cmdtest >$null; cd cmdtest; cmd /c \"echo out-4& exit 4\""},
     TERMKEY(GKEY_ENTER, 100),
     {OP_WAIT, W_TERM, 0, 0, 10000, "\nout-4"},
-    {OP_WAIT, W_RUNTO, 0, 0, 10000, "send"},
+    {OP_WAIT, W_RUNTO, 0, 0, 10000, "ready"},
+    {OP_CHECK, CHK_RUNTO, 0, 0, 0, "new"},  // in another folder than the session's
     {OP_CHECK, CHK_TERMCWD, 0, 0, 0, "/cmdtest"},
     {OP_CHECK, CHK_TERMCMD, 0, 0, 0,
      "mkdir -Force cmdtest >$null; cd cmdtest; cmd /c \"echo out-4& exit 4\"|4|out-4"},
@@ -22462,7 +22465,7 @@ static DriveOp termops[] = {
     {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
     {OP_TEXT, 0, 0, 0, 100, "cd cmdtest"},
     TERMKEY(GKEY_ENTER, 100),
-    {OP_WAIT, W_RUNTO, 0, 0, 10000, "send"},
+    {OP_WAIT, W_RUNTO, 0, 0, 10000, "ready"},
 #endif
     // Its shell's clean exit closes the new tab, the first one in front
     // again, which says where it was (as the root's other checks below)
@@ -25435,7 +25438,13 @@ static b32 driverunto(Gui *g, Str want, b32 log)
         guilog(g, "drive: no block aimed at to run");
         return 0;
     }
-    CodeRun   cr  = coderun(g, g->view, &a, g->drivecodemsg, g->drivecodeblk);
+    CodeRun cr = coderun(g, g->view, &a, g->drivecodemsg, g->drivecodeblk);
+    if (want == Str("ready")) {
+        // The front tab could take it, whatever its folder
+        TermTab  *tt = termfront(g);
+        TermState st = tt ? termstate(tt) : TermState{};
+        return cr.kind && tt && termavail(&st, cr.kind, os_ticks(g->os));
+    }
     TermRoute r   = cr.kind ? termroute(g, g->sess, cr.kind, cr.key) : TermRoute{};
     Str       got = r.how==TROUTE_SHOW ? Str("show") : r.how==TROUTE_SEND ? Str("send") :
                     r.how==TROUTE_NEW  ? Str("new")  : Str("none");
