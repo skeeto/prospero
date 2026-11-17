@@ -679,6 +679,8 @@ struct GuiSession {
     b32          archived;  // from the list (only a root's counts)
     i64          trashed;   // epoch ms it went to the Trash, else 0 (only
                             // a root's counts)
+    i64          asideid;   // its latest archive, group or trash command:
+                            // unanswered, a list keeps the three as set here
     b32          gone;      // deleted: shown nowhere
     Slice<SkillItem> skills;  // what /name invokes, as its engine lists them
     i64          skillsid;  // that list's skills in flight, 0 if none
@@ -2587,6 +2589,18 @@ static void request(Gui *g, i64 id, i32 cmd, GuiSession *s, GuiHost *h)
     slot->cmd = cmd;
     slot->s   = s;
     slot->h   = h;
+}
+
+// Whether a command still awaits its reply. Not once its slot is taken
+// by a newer one, nor once reissue gave up on it, so never for good.
+static b32 awaiting(Gui *g, i64 id)
+{
+    for (i32 i = 0; id && i < REQ_MAX; i++) {
+        if (g->reqs[i].id == id) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static Request takereq(Gui *g, i64 id)
@@ -5707,12 +5721,17 @@ static void onsessions(Gui *g, GuiHost *h, Json *j)
         s->state  = livestate(state);
         s->listed = 1;
         s->gone   = 0;  // listed, so there after all
-        Str group = jsonstr(jsonget(e, "group"));
-        s->group    = s->group==group ? s->group : clone(&g->perm, group);
-        s->archived = jsonint(jsonget(e, "archived"), 0) != 0;
-        s->trashed  = jsonint(jsonget(e, "trashed"), 0);
+        if (!awaiting(g, s->asideid)) {
+            // Else a list asked for before it, which would put the row
+            // back as it was until the list its reply asks for (relist):
+            // guitrash closes the view, which lists, then trashes
+            Str group = jsonstr(jsonget(e, "group"));
+            s->group    = s->group==group ? s->group : clone(&g->perm, group);
+            s->archived = jsonint(jsonget(e, "archived"), 0) != 0;
+            s->trashed  = jsonint(jsonget(e, "trashed"), 0);
+        }
         if (!s->parent.len && !s->archived && !s->trashed) {
-            addgroup(g, group);
+            addgroup(g, s->group);
         }
     }
     h->trashdays = (i32)jsonint(jsonget(j, "trash_days"), 0);
@@ -10360,6 +10379,7 @@ static void guiarchive(Gui *g, GuiSession *s, b32 on)
     putkey(&w.json, "on");
     putint(&w.json, on ? 1 : 0);
     cmdsend(g, &w, a);
+    s->asideid  = g->nextid;
     s->archived = on;
     scheddirty(&g->sched);
 }
@@ -10390,6 +10410,7 @@ static void guigroup(Gui *g, GuiSession *s, Str name)
         putnull(&w.json);
     }
     cmdsend(g, &w, a);
+    s->asideid = g->nextid;
     s->group = name.len ? clone(&g->perm, name) : Str{};
     addgroup(g, name);
     scheddirty(&g->sched);
@@ -10454,6 +10475,7 @@ static void guitrash(Gui *g, GuiSession *s, b32 on)
         putkey(&w.json, "on");
         putint(&w.json, on ? 1 : 0);
         cmdsend(g, &w, a);
+        s->asideid = g->nextid;
     }
     s->trashed = on ? os_time(g->os) : 0;
     if (last) {
@@ -15798,6 +15820,7 @@ enum : i32 {
                   // elsewhere, and none turned away
     W_FILESKEPT,  // no Files record of a session on the remote text still
                   // waits: each attached or dropped (filesrestore)
+    W_TERMRAN,    // dx external terminals launched, or noted (termlaunch)
 };
 
 static Str waitnames[] = {
@@ -15827,8 +15850,9 @@ static Str waitnames[] = {
     "the file", "the file checked", "the file's find", "the pause",
     "Open file's check", "the file work",
     "Files tabs of the remote attached or dropped",
+    "an external terminal",
 };
-static_assert(countof(waitnames) == W_FILESKEPT+1);
+static_assert(countof(waitnames) == W_TERMRAN+1);
 
 enum : i32 {
     KEY_CTRL  = 1,
@@ -19561,6 +19585,7 @@ static DriveOp sessionsops[] = {
     {OP_MOVE, T_NAMED, 0, 0, 100, "Open in external terminal"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 500, ""},
+    {OP_WAIT, W_TERMRAN, 1, 0, 10000, ""},  // after shell.env's answer
     {OP_CHECK, CHK_TERMRAN, 1, 1, 0, ""},
     // Renamed from its context menu
     {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Say hello."},
@@ -26097,6 +26122,9 @@ static b32 drivewaitdone(Gui *g)
     }
     case W_TERMCOUNT:
         return (f32)drivetermcount(g) == g->ops[g->drivepc-1].dx;
+    case W_TERMRAN:
+        // A session here waits for its shell's environment (termopen)
+        return (f32)g->terms >= g->ops[g->drivepc-1].dx;
     case W_FILEREADY:
         return drivefileready(g);
     case W_FILEFRESH: {
