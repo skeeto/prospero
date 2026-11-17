@@ -2138,6 +2138,8 @@ struct Gui {
     ImGuiID            firstpane;  // the first run's floating dock node,
     ImVec2             firstspace; // centered in a dock space this size,
     Rect               firstbox;   // there, until moved
+    b32                helptabbar; // Help's tab bar always shown: in the first
+                                   // run's pane, till a drag of it ends
     DockLayout         layout;     // the layout picked, to apply (dock.cpp)
     b32                layoutpending;  // picked this frame
     b32                layoutnow;  // to apply this frame
@@ -14922,6 +14924,7 @@ enum : i32 {
     T_FILESPANE,   // the middle of the Files pane
     T_OUTCLOSE,    // the Output window's title bar X
     T_PRESSED,     // T_NAMED's item, where it was at the drag's OP_DOWN
+    T_POINTER,     // where the pointer was last moved, for a drag on
 };
 
 enum : i32 {
@@ -15190,6 +15193,8 @@ enum : i32 {
     CHK_FIRSTSIZE,    // the window opened at its first size, or maximized
     CHK_FIRSTRUN,     // Help floats centered, selected; Settings with it if
                       // dx, else closed; Hosts closed
+    CHK_HELPLOOSE,    // Help floats alone as a loose window, with a title
+                      // bar and no tab bar, as other panes do (#73)
     CHK_DOCKTREE,     // the docked layout, as built, Jobs selected
     CHK_COMPACT,      // the Compact layout, as built
     CHK_FOCUSED,      // the Focus layout, as built
@@ -15614,6 +15619,7 @@ static Str chknames[] = {
     "the session shown works in the directory completed",
     "the window opened at its first size, maximized on a small display",
     "a first run's Help floats centered in front, its tab selected",
+    "Help dragged out alone is a loose window, no tab bar",
     "the layout is as built: its panes' places and shares, Jobs selected",
     "the Compact layout is as built: two columns, Plan with Transcript, Terminal a tab behind Prompt",
     "the Focus layout is as built: one session, four panes",
@@ -16360,6 +16366,19 @@ static DriveOp m3ops[] = {
     {OP_CHECK, CHK_THEMEQUIET, 0, 0, 0, ""},
     {OP_CHECK, CHK_TITLEBAR, 0, 0, 0, ""},
     {OP_SYSTHEME, 0, -1, 0, 1000, ""},  // the system's own again
+    // Help's tab dragged out of its node, off the dock targets: alone it
+    // floats as a loose window, as any other pane does (#73). Then the
+    // layout as it was, before the tabs are switched, which leaves the
+    // focus as later steps have it.
+    {OP_MOVE, T_HELPTAB, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 100, ""},
+    {OP_MOVE, T_POINTER, 0, 20, 100, ""},
+    {OP_MOVE, T_POINTER, -60, 40, 100, ""},
+    {OP_MOVE, T_POINTER, -90, 20, 300, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_CHECK, CHK_HELPLOOSE, 0, 0, 0, ""},
+    LAYOUT("Standard"),
+    {OP_CHECK, CHK_DOCKTREE, 0, 0, 0, ""},
     // Switching tabs
     {OP_MOVE, T_HELPTAB, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -24807,6 +24826,7 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_SETTINGSTAB:   return tabcenter("Settings");
     case T_JOBSTAB:       return tabcenter("Jobs");
     case T_LOGTAB:        return tabcenter("Log");
+    case T_POINTER:       return v2(g->drivex, g->drivey);
     case T_BELOW: {
         Rect r = g->rects[RECT_TRANSCRIPT];
         return v2((r.x0+r.x1)/2, r.y1);
@@ -24905,6 +24925,21 @@ static b32 firstsizecheck(Gui *g)
     f32 dx = ds.x - (f32)want.box.w;
     f32 dy = ds.y - (f32)want.box.h;
     return now.ok && !now.max && dx>-1.5f && dx<1.5f && dy>-1.5f && dy<1.5f;
+}
+
+// Help undocked alone: a loose window of its own, its title bar ImGui's,
+// as any other pane's alone, not a floating node with a tab bar.
+static b32 helploose(Gui *g)
+{
+    ImGuiWindow *h = ImGui::FindWindowByName("Help");
+    if (!h || !h->Active) {
+        guilog(g, "drive: Help is not shown");
+        return 0;
+    } else if (h->DockIsActive || (h->Flags & ImGuiWindowFlags_NoTitleBar)) {
+        guilog(g, "drive: Help is in a dock node, not a loose window");
+        return 0;
+    }
+    return 1;
 }
 
 // A first run's pane: Help's floating node, centered on the dock space,
@@ -27389,6 +27424,7 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_FOCUSED:       return focuscheck(g);
     case CHK_LAYOUTBACK:    return layoutbackcheck(g, g->ops[g->drivepc-1].text);
     case CHK_HELPTAB:       return tabselected("Help");
+    case CHK_HELPLOOSE:     return helploose(g);
     case CHK_TRANSCRIPTTAB: return tabselected("Transcript");
     case CHK_JOBSTAB:       return tabselected("Jobs") && g->jobsvisible;
     case CHK_NAVWIN:        return c.NavWindowingTarget != 0;

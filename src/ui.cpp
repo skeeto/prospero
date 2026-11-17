@@ -18042,10 +18042,13 @@ static void dockwindows(Gui *g)
         if (g->helpfocus && !--g->helpfocus) {
             ImGui::SetNextWindowFocus();
         }
-        // A floating node of Help alone keeps its tab bar, and with it
-        // the node, rather than leaving Help a loose window
+        // The first run's pane, of Help alone, keeps its tab bar, and
+        // with it the node that stays centered, rather than leaving Help
+        // a loose window. Once that pane is moved (at the drag's end),
+        // Help floats as any other pane does, a loose window alone (#73).
+        g->helptabbar = g->firstpane || (g->helptabbar && ImGui::IsMouseDown(0));
         ImGuiWindowClass wc;
-        wc.DockingAlwaysTabBar = 1;
+        wc.DockingAlwaysTabBar = g->helptabbar;
         ImGui::SetNextWindowClass(&wc);
         if (beginpane(g, PANE_HELP)) {
             drawhelp(g);
