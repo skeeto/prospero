@@ -631,10 +631,17 @@ static void host(ariel_Term *t, u8 op, u8 arg)
 
 #define EQ(c)  do { if (!(c)) { trace("termeq: %s\n", #c); return 0; } } while (0)
 
-static b32 peneq(Pen *a, Pen *b)
+// Links by their URIs: the replay links each anew, under its own handle
+static b32 linkeq(ariel_Term *ta, u32 x, ariel_Term *tb, u32 y)
+{
+    ariel_Str ux = ariel_link(ta, x), uy = ariel_link(tb, y);
+    return ux.len==uy.len && !memcmp(ux.data, uy.data, (size_t)ux.len);
+}
+
+static b32 peneq(ariel_Term *ta, Pen *a, ariel_Term *tb, Pen *b)
 {
     return a->fg==b->fg && a->bg==b->bg && a->ul==b->ul &&
-           a->attr==b->attr && a->link==b->link;
+           a->attr==b->attr && linkeq(ta, a->link, tb, b->link);
 }
 
 static b32 celleq(ariel_Term *a, Cell *x, ariel_Term *b, Cell *y)
@@ -642,7 +649,7 @@ static b32 celleq(ariel_Term *a, Cell *x, ariel_Term *b, Cell *y)
     b32 ex = eerased(x), ey = eerased(y);
     if (ex || ey) return ex==ey && x->bg==y->bg;
     if (x->cp!=y->cp || x->fg!=y->fg || x->bg!=y->bg || x->ul!=y->ul ||
-        x->attr!=y->attr || x->link!=y->link) {
+        x->attr!=y->attr || !linkeq(a, x->link, b, y->link)) {
         return 0;
     }
     u32 xa[POOLN], xb[POOLN];
@@ -651,10 +658,10 @@ static b32 celleq(ariel_Term *a, Cell *x, ariel_Term *b, Cell *y)
     return na==nb && !memcmp(xa, xb, sizeof(u32)*(size_t)na);
 }
 
-static b32 cursoreq(Cursor *a, Cursor *b)
+static b32 cursoreq(ariel_Term *ta, Cursor *a, ariel_Term *tb, Cursor *b)
 {
     return a->x==b->x && a->y==b->y && a->wrapnext==b->wrapnext &&
-           peneq(&a->pen, &b->pen) && !memcmp(a->g, b->g, 4) &&
+           peneq(ta, &a->pen, tb, &b->pen) && !memcmp(a->g, b->g, 4) &&
            a->gl==b->gl && a->ss==b->ss;
 }
 
@@ -771,12 +778,12 @@ static b32 termeq(ariel_Term *a, ariel_Term *b)
             }
         }
     }
-    EQ(cursoreq(&a->c, &b->c));
+    EQ(cursoreq(a, &a->c, b, &b->c));
     EQ(a->origin == b->origin);
     for (i32 i = 0; i < 2; i++) {
         Cursor *x = a->saved + i, *y = b->saved + i;
         EQ(x->valid == y->valid);
-        EQ(!x->valid || (cursoreq(x, y) && x->origin==y->origin));
+        EQ(!x->valid || (cursoreq(a, x, b, y) && x->origin==y->origin));
     }
     EQ(a->top==b->top && a->bot==b->bot);
     for (i32 x = 0; x < a->cols; x++) EQ(istab(a, x) == istab(b, x));

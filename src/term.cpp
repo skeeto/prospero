@@ -141,6 +141,9 @@ struct TermTab {
 static void editdone(Gui *, GuiSession *, GuiHost *, Str, b32);
 static void termeditstale(Gui *, GuiSession *, TermTab *);
 
+// Cmd/Ctrl+click on a link or a path in a tab
+static b32 termclick(Gui *, TermTab *, i32, i32, b32);
+
 static iz termkeep(u8 *dst, Str s)
 {
     iz n = s.len<TERMTAB_TEXT ? s.len : (iz)TERMTAB_TEXT;
@@ -1974,6 +1977,18 @@ static void termmouse(Gui *g, TermTab *tt, TermMetrics *m, ImVec2 pos, ImGuiID i
     e.px   = e.px<pw ? e.px : pw-1;
     e.py   = e.py<ph ? e.py : ph-1;
 
+    // Cmd+click (macOS), else Ctrl+click: a link or a path opens, unless
+    // the program has the mouse (Shift takes it back). Over one, the hand
+    if (hovered && io.KeyCtrl && !io.KeyAlt && !rep && ImGui::IsMousePosValid() &&
+        termclick(g, tt, e.x, e.y, 0)) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        // a11y: a shortcut for the mouse: Open file takes the same path
+        if (ImGui::IsMouseClicked(0)) {
+            termclick(g, tt, e.x, e.y, 1);
+            return;
+        }
+    }
+
     if (rep && ImGui::IsMousePosValid()) {
         static i32 const buttons[] = {1, 3, 2};  // ImGui's left, right, middle
         for (i32 b = 0; b < 3; b++) {
@@ -2136,6 +2151,159 @@ static Str termasktext(Gui *g, TermTab *tt, i64 row, Arena *a, Str *label)
     print(&b, text.len ? Str(", its last lines:\n\n") : Str(", which shows nothing.\n"));
     print(&b, termclip(a, text, 0, TAIL, LINEMAX, MAXBYTES));
     return finish(&b);
+}
+
+// Files' (files.cpp, after this)
+static FileTab *filesopen(Gui *, GuiSession *, u64, Str, i32, i32, Str);
+static u64      fileuid(GuiHost *);
+
+// A file a tab names (a link, or a path, Cmd/Ctrl+clicked), relative to base,
+// a folder on the tab's host: shown in Files at its lines, in the tab's
+// root's set, if go; else only whether it would be. Returns why not, or
+// null. On this computer it must be a file there.
+static Str termopenref(Gui *g, TermTab *tt, Arena *a, FileRef r, Str base, b32 go)
+{
+    GuiSession *own  = termowner(g, tt);
+    GuiHost    *h    = tt->host;
+    b32         win  = h ? hostwin(h) : (b32)HOST_WINDOWS;
+    Str         home = h && h->home.len ? h->home : g->main ? g->main->home : Str{};
+    u64         uid  = fileuid(h);
+    if (!own) {
+        return "its tab belongs to no session";
+    } else if (r.kind!=FREF_PATH || !r.path.len) {
+        return "it names no file";
+    }
+    FilePath p = filepath(a, r, base, home, win, 0);
+    if (p.err.len) {
+        return p.err;
+    } else if (!uid && os_stat(g->os, *a, p.path).type!=STAT_FILE) {
+        return "no such file";
+    }
+    if (go) {
+        filesopen(g, own, uid, p.path, r.line0, r.line1, {});
+    }
+    return {};
+}
+
+// A file as typed or printed: PATH[:LINE[:COL]].
+static FileRef termfileref(Str text)
+{
+    FileRef   r = {};
+    FrefLines l = {};
+    iz        n = frefsuffix(text, &l);
+    r.path = cuttail(text, n);
+    r.kind = FREF_PATH;
+    freflines(&r, l);
+    return r;
+}
+
+// What Cmd/Ctrl+click opens at viewport cell (x, y): an OSC 8 link's
+// URI (*link), else the word there as a path or a URL might be printed,
+// bounded by blanks, quotes and brackets, across wrapped rows, its
+// trailing punctuation dropped.
+static Str termclickword(Arena *a, TermTab *tt, i32 x, i32 y, b32 *link)
+{
+    enum { ROWS = 8 };
+    ariel_Term *t    = tt->t;
+    i32         cols = tt->cols;
+    *link = 0;
+    if (x<0 || y<0 || y>=tt->rows || x>=cols || cols>TERMCMD_ROW) {
+        return {};
+    }
+    ariel_Cell cells[TERMCMD_ROW];
+    ariel_row(t, y, cells, countof(cells));
+    if (cells[x].link) {
+        ariel_Str u = ariel_link(t, cells[x].link);
+        *link = u.len > 0;
+        return u.len ? clone(a, Str{u.data, u.len}) : Str{};
+    }
+    i32 y0 = y, y1 = y;
+    for (; y0>0 && y-y0<ROWS && (ariel_rowinfo(t, y0-1).flags & ARIEL_R_WRAPPED); y0--) {}
+    for (; y1<tt->rows-1 && y1-y0<ROWS && (ariel_rowinfo(t, y1).flags & ARIEL_R_WRAPPED); y1++) {}
+    u32 *cps = alloc<u32>(a, (iz)(y1-y0+1)*cols);
+    iz   n   = 0;
+    iz   at  = -1;
+    for (i32 r = y0; r <= y1; r++) {
+        i32 w = ariel_row(t, r, cells, countof(cells));
+        for (i32 c = 0; c < cols; c++) {
+            if (c<w && !cells[c].width) {
+                at = r==y && c==x ? n-1 : at;  // a wide character's right half
+                continue;
+            }
+            at = r==y && c==x ? n : at;
+            cps[n++] = c<w && cells[c].cp ? cells[c].cp : ' ';
+        }
+    }
+    auto stop = [](u32 c) {
+        return c<=' ' || c=='"' || c=='\'' || c=='`' || c=='(' || c==')' || c=='[' ||
+               c==']' || c=='{' || c=='}' || c=='<' || c=='>' || c=='|' || c==',' || c==';';
+    };
+    if (at<0 || stop(cps[at])) {
+        return {};
+    }
+    iz lo = at, hi = at + 1;
+    for (; lo>0 && !stop(cps[lo-1]); lo--) {}
+    for (; hi<n && !stop(cps[hi]); hi++) {}
+    for (; hi>lo && (cps[hi-1]=='.' || cps[hi-1]==':' || cps[hi-1]=='!' ||
+                     cps[hi-1]=='?'); hi--) {}
+    Buf b(a, (hi - lo)*4);
+    for (iz i = lo; i < hi; i++) {
+        u8 enc[4];
+        print(&b, Str{enc, utf8encode(enc, (i32)cps[i])});
+    }
+    return finish(&b);
+}
+
+static b32 termweburl(Str s)
+{
+    return startswith(s, "https://") || startswith(s, "http://");
+}
+
+// Cmd+click on macOS, else Ctrl+click, at viewport cell (x, y): a link
+// or a URL to the browser; a file:// link, or a path, in Files, a
+// relative one in the folder of the command whose lines hold it, else
+// the shell's now, else the session's. Whether there is one, opened if
+// go.
+static b32 termclick(Gui *g, TermTab *tt, i32 x, i32 y, b32 go)
+{
+    Arena a    = g->frame;
+    b32   link = 0;
+    Str   w    = termclickword(&a, tt, x, y, &link);
+    if (!w.len) {
+        return 0;
+    } else if (termweburl(w)) {
+        if (go && !os_guiopenurl(g->os, a, w)) {
+            GuiSession *own = termowner(g, tt);
+            if (own) {
+                setnote(g, own, concat(&a, "the browser could not be opened: visit ", w), 1);
+            }
+        }
+        return 1;
+    }
+    FileRef r = {};
+    if (link) {
+        if (w.len<5 || !equalfold(takehead(w, 5), "file:")) {
+            return 0;
+        }
+        // Its host, if named, is the one the program ran on: the tab's
+        Str rest = cuthead(w, 5);
+        if (startswith(rest, "//")) {
+            Cut h = cut(cuthead(rest, 2), '/');
+            rest  = cuthead(rest, 2 + h.head.len);
+        }
+        r = fileref(&a, concat(&a, "file://", rest));
+    } else {
+        r = termfileref(w);
+    }
+    TermCmds *cs   = tt->cmds;
+    Str       base = cs && cs->cwdlen ? Str{cs->cwd, cs->cwdlen} : Str{};
+    i64       row  = termviewline(tt, y);
+    b32       out  = 0;
+    TermCmd  *c    = cs && row>=0 ? termcmdatrow(cs, tt->t, row, &out) : 0;
+    base = c && c->cwdlen ? termcmdcwd(c) : base;
+    GuiSession *own = termowner(g, tt);
+    base = base.len || !own ? base : termcwd(own);
+    return !termopenref(g, tt, &a, r, base, go).len;
 }
 
 // Ask about this: attach termasktext to the prompt of the session

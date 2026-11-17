@@ -582,6 +582,18 @@ the agent hears how the block ended, its exit code and its last lines
 agent is asked to put commands that only you can run, such as one that
 asks for your password, in such blocks.
 
+### Opening files from a tab
+
+<kbd>Ctrl</kbd>+click (<kbd>Cmd</kbd>+click on macOS) on a path a
+program printed, such as a compiler's `src/main.c:120:5: error`, shows
+that file at that line; the pointer is a hand over one it can open.
+A relative path is from the folder of the command that printed it,
+even once the shell has moved on, else the tab's folder. A web
+address opens in your browser. A link a program makes with OSC 8,
+as `ls --hyperlink` and some compilers do, opens what it links to: a
+`file://` link in Files, its host taken as the tab's, which in a
+remote session is that host.
+
 ### Shell integration
 
 With `[terminal] integration` on (the default), a tab's zsh, bash or

@@ -1331,6 +1331,8 @@ enum {
     MAXDIM   = 4096,
     NPARAM   = 32,
     OSCMAX   = 4096,
+    NLINKS   = 256,     // hyperlink slots: a handle is gen<<8 | slot
+    LINKPOOL = 32768,   // their URIs' bytes, a ring
     DCSMAX   = 1024,
     TITLEMAX = 512,
     NTITLES  = 10,
@@ -1461,6 +1463,15 @@ typedef struct {
     b32  block;
 } Sel;
 
+// A hyperlink's URI (OSC 8) in linkbytes. A slot taken again gets a
+// new generation, so cells holding the old handle find nothing.
+typedef struct {
+    u32 off;
+    u16 len;
+    u8  gen;            // 1 to 255 once used
+    u8  live;
+} LinkSlot;
+
 struct ariel_Term {
     u32  magic;
     u32  flags;
@@ -1554,6 +1565,12 @@ struct ariel_Term {
     // Colors
     u32  paldef[ARIEL_C_COUNT]; // the host's
     u32  pal[ARIEL_C_COUNT];    // effective
+
+    // Hyperlinks
+    LinkSlot links[NLINKS];
+    i32  linknext;              // the slot taken next
+    u32  linkw;                 // where the next URI goes in linkbytes
+    u8   linkbytes[LINKPOOL];
 
     // Output
     Ev   ev;                    // pending event, kind 0 if none
@@ -1900,6 +1917,7 @@ enum {
     RUN_UL    = 1<<2,
     RUN_ATTR  = 1<<3,
     RUN_WIDE  = 1<<4,   // has a wide cell
+    RUN_LINK  = 1<<5,
     H_ERASED  = 1,
     H_WIDE    = 2,
     H_EXTRA   = 3,
@@ -2016,13 +2034,15 @@ static void wrapcell(Wrap *w, i32 width, i32 cols)
 static i32 hdrsize(u8 mask)
 {
     return 5 + (mask&RUN_FG ? 4 : 0) + (mask&RUN_BG ? 4 : 0) +
-               (mask&RUN_UL ? 4 : 0) + (mask&RUN_ATTR ? 2 : 0);
+               (mask&RUN_UL ? 4 : 0) + (mask&RUN_ATTR ? 2 : 0) +
+               (mask&RUN_LINK ? 2 : 0);
 }
 
 static u8 penmask(Pen *p)
 {
     return (u8)((p->fg ? RUN_FG : 0) | (p->bg ? RUN_BG : 0) |
-                (p->ul ? RUN_UL : 0) | (p->attr ? RUN_ATTR : 0));
+                (p->ul ? RUN_UL : 0) | (p->attr ? RUN_ATTR : 0) |
+                (p->link ? RUN_LINK : 0));
 }
 
 // Read the run header at pos
@@ -2038,6 +2058,7 @@ static Hpos hrunat(u8 *rec, i32 pos)
     if (r.mask & RUN_BG)   { r.pen.bg   = get32(p);      p += 4; }
     if (r.mask & RUN_UL)   { r.pen.ul   = get32(p);      p += 4; }
     if (r.mask & RUN_ATTR) { r.pen.attr = (u16)get16(p); p += 2; }
+    if (r.mask & RUN_LINK) { r.pen.link = (u16)get16(p); p += 2; }
     r.pos    = (i32)(p - rec);
     r.runend = r.pos + n;
     return r;
@@ -2063,6 +2084,7 @@ static b32 hnext(u8 *rec, i32 len, Hpos *h, Hcell *o)
     r.c.bg   = h->pen.bg;
     r.c.ul   = h->pen.ul;
     r.c.attr = h->pen.attr;
+    r.c.link = h->pen.link;
     r.width  = 1;
     u8 *p = rec + h->pos;
     i32 i = 0;
@@ -2272,6 +2294,7 @@ static void hencrun(Henc *e, Pen p)
         if (p.bg)   { put32(q, p.bg);   q += 4; }
         if (p.ul)   { put32(q, p.ul);   q += 4; }
         if (p.attr) { put16(q, p.attr); q += 2; }
+        if (p.link) { put16(q, p.link); q += 2; }
     }
     e->pos += (u32)hdrsize(e->mask);
 }
@@ -2305,12 +2328,14 @@ static void henccell(ariel_Term *t, Henc *e, Cell *c)
         p.bg   = c->bg;
         p.ul   = c->ul;
         p.attr = c->attr;
+        p.link = c->link;
     }
     u32 x[POOLN];
     i32 nx;
     i32 size = hcellsize(t, c, e->mode, x, &nx);
     if (!e->inrun || p.fg!=e->pen.fg || p.bg!=e->pen.bg || p.ul!=e->pen.ul ||
-        p.attr!=e->pen.attr || e->nbytes+size>RUNMAX || e->ncells==RUNMAX) {
+        p.attr!=e->pen.attr || p.link!=e->pen.link || e->nbytes+size>RUNMAX ||
+        e->ncells==RUNMAX) {
         hencrun(e, p);
     }
     b32 wide = cellkind(c)==KIND_WIDE && !erased(c);
@@ -2348,11 +2373,12 @@ static i32 hplain(Henc *e, Cell *r, i32 n)
     i32  i = 0;
     if (e->mode) {
         // Styles are dropped, so only an unstyled run continues
-        if (p->fg || p->bg || p->ul || p->attr) return 0;
+        if (p->fg || p->bg || p->ul || p->attr || p->link) return 0;
         for (; i<n && r[i].cp-1<0x7f && !r[i].ext; i++) {}
     } else {
         for (; i<n && r[i].cp-1<0x7f && !r[i].ext && r[i].fg==p->fg &&
-               r[i].bg==p->bg && r[i].ul==p->ul && r[i].attr==p->attr; i++) {}
+               r[i].bg==p->bg && r[i].ul==p->ul && r[i].attr==p->attr &&
+               r[i].link==p->link; i++) {}
     }
     return i;
 }
@@ -2392,7 +2418,7 @@ static u32 hmeasure(ariel_Term *t, Cell *r, i32 n, i32 mode, u32 max)
 // A run header, maybe a split, and a fill run: the most beyond the text
 static u32 hslack(void)
 {
-    return 3*(u32)hdrsize(RUN_FG|RUN_BG|RUN_UL|RUN_ATTR);
+    return 3*(u32)hdrsize(RUN_FG|RUN_BG|RUN_UL|RUN_ATTR|RUN_LINK);
 }
 
 // How many of cells [0, n) fit max bytes with everything kept
@@ -3822,8 +3848,11 @@ static void decaln(ariel_Term *t)
     setcursor(t, 0, 0);
 }
 
+static void linkclear(ariel_Term *t);
+
 static void ris(ariel_Term *t)
 {
+    linkclear(t);
     setscreen(t, 1);
     resetpen(&t->c.pen);
     clearscreen(t);
@@ -4730,6 +4759,42 @@ static void settitle(ariel_Term *t, i32 which, ariel_Str s)
     t->titlelen[which] = len;
 }
 
+// Hyperlinks: the slot of an equal live URI, else a new one, its bytes
+// at the ring's end, any older URI they overwrite gone
+static u16 linkadd(ariel_Term *t, ariel_Str uri)
+{
+    for (i32 i = 0; i < NLINKS; i++) {
+        LinkSlot *s = t->links + i;
+        if (s->live && s->len==uri.len &&
+            !__builtin_memcmp(t->linkbytes+s->off, uri.data, (uz)uri.len)) {
+            return (u16)(s->gen<<8 | i);
+        }
+    }
+    if (t->linkw+(u32)uri.len > LINKPOOL) t->linkw = 0;
+    u32 lo = t->linkw, hi = lo + (u32)uri.len;
+    for (i32 i = 0; i < NLINKS; i++) {
+        LinkSlot *s = t->links + i;
+        if (s->live && s->off<hi && lo<s->off+s->len) s->live = 0;
+    }
+    i32 i = t->linknext;
+    t->linknext = (i+1) % NLINKS;
+    LinkSlot *s = t->links + i;
+    s->gen  = (u8)(s->gen==255 ? 1 : s->gen+1);
+    s->off  = lo;
+    s->len  = (u16)uri.len;
+    s->live = 1;
+    xcpy(t->linkbytes+lo, uri.data, uri.len);
+    t->linkw = hi;
+    return (u16)(s->gen<<8 | i);
+}
+
+// Every link gone, their generations kept so no old handle comes back
+static void linkclear(ariel_Term *t)
+{
+    for (i32 i = 0; i < NLINKS; i++) t->links[i].live = 0;
+    t->linkw = 0;
+}
+
 static void oscdispatch(ariel_Term *t)
 {
     if (t->osclong) return;
@@ -4803,6 +4868,15 @@ static void oscdispatch(ariel_Term *t)
     case 7:
         event(t, ARIEL_EV_CWD, 0, 0, rest.data, rest.len);
         return;
+
+    case 8: {
+        // OSC 8 ; params ; URI: the cells printed next link to URI, until
+        // one with no URI. The params (id=) are not kept: cells link by
+        // their URI alone.
+        Cut a = cut(rest, ';');
+        if (!a.ok) return;
+        t->c.pen.link = a.tail.len ? linkadd(t, a.tail) : 0;
+    } return;
 
     case 9: {
         Cut a = cut(rest, ';');
@@ -5260,9 +5334,15 @@ ptrdiff_t ariel_cluster(ariel_Term *t, int32_t x, int32_t y, uint32_t *out, ptrd
 
 ariel_Str ariel_link(ariel_Term *t, uint32_t handle)
 {
-    (void)t;
-    (void)handle;
-    ariel_Str r = {0};
+    ariel_Str r   = {0};
+    u32       i   = handle & 0xff;
+    u32       gen = handle>>8;
+    if (!gen || gen>255) return r;
+    LinkSlot *s = t->links + i;
+    if (s->live && s->gen==gen) {
+        r.data = t->linkbytes + s->off;
+        r.len  = s->len;
+    }
     return r;
 }
 
@@ -7309,6 +7389,13 @@ static void ecup(Exp *e, i32 y, i32 x, i32 top)
 static void esgr(Exp *e, Pen p)
 {
     Pen *q = &e->pen;
+    if (p.link != q->link) {
+        // Its URI, which the replay links anew under a handle of its own
+        eputs(e, S("\x1b]8;;"));
+        eputs(e, ariel_link(e->t, p.link));
+        eputs(e, S("\x1b\\"));
+        q->link = p.link;
+    }
     if (p.fg==q->fg && p.bg==q->bg && p.ul==q->ul && p.attr==q->attr) {
         return;
     }
@@ -7414,7 +7501,7 @@ static void eprint(Exp *e, Ecell *c, i32 x)
             ebreak(e);  // it would join the cluster before it
         }
     }
-    Pen p = {c->c.fg, c->c.bg, c->c.ul, c->c.attr, 0};
+    Pen p = {c->c.fg, c->c.bg, c->c.ul, c->c.attr, c->c.link};
     esgr(e, p);
     u8  buf[64];
     Out o = newout(buf, countof(buf));

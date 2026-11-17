@@ -61,6 +61,9 @@ there too.
   about this, which attaches the tab's last command, or the text
   selected in it, to the session's prompt
   ([The agent and your terminals](help:sessions#the-agent-and-your-terminals)).
+- <kbd>Ctrl</kbd>+click on a path, `path:line`, web address or link in a
+  Terminal tab: open it, a file in the Files pane
+  ([Opening files from a tab](help:sessions#opening-files-from-a-tab)).
 - <kbd>Ctrl+1</kbd> to <kbd>Ctrl+9</kbd>: a layout, as View → Layout lists them:
   Standard, Compact, Focus, then those you saved.
 - <kbd>Ctrl+=</kbd> and <kbd>Ctrl+-</kbd> zoom the text in and out, and <kbd>Ctrl+0</kbd>

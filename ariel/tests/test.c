@@ -1614,6 +1614,99 @@ static int linetext(ariel_Term *t, int64_t line, char *buf, int cap)
 
 // ariel_lines and ariel_line: the main screen and its history by line,
 // whatever the viewport, and on the alternate screen
+static b32 linkis(ariel_Term *t, uint32_t h, char *uri)
+{
+    ariel_Str u = ariel_link(t, h);
+    return u.len==(iz)strlen(uri) && !memcmp(u.data, uri, (size_t)u.len);
+}
+
+// OSC 8: cells link to a URI until a link with none; an equal URI
+// shares a handle; history keeps it; an export's replay links the same
+// URIs; a slot taken again forgets the old URI; RIS forgets them all
+static void linktest(void)
+{
+    checks++;
+    ariel_Config cfg = {0};
+    cfg.cols      = 20;
+    cfg.rows      = 3;
+    cfg.histlines = 16;
+    iz    size = ariel_size(&cfg);
+    void *mem  = alignedalloc((size_t)size);
+    ariel_Term *t = ariel_init(mem, size, &cfg);
+    ariel_Cell  c[20];
+    int bad = 0;
+
+    feedstr(t, "a\x1b]8;id=x;file:///tmp/f.txt\x1b\\link\x1b]8;;\x1b\\b");
+    ariel_row(t, 0, c, 20);
+    uint32_t h = c[1].link;
+    bad |= c[0].link!=0 || !h || c[4].link!=h || c[5].link!=0;
+    bad |= !linkis(t, h, "file:///tmp/f.txt");
+    feedstr(t, "\r\n\x1b]8;;file:///tmp/f.txt\x07x\x1b]8;;\x07\x1b]8;;http://e/\x07y");
+    ariel_row(t, 1, c, 20);
+    bad |= c[0].link!=h || !c[1].link || c[1].link==h || !linkis(t, c[1].link, "http://e/");
+    feedstr(t, "\x1b]8;;\x07\r\n1\r\n2\r\n3\r\n4");  // into history
+    ariel_Lines ls = ariel_lines(t);
+    ariel_line(t, ls.first, c, 20);
+    bad |= ls.end-ls.first!=6 || c[1].link!=h || c[0].link!=0 || c[5].link!=0;
+    ariel_line(t, ls.first+1, c, 20);
+    bad |= c[0].link!=h || !linkis(t, c[1].link, "http://e/");
+    if (bad) {
+        failures++;
+        fprintf(stderr, "linktest: links read wrong\n");
+        bad = 0;
+    }
+
+    // The export's replay
+    ariel_Config nc = cfg;
+    nc.capcols = t->capcols;
+    nc.caprows = t->caprows;
+    iz    nsize = ariel_size(&nc);
+    void *nmem  = alignedalloc((size_t)nsize);
+    ariel_Term *n = ariel_init(nmem, nsize, &nc);
+    iz  len = ariel_export(t, t->hcount, 0, 0);
+    u8 *e   = malloc((size_t)len + 1);
+    ariel_export(t, t->hcount, e, len);
+    for (ariel_Str in = {e, len}; in.len;) {
+        in = ariel_feed(n, in).rest;
+    }
+    free(e);
+    ariel_Lines nl = ariel_lines(n);
+    ariel_line(n, nl.first, c, 20);
+    bad |= nl.end-nl.first!=6 || c[0].link || !linkis(n, c[1].link, "file:///tmp/f.txt") ||
+           c[5].link;
+    ariel_line(n, nl.first+1, c, 20);
+    bad |= !linkis(n, c[0].link, "file:///tmp/f.txt") || !linkis(n, c[1].link, "http://e/");
+    alignedfree(nmem);
+    if (bad) {
+        failures++;
+        fprintf(stderr, "linktest: the export's replay links differ\n");
+        bad = 0;
+    }
+
+    // Slots taken again, then RIS
+    char buf[64];
+    for (int i = 0; i < 300; i++) {
+        snprintf(buf, sizeof(buf), "\x1b]8;;u%d\x07z\x1b]8;;\x07", i);
+        feedstr(t, buf);
+    }
+    bad |= ariel_link(t, h).len != 0;
+    uint32_t last = 0;
+    for (int y = 0; y < 3; y++) {
+        ariel_row(t, y, c, 20);
+        for (int x = 0; x < 20; x++) {
+            last = c[x].link ? c[x].link : last;
+        }
+    }
+    bad |= !linkis(t, last, "u299");
+    feedstr(t, "\x1b" "c");
+    bad |= ariel_link(t, last).len != 0;
+    if (bad) {
+        failures++;
+        fprintf(stderr, "linktest: an old link outlived its slot\n");
+    }
+    alignedfree(mem);
+}
+
 static void linestest(void)
 {
     checks++;
@@ -1670,6 +1763,7 @@ int main(int argc, char **argv)
 {
     movetest();
     linestest();
+    linktest();
     hfilltest();
     for (int i = 1; i < argc; i++) {
         char *name = argv[i];
