@@ -20124,7 +20124,19 @@ def term_shell_lang(t):
 
 def runtype(tt, sid, text, key):
     """A Run typed at the tab's prompt, as the window sends it: pasted,
-    bracketed if the shell asked for that, then Enter, with run."""
+    bracketed if the shell asked for that, then Enter, with run. It waits
+    for the prompt to be drawn whole, its B after its A where the shell
+    marks one, then for bracketed paste to be on again where the shell
+    used it before, as zsh turns it on only after its prompt: typed
+    before, the block is read as typed lines, as a loaded machine (CI)
+    showed. A person's click on Run comes long after."""
+    def on(x):
+        raw = bytes(x.data)
+        return raw.rfind(b"\x1b[?2004h") > raw.rfind(b"\x1b[?2004l")
+    if "B" in marksof(tt, True):
+        tt.pump(lambda x: marksof(x, True)[-1:] == ["B"], 10, "the prompt's B")
+    if b"\x1b[?2004h" in bytes(tt.data):
+        tt.pump(on, 10, "bracketed paste on")
     data = text.replace("\n", "\r").encode()
     raw = bytes(tt.data)
     if raw.rfind(b"\x1b[?2004h") > raw.rfind(b"\x1b[?2004l"):
