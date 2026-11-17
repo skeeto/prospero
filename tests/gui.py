@@ -1156,6 +1156,8 @@ def detaching(host, plain):
                 pass
     p, more = barelaunch(host)
     problems, lines = problems + p, lines + more
+    if sys.platform == "darwin" and isinstance(host, Local):
+        return problems, lines  # macOS would put up a crash dialog
     p, more = crashlaunch(host)
     return problems + p, lines + more
 

@@ -897,7 +897,10 @@ def crash_said(t):
     detached window's launch can report of it (#74), and the process
     still dies of it. PROSPERO_TEST_CRASH faults on purpose; "detached"
     only in a --detached window. A sanitizer's handler goes first, so it
-    is told to keep out of SIGSEGV here."""
+    is told to keep out of SIGSEGV here. Not on macOS, whose crash
+    reporter puts a dialog on the desktop for each run."""
+    if sys.platform == "darwin" and not t.host.windows:
+        raise Skip("macOS shows a crash dialog")
     env = dict(t.tmpenv, ASAN_OPTIONS="handle_segv=0:handle_abort=0")
 
     def run(value):
