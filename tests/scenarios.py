@@ -4829,6 +4829,13 @@ def compaction(t):
     t.check(f"<summary>\n{cp['summary']}\n</summary>" in post[1]["content"],
             "the checkpoint holds the summary")
     tail = post[2:]
+    # Last, after them, the agent told of the summary (#57)
+    t.check(tail and tail[-1]["role"] == "user" and
+            str(tail[-1]["content"]).startswith("Your conversation was just summarized. "
+                                                "If your instructions say what to do after "
+                                                "a compaction"),
+            f"told of the summary: {tail[-1:]}")
+    tail = tail[:-1]
     t.check(len(tail) >= 4 and tail[0]["role"] == "assistant" and
             tail[-1]["role"] == "tool", f"cut at a call: {[m['role'] for m in tail]}")
     t.check(tail[:-2] == prev[len(prev) - len(tail) + 2:], "kept verbatim")
@@ -8588,6 +8595,13 @@ def compact_manual(t):
         reqs = t.requests()
         t.check(len(reqs) == chats + 1 and checkpointed(chat(reqs[-1])),
                 "the next request has the checkpoint")
+        # And the agent is told of the summary, once, after the prompt,
+        # as other notices are: the newest message (#57)
+        msgs = chat(reqs[-1])
+        told = [i for i, m in enumerate(msgs) if m.get("role") == "user" and
+                str(m.get("content")).startswith("Your conversation was just summarized.")]
+        t.check(told == [len(msgs) - 1] and msgs[-2].get("content") == "again",
+                f"told of the summary once, last: {told}")
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")

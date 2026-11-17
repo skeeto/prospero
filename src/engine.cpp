@@ -15776,6 +15776,13 @@ static void compacted(Session *s, Arena scratch, Partial *p)
     wtheed(s, scratch);  // and a side chat in a worktree, where it works
     moveheed(s, scratch);  // and a fork into another folder, where it moved
     compactheed(s, scratch);  // and what it was told of its instructions
+    // Last, so the newest message: a step the instructions ask for after
+    // a compaction is taken only when the agent is told of it here, not
+    // from the checkpoint or the system prompt alone (#57, tried on a
+    // model 0 times in 10 without it, 10 in 10 with it)
+    notify(s, "compacted", "Your conversation was just summarized. If your "
+           "instructions say what to do after a compaction, do it now, "
+           "before you carry on.", 0);
     // Right after the summary, in every mode: the step that follows is
     // made from these, never left to learn them a step late. A manual
     // compaction's wait for the next turn's prompt

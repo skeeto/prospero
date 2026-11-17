@@ -3074,6 +3074,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
                        kind=="worktree"     ? Str("To the agent: a worktree") :
                        kind=="memory"       ? Str("To the agent: memory") :
                        kind=="grants"       ? Str("To the agent: permissions") :
+                       kind=="compacted"    ? Str("To the agent: summarized") :
                        Str("To the agent");
         }
     } return 1;
