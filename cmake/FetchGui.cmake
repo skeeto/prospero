@@ -210,6 +210,30 @@ imgui_splice(imgui_widgets_text
   "    // Render shape\n    const ImU32 frame_col = GetColorU32(hovered ? ImGuiCol_FrameBgHovered : ImGuiCol_FrameBg);"
   "    if (g.TestEngineHookItems)  // prospero\n        prospero_axcombo(id, label, preview_value, popup_open);\n\n"
   "BeginCombo's shape")
+# A press on an open menu's header in the menu bar no longer closes the
+# menu: a release over the header does, as Win32's and macOS's menus
+# close, and a press dragged into the menu picks an item there. Enter
+# or Space on a header still toggles it at once.
+imgui_splice(imgui_widgets_text
+  "bool ImGui::BeginMenuEx("
+  "static ImGuiID prospero_menuclose;  // prospero: the header pressed while open\n\n"
+  "BeginMenuEx's definition")
+imgui_splice(imgui_widgets_text
+  "        if (menu_is_open && pressed && menuset_is_open) // Click an open menu again to close it"
+  [==[        // prospero: an open menu closes on the release over its header
+        if (pressed && menu_is_open && menuset_is_open && IsMouseClicked(ImGuiMouseButton_Left))
+        {
+            prospero_menuclose = id;
+            pressed = false;
+        }
+        else if (prospero_menuclose == id && (!menu_is_open || !IsMouseDown(ImGuiMouseButton_Left)))
+        {
+            pressed = menu_is_open && IsMouseReleased(ImGuiMouseButton_Left) &&
+                      IsMouseHoveringRect(g.LastItemData.Rect.Min, g.LastItemData.Rect.Max);
+            prospero_menuclose = 0;
+        }
+]==]
+  "BeginMenuEx's close on a click of an open header")
 set(imgui_widgets_patched ${CMAKE_CURRENT_BINARY_DIR}/imgui-patched/imgui_widgets.cpp)
 file(WRITE ${imgui_widgets_patched}.new "${imgui_widgets_text}")
 file(COPY_FILE ${imgui_widgets_patched}.new ${imgui_widgets_patched} ONLY_IF_DIFFERENT)

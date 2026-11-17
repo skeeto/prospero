@@ -16037,6 +16037,16 @@ static DriveOp driveops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 700, ""},
     {OP_CHECK, CHK_NOPOPUP, 0, 0, 0, ""},
+    // An open menu stays open while its header is pressed, and closes on
+    // the release, as Win32's and macOS's menus do
+    {OP_MOVE, T_MENU, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 700, ""},
+    {OP_CHECK, CHK_POPUP, 0, 0, 0, ""},
+    {OP_DOWN, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_POPUP, 0, 0, 0, ""},
+    {OP_UP, 0, 0, 0, 700, ""},
+    {OP_CHECK, CHK_NOPOPUP, 0, 0, 0, ""},
     // A modal, whose dimming fades in and out over several frames
     {OP_MOVE, T_MENU, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
