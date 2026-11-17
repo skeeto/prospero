@@ -47,6 +47,56 @@ static void test_worktree(Test *t)
     }
 
     {
+        // A subagent's worktree, named after its task's description
+        struct { Str desc; iz max; Str want; } slugs[] = {
+            {"Fix the parser",                          24, "fix-the-parser"},
+            {"  Fix: the PARSER!! ",                    24, "fix-the-parser"},
+            {"\xc3\x9c" "berarbeite die Doku",          24, "berarbeite-die-doku"},
+            {"v2 of x_y",                               24, "v2-of-x-y"},
+            {"Refactor the session list scanning code", 24, "refactor-the-session"},
+            {"Refactor the session list",               22, "refactor-the-session"},
+            {"Refactor the sessions",                   24, "refactor-the-sessions"},
+            {"abcdefghijklmnopqrstuvwx yz",             24, "abcdefghijklmnopqrstuvwx"},
+            {"abcdefghijklmnopqrstuvwxyz",              24, "abcdefghijklmnopqrstuvwx"},
+            {"!!!",                                     24, ""},
+            {"",                                        24, ""},
+            {"con",                                     24, "con"},
+        };
+        for (iz i = 0; i < countof(slugs); i++) {
+            expect(t, concat(a, "wtslug ", slugs[i].desc),
+                   wtslug(a, slugs[i].desc, slugs[i].max), slugs[i].want);
+        }
+
+        // A parent's grant, as its subagent's worktree k has it: from
+        // the parent's checkout or the main one, else as it is
+        struct { Str path; Str from; Str want; b32 win; } maps[] = {
+            {"/r/src/x.c",                       "/r", "/r/.prospero/worktrees/k/src/x.c", 0},
+            {"/r",                               "/r", "/r/.prospero/worktrees/k", 0},
+            {"/r/src/x.c",                       "",   "/r/.prospero/worktrees/k/src/x.c", 0},
+            {"/r/.prospero/worktrees/p/src/x.c", "/r/.prospero/worktrees/p",
+             "/r/.prospero/worktrees/k/src/x.c", 0},
+            {"/r/src/x.c",                       "/r/.prospero/worktrees/p",
+             "/r/.prospero/worktrees/k/src/x.c", 0},
+            {"/r/.prospero/worktrees/o/x.c",     "/r", "/r/.prospero/worktrees/o/x.c", 0},
+            {"/r/.prospero/worktrees/o/x.c",     "/r/.prospero/worktrees/p",
+             "/r/.prospero/worktrees/o/x.c", 0},
+            {"/rx/y",                            "/r", "/rx/y", 0},
+            {"/home/u/notes",                    "/r", "/home/u/notes", 0},
+            {"c:\\R\\src\\x.c",                  "C:\\r",
+             "C:\\r\\.prospero\\worktrees\\k\\src\\x.c", 1},
+            {"C:/r/src/x.c",                     "C:\\r", "C:/r/.prospero/worktrees/k/src/x.c", 1},
+            {"C:\\r\\.prospero\\worktrees\\o\\x", "C:\\r", "C:\\r\\.prospero\\worktrees\\o\\x", 1},
+        };
+        for (iz i = 0; i < countof(maps); i++) {
+            Str main = maps[i].win ? Str("C:\\r") : Str("/r");
+            Str to   = maps[i].win ? Str("C:\\r\\.prospero\\worktrees\\k")
+                                   : Str("/r/.prospero/worktrees/k");
+            expect(t, concat(a, "wtinto ", maps[i].path),
+                   wtinto(a, maps[i].path, maps[i].from, main, to, maps[i].win), maps[i].want);
+        }
+    }
+
+    {
         static Str const good[] = {"prospero/", "wt-", "a/b/", "me.x/", "x"};
         static Str const bad[] = {
             "", "/x", "-x", "x.", "a//b", "a..b", "a/.b", ".x", "x.lock/",

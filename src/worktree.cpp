@@ -522,6 +522,38 @@ static Str wtrandom(Arena *a, u64 r)
     return concat(a, concat(a, adj, "-"), noun);
 }
 
+// A name from a subagent's task, as "Fix the parser" gives
+// fix-the-parser: the description's letters and digits, in lowercase,
+// with '-' for each run of anything else between them, cut to at most
+// max characters after a whole word, should one fit. It may be empty,
+// or a name no worktree may have (wtname): a device's.
+static Str wtslug(Arena *a, Str desc, iz max)
+{
+    Buf b(a, max + 2);
+    b32 gap = 0;
+    for (iz i = 0; i<desc.len && b.len<=max; i++) {
+        u8 c = desc[i]>='A' && desc[i]<='Z' ? (u8)(desc[i] + 32) : desc[i];
+        if ((c>='a' && c<='z') || (c>='0' && c<='9')) {
+            if (gap && b.len) {
+                putbyte(&b, '-');
+            }
+            putbyte(&b, c);
+            gap = 0;
+        } else {
+            gap = 1;
+        }
+    }
+    Str s = finish(&b);
+    if (s.len > max) {
+        iz at = max;
+        while (at>0 && s[at]!='-') {
+            at--;
+        }
+        s = takehead(s, at ? at : max);  // one long word: cut in it
+    }
+    return s;
+}
+
 // A path in the host's own form: on Windows with '\'.
 static Str wtnative(Arena *a, Str path, b32 win)
 {
@@ -567,6 +599,31 @@ static Str wtmainof(Os *os, Arena *a, Str path, b32 win)
         return path;
     }
     return c.ok ? concat(a, concat(a, main, sep), c.tail) : main;
+}
+
+// Whether path is dir or below it, as copyremap compares them.
+static b32 wtunder(Arena scratch, Str path, Str dir, b32 win)
+{
+    return copyremap(&scratch, path, dir, "/", win).len > 0;
+}
+
+// A path as the same place in another checkout of the repository, to: a
+// path in from's checkout, or in the main checkout, main, as in to. Any
+// other as it is: one outside the repository, or in another worktree.
+// With win, either separator, and in any case (copyremap). So a grant
+// of a subagent's parent follows it into the subagent's worktree.
+static Str wtinto(Arena *a, Str path, Str from, Str main, Str to, b32 win)
+{
+    Arena t     = *a;
+    Str   trees = concat(&t, main, win ? Str("\\.prospero\\worktrees")
+                                       : Str("/.prospero/worktrees"));
+    b32   tree  = wtunder(t, path, trees, win);  // in some worktree
+    b32   own   = from.len && (!tree || wtunder(t, from, trees, win));
+    Str   r     = own ? copyremap(a, path, from, to, win) : Str{};
+    if (!r.len && !tree) {
+        r = copyremap(a, path, main, to, win);
+    }
+    return r.len ? r : path;
 }
 
 // Where a worktree session can start from a folder: the repository's
@@ -659,11 +716,59 @@ static b32 wtrecorded(Engine *e, Arena scratch, Str main, Str name, b32 win)
     return 0;
 }
 
+// The worktrees that session records name, as wtrecorded reads them, in
+// a: read once for the names that a batch of subagents may try.
+static Slice<WtName> wtrecords(Engine *e, Arena *a)
+{
+    Str           dir  = join(a, e->statedir, "sessions");
+    Dirent       *list = os_list(e->os, a, dir);
+    Arena         tmp  = carve(a, 1<<18);  // a record's head, read and parsed
+    Slice<WtName> r    = {};
+    for (Dirent *d = list; d; d = d->next) {
+        if (!d->isdir) continue;
+        Arena t    = tmp;
+        Str   path = join(&t, join(&t, dir, d->name), "events.jsonl");
+        Read  rd   = os_readat(e->os, &t, path, 0, 4096);
+        EvRec rec  = evparse(&t, cut(rd.data, '\n').head);
+        Json *wt   = jsonget(rec.root, "worktree");
+        Str   name = jsonstr(jsonget(wt, "name"));
+        if (rec.ok && rec.ev==EV_SESSION && name.len) {
+            WtName n = {clone(a, jsonstr(jsonget(wt, "main"))), clone(a, name)};
+            r = push(a, r, n);
+        }
+    }
+    return r;
+}
+
+static b32 wtnamed(Slice<WtName> *recs, Str main, Str name, b32 win)
+{
+    for (iz i = 0; i < recs->len; i++) {
+        WtName *n = &recs->data[i];
+        if (n->name==name && (win ? equalfold(n->main, main) : n->main==main)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Whether a session loaded here has the worktree at path, as a subagent
+// started a moment ago has, whatever its record holds.
+static b32 wtloaded(Engine *e, Str path, b32 win)
+{
+    for (Session *s = e->sessions; s; s = s->next) {
+        if (s->wt.name.len && (win ? equalfold(s->wt.path, path) : s->wt.path==path)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 // Whether a worktree cannot be made by this name: its folder exists,
-// its branch does, or a session has it.
+// its branch does, or a session has it, by the records read (recs), if
+// given, else by reading them.
 enum : i32 {WT_FREE, WT_HASDIR, WT_HASBRANCH, WT_HASSESSION};
 
-static i32 wttaken(Engine *e, Arena scratch, WtPlace *p, Str name)
+static i32 wttaken(Engine *e, Arena scratch, WtPlace *p, Str name, Slice<WtName> *recs = 0)
 {
     b32 win = HOST_WINDOWS;
     Str ref = concat(&scratch, concat(&scratch, "refs/heads/", wtprefix(e)), name);
@@ -674,7 +779,10 @@ static i32 wttaken(Engine *e, Arena scratch, WtPlace *p, Str name)
     Arena oid = carve(&scratch, 128);  // apart from the scratch it reads in
     if (gitrefoid(e->os, &oid, scratch, p->common, ref).len) {
         return WT_HASBRANCH;
-    } else if (wtrecorded(e, scratch, p->main, name, win)) {
+    } else if (wtloaded(e, dir, win)) {
+        return WT_HASSESSION;
+    } else if (recs ? wtnamed(recs, p->main, name, win)
+                    : wtrecorded(e, scratch, p->main, name, win)) {
         return WT_HASSESSION;
     }
     return WT_FREE;
@@ -695,11 +803,12 @@ static Str wttakenwhy(Engine *e, Arena *a, i32 taken, Str name)
 }
 
 // A free name, random, else null.
-static Str wtsuggest(Engine *e, Arena *a, Arena scratch, WtPlace *p)
+static Str wtsuggest(Engine *e, Arena *a, Arena scratch, WtPlace *p,
+                     Slice<WtName> *recs = 0)
 {
     for (i32 i = 0; i < WT_TRIES; i++) {
         Str name = wtrandom(a, os_random(e->os));
-        if (wttaken(e, scratch, p, name) == WT_FREE) {
+        if (wttaken(e, scratch, p, name, recs) == WT_FREE) {
             return name;
         }
     }
@@ -906,6 +1015,28 @@ static b32 wtexists(Engine *e, Arena scratch, WtSess *wt)
     return os_stat(e->os, scratch, git).type != STAT_MISSING;
 }
 
+// The rest of a worktree's plan, its name free: what the session record
+// keeps, and the working directory, the same place below the
+// worktree's root as below the folder's checkout's, in a.
+static void wtfill(Engine *e, Arena *a, Arena scratch, WtPlace *p, Str name, WtSess *wt,
+                   Str *wcwd)
+{
+    b32 win = HOST_WINDOWS;
+    wt->name   = clone(a, name);
+    wt->main   = clone(a, p->main);
+    wt->branch = concat(a, wtprefix(e), name);
+    wt->base   = clone(a, p->base);
+    wt->oid    = clone(a, p->oid);
+    wt->src    = clone(a, p->h.root);
+    wt->path   = wtpath(a, wt->main, name, win);
+    *wcwd      = wt->path;
+    if (p->sub.len) {
+        Str sub = wtnative(&scratch, p->sub, win);
+        *wcwd = concat(a, concat(a, wt->path, win ? Str("\\") : Str("/")), sub);
+    }
+    wtignore(e->os, scratch, wt->path);
+}
+
 // A worktree as asked ({name?}) from a folder, cwd, in a's arena: what
 // the session record keeps, and the working directory, the same place
 // below the worktree's root, also in a. Null if it can be, else why not.
@@ -932,20 +1063,44 @@ static Str wtplan(Engine *e, Arena *a, Arena scratch, Json *ask, Str cwd, WtSess
     if (taken != WT_FREE) {
         return wttakenwhy(e, a, taken, name);
     }
+    wtfill(e, a, scratch, &p, name, wt, wcwd);
+    return {};
+}
 
-    wt->name   = clone(a, name);
-    wt->main   = clone(a, p.main);
-    wt->branch = concat(a, wtprefix(e), name);
-    wt->base   = clone(a, p.base);
-    wt->oid    = clone(a, p.oid);
-    wt->src    = clone(a, p.h.root);
-    wt->path   = wtpath(a, wt->main, name, win);
-    *wcwd      = wt->path;
-    if (p.sub.len) {
-        Str sub = wtnative(&keep, p.sub, win);
-        *wcwd = concat(a, concat(a, wt->path, win ? Str("\\") : Str("/")), sub);
+// A subagent's worktree (task {worktree}), from its parent's folder,
+// cwd, as wtplan's: named after its task's description, desc, with -2
+// to -9 after it should that be taken, else at random. recs is the
+// names that sessions record, read once for the batch (wtrecords).
+// wt->src is the parent's checkout, which its grants are mapped from.
+static Str wttask(Engine *e, Arena *a, Arena scratch, Str cwd, Str desc,
+                  Slice<WtName> *recs, WtSess *wt, Str *wcwd)
+{
+    b32     win  = HOST_WINDOWS;
+    Arena   keep = carve(&scratch, 1<<16);
+    WtPlace p    = wtplace(e->os, &keep, scratch, cwd, win);
+    if (p.err.len) {
+        return clone(a, p.err);
     }
-    wtignore(e->os, scratch, wt->path);
+    Str name = wtslug(&keep, desc, WT_NAMEMAX);
+    if (!wtname(name) || wttaken(e, scratch, &p, name, recs)!=WT_FREE) {
+        name = {};
+    }
+    Str stem = wtslug(&keep, desc, WT_NAMEMAX-2);  // room for -N
+    for (i32 n = 2; !name.len && stem.len && n<=9; n++) {
+        Buf b(&keep, WT_NAMEMAX + 1);
+        print(&b, stem);
+        putbyte(&b, '-');
+        print(&b, (i64)n);
+        Str next = finish(&b);
+        if (wtname(next) && wttaken(e, scratch, &p, next, recs)==WT_FREE) {
+            name = next;
+        }
+    }
+    name = name.len ? name : wtsuggest(e, &keep, scratch, &p, recs);
+    if (!name.len) {
+        return "no free name was found for the worktree";
+    }
+    wtfill(e, a, scratch, &p, name, wt, wcwd);
     return {};
 }
 
@@ -1119,6 +1274,12 @@ static Str wtpromptline(Session *s, Arena *a)
                   "or when asked, report it to that session with send_message: "
                   "the branch, its commits and what they change, so that it "
                   "can review and merge them.");
+    } else if (s->psid.len && !s->wt.from.len) {
+        // A subagent's (task {worktree})
+        print(&b, " The agent that started you reviews this branch and merges "
+                  "it: commit your work on it before you report, and name the "
+                  "branch and its commits in your report. What you leave "
+                  "uncommitted is not merged.");
     }
     return finish(&b);
 }

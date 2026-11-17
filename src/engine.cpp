@@ -1028,6 +1028,12 @@ struct WtJob {
     Str sid;
 };
 
+// A worktree that a session's record names (wtrecords).
+struct WtName {
+    Str main;
+    Str name;
+};
+
 // Engine functions take scratch by value, so that whatever a caller has
 // allocated in its own scratch stays intact below them.
 struct Terms;  // ptyhost.cpp
