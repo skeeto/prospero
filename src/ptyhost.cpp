@@ -2595,7 +2595,7 @@ static void termcmdsread(Buf *b, Arena *a, Term *t, i64 n, i64 now, TermSecrets 
                          iz *hidden)
 {
     TermCmd *list[TERMCMD_MAX];
-    i64      k = 0;
+    iz       k = 0;
     for (i64 i = 0; k<n && i<TERMCMD_MAX; i++) {
         TermCmd *c = termcmdat(&t->cmds, i);
         if (c && c->state!=TC_PROMPT) {
