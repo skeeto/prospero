@@ -31,6 +31,11 @@ whose tracked files must be committed), as the GitHub release is:
      (x86_64's through Docker's emulation here) and packed by
      tools/linuxgui's build.sh, as the GitHub release's are.
 
+The Mac's disk image is notarized while 3 and 4 build, since Apple's
+notary takes minutes; its output goes to package.log in its build
+directory. They start after the Mac's tests, which their load would
+slow.
+
 Everything that signs must work: no aas-sign, no Developer ID identity
 in the keychain, or, building macOS, no notary credentials, and nothing
 is built. The display is kept
@@ -55,6 +60,7 @@ unsigned, and is not put in DIR.
 """
 
 import argparse
+import concurrent.futures
 import glob
 import hashlib
 import os
@@ -198,8 +204,8 @@ def engines(args, src, ver):
     return os.path.join(out, f"prospero-engines-{ver}.zip")
 
 
-def macos(args, src, ver, zip):
-    """The disk image, signed, notarized and stapled."""
+def macbuild(args, src, ver, zip):
+    """Prospero.app, built, tested and signed: its build directory."""
     b = os.path.join(args.work, "macos")
     if os.path.exists(b):
         shutil.rmtree(b)
@@ -217,9 +223,29 @@ def macos(args, src, ver, zip):
     if said.split()[:2] != ["prospero", ver]:
         sys.exit(f"itch: {exe} --version says {said!r}")
     run(["codesign", "--verify", "--deep", "--strict", app])
-    run(["cmake", "--build", b, "--target", "package"])
+    return b
+
+
+def macpackage(b, ver):
+    """The disk image, signed, notarized and stapled. It runs beside the
+    other platforms' builds, so its output goes to package.log, whose
+    end is printed if it fails."""
+    log = os.path.join(b, "package.log")
     dmg = os.path.join(b, f"prospero-{ver}-macos-arm64.dmg")
-    run(["xcrun", "stapler", "validate", dmg])
+    with open(log, "w") as f:
+        for argv in (["cmake", "--build", b, "--target", "package"],
+                     ["xcrun", "stapler", "validate", dmg]):
+            say("macos: " + " ".join(shlex.quote(str(a)) for a in argv) + f" >{log}")
+            f.flush()
+            r = subprocess.run(argv, stdout=f, stderr=subprocess.STDOUT,
+                               stdin=subprocess.DEVNULL)
+            if r.returncode != 0:
+                f.flush()
+                with open(log) as g:
+                    tail = g.read().splitlines()[-40:]
+                say(f"macos: failed, the end of {log}:\n" + "\n".join(tail))
+                raise subprocess.CalledProcessError(r.returncode, argv)
+    say(f"macos: {os.path.basename(dmg)} notarized and stapled")
     return dmg
 
 
@@ -317,25 +343,35 @@ def main():
     src, ver = source(args)
     zip = engines(args, src, ver)
     built = {}
+    notary = None
     if "macos" in plats:
-        built["macos"] = macos(args, src, ver, zip)
-    if "windows" in plats:
-        built["windows"] = windows(args, src, ver, zip)
-    for arch in ("x86_64", "aarch64"):
-        if f"linux-{arch}" in plats:
-            built[f"linux-{arch}"] = linux(args, src, ver, zip, arch)
+        # Apple's notary takes minutes, mostly waiting: the others build
+        # meanwhile, after the Mac's tests, which their load would slow
+        b = macbuild(args, src, ver, zip)
+        notary = concurrent.futures.ThreadPoolExecutor(1).submit(macpackage, b, ver)
+    try:
+        if "windows" in plats:
+            built["windows"] = windows(args, src, ver, zip)
+        for arch in ("x86_64", "aarch64"):
+            if f"linux-{arch}" in plats:
+                built[f"linux-{arch}"] = linux(args, src, ver, zip, arch)
+    finally:
+        if notary:
+            if not notary.done():
+                say("macos: waiting for the notary")
+            built["macos"] = notary.result()
 
     # An unsigned engines zip stays in the work directory, apart from
     # the release's signed one
     os.makedirs(args.out, exist_ok=True)
-    made = []
-    for path in (*built.values(), *([zip] if args.signs else [])):
+    made = {}
+    for key, path in (*built.items(), *([("engines", zip)] if args.signs else [])):
         dst = os.path.join(args.out, os.path.basename(path))
         shutil.copyfile(path, dst)
         name = os.path.basename(dst)
         with open(dst + ".sha256", "w") as f:
             f.write(f"{sha256(dst)}  {name}\n")
-        made.append(dst)
+        made[key] = dst
         say(f"{name}: {os.path.getsize(dst)} bytes, sha256 {sha256(dst)}")
     if args.only:
         say(f"done: {args.out}")
@@ -347,12 +383,12 @@ def main():
     if os.path.exists(winpush):
         shutil.rmtree(winpush)
     os.makedirs(winpush)
-    shutil.copy2(made[1], winpush)
-    pushes = [["butler", "push", made[0], f"{GAME}:mac", "--userversion", ver],
+    shutil.copy2(made["windows"], winpush)
+    pushes = [["butler", "push", made["macos"], f"{GAME}:mac", "--userversion", ver],
               ["butler", "push", "--no-auto-unzip", winpush, f"{GAME}:windows",
                "--userversion", ver],
-              ["butler", "push", made[2], f"{GAME}:linux", "--userversion", ver],
-              ["butler", "push", made[3], f"{GAME}:linux-arm64", "--userversion", ver]]
+              ["butler", "push", made["linux-x86_64"], f"{GAME}:linux", "--userversion", ver],
+              ["butler", "push", made["linux-aarch64"], f"{GAME}:linux-arm64", "--userversion", ver]]
     for argv in pushes:
         if args.push:
             run(argv)

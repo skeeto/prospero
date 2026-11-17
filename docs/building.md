@@ -143,7 +143,8 @@ Debian 12's X11, Wayland, libdecor and D-Bus headers, unpacked into the
 sysroots from a snapshot (`tools/toolchain/sysroot.py`), and loads
 those libraries at run time, so they set no floor. The x86_64 build's
 tests run through Docker's emulation, with the sysroot's loader and
-libraries. Without
+libraries. The Windows and Linux builds run while Apple notarizes the
+disk image, which takes minutes. Without
 `aas-sign`, the Developer ID in the keychain, or notary credentials
 (`--notary-profile`, from `xcrun notarytool store-credentials`), it
 builds nothing. `--push` uploads the four with [butler][], which needs
