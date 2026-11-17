@@ -5643,11 +5643,10 @@ static void drawtrashtoast(Gui *g, i32 pane, f32 lift)
 static void addsection(Gui *, Str);
 
 // The Add endpoint dialog, from a Set up a model... button, over the
-// Settings pane, which floats wide if its place would be cramped: a
-// newcomer is shown it whole, not squeezed in the right column (#67).
+// Settings pane, which floats wide if its place would be cramped, as
+// setpane floats it while nothing is set up (#67).
 static void setupmodel(Gui *g)
 {
-    g->settingswide = 1;
     addsection(g, "endpoint");
 }
 
@@ -15381,13 +15380,20 @@ static void drawcfgadd(Gui *g)
 {
     Arena a  = g->frame;
     f32   sc = g->scale;
-    if (g->openadd) {
+    // Opened once Settings shows: a tab just selected in its dock node,
+    // as beside the transcript, is hidden its first frame, and a popup
+    // opened from it then is lost
+    ImGuiWindow *sw = ImGui::GetCurrentWindow();
+    if (g->openadd && !sw->Hidden && !ImGui::IsWindowAppearing()) {
         ImGui::OpenPopup("New section");
         g->openadd    = 0;
         g->addname[0] = g->remdest[0] = g->rempath[0] = 0;
         g->adderr     = {};
         g->addepkind  = EP_OPENAI;
     }
+    // Centered each time, not where a layout file last kept it
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing,
+                            v2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(v2(380*sc, 0));
     if (!ImGui::BeginPopupModal("New section", 0, ImGuiWindowFlags_AlwaysAutoResize)) {
         return;
@@ -17776,15 +17782,26 @@ static b32 beginpane(Gui *g, i32 pane)
     if (g->panefocus == pane+1) {
         g->panefocus = 0;
         ImGui::SetNextWindowFocus();
+        // Its tab in front outright, as setpane says: a node selects the
+        // focused window's tab, but the focus may move on at once, as to
+        // the prompt from the Transcript behind Settings in its node
+        ImGuiWindow *w = ImGui::FindWindowByName(panenames[pane]);
+        if (w && w->DockNode && w->DockNode->TabBar) {
+            w->DockNode->TabBar->NextSelectedTabId = w->TabId;
+        }
     }
     if (pane==PANE_SETTINGS && g->settingswide) {
-        // Asked for whole (setupmodel): floated as the first run floats
-        // Help, if docked too narrow for its list beside its page, or
-        // never placed yet; else left where it is
+        // Asked for whole (setpane): floated as the first run floats
+        // Help, if its place, the dock node it shows in or the size it
+        // floats at, is too narrow for its list beside its page, or it
+        // has none yet; else left where it is
         g->settingswide = 0;
-        ImGuiWindow *w  = ImGui::FindWindowByName(panenames[pane]);
-        f32          sc = g->scale;
-        if (!w || !w->WasActive || (w->DockIsActive && w->Size.x < (CFG_TWOPANE+40)*sc)) {
+        ImGuiWindow   *w    = ImGui::FindWindowByName(panenames[pane]);
+        f32            sc   = g->scale;
+        f32            need = (CFG_TWOPANE+40)*sc;
+        ImGuiDockNode *n    = w && w->DockId ? ImGui::DockBuilderGetNode(w->DockId) : 0;
+        f32            wide = !w ? 0 : w->DockId ? (n ? n->Size.x : 0) : w->Size.x;
+        if (wide < need) {
             ImGuiViewport *vp = ImGui::GetMainViewport();
             ImVec2 fs = v2(vp->WorkSize.x*0.6f, vp->WorkSize.y*0.7f);
             fs.x = fs.x<(CFG_TWOPANE+40)*sc ? (CFG_TWOPANE+40)*sc : fs.x;
@@ -17794,6 +17811,15 @@ static b32 beginpane(Gui *g, i32 pane)
             ImGui::SetNextWindowDockID(0, ImGuiCond_Always);
             ImGui::SetNextWindowSize(fs, ImGuiCond_Always);
             ImGui::SetNextWindowPos(vp->GetWorkCenter(), ImGuiCond_Always, v2(0.5f, 0.5f));
+        }
+        ImGui::SetNextWindowFocus();
+    }
+    if (g->dockpane == pane+1) {
+        // The checklist's docking of a pane beside another (OP_DOCKWITH)
+        g->dockpane    = 0;
+        ImGuiWindow *w = ImGui::FindWindowByName(panenames[g->dockwith]);
+        if (w && w->DockId) {
+            ImGui::SetNextWindowDockID(w->DockId, ImGuiCond_Always);
         }
         ImGui::SetNextWindowFocus();
     }

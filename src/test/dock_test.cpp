@@ -48,10 +48,10 @@ static void test_dock(Test *t)
            "Tabs=Sessions\n"
            "Tabs=Todo\n"
            "Split=Y,0.72\n"
-           "Center=Transcript\n"
+           "Center=*Transcript,Settings\n"
            "Tabs=Prompt\n"
            "Split=Y,0.5\n"
-           "Tabs=*Jobs,Log,Help,Settings,Hosts\n"
+           "Tabs=*Jobs,Log,Help,Hosts\n"
            "Tabs=*Plan,Terminal,Changes,Files,Permissions\n");
 
     // Compact keeps the left column's width, with no right column, and
@@ -102,6 +102,8 @@ static void test_dock(Test *t)
         expect(t, concat(&a, name, ".keepfiles"), istr(&a, l.keep>>PANE_FILES & 1),
                focus ? Str("0") : Str("1"));
         expect(t, concat(&a, name, ".hidefiles"), istr(&a, l.shown>>PANE_FILES & 1), "0");
+        expect(t, concat(&a, name, ".hidesettings"),
+               istr(&a, (l.shown|l.keep)>>PANE_SETTINGS & 1), "0");
         b32 done = dockdone(&l);
         expect(t, concat(&a, name, ".done"), istr(&a, done), "1");
         expect(t, concat(&a, name, ".pruned"), dockstr(&a, &l), text);

@@ -2115,10 +2115,12 @@ struct Gui {
     TrashToast         trashtoast;
     i32                panefocus;  // PANE_*+1 to bring to the front, else 0
     i32                floatpane;  // PANE_*+1 to float or dock back (OP_FLOAT)
+    i32                dockpane;   // PANE_*+1 to dock beside dockwith (OP_DOCKWITH)
+    i32                dockwith;
     ImVec2             floatsize;  // its size floating, 0 wide to dock back
     ImGuiID            floatdock;  // the dock node it was in, to go back to
     b32                floating;   // floatdock is saved
-    b32                settingswide; // Settings to float wide if cramped (setupmodel)
+    b32                settingswide; // Settings to float wide if cramped (setpane)
     b32                openabout;
     f32                fontbase;   // [ui] font_size
     f32                zoom;       // the View menu's, for this run only
@@ -13907,10 +13909,17 @@ static void addinihandler(Gui *g)
     ImGui::AddSettingsHandler(&h);
 }
 
+static b32 nosetup(Gui *);
+
 // Show or hide a pane, kept with the layout. One shown is brought to
-// the front, its tab selected.
+// the front, its tab selected. Settings, shown while nothing is set up,
+// floats wide if its place would cramp it: a newcomer sees it whole,
+// however it was asked for (#67).
 static void setpane(Gui *g, i32 pane, b32 show)
 {
+    if (show && pane==PANE_SETTINGS && nosetup(g)) {
+        g->settingswide = 1;
+    }
     show = show && paneoffered(pane);
     if (g->panes[pane] != show) {
         g->panes[pane] = show;
@@ -14757,6 +14766,8 @@ enum : i32 {
     OP_CLOSEMAIN, // close the session the checklist made, as Close does
     OP_FLOAT,     // float the pane named text, dx by dy, centered; dx 0
                   // docks it back where it was before it first floated
+    OP_DOCKWITH,  // dock the pane named text's first, "A,B", as a tab beside
+                  // B, as a drag of its tab there would
     OP_FOCUS,     // the window has the focus as dx says: 1 it does, 2 not
     OP_NOTIFY,    // [ui] notify is dx (NOTIFY_*), as a setting would
     OP_TOASTMARK, // remember the toasts shown and withdrawn so far
@@ -15203,7 +15214,7 @@ enum : i32 {
     CHK_LAYOUTBACK,   // the layout saved as text is back as saved
     CHK_HELPPAGE,     // Help shows the topic whose page starts with text
     CHK_HELPNARROW,   // dx 1: Help's topics are a combo above the page; 0 a list
-    CHK_PANEFLOATS,   // the pane named by text floats, wide enough for two panes
+    CHK_PANEWIDE,     // the pane named by text is shown wide enough for two panes
     CHK_HELPCOPY,     // the clipboard has Help's page, selected whole
     CHK_DEPLOYOFFER,  // the remote "missing" failed with no engine there,
                       // Deploy engine offered; "bad" not offered it
@@ -15628,7 +15639,7 @@ static Str chknames[] = {
     "the layout saved is back as it was saved",
     "Help shows the topic picked, its page from the top",
     "Help's topics are a combo when narrow, else a list beside the page",
-    "the pane floats, wide enough for its list beside its page",
+    "the pane is shown wide enough for its list beside its page",
     "Help's page, selected whole, copied as its text",
     "a remote with no engine there failed, and Deploy engine is offered",
     "Deploy engine deployed one and connected, which is older, offering Update engine",
@@ -16230,6 +16241,9 @@ static DriveOp m3ops[] = {
     {OP_CHECK, CHK_ENGINE, 0, 0, 0, ""},
     FIRSTRUN(0),
     SHOWPANE("Settings"),
+    // With the jobs, as Settings was docked before #67, so it shows
+    // beside the transcript, not as a tab over it
+    {OP_DOCKWITH, 0, 0, 0, 700, "Settings,Jobs"},
     {OP_MOVE, T_JOBSTAB, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 500, ""},
@@ -16381,6 +16395,13 @@ static DriveOp m3ops[] = {
     {OP_CHECK, CHK_HELPLOOSE, 0, 0, 0, ""},
     LAYOUT("Standard"),
     {OP_CHECK, CHK_DOCKTREE, 0, 0, 0, ""},
+    // Standard closes Settings: shown again with the jobs, Jobs in front,
+    // as this checklist has had it since its start
+    SHOWPANE("Settings"),
+    {OP_DOCKWITH, 0, 0, 0, 700, "Settings,Jobs"},
+    {OP_MOVE, T_JOBSTAB, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
     // Switching tabs
     {OP_MOVE, T_HELPTAB, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -18293,6 +18314,12 @@ static DriveOp m3ops[] = {
     // Back and forward through jumps (#58): Back goes to the place in
     // the transcript a jump (Ctrl+,) left, or to its end, followed again,
     // if it followed it, leaving the links in view for what follows
+    // The transcript focused first, by its tab: the wheel scrolls it
+    // without, and Back would go to the pane that had the focus, Plan,
+    // leaving Settings over the transcript, a tab in its node
+    {OP_MOVE, T_TRANSCRIPTTAB, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
     {OP_MOVE, T_TRANSCRIPT, 0, 0, 100, ""},
     {OP_WHEEL, 0, 0, 10, 50, ""},
     {OP_WHEEL, 0, 0, 10, 800, ""},
@@ -18876,8 +18903,10 @@ static DriveOp e2eops[] = {
 
 // The settings window (--settings, tests/gui.py --mode settings), over a
 // transcript of most of what it can show: reasoning, markdown and code,
-// a diff, an open ask, the strip waiting for an answer. Docked as it is
-// by default, it is narrow: its pages are a combo above the page. Wider,
+// a diff, an open ask, the strip waiting for an answer. Docked with the
+// jobs, in the right column (its home is beside the transcript, but the
+// checklist moves it there), it is narrow: its pages are a combo above
+// the page. Wider,
 // they are a list beside it, from which the checklist edits a value
 // longer than a field's slack whole, picks the theme from its list, dark
 // and then light, edits the guard's roots one a line, finds a section of
@@ -18891,6 +18920,7 @@ static DriveOp settingsops[] = {
     {OP_MARK, 0, 0, 0, 1000, ""},
     FIRSTRUN(0),
     SHOWPANE("Settings"),
+    {OP_DOCKWITH, 0, 0, 0, 700, "Settings,Jobs"},
     SHOWPANE("Hosts"),
     {OP_NEWSESSION, 0, 0, 0, 0, ""},
     {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
@@ -21326,6 +21356,9 @@ static DriveOp mcpops[] = {
     {OP_MARK, 0, 0, 0, 1000, ""},
     FIRSTRUN(0),
     SHOWPANE("Settings"),
+    // With the jobs, as Settings was docked before #67, so it shows
+    // beside the transcript, not as a tab over it
+    {OP_DOCKWITH, 0, 0, 0, 700, "Settings,Jobs"},
     {OP_MOVE, T_SETTINGSTAB, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 800, ""},
@@ -23829,10 +23862,10 @@ static DriveOp compose2ops[] = {
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
 // A first run with nothing configured, on a display too small for the
-// first size (--display): maximized, Help in front with Settings and
-// Hosts, which the Standard layout puts with the jobs. The empty
-// transcript offers to set up a model, whose button opens the Add
-// endpoint dialog (#67).
+// first size (--display): maximized, Help in front with Settings, which
+// the Standard layout puts with the jobs and behind the transcript,
+// closed. The empty transcript offers to set up a model, whose button
+// opens the Add endpoint dialog over Settings, shown wide (#67).
 static DriveOp firstops[] = {
     {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
     {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
@@ -23844,7 +23877,7 @@ static DriveOp firstops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 700, ""},
     {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
-    {OP_CHECK, CHK_PANEFLOATS, 0, 0, 0, "Settings"},  // not in the narrow column
+    {OP_CHECK, CHK_PANEWIDE, 0, 0, 0, "Settings"},  // beside the transcript, or floating
     {OP_SHOT, 0, 0, 0, 300, "firstrun-setup"},
     {OP_SUMMARY, 0, 0, 0, 0, ""},
     {OP_QUIT, 0, 0, 0, 0, ""},
@@ -24477,6 +24510,9 @@ static DriveOp a11yops[] = {
     // A combo, Settings' pages while it is narrow: pressed, it opens on
     // its choices, the page shown selected
     SHOWPANE("Settings"),
+    // With the jobs, as Settings was docked before #67, so it shows
+    // beside the transcript, not as a tab over it
+    {OP_DOCKWITH, 0, 0, 0, 700, "Settings,Jobs"},
     {OP_WAIT, W_CONFIG, 0, 0, 5000, ""},
     {OP_A11Y, 0, 0, 0, 300, "is !expanded combo Page"},
     {OP_A11Y, 0, 0, 0, 300, "press combo Page"},
@@ -25031,7 +25067,8 @@ static b32 dockshowncheck(Gui *g, u32 mask)
 }
 
 // The Standard layout, as applied: the shares of each split, the panes
-// in their places, Help, Settings and Hosts with the jobs, Jobs selected.
+// in their places, Help and Hosts with the jobs, Settings behind the
+// transcript, Jobs selected.
 static b32 docktreecheck(Gui *g)
 {
     ImGuiDockNode *root = ImGui::DockBuilderGetNode(g->dockspace);
@@ -25077,7 +25114,7 @@ static b32 docktreecheck(Gui *g)
         {PANE_FILES,      right->ChildNodes[1]},
         {PANE_PERMISSIONS, right->ChildNodes[1]},
         {PANE_HELP,       rtop},
-        {PANE_SETTINGS,   rtop},
+        {PANE_SETTINGS,   center->ChildNodes[0]},
         {PANE_HOSTS,      rtop},
     };
     return dockplacescheck(g, places, countof(places)) &&
@@ -28592,13 +28629,13 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_HELPNARROW:
         return g->helpframe+3>=g->total.frames &&
                g->helpnarrow==(g->ops[g->drivepc-1].dx!=0);
-    case CHK_PANEFLOATS: {
+    case CHK_PANEWIDE: {
         Str          name = g->ops[g->drivepc-1].text;
         ImGuiWindow *w    = 0;
         for (i32 i = 0; i < PANE_COUNT; i++) {
             w = name==inistr(panenames[i]) ? ImGui::FindWindowByName(panenames[i]) : w;
         }
-        return w && w->Active && !w->DockIsActive && w->Size.x >= (CFG_TWOPANE+40)*g->scale;
+        return w && w->Active && w->Size.x >= (CFG_TWOPANE+40)*g->scale;
     }
     case CHK_HELPCOPY: {
         // Copied as text, and as Markdown the page's file, byte for byte
@@ -29538,6 +29575,14 @@ static void drivestep(Gui *g)
         e.kind = GEV_CLOSE;
         os_guiinject(g->os, &e);
         break;
+    case OP_DOCKWITH: {
+        Cut c = cut(op->text, ',');
+        for (i32 i = 0; i < PANE_COUNT; i++) {
+            g->dockpane = c.head==inistr(panenames[i]) ? i+1 : g->dockpane;
+            g->dockwith = c.tail==inistr(panenames[i]) ? i : g->dockwith;
+        }
+        scheddirty(&g->sched);
+    } break;
     case OP_FLOAT:
         for (i32 i = 0; i < PANE_COUNT; i++) {
             if (op->text == inistr(panenames[i])) {

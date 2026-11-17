@@ -15,7 +15,8 @@
 // The presets:
 //   Standard  Sessions over Todo, Transcript over Prompt, and a right
 //             column of Jobs and Log over Plan and Terminal, with Files
-//             as their tab once a file opens
+//             as their tab once a file opens; Settings a tab behind
+//             Transcript, whose shape suits its list beside its page
 //   Compact   Standard without its right column: Jobs behind Todo, Plan
 //             and Files behind Transcript, Log closed, and Terminal a tab
 //             behind Prompt
@@ -487,17 +488,19 @@ static Str docknamewhy(Str name)
     return {};
 }
 
-// A preset, as if read from the layout file. Help, Settings and Hosts
-// stay shown or hidden in Standard and Compact, whose side columns have
-// little room for them, and Files too, hidden until a file opens; Focus
-// hides it, and a file opened shows it in the center. Standard shows the terminal as a tab beside
+// A preset, as if read from the layout file. Help and Hosts stay shown
+// or hidden in Standard and Compact, whose side columns have little
+// room for them, and Files too, hidden until a file opens; Focus hides
+// it, and a file opened shows it in the center. Every preset closes
+// Settings, its home a tab behind Transcript, where its list fits
+// beside its page. Standard shows the terminal as a tab beside
 // Plan, where a first run finds it; Compact, as a tab behind the
 // prompt, Ctrl+` going between them; Focus leaves it out, and Ctrl+` brings it
 // back, its shells having run on, in the home dockaddterm gives it under
 // the prompt.
 static DockLayout dockpreset(i32 preset)
 {
-    u32        extras = 1u<<PANE_HELP | 1u<<PANE_SETTINGS | 1u<<PANE_HOSTS;
+    u32        extras = 1u<<PANE_HELP | 1u<<PANE_HOSTS;
     DockLayout l      = {};
     l.name = presetnames[preset];
     switch (preset) {
@@ -510,10 +513,10 @@ static DockLayout dockpreset(i32 preset)
         dockline(&l, "Tabs", "Sessions");
         dockline(&l, "Tabs", "Todo");
         docksplit(&l, DOCK_Y, 1 - LAYOUT_PROMPT);
-        dockline(&l, "Center", "Transcript");
+        dockline(&l, "Center", "*Transcript,Settings");
         dockline(&l, "Tabs", "Prompt");
         docksplit(&l, DOCK_Y, 1 - LAYOUT_PLAN);
-        dockline(&l, "Tabs", "*Jobs,Log,Help,Settings,Hosts");
+        dockline(&l, "Tabs", "*Jobs,Log,Help,Hosts");
         dockline(&l, "Tabs", "*Plan,Terminal,Changes,Files,Permissions");
         l.keep = extras | 1u<<PANE_FILES;
         break;

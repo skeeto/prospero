@@ -93,7 +93,10 @@ so <kbd>Ctrl+1</kbd> is Standard and <kbd>Ctrl+4</kbd> the first you saved:
 Files stays hidden until a file is opened, then shows where the
 layout puts it, beside the plan, whichever layout is picked. So do
 Changes and Permissions, shown from the session bar's branch and its
-shield.
+shield. Every layout closes Settings, and opened again it is a tab
+beside the transcript, wide enough for its list beside its page.
+Until an endpoint is set up, Settings opens floating, in front, if
+its place would be too narrow.
 
 Arrange the panes as you like, by dragging their tabs and the borders
 between them, then View → Layout → Save layout... keeps that
