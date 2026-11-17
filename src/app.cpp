@@ -300,6 +300,7 @@ enum : i32 {
     RECT_CMEDITOR,
     RECT_CMREDO,
     RECT_CMCUT,
+    RECT_CMASK,      // the terminal's menu's Ask about this
     RECT_MODEL0,     // /model's first model
     RECT_SIDELINK,   // a side chat's link to its original
     RECT_NEWMODEL,   // the new session dialog's model combo
@@ -14734,6 +14735,7 @@ enum : i32 {
                   // puts the walk held
     OP_MENTIONS,  // dx 0 as [ui] mentions = false would, dx 1 as true
     OP_NODIALOG,  // the next file dialog cannot be shown, as without a portal
+    OP_ATTCLEAR,  // the shown session's draft lets go of its attachments
     OP_OPENFILE,  // open text in Files, as a reference (fileref) in --cwd,
                   // in the session shown
     OP_MDOWN,     // middle button
@@ -14878,6 +14880,7 @@ enum : i32 {
     T_CMPASTE,
     T_CMSELALL,
     T_CMEDITOR,
+    T_CMASK,       // the terminal's menu's Ask about this
     T_EDITCANCEL,  // its Cancel while the editor runs
     T_MODEL0,      // the first model /model lists
     T_NAMED,       // the item whose name (itemnamed) starts with text
@@ -15253,6 +15256,8 @@ enum : i32 {
     CHK_TERMKIND,     // the front tab's shell's family is text; dx 1: hooked, marked
     CHK_TERMCWD,      // the front tab's folder by OSC 7 ends with text; dx 1: doesn't
     CHK_TERMCMD,      // its command dx back, 0 the newest run: "cmd|code|output"
+    CHK_ATTFILE,      // the draft has dx attachments, the last a text file:
+                      // "label|text|text..." it is named and holds
     CHK_TERMSIZE,     // the terminal fills its pane, the engine told its size
     CHK_TERMNONE,     // the session shown has no terminal
     CHK_TERMCOUNT,    // dx terminals are open, in every session
@@ -15642,6 +15647,7 @@ static Str chknames[] = {
     "the terminal has the keyboard", "the terminal shows the text, or not, as said",
     "Run in Terminal takes the block as said", "the front tab's shell is of that family, hooked as said",
     "the front tab's folder is as its shell said", "the front tab's command line is as said",
+    "the draft's last attachment is the text file said",
     "the terminal fills its pane", "the terminal is closed",
     "that many terminals are open", "the terminal tabs are as said",
     "a subagent shows its root's terminal tabs",
@@ -22243,6 +22249,26 @@ static DriveOp termops[] = {
     {OP_CHECK, CHK_TERMCWD, 0, 0, 0, "/cmdtest"},
     {OP_CHECK, CHK_TERMCMD, 0, 0, 0,
      "mkdir -p cmdtest && cd cmdtest && sh -c 'echo out-4; exit 4'|4|out-4"},
+    // Ask about this: Cmd/Ctrl+Shift+L attaches the last command, its
+    // line, status and output, to the prompt; the grid's menu attaches
+    // the command whose lines were right-clicked, here its output's
+    CMDSHIFTKEY(GKEY_L, 500),
+    {OP_CHECK, CHK_ATTFILE, 1, 0, 0, "terminal-command.txt|/cmdtest, a command the user "
+     "ran:|$ mkdir -p cmdtest && cd cmdtest && sh -c 'echo out-4; exit 4'|"
+     "exited with code 4 after|Its output (1 line):\n\nout-4"},
+    {OP_ATTCLEAR, 0, 0, 0, 100, ""},
+    {OP_MOVE, T_TERMTEXT, 0, 0, 100, "out-4"},
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_CMASK, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_ATTFILE, 1, 0, 0, "terminal-command.txt|exited with code 4|out-4"},
+    {OP_ATTCLEAR, 0, 0, 0, 100, ""},
+    {OP_MOVE, T_TERMGRID, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
     {OP_TEXT, 0, 0, 0, 100, "exit 5"},
     TERMKEY(GKEY_ENTER, 1000),
     {OP_CHECK, CHK_TERMBANNER, 0, 0, 0, "The shell exited with code 5"},
@@ -22352,6 +22378,24 @@ static DriveOp termops[] = {
     {OP_CHECK, CHK_TERMCWD, 0, 0, 0, "/cmdtest"},
     {OP_CHECK, CHK_TERMCMD, 0, 0, 0,
      "mkdir -Force cmdtest >$null; cd cmdtest; cmd /c \"echo out-4& exit 4\"|4|out-4"},
+    // Ask about this, by Ctrl+Shift+L and by the grid's menu
+    CMDSHIFTKEY(GKEY_L, 500),
+    {OP_CHECK, CHK_ATTFILE, 1, 0, 0, "terminal-command.txt|/cmdtest, a command the "
+     "user ran:|$ mkdir -Force cmdtest >$null; cd cmdtest; cmd /c \"echo out-4& exit 4\"|"
+     "exited with code 4 after|out-4"},
+    {OP_ATTCLEAR, 0, 0, 0, 100, ""},
+    {OP_MOVE, T_TERMTEXT, 0, 0, 100, "out-4"},
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_CMASK, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_ATTFILE, 1, 0, 0, "terminal-command.txt|exited with code 4|out-4"},
+    {OP_ATTCLEAR, 0, 0, 0, 100, ""},
+    {OP_MOVE, T_TERMGRID, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
 #endif
     // Its shell's clean exit closes the new tab, the first one in front
     // again, which says where it was (as the root's other checks below)
@@ -24609,6 +24653,7 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_CMCOPY:        return rectcenter(g->rects[RECT_CMCOPY]);
     case T_CMPASTE:       return rectcenter(g->rects[RECT_CMPASTE]);
     case T_CMSELALL:      return rectcenter(g->rects[RECT_CMSELALL]);
+    case T_CMASK:         return rectcenter(g->rects[RECT_CMASK]);
     case T_CMEDITOR:      return rectcenter(g->rects[RECT_CMEDITOR]);
     case T_EDITCANCEL:    return rectcenter(g->rects[RECT_EDITCANCEL]);
     case T_MODEL0:        return rectcenter(g->rects[RECT_MODEL0]);
@@ -28272,6 +28317,26 @@ static b32 drivecheck(Gui *g, i32 chk)
         guilog(g, concat(&a, "drive: the front tab's command ", got));
         return got == g->ops[g->drivepc-1].text;
     }
+    case CHK_ATTFILE: {
+        DriveOp *op = &g->ops[g->drivepc-1];
+        AttBox  *x  = g->sess ? g->sess->att : 0;
+        i32      n  = x ? x->len : 0;
+        if (n!=(i32)op->dx || !n) {
+            return n==(i32)op->dx;
+        }
+        AttImage *m  = &x->imgs[n-1];
+        Cut       c  = cut(op->text, '|');
+        b32       ok = m->file && m->label==c.head;
+        guilog(g, concat(&g->frame, "drive: attached ", m->label));
+        while (ok && c.ok) {
+            c  = cut(c.tail, '|');
+            ok = contains(m->data, c.head);
+        }
+        if (!ok) {
+            guilog(g, concat(&g->frame, "drive: it holds ", m->data));
+        }
+        return ok;
+    }
     case CHK_TERMKIND: {
         TermTab *tt   = termfront(g);
         Str      want = g->ops[g->drivepc-1].text;
@@ -29994,6 +30059,12 @@ static void drivestep(Gui *g)
         break;
     case OP_NODIALOG:
         g->nodialog = 1;
+        break;
+    case OP_ATTCLEAR:
+        if (g->sess) {
+            attachclear(g, g->sess);
+            scheddirty(&g->sched);
+        }
         break;
     case OP_NOSESS:
         setcur(g, 0);

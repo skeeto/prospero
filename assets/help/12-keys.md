@@ -57,6 +57,10 @@ there too.
 - <kbd>Ctrl+Shift+R</kbd>: show, or fold again, all of its reasoning (the
   Reasoning button, a light bulb). Each of these three buttons is
   filled while it is on, and its tooltip says whether it is.
+- <kbd>Ctrl+Shift+L</kbd>, while a Terminal tab has the keyboard: Ask
+  about this, which attaches the tab's last command, or the text
+  selected in it, to the session's prompt
+  ([The agent and your terminals](help:sessions#the-agent-and-your-terminals)).
 - <kbd>Ctrl+1</kbd> to <kbd>Ctrl+9</kbd>: a layout, as View → Layout lists them:
   Standard, Compact, Focus, then those you saved.
 - <kbd>Ctrl+=</kbd> and <kbd>Ctrl+-</kbd> zoom the text in and out, and <kbd>Ctrl+0</kbd>

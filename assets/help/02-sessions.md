@@ -527,7 +527,17 @@ command's end starts a new one, with its exit code and output, so it
 can answer without you prompting again. This counts toward `[tools]
 auto_resume`, as a job's end does; past it, the agent hears at your
 next prompt. Where the shell marks no commands, it waits until no
-program but the shell has the terminal. A subagent cannot wait. It
+program but the shell has the terminal. A subagent cannot wait.
+
+To ask about something in a tab yourself, use Ask about this
+(<kbd>Ctrl+Shift+L</kbd>, or on the tab's right-click menu). It
+attaches a text file to the session's prompt, which takes the
+keyboard: the text selected in the tab, if any; else a command with
+its folder, exit code (or that it still runs), how long it took, and
+its output, its first 50 and last 200 lines if longer. The menu takes
+the command whose lines you right-clicked, the key the last one run.
+In a shell that marks no commands, it attaches the tab's last 200
+lines. It
 cannot type, and runs nothing. A subagent reads its session's
 tabs, and a side chat in the same folder its original's. The tool is
 offered to sessions you open while `[terminal] agent` is on (the

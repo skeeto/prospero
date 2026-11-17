@@ -717,6 +717,7 @@ enum {
     GKEY_RIGHT,
     GKEY_LBRACKET,
     GKEY_RBRACKET,
+    GKEY_L,
 };
 struct GuiEvent {
     i32 kind;

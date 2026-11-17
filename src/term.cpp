@@ -83,6 +83,7 @@ struct TermTab {
     b32         selecting; // the left button drags a local selection
     b32         copyc;     // C, held since Ctrl+C copied (Windows)
     b32         menuopen;  // its context menu drew (termmenu)
+    i64         menurow;   // the line it opened on (ariel_lines), else -1
     b32         refocus;   // and closed: the grid takes the keyboard back
     i32         histlines; // its history, as [terminal] scrollback said
     Palette    *pal;       // the colors given ariel
@@ -1809,6 +1810,7 @@ static b32 termkept(Gui *g, ImGuiKey k)
         return io.KeyShift || HOST_WINDOWS;
     case ImGuiKey_C: case ImGuiKey_N:
     case ImGuiKey_S: case ImGuiKey_T: case ImGuiKey_R:
+    case ImGuiKey_L:  // Ask about this
         return io.KeyShift;
     default:
         return zoomkey(g, k, io.KeyShift) != 0;
@@ -1821,7 +1823,7 @@ static b32 termkeptpressed(Gui *g)
     static ImGuiKey const keys[] = {
         ImGuiKey_GraveAccent, ImGuiKey_KeypadAdd, ImGuiKey_KeypadSubtract,
         ImGuiKey_Keypad0, ImGuiKey_C, ImGuiKey_V, ImGuiKey_N, ImGuiKey_S,
-        ImGuiKey_T, ImGuiKey_R,
+        ImGuiKey_T, ImGuiKey_R, ImGuiKey_L,
     };
     for (iz i = 0; i < countof(keys); i++) {
         if (ImGui::IsKeyPressed(keys[i], false) && termkept(g, keys[i])) {
@@ -2029,13 +2031,144 @@ static void termmouse(Gui *g, TermTab *tt, TermMetrics *m, ImVec2 pos, ImGuiID i
     }
 }
 
+// The line (ariel_lines) at viewport row y, else -1: none on the
+// alternate screen, which has no history or records.
+static i64 termviewline(TermTab *tt, i32 y)
+{
+    ariel_Lines ls = ariel_lines(tt->t);
+    if (ls.cursor<0 || y<0 || y>=tt->rows) {
+        return -1;
+    }
+    i64 row = ls.end - tt->rows - ariel_view(tt->t).offset + y;
+    return row>=ls.first && row<ls.end ? row : -1;
+}
+
+// What Ask about this attaches from a tab: the selection, else the
+// command at line row, else (row -1, or at the prompt waiting now) the
+// last one run, else the tab's last lines; its label to *label. A command's output is cut to its
+// first and last lines, as read_terminal's is, but more of them.
+static Str termasktext(Gui *g, TermTab *tt, i64 row, Arena *a, Str *label)
+{
+    enum { HEAD = 50, TAIL = 200, MAXBYTES = 64<<10, LINEMAX = 2000 };
+    TermCmds *cs   = tt->cmds;
+    Buf       b(a, MAXBYTES + 4096);
+    print(&b, "Terminal ");
+    print(&b, tt->tid);
+    if (cs && cs->cwdlen) {
+        print(&b, ", in ");
+        print(&b, Str{cs->cwd, cs->cwdlen});
+    }
+    *label = "terminal.txt";
+    if (termselected(tt)) {
+        iz  n   = ariel_copy(tt->t, 0, 0);
+        u8 *buf = alloc<u8>(a, n+1);
+        n = ariel_copy(tt->t, buf, n+1);
+        Str sel = termclip(a, {buf, n}, HEAD, TAIL, LINEMAX, MAXBYTES);
+        print(&b, ", text the user selected:\n\n");
+        print(&b, sel);
+        *label = "terminal-selection.txt";
+        return finish(&b);
+    }
+    TermCmd *c = 0;
+    if (cs && row>=0) {
+        b32 inout = 0;
+        c = termcmdatrow(cs, tt->t, row, &inout);
+    }
+    c = c && c->state!=TC_PROMPT ? c : 0;
+    for (i64 i = 0; cs && !c && i < cs->n && i < TERMCMD_MAX; i++) {
+        TermCmd *r = termcmdat(cs, i);
+        c = r && r->state!=TC_PROMPT ? r : 0;
+    }
+    if (c && c->state!=TC_PROMPT) {
+        print(&b, ", a command the user ran:\n\n$ ");
+        print(&b, termcmdstr(c));
+        print(&b, c->cmdcut ? Str("...\n") : Str("\n"));
+        if (c->cwdlen && !(cs->cwdlen && termcmdcwd(c)==Str{cs->cwd, cs->cwdlen})) {
+            print(&b, "(in ");
+            print(&b, termcmdcwd(c));
+            print(&b, ")\n");
+        }
+        i64 now = os_ticks(g->os);
+        if (c->state == TC_RUNNING) {
+            print(&b, "\nIt is still running, for ");
+            printelapsed(&b, (now - c->startat) / MS);
+        } else if (c->hascode) {
+            print(&b, "\nIt exited with code ");
+            print(&b, (i64)c->code);
+            print(&b, " after ");
+            printelapsed(&b, (c->endat - c->startat) / MS);
+        } else {
+            print(&b, "\nIt ended after ");
+            printelapsed(&b, (c->endat - c->startat) / MS);
+            print(&b, ", its shell giving no status");
+        }
+        b32 gone = 0;
+        Str out  = termcmdoutput(a, cs, tt->t, c, &gone);
+        i64 lines = out.len ? 1 : 0;
+        for (iz i = 0; i < out.len; i++) {
+            lines += out[i] == '\n';
+        }
+        if (gone) {
+            print(&b, ". Its output is no longer in the terminal's history.\n");
+        } else if (!out.len) {
+            print(&b, c->state==TC_RUNNING ? Str(". It has printed nothing yet.\n")
+                                           : Str(". It printed nothing.\n"));
+        } else {
+            print(&b, c->state==TC_RUNNING ? Str(". Its output so far (")
+                                           : Str(". Its output ("));
+            print(&b, lines);
+            print(&b, lines==1 ? Str(" line):\n\n") : Str(" lines):\n\n"));
+            print(&b, termclip(a, out, HEAD, TAIL, LINEMAX, MAXBYTES));
+        }
+        *label = "terminal-command.txt";
+        return finish(&b);
+    }
+    // No record: the last lines, as the screen and history hold them
+    ariel_Lines ls   = ariel_lines(tt->t);
+    i64         from = ls.end - TAIL;
+    from = from>ls.first ? termlinefirst(tt->t, from) : ls.first;
+    Buf      tb(a, 4096);
+    TermSink k = {};
+    k.b = &tb;
+    Str text = ls.cursor<0 ? Str{} : termrowstext(&k, tt->t, from, 0, ls.end);
+    finish(&tb);
+    print(&b, text.len ? Str(", its last lines:\n\n") : Str(", which shows nothing.\n"));
+    print(&b, termclip(a, text, 0, TAIL, LINEMAX, MAXBYTES));
+    return finish(&b);
+}
+
+// Ask about this: attach termasktext to the prompt of the session
+// shown, if the tab is among its tabs, else the tab's own, and give the
+// box the keyboard.
+static void termask(Gui *g, TermTab *tt, i64 row, Arena a)
+{
+    GuiSession *own = termowner(g, tt);
+    GuiSession *s   = g->sess && own && termroot(g, g->sess)==own ? g->sess : own;
+    if (!s) {
+        return;
+    }
+    Str label = {};
+    Str text  = termasktext(g, tt, row, &a, &label);
+    Str err   = attachadd(g, s, text, label);
+    if (err.len) {
+        setnote(g, s, concat(&g->frame, "not attached: ", err), 1);
+        return;
+    }
+    if (s != g->sess) {
+        guiselect(g, s);
+    }
+    g->promptfocus = 1;
+    scheddirty(&g->sched);
+}
+
 // The grid's context menu (#66): Copy, Paste and Select all, whose
 // keys off macOS are not a text field's. On a right click the program
 // doesn't take (no mouse mode, or Shift held, which keeps the mouse
 // local as termmouse does), or as an assistive tool asks. Its picks act
 // at once, Paste as its keys do (termpaste, which may ask first). The
 // grid has the keyboard back as it closes, but for a click elsewhere.
-static void termmenu(Gui *g, TermTab *tt, ImGuiID id, b32 hovered, Arena a)
+static void termmenu(Gui *g, TermTab *tt, TermMetrics *m, ImVec2 pos, ImGuiID id,
+                     b32 hovered, Arena a)
 {
     ImGuiIO    &io   = ImGui::GetIO();
     ariel_Modes mo   = ariel_modes(tt->t);
@@ -2047,6 +2180,8 @@ static void termmenu(Gui *g, TermTab *tt, ImGuiID id, b32 hovered, Arena a)
     ImGui::PushOverrideID(id);
     if (open) {
         ImGui::OpenPopup("##termmenu");
+        f32 dy = io.MousePos.y - pos.y;
+        tt->menurow = axmenuasked(g, id) || dy<0 ? -1 : termviewline(tt, (i32)(dy / m->ch));
     }
     b32 shown = ImGui::BeginPopup("##termmenu");
     if (shown) {
@@ -2069,6 +2204,11 @@ static void termmenu(Gui *g, TermTab *tt, ImGuiID id, b32 hovered, Arena a)
             }
         }
         itemrect(g, RECT_CMSELALL);
+        ImGui::Separator();
+        if (ImGui::MenuItem("Ask about this", g->mac ? "Cmd+Shift+L" : "Ctrl+Shift+L")) {
+            termask(g, tt, tt->menurow, a);
+        }
+        itemrect(g, RECT_CMASK);
         ImGui::EndPopup();
     }
     ImGui::PopID();
@@ -2118,8 +2258,13 @@ static void termkeys(Gui *g, TermTab *tt, Arena a)
             termpaste(g, tt, a);
         } else if (ImGui::IsKeyPressed(ImGuiKey_C, false)) {
             termcopy(g, tt);
+        } else if (io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_L, false)) {
+            termask(g, tt, -1, a);  // Ask about this
         }
         return;
+    }
+    if (termkept(g, ImGuiKey_L) && ImGui::IsKeyPressed(ImGuiKey_L, false)) {
+        termask(g, tt, -1, a);  // Ask about this: Ctrl+Shift+L
     }
     // Copy: Ctrl+Shift+C, and on Windows Ctrl+C while there is a
     // selection, which it clears, else Ctrl+C is ^C. The C it took
@@ -2804,7 +2949,7 @@ static void drawterm(Gui *g)
     g->termverts = dl->VtxBuffer.Size;
     if (tt->state==TT_LIVE || tt->state==TT_ENDED) {
         termmouse(g, tt, &m, pos, id, hovered);
-        termmenu(g, tt, id, hovered, a);
+        termmenu(g, tt, &m, pos, id, hovered, a);
     }
 
     if (active) {

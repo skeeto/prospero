@@ -1656,7 +1656,7 @@ extern "C" void w32gui_inject(void *p, int kind, float x, float y,
             VK_END, VK_CONTROL, VK_OEM_PLUS, VK_OEM_MINUS, '0', 'F', 'G', 'T',
             'R', VK_UP, VK_DOWN, 'V', 'B', '2', VK_OEM_COMMA, 'S', VK_OEM_3,
             VK_BACK, VK_LEFT, 'D', 'K', 'O', 'W', VK_F3, VK_F10, 'Z',
-            VK_RIGHT, VK_OEM_4, VK_OEM_6,
+            VK_RIGHT, VK_OEM_4, VK_OEM_6, 'L',
         };
         BYTE state[256];
         GetKeyboardState(state);
