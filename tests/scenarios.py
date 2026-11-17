@@ -18043,6 +18043,415 @@ def worktree_quit(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+# Subagents in worktrees of their own (task {worktree})
+
+WTLINE = re.compile(r"\[It worked in the worktree (?P<path>.+?), on the branch "
+                    r"(?P<branch>\S+), cut from (?:(?P<base>\S+) at )?(?P<oid>[0-9a-f]{7})"
+                    r"(?P<rest>[:;].*)\]\Z", re.S)
+
+
+def wtreport(text):
+    """A worktree subagent's call's text: its report, and the match of its
+    worktree's line, or None if that line is missing."""
+    body = report(text)
+    if body is None:
+        return None, None
+    head, _, last = body.rpartition("\n\n")
+    return head, WTLINE.match(last)
+
+
+def wtkeep(env):
+    """What a harness running git for a test needs of its environment:
+    the configuration left out, and an identity to commit with."""
+    names = ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_AUTHOR_NAME",
+             "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL")
+    return {k: env[k] for k in names}
+
+
+def wtnews(h, path, did=None):
+    return [e for e in h.all("worktree") if e.get("path") == path and
+            (did is None or e.get("did") == did)]
+
+
+@scenario(bound=60)
+def task_worktree(t):
+    """task {worktree} from a subdirectory: the subagent works in a new
+    worktree named after its task, on a branch cut from its parent's,
+    at the same subdirectory, its prefix logged once, when the worktree
+    is there. It commits; its parent's call says so after the report,
+    and the main checkout is untouched. The worktree stays until a turn
+    of its parent's in which the branch got merged, after which it and
+    the branch go. Opening the subagent leaves it gone, and a message
+    to it makes it again, from the branch's last commit."""
+    env = gitrepo(t)
+    oid = gitrun(t, env, "rev-parse", "HEAD")
+    main = os.path.realpath(t.work)
+    path = os.path.join(main, ".prospero", "worktrees", "fix-the-parser")
+    h = t.headless(env=wtkeep(env))
+    try:
+        src = t.host.join(t.work, "src")
+        own = h.call("new", cwd=src, model=t.model, endpoint="fake", attended=1)["sid"]
+        tools = fake_provider.tool_names
+        wtturn(t, h, own, "go", timeout=60)
+        kids = [e for e in h.all("session") if e.get("parent") == own]
+        t.check(len(kids) == 1, f"one subagent: {kids}")
+        kid = kids[0]["sid"]
+        rec = sessionlog(t, kid)[0]
+        t.check(rec.get("cwd") == os.path.join(path, "src") and
+                rec.get("worktree") == {"name": "fix-the-parser", "main": main,
+                                        "branch": "prospero/fix-the-parser",
+                                        "base": "main", "oid": oid},
+                f"the subagent's record: {rec}")
+        prefixes = [e for e in sessionlog(t, kid) if e.get("ev") == "prefix"]
+        t.check(len(prefixes) == 1 and "prospero/fix-the-parser" in prefixes[0]["system"],
+                f"one prefix, naming the branch: {len(prefixes)}")
+        t.check(any("worktree" in json.dumps(q["body"].get("tools", []))
+                    for q in t.requests()), "the parent was offered worktree")
+
+        end = h.all("tool.end", own)[-1]
+        body, line = wtreport(end["text"])
+        tip = gitrun(t, env, "rev-parse", "prospero/fix-the-parser")
+        t.check(body == "Report: prospero/fix-the-parser", f"the report: {end['text']!r}")
+        t.check(line and line["path"] == path and line["branch"] == "prospero/fix-the-parser" and
+                line["base"] == "main" and line["oid"] == oid[:7] and
+                line["rest"] == f": 1 commit, the branch now at {tip[:7]}, nothing left "
+                                "uncommitted.", f"its line: {end['text']!r}")
+        t.check(gitrun(t, env, "status", "--porcelain") == "" and
+                gitrun(t, env, "rev-parse", "HEAD") == oid, "the main checkout untouched")
+        t.check(os.path.isdir(path) and not wtnews(h, path, "removed"), "it stays")
+
+        # A turn that does not merge it leaves it; one that does, removes it
+        wtturn(t, h, own, "hi")
+        time.sleep(0.5)
+        t.check(os.path.isdir(path) and not wtnews(h, path, "removed"), "still there")
+        wtturn(t, h, own, "run git merge -q --ff-only prospero/fix-the-parser")
+        gone = h.wait(lambda e: e.get("ev") == "worktree" and e.get("path") == path and
+                      e.get("did") != "made", 30)
+        t.check(gone.get("did") == "removed" and gone.get("branch") == "deleted" and
+                gone.get("session") == kid, f"removed once merged: {gone}")
+        t.check(not os.path.exists(path) and
+                "prospero/fix-the-parser" not in gitrun(t, env, "branch"), "gone")
+
+        # Opened, it is not made again; a message to it makes it
+        h.call("open", sid=kid)
+        time.sleep(0.5)
+        t.check(not os.path.exists(path) and len(wtnews(h, path, "made")) == 1,
+                f"not made as it opens: {wtnews(h, path)}")
+        wtturn(t, h, kid, "hi", timeout=60)
+        t.check(len(wtnews(h, path, "made")) == 2, f"made for its turn: {wtnews(h, path)}")
+        t.check(gitrun(t, env, "rev-parse", "HEAD", cwd=path) == tip, "at its last commit")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=60)
+def task_worktree_two(t):
+    """Two subagents in worktrees, started in one response, change the
+    same file each its own way, on branches of their own, the second
+    named with -2, and the main checkout untouched. The parent merges
+    one, then works in its worktree in the same turn: it goes only after
+    that turn. The other stays, and archiving the parent removes its
+    clean worktree and keeps its unmerged branch."""
+    env = gitrepo(t)
+    main = os.path.realpath(t.work)
+    one = os.path.join(main, ".prospero", "worktrees", "edit-the-file")
+    two = os.path.join(main, ".prospero", "worktrees", "edit-the-file-2")
+    h = t.headless(env=wtkeep(env))
+    try:
+        own = h.call("new", cwd=t.host.join(t.work, "src"), model=t.model, endpoint="fake",
+                     attended=1)["sid"]
+        wtturn(t, h, own, "go", timeout=60)
+        ends = h.all("tool.end", own)
+        t.check([e["status"] for e in ends] == ["ok", "ok"], f"both reported: {ends}")
+        lines = [wtreport(e["text"])[1] for e in ends]
+        t.check([m and m["path"] for m in lines] == [one, two], f"their worktrees: {ends}")
+        t.check(gitrun(t, env, "show", "prospero/edit-the-file:README") == "A" and
+                gitrun(t, env, "show", "prospero/edit-the-file-2:README") == "B",
+                "each its own change")
+        t.check(t.file("README") == "hello\n" and gitrun(t, env, "status", "--porcelain") == "",
+                "the main checkout untouched")
+
+        wtturn(t, h, own, "run git merge -q --ff-only prospero/edit-the-file && sleep 0.5 && "
+                          f"test -d {one} && echo still")
+        t.check("still" in h.all("tool.end", own)[-1]["text"],
+                f"there in the turn that merged it: {h.all('tool.end', own)[-1]}")
+        gone = h.wait(lambda e: e.get("ev") == "worktree" and e.get("path") == one and
+                      e.get("did") != "made", 30)
+        t.check(gone.get("did") == "removed" and gone.get("branch") == "deleted",
+                f"removed after it: {gone}")
+        t.check(t.file("README") == "A\n", "merged")
+        time.sleep(0.5)
+        t.check(os.path.isdir(two) and len(wtnews(h, two)) == 1, "the other stays")
+
+        t.check(h.call("archive", sid=own, on=1).get("ok") == 1, "archived")
+        n = h.wait(lambda e: e.get("ev") == "worktree" and e.get("path") == two and
+                   e.get("did") != "made", 30)
+        t.check(n.get("did") == "removed" and n.get("branch") == "unmerged" and
+                not os.path.exists(two) and
+                "prospero/edit-the-file-2" in gitrun(t, env, "branch"),
+                f"its clean worktree goes with the archive, its branch stays: {n}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=60)
+def task_worktree_empty(t):
+    """A subagent that commits nothing: its worktree and branch go once it
+    reports, and its parent's call says so. One that leaves a file
+    uncommitted says that, and its worktree stays, git keeping it as
+    dirty, through its parent's later turns."""
+    env = gitrepo(t)
+    main = os.path.realpath(t.work)
+    none = os.path.join(main, ".prospero", "worktrees", "do-nothing")
+    left = os.path.join(main, ".prospero", "worktrees", "leave-a-file")
+    h = t.headless(env=wtkeep(env))
+    try:
+        own = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        wtturn(t, h, own, "go", timeout=60)
+        ends = h.all("tool.end", own)
+        a, b = [wtreport(e["text"])[1] for e in ends]
+        t.check(a and a["rest"] == ": no commits and nothing uncommitted, so the worktree "
+                                   "and the branch are being removed.", f"the first: {ends}")
+        t.check(b and b["rest"] == ": no commits, 1 file changed but not committed, which "
+                                   "stays in the worktree.", f"the second: {ends}")
+        gone = h.wait(lambda e: e.get("ev") == "worktree" and e.get("path") == none and
+                      e.get("did") != "made", 30)
+        t.check(gone.get("did") == "removed" and gone.get("branch") == "deleted" and
+                "prospero/do-nothing" not in gitrun(t, env, "branch"), f"removed: {gone}")
+        kept = h.wait(lambda e: e.get("ev") == "worktree" and e.get("path") == left and
+                      e.get("did") != "made", 30)
+        t.check(kept.get("did") == "kept" and kept.get("why") == "dirty" and
+                os.path.exists(os.path.join(left, "new.txt")), f"kept: {kept}")
+        wtturn(t, h, own, "hi")
+        time.sleep(0.5)
+        t.check(len(wtnews(h, left)) == 2, f"tried once: {wtnews(h, left)}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=60)
+def task_worktree_refused(t):
+    """task {worktree} starts nothing in plan mode, in a folder outside any
+    repository, or in a session of no folder, where it is not offered,
+    nor in a repository with no commits yet."""
+    env = gitrepo(t)
+    plain = t.host.join(t.base, "plain")
+    unborn = t.host.join(t.base, "unborn")
+    t.host.mkdir(plain)
+    t.host.mkdir(unborn)
+    gitrun(t, env, "init", "-q", "-b", "main", cwd=unborn)
+    h = t.headless(env=wtkeep(env))
+    try:
+        def refused(why, **new):
+            sid = h.call("new", model=t.model, endpoint="fake", attended=1, **new)["sid"]
+            def go():
+                wtturn(t, h, sid, "go")
+                ends = h.all("tool.end", sid)
+                t.check(ends, f"{why}: no call ended: {h.all('assistant', sid)}")
+                return ends[-1]
+            return sid, go
+
+        sid, go = refused("plan", cwd=t.work)
+        t.check(h.call("mode", sid=sid, mode="plan").get("ok") == 1, "plan mode")
+        end = go()
+        t.check(end["status"] == "error" and "plan mode only reads" in end["text"],
+                f"in plan mode: {end}")
+        for what, new in [("outside", {"cwd": plain}), ("no folder", {"nofolder": 1})]:
+            sid, go = refused(what, **new)
+            end = go()
+            tools = t.requests()[-2]["body"].get("tools", [])
+            t.check(end["status"] == "error" and "only in a git repository" in end["text"] and
+                    "worktree" not in json.dumps(tools), f"{what}: {end}")
+        sid, go = refused("unborn", cwd=unborn)
+        end = go()
+        t.check(end["status"] == "error" and
+                end["text"] == "No subagent was started: the branch main has no commits yet",
+                f"unborn: {end}")
+        t.check(not [e for e in h.all("session") if e.get("parent")], "nothing started")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=60)
+def task_worktree_nested(t):
+    """A subagent in a worktree starts one of its own in a worktree, cut
+    from its branch, under the main checkout's worktrees. It merges that
+    branch into its own, after which that worktree and branch go; its
+    own stay until its parent merges them."""
+    env = gitrepo(t)
+    main = os.path.realpath(t.work)
+    outer = os.path.join(main, ".prospero", "worktrees", "outer-work")
+    inner = os.path.join(main, ".prospero", "worktrees", "inner-work")
+    h = t.headless(env=wtkeep(env))
+    try:
+        own = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        wtturn(t, h, own, "go", timeout=60)
+        kid = [e for e in h.all("session") if e.get("parent") == own][0]["sid"]
+        grand = [e for e in h.all("session") if e.get("parent") == kid]
+        t.check(len(grand) == 1, f"one below it: {grand} {h.all('tool.end', kid)}")
+        rec = sessionlog(t, grand[0]["sid"])[0]
+        t.check(rec.get("cwd") == inner and rec["worktree"].get("base") == "prospero/outer-work",
+                f"cut from its parent's branch: {rec}")
+        try:
+            gone = h.wait(lambda e: e.get("ev") == "worktree" and e.get("path") == inner and
+                          e.get("did") != "made", 30)
+        except Exception:
+            raise Failure(f"no removal: {[(e['path'][-12:], e['did']) for e in h.all('worktree')]} "
+                          f"{[e['text'] for e in h.all('tool.end')]}")
+        t.check(gone.get("did") == "removed" and gone.get("branch") == "deleted",
+                f"removed once merged: {gone} "
+                f"{os.path.isdir(inner) and gitrun(t, env, 'status', '--porcelain', cwd=inner)}")
+        _, line = wtreport(h.all("tool.end", own)[-1]["text"])
+        t.check(line and line["path"] == outer and line["rest"].startswith(": 1 commit"),
+                f"the outer one's line: {h.all('tool.end', own)[-1]['text']!r}")
+        t.check(os.path.isdir(outer) and not wtnews(h, outer, "removed"), "the outer one stays")
+        wtturn(t, h, own, "run git merge -q --ff-only prospero/outer-work")
+        n = h.wait(lambda e: e.get("ev") == "worktree" and e.get("path") == outer and
+                   e.get("did") != "made", 30)
+        t.check(n.get("did") == "removed" and n.get("branch") == "deleted", f"then it: {n}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=90)
+def task_worktree_cancel(t):
+    """Cancelled while its worktree is made, a subagent reports at once,
+    saying the worktree was not made yet, and the worktree goes once it
+    is. While git checks its worktree as it reports, a message to it
+    starts a turn that waits for the check, and its parent hears once,
+    after that turn; and a Stop then reports at once."""
+    if os.name == "nt":
+        raise Skip("hooks and a git wrapper in sh")
+    env = gitrepo(t)
+    main = os.path.realpath(t.work)
+    path = os.path.join(main, ".prospero", "worktrees", "hold-on")
+    hook = os.path.join(t.work, ".git", "hooks", "post-checkout")
+    with open(hook, "w") as f:
+        f.write("#!/bin/sh\nsleep 3\n")
+    os.chmod(hook, 0o755)
+    hold = os.path.join(t.base, "hold")
+    wrap = os.path.join(t.base, "git-wrap")
+    with open(wrap, "w") as f:
+        f.write(f"#!/bin/sh\nfor a; do [ \"$a\" = status ] && [ -e {hold} ] && sleep 3; done\n"
+                f"exec {shutil.which('git')} \"$@\"\n")
+    os.chmod(wrap, 0o755)
+    t.host.write(t.config, t.host.read(t.config) + f"[tools]\ngit = {wrap}\n")
+    h = t.headless(env=wtkeep(env))
+    try:
+        own = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.send("prompt", sid=own, text="go")
+        kid = h.wait(lambda e: e.get("ev") == "session" and e.get("parent") == own)["sid"]
+        time.sleep(0.5)
+        h.call("cancel", sid=own)
+        end = h.wait(lambda e: e.get("ev") == "tool.end" and e.get("sid") == own)
+        t.check(end["status"] == "cancelled" and
+                f"[Its worktree, {path}, was not made yet, so its branch, prospero/hold-on, "
+                "has no commits.]" in end["text"], f"cancelled: {end}")
+        n = h.wait(lambda e: e.get("ev") == "worktree" and e.get("path") == path and
+                   e.get("did") not in ("made", "failed"), 30)
+        t.check(n.get("did") == "removed" and n.get("branch") == "deleted",
+                f"removed once made: {n}")
+        os.remove(hook)
+
+        # The check held: a message to it waits for it
+        open(hold, "w").close()
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == own)
+        h.send("prompt", sid=own, text="go")
+        h.wait(lambda e: len([x for x in h.all("session") if x.get("parent") == own]) == 2)
+        kid = [x for x in h.all("session") if x.get("parent") == own][1]["sid"]
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == kid, 60)
+        h.call("prompt", sid=kid, text="hi")
+        h.wait(lambda e: len(h.all("turn.end", kid)) == 2, 30)
+        states = [e.get("state") for e in h.all("live", kid)]
+        t.check("worktree" in states, f"the message's turn waited: {states}")
+        end = h.wait(lambda e: e.get("ev") == "tool.end" and e.get("sid") == own and
+                     e.get("child") == kid, 30)
+        t.check(len([e for e in h.all("tool.end", own) if e.get("child") == kid]) == 1 and
+                end["status"] == "ok", f"one report: {end}")
+        _, line = wtreport(end["text"])
+        t.check(line and line["rest"].startswith(": 1 commit"), f"its line: {end['text']!r}")
+
+        # Stop while it is held: at once
+        h.wait(lambda e: len(h.all("turn.end", own)) == 2, 30)
+        h.send("prompt", sid=own, text="go")
+        h.wait(lambda e: len([x for x in h.all("session") if x.get("parent") == own]) == 3)
+        kid = [x for x in h.all("session") if x.get("parent") == own][2]["sid"]
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == kid, 60)
+        start = time.monotonic()
+        h.call("cancel", sid=own)
+        end = h.wait(lambda e: e.get("ev") == "tool.end" and e.get("sid") == own and
+                     e.get("child") == kid, 10)
+        took = time.monotonic() - start
+        _, line = wtreport(end["text"])
+        t.check(took < 2 and end["status"] == "ok" and line and
+                line["rest"].startswith("; the branch is at"), f"at once ({took:.1f} s): {end}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=60)
+def task_worktree_grants(t):
+    """A subagent in a worktree has its parent's grants and denies in the
+    main checkout as in its worktree: a write grant of a folder there is
+    its own there, while the main checkout's still asks; a deny holds in
+    both. One the user revokes later in its parent's pane goes from it
+    too, in its worktree."""
+    env = gitrepo(t)
+    main = os.path.realpath(t.work)
+    tree = os.path.join(main, ".prospero", "worktrees", "use-grants")
+    t.host.mkdir(t.host.join(t.work, "other"))
+    t.put("other/keep", "k\n")
+    t.put("secret", "s\n")
+    gitrun(t, env, "add", ".")
+    gitrun(t, env, "commit", "-q", "-m", "more")
+    other = os.path.join(main, "other")
+    h = t.headless(env=wtkeep(env))
+    try:
+        own = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        t.check(h.call("grant", sid=own, path=other, access="write").get("ok") == 1, "granted")
+        t.check(h.call("grant", sid=own, path=os.path.join(main, "secret"),
+                       access="deny").get("ok") == 1, "denied")
+        wtturn(t, h, own, f"task write {os.path.join(tree, 'other', 'new.txt')}", timeout=60)
+        kids = [e for e in h.all("session") if e.get("parent") == own]
+        t.check(kids, f"started: {h.all('tool.end', own)}")
+        kid = kids[0]["sid"]
+        grants = h.call("grants", sid=kid)
+        t.check(os.path.join(tree, "other") in json.dumps(grants) and
+                sorted(grants.get("denies", [])) == sorted([os.path.join(main, "secret"),
+                                                            os.path.join(tree, "secret")]),
+                f"its grants and denies: {grants}")
+        t.check(not h.all("ask", kid) and os.path.exists(os.path.join(tree, "other", "new.txt")),
+                f"no ask in its worktree's copy: {h.all('ask', kid)}")
+
+        # The main checkout's copy asks, and the deny holds in the tree
+        h.send("prompt", sid=kid, text=f"write {os.path.join(other, 'main.txt')}")
+        ask = h.wait(lambda e: e.get("ev") == "ask" and e.get("sid") == kid)
+        h.call("answer", sid=kid, req=ask["req"], decision="deny")
+        h.wait(lambda e: len(h.all("turn.end", kid)) == 2, 30)
+        h.send("prompt", sid=kid, text=f"read {os.path.join(tree, 'secret')}")
+        ask = h.wait(lambda e: e.get("ev") == "ask" and e.get("sid") == kid and
+                     e.get("tool") == "read")
+        t.check("always" not in ask and "Permissions pane" in ask.get("detail", ""),
+                f"denied, so asked with no always: {ask}")
+        h.call("answer", sid=kid, req=ask["req"], decision="deny")
+        h.wait(lambda e: len(h.all("turn.end", kid)) == 3, 30)
+
+        # A revoke in the parent's pane reaches it, in its worktree
+        h.call("grant", sid=own, path=other, access="none")
+        grants = h.call("grants", sid=kid)
+        t.check(os.path.join(tree, "other") not in json.dumps(grants.get("grants", grants)),
+                f"revoked: {grants}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 # Terminals: term.open and its commands (ptyhost.cpp), each with
 # "prospero --tty-probe" for its shell, a stand-in that answers commands
 

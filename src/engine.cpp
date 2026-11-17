@@ -430,6 +430,7 @@ struct TaskRun {
     Str host;    // and that host's name
     i64 took;    // ticks it worked, once it reported or was cancelled
     Str spent;   // its context and requests (taskspent), once reported
+    Str wtline;  // what it left in its worktree, if it had one (wtcheckline)
     Slice<Str> urls;  // the report's URLs the subagent saw (webvouch)
 };
 
@@ -948,6 +949,7 @@ struct Session {
     Str          rrelay;     // and its link's token: its offer relays this
     Session     *parent;     // the parent, while both are in memory
     b32          intask;     // the parent waits for this one's report
+    b32          wtcheck;    // and git checks its worktree first (wtchecked)
     b32          bgtask;     // or no longer: the user moved it to the
                              // background, and the report goes to psid
                              // as a notice (bgreport)
@@ -1026,6 +1028,7 @@ struct WtJob {
     i32 kind;
     Str path;
     Str sid;
+    Str holds;  // a session whose turns wait for it, if any (wtgate)
 };
 
 // A worktree that a session's record names (wtrecords).
@@ -1041,6 +1044,22 @@ struct WtKid {
     Str sid;
     Str parent;
     Str grand;
+};
+
+// A session whose own and descendants' worktrees may go once merged
+// (wtsweep), "" for every subagent's, and how often it was tried.
+struct WtEnd {
+    Str sid;
+    i32 tries;
+};
+
+// A subagent's worktree whose branch was not merged yet, as wtremove
+// found it in merged mode, by the commits of its base and its branch:
+// tried again once either moves.
+struct WtWait {
+    Str path;
+    Str base;
+    Str tip;
 };
 
 // Engine functions take scratch by value, so that whatever a caller has
@@ -1126,8 +1145,10 @@ struct Engine {
     Slice<Str>  wtdue;    // sessions whose worktrees may go now, "" for all
     Slice<WtSess> wtgone; // worktrees of sessions deleted
     Slice<WtKid> wtkids;  // subagents in worktrees of their own
-    Slice<Str>  wtends;   // sessions whose own and descendants' worktrees
+    Slice<WtEnd> wtends;  // sessions whose own and descendants' worktrees
                           // may go once merged
+    i64         wtendsat; // ticks: when wtends is due
+    Slice<WtWait> wtwaits;  // subagents' worktrees not merged yet
     i64         trashat;  // ticks: when the Trash is next purged (trashpurge)
     PrefillLine plines[16];  // prompt processing's lines, by endpoint and model
     u64         pserial;
@@ -2624,6 +2645,10 @@ static b32  wtoffer(Os *, Arena, Str cwd, b32 win);
 static Str  wtfor(Session *to, Arena *, Str from, Str path);
 static void wtkidput(Session *, Session *parent);
 static b32  wtkidof(Engine *, Str sid);
+static b32  wtcheckask(Session *, Arena);
+static Str  wtfallback(Session *, Arena *);
+static b32  wtkid(Session *);
+static void wtend(Engine *, Str sid);
 static void wtrecord(Session *, JsonOut *);
 static void wtload(Session *, Json *);
 static Str  wtpromptline(Session *, Arena *);
@@ -6029,11 +6054,20 @@ static Session *treeroot(Session *s)
     return s;
 }
 
+// The checkout a session works in, if a worktree, else null: the
+// repository's main checkout, or none (wtfor).
+static Str wtsrc(Session *s)
+{
+    return s->wt.name.len ? s->wt.path : Str{};
+}
+
 // The user's "always" for the ask of s: logged in s, and in its root if
 // that is another session in memory, then given to the whole tree, and
 // logged by "parent" in each other session of it that lacked it, so
-// that one opened again later has it as it had it here. A skill's
-// directory is granted the same way, by "skill" (skillgrant).
+// that one opened again later has it as it had it here. A subagent in
+// a worktree of its own gets a path in s's checkout as in its worktree
+// (wtfor). A skill's directory is granted the same way, by "skill"
+// (skillgrant).
 static void usergrant(Session *s, Arena scratch, Grant g, Str req, Str by)
 {
     Session *root = treeroot(s);
@@ -6043,9 +6077,12 @@ static void usergrant(Session *s, Arena scratch, Grant g, Str req, Str by)
         loggrant(root, scratch, g, "subagent", req, s->sid);
     }
     for (Session *t = s->e->sessions; t; t = t->next) {
-        if (treeroot(t)==root && addgrant(t, g) &&
+        Arena a  = scratch;
+        Grant tg = g;
+        tg.path  = t==s ? g.path : wtfor(t, &a, wtsrc(s), g.path);
+        if (treeroot(t)==root && addgrant(t, tg) &&
                 t!=s && !(t==root && top)) {
-            loggrant(t, scratch, g, "parent", {}, {});
+            loggrant(t, a, tg, "parent", {}, {});
         }
     }
 }
@@ -6117,9 +6154,12 @@ static b32 userrevoke(Session *s, Arena scratch, Grant r)
     Session *root = treeroot(s);
     b32      any  = 0;
     for (Session *t = s->e->sessions; t; t = t->next) {
-        if (treeroot(t)==root && revokegrant(t, r)) {
+        Arena a  = scratch;
+        Grant tr = r;
+        tr.path  = t==s ? r.path : wtfor(t, &a, wtsrc(s), r.path);
+        if (treeroot(t)==root && revokegrant(t, tr)) {
             TreeBy b = treeby(s, t);
-            logrevoke(t, scratch, r, 0, b.by, b.from);
+            logrevoke(t, a, tr, 0, b.by, b.from);
             any = 1;
         }
     }
@@ -6134,18 +6174,28 @@ static b32 userdeny(Session *s, Arena scratch, Str path, b32 on)
     Session *root = treeroot(s);
     b32      any  = 0;
     for (Session *t = s->e->sessions; t; t = t->next) {
-        if (treeroot(t)!=root || !denypath(t, path, on)) {
+        if (treeroot(t) != root) {
             continue;
         }
-        TreeBy b = treeby(s, t);
-        if (on) {
-            logdeny(t, scratch, path, b.by, b.from);
-        } else {
-            Grant r = {};
-            r.path = path;
-            logrevoke(t, scratch, r, 1, b.by, b.from);
+        // In a worktree subagent, as in its worktree, and as given too,
+        // as a deny only narrows
+        Arena a     = scratch;
+        Str   in    = t==s ? path : wtfor(t, &a, wtsrc(s), path);
+        Str   paths[2] = {in, path};
+        for (iz i = 0; i < (in.data==path.data ? 1 : 2); i++) {
+            if (!denypath(t, paths[i], on)) {
+                continue;
+            }
+            TreeBy b = treeby(s, t);
+            if (on) {
+                logdeny(t, a, paths[i], b.by, b.from);
+            } else {
+                Grant r = {};
+                r.path = paths[i];
+                logrevoke(t, a, r, 1, b.by, b.from);
+            }
+            any = 1;
         }
-        any = 1;
     }
     return any;
 }
@@ -16445,6 +16495,9 @@ static void endturn(Session *s, Arena scratch, Str why, Str err)
         s->e->wtdue = push(&s->e->perm, s->e->wtdue, clone(&s->e->perm, s->sid));
     }
     taskcheck(s, scratch, why, err);
+    if (!busy(s) && ((wtkid(s) && !s->intask) || wtkidof(s->e, s->sid))) {
+        wtend(s->e, s->sid);  // a subagent's branch may be merged now
+    }
 }
 
 static b32 busy(Session *s)
@@ -18268,13 +18321,14 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err,
         return 0;
     }
     s->cwd   = clone(&s->perm, p->cwd);
+    s->psid  = clone(&s->perm, p->sid);  // a subagent's, for wtfor
     Str from = {};  // the parent's checkout, in a worktree of its own
     if (args->worktree) {
         Str desc = args->desc.len ? args->desc : args->prompt;
         Str why  = wttask(e, &s->perm, scratch, p->cwd, desc, recs, &s->wt, &s->cwd);
         if (why.len) {
-            dropsession(e, s);
             *err = concat(&p->perm, "No subagent was started: ", why);
+            dropsession(e, s);  // and its arena, with why in it
             return 0;
         }
         from = s->wt.src;
@@ -18316,7 +18370,6 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err,
                  TOOL_PLANMASK | TOOL_ASKMASK;
     s->mcpfilter = r.mcp.data ? clone(&s->perm, r.mcp) :
                    p->mcpfilter.data ? clone(&s->perm, p->mcpfilter) : Str{};
-    s->psid    = clone(&s->perm, p->sid);
     s->pcall   = clone(&s->perm, c->id);
     s->intask  = 1;
     s->tbegan  = os_time(e->os);
@@ -18736,15 +18789,19 @@ static Str reportcut(Session *p, Arena *a, Str call, Str text, Str *spill, i64 *
     return finish(&in);
 }
 
-static void bgreport(Session *, Arena, Str why, Str err);
+static void bgreport(Session *, Arena, Str why, Str err, Str wtline);
 
 // A subagent is done with its task: its report goes to the parent's
 // call, which ends once the calls before it have (taskflush), or as a
 // notice if the user moved it to the background. why and err are as
-// its last turn ended.
-static void taskreport(Session *c, Arena scratch, Str why, Str err)
+// its last turn ended. A subagent in a worktree of its own has a line
+// on what it left there: wtline, from git's check, else what the refs
+// say (wtfallback).
+static void taskreport(Session *c, Arena scratch, Str why, Str err, Str wtline = {})
 {
-    c->intask = 0;
+    c->intask  = 0;
+    c->wtcheck = 0;  // its answer, should it come, is dropped
+    wtline = wtline.len || !wtkid(c) ? wtline : wtfallback(c, &scratch);
     if (c->rparent.len) {
         // Not as the engine quits: opened again, it reports interrupted
         if (!c->e->quitting && !c->readonly) {
@@ -18752,7 +18809,7 @@ static void taskreport(Session *c, Arena scratch, Str why, Str err)
         }
         return;
     } else if (c->bgtask) {
-        bgreport(c, scratch, why, err);
+        bgreport(c, scratch, why, err, wtline);
         return;
     }
     Session *p = c->parent;
@@ -18768,6 +18825,7 @@ static void taskreport(Session *c, Arena scratch, Str why, Str err)
     text = reportcut(p, &scratch, p->calls[t->call].id, text, &t->spill, &t->bytes);
     t->text = clone(&p->perm, text);
     t->spent = clone(&p->perm, taskspent(&scratch, c));
+    t->wtline = wtline.len ? clone(&p->perm, wtline) : Str{};
     t->urls = webvouch(c, &p->perm, text);  // for the parent's webseen
     t->took = os_ticks(p->e->os) - t->start;
     t->done = 1;
@@ -18777,16 +18835,20 @@ static void taskreport(Session *c, Arena scratch, Str why, Str err)
 
 // A subagent's turn ended: its task did too, unless it ended well with
 // background jobs running, whose ends will start the next turn. Once it
-// reports, any jobs it left are stopped.
+// reports, any jobs it left are stopped. One in a worktree of its own
+// that ended well reports once git has checked what it left there
+// (wtchecked), should the check start.
 static void taskcheck(Session *s, Arena scratch, Str why, Str err)
 {
-    if (!s->intask || busy(s)) {
+    if (!s->intask || busy(s) || s->wtcheck) {
         return;
     } else if (why=="done" && jobsrunning(s) && canresume(s)) {
         return;
     }
     stopjobs(s, scratch, s->e->quitting);
-    taskreport(s, scratch, why, err);
+    if (why!="done" || !wtcheckask(s, scratch)) {
+        taskreport(s, scratch, why, err);
+    }
 }
 
 // End the task calls whose subagents have reported, in order, and once
@@ -18804,6 +18866,9 @@ static void taskflush(Session *s, Arena scratch)
         Arena    a = scratch;
         TaskRun *t = &s->tasks[i];
         Str      text = t->text;
+        if (t->wtline.len) {
+            text = concat(&a, concat(&a, text, "\n\n"), t->wtline);
+        }
         if (t->took || t->spent.len) {
             text = concat(&a, concat(&a, text, "\n\n"),
                           spentline(&a, t->took/MS, t->spent));
@@ -18848,9 +18913,10 @@ static void taskcancel(Session *s, Arena scratch)
         Arena a = scratch;
         cancelturn(c, a);
         if (c->intask && !busy(c)) {
-            // It waited for its background jobs
+            // It waited for its background jobs, or for git's check of
+            // its worktree, its task done
             stopjobs(c, a, e->quitting);
-            taskreport(c, a, "cancel", {});
+            taskreport(c, a, c->wtcheck ? Str("done") : Str("cancel"), {});
         }
     }
     farcancel(s, scratch);  // those on other hosts end at once
@@ -18901,12 +18967,13 @@ static Session *bgparent(Engine *e, Arena scratch, Str psid)
 // on host, if another, for call), status and text as reporttext's, as
 // a notice of kind task, which starts its turn if it is idle.
 static void bgnotice(Session *p, Arena scratch, Str call, Str sid, Str title,
-                     Str host, Str status, Str text, Slice<Str> urls = {})
+                     Str host, Str status, Str text, Slice<Str> urls = {},
+                     Str tail = {})
 {
     Str spill = {};
     i64 bytes = 0;
     text = reportcut(p, &scratch, call, text, &spill, &bytes);
-    Buf b(&scratch, 512 + title.len + host.len + text.len);
+    Buf b(&scratch, 512 + title.len + host.len + text.len + tail.len);
     print(&b, "The subagent ");
     if (title.len) {
         print(&b, "\"");
@@ -18923,6 +18990,10 @@ static void bgnotice(Session *p, Arena scratch, Str call, Str sid, Str title,
     print(&b, status=="ok" ? Str("finished. Its report:\n\n")
                            : Str("ended before it finished:\n\n"));
     print(&b, text);
+    if (tail.len) {
+        print(&b, "\n\n");
+        print(&b, tail);  // never cut
+    }
 
     Notice n = {};
     n.kind   = "task";
@@ -18937,8 +19008,9 @@ static void bgnotice(Session *p, Arena scratch, Str call, Str sid, Str title,
     }  // else read at its next step, or its turn's end starts one
 }
 
-// A subagent in the background is done: tell its parent.
-static void bgreport(Session *c, Arena scratch, Str why, Str err)
+// A subagent in the background is done: tell its parent, with a line on
+// what it left in its worktree, if it had one (taskreport).
+static void bgreport(Session *c, Arena scratch, Str why, Str err, Str wtline)
 {
     Engine *e = c->e;
     c->bgtask = 0;
@@ -18954,10 +19026,10 @@ static void bgreport(Session *c, Arena scratch, Str why, Str err)
     Str status = {};
     Str text   = reporttext(c, &scratch, why, err, &status);
     i64 ms     = c->tbegan>0 ? os_time(e->os) - c->tbegan : 0;
-    text = concat(&scratch, concat(&scratch, text, "\n\n"),
-                  spentline(&scratch, ms, taskspent(&scratch, c)));
+    Str tail   = spentline(&scratch, ms, taskspent(&scratch, c));
+    tail = wtline.len ? concat(&scratch, concat(&scratch, wtline, "\n\n"), tail) : tail;
     bgnotice(p, scratch, c->pcall, c->sid, c->title, {}, status, text,
-             webvouch(c, &p->perm, text));
+             webvouch(c, &p->perm, text), tail);
 }
 
 // Whether a subagent's report waits that may start a turn.
@@ -26275,6 +26347,7 @@ static void enginethread(void *arg)
     e->trashat = os_ticks(e->os);  // the Trash purged as it starts
     farinit(e, newarena(e->scratch));
     e->wtdue = push(&e->perm, e->wtdue, Str{});  // left by an engine before
+    wtend(e, {});  // and subagents' merged since
     for (;;) {
         i64 now  = os_ticks(e->os);
         i64 next = e->quitting ? e->quitby : I64MAX;
@@ -26283,6 +26356,7 @@ static void enginethread(void *arg)
         next = mcpnext(e)<next ? mcpnext(e) : next;
         next = farnext(e)<next ? farnext(e) : next;
         next = e->wtdue.len || e->wtgone.len ? now : next;
+        next = e->wtends.len && e->wtendsat<next ? (e->wtendsat<now ? now : e->wtendsat) : next;
         next = !e->quitting && e->trashat<next ? e->trashat : next;
         next = relaynext(e, now)<next ? relaynext(e, now) : next;
         next = termnext(e, now)<next ? termnext(e, now) : next;
@@ -26375,7 +26449,8 @@ static void enginethread(void *arg)
             trashpurge(e, &t, trashdays(e)*DAY_MS, &gone);
             e->trashat = os_ticks(e->os) + TRASH_EVERY*(i64)MS;
         }
-        if ((e->wtdue.len || e->wtgone.len) && !e->quitting) {
+        b32 ends = e->wtends.len && os_ticks(e->os)>=e->wtendsat;
+        if ((e->wtdue.len || e->wtgone.len || ends) && !e->quitting) {
             wtsweep(e, newarena(e->scratch));  // worktrees no session needs
         }
 

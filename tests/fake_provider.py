@@ -1884,6 +1884,148 @@ def second(model):
     return ":".join(parts)
 
 
+def said_last(req):
+    """What the user said last, as a scenario's command: the first line of
+    the messages since the model's last response that is one (go, nest,
+    hi, or run, task, write or read with an argument), apart from any
+    notices, else the last message's text."""
+    lines = []
+    for m in reversed(req.get("messages", [])):
+        if m.get("role") != "user":
+            break
+        c = m.get("content")
+        if isinstance(c, list):
+            c = "".join(b.get("text", "") for b in c if b.get("type") == "text")
+        lines = str(c or "").splitlines() + lines
+    for line in lines:
+        if re.fullmatch(r"(go|nest|hi|(run|task|write|read) .+)", line.strip()):
+            return line.strip()
+    return last_user_text(req)
+
+
+def wt_parent(model, n, req, tasks):
+    """A parent of subagents in worktrees: "go" starts tasks [(description,
+    prompt)] in worktrees, "run CMD" runs CMD, and else it says what it
+    heard."""
+    said = said_last(req)
+    if req["messages"][-1].get("role") == "user" and said == "go":
+        b = second(model)
+        yield from calls(model, n, [("task", {"description": d, "prompt": p, "model": b,
+                                              "worktree": True}) for d, p in tasks])
+    elif req["messages"][-1].get("role") == "user" and said and said.startswith("run "):
+        yield from tool(model, n, "shell", {"command": said[4:]})
+    else:
+        yield from answer(model, "Parent heard: " + " / ".join(tool_results(req)))
+
+
+def wt_child(model, n, req):
+    """A subagent in a worktree: a task's prompt "run CMD" runs CMD, then
+    it reports; any other message gets a plain answer."""
+    said = said_last(req) or ""
+    if req["messages"][-1].get("role") == "tool":
+        out = tool_results(req)[-1].strip().splitlines()
+        yield from answer(model, "Report: " + (out[0] if out else ""))
+    elif said.startswith("run "):
+        yield from tool(model, n, "shell", {"command": said[4:]})
+    else:
+        yield from answer(model, f"Answer number {n}.")
+
+
+def sc_task_worktree(model, n, req):
+    yield from wt_parent(model, n, req, [
+        ("Fix the parser", "run echo 'int x;' >> main.c && git commit -qam change && "
+                           "git rev-parse --abbrev-ref HEAD")])
+
+
+def sc_task_worktree_b(model, n, req):
+    yield from wt_child(model, n, req)
+
+
+EDIT = "run echo {} > ../README && git commit -qam {} && git rev-parse --abbrev-ref HEAD"
+
+
+def sc_task_worktree_two(model, n, req):
+    yield from wt_parent(model, n, req, [("Edit the file", EDIT.format("A", "a")),
+                                         ("Edit the file", EDIT.format("B", "b"))])
+
+
+def sc_task_worktree_two_b(model, n, req):
+    yield from wt_child(model, n, req)
+
+
+def sc_task_worktree_empty(model, n, req):
+    yield from wt_parent(model, n, req, [("Do nothing", "run true"),
+                                         ("Leave a file", "run echo x > new.txt")])
+
+
+def sc_task_worktree_empty_b(model, n, req):
+    yield from wt_child(model, n, req)
+
+
+def sc_task_worktree_refused(model, n, req):
+    yield from wt_parent(model, n, req, [("Try it", "run true")])
+
+
+def sc_task_worktree_nested(model, n, req):
+    yield from wt_parent(model, n, req, [("Outer work", "nest")])
+
+
+def sc_task_worktree_nested_b(model, n, req):
+    # Starts one of its own in a worktree, merges its branch, and reports;
+    # the one it starts runs this script too
+    said = said_last(req)
+    if said == "nest" and not last_call(req)[0]:
+        yield from calls(model, n, [("task", {
+            "description": "Inner work", "model": model, "worktree": True,
+            "prompt": "run echo y >> src/main.c && git commit -qam inner && "
+                      "git rev-parse --abbrev-ref HEAD"})])
+    elif last_call(req)[0] == "task":
+        yield from tool(model, n, "shell", {"command": "git merge -q --ff-only "
+                                            "prospero/inner-work && echo merged"})
+    elif last_call(req)[0] == "shell" and said == "nest":
+        yield from answer(model, "Report: " + tool_results(req)[-1].strip().split("\n")[0])
+    else:
+        yield from wt_child(model, n, req)
+
+
+def sc_task_worktree_nested_b_b(model, n, req):
+    yield from wt_child(model, n, req)
+
+
+def sc_task_worktree_cancel(model, n, req):
+    yield from wt_parent(model, n, req, [("Hold on", "run echo z >> src/main.c && "
+                                          "git commit -qam z && git rev-parse "
+                                          "--abbrev-ref HEAD")])
+
+
+def sc_task_worktree_cancel_b(model, n, req):
+    yield from wt_child(model, n, req)
+
+
+def sc_task_worktree_grants(model, n, req):
+    # "task PROMPT" starts one with that prompt
+    said = said_last(req)
+    if req["messages"][-1].get("role") == "user" and said and said.startswith("task "):
+        yield from calls(model, n, [("task", {"description": "Use grants", "prompt": said[5:],
+                                              "model": second(model), "worktree": True})])
+    else:
+        yield from answer(model, "Parent heard: " + " / ".join(tool_results(req)))
+
+
+def sc_task_worktree_grants_b(model, n, req):
+    # Its task's prompt: "write PATH" or "read PATH", or else a plain answer
+    said = said_last(req) or ""
+    m = re.match(r"(write|read) (\S+)$", said)
+    if req["messages"][-1].get("role") == "user" and m:
+        args = {"path": m.group(2)}
+        args.update({"content": "x\n"} if m.group(1) == "write" else {})
+        yield from tool(model, n, m.group(1), args)
+    elif req["messages"][-1].get("role") == "tool":
+        yield from answer(model, "Report: " + tool_results(req)[-1].strip().split("\n")[0])
+    else:
+        yield from answer(model, f"Answer number {n}.")
+
+
 def sc_task_parallel(model, n, req):
     if step(req) == 0:
         b = second(model)

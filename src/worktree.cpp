@@ -23,6 +23,13 @@
 // BASE (for a detached base: still at OID) and checked out nowhere.
 // What stays, and why, is in the answer.
 //
+// In merged mode (a subagent's worktree), a removal waits until BRANCH
+// is merged, answering "waiting" until then, and touching nothing.
+//
+// check: what a subagent left in its worktree as it reports, reading
+// only: BRANCH's commit, its commits since OID, the files not
+// committed, and the branch the worktree is on.
+//
 // This is free and unencumbered software released into the public domain.
 
 enum : i64 {
@@ -38,9 +45,10 @@ enum : i64 {
 enum : i32 {
     WT_MAKE,
     WT_REMOVE,
+    WT_CHECK,
 };
 
-static Str wtkinds[] = {"make", "remove"};
+static Str wtkinds[] = {"make", "remove", "check"};
 
 // A job, as the worker takes it.
 struct WtAsk {
@@ -53,6 +61,7 @@ struct WtAsk {
     Str        base;     // the branch it was cut from, null if detached
     Str        oid;      // the commit it was cut from
     Str        tip;      // make: the branch's commit when it was removed
+    b32        merged;   // remove: only once BRANCH is merged
     Str        git;      // [tools] git
     Str        home;
     Str        errpath;  // for git's standard error
@@ -65,7 +74,8 @@ static WtAsk wtparseask(Arena *a, Str record)
     WtAsk   q = {};
     JsonDoc d = jsonparse(a, clone(a, record));
     q.id      = jsonint(jsonget(d.root, "id"), 0);
-    q.kind    = jsonstr(jsonget(d.root, "kind"))=="remove" ? WT_REMOVE : WT_MAKE;
+    Str kind  = jsonstr(jsonget(d.root, "kind"));
+    q.kind    = kind=="remove" ? WT_REMOVE : kind=="check" ? WT_CHECK : WT_MAKE;
     q.sid     = jsonstr(jsonget(d.root, "sid"));
     q.main    = jsonstr(jsonget(d.root, "main"));
     q.path    = jsonstr(jsonget(d.root, "path"));
@@ -73,6 +83,7 @@ static WtAsk wtparseask(Arena *a, Str record)
     q.base    = jsonstr(jsonget(d.root, "base"));
     q.oid     = jsonstr(jsonget(d.root, "oid"));
     q.tip     = jsonstr(jsonget(d.root, "tip"));
+    q.merged  = jsonflag(jsonget(d.root, "merged"), 0);
     q.git     = jsonstr(jsonget(d.root, "git"));
     q.home    = jsonstr(jsonget(d.root, "home"));
     q.errpath = jsonstr(jsonget(d.root, "errpath"));
@@ -86,11 +97,17 @@ static WtAsk wtparseask(Arena *a, Str record)
 // What a job did, for the engine.
 struct WtDone {
     b32 ok;
-    Str err;     // why not
-    Str did;     // remove: removed, kept, or gone (no worktree there)
-    Str why;     // kept: dirty, submodules, locked, in use, branch, or error
-    Str tip;     // remove: the branch's commit then
-    Str branch;  // remove: deleted, unmerged, or null if none
+    Str err;      // why not
+    Str did;      // remove: removed, kept, gone (no worktree there), or
+                  // waiting (merged mode); check: there, or gone
+    Str why;      // kept: dirty, submodules, locked, in use, branch, or error
+    Str tip;      // remove, check: the branch's commit then
+    Str branch;   // remove: deleted, unmerged, or null if none
+    i64 commits;  // check: the branch's since OID, -1 if not known
+    i64 dirty;    // check: the files not committed, -1 if not known
+    Str head;     // check: the branch the worktree is on, if not BRANCH
+    Str headoid;  // and its commit
+    Str baseoid;  // remove, waiting: the base's commit then
 };
 
 static Str wtdonejson(Arena *a, WtAsk *q, WtDone *d)
@@ -108,6 +125,13 @@ static Str wtdonejson(Arena *a, WtAsk *q, WtDone *d)
     if (d->why.len) putstrkey(&w, "why", d->why);
     if (d->tip.len) putstrkey(&w, "tip", d->tip);
     if (d->branch.len) putstrkey(&w, "branch", d->branch);
+    if (d->baseoid.len) putstrkey(&w, "baseoid", d->baseoid);
+    if (q->kind == WT_CHECK) {
+        putintkey(&w, "commits", d->commits);
+        putintkey(&w, "dirty", d->dirty);
+        if (d->head.len) putstrkey(&w, "head", d->head);
+        if (d->headoid.len) putstrkey(&w, "headoid", d->headoid);
+    }
     putend(&w);
     return finish(&b);
 }
@@ -307,11 +331,38 @@ static Str wtwhy(Str err)
     return "error";
 }
 
+// Whether the branch's commit, tip, is merged into the base, or for a
+// detached base, still where it was cut.
+static b32 wtmerged(GitWork *w, Arena *a, Arena scratch, WtAsk *q, Str prog, Str tip)
+{
+    if (!q->base.len) {
+        return tip == q->oid;
+    }
+    Slice<Str> args = {};
+    args = wtargs(&scratch, args, "merge-base");
+    args = wtargs(&scratch, args, "--is-ancestor");
+    args = wtargs(&scratch, args, tip);
+    args = wtargs(&scratch, args, concat(&scratch, "refs/heads/", q->base));
+    GitRun r = wtgit(w, a, scratch, q, prog, args, WT_GITWAIT);
+    return r.spawned && !r.timeout && !r.quit && r.code==0;
+}
+
 static WtDone wtremove(GitWork *w, Arena *a, Arena scratch, WtAsk *q, Str prog)
 {
     WtDone d   = {};
     Os    *os  = w->os;
     Str    ref = concat(&scratch, "refs/heads/", q->branch);
+
+    if (q->merged) {
+        Str tip = wtbranchoid(w, a, scratch, q, prog, q->branch);
+        if (tip.len && !wtmerged(w, a, scratch, q, prog, tip)) {
+            d.ok      = 1;
+            d.did     = "waiting";
+            d.tip     = clone(a, tip);
+            d.baseoid = q->base.len ? wtbranchoid(w, a, scratch, q, prog, q->base) : Str{};
+            return d;
+        }
+    }
 
     Slice<GitTree> trees = wtlist(w, a, scratch, q, prog, &d.err);
     if (d.err.len) {
@@ -375,19 +426,7 @@ static WtDone wtremove(GitWork *w, Arena *a, Arena scratch, WtAsk *q, Str prog)
         return d;
     }
     d.tip = clone(a, tip);
-    b32 merged = 0;
-    if (q->base.len) {
-        Slice<Str> args = {};
-        args = wtargs(&scratch, args, "merge-base");
-        args = wtargs(&scratch, args, "--is-ancestor");
-        args = wtargs(&scratch, args, tip);
-        args = wtargs(&scratch, args, concat(&scratch, "refs/heads/", q->base));
-        GitRun r = wtgit(w, a, scratch, q, prog, args, WT_GITWAIT);
-        merged = r.spawned && !r.timeout && !r.quit && r.code==0;
-    } else {
-        merged = tip == q->oid;
-    }
-    if (!merged) {
+    if (!wtmerged(w, a, scratch, q, prog, tip)) {
         d.branch = "unmerged";
         return d;
     }
@@ -402,6 +441,64 @@ static WtDone wtremove(GitWork *w, Arena *a, Arena scratch, WtAsk *q, Str prog)
     return d;
 }
 
+// The number of lines in a run's output.
+static i64 wtlines(Str out)
+{
+    i64 n = 0;
+    for (iz i = 0; i < out.len; i++) {
+        n += out[i]=='\n' || (i==out.len-1 && out[i]!='\n');
+    }
+    return n;
+}
+
+static WtDone wtcheck(GitWork *w, Arena *a, Arena scratch, WtAsk *q, Str prog)
+{
+    WtDone d   = {};
+    Os    *os  = w->os;
+    Str    ref = concat(&scratch, "refs/heads/", q->branch);
+    d.commits  = d.dirty = -1;
+
+    Slice<GitTree> trees = wtlist(w, a, scratch, q, prog, &d.err);
+    if (d.err.len) {
+        d.err = clone(a, d.err);
+        return d;
+    }
+    GitTree *ours = 0;
+    for (iz i = 0; i < trees.len; i++) {
+        ours = wtsame(os, scratch, trees[i].path, q->path, q->win) ? &trees[i] : ours;
+    }
+    d.ok  = 1;
+    d.did = ours && !ours->prunable ? Str("there") : Str("gone");
+    d.tip = wtbranchoid(w, a, scratch, q, prog, q->branch);
+    if (d.tip.len) {
+        Slice<Str> args = {};
+        args = wtargs(&scratch, args, "rev-list");
+        args = wtargs(&scratch, args, "--count");
+        args = wtargs(&scratch, args, concat(&scratch, concat(&scratch, q->oid, ".."),
+                                             d.tip));
+        GitRun r = wtgit(w, a, scratch, q, prog, args, WT_GITWAIT);
+        Str    n = gitclean(r.out);
+        Int    c = parseint(n);
+        d.commits = !r.code && c.ok ? c.val : -1;
+    }
+    if (d.did == "gone") {
+        return d;
+    } else if (ours->branch != ref) {
+        Str head  = ours->branch;
+        d.head    = startswith(head, "refs/heads/") ? cuthead(head, 11) : head;
+        d.head    = d.head.len ? clone(a, d.head) : Str("(detached)");
+        d.headoid = clone(a, ours->oid);
+    }
+    Slice<Str> args = {};
+    args = wtargs(&scratch, args, "-C");
+    args = wtargs(&scratch, args, q->path);
+    args = wtargs(&scratch, args, "status");
+    args = wtargs(&scratch, args, "--porcelain");
+    GitRun r = wtgit(w, a, scratch, q, prog, args, WT_GITWAIT);
+    d.dirty  = !r.code && r.spawned && !r.timeout ? wtlines(r.out) : -1;
+    return d;
+}
+
 static Str wtjob(GitWork *w, Arena *a, Arena scratch, WtAsk *q)
 {
     WtDone  d    = {};
@@ -412,6 +509,8 @@ static Str wtjob(GitWork *w, Arena *a, Arena scratch, WtAsk *q)
         d.err = gitmissing(a, q->git, prog.shim);
     } else if (q->kind == WT_REMOVE) {
         d = wtremove(w, a, scratch, q, prog.path);
+    } else if (q->kind == WT_CHECK) {
+        d = wtcheck(w, a, scratch, q, prog.path);
     } else {
         d = wtmake(w, a, scratch, q, prog.path);
     }
@@ -902,6 +1001,19 @@ static GitWork *wtwork(Engine *e)
     return w->started ? w : 0;
 }
 
+// Whether a job holds a session's turns: the removal of a subagent's
+// merged worktree, queued while its parent was idle, which the parent's
+// next turn must not see half done.
+static b32 wtholding(Engine *e, Str sid)
+{
+    for (iz i = 0; i < e->wtjobs.len; i++) {
+        if (e->wtjobs[i].holds.len && e->wtjobs[i].holds==sid) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 // The job under way or waiting for a worktree, if any.
 static WtJob *wtjobfor(Engine *e, Str path)
 {
@@ -923,6 +1035,8 @@ struct WtSpec {
     Str base;
     Str oid;
     Str tip;
+    b32 merged;  // remove: only once the branch is merged
+    Str holds;   // a session whose turns wait for the job
 };
 
 // Queue a job for the worker: null if queued, else why not.
@@ -959,6 +1073,7 @@ static Str wtqueue(Engine *e, Arena scratch, i32 kind, WtSpec *sp)
     putstrkey(&o, "base", sp->base);
     putstrkey(&o, "oid", sp->oid);
     putstrkey(&o, "tip", sp->tip);
+    putintkey(&o, "merged", sp->merged);
     putstrkey(&o, "git", trim(cfgget(e->cfg, "tools", "", "git", 0)));
     putstrkey(&o, "home", e->home);
     putstrkey(&o, "errpath", errpath);
@@ -978,6 +1093,7 @@ static Str wtqueue(Engine *e, Arena scratch, i32 kind, WtSpec *sp)
     job.kind  = kind;
     job.path  = clone(&e->perm, sp->path);
     job.sid   = clone(&e->perm, sp->sid);
+    job.holds = sp->holds.len ? clone(&e->perm, sp->holds) : Str{};
     e->wtjobs = push(&e->perm, e->wtjobs, job);
     return {};
 }
@@ -1426,7 +1542,10 @@ static Str wtask(Session *s, Arena scratch)
 static b32 wtgate(Session *s, Arena scratch, b32 turn)
 {
     Engine *e = s->e;
-    if (!s->wt.name.len || s->readonly) {
+    if (turn && wtholding(e, s->sid)) {
+        setstate(s, S_WORKTREE);  // until wtdone
+        return 0;
+    } else if (!s->wt.name.len || s->readonly) {
         return 1;
     } else if (wtexists(e, scratch, &s->wt) && !wtjobfor(e, s->wt.path)) {
         wtready(s, scratch);
@@ -1468,9 +1587,21 @@ static Slice<Str> wtrecorders(Engine *e, Arena *a, Str path)
 // A worktree made, or not: the sessions in it go on, and those waiting
 // for it begin their turns, or end them with git's reason. Made, it is
 // no longer marked as removed or kept.
+static void wtforget(Engine *e, Str path)
+{
+    for (iz i = 0; i < e->wtwaits.len; i++) {
+        if (e->wtwaits[i].path == path) {
+            e->wtwaits[i] = e->wtwaits[e->wtwaits.len-1];
+            e->wtwaits.len--;
+            return;
+        }
+    }
+}
+
 static void wtmade(Engine *e, Arena scratch, Str sid, Str path, b32 ok, Str err)
 {
     wtsay(e, scratch, sid, path, ok ? Str("made") : Str("failed"), {}, err, {});
+    wtforget(e, path);
     Slice<Str> sids = ok ? wtrecorders(e, &scratch, path) : Slice<Str>{};
     for (iz i = 0; i < sids.len; i++) {
         sidecarput(e, scratch, sids[i], "worktree", {});
@@ -1485,6 +1616,9 @@ static void wtmade(Engine *e, Arena scratch, Str sid, Str path, b32 ok, Str err)
             if (ok && s->wtdefer) {
                 wtready(s, a);
             }
+            if (ok && wtkid(s) && !s->intask && !busy(s)) {
+                wtend(e, s->sid);  // a subagent done meanwhile (cancelled)
+            }
         } else if (ok) {
             setstate(s, S_IDLE);
             turnready(s, a);  // through the gate again, as it may be gone
@@ -1492,6 +1626,17 @@ static void wtmade(Engine *e, Arena scratch, Str sid, Str path, b32 ok, Str err)
             setstate(s, S_IDLE);
             Str why = concat(&a, "the worktree cannot be made: ", err);
             endturn(s, a, "error", why);
+        }
+    }
+}
+
+static void wtkiddrop(Engine *e, Str sid)
+{
+    for (iz i = 0; i < e->wtkids.len; i++) {
+        if (e->wtkids[i].sid == sid) {
+            e->wtkids[i] = e->wtkids[e->wtkids.len-1];
+            e->wtkids.len--;
+            return;
         }
     }
 }
@@ -1507,12 +1652,37 @@ static void wtremoved(Engine *e, Arena scratch, Json *answer)
     Str why  = ok ? jsonstr(jsonget(answer, "why")) : Str("error");
     Str path = jsonstr(jsonget(answer, "path"));
     Str tip  = jsonstr(jsonget(answer, "tip"));
+    if (did == "waiting") {
+        // Merged mode, its branch not merged yet: nothing changed, so no
+        // news and no mark, only what to try again once it moves
+        wtforget(e, path);
+        WtWait wait = {};
+        wait.path = clone(&e->perm, path);
+        wait.base = clone(&e->perm, jsonstr(jsonget(answer, "baseoid")));
+        wait.tip  = clone(&e->perm, tip);
+        e->wtwaits = push(&e->perm, e->wtwaits, wait);
+        for (Session *s = e->sessions; s; s = s->next) {
+            if (s->wt.path==path && s->state==S_WORKTREE) {
+                Arena a = scratch;
+                setstate(s, S_IDLE);
+                turnready(s, a);
+            }
+        }
+        return;
+    }
     wtsay(e, scratch, jsonstr(jsonget(answer, "sid")), path, did, why,
           jsonstr(jsonget(answer, "err")), jsonstr(jsonget(answer, "branch")));
+    wtforget(e, path);
     Str        mark = did=="kept" ? Str("kept") : gitoid(tip) ? tip : Str("gone");
     Slice<Str> sids = wtrecorders(e, &scratch, path);
     for (iz i = 0; i < sids.len; i++) {
         sidecarput(e, scratch, sids[i], "worktree", mark);
+    }
+    Str branch = jsonstr(jsonget(answer, "branch"));
+    if (did!="kept" && (!branch.len || branch=="deleted")) {
+        for (iz i = 0; i < sids.len; i++) {
+            wtkiddrop(e, sids[i]);  // nothing of it left to merge
+        }
     }
     for (Session *s = e->sessions; s; s = s->next) {
         if (s->wt.path==path && s->state==S_WORKTREE) {
@@ -1523,14 +1693,48 @@ static void wtremoved(Engine *e, Arena scratch, Json *answer)
     }
 }
 
+// Whether a scanned session is sid or below it.
+static b32 scanunder(SessScan *sc, iz i, Str sid)
+{
+    for (i32 n = 0; i>=0 && n<=TASK_DEPTH+8; n++) {
+        ListEntry *en = &sc->list[i];
+        if (en->sid == sid) {
+            return 1;
+        }
+        iz *p = en->parent.len ? upsert(&sc->bysid, en->parent, (Arena *)0) : 0;
+        i = p ? *p : -1;
+    }
+    return 0;
+}
+
+// Whether a scanned session is a subagent in a worktree of its own.
+static b32 scankid(ListEntry *en)
+{
+    return en->wt.name.len && en->parent.len && !en->wt.src.len;
+}
+
+enum : i32 {
+    WT_ENDTRIES = 30,       // times a merged pass waits for a session to settle
+    WT_ENDWAIT  = 2*SEC,    // between them
+};
+
 // Worktrees no session needs any longer, removed: those of the sessions
 // due (wtdue), or of all sessions ("" in it, as the engine starts), and
 // of those deleted (wtgone). One goes once every session recording it,
 // or working in it, is archived or in the Trash (it or an ancestor:
 // scanaside) or deleted, open in no other process, and idle here, which
-// is then parked, so that its MCP servers let go of the folder. As the
-// engine starts, a worktree marked removed or kept (the worktree
-// sidecar) is left alone, unless it is back, made again by hand.
+// is then parked, so that its MCP servers let go of the folder. A due
+// session names its own worktree, the one it works in, and those of
+// its descendants. As the engine starts, a worktree marked removed or
+// kept (the worktree sidecar) is left alone, unless it is back, made
+// again by hand.
+//
+// Subagents' worktrees, of the sessions in wtends and below them, go
+// once merged: in merged mode, once every session recording or working
+// in one is a finished subagent (idle, its task done), and, should its
+// branch have commits, its parent is idle too, so not while that turn
+// still works in it. One that git found unmerged waits until its base
+// or its branch moves (wtwaits).
 static void wtsweep(Engine *e, Arena scratch)
 {
     b32 win = HOST_WINDOWS;
@@ -1541,6 +1745,7 @@ static void wtsweep(Engine *e, Arena scratch)
     SessScan       sc    = scansessions(e, &scratch);
     Slice<WtSess>  cands = {};
     Slice<b32>     named = {};  // by a session due, or deleted
+    Slice<iz>      ended = {};  // by a session in wtends: its index, else -1
     for (iz k = 0; k < sc.list.len + e->wtgone.len; k++) {
         WtSess *wt   = k<sc.list.len ? &sc.list[k].wt : &e->wtgone[k-sc.list.len];
         b32     gone = k >= sc.list.len;
@@ -1551,6 +1756,7 @@ static void wtsweep(Engine *e, Arena scratch)
         if (wt->name.len && at<0) {
             cands = push(&scratch, cands, *wt);
             named = push(&scratch, named, gone);
+            ended = push(&scratch, ended, (iz)-1);
         } else if (at >= 0) {
             named[at] |= gone;
         }
@@ -1562,20 +1768,64 @@ static void wtsweep(Engine *e, Arena scratch)
             Str p = normpath(&scratch, cands[i].path, ".", win);
             named[i] |= sc.list[*at].wt.path==cands[i].path || within(p, cwd, win);
         }
+        for (iz j = 0; at && j<sc.list.len; j++) {
+            // Its descendants' too, as an archive or the Trash takes them
+            for (iz i = 0; sc.list[j].wt.name.len && i<cands.len; i++) {
+                named[i] |= sc.list[j].wt.path==cands[i].path &&
+                            scanunder(&sc, j, e->wtdue[d]);
+            }
+        }
+    }
+    Slice<WtEnd> ends = e->wtends;
+    b32          any  = 0;  // every subagent's
+    for (iz d = 0; d < ends.len; d++) {
+        any |= !ends[d].sid.len;
+    }
+    for (iz j = 0; ends.len && j<sc.list.len; j++) {
+        ListEntry *en = &sc.list[j];
+        if (!scankid(en)) {
+            continue;
+        }
+        iz by = -1;
+        for (iz d = 0; by<0 && d<ends.len; d++) {
+            by = !ends[d].sid.len || scanunder(&sc, j, ends[d].sid) ? d : -1;
+        }
+        for (iz i = 0; by>=0 && i<cands.len; i++) {
+            ended[i] = en->wt.path==cands[i].path && ended[i]<0 ? by : ended[i];
+        }
+        b32 listed = 0;
+        for (iz i = 0; i < e->wtkids.len; i++) {
+            listed |= e->wtkids[i].sid == en->sid;
+        }
+        if (any && !listed) {
+            // As the engine starts: whose turns' ends may merge it
+            iz *p  = upsert(&sc.bysid, en->parent, (Arena *)0);
+            WtKid k = {};
+            k.sid    = clone(&e->perm, en->sid);
+            k.parent = clone(&e->perm, en->parent);
+            k.grand  = p && sc.list[*p].parent.len ? clone(&e->perm, sc.list[*p].parent)
+                                                   : Str{};
+            e->wtkids = push(&e->perm, e->wtkids, k);
+        }
     }
     e->wtdue.len  = 0;
     e->wtgone.len = 0;
+    e->wtends     = {};
+    i64 now       = os_ticks(e->os);
 
     for (iz c = 0; c < cands.len; c++) {
         WtSess *wt = &cands[c];
-        if ((!all && !named[c]) || wtjobfor(e, wt->path)) {
+        b32     merge = ended[c]>=0 && !named[c];
+        if ((!all && !named[c] && !merge) || wtjobfor(e, wt->path)) {
             continue;
         }
         Arena           t      = scratch;
         Str             p      = normpath(&t, wt->path, ".", win);
         b32             ok     = 1;
         b32             marked = 1;  // every session recording it is
+        b32             settle = 0;  // a session to wait for a moment
         Str             sid    = {};
+        Str             parent = {};
         Slice<Session*> parks  = {};
         for (iz i = 0; ok && i<sc.list.len; i++) {
             ListEntry *en  = &sc.list[i];
@@ -1584,16 +1834,62 @@ static void wtsweep(Engine *e, Arena scratch)
                 continue;
             }
             sid     = rec && !sid.len ? en->sid : sid;
+            parent  = rec && !parent.len ? en->parent : parent;
             marked &= !rec || sidecarget(e, &t, en->sid, "worktree", 128).data!=0;
-            Session *s = findsession(e, en->sid);
-            ok = scanaside(&sc, i) && !en->locked && (!s || (!s->readonly && parkable(s)));
+            Session *s    = findsession(e, en->sid);
+            b32      idle = !s || (!s->readonly && parkable(s));
+            if (merge) {
+                // Only finished subagents, none aside (the archive rule)
+                ok = !scanaside(&sc, i) && !en->locked && en->parent.len && idle &&
+                     (!s || !s->wtcheck);
+                settle |= !ok && s && !busy(s) && !en->locked;
+            } else {
+                ok = scanaside(&sc, i) && !en->locked && idle;
+            }
             if (s && ok) {
                 parks = push(&t, parks, s);
             }
         }
         b32 there = wtexists(e, t, wt);  // not what a removal left
         b32 kept  = sid.len && gitclean(sidecarget(e, &t, sid, "worktree", 128))=="kept";
-        if (!ok || (!named[c] && marked && (!there || kept))) {
+        Str tipnow = {};  // merged mode: the branch's commit, by the refs
+        if (merge && ok && !kept) {
+            Arena oids = carve(&t, 256);  // apart from the scratch they are read in
+            Str   git  = gitcommon(e->os, &t, join(&t, wt->main, ".git"), win);
+            Str   ref  = concat(&t, "refs/heads/", wt->branch);
+            Str   bref = concat(&t, "refs/heads/", wt->base);
+            Str   tip  = gitrefoid(e->os, &oids, t, git, ref);
+            Str   base = wt->base.len ? gitrefoid(e->os, &oids, t, git, bref) : Str{};
+            tipnow = tip;
+            if (!there && !tip.len) {
+                wtkiddrop(e, sid);  // nothing left of it
+                continue;
+            }
+            for (iz i = 0; i < e->wtwaits.len; i++) {
+                WtWait *w = &e->wtwaits[i];
+                ok &= !(w->path==wt->path && tip.len && w->tip==tip && w->base==base);
+            }
+            // With commits, not in its parent's turn, which may still
+            // build or test in it, nor while it is open elsewhere
+            iz      *at = parent.len ? upsert(&sc.bysid, parent, (Arena *)0) : 0;
+            Session *ps = parent.len ? findsession(e, parent) : 0;
+            b32      busyp = (ps && busy(ps)) || (at && sc.list[*at].locked);
+            ok &= tip==wt->oid || !busyp;
+        }
+        b32 again = merge && !ok && settle && ends[ended[c]].tries<WT_ENDTRIES;
+        for (iz i = 0; again && i<e->wtends.len; i++) {
+            again = e->wtends[i].sid != ends[ended[c]].sid;
+        }
+        if (again) {
+            WtEnd d = ends[ended[c]];
+            d.tries++;
+            d.sid = d.sid.len ? clone(&e->perm, d.sid) : Str{};
+            e->wtends   = push(&e->perm, e->wtends, d);
+            e->wtendsat = now + WT_ENDWAIT;  // a title or a notice, settling
+        }
+        if (!ok || (merge && kept)) {
+            continue;
+        } else if (!named[c] && !merge && marked && (!there || kept)) {
             continue;  // as the engine starts: removed, or kept, before
         }
         for (iz i = 0; i < parks.len; i++) {
@@ -1606,6 +1902,8 @@ static void wtsweep(Engine *e, Arena scratch)
         sp.branch = wt->branch;
         sp.base   = wt->base;
         sp.oid    = wt->oid;
+        sp.merged = merge;
+        sp.holds  = merge && !(tipnow==wt->oid) ? parent : Str{};
         wtqueue(e, t, WT_REMOVE, &sp);  // if it cannot, the next sweep tries
     }
 }
@@ -1639,14 +1937,215 @@ static void wtrestore(Engine *e, Arena scratch, Str sid)
     wtqueue(e, scratch, WT_MAKE, &sp);
 }
 
+// Subagents' worktrees
+//
+// A subagent started in a worktree of its own (task {worktree}) commits
+// its work on its branch, which its parent reviews and merges. As it
+// reports, a check job says what it left there, for a line after its
+// report: its commits, and the files it did not commit. The check only
+// reads, as a turn may begin in the worktree while it runs: a message
+// starts one, which waits at the gate for the job, as for any.
+
+// Whether a session is a subagent in a worktree of its own: not a side
+// chat's, which is a copy of another's.
+static b32 wtkid(Session *s)
+{
+    return s->wt.name.len && s->psid.len && !s->wt.from.len;
+}
+
+// Sessions whose worktrees, and their descendants', may go once their
+// branches are merged (wtsweep).
+static void wtend(Engine *e, Str sid)
+{
+    WtEnd d = {};
+    d.sid = sid.len ? clone(&e->perm, sid) : Str{};
+    e->wtends   = push(&e->perm, e->wtends, d);
+    e->wtendsat = 0;  // at once
+}
+
+static Str wtshort(Str oid)
+{
+    return takehead(oid, 7);
+}
+
+// The start of a worktree subagent's line: where it worked.
+static void wtlinehead(Buf *b, WtSess *wt)
+{
+    print(b, "[It worked in the worktree ");
+    print(b, wt->path);
+    print(b, ", on the branch ");
+    print(b, wt->branch);
+    print(b, ", cut from ");
+    if (wt->base.len) {
+        print(b, wt->base);
+        print(b, " at ");
+    }
+    print(b, wtshort(wt->oid));
+}
+
+// A worktree subagent's line, git's check not run: its branch's commit,
+// as the refs have it. Its worktree is not made yet while its prefix
+// waits for it (wtdefer), though git may have begun.
+static Str wtfallback(Session *s, Arena *a)
+{
+    Engine *e   = s->e;
+    b32     win = HOST_WINDOWS;
+    Arena   t   = carve(a, 1<<16);  // apart from the line, built in a
+    Arena   oid = carve(&t, 128);   // apart from the scratch it is read in
+    Str     git = gitcommon(e->os, &t, join(&t, s->wt.main, ".git"), win);
+    Str     ref = concat(&t, "refs/heads/", s->wt.branch);
+    Str     tip = gitrefoid(e->os, &oid, t, git, ref);
+    Buf     b(a, 512 + s->wt.path.len + 2*s->wt.branch.len);
+    if ((s->wtdefer || !wtexists(e, t, &s->wt)) && (!tip.len || tip==s->wt.oid)) {
+        print(&b, "[Its worktree, ");
+        print(&b, s->wt.path);
+        print(&b, ", was not made yet, so its branch, ");
+        print(&b, s->wt.branch);
+        print(&b, ", has no commits.]");
+        return finish(&b);
+    }
+    wtlinehead(&b, &s->wt);
+    if (tip.len) {
+        print(&b, "; the branch is at ");
+        print(&b, wtshort(tip));
+        print(&b, ".]");
+    } else {
+        print(&b, "; the branch is gone.]");
+    }
+    return finish(&b);
+}
+
+// A worktree subagent's line from git's check of its worktree, and
+// whether nothing in it is to be merged, so that it goes at once.
+static Str wtcheckline(Session *s, Arena *a, Json *ans, b32 *none)
+{
+    Str did     = jsonstr(jsonget(ans, "did"));
+    Str tip     = jsonstr(jsonget(ans, "tip"));
+    i64 commits = jsonint(jsonget(ans, "commits"), -1);
+    i64 dirty   = jsonint(jsonget(ans, "dirty"), -1);
+    Str head    = jsonstr(jsonget(ans, "head"));
+    Str headoid = jsonstr(jsonget(ans, "headoid"));
+    *none = 0;
+    if (jsonint(jsonget(ans, "ok"), 0)!=1 || commits<0 || (did!="gone" && dirty<0)) {
+        return wtfallback(s, a);
+    }
+
+    Buf b(a, 1024 + s->wt.path.len + 2*s->wt.branch.len + head.len);
+    wtlinehead(&b, &s->wt);
+    print(&b, ": ");
+    if (did == "gone") {
+        print(&b, commits ? Str("") : Str("no commits, "));
+        if (commits) {
+            print(&b, commits);
+            print(&b, commits==1 ? Str(" commit, ") : Str(" commits, "));
+            print(&b, "the branch now at ");
+            print(&b, wtshort(tip));
+            print(&b, ", ");
+        }
+        print(&b, "but the worktree is gone.]");
+        return finish(&b);
+    } else if (!commits && !dirty && !head.len) {
+        *none = 1;
+        print(&b, "no commits and nothing uncommitted, so the worktree and "
+                  "the branch are being removed.]");
+        return finish(&b);
+    }
+    if (!commits) {
+        print(&b, "no commits");
+    } else {
+        print(&b, commits);
+        print(&b, commits==1 ? Str(" commit, the branch now at ")
+                             : Str(" commits, the branch now at "));
+        print(&b, wtshort(tip));
+    }
+    if (!dirty) {
+        print(&b, ", nothing left uncommitted");
+    } else {
+        print(&b, ", ");
+        print(&b, dirty);
+        print(&b, dirty==1 ? Str(" file changed but not committed, which stays")
+                           : Str(" files changed but not committed, which stay"));
+        print(&b, " in the worktree");
+    }
+    if (head == "(detached)") {
+        print(&b, "; the worktree is no longer on the branch: its HEAD is "
+                  "detached at ");
+        print(&b, wtshort(headoid));
+    } else if (head.len) {
+        print(&b, "; the worktree is no longer on the branch but on ");
+        print(&b, head);
+        print(&b, ", at ");
+        print(&b, wtshort(headoid));
+    }
+    print(&b, ".]");
+    return finish(&b);
+}
+
+// Ask git to check a worktree subagent's worktree, its task done, before
+// it reports: whether asked. Not when a job for the worktree is under
+// way, whose answer would be taken for the check's (wtqueue).
+static b32 wtcheckask(Session *s, Arena scratch)
+{
+    Engine *e = s->e;
+    if (!wtkid(s) || e->quitting || wtjobfor(e, s->wt.path) ||
+            !wtexists(e, scratch, &s->wt)) {
+        return 0;
+    }
+    WtSpec sp = {};
+    sp.sid    = s->sid;
+    sp.main   = s->wt.main;
+    sp.path   = s->wt.path;
+    sp.branch = s->wt.branch;
+    sp.base   = s->wt.base;
+    sp.oid    = s->wt.oid;
+    if (wtqueue(e, scratch, WT_CHECK, &sp).len) {
+        return 0;
+    }
+    s->wtcheck = 1;
+    return 1;
+}
+
+// git's check of a subagent's worktree: turns waiting at the gate for it
+// go on, and unless the subagent reported already (cancelled), or one
+// of its own turns began meanwhile, whose end checks again, it reports,
+// with a line on what it left. With nothing to merge, the worktree and
+// its branch go at once.
+static void wtchecked(Engine *e, Arena scratch, Json *answer)
+{
+    Str      path = jsonstr(jsonget(answer, "path"));
+    Session *c    = findsession(e, jsonstr(jsonget(answer, "sid")));
+    b32      mine = c && c->wtcheck && c->wt.path==path;
+    if (mine) {
+        c->wtcheck = 0;
+    }
+    for (Session *s = e->sessions; s; s = s->next) {
+        if (s->wt.path==path && s->state==S_WORKTREE) {
+            Arena a = scratch;
+            setstate(s, S_IDLE);
+            turnready(s, a);
+        }
+    }
+    if (!mine || !c->intask || busy(c) || c->wtcheck) {
+        return;
+    }
+    b32 none = 0;
+    Str line = wtcheckline(c, &scratch, answer, &none);
+    taskreport(c, scratch, "done", {}, line);
+    if (none) {
+        wtend(e, c->sid);
+    }
+}
+
 // The worker's answer to a job.
 static void wtdone(Engine *e, Arena scratch, Str answer)
 {
     JsonDoc d    = jsonparse(&scratch, answer);
     i64     id   = jsonint(jsonget(d.root, "id"), 0);
     Str     kind = jsonstr(jsonget(d.root, "kind"));
+    Str     held = {};
     for (iz i = 0; i < e->wtjobs.len; i++) {
         if (e->wtjobs[i].id == id) {
+            held = e->wtjobs[i].holds;
             e->wtjobs[i] = e->wtjobs[e->wtjobs.len-1];
             e->wtjobs.len--;
             break;
@@ -1654,10 +2153,17 @@ static void wtdone(Engine *e, Arena scratch, Str answer)
     }
     if (kind == "remove") {
         wtremoved(e, scratch, d.root);
+    } else if (kind == "check") {
+        wtchecked(e, scratch, d.root);
     } else {
         b32 ok = jsonint(jsonget(d.root, "ok"), 0) == 1;
         wtmade(e, scratch, jsonstr(jsonget(d.root, "sid")),
                jsonstr(jsonget(d.root, "path")), ok, jsonstr(jsonget(d.root, "err")));
+    }
+    Session *h = held.len ? findsession(e, held) : 0;
+    if (h && h->state==S_WORKTREE && !wtholding(e, held)) {
+        setstate(h, S_IDLE);
+        turnready(h, scratch);  // a turn held for the removal goes on
     }
 }
 
