@@ -509,7 +509,16 @@ The agent can read the session's Terminal pane tabs with its
 number (the tab's tooltip shows it, as "Terminal 7"), and a tab's last
 lines as its screen and history show them, up to as many as the tab
 keeps, at most 2000. It reads the tab you used last unless it names
-one. A tab whose shell ended stays readable until you close it. It
+one. A tab whose shell ended stays readable until you close it.
+
+Where the tab's shell marks its commands (see [Shell
+integration](help:sessions#shell-integration)), the agent can read its last
+commands instead, up to 32, oldest first: each one's command line,
+folder, exit code or that it still runs, how long it took, and its
+output, a long one cut to its first 20 and last 80 lines. This is how
+it sees how something you ran went, such as a build or the tests,
+without reading past it; the list of tabs says what each one is
+running. In a shell that marks none, it gets the tab's lines. It
 cannot type, and runs nothing. A subagent reads its session's
 tabs, and a side chat in the same folder its original's. The tool is
 offered to sessions you open while `[terminal] agent` is on (the

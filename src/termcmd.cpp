@@ -127,6 +127,8 @@ enum : i32 {
     TC_DONE,     // its D, or the next prompt without one
 };
 
+static_assert(TERMCMD_MAX == 32, "read_terminal's commands say 1 to 32 (tools.cpp)");
+
 struct TermCmd {
     i64 seq;       // the tab's count of records at its making, from 1
     i64 prompt;    // its prompt line's number (TermCmds' prompts)

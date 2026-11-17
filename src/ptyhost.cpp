@@ -2503,8 +2503,101 @@ static TermNode termlookup(void *ctx, Arena *a, Str sid)
     return n;
 }
 
+// A hooked tab's command running now, else null.
+static TermCmd *termcmdrunning(Term *t)
+{
+    TermCmd *c = t->screen && !t->exited ? termcmdat(&t->cmds, 0) : 0;
+    return c && c->state==TC_RUNNING ? c : 0;
+}
+
+// A record's line in read_terminal's commands: its command line, folder,
+// status and times, then its output, its secrets hidden, clipped to its
+// first and last lines within max bytes.
+static void termcmdread(Buf *b, Arena *a, Term *t, TermCmd *c, i64 now, iz max,
+                        TermSecrets *ss, iz *hidden)
+{
+    iz h = 0;
+    print(b, "`");
+    print(b, termmask(a, termcmdstr(c), ss, &h));
+    *hidden += h;
+    print(b, c->cmdcut ? Str("...`") : Str("`"));
+    if (c->cwdlen) {
+        print(b, ", in ");
+        print(b, termcmdcwd(c));
+    }
+    if (c->state == TC_RUNNING) {
+        print(b, ": still running, for ");
+        printelapsed(b, (now - c->startat) / MS);
+    } else {
+        print(b, c->hascode ? Str(": exited with code ") : Str(": ended"));
+        if (c->hascode) {
+            print(b, (i64)c->code);
+        } else {
+            print(b, " (its shell gave no status)");
+        }
+        print(b, " after ");
+        printelapsed(b, (c->endat - c->startat) / MS);
+        print(b, ", ");
+        printelapsed(b, (now - c->endat) / MS);
+        print(b, " ago");
+    }
+    b32 gone = 0;
+    Str out  = termcmdoutput(a, &t->cmds, t->screen, c, &gone);
+    if (gone) {
+        print(b, ". Its output is no longer in the terminal's history.\n");
+        return;
+    } else if (!out.len) {
+        print(b, c->state==TC_RUNNING ? Str(". Nothing printed yet.\n")
+                                      : Str(". It printed nothing.\n"));
+        return;
+    }
+    out = termmask(a, out, ss, &h);
+    *hidden += h;
+    i64 lines = 1;
+    for (iz i = 0; i < out.len; i++) {
+        lines += out[i] == '\n';
+    }
+    Str clip = termclip(a, out, 20, 80, READ_LINEMAX, max);
+    print(b, c->state==TC_RUNNING ? Str(". Its output so far (") : Str(". Its output ("));
+    print(b, lines);
+    print(b, lines==1 ? Str(" line):\n") : Str(" lines):\n"));
+    print(b, clip);
+}
+
+// read_terminal's commands: the last n records run, oldest first, in
+// TERM_READBYTES shared among them.
+static void termcmdsread(Buf *b, Arena *a, Term *t, i64 n, i64 now, TermSecrets *ss,
+                         iz *hidden)
+{
+    TermCmd *list[TERMCMD_MAX];
+    i64      k = 0;
+    for (i64 i = 0; k<n && i<TERMCMD_MAX; i++) {
+        TermCmd *c = termcmdat(&t->cmds, i);
+        if (c && c->state!=TC_PROMPT) {
+            list[k++] = c;
+        }
+    }
+    print(b, "Terminal ");
+    print(b, t->tid);
+    if (!k) {
+        print(b, "'s shell has run no command yet that it still has a record of.\n");
+        return;
+    }
+    print(b, k==1 ? Str("'s last command:\n") : Str("'s last commands, oldest first:\n"));
+    iz  max = TERM_READBYTES / k;
+    max = max<(2<<10) ? 2<<10 : max;
+    for (i64 i = k-1; i >= 0; i--) {
+        putbyte(b, '\n');
+        if (k > 1) {
+            print(b, k-i);
+            print(b, ". ");
+        }
+        termcmdread(b, a, t, list[i], now, max, ss, hidden);
+    }
+}
+
 // A terminal's line in the list: its number, label, state and folder.
-static void termlistline(Buf *b, Arena *a, Term *t, TermSecrets *ss, iz *hidden)
+static void termlistline(Buf *b, Arena *a, Term *t, i64 now, TermSecrets *ss, iz *hidden)
 {
     iz  h     = 0;
     Str label = t->run      ? termmask(a, {t->runline, t->runlinelen}, ss, &h)
@@ -2537,6 +2630,14 @@ static void termlistline(Buf *b, Arena *a, Term *t, TermSecrets *ss, iz *hidden)
         print(b, termmask(a, {t->runline, t->runlinelen}, ss, hidden));
         print(b, t->runlines>1 ? Str("`... (the user ran it from your message)")
                                : Str("` (the user ran it from your message)"));
+    } else if (termcmdrunning(t)) {
+        TermCmd *c = termcmdrunning(t);
+        iz       h = 0;
+        print(b, ", running `");
+        print(b, termmask(a, termcmdstr(c), ss, &h));
+        print(b, "` for ");
+        printelapsed(b, (now - c->startat) / MS);
+        *hidden += h;
     } else if (t->busy) {
         print(b, ", a program is running");
     } else {
@@ -2871,7 +2972,7 @@ static void toolreadterm(Session *s, Arena scratch, Args *args)
     Buf          b(&scratch, 1024);
     print(&b, n==1 ? Str("The session's terminal:\n") : Str("The session's terminals, newest first:\n"));
     for (i32 i = 0; i < n; i++) {
-        termlistline(&b, &scratch, list[i], ss, &hidden);
+        termlistline(&b, &scratch, list[i], os_ticks(e->os), ss, &hidden);
     }
     if (!pick) {
         print(&b, "\nNo terminal ");
@@ -2887,7 +2988,22 @@ static void toolreadterm(Session *s, Arena scratch, Args *args)
         print(&b, "Terminal ");
         print(&b, pick->tid);
         print(&b, " cannot be read: it opened while [terminal] agent was off.\n");
+    } else if (args->commands && pick->cmds.hooked) {
+        termscan(e, pick);
+        termcmdsread(&b, &scratch, pick, args->commands, os_ticks(e->os), ss, &hidden);
+        if (ariel_modes(pick->screen).altscreen) {
+            print(&b, "[a full-screen program has the terminal: a command's output "
+                      "is what it printed before that program took the screen]\n");
+        }
+        pick->readfed = pick->fed;
     } else {
+        if (args->commands) {
+            print(&b, "Terminal ");
+            print(&b, pick->tid);
+            print(&b, "'s shell does not mark its commands (zsh, bash and PowerShell "
+                      "do, started as themselves, with [terminal] integration on), so "
+                      "here are its lines instead.\n");
+        }
         // Catch up, take the whole text, wrapped rows joined, then hide
         // the secrets before it is cut, so that none is cut in two
         termscan(e, pick);

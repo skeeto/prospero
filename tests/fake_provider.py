@@ -6692,6 +6692,16 @@ def sc_term_run(model, n, req):
         yield from answer(model, "Heard: " + user_text_all(req)[-1500:])
 
 
+def sc_term_read_commands(model, n, req):
+    reads = [{"commands": 4}, {"commands": 2, "lines": 5}, {"tab": 1, "commands": 3},
+             {"commands": 40}]
+    k = step(req)
+    if k < len(reads):
+        yield from tool(model, n, "read_terminal", reads[k])
+    else:
+        yield from answer(model, "Read them.")
+
+
 sc_term_run_windows = sc_term_run
 sc_term_run_parked = sc_term_run
 sc_term_marks_run = sc_term_run

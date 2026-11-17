@@ -19572,6 +19572,73 @@ def termnotices(evs):
     return [e for e in evs if e.get("ev") == "notice" and e.get("kind") == "terminal"]
 
 
+@scenario(bound=120)
+def term_read_commands(t):
+    """read_terminal's commands: a hooked shell's last commands, oldest
+    first, each with its line, folder, status and output, a long one cut
+    to its first and last lines, one still running, which the list says
+    too; a shell that marks none falls back to its lines; commands with
+    lines, or too many, are refused."""
+    ttyprobe(t)
+    env = {}
+    if t.host.windows:
+        shell = "powershell"
+        cmds = [("Write-Output one; Write-Output two", "D;0"),
+                ('cmd /c "echo bad& exit 3"', "D;3"),
+                ('1..300 | ForEach-Object { "n$_" }', "D;0")]
+        long = "Start-Sleep 30"
+    else:
+        shell = "bash"
+        env["HOME"] = hookhome(t, "home", {".bashrc": "PS1='p$ '\n"})
+        env["BASH_SILENCE_DEPRECATION_WARNING"] = "1"
+        cmds = [("echo one; echo two", "D;0"), ("sh -c 'echo bad; exit 3'", "D;3"),
+                ("seq -f n%g 300", "D;0")]
+        long = "sleep 30"
+    h = t.headless(env=env)
+    try:
+        sid = readsession(t, h)
+        probe = Tty(t, h, sid)
+        probe.line("probe ready")
+        probe.type("say plain text\r")
+        probe.line("plain text")
+        tt = Tty(t, h, sid, cols=120, shell=shell)
+        t.check(tt.reply.get("nonce"), f"hooked: {tt.reply}")
+        markwait(tt, 1, 60)
+        for line, d in cmds:
+            markrun(tt, line, ["C", d, "A"], 30)
+        tt.pump(lambda x: marksof(x)[-1:] == ["A"], 30, "a prompt")
+        have = len(marksof(tt))
+        tt.type(long + "\r")
+        tt.pump(lambda x: marksof(x)[have:] == ["C"], 30, "its C")
+        ends = toolends(turnof(h, sid))
+        t.check(len(ends) == 4, f"reads {len(ends)}")
+        first, second, third, fourth = [e.get("text", "") for e in ends]
+        t.check(f"terminal {tt.tid}: " in first and f", running `{long}` for " in first,
+                f"the list says what runs: {first[:400]!r}")
+        body = first[first.find(f"Terminal {tt.tid}'s last commands, oldest first:"):]
+        parts = re.split(r"\n\d\. ", body)
+        t.check(len(parts) == 5, f"four commands: {body[:1500]!r}")
+        if len(parts) == 5:
+            one, bad, seq, run = parts[1:]
+            t.check(one.startswith(f"`{cmds[0][0]}`, in ") and
+                    ": exited with code 0 after " in one and " ago. Its output (2 lines):\n"
+                    "one\ntwo" in one, f"the first: {one!r}")
+            t.check(f"`{cmds[1][0]}`" in bad and "exited with code 3" in bad and "bad" in bad,
+                    f"the second: {bad!r}")
+            t.check("(300 lines):\nn1\n" in seq and "[... 200 lines left out ...]\nn221\n" in seq
+                    and seq.rstrip().endswith("n300") and "n150\n" not in seq,
+                    f"the long one: {seq[:300]!r} ... {seq[-200:]!r}")
+            t.check(run.startswith(f"`{long}`, in ") and ": still running, for " in run and
+                    "Nothing printed yet." in run, f"the running one: {run!r}")
+        t.check(ends[1].get("status") == "error" and "not both" in second, f"both: {second!r}")
+        t.check(f"Terminal 1's shell does not mark its commands" in third and
+                "plain text" in third, f"unhooked: {third[-400:]!r}")
+        t.check(ends[3].get("status") == "error" and "1 to 32" in fourth, f"40: {fourth!r}")
+        h.send("term.close", tid=tt.tid, kill=True)
+    finally:
+        h.close()
+
+
 @scenario(bound=150)
 def term_marks_pwsh(t):
     """On Windows a PowerShell tab is hooked, and ConPTY passes its marks
@@ -19606,7 +19673,7 @@ def term_marks_pwsh(t):
         # Its folder at each prompt (OSC 7), a file system's only, and B
         # where each prompt ends
         odd = t.host.join(t.base, "odd %#")
-        t.host.sh(f"mkdir -p {shlex.quote(odd)}")
+        t.host.mkdir(odd)
         markfolder(tt, odd, 30)
         markrun(tt, "Set-Location Env:", ["C", "D;0", "A"], 30)
         t.check(samedir(t, cwdsof(tt)[-1], odd), f"Env: keeps the folder: {cwdsof(tt)[-3:]}")
