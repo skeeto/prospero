@@ -712,6 +712,34 @@ static Str logappend(EventLog *log, EvOut *r)
     return line;
 }
 
+enum : iz {
+    LOG_HEADFIRST = (iz)4 << 10,  // read at first: most session records fit
+    LOG_HEADMAX   = (iz)2 << 20,  // a session record read back at most
+};
+
+// A log's first line, its session record, read without the rest of the
+// log: a little at first, then more while the line runs on, so that a
+// long record (a role's prompt is kept in it) reads whole. ok if the
+// line is complete; not if it is longer than LOG_HEADMAX, or if a lacks
+// the room to hold it and to parse it, which takes as much again.
+static Cut loghead(Os *os, Arena *a, Str path)
+{
+    Arena mark = *a;
+    for (iz max = LOG_HEADFIRST;; max *= 8) {
+        max = max<LOG_HEADMAX ? max : LOG_HEADMAX;
+        Read rd = os_readat(os, a, path, 0, max);
+        Cut  c  = cut(rd.data, '\n');
+        if (c.ok || rd.data.len<max || max==LOG_HEADMAX) {
+            return c;  // whole, or the log ends, or it runs on too long
+        }
+        *a = mark;
+        iz next = max*8<LOG_HEADMAX ? max*8 : LOG_HEADMAX;
+        if (!fits(a, 3*next)) {
+            return {};
+        }
+    }
+}
+
 static void logclose(EventLog *log)
 {
     if (log->fd >= 0) {

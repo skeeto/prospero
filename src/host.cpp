@@ -454,8 +454,7 @@ static Str hostparent(Host *h, Arena scratch, Str sid)
         return ss->parent;
     }
     Str   dir  = join(&scratch, join(&scratch, h->statedir, "sessions"), sid);
-    Read  rd   = os_readat(h->os, &scratch, join(&scratch, dir, "events.jsonl"), 0, 4096);
-    Cut   line = cut(rd.data, '\n');
+    Cut   line = loghead(h->os, &scratch, join(&scratch, dir, "events.jsonl"));
     Json *root = evparse(&scratch, line.head).root;
     Str   p    = jsonflag(jsonget(root, "remote"), 0) ? Str{} : jsonstr(jsonget(root, "parent"));
     if (line.ok && validsid(p)) {

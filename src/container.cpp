@@ -692,8 +692,7 @@ static b32 ctrkeepable(Os *os, Arena scratch, Str from, Str to, Str sid)
 {
     for (i32 n = 0; n < 16; n++) {
         Str  log = join(&scratch, join(&scratch, from, sid), "events.jsonl");
-        Read rd  = os_readat(os, &scratch, log, 0, 1<<16);
-        Json *j  = jsonparse(&scratch, cut(rd.data, '\n').head).root;
+        Json *j  = jsonparse(&scratch, loghead(os, &scratch, log).head).root;
         Str  p   = jsonstr(jsonget(j, "parent"));
         if (!validsid(p)) {
             return 1;

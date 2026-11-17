@@ -21,8 +21,12 @@ static Str wtplacestr(Os *os, Arena *a, Str cwd)
     return finish(&b);
 }
 
+static void testlonghead(Test *);
+
 static void test_worktree(Test *t)
 {
+    testlonghead(t);
+
     Arena  mem = t->perm;  // let go as it returns
     Arena *a   = &mem;
 
@@ -229,4 +233,97 @@ static void test_worktree(Test *t)
             expect(t, concat(a, "hole ", holes[i].path), got, holes[i].want);
         }
     }
+}
+
+// A session record longer than a first read: a subagent whose role has
+// a long prompt, kept in its record, in a worktree of its own. Whatever
+// reads the record back (the sessions list, the worktree names taken,
+// the sessions recording a worktree, the parent walks of the Trash and
+// of terminals) reads it whole, at each size it grows through; one past
+// LOG_HEADMAX reads as none, and a lack of room fails, not overflows.
+static void testlonghead(Test *t)
+{
+    Arena   a = t->perm;
+    CfgEnv  v = newcfgenv(&a);
+    v.os->mem = carve(&a, 16<<20);  // room for the longest record
+    Engine *e = alloc<Engine>(&a);
+    e->os       = v.os;
+    e->statedir = "/s";
+    MadeSession made[] = {{"20260101-000000-aaaa", {}}};
+    makesessions(v.os, &a, {made, countof(made)});
+
+    Str    oid     = "0123456789abcdef0123456789abcdef01234567";
+    iz     sizes[] = {LOG_HEADFIRST, 5000, 40000, 300000, LOG_HEADMAX + 1000};
+    Str    names[] = {"calm-ferret", "brisk-otter", "slow-heron", "pale-moth", "too-long"};
+    for (iz i = 0; i < countof(sizes); i++) {
+        Buf b(&a, 1024 + sizes[i]);
+        Str sid = concat(&a, "20260101-00000", concat(&a, istr(&a, i+1), "-bbbb"));
+        print(&b, "{\"sid\":\"");
+        print(&b, sid);
+        print(&b, "\",\"seq\":1,\"ts\":0,\"ev\":\"session\",\"cwd\":\"/w\",\"role\":\"r\","
+                  "\"model\":\"m\",\"parent\":\"20260101-000000-aaaa\",\"call\":\"c\","
+                  "\"depth\":1,\"prompt\":\"");
+        while (b.len < sizes[i]-200) {
+            print(&b, "Read the code\\n and \\\"report\\\". ");
+        }
+        print(&b, "\",\"worktree\":{\"name\":\"");
+        print(&b, names[i]);
+        print(&b, "\",\"main\":\"/w\",\"branch\":\"p/x\",\"oid\":\"");
+        print(&b, oid);
+        print(&b, "\"}}\n{\"sid\":\"x\"}\n");
+        Str dir = concat(&a, "/s/sessions/", sid);
+        os_mkdirs(v.os, a, dir);
+        Str log = concat(&a, dir, "/events.jsonl");
+        os_write(v.os, a, log, finish(&b));
+    }
+    os_write(v.os, a, "/s/sessions/20260101-000000-aaaa/trashed", "1");
+
+    Arena    tmp = carve(&a, 64<<20);
+    SessScan sc  = scansessions(e, &tmp);
+    Buf      got(&tmp, 1024);
+    for (iz i = 0; i < sc.list.len; i++) {
+        print(&got, cuthead(sc.list[i].sid, 13));
+        if (sc.list[i].parent.len) {
+            putbyte(&got, '^');
+            print(&got, cuthead(sc.list[i].parent, 16));
+        }
+        if (sc.list[i].wt.name.len) {
+            putbyte(&got, '@');
+            print(&got, sc.list[i].wt.name);
+        }
+        putbyte(&got, ' ');
+    }
+    expect(t, "long records listed", finish(&got),
+           "00-aaaa 01-bbbb^aaaa@calm-ferret 02-bbbb^aaaa@brisk-otter "
+           "03-bbbb^aaaa@slow-heron 04-bbbb^aaaa@pale-moth ");
+
+    Slice<WtName> recs = wtrecords(e, &tmp);
+    Buf           wts(&tmp, 256);
+    for (iz i = 0; i < recs.len; i++) {
+        print(&wts, recs[i].name);
+        putbyte(&wts, ' ');
+    }
+    expect(t, "long records' worktrees", finish(&wts),
+           "calm-ferret brisk-otter slow-heron pale-moth ");
+    for (iz i = 0; i < countof(names); i++) {
+        b32 want = i < countof(names)-1;
+        expect(t, concat(&tmp, "wtrecorded ", names[i]),
+               istr(&tmp, wtrecorded(e, tmp, "/w", names[i], 0)), istr(&tmp, want));
+        Str path = wtpath(&tmp, "/w", names[i], 0);
+        expect(t, concat(&tmp, "wtrecorders ", names[i]),
+               istr(&tmp, wtrecorders(e, &tmp, path).len), istr(&tmp, want));
+        Str sid = concat(&tmp, "20260101-00000", concat(&tmp, istr(&tmp, i+1), "-bbbb"));
+        expect(t, concat(&tmp, "intrash ", names[i]), istr(&tmp, intrash(e, tmp, sid)),
+               istr(&tmp, want));
+        TermNode n = termlookup(e, &tmp, sid);
+        expect(t, concat(&tmp, "termlookup ", names[i]),
+               concat(&tmp, n.parent, istr(&tmp, n.worktree)),
+               want ? Str("20260101-000000-aaaa1") : Str("0"));
+    }
+
+    // Too little room: no record, rather than an overflow (the test
+    // platform reads a whole file whatever the bound, hence 48 KiB)
+    Arena small = carve(&tmp, 48<<10);
+    Cut   c     = loghead(v.os, &small, "/s/sessions/20260101-000003-bbbb/events.jsonl");
+    expect(t, "loghead without room", istr(&tmp, c.ok*10 + (c.head.len>0)), "0");
 }

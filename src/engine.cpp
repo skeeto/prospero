@@ -19494,8 +19494,7 @@ static SessScan scansessions(Engine *e, Arena *a)
         if (!d->isdir) continue;
         Str   sdir = join(a, dir, d->name);
         Str   path = join(a, sdir, "events.jsonl");
-        Read  rd   = os_readat(e->os, a, path, 0, 4096);
-        Cut   line = cut(rd.data, '\n');
+        Cut   line = loghead(e->os, a, path);
         EvRec rec  = evparse(a, line.head);
         if (!line.ok || rec.ev!=EV_SESSION) continue;
         Session  *s    = findsession(e, d->name);
@@ -21069,8 +21068,7 @@ static b32 intrash(Engine *e, Arena scratch, Str sid)
             return 1;
         }
         Str   path = sidecarpath(&scratch, e, sid, "events.jsonl");
-        Read  rd   = os_readat(e->os, &scratch, path, 0, 4096);
-        EvRec rec  = evparse(&scratch, cut(rd.data, '\n').head);
+        EvRec rec  = evparse(&scratch, loghead(e->os, &scratch, path).head);
         if (rec.ev!=EV_SESSION || jsonint(jsonget(rec.root, "remote"), 0)==1) {
             return 0;
         }

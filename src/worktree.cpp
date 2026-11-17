@@ -803,8 +803,7 @@ static b32 wtrecorded(Engine *e, Arena scratch, Str main, Str name, b32 win)
         if (!d->isdir) continue;
         Arena t    = scratch;
         Str   path = join(&t, join(&t, dir, d->name), "events.jsonl");
-        Read  rd   = os_readat(e->os, &t, path, 0, 4096);
-        EvRec rec  = evparse(&t, cut(rd.data, '\n').head);
+        EvRec rec  = evparse(&t, loghead(e->os, &t, path).head);
         Json *wt   = jsonget(rec.root, "worktree");
         Str   m    = jsonstr(jsonget(wt, "main"));
         if (rec.ok && rec.ev==EV_SESSION && jsonstr(jsonget(wt, "name"))==name &&
@@ -821,14 +820,13 @@ static Slice<WtName> wtrecords(Engine *e, Arena *a)
 {
     Str           dir  = join(a, e->statedir, "sessions");
     Dirent       *list = os_list(e->os, a, dir);
-    Arena         tmp  = carve(a, 1<<18);  // a record's head, read and parsed
+    Arena         tmp  = carve(a, 3*LOG_HEADMAX + (1<<18));  // a record's head, read and parsed
     Slice<WtName> r    = {};
     for (Dirent *d = list; d; d = d->next) {
         if (!d->isdir) continue;
         Arena t    = tmp;
         Str   path = join(&t, join(&t, dir, d->name), "events.jsonl");
-        Read  rd   = os_readat(e->os, &t, path, 0, 4096);
-        EvRec rec  = evparse(&t, cut(rd.data, '\n').head);
+        EvRec rec  = evparse(&t, loghead(e->os, &t, path).head);
         Json *wt   = jsonget(rec.root, "worktree");
         Str   name = jsonstr(jsonget(wt, "name"));
         if (rec.ok && rec.ev==EV_SESSION && name.len) {
@@ -1573,8 +1571,7 @@ static Slice<Str> wtrecorders(Engine *e, Arena *a, Str path)
         if (!d->isdir || !validsid(d->name)) continue;
         Arena  t   = *a;
         Str    log = join(&t, join(&t, dir, d->name), "events.jsonl");
-        Read   rd  = os_readat(e->os, &t, log, 0, 4096);
-        EvRec  rec = evparse(&t, cut(rd.data, '\n').head);
+        EvRec  rec = evparse(&t, loghead(e->os, &t, log).head);
         WtSess wt  = rec.ok && rec.ev==EV_SESSION ? wtfrom(&t, jsonget(rec.root, "worktree"))
                                                   : WtSess{};
         if (wt.path == path) {
@@ -1918,8 +1915,7 @@ static void wtrestore(Engine *e, Arena scratch, Str sid)
         return;
     }
     Str    log = sidecarpath(&scratch, e, sid, "events.jsonl");
-    Read   rd  = os_readat(e->os, &scratch, log, 0, 4096);
-    EvRec  rec = evparse(&scratch, cut(rd.data, '\n').head);
+    EvRec  rec = evparse(&scratch, loghead(e->os, &scratch, log).head);
     WtSess wt  = rec.ok && rec.ev==EV_SESSION ? wtfrom(&scratch, jsonget(rec.root, "worktree"))
                                               : WtSess{};
     if (!wt.name.len || (wtexists(e, scratch, &wt) && !wtjobfor(e, wt.path))) {

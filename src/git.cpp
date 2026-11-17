@@ -1127,8 +1127,7 @@ static Str gitsessdir(Engine *e, Arena *a, Str sid, b32 *nofolder, Str *ceiling)
         return s->cwd;
     }
     Str   path = sidecarpath(a, e, sid, "events.jsonl");
-    Read  rd   = os_readat(e->os, a, path, 0, 64<<10);
-    Cut   line = cut(rd.data, '\n');
+    Cut   line = loghead(e->os, a, path);
     EvRec rec  = evparse(a, line.head);
     if (!line.ok || rec.ev!=EV_SESSION) {
         return {};

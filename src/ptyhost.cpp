@@ -2513,8 +2513,7 @@ static TermNode termlookup(void *ctx, Arena *a, Str sid)
         return n;
     }
     Str   path = join(a, join(a, join(a, e->statedir, "sessions"), sid), "events.jsonl");
-    Read  rd   = os_readat(e->os, a, path, 0, 4096);
-    Cut   line = cut(rd.data, '\n');
+    Cut   line = loghead(e->os, a, path);
     EvRec rec  = evparse(a, line.head);
     if (!line.ok || rec.ev!=EV_SESSION) {
         return n;
