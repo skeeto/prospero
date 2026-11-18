@@ -277,12 +277,14 @@ static void test_gemmaattend(Test *t)
         // the first token again a head at a time
         for (i32 t0 = 0; t0 < n; t0 += GM_TILE) {
             i32 t1 = t0+GM_TILE<n ? t0+GM_TILE : n;
-            gmattendtile(&w, &f, &l, keys, vals, mask, stride, t0, t1, 0, GM_HEADS);
+            gmattendtile(&w, &f, &l, keys, vals, mask, stride, t0, t1, 0, GM_HEADS,
+                         0, pos+n, 0);
         }
         f32 *whole = alloc<f32>(&a, qw);
         copybytes(whole, g->hidden, qw*(iz)sizeof(f32));
         for (i32 h = 0; h < GM_HEADS; h++) {
-            gmattendtile(&w, &f, &l, keys, vals, mask, stride, 0, 1, h, h+1);
+            gmattendtile(&w, &f, &l, keys, vals, mask, stride, 0, 1, h, h+1,
+                         0, pos+n, 0);
         }
         b32 same = gmtclose(whole, g->hidden, qw, 1e-6f);
 
@@ -320,6 +322,28 @@ static void test_gemmaattend(Test *t)
         print(&b, "gemma.attend.");
         print(&b, full ? Str("full") : Str("sliding"));
         expect(t, finish(&b), istr(&a, same && gmtclose(ref, g->hidden, (iz)n*qw, 1e-5f)), "1");
+
+        // Each token's keys split in uneven parts, some outside its
+        // window, all heads at once, then joined, as decode does
+        enum { NPARTS = 3 };
+        i32  cut[NPARTS+1] = {0, pos/3, pos-1, pos+n};
+        iz   each  = GM_HEADS*(iz)(hd+2);
+        f32 *parts = alloc<f32>(&a, NPARTS*each);
+        f32 *split = alloc<f32>(&a, (iz)n*qw);
+        for (i32 tk = 0; tk < n; tk++) {
+            for (i32 i = 0; i < NPARTS; i++) {
+                gmattendtile(&w, &f, &l, keys, vals, mask, stride, tk, tk+1,
+                             0, GM_HEADS, cut[i], cut[i+1], parts + i*each);
+            }
+            for (i32 h = 0; h < GM_HEADS; h++) {
+                gmattendjoin(split + (iz)tk*qw + h*hd, parts + h*(hd+2),
+                             NPARTS, each, hd);
+            }
+        }
+        b = Buf(&a, 32);
+        print(&b, "gemma.attend.split.");
+        print(&b, full ? Str("full") : Str("sliding"));
+        expect(t, finish(&b), istr(&a, gmtclose(ref, split, (iz)n*qw, 1e-5f)), "1");
     }
 }
 
