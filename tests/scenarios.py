@@ -9298,9 +9298,13 @@ def perms_config(t):
 
 @scenario(conf=BIG, bound=40, alone=True)
 def perms_heard(t):
-    """After a summary, the agent is told its pane grants again."""
+    """After a summary, the agent is told its pane grants again, as what
+    still holds rather than as a change (#79); a change after it is told
+    as one."""
     ext = t.host.join(t.base, "pext")
     t.host.mkdir(ext)
+    ext2 = t.host.join(t.base, "pext2")
+    t.host.mkdir(ext2)
     bigfiles(t, 8, 256)
     h = t.headless()
     try:
@@ -9316,6 +9320,18 @@ def perms_heard(t):
         ended(h, sid, 3)
         ns = grantnotices(h, sid)
         t.check(len(ns) == 2 and ext in ns[-1]["text"], f"told again: {ns}")
+        again = ns[-1]["text"]
+        t.check("unchanged by the summary" in again and "changed your" not in again
+                and "You may read" in again and " now " not in again,
+                f"as what holds: {again!r}")
+        h.call("grant", sid=sid, path=ext2, access="read")
+        h.send("prompt", sid=sid, text="later")
+        ended(h, sid, 4)
+        ns = grantnotices(h, sid)
+        last = ns[-1]["text"] if ns else ""
+        t.check(len(ns) == 3 and "changed your permissions" in last
+                and "You may now read" in last and ext2 in last and ext not in
+                last.replace(ext2, ""), f"a change after it: {ns}")
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")

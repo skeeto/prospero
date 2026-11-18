@@ -745,6 +745,8 @@ struct Session {
                             // (the Permissions pane): holes in the guard
     Slice<Grant> grantsheard;  // the grants the agent knows of, and the
     Slice<Str>   deniesheard;  // denies (grantheed)
+    b32          grantsagain;  // told set forgotten by a summary: the
+                               // next notice says what holds (grantforget)
     Str          model;
     Str          title;
     b32          usertitle;  // the user named it (rename), not its prompt
@@ -1974,6 +1976,7 @@ static void deliver(Session *s, Arena scratch)
         if (n->kind == "grants") {
             s->grantsheard = n->grants;
             s->deniesheard = n->denies;
+            s->grantsagain = 0;
         }
     }
     s->notices = {};
@@ -5818,11 +5821,13 @@ static b32 grantin(Slice<Grant> gs, Grant g)
 
 // What the agent knows of its permissions after a summary, which may
 // have left out what it was told: the grants it knew of without being
-// told (grantknown), the pane's to be told again.
+// told (grantknown), the pane's to be told again, as what still holds
+// rather than as a change (#79).
 static void grantforget(Session *s)
 {
     s->grantsheard  = {};
     s->deniesheard  = {};
+    s->grantsagain  = 1;
     for (iz i = 0; i < s->grants.len; i++) {
         grantknown(s, s->grants[i]);
     }
@@ -5831,20 +5836,23 @@ static void grantforget(Session *s)
 static Str grantclass(Grant);
 
 // One line of a "grants" notice: what changed of a grant of a kind other
-// than a path's, g, given or (on false) taken back.
-static void grantline(Buf *b, Grant g, b32 on)
+// than a path's, g, given or (on false) taken back. Told again after a
+// summary (again), a grant given is said to hold, not to be new.
+static void grantline(Buf *b, Grant g, b32 on, b32 again)
 {
+    Str may = again ? Str("You may ") : Str("You may now ");
     print(b, "\n- ");
     if (g.desk) {
-        print(b, on ? Str("You may now use the desktop tool's ")
-                    : Str("The desktop tool's "));
+        print(b, on ? may : Str("The desktop tool's "));
+        print(b, on ? Str("use the desktop tool's ") : Str(""));
         print(b, grantclass(g));
         print(b, on ? Str(" actions without asking.") : Str(" actions ask again."));
     } else if (g.mcp.len) {
         Str name = cuthead(g.mcp, 5);  // past "mcp__"
         Cut c    = cut(name, '_');
         b32 one  = c.ok && startswith(c.tail, "_");
-        print(b, on ? Str("You may now call ") : Str("Calls to "));
+        print(b, on ? may : Str("Calls to "));
+        print(b, on ? Str("call ") : Str(""));
         if (one) {
             print(b, "the MCP tool ");
             print(b, g.mcp);
@@ -5854,26 +5862,31 @@ static void grantline(Buf *b, Grant g, b32 on)
         }
         print(b, on ? Str(" without asking.") : Str(" ask again."));
     } else if (g.web == "search") {
-        print(b, on ? Str("You may now search the web without asking.")
-                    : Str("Web searches ask again."));
+        print(b, on ? may : Str("Web searches ask again."));
+        print(b, on ? Str("search the web without asking.") : Str(""));
     } else if (g.web.len) {
-        print(b, on ? Str("You may now fetch pages of ") : Str("Fetching pages of "));
+        print(b, on ? may : Str("Fetching pages of "));
+        print(b, on ? Str("fetch pages of ") : Str(""));
         print(b, g.host);
         print(b, on ? Str(" without asking.") : Str(" asks again."));
     } else if (g.image.len) {
-        print(b, on ? Str("You may now start subagents in the container image ")
-                    : Str("Subagents in the container image "));
+        print(b, on ? may : Str("Subagents in the container image "));
+        print(b, on ? Str("start subagents in the container image ") : Str(""));
         print(b, g.image);
         print(b, on ? Str(" without asking.") : Str(" ask again."));
     }
 }
 
-// One line of a "grants" notice: a path's state, from was to now.
-static void grantpathline(Session *s, Arena scratch, Buf *b, Str path, Str was, Str now)
+// One line of a "grants" notice: a path's state, from was to now. Told
+// again after a summary (again), a state is said to hold, not to be new.
+static void grantpathline(Session *s, Arena scratch, Buf *b, Str path,
+                          Str was, Str now, b32 again)
 {
+    Str may = again ? Str("You may ") : Str("You may now ");
     print(b, "\n- ");
     if (now == "write") {
-        print(b, "You may now read and write ");
+        print(b, may);
+        print(b, "read and write ");
         print(b, path);
         print(b, " (and everything under it) without asking.");
         if (cfgfile(s, scratch, path)) {
@@ -5881,8 +5894,8 @@ static void grantpathline(Session *s, Arena scratch, Buf *b, Str path, Str was, 
                      "reloads it.");
         }
     } else if (now == "read") {
-        print(b, was=="write" ? Str("You may now only read ")
-                              : Str("You may now read "));
+        print(b, may);
+        print(b, was=="write" ? Str("only read ") : Str("read "));
         print(b, path);
         print(b, was=="write" ? Str(" (and everything under it): writes there ask.")
                               : Str(" (and everything under it) without asking."));
@@ -5904,9 +5917,14 @@ static void grantpathline(Session *s, Arena scratch, Buf *b, Str path, Str was, 
 // Queue the notice of the user's changes in the Permissions pane, unless
 // the agent knows its permissions as they are: one notice for all the
 // changes since it was last told, a notice of them queued before gone.
-// Its record carries the whole set it leaves the agent knowing.
+// Its record carries the whole set it leaves the agent knowing. After a
+// summary (grantsagain, the told set emptied of the pane's by
+// grantforget) it says what still holds rather than calling it a change
+// (#79), until such a notice is delivered: one queued at the summary is
+// remade at the next request, and a reopen forgets again.
 static void grantheed(Session *s, Arena scratch)
 {
+    b32 again = s->grantsagain;
     iz n = 0;
     for (iz i = 0; i < s->notices.len; i++) {
         if (!(s->notices[i].kind == "grants")) {
@@ -5930,7 +5948,10 @@ static void grantheed(Session *s, Arena scratch)
     }
 
     Buf b(&scratch, 1024);
-    print(&b, "The user changed your permissions in the Permissions pane:");
+    print(&b, again ? Str("Your permissions as the user set them in the "
+                          "Permissions pane, unchanged by the summary:")
+                    : Str("The user changed your permissions in the "
+                          "Permissions pane:"));
     iz lines = 0;
     for (iz i = 0; i < paths.len; i++) {
         b32 seen = 0;
@@ -5940,7 +5961,7 @@ static void grantheed(Session *s, Arena scratch)
         Str from = grantsat(was, wasd, paths[i]);
         Str to   = grantsat(s->grants, s->denies, paths[i]);
         if (!seen && from!=to) {
-            grantpathline(s, scratch, &b, paths[i], from, to);
+            grantpathline(s, scratch, &b, paths[i], from, to, again);
             lines++;
         }
     }
@@ -5951,12 +5972,13 @@ static void grantheed(Session *s, Arena scratch)
             Grant g = a[i];
             b32   proj = startswith(g.mcp, "project");
             if (!grantispath(g) && !proj && !grantin(z, g)) {
-                grantline(&b, g, on);
+                grantline(&b, g, on, again);
                 lines++;
             }
         }
     }
     if (!lines) {
+        s->grantsagain = 0;  // nothing of the pane's to tell again
         return;
     }
     print(&b, "\nThese hold for this session and its subagents, and cover "
@@ -15792,7 +15814,7 @@ static void compacted(Session *s, Arena scratch, Partial *p)
     planheed(s, scratch);
     s->shellheard = s->shellpre;  // and a shell other than the tool's
     shellheed(s, scratch);
-    grantforget(s);  // and the Permissions pane's changes
+    grantforget(s);  // and the Permissions pane's grants, as they hold
     grantheed(s, scratch);
     wtheed(s, scratch);  // and a side chat in a worktree, where it works
     moveheed(s, scratch);  // and a fork into another folder, where it moved
@@ -20852,6 +20874,7 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
                 // The whole set it left the agent knowing
                 s->grantsheard = {};
                 s->deniesheard = {};
+                s->grantsagain = 0;
                 for (Json *x = jsonget(j, "grants")->child; x; x = x->next) {
                     Grant g = grantof(x);
                     s->grantsheard = push(&s->perm, s->grantsheard,
