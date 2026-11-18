@@ -2909,7 +2909,16 @@ static i64 os_guidiskfree(Os *, Arena scratch, Str path)
     return (i64)v.f_bavail * (i64)v.f_frsize;
 }
 
+#ifdef __APPLE__
+// Interactive QoS, which the scheduler keeps on the performance cores:
+// a worker left on an efficiency core holds up every barrier.
+static void os_guithreadfast(Os *)
+{
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+}
+#else
 static void os_guithreadfast(Os *) {}
+#endif
 
 #ifdef __APPLE__
 // NSProcessInfo's activity for work the user asked for, which keeps

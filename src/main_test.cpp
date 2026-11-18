@@ -784,6 +784,8 @@ static Str istr(Arena *a, i64 v)
 #  include "test/nav_test.cpp"
 #  include "test/dropto_test.cpp"
 #  include "test/a11y_test.cpp"
+#  include "gemma.cpp"
+#  include "test/gemma_test.cpp"
 #endif
 
 int main()
@@ -898,6 +900,10 @@ int main()
     test_a11yname(&t);
     test_a11ytext(&t);
     test_a11ydoc(&t);
+    test_gemmanumbers(&t);
+    test_gemmakernels(&t);
+    test_gemmatokens(&t);
+    test_gemmagguf(&t);
     test_a11ylog(&t);
     test_viewexport(&t);
     #endif

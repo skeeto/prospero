@@ -79,6 +79,7 @@
 #include "nav.cpp"
 #include "dropto.cpp"
 #include "a11y.cpp"
+#include "gemma.cpp"   // after dock.cpp: PROSPERO_DEVTOOLS
 
 enum : i64 {
     STREAM_PERIOD = 1000000/30,  // µs between frames showing new deltas
@@ -31150,6 +31151,11 @@ static b32 startsubprocess(Gui *g, Arena scratch)
 // arenalint: frame ok, as args are the command line's
 static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
 {
+    #if PROSPERO_DEVTOOLS
+    if (nargs>1 && (args[1]=="builtin-bench" || args[1]=="builtin-logits")) {
+        return gmmain(os, mem, args, nargs);  // gemma.cpp
+    }
+    #endif
     Gui *g = alloc<Gui>(&mem);
     g->os       = os;
     g->started  = os_ticks(os);
