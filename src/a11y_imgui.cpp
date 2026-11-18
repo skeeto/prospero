@@ -1051,10 +1051,10 @@ static void axtraceopen(AxGui *x)
 
 // The Metrics pane's Accessibility section (Debug builds): the setting,
 // the focus, the text model, and the adapter's log, to copy.
-static void axmetrics(Gui *g)
+static void axmetrics(Gui *g, Arena scratch)
 {
     AxGui *x = g->ax;
-    Arena  a = g->frame;
+    Arena  a = scratch;
     Buf    b(&a, 256);
     ImGui::SeparatorText("Accessibility");
     print(&b, "setting ");

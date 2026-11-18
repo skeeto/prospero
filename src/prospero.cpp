@@ -524,7 +524,7 @@ static void    gui_preedit(Gui *, Str text, i32 start, i32 count);
 static b32     gui_composing(Gui *);
 // Open the main window with ImGui's platform and renderer backends, or
 // open it again after os_guished. Returns 0 on failure.
-static b32     os_guiopen(Os *, Gui *, Str title);
+static b32     os_guiopen(Os *, Gui *, Arena scratch, Str title);
 // Wait up to us microseconds (forever if negative) for an event, then
 // dispatch every pending one. Returns 0 if the window is gone.
 static b32     os_guiwait(Os *, i64 us);

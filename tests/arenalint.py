@@ -25,7 +25,9 @@ from its caller instead, unless the comment above it says
 a copy of the root likewise uses that copy, not the root, while the
 copy is in scope: where the root has moved since (a string put in the
 frame itself, &g->frame, by a callee), the copy is done with, so it
-ends its block first.
+ends its block first. Nor does it call, while the copy is in scope, a
+function that copies the root, itself or through its own calls: it
+passes its copy down instead (matched by name across the sources).
 
 Each finding in src/ and src/test/ is printed, as FILE:LINE: and why,
 and any fails the check. Nothing is built: the sources are read with
@@ -180,6 +182,7 @@ FUNC  = re.compile(r"^(?![ \t#}])[^\n;{}()=]*?\b([A-Za-z_]\w*)\s*\(((?:[^()]|\([
                    r"\s*(?:const\s*)?\{", re.M)
 STRS  = re.compile(r"\bStr\b|\bchar\b[^,]*\*|\bu8\b[^,]*\*|\bSlice\s*<")
 COPY  = re.compile(r"\bArena\s+([A-Za-z_]\w*)\s*=\s*$")
+CALL  = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
 EXEMPT = "arenalint: frame ok"
 
 
@@ -204,7 +207,7 @@ def leading(text, off):
     return "\n".join(out)
 
 
-def framelint(text, s, line):
+def framelint(text, s, line, copiers):
     found = []
     for m, params, beg, end in functions(s):
         uses = [u for u in ROOT.finditer(s, beg, end) if not u.group(1)]
@@ -231,16 +234,54 @@ def framelint(text, s, line):
             d = COPY.search(s, beg, u.start())
             if d and d.end() == u.start():
                 copies.append((d.group(1), u.end()))
+        for name, at in copies:
+            depth, i = 0, at
+            while i < end and depth >= 0:
+                depth += {"{": 1, "}": -1}.get(s[i], 0)
+                i += 1
+            for c in CALL.finditer(s, at, i):
+                if c.group(1) in copiers and c.group(1) != m.group(1):
+                    found.append((line(c.start()), f"{m.group(1)}() holds {name}, a copy "
+                                  f"of the frame, yet calls {c.group(1)}(), which copies "
+                                  f"the frame over it{via(copiers, c.group(1))}: pass "
+                                  f"it {name}"))
     return found
 
 
-def lint(text, values, pointers):
+def copying(texts):
+    """The functions in the stripped texts that copy the frame, themselves
+    or through a call, each mapped to the one it calls that does, or None."""
+    calls, found = {}, {}
+    for s in texts:
+        for m, params, beg, end in functions(s):
+            if any(not u.group(1) for u in ROOT.finditer(s, beg, end)):
+                found[m.group(1)] = None
+            calls.setdefault(m.group(1), set()).update(
+                c.group(1) for c in CALL.finditer(s, beg, end))
+    while True:
+        new = {n: min(cs & found.keys()) for n, cs in calls.items()
+               if n not in found and cs & found.keys()}
+        if not new:
+            return found
+        found |= new
+
+
+def via(copiers, name):
+    """How name copies the frame, as " (through f(), g())"."""
+    chain = []
+    while copiers.get(name) and len(chain) < 8 and copiers[name] not in chain:
+        name = copiers[name]
+        chain.append(f"{name}()")
+    return f" (through {', '.join(chain)})" if chain else ""
+
+
+def lint(text, values, pointers, copiers=None):
     """Findings in one file's text, as (line, message)."""
     s = strip(text)
     found = []
     def line(off):
         return s.count("\n", 0, off) + 1
-    found += framelint(text, s, line)
+    found += framelint(text, s, line, copying([s]) if copiers is None else copiers)
     for open_, args in calls(s):
         given = set(args)
         for a in args:
@@ -323,6 +364,17 @@ SNIPPETS = [
      "    } break;\n    case 2: {\n        Arena a = g->frame;\n    } break;\n    }\n}\n", 0),
     ("static void f(Gui *g)\n{\n    Arena a = g->frame;\n    if (x) {\n"
      "        h(g->os, g->frame);\n    }\n}\n", 1),
+    # A callee copying the frame, itself or further down
+    ("static void k(Gui *g)\n{\n    Arena t = g->frame;\n}\n"
+     "static void f(Gui *g)\n{\n    Arena a = g->frame;\n    k(g);\n}\n", 1),
+    ("static void k(Gui *g)\n{\n    Arena t = g->frame;\n}\n"
+     "static void j(Gui *g)\n{\n    k(g);\n}\n"
+     "static void f(Gui *g)\n{\n    Arena a = g->frame;\n    j(g);\n}\n", 1),
+    ("static void k(Gui *g, Arena scratch)\n{\n    Arena t = scratch;\n}\n"
+     "static void f(Gui *g)\n{\n    Arena a = g->frame;\n    k(g, a);\n}\n", 0),
+    ("static void k(Gui *g)\n{\n    Arena t = g->frame;\n}\n"
+     "static void f(Gui *g)\n{\n    {\n        Arena a = g->frame;\n    }\n    k(g);\n}\n", 0),
+    ("static void f(Gui *g, i32 n)\n{\n    Arena a = g->frame;\n    if (n) f(g, n-1);\n}\n", 0),
 ]
 
 
@@ -353,10 +405,11 @@ def main():
         v, p = arenanames(strip(texts[path]))
         values |= v
         pointers |= p
+    copiers = copying(strip(t) for t in texts.values())
     count = 0
     for path in paths:
         rel = os.path.relpath(path, os.path.join(SRC, ".."))
-        for line, why in lint(texts[path], values, pointers):
+        for line, why in lint(texts[path], values, pointers, copiers):
             print(f"{rel}:{line}: {why}")
             count += 1
     if count:

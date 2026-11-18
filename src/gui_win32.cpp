@@ -2236,9 +2236,9 @@ static void hookframe(void *g)           { gui_frame((Gui *)g); }
 static void hookscale(void *g, float s)  { gui_scale((Gui *)g, s); }
 static void hookminimized(void *g, int m){ gui_minimized((Gui *)g, m); }
 static void hookmodal(void *g, int m)    { gui_modal((Gui *)g, m); }
-static void hookclose(void *g)           { gui_close((Gui *)g); }
+static void hookclose(void *g)           { gui_close((Gui *)g, ((Gui *)g)->frame); }
 static void hooksystheme(void *g, int d) { gui_systheme((Gui *)g, d); }
-static void hooktray(void *g, int item)  { gui_tray((Gui *)g, item); }
+static void hooktray(void *g, int item)  { gui_tray((Gui *)g, ((Gui *)g)->frame, item); }
 static void hooktoasted(void *g, int id, int refused)
 {
     if (refused) {
@@ -2356,9 +2356,9 @@ static void os_wake(Os *os)
 }
 
 // arenalint: frame ok, as title is a literal
-static b32 os_guiopen(Os *os, Gui *g, Str title)
+static b32 os_guiopen(Os *os, Gui *g, Arena scratch, Str title)
 {
-    Arena t = g->frame;
+    Arena t = scratch;
     unsigned short *wtitle = (unsigned short *)towide(&t, title).data;
     // Where it was last, if anywhere, else its first size: the work
     // area's pixels hold it at the primary display's scale, or not

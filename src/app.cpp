@@ -5437,9 +5437,9 @@ static b32 quitdone(Gui *g)
 // leave the other hosts, then exit once all that is done, or after
 // QUIT_GRACE regardless. Sessions on the other hosts run on.
 static void draftsendall(Gui *);
-static void editcancel(Gui *);
+static void editcancel(Gui *, Arena);
 
-static void startquit(Gui *g)
+static void startquit(Gui *g, Arena scratch)
 {
     if (g->quitting) {
         return;
@@ -5447,7 +5447,7 @@ static void startquit(Gui *g)
     g->quitting = 1;
     g->quitby   = os_ticks(g->os) + QUIT_GRACE;
     draftsendall(g);  // before the hosts are left
-    editcancel(g);
+    editcancel(g, scratch);
     closehosts(g);
     if (!g->enginegone && !g->host) {
         Arena a = newarena(g->cmdr);
@@ -5502,7 +5502,7 @@ static void setcfgstr(Gui *g, Str *dst, CfgRow r)
 static void wslremotes(Gui *);
 static void setnotify(Gui *, u32);
 
-static void palbuild(Gui *, b32);
+static void palbuild(Gui *, Arena, b32);
 
 // The settings window's rows, from a config.get reply line, and the
 // theme they set.
@@ -5632,7 +5632,7 @@ static void loadcfg(Gui *g, Arena scratch, Str line)
     }
     wslremotes(g);
     if (g->palw.shown) {
-        palbuild(g, 1);  // its settings, as they are now, the pick kept
+        palbuild(g, t, 1);  // its settings, as they are now, the pick kept
     }
 }
 
@@ -5666,7 +5666,7 @@ static void movesess(Gui *g, GuiSession *s, GuiHost *to)
 }
 
 static GuiCtr *ctrofhost(Gui *, GuiHost *);
-static void    ctrkeep(Gui *, GuiCtr *);
+static void    ctrkeep(Gui *, Arena, GuiCtr *);
 static void    filesrestore(Gui *, GuiHost *);
 
 // The sessions a host lists. A background host of another process lists
@@ -5749,7 +5749,7 @@ static void onsessions(Gui *g, GuiHost *h, Json *j)
         if (g->main && g->main->trashdays>0) {
             h->trashdays = g->main->trashdays;  // its Trash is the window's
         }
-        ctrkeep(g, c);
+        ctrkeep(g, g->frame, c);
     }
     if (shared) {
         // What it no longer holds is the engine's again
@@ -6268,7 +6268,7 @@ static void pathfallback(Gui *g)
     scheddirty(&g->sched);
 }
 
-static void attachpick(Gui *g, GuiSession *s)
+static void attachpick(Gui *g, Arena scratch, GuiSession *s)
 {
     if (g->attpend) {
         return;
@@ -6277,7 +6277,7 @@ static void attachpick(Gui *g, GuiSession *s)
     g->attsess = s;
     Str title  = "Attach a file";
     g->attpend = pathkeep(g, ASK_OPEN, title, "~/", TASK_ATTACH, g->attask) ||
-                 os_guiopenfile(g->os, g->frame, title, OPEN_ATTACH, g->tasks,
+                 os_guiopenfile(g->os, scratch, title, OPEN_ATTACH, g->tasks,
                                 TASK_ATTACH, g->attask);
     if (!g->attpend) {
         g->attpend = 1;
@@ -6299,9 +6299,9 @@ static Str attachpending(Gui *g, GuiSession *s)
 // machine, in the platform's folder dialog, starting in the directory
 // typed, if it is one. The checklist's answer is the state directory,
 // without asking.
-static void browsestart(Gui *g, GuiHost *h)
+static void browsestart(Gui *g, Arena scratch, GuiHost *h)
 {
-    Arena a = g->frame;
+    Arena a = scratch;
     g->browseask++;
     g->browsehost = h;
     g->newerr     = {};
@@ -6421,7 +6421,7 @@ static void gui_droptext(Gui *g)
 
 // Paste: the clipboard's image, or its file, attached, an image or
 // text. Returns 0 if it holds neither, for the box to paste its text.
-static b32 attachpaste(Gui *g, GuiSession *s)
+static b32 attachpaste(Gui *g, Arena scratch, GuiSession *s)
 {
     Region *r = os_reserve(g->os, ATTACH_UPLOAD + 4096);
     if (!r) {
@@ -6442,9 +6442,9 @@ static b32 attachpaste(Gui *g, GuiSession *s)
     Str err  = {};
     b32 got  = c.data.len>0 || file;
     if (c.data.len) {
-        err = attachadd(g, g->frame, s, c.data, {});
+        err = attachadd(g, scratch, s, c.data, {});
     } else if (file) {
-        err = attachfile(g, g->frame, s, c.path);
+        err = attachfile(g, scratch, s, c.path);
     }
     os_release(g->os, r);
     if (err.len) {
@@ -6890,7 +6890,7 @@ static void filesweep(Gui *);
 static void filesrelease(Gui *);
 static void filesframe(Gui *);
 static void filesfont(Gui *);
-static void fileaskopen(Gui *);
+static void fileaskopen(Gui *, Arena);
 static void fileclosefront(Gui *);
 static void filefindopen(Gui *);
 static void filelineopen(Gui *);
@@ -8219,13 +8219,13 @@ static void editorjumprun(Gui *g, Arena a, EditJump j, Str dir)
 // The plan file as the editor left it, in its ask (or the plan's ask
 // that came while it was out), empty if it is gone or too long to put
 // to the user, and in the Plan window, fetched again.
-static void planedited(Gui *g, GuiSession *s)
+static void planedited(Gui *g, Arena scratch, GuiSession *s)
 {
     View *v = s->view;
     if (!v) {
         return;
     }
-    Arena a = g->frame;
+    Arena a = scratch;
     i32   i = g->edreq.len ? findask(v, g->edreq) : planask(v);
     if (i >= 0) {
         Read rd = os_read(g->os, &a, g->edpath, (iz)64<<10);
@@ -8237,10 +8237,10 @@ static void planedited(Gui *g, GuiSession *s)
 }
 
 // The editor exited with a status, or was cancelled (status -1).
-static void editend(Gui *g, i32 status)
+static void editend(Gui *g, Arena scratch, i32 status)
 {
     GuiSession *s    = g->edsess;
-    Arena       a    = g->frame;
+    Arena       a    = scratch;
     Str         what = g->edcfg  ? Str("the configuration") :
                        g->edplan ? Str("the plan") : Str("the draft");
     if (g->edcfg) {
@@ -8250,7 +8250,7 @@ static void editend(Gui *g, i32 status)
     } else if (g->edplan && g->edfar) {
         planreadstart(g, s, g->edreq);  // read again there, through its engine
     } else if (g->edplan) {
-        planedited(g, s);
+        planedited(g, a, s);
     } else if (status == 0) {
         Read rd = os_read(g->os, &a, g->edpath, DRAFT_MAX+2);
         Str  t  = editortext(rd.data);
@@ -8311,11 +8311,11 @@ static void editend(Gui *g, i32 status)
 
 // Cancel the edit: the editor is killed, and its exit, when it comes,
 // is ignored.
-static void editcancel(Gui *g)
+static void editcancel(Gui *g, Arena scratch)
 {
     if (g->edproc) {
         os_kill(g->os, g->edproc, 1);
-        editend(g, -1);
+        editend(g, scratch, -1);
     }
 }
 
@@ -8331,7 +8331,7 @@ static b32 drainedit(Gui *g)
         if (r.type==PROC_EXIT && g->edproc && r.id==g->edid) {
             i32 code = get32(r.data);
             i32 sig  = get32(cuthead(r.data, 4));
-            editend(g, sig ? 128+sig : code<0 ? 255 : code);
+            editend(g, g->frame, sig ? 128+sig : code<0 ? 255 : code);
             any = 1;
         }
     }
@@ -9961,7 +9961,7 @@ static void deployfailed(Gui *g, GuiHost *h, Str why)
 // hooks).
 // With deploy, an engine is deployed there if it has none or one of
 // another protocol, as [remote NAME] deploy = auto has it always.
-static b32 ctrready(Gui *, GuiCtr *);
+static b32 ctrready(Gui *, Arena, GuiCtr *);
 
 static GuiHost *remoteconnect(Gui *g, Arena scratch, Str name, b32 deploy = 0)
 {
@@ -9972,7 +9972,7 @@ static GuiHost *remoteconnect(Gui *g, Arena scratch, Str name, b32 deploy = 0)
         return h;
     }
     GuiCtr *c = ctrof(g, name);
-    if (c && !ctrready(g, c)) {
+    if (c && !ctrready(g, scratch, c)) {
         return h;  // starting it first, else not to be reached
     }
     Reach      l  = remotelink(g, name);
@@ -10430,13 +10430,13 @@ static void guigroup(Gui *g, GuiSession *s, Str name)
 }
 
 // A session and its subagents, for good.
-static void ctrforget(Gui *, GuiCtr *, GuiSession *);
+static void ctrforget(Gui *, Arena, GuiCtr *, GuiSession *);
 
-static void guidelete(Gui *g, GuiSession *s)
+static void guidelete(Gui *g, Arena scratch, GuiSession *s)
 {
     GuiCtr *c = ctrofhost(g, s->host);
     if (c && !s->host->up) {
-        ctrforget(g, c, s);  // stopped: it is gone here, and in its ini
+        ctrforget(g, scratch, c, s);  // stopped: it is gone here, and in its ini
         return;
     }
     Arena a = newarena(g->cmdr);
@@ -10459,15 +10459,15 @@ static b32 sesstrashed(Gui *g, GuiSession *s)
 
 static void sessclose(Gui *, GuiSession *);
 static b32  ctrlast(Gui *, GuiCtr *, GuiSession *);
-static void ctrtrash(Gui *, GuiCtr *);
-static void ctrrestore(Gui *, GuiCtr *, GuiSession *);
+static void ctrtrash(Gui *, Arena, GuiCtr *);
+static void ctrrestore(Gui *, Arena, GuiCtr *, GuiSession *);
 static void ctrdelete(Gui *, GuiCtr *);
-static void ctrforget(Gui *, GuiCtr *, GuiSession *);
+static void ctrforget(Gui *, Arena, GuiCtr *, GuiSession *);
 
 // A root and its subagents into the Trash (on), or back (off). Into it,
 // its views here close first, so its host may let it go; then it is
 // listed, not shown, until restored.
-static void guitrash(Gui *g, GuiSession *s, b32 on)
+static void guitrash(Gui *g, Arena scratch, GuiSession *s, b32 on)
 {
     if (on) {
         for (GuiSession *k = g->sessions; k; k = k->next) {
@@ -10492,9 +10492,9 @@ static void guitrash(Gui *g, GuiSession *s, b32 on)
     }
     s->trashed = on ? os_time(g->os) : 0;
     if (last) {
-        ctrtrash(g, c);  // its last session: the container stops
+        ctrtrash(g, scratch, c);  // its last session: the container stops
     } else if (c && !on && c->c.trashed) {
-        ctrrestore(g, c, s);
+        ctrrestore(g, scratch, c, s);
     }
     scheddirty(&g->sched);
 }
@@ -10857,7 +10857,7 @@ static void importfail(Gui *g, Str why)
 
 // Ask for a raw log to import to a host (the dialog's default if null).
 // The checklist imports its latest export without asking.
-static void importstart(Gui *g, GuiHost *h)
+static void importstart(Gui *g, Arena scratch, GuiHost *h)
 {
     Import *x = &g->imp;
     if (x->state != IMP_IDLE) {
@@ -10871,7 +10871,7 @@ static void importstart(Gui *g, GuiHost *h)
     if (g->drive) {
         mailpost(g->tasks, TASK_OPENED, x->ask, g->exp.saved, 1);
     } else if (!pathkeep(g, ASK_OPEN, title, "~/", TASK_OPENED, x->ask) &&
-               !os_guiopenfile(g->os, g->frame, title, OPEN_LOG,
+               !os_guiopenfile(g->os, scratch, title, OPEN_LOG,
                                g->tasks, TASK_OPENED, x->ask)) {
         pathfallback(g);
     }
@@ -11505,10 +11505,10 @@ static b32 ctrlisted(Gui *g)
 static void ctrsessions(Gui *g, GuiCtr *c);
 
 // A container's host, made if missing, keeping the main host's Trash.
-static GuiHost *ctrhost(Gui *g, GuiCtr *c)
+static GuiHost *ctrhost(Gui *g, Arena scratch, GuiCtr *c)
 {
     if (!c->h) {
-        Arena a = g->frame;
+        Arena a = scratch;
         Str   n = concat(&a, "ctr:", c->c.name);
         c->h = findhost(g, GH_REMOTE, n);
         c->h = c->h ? c->h : addhost(g, GH_REMOTE, n);
@@ -11533,7 +11533,7 @@ static void ctrload(Gui *g)
         c->made = 1;
         c->next = g->ctrs;
         g->ctrs = c;
-        ctrhost(g, c);
+        ctrhost(g, a, c);
         ctrsessions(g, c);
     }
 }
@@ -11556,7 +11556,7 @@ static void ctrsessions(Gui *g, GuiCtr *c)
 }
 
 // Keep the sessions a container holds now in its container.ini.
-static void ctrkeep(Gui *g, GuiCtr *c)
+static void ctrkeep(Gui *g, Arena scratch, GuiCtr *c)
 {
     Slice<CtrSess> l = {};
     for (GuiSession *s = g->sessions; s; s = s->next) {
@@ -11567,20 +11567,20 @@ static void ctrkeep(Gui *g, GuiCtr *c)
     }
     c->c.sessions = l;
     if (c->made) {
-        ctrsave(g->os, g->frame, g->statedir, &c->c);
+        ctrsave(g->os, scratch, g->statedir, &c->c);
     }
 }
 
 // Whether a container is running to be connected to; if not, starting
 // it, to connect once it has, unless it is in the Trash.
-static b32 ctrready(Gui *g, GuiCtr *c)
+static b32 ctrready(Gui *g, Arena scratch, GuiCtr *c)
 {
-    GuiHost *h = ctrhost(g, c);
+    GuiHost *h = ctrhost(g, scratch, c);
     if (c->c.trashed) {
         // Asked to connect, so out of the Trash, its sessions left there
         c->c.trashed = 0;
         c->stopafter = 0;
-        ctrsave(g->os, g->frame, g->statedir, &c->c);
+        ctrsave(g->os, scratch, g->statedir, &c->c);
     }
     if (c->state == "running") {
         return 1;
@@ -11610,10 +11610,10 @@ static b32 ctrstartable(Gui *g, GuiCtr *c)
 }
 
 // New session on a container once it is up, starting it first.
-static void ctrnewafter(Gui *g, GuiCtr *c)
+static void ctrnewafter(Gui *g, Arena scratch, GuiCtr *c)
 {
     c->newafter = 1;
-    remoteconnect(g, g->frame, ctrhost(g, c)->name);
+    remoteconnect(g, scratch, ctrhost(g, scratch, c)->name);
 }
 
 // Make a container for a new session, from image, with folder copied
@@ -11667,7 +11667,7 @@ static Str ctrnew(Gui *g, Str image, i32 ws, Str folder, b32 net, Str ep, Str mo
     c->plan        = plan;
     c->next = g->ctrs;
     g->ctrs = c;
-    GuiHost *h = ctrhost(g, c);
+    GuiHost *h = ctrhost(g, scratch, c);
     h->state = RS_CONNECTING;
     h->msg   = "making the container";
     if (!ctrjob(g, CJOB_CREATE, c)) {
@@ -11701,7 +11701,7 @@ static void ctrremote(Gui *g, GuiHost *h, i32 was)
         GuiSession *s = findsess(g, h, c->restore);
         c->restore = {};
         if (s) {
-            guitrash(g, s, 0);
+            guitrash(g, g->frame, s, 0);
         }
     } else if (h->state==RS_FAILED && find(h->msg, "is not running")>=0) {
         c->state = "exited";  // so that connecting starts it
@@ -11749,12 +11749,12 @@ static void ctrstop(Gui *g, GuiCtr *c)
 
 // Its last session into the Trash: the container stops, and the window
 // keeps its sessions, as in the Trash.
-static void ctrtrash(Gui *g, GuiCtr *c)
+static void ctrtrash(Gui *g, Arena scratch, GuiCtr *c)
 {
     i64 now = os_time(g->os);
-    ctrkeep(g, c);
+    ctrkeep(g, scratch, c);
     c->c.trashed = now;
-    ctrsave(g->os, g->frame, g->statedir, &c->c);
+    ctrsave(g->os, scratch, g->statedir, &c->c);
     for (GuiSession *s = g->sessions; s; s = s->next) {
         if (s->host==c->h && !s->gone) {
             s->trashed = now;
@@ -11765,19 +11765,19 @@ static void ctrtrash(Gui *g, GuiCtr *c)
 
 // And back, with root s: connecting starts it again, and then s leaves
 // its Trash there too (ctrremote).
-static void ctrrestore(Gui *g, GuiCtr *c, GuiSession *s)
+static void ctrrestore(Gui *g, Arena scratch, GuiCtr *c, GuiSession *s)
 {
     c->c.trashed = 0;
     c->restore   = clone(&g->perm, s->sid);
     c->stopafter = 0;
-    ctrsave(g->os, g->frame, g->statedir, &c->c);
-    remoteconnect(g, g->frame, c->h->name);
+    ctrsave(g->os, scratch, g->statedir, &c->c);
+    remoteconnect(g, scratch, c->h->name);
     scheddirty(&g->sched);
 }
 
 // Delete s while its container is stopped: it goes here and from the
 // container's ini, and the container with the last.
-static void ctrforget(Gui *g, GuiCtr *c, GuiSession *s)
+static void ctrforget(Gui *g, Arena scratch, GuiCtr *c, GuiSession *s)
 {
     for (GuiSession *k = g->sessions; k; k = k->next) {
         if (k!=s && k->host==c->h && !k->gone && sessroot(g, k)==s) {
@@ -11785,7 +11785,7 @@ static void ctrforget(Gui *g, GuiCtr *c, GuiSession *s)
         }
     }
     sessgone(g, s);
-    ctrkeep(g, c);
+    ctrkeep(g, scratch, c);
     for (GuiSession *k = g->sessions; k; k = k->next) {
         if (k->host==c->h && !k->gone && k->listed) {
             return;
@@ -11883,7 +11883,7 @@ static void ctrdone(Gui *g, Record r)
             }
             Str st = ctrstateof(out, k->c.name);
             k->state = clone(&g->perm, st.len ? st : Str("gone"));
-            GuiHost *h = ctrhost(g, k);
+            GuiHost *h = ctrhost(g, a, k);
             if (k->state=="running" && !k->c.trashed && !h->r && !h->userclosed) {
                 remoteconnect(g, a, h->name);
             } else if (k->state == "gone") {
@@ -11973,7 +11973,7 @@ static void ctrnoted(Gui *g, Record r)
 // that closing it leaves the host as it was.
 
 static void saveini(Gui *, b32 last);
-static void gui_close(Gui *);
+static void gui_close(Gui *, Arena);
 
 static Str hostlockpath(Arena *a, Str statedir)
 {
@@ -12025,7 +12025,7 @@ enum {
     TOAST_DONE,
 };
 
-static void gui_tray(Gui *, i32);
+static void gui_tray(Gui *, Arena, i32);
 
 // Whether a record of s, by its seq and epoch ms ts, was history as s
 // was opened: the replay before an open's reply, else what the reply
@@ -12309,7 +12309,7 @@ static void gui_toasted(Gui *g, i32 id)
     toastgone(g, root);
     g->toastclicks++;
     guilog(g, "a toast was clicked: to its session");
-    gui_tray(g, TRAY_OPEN);  // back from the background, or raised
+    gui_tray(g, g->frame, TRAY_OPEN);  // back from the background, or raised
     if (!sel->gone) {
         navjump(g);
         guiselect(g, sel);
@@ -12462,14 +12462,14 @@ static b32 gobackground(Gui *g)
 // Bring the window back, in a process that hosts: a client of its own
 // host, as another process's window would be, its views taking up from
 // where they were.
-static void reopen(Gui *g)
+static void reopen(Gui *g, Arena scratch)
 {
     if (!g->bg) {
         os_guiraise(g->os);
         return;
     }
     i64 frames = g->total.frames;  // before the opening draws any
-    if (!os_guiopen(g->os, g, PROSPERO_TITLE)) {
+    if (!os_guiopen(g->os, g, scratch, PROSPERO_TITLE)) {
         guilog(g, "cannot open a window");
         return;
     }
@@ -12479,7 +12479,7 @@ static void reopen(Gui *g)
     schedminimize(&g->sched, 0);
     schedforce(&g->sched);
 
-    Arena    a   = g->frame;
+    Arena    a   = scratch;
     Buf      b(&a, 32);
     print(&b, (i64)os_pid(g->os));
     GuiHost *own = findhost(g, GH_LOCAL, finish(&b));
@@ -12538,12 +12538,12 @@ static void opensettings(Gui *g)
 }
 
 // A pick from the tray icon's menu (or the checklist's, as if).
-static void gui_tray(Gui *g, i32 item)
+static void gui_tray(Gui *g, Arena scratch, i32 item)
 {
     switch (item) {
     case TRAY_OPEN:
         if (g->host) {
-            reopen(g);
+            reopen(g, scratch);
         } else {
             os_guiraise(g->os);
         }
@@ -12571,7 +12571,7 @@ static void gui_tray(Gui *g, i32 item)
             hoststop(g->host, 1);
             closehosts(g);
         } else if (!g->host) {
-            gui_close(g);
+            gui_close(g, scratch);
         }
         break;
     }
@@ -12592,7 +12592,7 @@ static void raisenow(Gui *g)
     if (g->bg) {
         os_guitoken(g->os, g->raisetoken);
     }
-    gui_tray(g, TRAY_OPEN);
+    gui_tray(g, g->frame, TRAY_OPEN);
     for (iz i = 0; i < g->raisedirs.len; i++) {
         opendirnew(g, g->frame, g->raisedirs[i], "another launch asked");
     }
@@ -12637,7 +12637,7 @@ static i32 handoff(Gui *g, Arena scratch)
     return 1;
 }
 
-static void gui_close(Gui *);
+static void gui_close(Gui *, Arena);
 static void setzoom(Gui *, f32);
 static void zoomby(Gui *, i32);
 static void setpane(Gui *, i32, b32);
@@ -13377,17 +13377,17 @@ static void gui_wake(Gui *g)
 // with no window, as from a signal or a logout, everything stops as the
 // tray's Quit stops it. Sessions at work on other hosts (remote, or in
 // the background) run on whatever happens, and the dialog says so.
-static void gui_close(Gui *g)
+static void gui_close(Gui *g, Arena scratch)
 {
     if (g->bg) {
-        gui_tray(g, TRAY_QUIT);
+        gui_tray(g, scratch, TRAY_QUIT);
         return;
     } else if (g->host) {
         shedlater(g, 0);
         return;
     }
     if (!g->quitting && !running(g) && !jobbing(g) && !elsewhere(g) && !termbusy(g)) {
-        startquit(g);
+        startquit(g, scratch);
         return;
     }
     g->closereq = 1;
@@ -20872,7 +20872,7 @@ static GuiCtr *ctrfirst(Gui *g)
     return g->ctrs;
 }
 
-static GuiSession *taskchild(Gui *, GuiSession *, ViewTool *);
+static GuiSession *taskchild(Gui *, Arena, GuiSession *, ViewTool *);
 
 // The shown session's task call whose subagent has a container of its
 // own (hostlink.cpp), and the window's host for it, if any.
@@ -20918,7 +20918,7 @@ static b32 ctrwait(Gui *g, Arena scratch, Str what)
     } else if (what=="tasklive" || what=="taskkept") {
         GuiHost    *h = 0;
         ViewTool   *t = ctrtaskcall(g, &h);
-        GuiSession *k = t ? taskchild(g, g->sess, t) : 0;
+        GuiSession *k = t ? taskchild(g, scratch, g->sess, t) : 0;
         if (what == "tasklive") {
             return h && h->up && h->taskexec.len && k && k->host==h && k->view && t->opened;
         }
@@ -20958,7 +20958,7 @@ static b32 ctrcheck(Gui *g, Arena scratch, Str what)
     } else if (what=="tasklive" || what=="taskkept") {
         GuiHost    *h = 0;
         ViewTool   *t = ctrtaskcall(g, &h);
-        GuiSession *k = t ? taskchild(g, g->sess, t) : 0;
+        GuiSession *k = t ? taskchild(g, scratch, g->sess, t) : 0;
         if (!ctrwait(g, scratch, what)) {
             return 0;
         } else if (what == "tasklive") {
@@ -24692,7 +24692,7 @@ static ImVec2 prompttextat(Gui *g, Str text)
               r.y0 + st.FramePadding.y + ((f32)row + 0.5f)*fs);
 }
 
-static ImVec2 targetpos(Gui *g, i32 t)
+static ImVec2 targetpos(Gui *g, Arena scratch, i32 t)
 {
     switch (t) {
     case T_PROMPTBTN:   return rectcenter(g->rects[RECT_PROMPTBTN]);
@@ -24759,7 +24759,7 @@ static ImVec2 targetpos(Gui *g, i32 t)
         return v2((r.x0+r.x1)/2, r.y0 + 24*g->scale);
     }
     case T_TERMTEXT:
-        return termtextat(g, g->frame, g->ops[g->drivepc-1].text);
+        return termtextat(g, scratch, g->ops[g->drivepc-1].text);
     case T_PROMPTTEXT:
         return prompttextat(g, g->ops[g->drivepc-1].text);
     case T_TERMGRID: {
@@ -24809,7 +24809,7 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_CFGFIND:       return rectcenter(g->rects[RECT_CFGFIND]);
     case T_CFGCLEAR:      return rectcenter(g->rects[RECT_CFGCLEAR]);
     case T_NOTIFY:        return rectcenter(g->rects[RECT_NOTIFY]);
-    case T_SPLITFROM:     return v2(g->splitx, targetpos(g, T_SPLITTER).y);
+    case T_SPLITFROM:     return v2(g->splitx, targetpos(g, scratch, T_SPLITTER).y);
     case T_PAGEITEM:
     case T_ADDOPEN: {
         Str text = g->ops[g->drivepc-1].text;
@@ -24829,7 +24829,7 @@ static ImVec2 targetpos(Gui *g, i32 t)
             }
             return v2(-1, -1);
         }
-        Arena a = g->frame;
+        Arena a = scratch;
         for (iz i = 0; i < g->cfgrows.len; i++) {
             CfgRow *r = &g->cfgrows[i];
             if (cfgpagekey(&a, r->kind, r->name) == text) {
@@ -27499,7 +27499,7 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_MODAL:         return ImGui::GetTopMostPopupModal() != 0;
     case CHK_NOMODAL:       return !ImGui::GetTopMostPopupModal() && c.DimBgRatio==0;
     case CHK_SPLIT: {
-        ImVec2 p = targetpos(g, T_SPLITTER);
+        ImVec2 p = targetpos(g, g->frame, T_SPLITTER);
         return p.x>0 && p.x < g->splitx - 40;
     }
     case CHK_FIRSTSIZE:     return firstsizecheck(g);
@@ -29480,7 +29480,7 @@ static void drivestep(Gui *g)
     g->driveat  = g->sched.now + (i64)op->ms*1000;
     switch (op->op) {
     case OP_MOVE: {
-        ImVec2 p = targetpos(g, op->target);
+        ImVec2 p = targetpos(g, g->frame, op->target);
         if (op->target==T_SPLITTER && g->splitx==0) {
             g->splitx = p.x;
         }
@@ -29772,7 +29772,7 @@ static void drivestep(Gui *g)
         e.text = finish(&paths);
         if (op->target != T_NONE) {
             // T_NONE's would be (0, 0): it is at no point instead
-            ImVec2 p = targetpos(g, op->target);
+            ImVec2 p = targetpos(g, a, op->target);
             e.x    = p.x;
             e.y    = p.y;
             e.down = 1;
@@ -29814,7 +29814,7 @@ static void drivestep(Gui *g)
         }
         // The title bar's point, T_NONE's, is above the window, as the
         // platforms have it
-        ImVec2 p = op->target!=T_NONE ? targetpos(g, op->target) : v2(40, -10);
+        ImVec2 p = op->target!=T_NONE ? targetpos(g, g->frame, op->target) : v2(40, -10);
         e.kind   = GEV_DRAG;
         e.button = (i32)op->dx;
         e.key    = op->dy == 1;
@@ -30401,7 +30401,7 @@ static void drivestep(Gui *g)
         if (!g->quitting) {
             drivesummary(g);
         }
-        startquit(g);
+        startquit(g, g->frame);
         break;
     }
 }
@@ -31319,7 +31319,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->sched = newsched(os_ticks(os), 16667);
     g->sched.probing    = probe;
     g->sched.aggressive = aggressive;
-    if (!os_guiopen(os, g, PROSPERO_TITLE)) {
+    if (!os_guiopen(os, g, g->frame, PROSPERO_TITLE)) {
         os_print(os, 2, "prospero: could not open a window\n");
         return 1;
     }
@@ -31392,7 +31392,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
 
     saveini(g, 1);
     if (!g->quitting && !g->enginegone) {
-        startquit(g);  // the window went without asking: stop anyway
+        startquit(g, mem);  // the window went without asking: stop anyway
     }
     {
         Arena a = g->frame;

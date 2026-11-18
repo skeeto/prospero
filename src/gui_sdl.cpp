@@ -398,7 +398,7 @@ static bool SDLCALL sdlwatch(void *ud, SDL_Event *e)
     return 1;
 }
 
-static b32 sdlwindow(Os *, Gui *, GuiSdl *, Str title);
+static b32 sdlwindow(Os *, Gui *, GuiSdl *, Arena, Str title);
 static void keyrepeat(GuiSdl *, SDL_KeyboardEvent *);
 
 // Whether windows are Wayland's, whose compositor places them, so that
@@ -1698,7 +1698,7 @@ static b32 sdlfailed(Os *os, Arena t, Str what, Str why = {})
 }
 
 // arenalint: frame ok, as title is a literal
-static b32 os_guiopen(Os *os, Gui *g, Str title)
+static b32 os_guiopen(Os *os, Gui *g, Arena scratch, Str title)
 {
     GuiSdl *p = (GuiSdl *)os->gui;
     if (p) {
@@ -1706,7 +1706,7 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
         dockicon(1);
         #endif
         p->framedark = -1;
-        if (!sdlwindow(os, g, p, title)) {
+        if (!sdlwindow(os, g, p, scratch, title)) {
             return 0;
         }
         SDL_DestroyWindow(p->waiter);
@@ -1737,13 +1737,13 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
     }
     #ifdef __APPLE__
     nopersist();
-    machandsoff(os, g->frame);
+    machandsoff(os, scratch);
     #endif
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         #ifdef __APPLE__
         machandsoffend();
         #endif
-        return sdlfailed(os, g->frame, "no display (Wayland or X11)");
+        return sdlfailed(os, scratch, "no display (Wayland or X11)");
     }
     p->wakeevent  = SDL_RegisterEvents(3);
     p->trayevent  = p->wakeevent + 1;
@@ -1761,7 +1761,7 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
     }
     axmacinit(g);
     #endif
-    if (!sdlwindow(os, g, p, title)) {
+    if (!sdlwindow(os, g, p, scratch, title)) {
         return 0;
     }
     os_thread(os, sigthread, 0);
@@ -1787,7 +1787,7 @@ static void glattrs(b32 es)
 // The window, its GL context, and ImGui's backends for them, which
 // os_guished takes down again.
 // arenalint: frame ok, as title is os_guiopen's
-static b32 sdlwindow(Os *os, Gui *g, GuiSdl *p, Str title)
+static b32 sdlwindow(Os *os, Gui *g, GuiSdl *p, Arena scratch, Str title)
 {
     SDL_WindowFlags flags = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE |
                             SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_HIDDEN;
@@ -1811,7 +1811,7 @@ static b32 sdlwindow(Os *os, Gui *g, GuiSdl *p, Str title)
     i32 w = geom.box.w;
     i32 h = geom.box.h;
     flags |= geom.max ? SDL_WINDOW_MAXIMIZED : 0;
-    Arena t = g->frame;
+    Arena t = scratch;
     glattrs(0);
     p->gles   = 0;
     p->window = SDL_CreateWindow(cstr0(&t, title), w, h, flags);
@@ -2003,7 +2003,7 @@ static void dispatch(Os *os, GuiSdl *p, SDL_Event *e)
         takewake(p);
         return;
     } else if (e->type == p->trayevent) {
-        gui_tray(g, e->user.code);
+        gui_tray(g, g->frame, e->user.code);
         return;
     } else if (e->type == p->toastevent) {
         if (e->user.data1) {
@@ -2015,7 +2015,7 @@ static void dispatch(Os *os, GuiSdl *p, SDL_Event *e)
     } else if (!p->window) {
         // Shed: what is left is quitting (a signal, a logout)
         if (e->type == SDL_EVENT_QUIT) {
-            gui_close(g);
+            gui_close(g, g->frame);
         }
         return;
     }
@@ -2026,7 +2026,7 @@ static void dispatch(Os *os, GuiSdl *p, SDL_Event *e)
             guilog(g, e->type==SDL_EVENT_QUIT ? Str("drive: SDL quit event")
                                               : Str("drive: SDL close event"));
         }
-        gui_close(g);
+        gui_close(g, g->frame);
         return;
     case SDL_EVENT_SYSTEM_THEME_CHANGED:
         gui_systheme(g, sysdark(p));

@@ -96,7 +96,7 @@ static b32  axmenuasked(Gui *, u32);
 static void fieldmenu(Gui *, Arena, char const *, b32 = 0);
 static void axexpanded(Gui *, b32 open);
 // The Metrics pane's section for them
-static void axmetrics(Gui *);
+static void axmetrics(Gui *, Arena);
 
 // The last item clicked, or pressed by other means: the keyboard's Space
 // on it, or an assistive tool (ImGui's activation)
@@ -1333,7 +1333,7 @@ static void printage(Gui *g, Buf *b, i64 ms)
     schedat(&g->sched, g->sched.now + (unit - ms%unit)*1000 + 1000, DUE_CLOCK);
 }
 
-static GuiSession *taskchild(Gui *, GuiSession *, ViewTool *);
+static GuiSession *taskchild(Gui *, Arena, GuiSession *, ViewTool *);
 static Str kidhost(Arena *, ViewTool *);
 static b32 kidnamed(Gui *, Arena, GuiSession *, Str);
 static Str kidlink(Gui *, Arena *, ViewTool *, i64);
@@ -1434,7 +1434,7 @@ static ImVec2 drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
             }
         }
         if (t->name=="task" && g->sess) {
-            GuiSession *k = taskchild(g, g->sess, t);
+            GuiSession *k = taskchild(g, a, g->sess, t);
             if (k && k->view && k->view->asks) {
                 pen(p, "  needs an answer", STYLE_BOLD, pal->amber);
             } else if (t->status==VTOOL_BACKGROUND && k && k->view &&
@@ -1688,14 +1688,14 @@ static ImVec2 drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
 
 // A task's subagent: named by its report, or found by its parent and
 // call while it works.
-static GuiSession *taskchild(Gui *g, GuiSession *parent, ViewTool *t)
+static GuiSession *taskchild(Gui *g, Arena scratch, GuiSession *parent, ViewTool *t)
 {
     if (t->host.len) {
         // On another host, named by task.host: only one this window
         // reaches by that name, as the parent's engine shares its
         // configuration (kidnamed). In a container, once it is gone, its
         // copy here (ctrkeep), a subagent of its parent.
-        Arena       a   = g->frame;
+        Arena       a   = scratch;
         b32         own = parent->host->kind != GH_REMOTE;
         GuiHost    *h   = own ? findhost(g, GH_REMOTE, kidhost(&a, t)) : 0;
         GuiSession *k   = h && t->child.len ? findsess(g, h, t->child) : 0;
@@ -1995,7 +1995,7 @@ static MsgAction msgaction(Gui *g, GuiSession *s, View *v, ViewMsg *m)
     MsgAction r = {};
     ViewTool *t = m->tool;
     if (m->role==VIEW_TOOL && t->name=="task" && s) {
-        r.child = taskchild(g, s, t);
+        r.child = taskchild(g, g->frame, s, t);
         Arena a = g->frame;
         Str   n = kidhost(&a, t);  // before a goes by value
         if (r.child || (t->child.len && kidnamed(g, a, s, n))) {
@@ -2380,7 +2380,7 @@ static void planeditbutton(Gui *g, Arena scratch, GuiSession *s, Str path, Str r
         ImGui::TextDisabled("editing in %s...", cstr0(&a, g->edname));
         ImGui::SameLine();
         if (ImGui::SmallButton("Cancel##planedit")) {
-            editcancel(g);
+            editcancel(g, a);
         }
         itemnamed(g, "cancel plan editor");
         itemtip("Stop the editor: the plan is as it left the file");
@@ -2963,9 +2963,9 @@ static b32  workrows(Arena, View *);
 
 // The session's details: what it is, where it works, which model and
 // role, and the instruction files the agent was given.
-static void drawinfo(Gui *g, GuiSession *s, View *v)
+static void drawinfo(Gui *g, Arena scratch, GuiSession *s, View *v)
 {
-    Arena a  = g->frame;
+    Arena a  = scratch;
     f32   sc = g->scale;
     ImGui::PushTextWrapPos(560*sc);
     if (ImGui::BeginTable("##info", 2, ImGuiTableFlags_SizingFixedFit)) {
@@ -3810,7 +3810,7 @@ static void drawsessbar(Gui *g)
     itemrect(g, RECT_INFOBTN);
     itemtip("Info: the session's model, role and instruction files");
     if (ImGui::BeginPopup("##sessinfo")) {
-        drawinfo(g, s, v);
+        drawinfo(g, a, s, v);
         ImGui::EndPopup();
     }
 }
@@ -4010,7 +4010,7 @@ static Str coderuntip(Gui *g, Arena *a, CodeRun *cr)
 // shows a check mark for a moment after, until a deadline. With aim, the
 // one the checklist chose is where it can find it. Beside it, in the
 // transcript (runs), a block coderun takes has a Run button.
-static void drawcodecopy(Gui *g, View *v, i32 msg, Placed *pl, ImVec2 origin, f32 top,
+static void drawcodecopy(Gui *g, Arena scratch, View *v, i32 msg, Placed *pl, ImVec2 origin, f32 top,
                          b32 dragging, b32 aim, b32 runs)
 {
     BlockLayout *bl = pl->bl;
@@ -4060,7 +4060,7 @@ static void drawcodecopy(Gui *g, View *v, i32 msg, Placed *pl, ImVec2 origin, f3
     }
     g->copiedshown |= copied;
     if (go) {
-        Arena t = g->frame;
+        Arena t = scratch;
         ImGui::SetClipboardText(cstr0(&t, copyblock(v, &t, msg, pl->block)));
         g->copiedview = v;
         g->copiedmsg  = msg;
@@ -4068,7 +4068,7 @@ static void drawcodecopy(Gui *g, View *v, i32 msg, Placed *pl, ImVec2 origin, f3
         g->copiedat   = g->sched.now;
     }
 
-    Arena   t  = g->frame;
+    Arena   t  = scratch;
     CodeRun cr = runs ? coderun(g, v, &t, msg, pl->block) : CodeRun{};
     if (!cr.kind) {
         return;
@@ -4215,7 +4215,7 @@ static void filelinkopen(Gui *, Arena *, Dest *, LinkFrom *);
 static void filelinkmark(Gui *, Arena, Str, LinkFrom *);
 static Str  codelinkat(Gui *, Arena, View *, TextHit, LinkFrom *);
 static void codelinkhostend(Gui *, u64);
-static void filelinkitems(Gui *);
+static void filelinkitems(Gui *, Arena);
 
 // The text's context menu, if it opened on the last item, or asked
 // opens it: Copy and Copy as Markdown, which the caller may follow with
@@ -4229,7 +4229,7 @@ static b32 begintextmenu(Gui *g, Arena scratch, View *v, i32 copyrect, b32 asked
     if (!ImGui::BeginPopup("##textmenu")) {
         return 0;
     }
-    filelinkitems(g);
+    filelinkitems(g, scratch);
     b32 any  = !selempty(&v->sel);
     b32 copy = ImGui::MenuItem("Copy", g->mac ? "Cmd+C" : "Ctrl+C", false, any);
     itemnamed(g, "text copy");
@@ -4323,7 +4323,7 @@ static void drawmsgtext(Gui *g, Arena scratch, ImDrawList *dl, ImDrawListSplitte
                 origin.y+pl->y+pl->bl->h < top) {
             continue;
         }
-        drawcodecopy(g, v, i, pl, origin, top, *ta->dragging, aim, ta->permsg);
+        drawcodecopy(g, scratch, v, i, pl, origin, top, *ta->dragging, aim, ta->permsg);
     }
     ImGui::PopID();
 }
@@ -5197,7 +5197,7 @@ static void drawfind(Gui *g, View *v, f64 scrolly, ImVec2 r0, ImVec2 r1)
 // The transcript's menu's fork at a message: a user's prompt forks the
 // turns before it, the prompt left in the new session's box to edit and
 // send again; anything else, the conversation to the end of its turn.
-static b32 forkitem(Gui *g, ViewMsg *m)
+static b32 forkitem(Gui *g, Arena scratch, ViewMsg *m)
 {
     GuiSession *s      = g->sess;
     b32         prompt = 0;
@@ -5205,7 +5205,7 @@ static b32 forkitem(Gui *g, ViewMsg *m)
     if (!s || turn<0) {
         return 0;
     }
-    Arena a   = g->frame;
+    Arena a   = scratch;
     Str   why = sesswhy(g, s, "fork", 1, 1);
     ImGui::Separator();
     if (menuitem(g, a, prompt ? Str("Fork before this prompt") : Str("Fork after this turn"),
@@ -5275,10 +5275,10 @@ static void wtdialog(Gui *g, GuiSession *s, Str quote)
 // The transcript's menu's side chat: a copy of the whole session, at
 // work or not, the selection quoted in its box (sidequote). And the
 // same in a worktree of its own.
-static void sideitem(Gui *g, View *v, b32 sep)
+static void sideitem(Gui *g, Arena scratch, View *v, b32 sep)
 {
     GuiSession *s   = g->sess;
-    Arena       a   = g->frame;
+    Arena       a   = scratch;
     Str         why = sidewhy(g, s);
     if (sep) {
         ImGui::Separator();
@@ -5533,7 +5533,7 @@ static void drawtoast(Gui *g, GuiSession *s, ImVec2 r0, ImVec2 r1)
         if (toastbox(g, g->frame, text, g->pal->paneltext, g->pal->rule, "Cancel", "",
                      "Stop the editor, leaving the draft as it was",
                      RECT_EDITCANCEL, r0, r1)) {
-            editcancel(g);
+            editcancel(g, g->frame);
         }
         g->editshown = 1;
     } else if (hint) {
@@ -5647,9 +5647,9 @@ static void drawtrashtoast(Gui *g, i32 pane, f32 lift)
     for (iz i = 0; b>=0 && b<2 && i < t->sids.len; i++) {
         GuiSession *s = findsess(g, h, t->sids[i]);
         if (s && !s->gone && b==0) {
-            guitrash(g, s, 0);
+            guitrash(g, g->frame, s, 0);
         } else if (s && !s->gone) {
-            guidelete(g, s);
+            guidelete(g, g->frame, s);
         }
     }
     if (b >= 0) {
@@ -6047,8 +6047,8 @@ static void drawtranscript(Gui *g)
             }
             itemnamed(g, "text run");
         }
-        b32 forked = forkitem(g, onmsg ? &v->msgs[g->menumsg] : 0);
-        sideitem(g, v, !forked);
+        b32 forked = forkitem(g, t, onmsg ? &v->msgs[g->menumsg] : 0);
+        sideitem(g, t, v, !forked);
         endtextmenu(g, v);
     }
 
@@ -6495,7 +6495,7 @@ static void stripdraw(Gui *g, Arena a, Strip *st, b32 picks)
     }
 }
 
-static void drawstrip(Gui *g)
+static void drawstrip(Gui *g, Arena scratch)
 {
     View *v  = g->view;
     f32   sc = g->scale;
@@ -6503,7 +6503,7 @@ static void drawstrip(Gui *g)
         ImGui::TextDisabled("No session: start one with New session.");
         return;
     }
-    Arena a     = g->frame;
+    Arena a     = scratch;
     i64   nowms = os_time(g->os);
     i64   now   = g->sched.now;
     b32   req   = v->state==LIVE_DISCOVER || v->state==LIVE_WAITING ||
@@ -7353,10 +7353,10 @@ static i32 drawmention(Gui *g, Arena a, MentionSrc *src, ImVec2 at, f32 maxw)
 
 // The images attached to the draft: thumbnails above the box, in rows,
 // each with an x that removes it, dimmed while they are sent.
-static void drawattached(Gui *g, GuiSession *s)
+static void drawattached(Gui *g, Arena scratch, GuiSession *s)
 {
     AttBox     *x    = s->att;
-    Arena       a    = g->frame;
+    Arena       a    = scratch;
     f32         sc   = g->scale;
     f32         box  = (f32)ATT_THUMB * sc;
     f32         gap  = 6*sc;
@@ -7538,7 +7538,7 @@ static void drawprompt(Gui *g)
     g->modelsshown  = 0;
     // mentionpath and mentionquery are not reset here: they are how the
     // next fill re-finds the pick among the rows it makes (below)
-    drawstrip(g);
+    drawstrip(g, a);
     ImGui::Dummy(v2(0, 2*g->scale));  // its lists apart from the box below
 
     // A line for the editor at work, else the latest command's outcome,
@@ -7553,7 +7553,7 @@ static void drawprompt(Gui *g)
         ImGui::TextDisabled("editing in %s...", cstr0(&a, g->edname));
         ImGui::SameLine();
         if (ImGui::SmallButton("Cancel")) {
-            editcancel(g);
+            editcancel(g, a);
             editing = 0;
         }
         itemtip("Stop the editor, leaving the draft as it was");
@@ -7567,7 +7567,7 @@ static void drawprompt(Gui *g)
         ImGui::PopStyleColor();
     }
     if (g->sess && g->sess->att && g->sess->att->len) {
-        drawattached(g, g->sess);
+        drawattached(g, a, g->sess);
     }
 
     ImGui::PushID(s);
@@ -7702,7 +7702,7 @@ static void drawprompt(Gui *g)
     // Paste: an image, or an image file, the clipboard holds is attached,
     // the key kept from the box
     if (active && !editing && g->sess && ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_V) &&
-            attachpaste(g, s)) {
+            attachpaste(g, a, s)) {
         ImGui::SetKeyOwner(ImGuiKey_V, ImGui::GetID("##attachpaste"), ImGuiInputFlags_LockThisFrame);
         g->promptfocus = 1;
     }
@@ -7939,7 +7939,7 @@ static void drawprompt(Gui *g)
         why = why.len ? why : attachpending(g, s);
         ImGui::BeginDisabled(why.len>0 || editing);
         if (ImGui::Button(ICON_ATTACH "##attach", v2(bw, 0))) {
-            attachpick(g, s);
+            attachpick(g, a, s);
         }
         ImGui::EndDisabled();
         itemnamed(g, "attach");
@@ -8510,7 +8510,7 @@ static Str emptywhy(Gui *g)
 static void trashroots(Gui *g, Arena a, Slice<GuiSession *> roots)
 {
     for (iz i = 0; i < roots.len; i++) {
-        guitrash(g, roots[i], 1);
+        guitrash(g, a, roots[i], 1);
     }
     trashtold(g, a, roots);
 }
@@ -8763,7 +8763,7 @@ static void sessitems(Gui *g, Arena a, GuiSession *s)
         // In the Trash: back, or gone for good
         if (menutip(g, &a, "Restore", sesswhy(g, s, "trash", 0, 1),
                     "Back where it was, with its subagents")) {
-            guitrash(g, s, 0);
+            guitrash(g, a, s, 0);
         }
         if (menutip(g, &a, "Delete Permanently...", sesswhy(g, s, "delete", 1, 0),
                     "Remove it and its subagents for good now, once you confirm")) {
@@ -9049,7 +9049,7 @@ static void groupitems(Gui *g, Arena a, Str group)
         // Into the Trash, host by host, told as one
         if (menuitem(g, a, "Move group to Trash", groupwhy(g, roots, "trash", 1))) {
             for (iz i = 0; i < roots.len; i++) {
-                guitrash(g, roots[i], 1);
+                guitrash(g, a, roots[i], 1);
             }
             trashtold(g, a, roots);
             groupdrop(g, group);
@@ -9087,7 +9087,7 @@ static void hostitems(Gui *g, Arena a, GuiHost *h, Str remote)
     Str why = cs || (h && hostready(g, h)) ? Str{} : Str("It is not connected");
     if (menuitem(g, a, "New session here...", why)) {
         if (cs) {
-            ctrnewafter(g, hc);
+            ctrnewafter(g, a, hc);
         } else {
             g->newhost = h;
             newsession(g);
@@ -9095,7 +9095,7 @@ static void hostitems(Gui *g, Arena a, GuiHost *h, Str remote)
     }
     Str iwhy = why.len ? why : importwhy(g, h);
     if (menuitem(g, a, "Import session here...", iwhy)) {
-        importstart(g, h);
+        importstart(g, a, h);
     }
     itemtip("A session from its raw log, exported here or elsewhere");
     if (GuiCtr *c = h ? ctrofhost(g, h) : 0) {
@@ -9254,7 +9254,7 @@ static void droptarget(Gui *g, Arena a, GuiHost *h, Str group, b32 archived, Str
         }
         if (p && p->IsDelivery()) {
             if (s->trashed) {
-                guitrash(g, s, 0);
+                guitrash(g, a, s, 0);
             }
             if (!archived && !(s->group==group)) {
                 guigroup(g, s, group);
@@ -9470,7 +9470,7 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
         ImGui::BeginDisabled(!ok);
         if (iconbutton(ICON_ADD)) {
             if (cs) {
-                ctrnewafter(g, hc);  // New session once it is up
+                ctrnewafter(g, a, hc);  // New session once it is up
             } else {
                 g->newhost = rt ? 0 : h;
                 g->newctr  = rt;
@@ -9624,7 +9624,7 @@ static void rowactions(Gui *g, Arena a, SideRow *r, GuiSession *s, ImVec2 r0, Im
         if (r->trashed) {
             Str why = sesswhy(g, s, "trash", 0, 1);
             if (rowicon(g, ICON_DISCARD "##restore", why)) {
-                guitrash(g, s, 0);
+                guitrash(g, a, s, 0);
             }
             axname(g, "Restore");
             itemnamed(g, concat(&a, "restore ", title));
@@ -10757,7 +10757,7 @@ static void drawsessdialogs(Gui *g)
                         sessclose(g, k);
                     }
                 }
-                guidelete(g, s);
+                guidelete(g, a, s);
             }
             if (g->delgroup.len) {
                 groupdrop(g, g->delgroup);
@@ -11482,10 +11482,10 @@ static void fieldput(char *field, Str s)
 // a directory of another machine. Its model where that host has one by
 // its name (its configuration's, which a host other than the main one
 // is asked for), else none.
-static void importfill(Gui *g, GuiHost *h)
+static void importfill(Gui *g, Arena scratch, GuiHost *h)
 {
     Import *x = &g->imp;
-    Arena   a = g->frame;
+    Arena   a = scratch;
     if (x->filled != h) {
         x->filled    = h;
         x->modelwait = 1;
@@ -12276,7 +12276,7 @@ static void drawmove(Gui *g)
     b32 remote = host->kind == GH_REMOTE;
     ImGui::BeginDisabled(remote);
     if (ImGui::Button(browse)) {
-        browsestart(g, host);
+        browsestart(g, a, host);
     }
     ImGui::EndDisabled();
     itemnamed(g, "move browse");
@@ -12414,7 +12414,7 @@ static b32 drawnewctr(Gui *g, Arena a, b32 *enter)
     pathafter(g, &pf, g->newcwd);
     ImGui::SameLine();
     if (ImGui::Button(browse)) {
-        browsestart(g, g->main);
+        browsestart(g, a, g->main);
     }
     itemnamed(g, "new browse");
     ImGui::EndDisabled();
@@ -12480,7 +12480,7 @@ static void drawnew(Gui *g)
     }
     if (import) {
         Import *x = &g->imp;
-        importfill(g, host);
+        importfill(g, a, host);
         ImGui::PushStyleColor(ImGuiCol_Text, g->pal->paneldim);
         ImGui::TextWrapped("%s", cstr0(&a, x->title.len ? x->title : Str("Untitled")));
         ImGui::TextWrapped("from %s", cstr0(&a, x->path));
@@ -12577,7 +12577,7 @@ static void drawnew(Gui *g)
         g->browseoff = remote;
         ImGui::BeginDisabled(remote);
         if (ImGui::Button(browse)) {
-            browsestart(g, host);
+            browsestart(g, a, host);
         }
         ImGui::EndDisabled();
         itemnamed(g, "new browse");
@@ -12774,7 +12774,7 @@ static void drawclose(Gui *g)
         g->closereq = 0;
         if (!g->quitting && !running(g) && !jobbing(g) && !elsewhere(g) &&
                 !termbusy(g)) {
-            startquit(g);
+            startquit(g, g->frame);
         } else if (!g->quitting) {
             g->hosterr = {};
             g->whynobg = clone(&g->perm, cannothost(g));
@@ -12851,7 +12851,7 @@ static void drawclose(Gui *g)
         b32 stop = ImGui::Button(cstr0(&a, n+j ? label : Str("Quit")));
         itemrect(g, RECT_CLOSESTOP);
         if (stop) {
-            startquit(g);
+            startquit(g, a);
         }
         if (n + j) {
             ImGui::SameLine();
@@ -15663,7 +15663,7 @@ static void cfgeditbutton(Gui *g, Arena a, Str path, b32 exists)
         ImGui::TextDisabled("%s", what);
         ImGui::SameLine();
         if (ImGui::Button("Cancel##cfgedit")) {
-            editcancel(g);
+            editcancel(g, a);
         }
         itemnamed(g, "cancel config editor");
         itemtip("Stop the editor: the file is as it left it, read again");
@@ -15988,7 +15988,7 @@ static void drawmetrics(Gui *g)
     ImGui::SameLine();
     checkbox("Aggressive", &g->sched.aggressive);
     itemtip("Probe every second while idle");
-    axmetrics(g);
+    axmetrics(g, a);
 }
 
 // The GUI's log, its latest lines, as a code block in a document whose
@@ -16327,14 +16327,13 @@ static void palopen(Gui *g)
 // are now, and the settings and Help's sections the query finds, and
 // order them for the query. The pick stays on its item if keep, else goes to
 // the top.
-static void palbuild(Gui *g, b32 keep)
+static void palbuild(Gui *g, Arena scratch, b32 keep)
 {
     PalWin *p = &g->palw;
     if (!p->base) {
         p->mem  = newarena(os_reserve(g->os, (iz)1<<24));
         p->base = p->mem.beg;
     }
-    Arena scratch = g->frame;
     Str   pick    = {};
     if (keep && p->sel>=0 && p->sel<p->order.len) {
         pick = clone(&scratch, p->items[p->order[p->sel]].id);
@@ -16586,7 +16585,7 @@ static void drawpalette(Gui *g)
         p->q[0]   = 0;
         p->sel    = 0;
         p->follow = 1;
-        palbuild(g, 0);
+        palbuild(g, g->frame, 0);
         ImGui::OpenPopup("##palette");
     }
     ImGuiViewport *vp = ImGui::GetMainViewport();
@@ -16658,7 +16657,7 @@ static void drawpalette(Gui *g)
     axname(g, "Go to");
     fieldmenu(g, a, p->q);
     if (cb.edited) {
-        palbuild(g, 0);
+        palbuild(g, a, 0);
         p->follow = 1;
         n = (i32)p->order.len;
     }
@@ -16835,7 +16834,7 @@ static void menukeys(Gui *g)
         if (why.len && g->sess) {
             setnote(g, g->sess, why, 0);
         } else {
-            fileaskopen(g);
+            fileaskopen(g, g->frame);
         }
     }
     // Close the front file tab while Files has the focus, its own popups
@@ -16936,7 +16935,7 @@ static void menukeys(Gui *g)
     }
     #if !defined(_WIN32) && !defined(__APPLE__)
     if (ImGui::Shortcut(ctrl|ImGuiKey_Q, glob)) {
-        gui_close(g);
+        gui_close(g, g->frame);
     }
     #endif
 
@@ -17474,7 +17473,7 @@ static void drawmenubar(Gui *g)
         }
         Str iwhy = !cannew(g) ? Str("No engine") : importwhy(g, g->main);
         if (menuitem(g, a, "Import session...", iwhy)) {
-            importstart(g, 0);
+            importstart(g, a, 0);
         }
         itemtip("A session from its raw log, exported here or elsewhere");
         GuiHost *fah = fileaskhost(g);
@@ -17482,7 +17481,7 @@ static void drawmenubar(Gui *g)
                                          filehostname(g, &a, fah ? fah->uid : 0)),
                           " in the Files pane, with :N after its path for a line");
         if (menutip(g, &a, "Open file...", fileaskwhy(g), fat, cmdkey(g, &a, "O"))) {
-            fileaskopen(g);
+            fileaskopen(g, a);
         }
         itemnamed(g, "menu open file");
         if (menutip(g, &a, "Empty Trash...", emptywhy(g),
@@ -17533,7 +17532,7 @@ static void drawmenubar(Gui *g)
         char const *quit = "Ctrl+Q";
         #endif
         if (ImGui::MenuItem("Quit", quit)) {
-            gui_close(g);
+            gui_close(g, a);
         }
         ImGui::EndMenu();
     }

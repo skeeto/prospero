@@ -142,7 +142,7 @@ static void editdone(Gui *, GuiSession *, GuiHost *, Str, b32);
 static void termeditstale(Gui *, GuiSession *, TermTab *);
 
 // Cmd/Ctrl+click on a link or a path in a tab
-static b32 termclick(Gui *, TermTab *, i32, i32, b32);
+static b32 termclick(Gui *, Arena, TermTab *, i32, i32, b32);
 
 static iz termkeep(u8 *dst, Str s)
 {
@@ -1883,13 +1883,13 @@ static b32 termselected(TermTab *tt)
 }
 
 // Copy tab tt's selection to the clipboard, if it has one.
-static b32 termcopy(Gui *g, TermTab *tt)
+static b32 termcopy(Gui *g, Arena scratch, TermTab *tt)
 {
     iz n = tt->t ? ariel_copy(tt->t, 0, 0) : 0;
     if (n <= 0) {
         return 0;
     }
-    Arena a   = g->frame;
+    Arena a   = scratch;
     u8   *buf = allocbytes(&a, n+1);
     ariel_copy(tt->t, buf, n);
     buf[n] = 0;
@@ -1902,7 +1902,7 @@ static b32 termcopy(Gui *g, TermTab *tt)
 // clicked once, twice or thrice, Shift extending (unless it is what
 // keeps the mouse local), Alt a block. A drag past the grid's top or
 // bottom scrolls history.
-static void termselect(Gui *g, TermTab *tt, TermMetrics *m, ImVec2 pos, b32 local, f32 my)
+static void termselect(Gui *g, Arena scratch, TermTab *tt, TermMetrics *m, ImVec2 pos, b32 local, f32 my)
 {
     ImGuiIO    &io = ImGui::GetIO();
     ariel_Modes mo = ariel_modes(tt->t);
@@ -1942,7 +1942,7 @@ static void termselect(Gui *g, TermTab *tt, TermMetrics *m, ImVec2 pos, b32 loca
     } else if (tt->selecting) {
         tt->selecting = 0;
         if (g->termcopysel) {
-            termcopy(g, tt);
+            termcopy(g, scratch, tt);
         }
     }
 }
@@ -1953,7 +1953,7 @@ static void termselect(Gui *g, TermTab *tt, TermMetrics *m, ImVec2 pos, b32 loca
 // later scrolls history (L3). Ctrl+wheel stays the app's zoom. Under
 // an ended tab's banner, nothing goes to the program, gone: the mouse
 // selects and the wheel scrolls history.
-static void termmouse(Gui *g, TermTab *tt, TermMetrics *m, ImVec2 pos, ImGuiID id, b32 hovered)
+static void termmouse(Gui *g, Arena scratch, TermTab *tt, TermMetrics *m, ImVec2 pos, ImGuiID id, b32 hovered)
 {
     ImGuiIO    &io   = ImGui::GetIO();
     ariel_Modes mo   = ariel_modes(tt->t);
@@ -1991,11 +1991,11 @@ static void termmouse(Gui *g, TermTab *tt, TermMetrics *m, ImVec2 pos, ImGuiID i
     // Cmd+click (macOS), else Ctrl+click: a link or a path opens, unless
     // the program has the mouse (Shift takes it back). Over one, the hand
     if (hovered && io.KeyCtrl && !io.KeyAlt && !rep && ImGui::IsMousePosValid() &&
-        termclick(g, tt, e.x, e.y, 0)) {
+        termclick(g, scratch, tt, e.x, e.y, 0)) {
         ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
         // a11y: a shortcut for the mouse: Open file takes the same path
         if (ImGui::IsMouseClicked(0)) {
-            termclick(g, tt, e.x, e.y, 1);
+            termclick(g, scratch, tt, e.x, e.y, 1);
             return;
         }
     }
@@ -2028,7 +2028,7 @@ static void termmouse(Gui *g, TermTab *tt, TermMetrics *m, ImVec2 pos, ImGuiID i
     } else if (!mo.mouse) {
         tt->mheld = 0;
     }
-    termselect(g, tt, m, pos, hovered && !rep, at.y);
+    termselect(g, scratch, tt, m, pos, hovered && !rep, at.y);
 
     if (!hovered || io.KeyCtrl) {
         tt->wheel = 0;
@@ -2275,9 +2275,9 @@ static b32 termweburl(Str s)
 // relative one in the folder of the command whose lines hold it, else
 // the shell's now, else the session's. Whether there is one, opened if
 // go.
-static b32 termclick(Gui *g, TermTab *tt, i32 x, i32 y, b32 go)
+static b32 termclick(Gui *g, Arena scratch, TermTab *tt, i32 x, i32 y, b32 go)
 {
-    Arena a    = g->frame;
+    Arena a    = scratch;
     b32   link = 0;
     Str   w    = termclickword(&a, tt, x, y, &link);
     if (!w.len) {
@@ -2347,7 +2347,7 @@ static void termask(Gui *g, TermTab *tt, i64 row, Arena a)
 // local as termmouse does), or as an assistive tool asks. Its picks act
 // at once, Paste as its keys do (termpaste, which may ask first). The
 // grid has the keyboard back as it closes, but for a click elsewhere.
-static void termmenu(Gui *g, TermTab *tt, TermMetrics *m, ImVec2 pos, ImGuiID id,
+static void termmenu(Gui *g, Arena scratch, TermTab *tt, TermMetrics *m, ImVec2 pos, ImGuiID id,
                      b32 hovered, Arena a)
 {
     ImGuiIO    &io   = ImGui::GetIO();
@@ -2370,7 +2370,7 @@ static void termmenu(Gui *g, TermTab *tt, TermMetrics *m, ImVec2 pos, ImGuiID id
         g->cmenushown = 1;
         g->cmenustate = (sel ? 4 : 0) | (clip ? 8 : 0);
         if (ImGui::MenuItem("Copy", g->mac ? "Cmd+C" : "Ctrl+Shift+C", false, sel)) {
-            termcopy(g, tt);
+            termcopy(g, scratch, tt);
         }
         itemrect(g, RECT_CMCOPY);
         if (ImGui::MenuItem("Paste", g->mac ? "Cmd+V" : "Ctrl+Shift+V", false, clip)) {
@@ -2380,7 +2380,7 @@ static void termmenu(Gui *g, TermTab *tt, TermMetrics *m, ImVec2 pos, ImGuiID id
         if (ImGui::MenuItem("Select all")) {
             ariel_select(tt->t, ARIEL_SEL_ALL, 0, 0);
             if (g->termcopysel) {
-                termcopy(g, tt);
+                termcopy(g, scratch, tt);
             }
         }
         itemrect(g, RECT_CMSELALL);
@@ -2437,7 +2437,7 @@ static void termkeys(Gui *g, TermTab *tt, Arena a)
         if (ImGui::IsKeyPressed(ImGuiKey_V, false)) {
             termpaste(g, tt, a);
         } else if (ImGui::IsKeyPressed(ImGuiKey_C, false)) {
-            termcopy(g, tt);
+            termcopy(g, a, tt);
         } else if (io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_L, false)) {
             termask(g, tt, -1, a);  // Ask about this
         }
@@ -2450,7 +2450,7 @@ static void termkeys(Gui *g, TermTab *tt, Arena a)
     // selection, which it clears, else Ctrl+C is ^C. The C it took
     // stays the copy's until let go, sending no repeats.
     if (termkept(g, ImGuiKey_C) && ImGui::IsKeyPressed(ImGuiKey_C, false)) {
-        termcopy(g, tt);
+        termcopy(g, a, tt);
     }
     tt->copyc = tt->copyc && ImGui::IsKeyDown(ImGuiKey_C);
     // Paste: Ctrl+Shift+V, and Shift+Insert as in GNOME Terminal and
@@ -2478,7 +2478,7 @@ static void termkeys(Gui *g, TermTab *tt, Arena a)
             pressed[e->Key.Key - ImGuiKey_NamedKey_BEGIN] = 1;
             if (HOST_WINDOWS && e->Key.Key==ImGuiKey_C && io.KeyCtrl && !io.KeyShift &&
                     !io.KeyAlt && termselected(tt)) {
-                termcopy(g, tt);
+                termcopy(g, a, tt);
                 ariel_select(tt->t, ARIEL_SEL_CLEAR, 0, 0);
                 tt->copyc = 1;
                 scheddirty(&g->sched);
@@ -2717,7 +2717,7 @@ struct TermBar {
 // selects its tab when front changed here (frontset), else front follows
 // the tab the user picked, and the set follows the bar's order. Each
 // tab's context menu closes, restarts or kills it.
-static TermBar termtabs(Gui *g, GuiSession *s)
+static TermBar termtabs(Gui *g, Arena scratch, GuiSession *s)
 {
     TermBar  r   = {-1, 0, -1, 0};
     TermSet *set = &s->terms;
@@ -2730,7 +2730,7 @@ static TermBar termtabs(Gui *g, GuiSession *s)
     if (!ImGui::BeginTabBar("##termtabs", bf)) {
         return r;
     }
-    Arena   a = g->frame;
+    Arena   a = scratch;
     ImGuiID ids[TERMTABS] = {};
     for (i32 i = 0; i < set->n; i++) {
         TermTab          *tt    = set->tabs[i];
@@ -2922,7 +2922,7 @@ static void drawterm(Gui *g)
         ImGui::TextDisabled("%s", cstr0(&a, why));
         return;
     }
-    TermBar bar = termtabs(g, s);
+    TermBar bar = termtabs(g, a, s);
     termpasteask(g, a);
 
     TermMetrics m     = termmetrics(g);
@@ -3128,8 +3128,8 @@ static void drawterm(Gui *g)
     termsizetip(g, dl, bb, cols, rows, a);
     g->termverts = dl->VtxBuffer.Size;
     if (tt->state==TT_LIVE || tt->state==TT_ENDED) {
-        termmouse(g, tt, &m, pos, id, hovered);
-        termmenu(g, tt, &m, pos, id, hovered, a);
+        termmouse(g, a, tt, &m, pos, id, hovered);
+        termmenu(g, a, tt, &m, pos, id, hovered, a);
     }
 
     if (active) {

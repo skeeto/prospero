@@ -1950,13 +1950,13 @@ static Str filerevealtip()
 
 // The text's context menu's first items, for a file link right-clicked:
 // Open in Files, Open in editor and Copy path, or why not.
-static void filelinkitems(Gui *g)
+static void filelinkitems(Gui *g, Arena scratch)
 {
     LinkMenu *m = &g->linkmenu;
     if (!m->on) {
         return;
     }
-    Arena a    = g->frame;
+    Arena a    = scratch;
     Str   path = {m->path, m->pathlen};
     Str   why  = {m->why, m->whylen};
     if (ImGui::MenuItem("Open in Files", 0, false, !why.len)) {
@@ -2346,12 +2346,12 @@ static Str fileaskwhy(Gui *g)
     return {};
 }
 
-static void fileaskopen(Gui *g)
+static void fileaskopen(Gui *g, Arena scratch)
 {
     if (fileaskwhy(g).len || g->fask.p.shown) {
         return;
     }
-    Arena       a = g->frame;
+    Arena       a = scratch;
     GuiSession *s = g->sess;
     Str         at = "~/";
     if (s && termcwd(s).len && !sessnofolder(s)) {
@@ -2720,7 +2720,7 @@ static i32 filetabline(FileTab *ft, i32 *col)
 // follows the tab picked, which counts as opening it, and the set
 // follows the bar's order. Each tab's context menu closes, copies its
 // path or reads it again; "+" is Open file.
-static FileBar filetabs(Gui *g, GuiSession *root)
+static FileBar filetabs(Gui *g, Arena scratch, GuiSession *root)
 {
     FileBar  r   = {-1, 0, 0, -1};
     FileSet *set = &root->files;
@@ -2733,7 +2733,7 @@ static FileBar filetabs(Gui *g, GuiSession *root)
     if (!ImGui::BeginTabBar("##filetabs", bf)) {
         return r;
     }
-    Arena   a = g->frame;
+    Arena   a = scratch;
     Str    *hosts = alloc<Str>(&a, set->n);
     for (i32 i = 0; i < set->n; i++) {
         hosts[i] = filehostname(g, &a, set->tabs[i]->host);
@@ -2808,7 +2808,7 @@ static FileBar filetabs(Gui *g, GuiSession *root)
     ImGui::BeginDisabled(why.len > 0);
     if (ImGui::TabItemButton("+", ImGuiTabItemFlags_Trailing |
                                   ImGuiTabItemFlags_NoTooltip)) {
-        fileaskopen(g);
+        fileaskopen(g, a);
     }
     ImGui::EndDisabled();
     if (why.len) {
@@ -2858,14 +2858,14 @@ static FileBar filetabs(Gui *g, GuiSession *root)
 }
 
 // What the pane says with no file open.
-static void filesempty(Gui *g)
+static void filesempty(Gui *g, Arena scratch)
 {
-    Arena a = g->frame;
+    Arena a = scratch;
     ImGui::TextDisabled("No file is open");
     Str why = fileaskwhy(g);
     ImGui::BeginDisabled(why.len > 0);
     if (ImGui::Button("Open file...")) {
-        fileaskopen(g);
+        fileaskopen(g, a);
     }
     ImGui::EndDisabled();
     itemnamed(g, "files open");
@@ -3423,7 +3423,7 @@ static void drawfiles(Gui *g)
     g->fimgshown    = 0;
     if (!set->n) {
         g->fshowing = 0;
-        filesempty(g);
+        filesempty(g, a);
         return;
     }
     // The shown tab checked as the window or the pane takes the focus,
@@ -3437,7 +3437,7 @@ static void drawfiles(Gui *g)
     g->fileswin   = win;
     g->filesfocus = focus;
 
-    FileBar bar = filetabs(g, root);
+    FileBar bar = filetabs(g, a, root);
     FileTab *rt = bar.reload>=0 ? set->tabs[bar.reload] : 0;
     if (rt && !(rt->host && filehostwhy(filehost(g, rt->host)).len)) {
         fileforce(g, rt);  // not one whose host can't serve it
@@ -3455,7 +3455,7 @@ static void drawfiles(Gui *g)
     FileTab *ft = filesetfront(set);
     if (!ft) {
         g->fshowing = 0;
-        filesempty(g);
+        filesempty(g, a);
         fetchtick(g, 0);
         return;
     }
