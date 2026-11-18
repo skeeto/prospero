@@ -481,6 +481,23 @@ if(NOT CMAKE_CROSSCOMPILING OR PROSPERO_CROSS_TESTS)
     target_link_options(prospero_test PRIVATE -nostdlib++)
   endif()
   add_test(NAME unit COMMAND prospero_test)
+  if(PROSPERO_GUI)
+    # ImGui's font atlas with the patched FreeType loader (FetchGui.cmake),
+    # which the unit tests leave out: glyphs keep their size when ImGui
+    # repacks its bakes (issue #77). ImGui's stock configuration, so none
+    # of the GUI's hooks.
+    add_executable(prospero_fonttest src/main_fonttest.cpp
+      ${IMGUI}/imgui.cpp ${imgui_draw_patched} ${IMGUI}/imgui_tables.cpp
+      ${IMGUI}/imgui_widgets.cpp ${imgui_freetype_patched})
+    target_include_directories(prospero_fonttest SYSTEM PRIVATE ${IMGUI})
+    target_compile_definitions(prospero_fonttest PRIVATE IMGUI_ENABLE_FREETYPE)
+    target_link_libraries(prospero_fonttest PRIVATE ${prospero_freetype})
+    if(WIN32)
+      # ImGui's default IME, clipboard and URL opening
+      target_link_libraries(prospero_fonttest PRIVATE imm32 user32 shell32)
+    endif()
+    add_test(NAME fonts COMMAND prospero_fonttest)
+  endif()
   if(APPLE)
     # The macOS desktop helper's own layer, which never touches the
     # screen: its pure parts, and its commands without permissions

@@ -240,13 +240,53 @@ file(COPY_FILE ${imgui_widgets_patched}.new ${imgui_widgets_patched} ONLY_IF_DIF
 file(REMOVE ${imgui_widgets_patched}.new)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${IMGUI}/imgui_widgets.cpp)
 
+# The FreeType loader shares one FT_Face among a font's sizes, and
+# switched the face to a bake's size only when the bake's pointer
+# differed from the last it used. ImGui packs its bake pool after
+# discarding unused sizes (after a zoom), moving a live bake to an
+# address the loader remembers, so its new glyphs were rasterized at
+# another size: scattered letters too large, or empty (issue #77). The
+# copy checks the face's active size instead.
+file(READ ${IMGUI}/misc/freetype/imgui_freetype.cpp imgui_freetype_text)
+function(imgui_ft_replace from to what)
+  string(FIND "${imgui_freetype_text}" "${from}" first)
+  string(FIND "${imgui_freetype_text}" "${from}" last REVERSE)
+  if(first LESS 0 OR NOT first EQUAL last)
+    message(FATAL_ERROR "imgui_freetype.cpp: ${what} has changed; "
+                        "update the size patch in FetchGui.cmake")
+  endif()
+  string(REPLACE "${from}" "${to}" text "${imgui_freetype_text}")
+  set(imgui_freetype_text "${text}" PARENT_SCOPE)
+endfunction()
+imgui_ft_replace("#include \"imgui_freetype.h\""
+  "#include \"misc/freetype/imgui_freetype.h\""
+  "the include of imgui_freetype.h")
+imgui_ft_replace([==[    if (bd_font_data->BakedLastActivated != baked) // <-- could use id
+    {
+        // Activate current size
+        ImGui_ImplFreeType_FontSrcBakedData* bd_baked_data = (ImGui_ImplFreeType_FontSrcBakedData*)loader_data_for_baked_src;
+        FT_Activate_Size(bd_baked_data->FtSize);
+        bd_font_data->BakedLastActivated = baked;
+    }]==]
+  [==[    // prospero: by the face's active size, not the bake's address, which
+    // ImGui reuses when it packs its bake pool (issue #77)
+    ImGui_ImplFreeType_FontSrcBakedData* bd_baked_data = (ImGui_ImplFreeType_FontSrcBakedData*)loader_data_for_baked_src;
+    if (bd_font_data->FtFace->size != bd_baked_data->FtSize)
+        FT_Activate_Size(bd_baked_data->FtSize);]==]
+  "FontBakedLoadGlyph's size activation")
+set(imgui_freetype_patched ${CMAKE_CURRENT_BINARY_DIR}/imgui-patched/imgui_freetype.cpp)
+file(WRITE ${imgui_freetype_patched}.new "${imgui_freetype_text}")
+file(COPY_FILE ${imgui_freetype_patched}.new ${imgui_freetype_patched} ONLY_IF_DIFFERENT)
+file(REMOVE ${imgui_freetype_patched}.new)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${IMGUI}/misc/freetype/imgui_freetype.cpp)
+
 add_library(imgui STATIC
   ${IMGUI}/imgui.cpp
   ${IMGUI}/imgui_demo.cpp
   ${imgui_draw_patched}
   ${IMGUI}/imgui_tables.cpp
   ${imgui_widgets_patched}
-  ${IMGUI}/misc/freetype/imgui_freetype.cpp
+  ${imgui_freetype_patched}
 )
 target_include_directories(imgui SYSTEM PUBLIC ${IMGUI} ${IMGUI}/backends)
 target_compile_definitions(imgui PUBLIC
