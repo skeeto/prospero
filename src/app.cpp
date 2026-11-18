@@ -10668,10 +10668,10 @@ static void exportrequest(Gui *g);
 
 // What the export saves is ready: copied, or a place to save it asked
 // for. The checklist saves in its directory without asking.
-static void exportready(Gui *g)
+static void exportready(Gui *g, Arena scratch)
 {
     Export *x = &g->exp;
-    Arena   a = g->frame;
+    Arena   a = scratch;
     if (x->clip) {
         putbyte(&x->data, 0);  // for ImGui
         ImGui::SetClipboardText((char *)x->data.data);
@@ -10708,7 +10708,7 @@ static void exportbuild(Gui *g)
     x->data = Buf(&x->mem, 1<<16);
     if (x->kind == EXPORT_MD) {
         viewexport(&x->data, s->view, s->sid, x->think, x->tools, x->output);
-        exportready(g);
+        exportready(g, g->frame);
     } else if (s->host->kind != GH_REMOTE) {
         Arena a  = g->frame;
         Str   p  = join(&a, sessdir(g, &a, s->sid), "events.jsonl");
@@ -10723,7 +10723,7 @@ static void exportbuild(Gui *g)
         x->data.len  = rd.data.len;
         x->data.cap  = rd.data.len;
         x->data.a    = &x->mem;
-        exportready(g);
+        exportready(g, a);
     } else {
         x->state = EXP_FETCH;
         x->off   = 0;
@@ -10772,7 +10772,7 @@ static void onexportfile(Gui *g, Arena scratch, Json *j, b32 ok, Str err)
     if (jsonint(jsonget(j, "more"), 0) && u.data.len) {
         exportrequest(g);
     } else {
-        exportready(g);
+        exportready(g, scratch);
     }
 }
 
@@ -12446,13 +12446,15 @@ static b32 gobackground(Gui *g)
         return 0;
     }
     closehosts(g);  // the others forget this window
-    Arena a = g->frame;
-    Buf   b(&a, 128);
-    print(&b, "running in the background as host ");
-    print(&b, (i64)os_pid(g->os));
-    print(&b, ", at ");
-    print(&b, h->endpoint);
-    guilog(g, finish(&b));
+    {
+        Arena a = g->frame;  // done with before shed saves the layout
+        Buf   b(&a, 128);
+        print(&b, "running in the background as host ");
+        print(&b, (i64)os_pid(g->os));
+        print(&b, ", at ");
+        print(&b, h->endpoint);
+        guilog(g, finish(&b));
+    }
     shed(g);
     return 1;
 }
@@ -12603,10 +12605,10 @@ static void raisenow(Gui *g)
 // its door opens with its window), and exit. Returns the exit status.
 // The session starts in the window's process, so it has that one's
 // environment, not this one's.
-static i32 handoff(Gui *g)
+static i32 handoff(Gui *g, Arena scratch)
 {
     Os   *os    = g->os;
-    Arena a     = g->frame;
+    Arena a     = scratch;
     Str   token = os_getenv(os, &a, "XDG_ACTIVATION_TOKEN");
     Knock k     = knock(os, &g->perm, a, g->statedir, token, g->opendir, DOOR_FIND,
                         os_guiletfront);
@@ -30439,11 +30441,10 @@ static b32 guiwanted(Str *args, i32 nargs)
 // prompt comes back after the window, or after its errors, read back
 // from the log; a window slower than DETACH_WAIT is left to it. Returns
 // the exit status.
-// arenalint: frame ok, as args are the command line's and here is in perm
-static i32 detachgui(Gui *g, Str *args, i32 nargs, Str here)
+static i32 detachgui(Gui *g, Arena scratch, Str *args, i32 nargs, Str here)
 {
     Os        *os   = g->os;
-    Arena      a    = g->frame;
+    Arena      a    = scratch;
     Slice<Str> argv = {};
     for (i32 i = 0; i < nargs; i++) {
         argv = push(&a, argv, args[i]);
@@ -31110,6 +31111,10 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     iz mb = (iz)1 << 20;
     g->perm      = newarena(os_reserve(os, 256*mb));
     g->frame     = newarena(os_reserve(os, 1024*mb));
+#if PROSPERO_ARENACHECK
+    arenaroot(&g->frame);
+    arenacheck.rootmode = ARENAROOT_FAULT;
+#endif
     g->framebase = g->frame.beg;
     g->vcache    = newviewcache(&g->perm, os_reserve(os, 2048*mb), 512*mb);
     g->replayr   = os_reserve(os, (iz)1<<32);
@@ -31214,9 +31219,9 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
         Arena a    = g->frame;
         Str   path = guilockpath(&a, g->statedir);
         if (os_lockheld(os, a, path)) {
-            return handoff(g);
+            return handoff(g, a);
         }
-        return detachgui(g, args, nargs, here);
+        return detachgui(g, a, args, nargs, here);
     }
     // One window per state directory (door.cpp), its lock held for this
     // process's life, the window gone to the background or not: a second
@@ -31226,7 +31231,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
         Str   path = guilockpath(&a, g->statedir);
         g->guilock = guilock(os, a, g->statedir);
         if (g->guilock<0 && os_lockheld(os, a, path)) {
-            return handoff(g);
+            return handoff(g, a);
         }
     }
     Str sessions = join(&g->perm, g->statedir, "sessions");

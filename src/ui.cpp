@@ -1031,7 +1031,7 @@ static void drawkbd(Gui *g, ImDrawList *dl, f32 x0, f32 x1, f32 ly, f32 lh, f32 
 static void namedrect(Gui *, Str, ImVec2, ImVec2);
 static b32  codelinkdrawn(Gui *, Arena, LinkFrom *, Str);
 
-static void drawblock(Gui *g, ImDrawList *dl, ImDrawListSplitter *sp,
+static void drawblock(Gui *g, Arena scratch, ImDrawList *dl, ImDrawListSplitter *sp,
                       Doc *d, i32 msg, Placed *p, ImVec2 origin, Range sel,
                       Marks *mk, f32 cliptop, f32 clipbot, f32 alpha, LinkFrom *from)
 {
@@ -1142,7 +1142,7 @@ static void drawblock(Gui *g, ImDrawList *dl, ImDrawListSplitter *sp,
             if (pc->flags&PIECE_CAND && candat!=r->piece) {
                 DocCand *c = from ? doccand(d, pc) : 0;
                 candat   = r->piece;
-                candlink = c && codelinkdrawn(g, g->frame, from, c->text);
+                candlink = c && codelinkdrawn(g, scratch, from, c->text);
             }
             b32          cand = pc->flags&PIECE_CAND && candlink;
             ImFontBaked *bk   = stylebaked(f, pc->style);
@@ -1174,12 +1174,12 @@ static void drawblock(Gui *g, ImDrawList *dl, ImDrawListSplitter *sp,
             }
             if (g->drive && pc->link>=0) {
                 // Where the checklist clicks a link: "link " and where to
-                Arena a = g->frame;
+                Arena a = scratch;
                 namedrect(g, concat(&a, "link ", d->links[pc->link]),
                           v2(ox+r->x, ly), v2(ox+r->x+r->w, ly+l->h));
             } else if (g->drive && cand) {
                 // Inline code, found a file: "codelink " and its text
-                Arena a = g->frame;
+                Arena a = scratch;
                 namedrect(g, concat(&a, "codelink ", pc->text),
                           v2(ox+r->x, ly), v2(ox+r->x+r->w, ly+l->h));
             }
@@ -1188,9 +1188,9 @@ static void drawblock(Gui *g, ImDrawList *dl, ImDrawListSplitter *sp,
 }
 
 // Copy a view's selection to the clipboard.
-static void copyout(Gui *g, View *v, i32 how)
+static void copyout(Gui *g, Arena scratch, View *v, i32 how)
 {
-    Arena a = g->frame;
+    Arena a = scratch;
     Str   s = copysel(v, &a, how);
     if (s.len) {
         ImGui::SetClipboardText(cstr0(&a, s));
@@ -3231,9 +3231,9 @@ static void gaugetip(Buf *b, View *v)
     printgrouped(b, v->cached);
 }
 
-static void drawgauge(Gui *g, View *v, f32 w)
+static void drawgauge(Gui *g, Arena scratch, View *v, f32 w)
 {
-    Arena       a     = g->frame;
+    Arena       a     = scratch;
     f32         sc    = g->scale;
     f32         h     = ImGui::GetFrameHeight();
     ImVec2      p0    = ImGui::GetCursorScreenPos();
@@ -3750,7 +3750,7 @@ static void drawsessbar(Gui *g)
     }
     g->gaugeshown = 0;
     if (gw > 0) {
-        drawgauge(g, v, gw);
+        drawgauge(g, a, v, gw);
         ImGui::SameLine();
     }
     if (togglebutton(g, sl, v->foldshell)) {
@@ -4221,7 +4221,7 @@ static void filelinkitems(Gui *);
 // opens it: Copy and Copy as Markdown, which the caller may follow with
 // items of its own before endtextmenu. With copyrect not negative, Copy
 // is that RECT_*.
-static b32 begintextmenu(Gui *g, View *v, i32 copyrect, b32 asked = 0)
+static b32 begintextmenu(Gui *g, Arena scratch, View *v, i32 copyrect, b32 asked = 0)
 {
     if (uirclicked(g) || asked) {
         ImGui::OpenPopup("##textmenu");
@@ -4237,10 +4237,10 @@ static b32 begintextmenu(Gui *g, View *v, i32 copyrect, b32 asked = 0)
         itemrect(g, copyrect);
     }
     if (copy) {
-        copyout(g, v, COPY_TEXT);
+        copyout(g, scratch, v, COPY_TEXT);
     }
     if (ImGui::MenuItem("Copy as Markdown", 0, false, any)) {
-        copyout(g, v, COPY_MARKDOWN);
+        copyout(g, scratch, v, COPY_MARKDOWN);
     }
     itemnamed(g, "text copy markdown");
     return 1;
@@ -4257,17 +4257,17 @@ static void endtextmenu(Gui *g, View *v)
 }
 
 // The selection's keys, while the window around the text has focus.
-static void textkeys(Gui *g, View *v)
+static void textkeys(Gui *g, Arena scratch, View *v)
 {
     if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) {
         if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_A)) {
             selall(v);
         }
         if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_C)) {
-            copyout(g, v, COPY_TEXT);
+            copyout(g, scratch, v, COPY_TEXT);
         }
         if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_C)) {
-            copyout(g, v, COPY_MARKDOWN);
+            copyout(g, scratch, v, COPY_MARKDOWN);
         }
     }
 }
@@ -4277,7 +4277,7 @@ static void textkeys(Gui *g, View *v)
 // code blocks' Copy buttons. A chunk of a file's lines has hundreds of
 // blocks, so the first on screen is found by its bottom, which grows
 // block by block, and none past the window's bottom is looked at.
-static void drawmsgtext(Gui *g, ImDrawList *dl, ImDrawListSplitter *sp, TextArea *ta,
+static void drawmsgtext(Gui *g, Arena scratch, ImDrawList *dl, ImDrawListSplitter *sp, TextArea *ta,
                         i32 i, MsgLayout *ml, ImVec2 origin, Range sel, Marks *mk,
                         f32 alpha, b32 aim)
 {
@@ -4311,7 +4311,7 @@ static void drawmsgtext(Gui *g, ImDrawList *dl, ImDrawListSplitter *sp, TextArea
         if (origin.y+pl->y > bot) {
             break;
         }
-        drawblock(g, dl, sp, d, i, pl, origin, sel, mk, top, bot, alpha, from);
+        drawblock(g, scratch, dl, sp, d, i, pl, origin, sel, mk, top, bot, alpha, from);
     }
     if (v->msgs[i].lines) {
         return;  // no code blocks, no Copy buttons
@@ -4446,9 +4446,9 @@ static void linktipnow(Gui *g, Arena *a, Str tip)
 // pressed on (press, a hash, and pressmsg keep which). A link to a
 // file is from where from says; right-clicked, the text's menu, opened
 // as the button is let go of, is for it (filelinkitems).
-static Str textlink(Gui *g, View *v, TextHit hit, u64 *press, i32 *pressmsg, LinkFrom *from)
+static Str textlink(Gui *g, Arena scratch, View *v, TextHit hit, u64 *press, i32 *pressmsg, LinkFrom *from)
 {
-    Arena a    = g->frame;
+    Arena a    = scratch;
     Str   link = {};
     if (hit.hit && hit.body && ImGui::IsItemHovered()) {
         link = doclinkat(msgdoc(v, hit.at.msg), hit.at.off);
@@ -4759,8 +4759,8 @@ static Str drawlines(Gui *g, Arena scratch, DocView *d, char const *id, Str name
     TextArea ta = {v, wpos, wh, width, pad, pad, ImGui::GetScrollY(), &d->dragging,
                    &d->scrollto, gutter, sx, 1, 0, 0};
     TextHit hit  = textmouse(g, &ta, name);
-    Str     link = textlink(g, v, hit, &d->press, &d->pressmsg, &d->from);
-    if (begintextmenu(g, v, -1)) {
+    Str     link = textlink(g, scratch, v, hit, &d->press, &d->pressmsg, &d->from);
+    if (begintextmenu(g, scratch, v, -1)) {
         endtextmenu(g, v);
     }
 
@@ -4791,7 +4791,7 @@ static Str drawlines(Gui *g, Arena scratch, DocView *d, char const *id, Str name
             mk = filemarks(&a, dl->find, i, m->text.data - v->body.data, &carry);
             carried |= carry;
         }
-        drawmsgtext(g, dr, sp, &ta, i, ml, v2(ox, y), sel, &mk, 1, 0);
+        drawmsgtext(g, a, dr, sp, &ta, i, ml, v2(ox, y), sel, &mk, 1, 0);
         for (iz k = 0; k < ml->blocks.len; k++) {
             Placed *pl = &ml->blocks[k];
             f32     ly = y + pl->y;
@@ -4891,7 +4891,7 @@ static Str drawlines(Gui *g, Arena scratch, DocView *d, char const *id, Str name
     fs->carried = carried;
     fs->winw    = ww;
     ImGui::EndChild();
-    textkeys(g, v);
+    textkeys(g, a, v);
     return link;
 }
 
@@ -4961,8 +4961,8 @@ static Str drawdoc(Gui *g, Arena scratch, DocView *d, char const *id, Str name, 
     TextArea ta   = {v, wpos, ImGui::GetWindowHeight(), width, pad, pad,
                      ImGui::GetScrollY(), &d->dragging, &d->scrollto, 0, 0, 0, &d->from, 0};
     TextHit hit  = textmouse(g, &ta, name);
-    Str     link = textlink(g, v, hit, &d->press, &d->pressmsg, &d->from);
-    if (begintextmenu(g, v, -1)) {
+    Str     link = textlink(g, scratch, v, hit, &d->press, &d->pressmsg, &d->from);
+    if (begintextmenu(g, scratch, v, -1)) {
         endtextmenu(g, v);
     }
 
@@ -4979,11 +4979,11 @@ static Str drawdoc(Gui *g, Arena scratch, DocView *d, char const *id, Str name, 
         MsgLayout *ml = msglayout(v, i, &g->measure, width, sc);
         Marks      mk = d->find && d->find->v==v ? hitmarks(d->find->hits, d->find->cur, i)
                                                  : Marks{0, 0, -1};
-        drawmsgtext(g, dl, sp, &ta, i, ml, v2(wpos.x + pad, y + pad), sel, &mk, 1, 0);
+        drawmsgtext(g, scratch, dl, sp, &ta, i, ml, v2(wpos.x + pad, y + pad), sel, &mk, 1, 0);
     }
     sp->Merge(dl);
     ImGui::EndChild();
-    textkeys(g, v);  // the window's, as its child's
+    textkeys(g, scratch, v);  // the window's, as its child's
     return link;
 }
 
@@ -6016,7 +6016,7 @@ static void drawtranscript(Gui *g)
                     0, 0, 0, 0, 1};
     TextHit  hit  = textmouse(g, &ta, "Transcript");
     LinkFrom from = filelinkfrom(g->sess, hit.hit ? msgcwd(v, hit.at.msg) : v->cwd);
-    Str      link = textlink(g, v, hit, &g->linkpress, &g->linkmsg, &from);
+    Str      link = textlink(g, g->frame, v, hit, &g->linkpress, &g->linkmsg, &from);
     itemrect(g, RECT_TRANSCRIPT);
     if (link.len) {
         followlink(g, g->frame, link, &from);
@@ -6026,7 +6026,7 @@ static void drawtranscript(Gui *g)
         g->menumsg = hit.hit && !asked ? hit.at.msg : -1;  // the popup takes the hover from here on
         g->menuoff = hit.hit && !asked ? hit.at.off : -1;
     }
-    if (begintextmenu(g, v, RECT_COPYITEM, asked)) {
+    if (begintextmenu(g, g->frame, v, RECT_COPYITEM, asked)) {
         b32 onmsg = g->menumsg>=0 && g->menumsg<v->msgs.len;
         if (ImGui::MenuItem("Copy Message", 0, false, onmsg)) {
             copymessage(g, g->menumsg);
@@ -6144,7 +6144,7 @@ static void drawtranscript(Gui *g)
         }
         if (!m->collapsed) {
             Marks mk = msgmarks(g, v, i);
-            drawmsgtext(g, dl, sp, &ta, i, ml, v2(x, y + head), sel, &mk, alpha, 1);
+            drawmsgtext(g, g->frame, dl, sp, &ta, i, ml, v2(x, y + head), sel, &mk, alpha, 1);
         }
 
         ImGui::PushID(i);
@@ -6263,7 +6263,7 @@ static void drawtranscript(Gui *g)
         drawgreeting(g, wpos, winh, width + 2*pad);
 #endif
     }
-    textkeys(g, v);
+    textkeys(g, g->frame, v);
 
     gs->stick = scrolly >= ImGui::GetScrollMaxY()-2 || total<=winh;
     ImGui::EndChild();
@@ -13926,9 +13926,9 @@ static b32 cfgfocused(Gui *g, CfgRow *r)
            r->name==g->cfgfname;
 }
 
-static void drawcfgrow(Gui *g, CfgRow *r, i32 target, b32 wide)
+static void drawcfgrow(Gui *g, Arena scratch, CfgRow *r, i32 target, b32 wide)
 {
-    Arena a = g->frame;
+    Arena a = scratch;
     ImGui::TableNextRow();
     b32 focus = cfgfocused(g, r);
     if (focus && g->sched.now<g->cfgmarkend) {
@@ -14278,9 +14278,9 @@ static void cfgheading(Gui *g, Arena a, b32 combo, Str label, b32 first = 0)
 
 // The list of pages, in the list beside the page or in the combo above
 // it: General's, each named kind's sections and its Add, Diagnostics.
-static void drawcfglist(Gui *g, b32 combo)
+static void drawcfglist(Gui *g, Arena scratch, b32 combo)
 {
-    Arena a     = g->frame;
+    Arena a     = scratch;
     f32   sc    = g->scale;
     Json *kinds = jsonget(g->cfg, "kinds");
     cfgheading(g, a, combo, "General", 1);
@@ -14599,7 +14599,7 @@ static void drawcfgfind(Gui *g, Arena a, Slice<i32> found, b32 enter)
 // The settings of one section, in a table: three columns when the
 // value has room beside the others, else two, with where each is set
 // under its key.
-static void drawcfgtable(Gui *g, Str kind, Str name)
+static void drawcfgtable(Gui *g, Arena scratch, Str kind, Str name)
 {
     // As if without a scrollbar, so that pages long and short agree
     f32          sc    = g->scale;
@@ -14639,7 +14639,7 @@ static void drawcfgtable(Gui *g, Str kind, Str name)
         } else if (r->value.len >= FIELD_MAX) {
             target = RECT_LONGFIELD;  // more than the slack
         }
-        drawcfgrow(g, r, target, wide);
+        drawcfgrow(g, scratch, r, target, wide);
     }
     ImGui::EndTable();
 }
@@ -14745,9 +14745,9 @@ static void copyallbutton(Gui *g, Arena a, Str text, char const *name, char cons
 // text is selectable and copied as the Plan's is (issue #36), each led
 // by its severity in bold, and Copy all for every one of them as text,
 // to paste where they are wanted.
-static void drawcfgdiags(Gui *g)
+static void drawcfgdiags(Gui *g, Arena scratch)
 {
-    Arena a     = g->frame;
+    Arena a     = scratch;
     Json *diags = jsonget(g->cfg, "diags");
     Buf   plain(&a, 1024);
     Buf   md(&a, 1024);
@@ -15260,12 +15260,12 @@ static void drawsignin(Gui *g, Arena a, Str name, b32 copilot)
 // named one of the user's own file, Connect for a remote, an MCP
 // server's state and sign-in, its settings, and a model's template
 // argument.
-static void drawcfgpage(Gui *g)
+static void drawcfgpage(Gui *g, Arena scratch)
 {
-    Arena       a  = g->frame;
+    Arena       a  = scratch;
     ImGuiStyle &st = ImGui::GetStyle();
     if (g->cfgdiag) {
-        drawcfgdiags(g);
+        drawcfgdiags(g, a);
         return;
     }
     Str   kind  = g->cfgpkind;
@@ -15368,7 +15368,7 @@ static void drawcfgpage(Gui *g)
         ImGui::TextDisabled("Loading...");
         return;
     }
-    drawcfgtable(g, kind, name);
+    drawcfgtable(g, a, kind, name);
     if (kind == "model") {
         drawcfgtemplate(g, a, name);
     }
@@ -15395,9 +15395,9 @@ static void cfgseed(Str kind, Str name, Str *key, Str *val)
 
 // A new named section: its name, then its page. A remote's asks how it
 // is reached as well, over ssh or by a command, and where prospero is.
-static void drawcfgadd(Gui *g)
+static void drawcfgadd(Gui *g, Arena scratch)
 {
-    Arena a  = g->frame;
+    Arena a  = scratch;
     f32   sc = g->scale;
     // Opened once Settings shows: a tab just selected in its dock node,
     // as beside the transcript, is hidden its first frame, and a popup
@@ -15589,9 +15589,9 @@ static void drawcfgadd(Gui *g)
 }
 
 // Before deleting the page's section: what goes, from where.
-static void drawcfgdel(Gui *g)
+static void drawcfgdel(Gui *g, Arena scratch)
 {
-    Arena a  = g->frame;
+    Arena a  = scratch;
     f32   sc = g->scale;
     if (g->opendel) {
         ImGui::OpenPopup("Delete section?");
@@ -15688,7 +15688,7 @@ static void cfgeditbutton(Gui *g, Arena a, Str path, b32 exists)
 // What the latest change in Settings came to, as a toast over the foot
 // of the page (r0 to r1), as the transcript's (drawtoast): an error stays until
 // dismissed or replaced, and anything else fades.
-static void drawcfgtoast(Gui *g, ImVec2 r0, ImVec2 r1)
+static void drawcfgtoast(Gui *g, Arena scratch, ImVec2 r0, ImVec2 r1)
 {
     b32 fresh = !g->cfgok || g->sched.now-g->cfgstatusat<TOAST_LIFE;
     if (!g->cfgstatus.len || !fresh) {
@@ -15698,7 +15698,7 @@ static void drawcfgtoast(Gui *g, ImVec2 r0, ImVec2 r1)
         schedat(&g->sched, g->cfgstatusat + TOAST_LIFE, DUE_CLOCK);
     }
     u32 c = g->cfgok ? g->pal->ok : g->pal->bad;
-    if (toastbox(g, g->frame, g->cfgstatus, c, g->cfgok ? g->pal->rule : c,
+    if (toastbox(g, scratch, g->cfgstatus, c, g->cfgok ? g->pal->rule : c,
                  "\xc3\x97", "settings dismiss", "Dismiss", -1, r0, r1, 1)) {  // a multiplication sign
         g->cfgstatus = {};
     }
@@ -15831,7 +15831,7 @@ static void drawsettings(Gui *g)
             if (find) {
                 drawcfgfind(g, a, found, enter);
             } else {
-                drawcfglist(g, 0);
+                drawcfglist(g, a, 0);
             }
             hs = ImGui::GetScrollMaxX();
         }
@@ -15852,7 +15852,7 @@ static void drawsettings(Gui *g)
         axnextname(g, "Page");
         if (ImGui::BeginCombo("##pages", cstr0(&a, show), ImGuiComboFlags_HeightLarge)) {
             g->cfgcombo = 1;
-            drawcfglist(g, 1);
+            drawcfglist(g, a, 1);
             ImGui::EndCombo();
         }
         g->rects[RECT_PAGECOMBO] = {at.x, at.y, at.x+w, at.y+ImGui::GetFrameHeight()};
@@ -15862,7 +15862,7 @@ static void drawsettings(Gui *g)
     ImVec2 t1 = v2(t0.x + ImGui::GetWindowSize().x, t0.y + ImGui::GetWindowSize().y);
     if (!(find && !g->cfgtwopane && !g->cfgfindhid)) {
         if (ImGui::BeginChild("##page", v2(0, 0))) {
-            drawcfgpage(g);
+            drawcfgpage(g, a);
             f32 m = ImGui::GetScrollMaxX();
             hs = hs>m ? hs : m;
         }
@@ -15870,9 +15870,9 @@ static void drawsettings(Gui *g)
         t0 = ImGui::GetItemRectMin();
         t1 = ImGui::GetItemRectMax();
     }
-    drawcfgtoast(g, t0, t1);
-    drawcfgadd(g);
-    drawcfgdel(g);
+    drawcfgtoast(g, a, t0, t1);
+    drawcfgadd(g, a);
+    drawcfgdel(g, a);
     f32 m = ImGui::GetScrollMaxX();
     g->cfghscroll = hs>m ? hs : m;
     g->cfgframe   = g->total.frames;
@@ -17292,14 +17292,14 @@ static char const *layoutkey(Gui *g, Arena *a, i32 n)
     return cmdkey(g, a, Str{(u8 *)d, 1});
 }
 
-static void drawlayoutmenu(Gui *g)
+static void drawlayoutmenu(Gui *g, Arena scratch)
 {
     b32 menu = ImGui::BeginMenu("Layout");
     itemnamed(g, "menu Layout");
     if (!menu) {
         return;
     }
-    Arena a = g->frame;
+    Arena a = scratch;
     for (i32 i = 0; i < PRESET_COUNT; i++) {
         b32 pick = ImGui::MenuItem(presetnames[i].cdata, layoutkey(g, &a, i));
         itemnamed(g, concat(&a, "layout ", presetnames[i]));
@@ -17546,10 +17546,10 @@ static void drawmenubar(Gui *g)
         View *v   = g->view;
         b32   any = !selempty(&v->sel);
         if (ImGui::MenuItem("Copy", cmdkey(g, &a, "C"), false, any)) {
-            copyout(g, v, COPY_TEXT);
+            copyout(g, a, v, COPY_TEXT);
         }
         if (ImGui::MenuItem("Copy as Markdown", cmdkey(g, &a, "Shift+C"), false, any)) {
-            copyout(g, v, COPY_MARKDOWN);
+            copyout(g, a, v, COPY_MARKDOWN);
         }
         if (ImGui::MenuItem("Select all", cmdkey(g, &a, "A"), false, v->msgs.len>0)) {
             selall(v);
@@ -17576,7 +17576,7 @@ static void drawmenubar(Gui *g)
     menu = ImGui::BeginMenu("View");
     itemrect(g, RECT_MENU);
     if (menu) {
-        Arena k = a;  // let go before drawlayoutmenu takes the frame's arena
+        Arena k = a;
         if (ImGui::MenuItem("Go to...", cmdkey(g, &k, "K"))) {
             palopen(g);
         }
@@ -17602,7 +17602,7 @@ static void drawmenubar(Gui *g)
         }
         ImGui::Separator();
         // Layouts first, the quickest to reach, then the panes
-        drawlayoutmenu(g);
+        drawlayoutmenu(g, k);
         ImGui::Separator();
         for (i32 i = 0; i < PANE_COUNT; i++) {
             if (!paneoffered(i)) {

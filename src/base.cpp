@@ -52,6 +52,7 @@ struct Arena {
     // was copied from, and the block a carve was lent by its parent.
     mutable u32  aid    = 0;
     u32          parent = 0;
+    b32          root   = 0;  // a root (arenaroot), not copied with it
     u32          lender = 0;
     byte        *lentlo = {};
     byte        *lenthi = {};

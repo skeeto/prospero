@@ -3155,11 +3155,11 @@ static b32 filemdreveal(Gui *g, FileBody *b, FindHit h)
 
 // The bar in line mode (filefindbar): the line typed, gone to on Enter,
 // or 'Not a line'; Enter on nothing, Esc or its close leaves.
-static void filelinebar(Gui *g, FileTab *ft, FileBody *b, ImVec2 r0, ImVec2 r1,
+static void filelinebar(Gui *g, Arena scratch, FileTab *ft, FileBody *b, ImVec2 r0, ImVec2 r1,
                         b32 held, b32 esc)
 {
     FileFindBar *fb = &g->ffind;
-    Arena        a  = g->frame;
+    Arena        a  = scratch;
     FindBar      bar = {};
     bar.child    = "##filefindbar";
     bar.name     = "file line";
@@ -3226,10 +3226,10 @@ static void filelinebar(Gui *g, FileTab *ft, FileBody *b, ImVec2 r0, ImVec2 r1,
 // line (physical Ctrl on macOS); F3 and Shift+F3, on macOS Cmd+G and
 // Cmd+Shift+G too, and Esc from the text; in the bar, Enter,
 // Shift+Enter, the arrows, and Ctrl/Cmd(+Shift)+G.
-static void filefindbar(Gui *g, FileTab *ft, FileBody *b, ImVec2 r0, ImVec2 r1)
+static void filefindbar(Gui *g, Arena scratch, FileTab *ft, FileBody *b, ImVec2 r0, ImVec2 r1)
 {
     FileFindBar *fb = &g->ffind;
-    Arena        a  = g->frame;
+    Arena        a  = scratch;
     // Go to line. In the find field Ctrl+G is the next match, the bar's
     // own key going ahead of this one; on macOS ImGui holds back Super
     // (physical Ctrl) chords from an active field, so there it is read
@@ -3274,7 +3274,7 @@ static void filefindbar(Gui *g, FileTab *ft, FileBody *b, ImVec2 r0, ImVec2 r1)
               !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId) &&
               ImGui::Shortcut(ImGuiKey_Escape);
     if (fb->mode == FBAR_LINE) {
-        filelinebar(g, ft, b, r0, r1, held, esc);
+        filelinebar(g, a, ft, b, r0, r1, held, esc);
         return;
     }
 
@@ -3736,7 +3736,7 @@ static void drawfiles(Gui *g)
         d->from.file  = ft->path;
         Str link = drawdoc(g, a, d, "##filetext", "File");
         itemnamed(g, "file text");
-        filefindbar(g, ft, b, ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+        filefindbar(g, a, ft, b, ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
         if (link.len) {
             followlink(g, a, link, &d->from);
         }
@@ -3780,7 +3780,7 @@ static void drawfiles(Gui *g)
     } else if (dl->restored) {
         dl->restore = 0;
     }
-    filefindbar(g, ft, b, ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    filefindbar(g, a, ft, b, ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
     if (dl->recorded) {
         ft->top     = dl->top;
         ft->dy      = dl->dy;

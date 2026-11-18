@@ -20,6 +20,16 @@
 // live to the end of the full expression, so f(scratch) || g(scratch)
 // looks the same.
 //
+// A root (arenaroot), the GUI's frame arena, is the exception: it is only
+// ever copied, never given by value twice in one expression, so copies
+// of it alive at once, each holding bytes, are a fault as soon as one
+// allocates over the other's (rootmode), read or not: a callee taking
+// its own copy of the frame while its caller's copy holds the string it
+// was given (the find bar's count, 2138a93). Each identity knows the copy
+// of a root it descends from (head), and copies of one copy are left to
+// the rule above, as is the root itself allocating over a copy, which a
+// function given the root by pointer does with its results.
+//
 // The checker never reads another Arena object: identities mirror
 // their frontier, which an arena moved down by hand (a trim) leaves
 // stale until it next allocates. Which identity last allocated a 16-byte
@@ -55,6 +65,7 @@
 extern "C" void __asan_poison_memory_region(void const volatile *, uz);
 extern "C" void __asan_unpoison_memory_region(void const volatile *, uz);
 extern "C" i32  __asan_address_is_poisoned(void const volatile *);
+extern "C" void __sanitizer_print_stack_trace();
 
 // Regions and the test arena are never freed as a whole. Weak, as a
 // program may have two translation units (Linux's with the X11 helper),
@@ -97,6 +108,8 @@ struct ArenaRec {
     i32          line;
     b32          given; // assigned from: its bytes may be another's now
     ArenaOver    over;  // the first overlap noted, if any (over.hi)
+    b32          root;  // a root (arenaroot), each copy of which starts at its base
+    u32          head;  // the copy of a root it is or descends from, if any
 };
 
 // Provided by the platform layer: write a fault's report to stderr.
@@ -119,6 +132,15 @@ struct ArenaCheck {
     ArenaRec  recs[ARENA_SLOTS];
     ArenaSpan spans[ARENA_SPANS];
     u32       nspans;
+    i32       rootmode; // ARENAROOT_*: two copies of a root overlapping
+    u64       rootseen[512];  // those noted once already (ARENAROOT_NOTE)
+    u32       nrootseen;
+};
+
+enum {
+    ARENAROOT_OFF,
+    ARENAROOT_NOTE,   // said once per pair of sites, with the stack
+    ARENAROOT_FAULT,
 };
 inline ArenaCheck arenacheck;
 
@@ -151,6 +173,9 @@ inline ArenaRec *arenaown(Arena const *a)
 
 inline ArenaRec *arenanew(Arena const *a, byte *lo)
 {
+    ArenaRec *p    = arenarec(a->parent);
+    b32       proot = p && p->root;
+    u32       phead = p ? p->head : 0;
     u32 slot = 0;
     if (arenacheck.nfree) {
         slot = arenacheck.free[--arenacheck.nfree];
@@ -171,8 +196,24 @@ inline ArenaRec *arenanew(Arena const *a, byte *lo)
     r->beg  = lo;
     r->file = a->file;
     r->line = a->line;
+    r->root = a->root;
+    r->head = a->root ? 0 : proot ? r->aid : phead;
     a->aid  = r->aid;
     return r;
+}
+
+// Mark a as a root, such as the GUI's frame arena, which is only ever
+// copied for scratch: each copy starts at its base, so two copies alive
+// at once, each holding bytes, overlap, though neither is the other's.
+inline void arenaroot(Arena *a)
+{
+    a->root = 1;
+    arenalock();
+    ArenaRec *r = arenaown(a);
+    r = r ? r : arenanew(a, a->beg);
+    r->root = 1;
+    r->head = 0;
+    arenaunlock();
 }
 
 inline void arenafree(ArenaRec *r)
@@ -451,23 +492,74 @@ inline void arenacheck_alloc(Arena *a, byte *p, iz n, void *pc)
     r->lo   = old<r->lo ? old : r->lo;
     r->beg  = hi;
 
+    // Another copy of a root, alive and holding these bytes, allocated
+    // over by this one, of another copy. Not by the root itself, as a
+    // function given it by pointer takes a copy for scratch and puts its
+    // results in the root once done: the rule above watches that copy.
+    ArenaRec *rv   = 0;
+    byte     *rvlo = 0;
+    byte     *rvhi = 0;
+    b32       rooted = arenacheck.rootmode && r->head;
     arenagranules(p, hi, [&](byte *g) {
         u32      *h = arenahint(g);
         ArenaRec *v = *h!=r->aid ? arenarec(*h) : 0;
-        if (v && !v->over.hi) {
+        if (v) {
             byte *lo  = p>v->lo ? p : v->lo;
             byte *top = hi<v->beg ? hi : v->beg;
             b32   lent = a->lender==v->aid && lo>=a->lentlo && top<=a->lenthi;
-            if (lo<top && !lent) {
+            if (lo<top && !lent && !v->over.hi) {
                 v->over = {lo, top, r->file, r->line, pc};
+            }
+            if (lo<top && !lent && rooted && !rv && v->head && v->head!=r->head) {
+                rv   = v;
+                rvlo = lo;
+                rvhi = top;
             }
         }
         *h = r->aid;
     });
+
+    u8       rbuf[sizeof(arenacheck.last)];
+    ArenaMsg rm   = {rbuf, 0, countof(rbuf)};
+    b32      note = 0;
+    if (rv) {
+        u64 key = (u64)(uz)r->file*31 ^ (u64)r->line*131 ^ (u64)(uz)rv->file*7 ^
+                  (u64)rv->line*1009;
+        b32 seen = 0;
+        for (u32 i = 0; i < arenacheck.nrootseen; i++) {
+            seen |= arenacheck.rootseen[i] == key;
+        }
+        if (!seen && arenacheck.nrootseen<countof(arenacheck.rootseen)) {
+            arenacheck.rootseen[arenacheck.nrootseen++] = key;
+        }
+        note = arenacheck.rootmode==ARENAROOT_NOTE;
+        if (!note || !seen) {
+            arenaputs(&rm, note ? "arena note: " : "arena fault: ");
+            arenaput(&rm, "a copy of a root arena, made at ");
+            arenaputsite(&rm, r->file, r->line);
+            arenaput(&rm, ", allocated over [");
+            arenaputn(&rm, (uz)rvlo, 16);
+            arenaput(&rm, ", ");
+            arenaputn(&rm, (uz)rvhi, 16);
+            arenaput(&rm, "), which another copy of it, made at ");
+            arenaputsite(&rm, rv->file, rv->line);
+            arenaput(&rm, ", still holds (allocation at ");
+            arenaputn(&rm, (uz)pc, 16);
+            arenaput(&rm, ")\n");
+        }
+    }
     arenaunlock();
 
     if (m.len) {
         arenafault(m.buf, m.len);
+    }
+    if (rm.len && note) {
+        os_arenafault({rm.buf, rm.len});
+#if ARENA_ASAN
+        __sanitizer_print_stack_trace();
+#endif
+    } else if (rm.len) {
+        arenafault(rm.buf, rm.len);
     }
 }
 

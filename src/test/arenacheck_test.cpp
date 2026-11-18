@@ -231,6 +231,49 @@ static void test_arenacheck(Test *t)
         expect(t, "arenacheck.trim", istr(&a, arenafaults()), "0");
     }
 
+    // Copies of a root (arenaroot), as of the GUI's frame: two alive at
+    // once, each holding bytes, overlap, which the root's copy taken by a
+    // callee shows at once, before any read of what it went over (the
+    // find bar's count, 2138a93)
+    {
+        i32   mode = arenacheck.rootmode;
+        Arena root = carve(&a, 1<<16);
+        arenaroot(&root);
+        arenacheck.rootmode = ARENAROOT_FAULT;
+        {
+            Arena c = root;
+            clone(&c, "1 of 3");
+            scribble(root);  // the callee's own copy of the root
+            expect(t, "arenacheck.root copies", istr(&a, arenafaults()), "1");
+            Str msg = {arenacheck.last, arenacheck.lastlen};
+            expect(t, "arenacheck.root copies where", istr(&a, find(msg, "arenacheck_test.cpp:")>=0), "1");
+            scribble(c);     // given the caller's copy instead
+            expect(t, "arenacheck.root given the copy", istr(&a, arenafaults()), "0");
+        }
+        {
+            // The root itself, under a copy's bytes, as a function given it
+            // by pointer does with its results: the copy's next allocation
+            Arena c = root;
+            allocbytes(&c, 64);
+            allocbytes(&root, 16);
+            expect(t, "arenacheck.root itself", istr(&a, arenafaults()), "0");
+            allocbytes(&c, 16);
+            expect(t, "arenacheck.root itself, then the copy", istr(&a, arenafaults()), "1");
+        }
+        for (i32 i = 0; i < 2; i++) {
+            Arena c = root;  // one at a time
+            allocbytes(&c, 64);
+        }
+        {
+            Arena c = root;
+            Arena d = c;     // of one copy: the rules above, not this one
+            allocbytes(&d, 64);
+            allocbytes(&c, 64);
+        }
+        expect(t, "arenacheck.root one at a time", istr(&a, arenafaults()), "0");
+        arenacheck.rootmode = mode;
+    }
+
     // A frame reset, with copies in each frame
     {
         Arena frame = carve(&a, 1<<16);
