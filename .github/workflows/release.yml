@@ -156,7 +156,13 @@ jobs:
               -DCMAKE_EXE_LINKER_FLAGS=-s -DFETCHCONTENT_FULLY_DISCONNECTED=ON
           cmake --build build-gui --target prospero
           python3 -I tools/pecheck.py --machine x86_64 --subsystem gui build-gui/prospero.exe
-          test "$(wine build-gui/prospero.exe --version)" = "prospero $V"
+          # A tag's build says just its version; one run by hand from a
+          # later commit adds " (git describe)"
+          said=$(wine build-gui/prospero.exe --version)
+          case "$GITHUB_EVENT_NAME:$said" in
+          *:"prospero $V" | workflow_dispatch:"prospero $V ("*")") ;;
+          *) echo "::error::prospero.exe --version says: $said"; exit 1 ;;
+          esac
           cp build-gui/prospero.exe "dist/prospero-$V-windows-x86_64.exe"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
@@ -244,7 +250,11 @@ jobs:
               -DPROSPERO_BUNDLE_ID=com.nullprogram.prospero
           cmake --build build-app -j"$n" --target prospero-app
           exe=build-app/Prospero.app/Contents/MacOS/prospero
-          test "$($exe --version)" = "prospero $v"
+          said=$($exe --version)  # as for the Windows program
+          case "$GITHUB_EVENT_NAME:$said" in
+          *:"prospero $v" | workflow_dispatch:"prospero $v ("*")") ;;
+          *) echo "::error::$exe --version says: $said"; exit 1 ;;
+          esac
           vtool -show-build "$exe" | grep -q 'minos 13\.0'
           mkdir out
           tar czf out/Prospero.app.tar.gz -C build-app Prospero.app

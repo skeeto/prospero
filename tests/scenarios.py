@@ -18664,7 +18664,8 @@ def probeexe(t):
 class Tty:
     """A terminal of term.open: its output gathered in order, and acked
     every ackevery bytes and when no more has come (after slow seconds
-    each time), or not at all while hold. Records may be lost on purpose (dropafter, the first at
+    each time), with idle only once none has come for idle seconds, or
+    not at all while hold. Records may be lost on purpose (dropafter, the first at
     or past that offset), and a gap asks for output again (resend)."""
 
     def __init__(self, t, h, sid, cols=80, rows=24, **kw):
@@ -18687,6 +18688,8 @@ class Tty:
         self.resends = 0
         self.ackevery = 0
         self.slow = 0.0
+        self.idle = 0.0      # seconds with no output before an ack of what came
+        self.lastat = 0.0    # when output last came
         self.hold = False
         self.dropafter = None
         self.dropped = 0
@@ -18722,6 +18725,7 @@ class Tty:
             self.busy.append(ev["busy"])
         elif name == "term":
             self.records += 1
+            self.lastat = time.monotonic()
             off = ev["off"]
             data = base64.b64decode(ev["data"])
             self.window = max(self.window, off + len(data) - self.acked)
@@ -18757,18 +18761,25 @@ class Tty:
             with self.h.cond:
                 evs = self.h.events[self.at:]
                 self.at = len(self.h.events)
-                if not evs:
-                    left = deadline - time.monotonic()
+                now = time.monotonic()
+                quiet = (self.idle and not self.hold and len(self.data) > self.acked
+                         and now >= self.lastat + self.idle)
+                if not evs and not quiet:
+                    left = deadline - now
                     if left <= 0:
                         tail = bytes(self.data[-300:])
                         raise Failure(f"timed out waiting for {what}; "
                                       f"{len(self.data)} bytes, the last {tail!r}")
-                    self.h.cond.wait(min(left, 0.25))
+                    wait = 0.25
+                    if self.idle and len(self.data) > self.acked:
+                        wait = max(0.01, self.lastat + self.idle - now)
+                    self.h.cond.wait(min(left, wait))
                     continue
             for ev in evs:
                 self.step(ev)
-            if not self.hold and len(self.data) > self.acked:
-                self.later()  # all there is for now
+            # All there is for now: at once, or with idle once none comes
+            if not self.hold and len(self.data) > self.acked and (not self.idle or quiet):
+                self.later()
 
     def line(self, prefix, timeout=20):
         """The next whole line of output that starts with prefix."""
@@ -18894,7 +18905,10 @@ def term_basic(t):
 @scenario(bound=90, alone=True)
 def term_flood(t):
     """10 MiB through a terminal to a slow acker arrive byte for byte,
-    with no more than the window unacked at any time."""
+    with no more than the window unacked at any time, and the window
+    used: the acker waits for three quarters of it, else for the output
+    to stop, so that a producer slowed by a loaded machine (CI) cannot
+    end the rounds early, while an engine that stops short still does."""
     ttyprobe(t)
     h = t.headless()
     try:
@@ -18902,7 +18916,8 @@ def term_flood(t):
         tt = Tty(t, h, sid)
         tt.line("probe ready")
         n = 10 << 20
-        tt.ackevery = 1 << 20  # past the window: acks only once it stops
+        tt.ackevery = TERM_WINDOW * 3 // 4 + 1
+        tt.idle = 0.5
         tt.slow = 0.02
         start = len(tt.text)
         tt.type(f"flood {n}\n")
