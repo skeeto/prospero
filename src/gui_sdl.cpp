@@ -69,7 +69,11 @@
 // This is free and unencumbered software released into the public domain.
 
 #include <dlfcn.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#  include <sys/sysctl.h>
+#endif
 
 #ifdef __APPLE__
 // The Objective-C runtime and AppKit's appearance names, declared by
@@ -2797,6 +2801,152 @@ static void os_guiunmap(Os *, Str data)
         munmap(data.data, (uz)data.len);
     }
 }
+
+
+// The built-in model's needs: cores, memory, disk, and no throttling
+
+#ifdef __APPLE__
+static i64 sysctlint(char const *name)
+{
+    i64 v   = 0;
+    uz  len = sizeof(v);
+    if (sysctlbyname(name, &v, &len, 0, 0) || !len || len>sizeof(v)) {
+        return 0;
+    }
+    if (len == 4) {
+        i32 w = 0;
+        copybytes(&w, &v, 4);
+        return w;
+    }
+    return v;
+}
+
+static i32 os_guicores(Os *, Arena)
+{
+    i64 n = sysctlint("hw.perflevel0.physicalcpu");  // Apple silicon's P cores
+    n = n>0 ? n : sysctlint("hw.physicalcpu");
+    return n>0 && n<4096 ? (i32)n : 1;
+}
+
+static i64 os_guiram(Os *)
+{
+    return sysctlint("hw.memsize");
+}
+#else
+// A small sysfs file's text, or a null string.
+static Str sysfsread(Arena *a, char const *path)
+{
+    i32 fd = open(path, O_RDONLY|O_CLOEXEC);
+    if (fd < 0) {
+        return {};
+    }
+    u8 *buf = alloc<u8>(a, 4096);
+    iz  n   = read(fd, buf, 4096);
+    close(fd);
+    return n>0 ? Str(buf, n) : Str{};
+}
+
+// Whether cpu is in a list such as "0-7,16-23", the kernel's cpulist.
+static b32 incpulist(Str list, i64 cpu)
+{
+    while (list.len) {
+        Cut c  = cut(list, ',');
+        list   = c.tail;
+        Cut r  = cut(trim(c.head), '-');
+        i64 lo = parseint(trim(r.head)).val;
+        i64 hi = r.ok ? parseint(trim(r.tail)).val : lo;
+        if (cpu>=lo && cpu<=hi) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Physical cores: the logical processors that come first among their
+// core's siblings, and on a hybrid Intel processor only the P cores'
+// (cpu_core's), else 1.
+static i32 os_guicores(Os *, Arena scratch)
+{
+    i64 cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    Str pcore = sysfsread(&scratch, "/sys/devices/cpu_core/cpus");
+    i32 n = 0;
+    for (i64 i = 0; i < cpus && i < 4096; i++) {
+        Arena a = scratch;
+        Buf   b(&a, 96);
+        print(&b, "/sys/devices/system/cpu/cpu");
+        print(&b, i);
+        print(&b, "/topology/thread_siblings_list");
+        putbyte(&b, 0);
+        Str sib = sysfsread(&a, (char const *)finish(&b).data);
+        if (!sib.len) {
+            continue;  // offline, or not there to say
+        }
+        Cut first = cut(cut(trim(sib), ',').head, '-');
+        if (parseint(trim(first.head)).val==i && (!pcore.len || incpulist(trim(pcore), i))) {
+            n++;
+        }
+    }
+    if (!n && cpus>0) {
+        n = (i32)(cpus<4096 ? cpus : 4096);
+    }
+    return n>0 ? n : 1;
+}
+
+static i64 os_guiram(Os *)
+{
+    i64 pages = sysconf(_SC_PHYS_PAGES);
+    i64 size  = sysconf(_SC_PAGESIZE);
+    return pages>0 && size>0 ? pages*size : 0;
+}
+#endif
+
+static i64 os_guidiskfree(Os *, Arena scratch, Str path)
+{
+    struct statvfs v;
+    if (hasnul(path) || statvfs(cstr(&scratch, path), &v)) {
+        return -1;
+    }
+    return (i64)v.f_bavail * (i64)v.f_frsize;
+}
+
+static void os_guithreadfast(Os *) {}
+
+#ifdef __APPLE__
+// NSProcessInfo's activity for work the user asked for, which keeps
+// App Nap from slowing the process while its window is hidden, but lets
+// the system sleep when idle (NSActivityUserInitiatedAllowingIdleSystemSleep).
+static void *busytoken;
+
+static void os_guibusy(Os *, b32 on)
+{
+    using Get   = void *(*)(void *, void *);
+    using Cstr  = void *(*)(void *, void *, char const *);
+    using Begin = void *(*)(void *, void *, u64, void *);
+    using End   = void  (*)(void *, void *, void *);
+    if (on == (busytoken != 0)) {
+        return;
+    }
+    void *pool = objc_autoreleasePoolPush();
+    void *info = ((Get)(void *)objc_msgSend)(objc_getClass("NSProcessInfo"),
+                                             sel_registerName("processInfo"));
+    if (on) {
+        void *why = ((Cstr)(void *)objc_msgSend)(objc_getClass("NSString"),
+                                                 sel_registerName("stringWithUTF8String:"),
+                                                 "Running the built-in model");
+        void *t = ((Begin)(void *)objc_msgSend)(info,
+                                                sel_registerName("beginActivityWithOptions:reason:"),
+                                                0x00EFFFFFull, why);
+        busytoken = t ? ((Get)(void *)objc_msgSend)(t, sel_registerName("retain")) : 0;
+    } else {
+        ((End)(void *)objc_msgSend)(info, sel_registerName("endActivity:"), busytoken);
+        ((Get)(void *)objc_msgSend)(busytoken, sel_registerName("release"));
+        busytoken = 0;
+    }
+    objc_autoreleasePoolPop(pool);
+}
+#else
+static void os_guibusy(Os *, b32) {}
+#endif
 
 #ifdef __APPLE__
 // CoreText's cascade list from Helvetica, the fonts it falls back on, in

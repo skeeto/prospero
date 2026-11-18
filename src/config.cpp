@@ -2907,37 +2907,77 @@ static void cfgshablock(u32 *h, u8 *p)
     }
 }
 
-// SHA-256 of s, as 64 lowercase hex digits.
-static Str cfgsha256(Arena *perm, Str s)
+// An incremental SHA-256: sha256put any number of times, then sha256hex.
+struct Sha256 {
+    u32 h[8];
+    u8  buf[64];
+    u64 len;  // bytes put
+};
+
+static Sha256 sha256init()
 {
-    u32 h[8] = {
+    Sha256 r = {};
+    u32 const iv[8] = {
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
         0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
     };
-    iz full = s.len - s.len%64;
-    for (iz i = 0; i < full; i += 64) {
-        cfgshablock(h, s.data+i);
+    for (i32 i = 0; i < 8; i++) {
+        r.h[i] = iv[i];
     }
-    u8 tail[128] = {};
-    iz rest = s.len - full;
-    iz n    = rest<56 ? 64 : 128;
-    copybytes(tail, s.data+full, rest);
-    tail[rest] = 0x80;
-    u64 bits = (u64)s.len * 8;
+    return r;
+}
+
+static void sha256put(Sha256 *c, Str s)
+{
+    iz used = (iz)(c->len % 64);
+    iz i    = 0;
+    c->len += (u64)s.len;
+    if (used) {
+        iz n = 64-used < s.len ? 64-used : s.len;
+        copybytes(c->buf+used, s.data, n);
+        i = n;
+        if (used+n < 64) {
+            return;
+        }
+        cfgshablock(c->h, c->buf);
+    }
+    for (; s.len-i >= 64; i += 64) {
+        cfgshablock(c->h, s.data+i);
+    }
+    if (i < s.len) {
+        copybytes(c->buf, s.data+i, s.len-i);
+    }
+}
+
+// The digest of everything put, as 64 lowercase hex digits.
+static Str sha256hex(Arena *perm, Sha256 c)
+{
+    u64 bits = c.len * 8;
+    iz  used = (iz)(c.len % 64);
+    u8  tail[128] = {};
+    iz  n    = used<56 ? 64 : 128;
+    copybytes(tail, c.buf, used);
+    tail[used] = 0x80;
     for (i32 i = 0; i < 8; i++) {
         tail[n-1-i] = (u8)(bits >> (8*i));
     }
     for (iz i = 0; i < n; i += 64) {
-        cfgshablock(h, tail+i);
+        cfgshablock(c.h, tail+i);
     }
-
     Buf b(perm, 64);
     for (i32 i = 0; i < 8; i++) {
-        printhex(&b, h[i], 8);
+        printhex(&b, c.h[i], 8);
     }
     return finish(&b);
 }
 
+// SHA-256 of s, as 64 lowercase hex digits.
+static Str cfgsha256(Arena *perm, Str s)
+{
+    Sha256 c = sha256init();
+    sha256put(&c, s);
+    return sha256hex(perm, c);
+}
 
 // URL includes
 //
