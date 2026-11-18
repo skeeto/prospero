@@ -58,6 +58,9 @@ enum {
     GM_TILE     = 4,        // attention's tokens per job, at most
     GM_QTILE    = GM_TILE*GM_HEADS,  // and so its queries
     GM_BLOCK    = 16,       // keys at a time
+    GM_SPLITJOBS = 4,       // decode's attention jobs per worker, about
+    GM_SPLITMIN = 64,       // and their keys, at least
+    GM_PARTS    = 128,      // and their parts, at most, each of all heads
     // A worker's scratch floats: a row of the model, or attention's
     GM_SCRATCH  = GM_WIDTH > GM_BLOCK+GM_FULLHD+2*GM_QTILE
                 ? GM_WIDTH : GM_BLOCK+GM_FULLHD+2*GM_QTILE,
@@ -198,6 +201,7 @@ struct Gemma {
     f32    *qscale;     // one per 64 of quant
     f32    *plin;       // GM_BATCH x GM_LAYERS x GM_PERLAYER
     f32    *logits;     // GM_VOCAB
+    f32    *parts;      // GM_PARTS x GM_HEADS x (GM_FULLHD+2), split attention's
 };
 
 enum {
@@ -1057,13 +1061,26 @@ static f32 *gmkeys(GmKv *kv, i32 owner, b32 full)
     return kv->ring + set*2*GM_RING*GM_SLIDEHD;
 }
 
+// Where a query's output goes: its row of g->hidden, or its part,
+// the tile's qi'th.
+static f32 *gmattout(GmFwd *f, GmLayer *l, i32 t, i32 h, f32 *part, i32 qi)
+{
+    if (part) {
+        return part + (iz)qi*(l->hd+2);
+    }
+    return f->g->hidden + (iz)t*GM_HEADS*l->hd + h*l->hd;
+}
+
 // Causal attention for tokens t0 to t1 and heads h0 to h1, a block of
 // keys at a time for all of them, so that each block is read from memory
 // once per tile rather than once per query. The softmax goes online: each
 // query keeps its running maximum and sum, and rescales its output.
+// Only keys k0 to k1 count. With parts, each query's output stays
+// unnormalized in its own, of hd+2 floats, followed by its maximum and
+// sum, for gmattendjoin.
 static void gmattendtile(GmWork *w, GmFwd *f, GmLayer *l, f32 *keys,
                          f32 *vals, i32 mask, iz stride, i32 t0, i32 t1,
-                         i32 h0, i32 h1)
+                         i32 h0, i32 h1, i32 k0, i32 k1, f32 *part)
 {
     Gemma *g   = f->g;
     i32    hd  = l->hd;
@@ -1079,9 +1096,10 @@ static void gmattendtile(GmWork *w, GmFwd *f, GmLayer *l, f32 *keys,
         max[i] = -1e30f;
         sum[i] = 0;
     }
+    i32 qi = 0;
     for (i32 t = t0; t < t1; t++) {
-        for (i32 h = h0; h < h1; h++) {
-            f32 *out = g->hidden + (iz)t*qw + h*hd;
+        for (i32 h = h0; h < h1; h++, qi++) {
+            f32 *out = gmattout(f, l, t, h, part, qi);
             for (i32 j = 0; j < hd; j++) {
                 out[j] = 0;
             }
@@ -1089,10 +1107,12 @@ static void gmattendtile(GmWork *w, GmFwd *f, GmLayer *l, f32 *keys,
     }
 
     i32 last  = f->pos + t1;  // past the last query's own position
+    last      = last<k1 ? last : k1;
     i32 first = l->full || f->pos+t0+1<=GM_WINDOW ? 0 : f->pos+t0+1-GM_WINDOW;
+    first     = first>k0 ? first : k0;
     for (i32 b0 = first; b0 < last; b0 += GM_BLOCK) {
         i32 b1 = b0+GM_BLOCK<last ? b0+GM_BLOCK : last;
-        i32 qi = 0;
+        qi = 0;
         for (i32 t = t0; t < t1; t++) {
             i32 pp  = f->pos + t;
             i32 beg = !l->full && pp+1>GM_WINDOW ? pp+1-GM_WINDOW : 0;
@@ -1104,7 +1124,7 @@ static void gmattendtile(GmWork *w, GmFwd *f, GmLayer *l, f32 *keys,
                 }
                 i32  count = end - beg;
                 f32 *q     = g->aux + (iz)t*qw + h*hd;
-                f32 *out   = g->hidden + (iz)t*qw + h*hd;
+                f32 *out   = gmattout(f, l, t, h, part, qi);
                 g->k.scores(p, q, keys, beg, count, mask, hd, stride);
                 f32 top = max[qi];
                 for (i32 i = 0; i < count; i++) {
@@ -1126,15 +1146,47 @@ static void gmattendtile(GmWork *w, GmFwd *f, GmLayer *l, f32 *keys,
         }
     }
 
-    i32 qi = 0;
+    qi = 0;
     for (i32 t = t0; t < t1; t++) {
         for (i32 h = h0; h < h1; h++, qi++) {
-            f32 *out = g->hidden + (iz)t*qw + h*hd;
-            f32  inv = 1 / sum[qi];
-            for (i32 j = 0; j < hd; j++) {
-                out[j] *= inv;
+            f32 *out = gmattout(f, l, t, h, part, qi);
+            if (part) {
+                out[hd]   = max[qi];
+                out[hd+1] = sum[qi];
+            } else {
+                f32 inv = 1 / sum[qi];
+                for (i32 j = 0; j < hd; j++) {
+                    out[j] *= inv;
+                }
             }
         }
+    }
+}
+
+// Join a query's nparts parts, each of hd+2 floats, step floats apart,
+// into out.
+static void gmattendjoin(f32 *out, f32 *parts, i32 nparts, iz step, i32 hd)
+{
+    f32 top = -1e30f;
+    for (i32 i = 0; i < nparts; i++) {
+        f32 m = parts[i*step + hd];
+        top   = m>top ? m : top;
+    }
+    f32 sum = 0;
+    for (i32 j = 0; j < hd; j++) {
+        out[j] = 0;
+    }
+    for (i32 i = 0; i < nparts; i++) {
+        f32 *part  = parts + i*step;
+        f32  scale = __builtin_expf(part[hd] - top);
+        sum += part[hd+1] * scale;
+        for (i32 j = 0; j < hd; j++) {
+            out[j] += part[j] * scale;
+        }
+    }
+    f32 inv = 1 / sum;
+    for (i32 j = 0; j < hd; j++) {
+        out[j] *= inv;
     }
 }
 
@@ -1172,22 +1224,52 @@ static void gmattend(GmWork *w, GmFwd *f, i32 layer)
         gmrope(w, g, l->full, k, 1, hd, f->pos, n, stride);
     }
 
-    // Jobs are tiles of tokens by heads, the latest tokens (with the most
-    // keys) first. Small batches go a query at a time, for parallelism.
+    // Jobs are tiles of tokens by all heads, which share the keys, the
+    // latest tokens (with the most keys) first. When a token per job
+    // still leaves workers idle (decode), each token's keys split into
+    // parts, joined after.
     i32 tt    = n / (2*w->n);
     tt        = tt<1 ? 1 : tt>GM_TILE ? GM_TILE : tt;
-    i32 hh    = tt>1 ? GM_HEADS : 1;
     i32 tiles = (n + tt - 1) / tt;
-    i32 per   = GM_HEADS / hh;
-    for (;;) {
-        i32 job = __atomic_fetch_add(&f->ticket, 1, __ATOMIC_RELAXED);
-        if (job >= tiles*per) {
-            break;
+    i32 end   = f->pos + n;
+    i32 base  = l->full || f->pos+1<=GM_WINDOW ? 0 : f->pos+1-GM_WINDOW;
+    i32 parts = tt>1 ? 1 : (GM_SPLITJOBS*w->n + n - 1) / n;
+    i32 most  = (end - base) / GM_SPLITMIN;
+    parts     = parts<most ? parts : most;
+    parts     = parts<GM_PARTS/n ? parts : GM_PARTS/n;
+    iz  each  = (iz)GM_HEADS*(hd+2);  // a part's floats
+
+    if (parts > 1) {
+        i32 chunk = (end - base + parts - 1) / parts;
+        for (;;) {
+            i32 job = __atomic_fetch_add(&f->ticket, 1, __ATOMIC_RELAXED);
+            if (job >= n*parts) {
+                break;
+            }
+            i32 t  = job / parts;
+            i32 k0 = base + job%parts*chunk;
+            i32 k1 = k0+chunk<end ? k0+chunk : end;
+            gmattendtile(w, f, l, keys, vals, mask, stride, t, t+1, 0,
+                         GM_HEADS, k0, k1, g->parts + job*each);
         }
-        i32 t0 = (tiles - 1 - job/per) * tt;
-        i32 t1 = t0+tt<n ? t0+tt : n;
-        i32 h0 = job%per * hh;
-        gmattendtile(w, f, l, keys, vals, mask, stride, t0, t1, h0, h0+hh);
+        gmbarrier(w);
+        GmSpan s = gmspan(w, (iz)n*GM_HEADS);
+        for (iz qi = s.beg; qi < s.end; qi++) {
+            iz   t   = qi / GM_HEADS;
+            f32 *src = g->parts + t*parts*each + qi%GM_HEADS*(hd+2);
+            gmattendjoin(g->hidden + qi*hd, src, parts, each, hd);
+        }
+    } else {
+        for (;;) {
+            i32 job = __atomic_fetch_add(&f->ticket, 1, __ATOMIC_RELAXED);
+            if (job >= tiles) {
+                break;
+            }
+            i32 t0 = (tiles - 1 - job) * tt;
+            i32 t1 = t0+tt<n ? t0+tt : n;
+            gmattendtile(w, f, l, keys, vals, mask, stride, t0, t1, 0,
+                         GM_HEADS, 0, end, 0);
+        }
     }
     gmbarrier(w);
 
@@ -2196,6 +2278,7 @@ static GmLoaded gmload(GmPool *pool, Arena *perm, Arena scratch, Str file,
     g->qscale   = alloc<f32>(perm, big/64);
     g->plin     = alloc<f32>(perm, (iz)GM_BATCH*GM_LAYERS*GM_PERLAYER);
     g->logits   = alloc<f32>(perm, GM_VOCAB);
+    g->parts    = alloc<f32>(perm, (iz)GM_PARTS*GM_HEADS*(GM_FULLHD+2));
     r.g = g;
     return r;
 }
