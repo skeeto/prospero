@@ -30,6 +30,14 @@ LiteLLM and others) and Anthropic's Messages API.
 Until an endpoint is set up, the empty transcript says so, and its Set
 up a model... button opens the Add endpoint dialog: step 2 below.
 
+It also offers the built-in model, Gemma 4 E2B by Google, for trying
+Prospero without a server or an account: Download fetches its file
+(3.3 GB) into Prospero's state directory, checks it, and adds an
+endpoint for it, `gemma`. Prospero's window runs it on this computer,
+so it is free and private, but slow, and far less capable than a
+service's models. Cancel keeps what came, to resume. See
+[The built-in model](help:config#the-built-in-model).
+
 Prospero starts with nothing configured, and writes no file until a
 setting is first saved. Its configuration file then starts from a
 built-in copy that documents every setting, with an endpoint for a
@@ -49,7 +57,8 @@ llama.cpp server on this machine as an example.
    `local/qwen3-coder`. Without it, a new session gets the first
    `[model]` section, else the first model the endpoint lists. A model
    without its endpoint goes to Defaults' `endpoint`, else to an
-   endpoint that listed it, else to the first endpoint with a url. The
+   endpoint that listed it, else to the first endpoint with a url (or
+   the built-in model's). The
    New session dialog lists every endpoint's models, to pick another
    for one session.
 

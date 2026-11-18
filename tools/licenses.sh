@@ -7,7 +7,8 @@
 #   tools/licenses.sh SRC OUT [gui]
 #
 # SRC is an unpacked source tarball (tools/dist.py), with deps/. With
-# gui, also the GUI's: SDL3, FreeType, Dear ImGui, md4c, and the fonts.
+# gui, also the GUI's: SDL3, FreeType, Dear ImGui, md4c, the fonts, and
+# gemma4.c's, from which the built-in model's code derives.
 # A missing file is an error.
 set -eu
 src=$1
@@ -35,4 +36,9 @@ if [ "$gui" = gui ]; then
     cp "$src/deps/imgui/LICENSE.txt" "$out/imgui.txt"
     cp "$src/deps/md4c/LICENSE.md" "$out/md4c.txt"
     cp "$src/assets/FONTS" "$out/fonts.txt"
+    # The built-in model's code derives from gemma4.c (MIT), whose notice
+    # ends gemma.cpp
+    sed -n '/^\/\/ MIT License/,$s|^// \{0,1\}||p' "$src/src/gemma.cpp" \
+        >"$out/gemma4.txt"
+    test -s "$out/gemma4.txt"
 fi

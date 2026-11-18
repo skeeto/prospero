@@ -196,6 +196,25 @@ risk, and `integration_id` names the product the requests are for (the
 available for integrator". If the account has no Copilot, the sign-in
 fails with a link to sign up for Copilot Free.
 
+## The built-in model
+
+An endpoint of kind **builtin** is Gemma 4 E2B, a small model by Google
+(Apache 2.0) that Prospero's own window runs, on this computer's
+processor: no server, no account, nothing sent anywhere. The first-run
+card's Download sets it up; so does Add endpoint... with **builtin**,
+then Download on its page, which also shows where the file is. The file
+is 3.3 GB, from Hugging Face, kept in the state directory's `models`
+folder.
+
+It suits trying Prospero out, not real work: it is slow, and a 2B
+model makes many more mistakes than a service's. It takes a processor
+with AVX2 (x86-64) or the dot product instructions (arm64, every Apple
+processor), and 6 GB of memory; on another, its page says why it can't
+run. It answers one request at a time, so a second session's turn says
+"1 in line" until the first's is done. Its sessions wait, paused, while
+Prospero's window is closed, and go on once it opens. It reads no
+images.
+
 ## Settings worth knowing
 
 - **API keys** never go in the file: `key = env:NAME` reads one from

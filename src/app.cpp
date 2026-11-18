@@ -3851,8 +3851,9 @@ static void guiconfigset(Gui *g, Str kind, Str name, Str key, Str value)
 
 // An endpoint's kind was just set to kind: its url follows, to the new
 // kind's own service (epkindurl), when it is unset, still another
-// kind's own, or the placeholder a new section gets (cfgseed's). A url
-// the user wrote stays.
+// kind's own, or the placeholder a new section gets (cfgseed's), and
+// such a url goes for the built-in model, which has none. A url the
+// user wrote stays.
 static void epurlfollow(Gui *g, Str name, Str kind)
 {
     Str to  = epkindurl(epkindof(kind));
@@ -3867,7 +3868,9 @@ static void epurlfollow(Gui *g, Str name, Str kind)
     for (i32 k = 0; k < (i32)countof(epkinds); k++) {
         stock |= cur.len && cur==epkindurl(k);
     }
-    if (to.len && stock && cur!=to) {
+    if (epkindof(kind)==EP_BUILTIN && cur.len && stock) {
+        guiconfigset(g, "endpoint", name, "url", {});  // it has none
+    } else if (to.len && stock && cur!=to) {
         guiconfigset(g, "endpoint", name, "url", to);
     }
 }
@@ -5513,6 +5516,8 @@ static void blhello(Gui *);
 static b32  blrelayin(Gui *, Arena, Json *);
 static b32  blflush(Gui *);
 static void blgone(Gui *);
+static void bldrawcard(Gui *, Arena);
+static void bldrawpage(Gui *, Arena);
 
 // The settings window's rows, from a config.get reply line, and the
 // theme they set.
@@ -14753,6 +14758,7 @@ enum : i32 {
     OP_KILLENGINE,// the engine process dies (--engine=subprocess)
     OP_REVEAL,    // scroll the settings window to the RECT_* target
     OP_TOUCH,     // write over a file in --cwd, as something else would
+    OP_RMMODEL,   // remove the built-in model's file (builtin.cpp)
     OP_TRAY,      // pick the tray icon's menu item dx (TRAY_*)
     OP_DROPLINK,  // break the shown session's host's stream (remotedrop)
     OP_TEXTRCWD,  // type the --rcwd directory, the remote one
@@ -15427,7 +15433,8 @@ enum : i32 {
     CHK_NAVPLACE,     // the transcript's place: text "mark" remembers it,
                       // "kept" is it again, "stuck" follows its end
     CHK_MARKSHOWN,    // the session OP_MARKSESS remembered is shown
-    CHK_NOTED,        // idle, the latest note begins with text
+    CHK_NOTED,        // idle, the latest note begins with text, or text
+                      // "BEGINNING|PART" begins so and has that part
     CHK_COUNT,
 };
 
@@ -15877,6 +15884,7 @@ enum : i32 {
                   // elsewhere, and none turned away
     W_FILESKEPT,  // no Files record of a session on the remote text still
                   // waits: each attached or dropped (filesrestore)
+    W_CFGVAL,     // text "KIND NAME KEY=VALUE": that row's value, as CHK_CFGVAL
     W_TERMRAN,    // dx external terminals launched, or noted (termlaunch)
 };
 
@@ -15907,7 +15915,7 @@ static Str waitnames[] = {
     "the file", "the file checked", "the file's find", "the pause",
     "Open file's check", "the file work",
     "Files tabs of the remote attached or dropped",
-    "an external terminal",
+    "a setting's value", "an external terminal",
 };
 static_assert(countof(waitnames) == W_TERMRAN+1);
 
@@ -21308,16 +21316,40 @@ static DriveOp thinops[] = {
 };
 
 // The built-in model (--builtin, tests/gui.py --mode builtin), faked
-// (PROSPERO_TEST_BUILTIN=fake) as the window's own: the configuration's
-// one endpoint is of kind builtin, so the engine relays its calls to
-// this window. A turn streams; a second session's waits in line behind
-// it (max_concurrent = 1), then runs; one cancelled while it streams
-// ends so, and the next turn after it runs as usual.
+// (PROSPERO_TEST_BUILTIN=fake) as the window's own, its file a few MB
+// from the fake provider. With nothing set up, the first-run card offers
+// to download it: cancelled midway, then resumed, it ends with an
+// endpoint of kind builtin in the configuration, and the card gone. A
+// turn streams; a second session's waits in line behind it
+// (max_concurrent = 1), then runs; one cancelled while it streams ends
+// so, and the next runs as usual. With the file gone, a turn ends with
+// the error that says so.
 static DriveOp builtinops[] = {
     {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
     {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
-    {OP_MARK, 0, 0, 0, 1000, ""},
-    FIRSTRUN(0),
+    {OP_MARK, 0, 0, 0, 1500, ""},
+    FIRSTRUN(1),
+    {OP_WAIT, W_NAMED, 0, 0, 5000, "builtin download"},
+    {OP_SHOT, 0, 0, 0, 300, "builtin-1-card"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "builtin download"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_NAMED, 0, 0, 10000, "builtin progress"},
+    {OP_MARK, 0, 0, 0, 1200, ""},
+    {OP_SHOT, 0, 0, 0, 300, "builtin-2-progress"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "builtin cancel"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_NAMED, 0, 0, 10000, "builtin download"},
+    {OP_MARK, 0, 0, 0, 500, ""},
+    {OP_SHOT, 0, 0, 0, 300, "builtin-3-resume"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "builtin download"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_CFGVAL, 0, 0, 60000, "endpoint gemma kind=builtin"},
+    {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
+    {OP_MARK, 0, 0, 0, 500, ""},
+    {OP_SHOT, 0, 0, 0, 300, "builtin-4-ready"},
     {OP_NEWSESSION, 0, 0, 0, 0, ""},
     {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
     {OP_PROMPT, 0, 0, 0, 300, "Say hello."},
@@ -21328,7 +21360,7 @@ static DriveOp builtinops[] = {
     {OP_PROMPT, 0, 0, 0, 0, "Say hello too."},
     {OP_WAIT, W_QUEUED, 0, 0, 5000, ""},
     {OP_CHECK, CHK_QUEUED, 0, 0, 0, ""},
-    {OP_SHOT, 0, 0, 0, 300, "builtin-1-queued"},
+    {OP_SHOT, 0, 0, 0, 300, "builtin-5-queued"},
     {OP_WAIT, W_SAID, 0, 0, 30000, "Hello from the built-in model."},
     // Cancelled while it streams, from the Transcript (from the box, the
     // first Esc only leaves it)
@@ -21344,7 +21376,12 @@ static DriveOp builtinops[] = {
     {OP_CHECK, CHK_NOTED, 0, 0, 0, "Cancelled"},
     {OP_PROMPT, 0, 0, 0, 100, "Say hello once more."},
     {OP_WAIT, W_SAID, 0, 0, 30000, "Hello from the built-in model."},
-    {OP_SHOT, 0, 0, 0, 300, "builtin-2-after"},
+    // Its file gone
+    {OP_RMMODEL, 0, 0, 0, 100, ""},
+    {OP_PROMPT, 0, 0, 0, 100, "Say hello without it."},
+    {OP_WAIT, W_IDLE, 0, 0, 30000, ""},
+    {OP_CHECK, CHK_NOTED, 0, 0, 0, "The turn ended with an error.|not downloaded yet"},
+    {OP_SHOT, 0, 0, 0, 300, "builtin-6-missing"},
     {OP_SUMMARY, 0, 0, 0, 0, ""},
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
@@ -26138,6 +26175,21 @@ static b32 drivefilecheck(Gui *g, i32 chk)
     return ok;
 }
 
+// Whether a setting, text "KIND NAME KEY=VALUE", has that value.
+static b32 checkcfgval(Gui *g, Str text)
+{
+    Cut kind = cut(text, ' ');
+    Cut name = cut(kind.tail, ' ');
+    Cut key  = cut(name.tail, '=');
+    for (iz i = 0; i < g->cfgrows.len; i++) {
+        CfgRow *r = &g->cfgrows[i];
+        if (r->kind==kind.head && r->name==name.head && r->key==key.head) {
+            return r->value == key.tail;
+        }
+    }
+    return 0;
+}
+
 static b32 drivewaitdone(Gui *g)
 {
     View *v = g->view;
@@ -26224,6 +26276,8 @@ static b32 drivewaitdone(Gui *g)
         return g->wsllists > 0;
     case W_WSLSECTION:
         return cfghas(g, "remote", "Deb");
+    case W_CFGVAL:
+        return checkcfgval(g, g->ops[g->drivepc-1].text);
     case W_NEWLISTED:
         return g->newhost && g->newhost->listgot;
     case W_NAMEDUP: {
@@ -27713,7 +27767,13 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_NOTED: {
         ViewMsg *n = lastmsg(g, VIEW_NOTE);
-        return n && startswith(n->text, g->ops[g->drivepc-1].text) && !v->busy;
+        Cut      c = cut(g->ops[g->drivepc-1].text, '|');
+        b32      ok = n && startswith(n->text, c.head) && (!c.ok || find(n->text, c.tail)>=0);
+        if (!ok && n) {
+            Arena a = g->frame;
+            guilog(g, concat(&a, "drive: the latest note: ", n->text));
+        }
+        return ok && !v->busy;
     }
     case CHK_CANCELLED: {
         ViewMsg  *n = lastmsg(g, VIEW_NOTE);
@@ -27955,18 +28015,8 @@ static b32 drivecheck(Gui *g, i32 chk)
         Str   page = g->cfgdiag ? Str("diagnostics") : cfgpagekey(&a, g->cfgpkind, g->cfgpname);
         return page == want;
     }
-    case CHK_CFGVAL: {
-        Cut kind = cut(g->ops[g->drivepc-1].text, ' ');
-        Cut name = cut(kind.tail, ' ');
-        Cut key  = cut(name.tail, '=');
-        for (iz i = 0; i < g->cfgrows.len; i++) {
-            CfgRow *r = &g->cfgrows[i];
-            if (r->kind==kind.head && r->name==name.head && r->key==key.head) {
-                return r->value == key.tail;
-            }
-        }
-        return 0;
-    }
+    case CHK_CFGVAL:
+        return checkcfgval(g, g->ops[g->drivepc-1].text);
     case CHK_SELTEXT: {
         // Glyphs of that color in the item's rectangle, in the frame last
         // drawn; the field's own text is in another
@@ -29773,6 +29823,13 @@ static void drivestep(Gui *g)
         guinew(g, g->main, g->drivecwd, {}, {}, op->text);  // in a role, if named
         g->newmine = 0;  // not a jump of the user's
         break;
+    case OP_RMMODEL:
+        if (!g->bl || !os_remove(g->os, g->frame, g->bl->path)) {
+            guilog(g, "drive: FAIL could not remove the built-in model's file");
+            g->drivechecks++;
+            g->drivefails++;
+        }
+        break;
     case OP_TOUCH: {
         Arena a    = g->frame;
         Str   path = join(&a, g->drivecwd, op->text);
@@ -31109,7 +31166,8 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->enginekind = fake ? ENGINE_FAKE : subprocess ? ENGINE_SUBPROCESS : ENGINE_INPROC;
     if (drive || idle || streamtest || e2e || settings || enginestop ||
             background || attach || remote || compose || sidebar || plan || launch ||
-            first || mcp || hosttask || changes || thin || containers || terminal || a11y) {
+            first || mcp || hosttask || changes || thin || containers || terminal || a11y ||
+            builtin) {
         g->drive = 1;
         if (a11y == 2) {
             g->ops  = a11yoffops;

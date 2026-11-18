@@ -99,3 +99,7 @@ done
 f=$(ls $src/deps/wuffs/wuffs-*.c /tmp/build-*/_deps/wuffs-src/wuffs-*.c 2>/dev/null | head -1)
 sed -n '/^\/\/ Copyright/,/^\/\/ SPDX-License-Identifier/s|^// \{0,1\}||p' $f \
     >$out/LICENSES/wuffs.txt
+# The built-in model's code derives from gemma4.c (MIT), whose notice
+# ends gemma.cpp
+sed -n '/^\/\/ MIT License/,$s|^// \{0,1\}||p' $src/src/gemma.cpp \
+    >$out/LICENSES/gemma4.txt

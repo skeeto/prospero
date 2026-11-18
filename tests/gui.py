@@ -121,6 +121,7 @@ import atexit
 import base64
 import fnmatch
 import difflib
+import hashlib
 import json
 import os
 import random
@@ -134,6 +135,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import zlib
 
 sys.dont_write_bytecode = True
@@ -290,13 +292,17 @@ def firstconfig(url):
     return "# A first run's configuration: nothing set up\n"
 
 
-def builtinconfig():
-    """The builtin mode's: one endpoint, the window's own model, which
-    PROSPERO_TEST_BUILTIN=fake answers for without the model."""
-    return ("# The built-in model, the window's own\n"
-            "endpoint = gemma\n\n"
-            "[endpoint gemma]\n"
-            "kind = builtin\n")
+def builtinenv(url):
+    """The builtin mode's environment: the window answers for its model
+    without it (PROSPERO_TEST_BUILTIN=fake), and its file is 3 MiB of
+    zeros from the fake provider, sent at 1 MiB a second, by way of a
+    redirect, as Hugging Face's go to its CDN."""
+    n = 3 << 20
+    to = urllib.parse.quote(f"/fake/bytes?n={n}&rate={1 << 20}", safe="")
+    return {"PROSPERO_TEST_BUILTIN": "fake",
+            "PROSPERO_TEST_BUILTIN_URL": f"{url}/fake/moved?to={to}",
+            "PROSPERO_TEST_BUILTIN_SIZE": str(n),
+            "PROSPERO_TEST_BUILTIN_SHA256": hashlib.sha256(bytes(n)).hexdigest()}
 
 
 def m4config(url, nonce):
@@ -2301,8 +2307,9 @@ def main():
     elif args.mode == "firstrun":
         before = firstconfig(curl)
     elif args.mode == "builtin":
-        before = builtinconfig()
-        os.environ["PROSPERO_TEST_BUILTIN"] = "fake"
+        # Nothing set up: the first-run card offers the built-in model
+        before = firstconfig(curl)
+        os.environ.update(builtinenv(curl))
     elif args.mode == "changes":
         gitrepo(work)
         before = config(curl, model)
