@@ -2749,6 +2749,7 @@ W32(b32, GetDiskFreeSpaceExW(c16 *, u64 *, u64 *, u64 *));
 W32(uz,  GetCurrentThread());
 W32(b32, SetThreadInformation(uz, i32, void *, u32));
 W32(b32, SetProcessInformation(uz, i32, void *, u32));
+W32(b32, IsProcessorFeaturePresent(u32));
 
 // Cores of the most efficient class, which on a hybrid processor is the
 // performance cores' (EfficiencyClass counts up with performance).
@@ -2823,6 +2824,11 @@ static void os_guibusy(Os *, b32 on)
 {
     W32Throttle t = {1, on ? 1u : 0u, 0};  // off: the system decides again
     SetProcessInformation(GetCurrentProcess(), 4, &t, sizeof(t));  // ProcessPowerThrottling
+}
+
+static b32 os_guiarmdot(Os *)
+{
+    return IsProcessorFeaturePresent(43);  // PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE
 }
 
 static Slice<Str> fontnames(Arena *a, Slice<Str> names, Str *list, iz n)

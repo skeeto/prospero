@@ -1622,6 +1622,8 @@ struct GuiLater {
     b32 at;
 };
 
+struct Builtin;
+
 struct Gui {
     Os                *os;
     Arena              perm;
@@ -2262,6 +2264,7 @@ struct Gui {
     // Files and log
     Str                statedir;
     Str                opensid;    // --session SID: shown once listed
+    Builtin           *bl;         // the built-in model (builtin.cpp)
     Str                inipath;
     Saver             *saver;      // writes inipath, or null: written here
     iz                 logfd;
@@ -5564,6 +5567,11 @@ static void wslremotes(Gui *);
 static void setnotify(Gui *, Arena, u32);
 
 static void palbuild(Gui *, Arena, b32);
+static void bloffer(Gui *, b32);
+static void blhello(Gui *);
+static b32  blrelayin(Gui *, Arena, Json *);
+static b32  blflush(Gui *);
+static void blgone(Gui *);
 
 // The settings window's rows, from a config.get reply line, and the
 // theme they set.
@@ -5695,6 +5703,7 @@ static void loadcfg(Gui *g, Arena scratch, Str line)
     if (g->palw.shown) {
         palbuild(g, t, 1);  // its settings, as they are now, the pick kept
     }
+    bloffer(g, 0);  // its builtin endpoints, as they are now
 }
 
 static void guiopen(Gui *, GuiSession *);
@@ -7334,7 +7343,7 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
         return;
 
     case CMD_RELAYOFFER:
-        if (q.h && ok) {
+        if (q.h && ok && q.h!=g->main) {  // the main one's is the built-in model's
             q.h->thin = jsonflag(jsonget(j, "thin"), 0);
         }
         return;
@@ -8740,6 +8749,9 @@ static b32 hostskills(GuiHost *);
 // session waits for it, as the window vouches (invoked).
 static void guirelayin(Gui *g, GuiHost *h, Arena a, Json *j)
 {
+    if (h==g->main && blrelayin(g, a, j)) {
+        return;  // for this window's own model
+    }
     i64 rid = jsonint(jsonget(j, "rid"), 0);
     if (h->kind!=GH_REMOTE || rid<=0) {
         return;
@@ -8930,6 +8942,9 @@ static b32 guiapply(Gui *g, GuiHost *h, Arena a, EvRec *r, Str line)
         }
         if (h==g->main && !h->listgot) {
             hostlist(g, h);  // for the new session dialog, and first runs
+        }
+        if (h == g->main) {
+            blhello(g);
         }
         return 1;
     case EV_SESSIONS:
@@ -12562,6 +12577,7 @@ static b32 gobackground(Gui *g)
         // calls it makes for thin hosts end here. The terminals hang up,
         // having no window to show them.
         guirelaylostall(g, newarena(g->cmdr), "this computer's window closed");
+        blgone(g);
         termcloseall(g);
         filesrelease(g);     // the files, read again when shown
         termcloseengine(g);  // and those whose term.open is still in flight
@@ -12793,6 +12809,7 @@ static void setpane(Gui *, i32, b32);
 #include "files.cpp"
 #include "navgui.cpp"  // after files.cpp and term.cpp: FileTab, TermTab
 #include "a11y_imgui.cpp"
+#include "builtin.cpp"
 
 
 // The fake agent
@@ -13394,6 +13411,7 @@ static void drainmail(Gui *g, i64 now)
     }
 
     other |= drainedit(g);
+    blflush(g);
 
     // The other hosts': let go while closing, or in the background
     for (GuiHost *h = g->hosts, *next; h; h = next) {
@@ -14436,7 +14454,7 @@ static void gui_frame(Gui *g)
     if (g->ctrs) {
         ctrpurge(g, os_time(g->os));
     }
-    if (guirelayflush(g)) {
+    if (guirelayflush(g) | blflush(g)) {
         schedat(s, s->now + 5000, DUE_APP);  // retried until there is room
     }
     if (g->quitat) {
@@ -15614,6 +15632,7 @@ enum : i32 {
     CHK_NAVPLACE,     // the transcript's place: text "mark" remembers it,
                       // "kept" is it again, "stuck" follows its end
     CHK_MARKSHOWN,    // the session OP_MARKSESS remembered is shown
+    CHK_NOTED,        // idle, the latest note begins with text
     CHK_COUNT,
 };
 
@@ -15960,6 +15979,7 @@ static Str chknames[] = {
     "Back and Forward reach as many spots as said",
     "the transcript's place is as said",
     "the session remembered is shown",
+    "the latest note begins as said",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -21534,6 +21554,48 @@ static DriveOp thinops[] = {
     {OP_WAIT, W_IDLE, 0, 0, 90000, ""},
     {OP_MARK, 0, 0, 0, 1000, ""},
     {OP_SHOT, 0, 0, 0, 300, "thin-4-after"},
+    {OP_SUMMARY, 0, 0, 0, 0, ""},
+    {OP_QUIT, 0, 0, 0, 0, ""},
+};
+
+// The built-in model (--builtin, tests/gui.py --mode builtin), faked
+// (PROSPERO_TEST_BUILTIN=fake) as the window's own: the configuration's
+// one endpoint is of kind builtin, so the engine relays its calls to
+// this window. A turn streams; a second session's waits in line behind
+// it (max_concurrent = 1), then runs; one cancelled while it streams
+// ends so, and the next turn after it runs as usual.
+static DriveOp builtinops[] = {
+    {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
+    {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
+    {OP_MARK, 0, 0, 0, 1000, ""},
+    FIRSTRUN(0),
+    {OP_NEWSESSION, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_PROMPT, 0, 0, 0, 300, "Say hello."},
+    {OP_WAIT, W_STREAMING, 0, 0, 15000, ""},
+    {OP_CHECK, CHK_MODEL, 0, 0, 0, "gemma-4-e2b"},
+    {OP_NEWSESSION, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_PROMPT, 0, 0, 0, 0, "Say hello too."},
+    {OP_WAIT, W_QUEUED, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_QUEUED, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "builtin-1-queued"},
+    {OP_WAIT, W_SAID, 0, 0, 30000, "Hello from the built-in model."},
+    // Cancelled while it streams, from the Transcript (from the box, the
+    // first Esc only leaves it)
+    {OP_PROMPT, 0, 0, 0, 100, "Say hello again."},
+    {OP_WAIT, W_STREAMING, 0, 0, 15000, ""},
+    {OP_MOVE, T_TRANSCRIPTTAB, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 300, ""},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_WAIT, W_IDLE, 0, 0, 30000, ""},
+    {OP_CHECK, CHK_NOTED, 0, 0, 0, "Cancelled"},
+    {OP_PROMPT, 0, 0, 0, 100, "Say hello once more."},
+    {OP_WAIT, W_SAID, 0, 0, 30000, "Hello from the built-in model."},
+    {OP_SHOT, 0, 0, 0, 300, "builtin-2-after"},
     {OP_SUMMARY, 0, 0, 0, 0, ""},
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
@@ -27922,6 +27984,10 @@ static b32 drivecheck(Gui *g, i32 chk)
         }
         return noted && !v->busy && !v->paused && !v->contmsg;
     }
+    case CHK_NOTED: {
+        ViewMsg *n = lastmsg(g, VIEW_NOTE);
+        return n && startswith(n->text, g->ops[g->drivepc-1].text) && !v->busy;
+    }
     case CHK_CANCELLED: {
         ViewMsg  *n = lastmsg(g, VIEW_NOTE);
         ViewTool *s = lasttool(g, "shell");
@@ -31191,7 +31257,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     b32 background = 0, attach = 0, remote = 0, compose = 0, sidebar = 0, plan = 0;
     b32 launch = 0, first = 0, mcp = 0, hosttask = 0, changes = 0, thin = 0;
     b32 terminal = 0, a11y = 0;
-    b32 containers = 0;
+    b32 containers = 0, builtin = 0;
     i64 history = 0;
     Str opendir = {};  // prospero DIR, as given
     i32 bench   = 0;
@@ -31254,6 +31320,8 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
             hosttask = probe = 1;
         } else if (a == "--thin") {
             thin = probe = 1;
+        } else if (a == "--builtin") {
+            builtin = probe = 1;
         } else if (a == "--containers") {
             containers = probe = 1;
         } else if (a == "--firstrun") {
@@ -31356,6 +31424,9 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
         } else if (first) {
             g->ops  = firstops;
             g->nops = countof(firstops);
+        } else if (builtin) {
+            g->ops  = builtinops;
+            g->nops = countof(builtinops);
         } else if (launch) {
             g->ops  = launchops;
             g->nops = countof(launchops);

@@ -2146,7 +2146,7 @@ static Gemma *gmdevload(Os *os, Arena *perm, Arena scratch, Str path, i32 ctx)
         Int n = parseint(env);
         threads = n.ok && n.val>0 ? (i32)n.val : threads;
     }
-    i32 isa = gmisa(1);
+    i32 isa = gmisa(os_guiarmdot(os));
     i64 t0  = os_ticks(os);
     os_guithreadfast(os);
     GmPool  *pool = gmpool(os, perm, threads, ctx>GM_WIDTH ? ctx : GM_WIDTH,

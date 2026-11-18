@@ -573,6 +573,9 @@ static void    os_guithreadfast(Os *);
 // macOS keeps App Nap away, Windows its power throttling. From one
 // thread at a time; on and off are not counted.
 static void    os_guibusy(Os *, b32 on);
+// Whether an arm64 processor has the dot product instructions (ARMv8.2
+// DotProd), which the built-in model's kernels need. Not asked on x86.
+static b32     os_guiarmdot(Os *);
 // A font file of the system's, and its face: by index, or in a
 // collection by PostScript name when psname is set (app.cpp, sysfonts).
 struct FontFile {

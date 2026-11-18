@@ -71,6 +71,9 @@
 #include <dlfcn.h>
 #include <sys/statvfs.h>
 #include <unistd.h>
+#if defined(__linux__) && defined(__aarch64__)
+#  include <sys/auxv.h>
+#endif
 #ifdef __APPLE__
 #  include <sys/sysctl.h>
 #endif
@@ -2955,6 +2958,18 @@ static void os_guibusy(Os *, b32 on)
 }
 #else
 static void os_guibusy(Os *, b32) {}
+#endif
+
+#if defined(__linux__) && defined(__aarch64__)
+static b32 os_guiarmdot(Os *)
+{
+    return !!(getauxval(AT_HWCAP) & (1ul<<20));  // HWCAP_ASIMDDP
+}
+#else
+static b32 os_guiarmdot(Os *)
+{
+    return 1;  // Apple's processors all have it, and x86 doesn't ask
+}
 #endif
 
 #ifdef __APPLE__

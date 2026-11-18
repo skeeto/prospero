@@ -27,6 +27,7 @@ by quitting are gone, with no engine process left behind.
   uv run tests/gui.py --prospero build/prospero --mode launch [--shots DIR]
   uv run tests/gui.py --prospero build/prospero --mode firstrun [--shots DIR]
   uv run tests/gui.py --prospero build/prospero --mode changes [--shots DIR]
+  uv run tests/gui.py --prospero build/prospero --mode builtin [--shots DIR]
   uv run tests/gui.py --prospero build/prospero --mode containers [--image IMAGE]
       (a real Docker or Podman, running, with IMAGE, a Linux one, already
       pulled; a Linux engine for it in the engines directory)
@@ -100,6 +101,11 @@ host, so Settings is in front with Help, the empty transcript
 offers to set up a model, and its button opens the Add endpoint dialog;
 its display is too small for the first size (--display), so the window
 opens maximized.
+
+The builtin mode's one endpoint is of kind builtin, the window's own
+model, which PROSPERO_TEST_BUILTIN=fake answers for: a turn streams, a
+second session's waits in line behind it, and one cancelled while it
+streams ends so.
 
 On Linux without a display it makes a desktop of its own
 (tests/headless.py: Xvfb at --screen, openbox or --wm, and a session
@@ -282,6 +288,15 @@ def firstconfig(url):
     """The firstrun mode's: nothing configured, no endpoint, no model and
     no remote, as Prospero's own first run has it."""
     return "# A first run's configuration: nothing set up\n"
+
+
+def builtinconfig():
+    """The builtin mode's: one endpoint, the window's own model, which
+    PROSPERO_TEST_BUILTIN=fake answers for without the model."""
+    return ("# The built-in model, the window's own\n"
+            "endpoint = gemma\n\n"
+            "[endpoint gemma]\n"
+            "kind = builtin\n")
 
 
 def m4config(url, nonce):
@@ -2053,6 +2068,7 @@ MODES = {
     "containers": dict(timeout=600,  default=False, whole=True),
     "terminal":   dict(timeout=600,  default=True,  whole=False),
     "a11y":       dict(timeout=600,  default=True,  whole=False),
+    "builtin":    dict(timeout=600,  default=True,  whole=False),
 }
 
 
@@ -2284,6 +2300,9 @@ def main():
         before = config(curl, model)
     elif args.mode == "firstrun":
         before = firstconfig(curl)
+    elif args.mode == "builtin":
+        before = builtinconfig()
+        os.environ["PROSPERO_TEST_BUILTIN"] = "fake"
     elif args.mode == "changes":
         gitrepo(work)
         before = config(curl, model)
@@ -2584,7 +2603,7 @@ def main():
             print(f"copilot: signed in by the device flow, polled {len(cp) - 1} times")
     if args.mode in ("drive", "e2e", "settings", "enginestop", "sessions", "plan",
                      "firstrun", "mcp", "hosttask", "changes", "thin", "containers",
-                     "terminal", "a11y"):
+                     "terminal", "a11y", "builtin"):
         summary = [l for l in lines if "drive:" in l and " checks, " in l]
         if not summary:
             problems.append("no checklist summary")
