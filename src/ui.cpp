@@ -5000,6 +5000,8 @@ struct FindBar {
     char const  *closetip;  // the close button's tooltip, else the find's
     // Out
     f32          fieldw;
+    u8           drawn[48]; // the count as drawn, for the checklist
+    i32          drawnlen;
     b32          prev;
     b32          next;
     b32          close;
@@ -5050,10 +5052,12 @@ static void findbarbegin(Gui *g, FindBar *fb, ImVec2 r0, ImVec2 r1)
     ImGui::SetNextItemWidth(fb->fieldw);
 }
 
-static void findbarend(Gui *g, FindBar *fb, Str count)
+// count is in the caller's arena, a, which it was made from: a fresh
+// copy of the frame's would start where count is, and the names made
+// here would write over it (the count read "find previ")
+static void findbarend(Gui *g, FindBar *fb, Str count, Arena a)
 {
-    Arena a  = g->frame;
-    f32   sp = ImGui::GetStyle().ItemSpacing.x;
+    f32 sp = ImGui::GetStyle().ItemSpacing.x;
     if (fb->arrows) {
         ImGui::SameLine();
         fb->prev = ImGui::ArrowButton("##findprev", ImGuiDir_Up);
@@ -5072,7 +5076,12 @@ static void findbarend(Gui *g, FindBar *fb, Str count)
     ImGui::SameLine();
     f32 x = ImGui::GetCursorPosX();
     ImGui::AlignTextToFramePadding();
-    ImGui::TextDisabled("%s", cstr0(&a, count));
+    char *shown = cstr0(&a, count);
+    ImGui::TextDisabled("%s", shown);
+    fb->drawnlen = 0;
+    for (; shown[fb->drawnlen] && fb->drawnlen<countof(fb->drawn); fb->drawnlen++) {
+        fb->drawn[fb->drawnlen] = (u8)shown[fb->drawnlen];
+    }
     ImGui::SameLine(x + fb->countw + sp);
     fb->close = iconbutton(ICON_CLOSE "##findclose");
     itemnamed(g, concat(&a, fb->name, " close"));
@@ -5161,7 +5170,10 @@ static void drawfind(Gui *g, View *v, f64 scrolly, ImVec2 r0, ImVec2 r1)
         print(&b, (i64)s->hits.len);
         print(&b, done ? Str("") : Str("+"));
     }
-    findbarend(g, &fb, finish(&b));
+    Str count = finish(&b);
+    findbarend(g, &fb, count, a);
+    copybytes(g->findshown, fb.drawn, fb.drawnlen);
+    g->findshownlen = fb.drawnlen;
     g->findheld = fb.focused;
 
     if (esc || fb.close) {

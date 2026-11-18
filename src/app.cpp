@@ -1857,6 +1857,8 @@ struct Gui {
     b32                findfocus;  // focus its field next frame
     b32                findactive; // its field had the keyboard
     b32                findheld;   // the bar had the focus last frame
+    u8                 findshown[48];  // its count as drawn, for the checklist
+    i32                findshownlen;
     b32                askactive;  // a question form's field had it
     f32                qformdrawn; // the latest question form's height, drawn
     b32                findjump;   // scroll to the current hit
@@ -25391,6 +25393,32 @@ static b32 thinkas(View *v, b32 want)
 
 // Whether the current find hit's row is open, with its line in the
 // transcript's window.
+// Whether the transcript's find bar drew its count as its search has
+// it, "N of M", "+" after while it still searches: what was drawn, so
+// that a count written over before it was drawn is caught.
+static b32 findcountshown(Gui *g)
+{
+    ViewSearch *s = g->search;
+    Arena       a = g->frame;
+    Buf         b(&a, 64);
+    print(&b, (i64)(s->cur>=0 ? s->cur+1 : 0));
+    print(&b, " of ");
+    print(&b, (i64)s->hits.len);
+    Str want  = finish(&b);
+    Str drawn = {g->findshown, g->findshownlen};
+    b32 ok    = drawn==want || drawn==concat(&a, want, "+");
+    if (!ok) {
+        Buf m(&a, 128);
+        print(&m, "drive: the find bar's count drawn as \"");
+        print(&m, drawn);
+        print(&m, "\", not \"");
+        print(&m, want);
+        print(&m, "\"");
+        guilog(g, finish(&m));
+    }
+    return ok;
+}
+
 static b32 hitshown(Gui *g)
 {
     ViewSearch *s  = g->search;
@@ -27118,13 +27146,14 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_FOUND:
         g->drivefound = g->search->cur;
         return g->search->hits.len==2 && v->msgs[g->search->hits[0].msg].role==VIEW_THINK &&
-               hitshown(g);
+               hitshown(g) && findcountshown(g);
     case CHK_FOUNDNEXT: {
         ViewSearch *s = g->search;
-        return s->hits.len==2 && s->cur==(g->drivefound+1)%2 && hitshown(g);
+        return s->hits.len==2 && s->cur==(g->drivefound+1)%2 && hitshown(g) &&
+               findcountshown(g);
     }
     case CHK_FOUNDPREV:
-        return g->search->cur==g->drivefound && hitshown(g);
+        return g->search->cur==g->drivefound && hitshown(g) && findcountshown(g);
     case CHK_FINDQUIET:
         return g->findopen && !g->findactive && g->search->hits.len==2 &&
                drivequiet(g, "with the find bar's matches shown", 3);

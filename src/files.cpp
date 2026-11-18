@@ -3194,10 +3194,10 @@ static void filelinebar(Gui *g, FileTab *ft, FileBody *b, ImVec2 r0, ImVec2 r1,
         print(&cb, (i64)b->lines);
     }
     Str count = finish(&cb);
-    iz  n     = count.len<countof(fb->shown) ? count.len : countof(fb->shown);
-    copybytes(fb->shown, count.data, n);
+    findbarend(g, &bar, count, a);
+    iz  n     = bar.drawnlen<countof(fb->shown) ? bar.drawnlen : countof(fb->shown);
+    copybytes(fb->shown, bar.drawn, n);
     fb->shownlen = (i32)n;
-    findbarend(g, &bar, count);
     fb->held  = bar.focused;
     fb->barh  = bar.bottom - r0.y;
     fb->drawn = 1;
@@ -3383,10 +3383,10 @@ static void filefindbar(Gui *g, FileTab *ft, FileBody *b, ImVec2 r0, ImVec2 r1)
         print(&cb, !done || full ? Str("+") : Str(""));
     }
     Str count = finish(&cb);
-    iz  n     = count.len<countof(fb->shown) ? count.len : countof(fb->shown);
-    copybytes(fb->shown, count.data, n);
+    findbarend(g, &bar, count, a);
+    iz  n     = bar.drawnlen<countof(fb->shown) ? bar.drawnlen : countof(fb->shown);
+    copybytes(fb->shown, bar.drawn, n);
     fb->shownlen = (i32)n;
-    findbarend(g, &bar, count);
     fb->held  = bar.focused;
     fb->barh  = bar.bottom - r0.y;
     fb->done  = done;
