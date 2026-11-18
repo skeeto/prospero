@@ -34,7 +34,7 @@ static Str const gmmodelid = "gemma-4-e2b";
 static Str const gmquote   = "<|\"|>";
 
 enum {
-    GM_CONTEXT  = 32768,    // the context listed, unless [model] context lowers it
+    GM_CONTEXT  = 65536,    // the context listed, unless [model] context lowers it
     GM_MAXNEW   = 4096,     // a response's tokens, unless the request says
     GM_TOPK     = 64,       // sampling's candidates at most
     GM_CHECKS   = 4,        // checkpoints a sequence keeps
