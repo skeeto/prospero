@@ -1467,6 +1467,18 @@ static void testcfgsha256(Test *t)
         expect(t, concat(&a, "sha256 a*", istr(&a, as[i].len)),
                cfgsha256(&a, takehead(m, as[i].len)), as[i].want);
     }
+    // Incrementally, in pieces that straddle blocks every which way
+    for (iz step = 1; step <= 200; step += 37) {
+        Sha256 c = sha256init();
+        for (iz off = 0, k = 0; off < m.len; k++) {
+            iz n = (step + k*13) % 257 + 1;
+            n = n<m.len-off ? n : m.len-off;
+            sha256put(&c, Str(m.data+off, n));
+            off += n;
+        }
+        expect(t, concat(&a, "sha256 pieces ", istr(&a, step)),
+               sha256hex(&a, c), as[3].want);
+    }
 
     static struct { i64 ms; Str want; } ages[] = {
         {-5, "0 seconds"}, {999, "0 seconds"}, {1000, "1 second"},

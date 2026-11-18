@@ -557,6 +557,22 @@ static b32     os_guitheme(Os *, b32 dark);
 // system's fonts, which may be tens of megabytes. Empty on failure.
 static Str     os_guimap(Os *, Arena scratch, Str path);
 static void    os_guiunmap(Os *, Str);
+// For the built-in model's pool of workers (builtin.cpp): this
+// computer's physical performance cores, the ones a busy worker each
+// should have (Apple's P cores, Intel's P cores), at least 1.
+static i32     os_guicores(Os *, Arena scratch);
+// Physical memory in bytes, or 0 if unknown.
+static i64     os_guiram(Os *);
+// Bytes this user may still write on the volume holding path, or -1 if
+// unknown.
+static i64     os_guidiskfree(Os *, Arena scratch, Str path);
+// Called by a worker thread computing for the user, which the system
+// must not slow to save power (Windows' EcoQoS). Elsewhere nothing.
+static void    os_guithreadfast(Os *);
+// While on, the process works for the user even with its window hidden:
+// macOS keeps App Nap away, Windows its power throttling. From one
+// thread at a time; on and off are not counted.
+static void    os_guibusy(Os *, b32 on);
 // A font file of the system's, and its face: by index, or in a
 // collection by PostScript name when psname is set (app.cpp, sysfonts).
 struct FontFile {

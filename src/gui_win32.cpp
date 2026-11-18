@@ -2740,6 +2740,91 @@ static void os_guiunmap(Os *, Str data)
     }
 }
 
+
+// The built-in model's needs: cores, memory, disk, and no throttling
+
+W32(b32, GetLogicalProcessorInformationEx(i32, void *, u32 *));
+W32(b32, GlobalMemoryStatusEx(void *));
+W32(b32, GetDiskFreeSpaceExW(c16 *, u64 *, u64 *, u64 *));
+W32(uz,  GetCurrentThread());
+W32(b32, SetThreadInformation(uz, i32, void *, u32));
+W32(b32, SetProcessInformation(uz, i32, void *, u32));
+
+// Cores of the most efficient class, which on a hybrid processor is the
+// performance cores' (EfficiencyClass counts up with performance).
+static i32 os_guicores(Os *, Arena scratch)
+{
+    u32 len = 0;
+    GetLogicalProcessorInformationEx(0, 0, &len);  // RelationProcessorCore
+    if (!len || len > (1u<<24)) {
+        return 1;
+    }
+    u8 *buf = alloc<u8>(&scratch, len);
+    if (!GetLogicalProcessorInformationEx(0, buf, &len)) {
+        return 1;
+    }
+    i32 best = -1;
+    i32 n    = 0;
+    for (u32 off = 0; off+10 <= len;) {
+        u32 size = 0;
+        copybytes(&size, buf+off+4, 4);
+        i32 eff = buf[off+9];  // PROCESSOR_RELATIONSHIP.EfficiencyClass
+        if (eff > best) {
+            best = eff;
+            n    = 0;
+        }
+        n += eff == best;
+        if (size < 10) {
+            break;
+        }
+        off += size;
+    }
+    return n>0 ? n : 1;
+}
+
+static i64 os_guiram(Os *)
+{
+    struct {
+        u32 len;
+        u32 load;
+        u64 total;  // ullTotalPhys
+        u64 rest[6];
+    } m = {};
+    m.len = sizeof(m);
+    return GlobalMemoryStatusEx(&m) ? (i64)m.total : 0;
+}
+
+static i64 os_guidiskfree(Os *, Arena scratch, Str path)
+{
+    u64 avail = 0;
+    u64 total = 0;
+    u64 free  = 0;
+    if (hasnul(path) || !GetDiskFreeSpaceExW(widepath(&scratch, path).data, &avail, &total, &free)) {
+        return -1;
+    }
+    return (i64)avail;
+}
+
+// THREAD_/PROCESS_POWER_THROTTLING_STATE: version 1, the execution
+// speed bit in the control mask, its state bit clear: never throttled.
+struct W32Throttle {
+    u32 version;
+    u32 control;
+    u32 state;
+};
+
+static void os_guithreadfast(Os *)
+{
+    W32Throttle t = {1, 1, 0};
+    SetThreadInformation(GetCurrentThread(), 3, &t, sizeof(t));  // ThreadPowerThrottling
+}
+
+static void os_guibusy(Os *, b32 on)
+{
+    W32Throttle t = {1, on ? 1u : 0u, 0};  // off: the system decides again
+    SetProcessInformation(GetCurrentProcess(), 4, &t, sizeof(t));  // ProcessPowerThrottling
+}
+
 static Slice<Str> fontnames(Arena *a, Slice<Str> names, Str *list, iz n)
 {
     for (iz i = 0; i < n; i++) {
