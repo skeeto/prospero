@@ -235,7 +235,7 @@ static Str blload(Builtin *b, BlCall *c, Arena scratch)
         Int n       = parseint(env);
         threads     = n.ok && n.val>0 && n.val<=256 ? (i32)n.val : threads;
         os_guithreadfast(os);
-        b->pool = gmpool(os, &pa, threads, (iz)GM_CONTEXT>(iz)GM_WIDTH ? (iz)GM_CONTEXT : (iz)GM_WIDTH,
+        b->pool = gmpool(os, &pa, threads, GM_SCRATCH,
                          os_guithreadfast);
     }
 
