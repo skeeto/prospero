@@ -2329,7 +2329,7 @@ static void termask(Gui *g, TermTab *tt, i64 row, Arena a)
     }
     Str label = {};
     Str text  = termasktext(g, tt, row, &a, &label);
-    Str err   = attachadd(g, s, text, label);
+    Str err   = attachadd(g, a, s, text, label);
     if (err.len) {
         setnote(g, s, concat(&g->frame, "not attached: ", err), 1);
         return;
@@ -3181,9 +3181,9 @@ static Str termscreen(Gui *g, Arena *a)
 
 // Where the screen last shows text, its first cell's middle, else
 // (-1, -1): ASCII text, so that bytes are cells.
-static ImVec2 termtextat(Gui *g, Str text)
+static ImVec2 termtextat(Gui *g, Arena scratch, Str text)
 {
-    Arena a   = g->frame;
+    Arena a   = scratch;
     Str   scr = termscreen(g, &a);
     iz    at  = -1;
     for (iz i = find(scr, text); i >= 0;) {

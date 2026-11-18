@@ -1644,11 +1644,11 @@ static void filelinkopen(Gui *g, Arena *a, Dest *d, LinkFrom *from)
 
 // A right-click in text, on link (empty for none): the menu's file
 // link, as it resolves now, kept for as long as the menu is open.
-static void filelinkmark(Gui *g, Str link, LinkFrom *from)
+static void filelinkmark(Gui *g, Arena scratch, Str link, LinkFrom *from)
 {
     LinkMenu *m = &g->linkmenu;
     *m = {};
-    Arena a = g->frame;
+    Arena a = scratch;
     Dest  d = helpdest(&a, link);
     if (!link.len || d.kind!=DEST_FILE || !from || !from->opens) {
         return;
@@ -2454,9 +2454,9 @@ static void fileaskstat(Gui *g)
 // Open file's OK: the path typed, its answer posted once the check
 // says it is a file, else why not. The modal stays open meanwhile,
 // saying "Checking..." if that takes a while.
-static Str fileaskok(Gui *g, Str text)
+static Str fileaskok(Gui *g, Arena scratch, Str text)
 {
-    Arena    a   = g->frame;
+    Arena    a   = scratch;
     FileRef  ref = {};
     FilePath p   = fileasked(g, &a, text, &ref);
     if (p.err.len) {
@@ -2657,7 +2657,7 @@ static void droproute(Gui *g)
             } break;
             case DROPTO_ATTACH:
                 if (!w.refuse) {
-                    dropattach(g, d->path);
+                    dropattach(g, g->frame, d->path);
                 } else if (first) {
                     Str note = concat(&g->frame, "not attached: ", w.detail);
                     if (g->sess) {
@@ -2883,9 +2883,9 @@ static void filesempty(Gui *g)
 }
 
 // A note over the file, dim, or in red for an error.
-static void filenote(Gui *g, Str s, b32 bad)
+static void filenote(Gui *g, Arena scratch, Str s, b32 bad)
 {
-    Arena a = g->frame;
+    Arena a = scratch;
     for (iz i = 0; i<s.len && g->fnoteslen<countof(g->fnotes); i++) {
         g->fnotes[g->fnoteslen++] = s[i];
     }
@@ -3536,7 +3536,7 @@ static void drawfiles(Gui *g)
         Str here = filelocal(g, &a, ft->host, ft->path, &rwhy);
         ImGui::BeginDisabled(rwhy.len > 0);
         if (iconbutton(ICON_FOLDER "##filereveal")) {
-            guishow(g, here);
+            guishow(g, a, here);
         }
         ImGui::EndDisabled();
         itemnamed(g, "file reveal");
@@ -3583,7 +3583,7 @@ static void drawfiles(Gui *g)
     g->fnotesstate  = ft->state;
     g->fnotesbody   = b;
     if (ft->state == FTAB_FAILED) {
-        filenote(g, ft->err, 1);
+        filenote(g, a, ft->err, 1);
         if (ImGui::Button("Retry")) {
             ft->state = FTAB_UNREAD;
             scheddirty(&g->sched);
@@ -3597,17 +3597,17 @@ static void drawfiles(Gui *g)
         FileFetch *f  = &g->ffetch;
         i64        at = f->ft==ft ? f->askedat+FILES_NOTEDELAY : 0;
         if (ft->state==FTAB_READING && g->sched.now>=at) {
-            filenote(g, "Reading...", 0);
+            filenote(g, a, "Reading...", 0);
         } else if (ft->state == FTAB_READING) {
             schedat(&g->sched, at, DUE_APP);
         } else if (farwhy.len) {
-            filenote(g, farwhy, 1);
+            filenote(g, a, farwhy, 1);
             if (fh && fh->r && !fh->closing && !fh->up) {
                 Buf nb(&a, 64 + fh->name.len);
                 print(&nb, "Reconnecting to ");
                 print(&nb, fh->name);
                 print(&nb, "...");
-                filenote(g, finish(&nb), 0);
+                filenote(g, a, finish(&nb), 0);
             }
         }
         g->fshowing = 0;
@@ -3615,7 +3615,7 @@ static void drawfiles(Gui *g)
     }
     b->drawn = g->total.frames;
     if (b->changed) {
-        filenote(g, "It changed while it was read.", 0);
+        filenote(g, a, "It changed while it was read.", 0);
     }
     if (b->kind == FBODY_IMAGE) {
         // Its size, from g->frame itself: drawimage takes a copy of it
@@ -3625,7 +3625,7 @@ static void drawfiles(Gui *g)
         print(&nb, (i64)b->h);
         print(&nb, " pixels");
         b32      fit = ft->fit;
-        ImgDrawn d   = drawimage(g, b->tex, b->w, b->h, &ft->fit, finish(&nb),
+        ImgDrawn d   = drawimage(g, a, b->tex, b->w, b->h, &ft->fit, finish(&nb),
                                  "Scale it to fit the pane");
         if (ft->fit != fit) {
             filesdirty(g);
@@ -3641,7 +3641,7 @@ static void drawfiles(Gui *g)
         print(&nb, "This is a binary file (");
         print(&nb, b->size);
         print(&nb, " bytes).");
-        filenote(g, finish(&nb), 0);
+        filenote(g, a, finish(&nb), 0);
         if (ImGui::Button("Show as text anyway")) {
             ft->astext = 1;
             filefree(g, ft);
@@ -3653,7 +3653,7 @@ static void drawfiles(Gui *g)
         g->fshowing = 0;
         return;
     } else if (!b->body.len) {
-        filenote(g, "This file is empty.", 0);
+        filenote(g, a, "This file is empty.", 0);
         g->fshowing = 0;
         return;
     }
@@ -3662,7 +3662,7 @@ static void drawfiles(Gui *g)
         print(&nb, "Only its first ");
         print(&nb, (i64)b->lines);
         print(&nb, " lines are shown.");
-        filenote(g, finish(&nb), 0);
+        filenote(g, a, finish(&nb), 0);
     }
     if (ft->band0>b->lines && !(b->flags&FTEXT_CUT)) {
         // A cut file's own note says why
@@ -3670,7 +3670,7 @@ static void drawfiles(Gui *g)
         print(&nb, "The file has only ");
         print(&nb, (i64)b->lines);
         print(&nb, b->lines==1 ? Str(" line.") : Str(" lines."));
-        filenote(g, finish(&nb), 0);
+        filenote(g, a, finish(&nb), 0);
     }
 
     // Another tab, mode or body than last frame's: its own place again,
@@ -3734,11 +3734,11 @@ static void drawfiles(Gui *g)
         d->from.win   = ft->win;
         d->from.opens = 1;
         d->from.file  = ft->path;
-        Str link = drawdoc(g, d, "##filetext", "File");
+        Str link = drawdoc(g, a, d, "##filetext", "File");
         itemnamed(g, "file text");
         filefindbar(g, ft, b, ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
         if (link.len) {
-            followlink(g, link, &d->from);
+            followlink(g, a, link, &d->from);
         }
         if (!pending && !set && !dl->restore) {
             filemdtop(g, b, &ft->top, &ft->dy);
@@ -3769,7 +3769,7 @@ static void drawfiles(Gui *g)
     dl->find    = fon ? ff : 0;
     dl->reveal  = fon && fb->reveal && ff->cur>=0 ? ff->hits[ff->cur] : FindHit{};
     dl->covered = fb->barh;
-    drawdoc(g, b->text, "##filetext", "File", 0, dl);
+    drawdoc(g, a, b->text, "##filetext", "File", 0, dl);
     itemnamed(g, "file text");
     if (dl->jumped && dl->reveal.len) {
         fb->reveal = 0;

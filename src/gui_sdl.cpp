@@ -1697,6 +1697,7 @@ static b32 sdlfailed(Os *os, Arena t, Str what, Str why = {})
     return 0;
 }
 
+// arenalint: frame ok, as title is a literal
 static b32 os_guiopen(Os *os, Gui *g, Str title)
 {
     GuiSdl *p = (GuiSdl *)os->gui;
@@ -1785,6 +1786,7 @@ static void glattrs(b32 es)
 
 // The window, its GL context, and ImGui's backends for them, which
 // os_guished takes down again.
+// arenalint: frame ok, as title is os_guiopen's
 static b32 sdlwindow(Os *os, Gui *g, GuiSdl *p, Str title)
 {
     SDL_WindowFlags flags = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE |
@@ -2203,6 +2205,7 @@ static void os_guiraise(Os *os)
 // SDL's Wayland backend activates a window it shows with the token in
 // the environment, then removes it from there. Elsewhere it would only
 // linger, for the engine's commands to inherit.
+// arenalint: frame ok, as token is kept in g
 static void os_guitoken(Os *os, Str token)
 {
     if (os->gui && wayland() && token.len) {
@@ -2635,6 +2638,7 @@ static void SDLCALL traypick(void *ud, SDL_TrayEntry *)
     SDL_PushEvent(&e);
 }
 
+// arenalint: frame ok, as tip is a literal
 static b32 os_trayopen(Os *os, Str tip)
 {
     GuiSdl *p = (GuiSdl *)os->gui;

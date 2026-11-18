@@ -1813,13 +1813,13 @@ static void kidsweep(Gui *g)
                     (t->opened && !t->want) || !kidnamed(g, a, s, name)) {
                 continue;
             } else if (t->want || t->status==VTOOL_RUNNING) {
-                kidreach(g, g->frame, t, t->want);
+                kidreach(g, a, t, t->want);
             } else if (t->status == VTOOL_BACKGROUND) {
                 GuiHost    *h = findhost(g, GH_REMOTE, name);
                 b32         up = h && h->r && !h->closing && h->up;
                 GuiSession *k = up ? findsess(g, h, t->child) : 0;
                 if (k && k->listed && k->state!=LIVE_IDLE && k->state!=LIVE_CLOSED) {
-                    kidreach(g, g->frame, t, 0);
+                    kidreach(g, a, t, 0);
                 }
             }
         }
@@ -2201,10 +2201,10 @@ static void whytip(Str);
 // A screenshot's thumbnail below its tool row, or an image's below the
 // user's message it was attached to, fetched as it first shows, which
 // opens the image whole in the Screenshot window.
-static void drawthumb(Gui *g, GuiSession *s, ImDrawList *dl, Str path, i32 w, i32 h,
+static void drawthumb(Gui *g, Arena scratch, GuiSession *s, ImDrawList *dl, Str path, i32 w, i32 h,
                       b32 user, ImVec2 p0, Thumb th, f32 top, f32 bot)
 {
-    Arena    a    = g->frame;
+    Arena    a    = scratch;
     f32      sc   = g->scale;
     ImVec2   p1   = v2(p0.x+th.w, p0.y+th.h);
     b32      in   = p1.y>=top && p0.y<=bot;
@@ -2359,10 +2359,10 @@ static Str planedittip = "Revise the plan file by hand in your editor before you
 
 // The plan file in the editor (planedit), for the plan's ask req, else
 // none: its button, or while it is out, which editor and a Cancel.
-static void planeditbutton(Gui *g, GuiSession *s, Str path, Str req, char const *label,
-                           Str named, Str tip)
+static void planeditbutton(Gui *g, Arena scratch, GuiSession *s, Str path, Str req,
+                           char const *label, Str named, Str tip)
 {
-    Arena a = g->frame;
+    Arena a = scratch;
     if (g->planread.s == s) {
         Str name = s->host->name;
         ImGui::AlignTextToFramePadding();
@@ -2749,7 +2749,7 @@ static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
 
         // Edit plan: the plan file in the editor, on this machine
         ImGui::SameLine();
-        planeditbutton(g, s, t->path, t->req, "Edit plan", "edit plan", planedittip);
+        planeditbutton(g, a, s, t->path, t->req, "Edit plan", "edit plan", planedittip);
         return;
     }
     if (ImGui::Button("Allow")) {
@@ -3073,7 +3073,8 @@ static void drawinfo(Gui *g, GuiSession *s, View *v)
                 : !v->mems.len ? Str("Nothing is saved yet") : Str{};
         ImGui::BeginDisabled(why.len != 0);
         if (iconbutton(ICON_FOLDER "##memreveal")) {
-            guishow(g, join(&a, v->memdir, "MEMORY.md"));
+            Str path = join(&a, v->memdir, "MEMORY.md");
+            guishow(g, a, path);
         }
         ImGui::EndDisabled();
         itemnamed(g, "memory reveal");
@@ -3330,7 +3331,7 @@ static void drawmodelpick(Gui *g, Arena a, GuiSession *s, View *v)
 
 static b32  cfghas(Gui *, Str, Str);
 static void cfgselect(Gui *, Str, Str);
-static void followlink(Gui *, Str, LinkFrom * = 0);
+static void followlink(Gui *, Arena, Str, LinkFrom * = 0);
 
 // A list's last item, label: where its choices are set, in Settings,
 // at the section of kind named, else the kind's first section, else a
@@ -3346,7 +3347,8 @@ static void settingsitem(Gui *g, Arena a, Str label, Str kind, Str name)
         g->cfgshowsel = 1;
         setpane(g, PANE_SETTINGS, 1);
     } else {
-        followlink(g, concat(&a, "settings:", kind));
+        Str link = concat(&a, "settings:", kind);
+        followlink(g, a, link);
     }
 }
 
@@ -4210,7 +4212,7 @@ static LinkFrom filelinkfrom(GuiSession *, Str);
 static Str  termcwd(GuiSession *);
 static Str  filelinktip(Gui *, Arena *, Str, Dest *, LinkFrom *);
 static void filelinkopen(Gui *, Arena *, Dest *, LinkFrom *);
-static void filelinkmark(Gui *, Str, LinkFrom *);
+static void filelinkmark(Gui *, Arena, Str, LinkFrom *);
 static Str  codelinkat(Gui *, Arena, View *, TextHit, LinkFrom *);
 static void codelinkhostend(Gui *, u64);
 static void filelinkitems(Gui *);
@@ -4381,9 +4383,9 @@ static Str linktip(Gui *g, Arena *a, Str link, LinkFrom *from)
 // configuration (drawsettings), a section of Help for its page's layout
 // (drawdoc). Under the checklist, a web link is only noted. A file's
 // opens in Files, from where the link is (from, null for nowhere).
-static void followlink(Gui *g, Str link, LinkFrom *from)
+static void followlink(Gui *g, Arena scratch, Str link, LinkFrom *from)
 {
-    Arena a = g->frame;
+    Arena a = scratch;
     Dest  d = helpdest(&a, link);
     switch (d.kind) {
     case DEST_HELP:
@@ -4465,7 +4467,7 @@ static Str textlink(Gui *g, View *v, TextHit hit, u64 *press, i32 *pressmsg, Lin
             ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByPopup)) {
         Str at = hit.hit && hit.body ? doclinkat(msgdoc(v, hit.at.msg), hit.at.off) : Str{};
         at = at.len ? at : codelinkat(g, a, v, hit, from);
-        filelinkmark(g, at, from);
+        filelinkmark(g, a, at, from);
     }
     // a11y: links are spans of the text, not items, until its text is a
     // tool's: each would need its runs' rectangles, which only drawing has
@@ -4478,7 +4480,10 @@ static Str textlink(Gui *g, View *v, TextHit hit, u64 *press, i32 *pressmsg, Lin
     Str r = {};
     if (*press && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
         b32 same = link.len && (hash(link)|1)==*press && hit.at.msg==*pressmsg;
-        r = same && !ImGui::IsMouseDragPastThreshold(ImGuiMouseButton_Left) ? link : Str{};
+        // Kept, as a code link is in this scratch, which the caller's
+        // scratch, given to followlink, would write over
+        r = same && !ImGui::IsMouseDragPastThreshold(ImGuiMouseButton_Left)
+          ? clone(&g->perm, link) : Str{};
         *press = 0;
     }
     return r;
@@ -4581,7 +4586,7 @@ static f64 lineslay(View *v, Gui *g, f32 width, f32 charw, f32 lineh, f64 y0, f6
     return viewtops(v, width, charw, lineh);
 }
 
-static Str drawlines(Gui *g, DocView *d, char const *id, Str name, DocLines *dl)
+static Str drawlines(Gui *g, Arena scratch, DocView *d, char const *id, Str name, DocLines *dl)
 {
     View       *v     = d->v;
     f32         sc    = g->scale;
@@ -4767,7 +4772,7 @@ static Str drawlines(Gui *g, DocView *d, char const *id, Str name, DocLines *dl)
     b32                 carried = 0;
     f32                 ox   = wpos.x + pad + gutter - sx;
     f32                 seen = dl->seenw;
-    Arena               a    = g->frame;
+    Arena               a    = scratch;
     ImFont             *font = stylefont(&g->fonts, STYLE_CODE);
     f32                 size = stylesize(&g->fonts, STYLE_CODE);
     sp->Split(dr, CH_COUNT);
@@ -4898,10 +4903,11 @@ static Str drawlines(Gui *g, DocView *d, char const *id, Str name, DocLines *dl)
 // once laid out. Returns the destination of a link clicked, if any,
 // which is the caller's to follow. With dl, it is a file's lines,
 // drawn by drawlines.
-static Str drawdoc(Gui *g, DocView *d, char const *id, Str name, f32 fit = 0, DocLines *lines = 0)
+static Str drawdoc(Gui *g, Arena scratch, DocView *d, char const *id, Str name, f32 fit = 0,
+                   DocLines *lines = 0)
 {
     if (lines) {
-        return drawlines(g, d, id, name, lines);
+        return drawlines(g, scratch, d, id, name, lines);
     }
     View       *v     = d->v;
     f32         sc    = g->scale;
@@ -4924,7 +4930,7 @@ static Str drawdoc(Gui *g, DocView *d, char const *id, Str name, f32 fit = 0, Do
 
     if (d->section.len && v->msgs.len && !ImGui::IsWindowAppearing()) {
         // The heading, whose letters and digits the section's are
-        Arena      a   = g->frame;
+        Arena      a   = scratch;
         Doc       *doc = msgdoc(v, 0);
         MsgLayout *ml  = msglayout(v, 0, &g->measure, width, sc);
         for (iz k = 0; k < doc->blocks.len; k++) {
@@ -5339,11 +5345,11 @@ static QueueShow queueshow(Arena *a, ViewQueued *q, f32 width, f32 pad)
 
 // The tail's bubbles, as measured (shows), from y in the transcript's
 // coordinates.
-static void drawqueue(Gui *g, GuiSession *s, Slice<QueueShow> shows, f64 y,
+static void drawqueue(Gui *g, Arena scratch, GuiSession *s, Slice<QueueShow> shows, f64 y,
                       ImVec2 wpos, f32 scrolly, f32 winh, f32 width, f32 pad)
 {
     View       *v  = s->view;
-    Arena       a  = g->frame;
+    Arena       a  = scratch;
     f32         sc = g->scale;
     ImDrawList *dl = ImGui::GetWindowDrawList();
     f32         lh = ImGui::GetTextLineHeight();
@@ -5414,11 +5420,11 @@ struct ToastOut {
 // or -1, as the child window id. With fit, it is only as wide as its
 // text needs, at the right. The button pressed, or -1, also when there
 // is no room.
-static i32 toastbtns(Gui *g, char const *id, Str text, u32 color, u32 edge,
+static i32 toastbtns(Gui *g, Arena scratch, char const *id, Str text, u32 color, u32 edge,
                      Slice<ToastBtn> btns, i32 which, ImVec2 r0, ImVec2 r1,
                      b32 fit = 0, ToastOut *out = 0)
 {
-    Arena       a    = g->frame;
+    Arena       a    = scratch;
     f32         sc   = g->scale;
     ImGuiStyle &st   = ImGui::GetStyle();
     f32         pad  = 8*sc;
@@ -5490,11 +5496,11 @@ static i32 toastbtns(Gui *g, char const *id, Str text, u32 color, u32 edge,
 }
 
 // One with a single button, as most are: true when it is pressed.
-static b32 toastbox(Gui *g, Str text, u32 color, u32 edge, Str btn, Str name,
+static b32 toastbox(Gui *g, Arena scratch, Str text, u32 color, u32 edge, Str btn, Str name,
                     char const *tip, i32 which, ImVec2 r0, ImVec2 r1, b32 fit = 0)
 {
     ToastBtn b = {btn, name, tip};
-    return toastbtns(g, "##toast", text, color, edge, {&b, 1}, which, r0, r1, fit) == 0;
+    return toastbtns(g, scratch, "##toast", text, color, edge, {&b, 1}, which, r0, r1, fit) == 0;
 }
 
 // The session's note, what the latest command from the box came to, or
@@ -5524,14 +5530,14 @@ static void drawtoast(Gui *g, GuiSession *s, ImVec2 r0, ImVec2 r1)
     if (editing) {
         // In the frame itself: toastbtns takes its scratch from there
         Str text = concat(&g->frame, concat(&g->frame, "Editing in ", g->edname), "...");
-        if (toastbox(g, text, g->pal->paneltext, g->pal->rule, "Cancel", "",
+        if (toastbox(g, g->frame, text, g->pal->paneltext, g->pal->rule, "Cancel", "",
                      "Stop the editor, leaving the draft as it was",
                      RECT_EDITCANCEL, r0, r1)) {
             editcancel(g);
         }
         g->editshown = 1;
     } else if (hint) {
-        if (toastbox(g, "Esc again stops the turn", g->pal->paneltext, g->pal->rule,
+        if (toastbox(g, g->frame, "Esc again stops the turn", g->pal->paneltext, g->pal->rule,
                      "Stop", "esc stop", "Stop: cancel the turn, killing any command it runs",
                      -1, r0, r1)) {
             g->eschint = 0;
@@ -5539,7 +5545,7 @@ static void drawtoast(Gui *g, GuiSession *s, ImVec2 r0, ImVec2 r1)
         }
         g->eschintshown = 1;
     } else if (s->note.len && fresh) {
-        if (toastbox(g, s->note, s->noteerr ? g->pal->bad : g->pal->paneldim,
+        if (toastbox(g, g->frame, s->note, s->noteerr ? g->pal->bad : g->pal->paneldim,
                      s->noteerr ? g->pal->bad : g->pal->rule,
                      "\xc3\x97", "dismiss", "Dismiss", -1, r0, r1)) {  // a multiplication sign
             s->note = {};
@@ -5578,7 +5584,7 @@ static f32 drawhosttoast(Gui *g, i32 pane)
     iz           n       = 0;
     b32          deploy  = h->kind==GH_REMOTE && h->state==RS_FAILED && h->deploys &&
                            !h->deployfail && !h->r && !remoteset(g, h->name, "path").len &&
-                           !deploywhy(g, h, h->name).len;
+                           !deploywhy(g, g->frame, h, h->name).len;
     if (deploy) {
         // In the frame itself: toastbtns takes its scratch from there
         btns[n++] = {"Deploy engine", concat(&g->frame, "toast deploy ", h->name),
@@ -5587,7 +5593,7 @@ static f32 drawhosttoast(Gui *g, i32 pane)
     }
     btns[n++] = {"\xc3\x97", "host dismiss", "Dismiss"};  // a multiplication sign
     ToastOut out = {};
-    i32      b   = toastbtns(g, "##toast", g->htoasttext, g->pal->bad, g->pal->bad,
+    i32      b   = toastbtns(g, g->frame, "##toast", g->htoasttext, g->pal->bad, g->pal->bad,
                              {btns, n}, -1, r0, r1, 0, &out);
     if (b>=0 && deploy && b==0) {
         guideploy(g, h->name);
@@ -5633,7 +5639,7 @@ static void drawtrashtoast(Gui *g, i32 pane, f32 lift)
         {"\xc3\x97", "trash dismiss", "Dismiss: they stay in the Trash"},  // a multiplication sign
     };
     ToastOut out = {};
-    i32      b   = toastbtns(g, "##trashtoast", t->text, g->pal->paneltext, g->pal->rule,
+    i32      b   = toastbtns(g, g->frame, "##trashtoast", t->text, g->pal->paneltext, g->pal->rule,
                              {btns, countof(btns)}, -1, r0, r1, 0, &out);
     if (out.hovered && t->until-g->sched.now < 2*1000*1000) {
         t->until = g->sched.now + 2*1000*1000;  // kept while the mouse is on it
@@ -5701,9 +5707,9 @@ static void drawsetup(Gui *g, ImVec2 wpos, f32 winh, f32 width)
     }
     f32 x = wpos.x + (width - wrap)/2;
     ImGui::SetCursorScreenPos(v2(x, wpos.y + winh/3));
-    Str link = drawdoc(g, g->setupdoc, "##setup", "Set up", wrap);
+    Str link = drawdoc(g, a, g->setupdoc, "##setup", "Set up", wrap);
     if (link.len) {
-        followlink(g, link);
+        followlink(g, a, link);
     }
     ImGui::SetCursorScreenPos(v2(x + 4*sc, ImGui::GetCursorScreenPos().y + 4*sc));
     if (ImGui::Button("Set up a model...")) {
@@ -5739,9 +5745,9 @@ static void drawgreeting(Gui *g, ImVec2 wpos, f32 winh, f32 width)
         docset(g->greeting, {(u8 *)greetingmd, countof(greetingmd)});
     }
     ImGui::SetCursorScreenPos(v2(wpos.x + (width - wrap)/2, wpos.y + winh/3));
-    Str link = drawdoc(g, g->greeting, "##greeting", "Welcome", wrap);
+    Str link = drawdoc(g, g->frame, g->greeting, "##greeting", "Welcome", wrap);
     if (link.len) {
-        followlink(g, link);
+        followlink(g, g->frame, link);
     }
 }
 #endif
@@ -6013,7 +6019,7 @@ static void drawtranscript(Gui *g)
     Str      link = textlink(g, v, hit, &g->linkpress, &g->linkmsg, &from);
     itemrect(g, RECT_TRANSCRIPT);
     if (link.len) {
-        followlink(g, link, &from);
+        followlink(g, g->frame, link, &from);
     }
     b32 asked = axmenuasked(g, ImGui::GetItemID());  // a11y: a tool's or the keyboard's, on no message
     if (ImGui::IsItemClicked(ImGuiMouseButton_Right) || asked) {
@@ -6216,7 +6222,7 @@ static void drawtranscript(Gui *g)
         Thumb th = msgthumb(v, m);
         if (th.h > 0) {
             sp->SetCurrentChannel(dl, CH_TEXT);
-            drawthumb(g, gs, dl, m->tool->image, m->tool->imgw, m->tool->imgh, 0,
+            drawthumb(g, g->frame, gs, dl, m->tool->image, m->tool->imgw, m->tool->imgh, 0,
                       v2(x, y + head + m->h + pad/4), th, top, bot);
         } else if (mfoot>0 && m->role==VIEW_USER) {
             sp->SetCurrentChannel(dl, CH_TEXT);
@@ -6224,7 +6230,7 @@ static void drawtranscript(Gui *g)
                 ViewImage *im = &m->images[k];
                 ThumbAt    t  = userthumbat(v, m, k);
                 ImGui::PushID((i32)k);
-                drawthumb(g, gs, dl, im->name, im->w, im->h, 1,
+                drawthumb(g, g->frame, gs, dl, im->name, im->w, im->h, 1,
                           v2(x + t.x, y + head + m->h + pad/4 + t.y), {t.w, t.h}, top, bot);
                 ImGui::PopID();
             }
@@ -6248,7 +6254,7 @@ static void drawtranscript(Gui *g)
     }
     sp->Merge(dl);
     if (shows.len) {
-        drawqueue(g, g->sess, shows, tail0, wpos, scrolly, winh, width, pad);
+        drawqueue(g, g->frame, g->sess, shows, tail0, wpos, scrolly, winh, width, pad);
     }
     if (!v->msgs.len && !shows.len && nosetup(g)) {
         drawsetup(g, wpos, winh, width + 2*pad);
@@ -7026,7 +7032,7 @@ static void fieldmenu(Gui *g, Arena a, char const *buf, b32 fixed)
 
 // Run a slash command typed in the box (parseslash). Sent commands
 // clear the box, keeping the text to put back if the command fails.
-static void runslash(Gui *g, GuiSession *s, Slash sl, Str text)
+static void runslash(Gui *g, Arena scratch, GuiSession *s, Slash sl, Str text)
 {
     s->note = {};
     if (sl.err.len) {
@@ -7143,7 +7149,7 @@ static void runslash(Gui *g, GuiSession *s, Slash sl, Str text)
         break;
     }
     if (!sent) {
-        Arena a = g->frame;
+        Arena a = scratch;
         setnote(g, s, concat(&a, slashinfo[sl.cmd].name,
                              ": this host's engine is too old for it; update the engine"), 1);
         return;
@@ -8038,7 +8044,7 @@ static void drawprompt(Gui *g)
         Slash sl = parseslash(p);
         Slash sk = parseskill(p, s->skills);
         if (sl.cmd) {
-            runslash(g, s, sl, p);
+            runslash(g, a, s, sl, p);
         } else if (s->fetchid && p.len) {
             setnote(g, s, concat(&a, concat(&a, "wait for ", s->fetchskill), " to be fetched"), 1);
         } else if (sk.skill.len && hostcap(s->host, "skills")) {
@@ -9109,7 +9115,7 @@ static void hostitems(Gui *g, Arena a, GuiHost *h, Str remote)
         itemtip("Remove it and its sessions for good");
     } else if (!h || h->kind==GH_REMOTE) {
         ImGui::Separator();
-        Str why = deploywhy(g, h, name);
+        Str why = deploywhy(g, a, h, name);
         if (h && h->up) {
             if (menuitem(g, a, "Update engine", why)) {
                 guiupdate(g, h);
@@ -10564,13 +10570,13 @@ static void drawsessions(Gui *g)
     }
 }
 
-static void drawpathask(Gui *, PathAsk *, char const *, char const *, b32);
+static void drawpathask(Gui *, Arena, PathAsk *, char const *, char const *, b32);
 static GuiHost *filehost(Gui *, u64);
 static GuiHost *fileaskhost(Gui *);
 static void fetchtick(Gui *, FileTab *);
 static Str  filehostname(Gui *, Arena *, u64);
 static void fileaskcheck(Gui *);
-static Str  fileaskok(Gui *, Str);
+static Str  fileaskok(Gui *, Arena, Str);
 
 // The naming dialog (a session's title, a new group for it, a group's
 // new name), the deletion's confirmation, the Markdown export's
@@ -10806,8 +10812,8 @@ static void drawsessdialogs(Gui *g)
         ImGui::EndPopup();
     }
 
-    drawpathask(g, &g->pask, "pathask", "pathask", 0);
-    drawpathask(g, &g->fask.p, "openfile", "openfile", 1);
+    drawpathask(g, a, &g->pask, "pathask", "pathask", 0);
+    drawpathask(g, a, &g->fask.p, "openfile", "openfile", 1);
 }
 
 
@@ -10910,9 +10916,9 @@ static void drawplan(Gui *g)
         ViewTool *t = k>=0 ? v->msgs[k].tool : 0;
         if (t) {
             Str path = t->path.len ? t->path : v->planpath;
-            planeditbutton(g, s, path, t->req, "Edit plan", "plan editor", planedittip);
+            planeditbutton(g, a, s, path, t->req, "Edit plan", "plan editor", planedittip);
         } else {
-            planeditbutton(g, s, v->planpath, {}, "View in editor", "plan editor",
+            planeditbutton(g, a, s, v->planpath, {}, "View in editor", "plan editor",
                            "Open the plan file in your editor: it shows here as the "
                            "editor leaves it, and the agent is not told");
         }
@@ -10923,7 +10929,7 @@ static void drawplan(Gui *g)
                 : Str{};
         ImGui::BeginDisabled(why.len != 0);
         if (iconbutton(ICON_FOLDER "##planreveal")) {
-            guishow(g, v->planpath);
+            guishow(g, a, v->planpath);
         }
         ImGui::EndDisabled();
         itemnamed(g, "plan reveal");
@@ -10952,9 +10958,9 @@ static void drawplan(Gui *g)
         return;  // on its way
     }
     f->doc->from = filelinkfrom(s, termcwd(s));
-    Str link = drawdoc(g, f->doc, "##plan", "Plan");
+    Str link = drawdoc(g, a, f->doc, "##plan", "Plan");
     if (link.len) {
-        followlink(g, link, &f->doc->from);
+        followlink(g, a, link, &f->doc->from);
     }
     itemnamed(g, "plan text");
     g->planshown = (i32)f->doc->v->msgs[0].text.len;
@@ -11857,9 +11863,10 @@ static void pathafter(Gui *g, PathField *f, char *buf)
 // platform has no file dialog to show (pathkeep, g->pask), it is
 // answered as the dialog would have; for Open file (openfile, g->fask),
 // fileaskok checks and answers it.
-static void drawpathask(Gui *g, PathAsk *pa, char const *pid, char const *name, b32 openfile)
+static void drawpathask(Gui *g, Arena scratch, PathAsk *pa, char const *pid, char const *name,
+                        b32 openfile)
 {
-    Arena a  = g->frame;
+    Arena a  = scratch;
     f32   sc = g->scale;
     Str   id = concat(&a, "###", Str{(u8 *)pid, (iz)__builtin_strlen(pid)});
     Str   nm = {(u8 *)name, (iz)__builtin_strlen(name)};
@@ -11953,7 +11960,7 @@ static void drawpathask(Gui *g, PathAsk *pa, char const *pid, char const *name, 
         b32 cancel = ImGui::Button("Cancel", v2(120*sc, 0)) || ImGui::Shortcut(ImGuiKey_Escape);
         if (ok && openfile) {
             if (!checking) {  // else the answer comes first
-                pa->err = fileaskok(g, trim({(u8 *)pa->buf, (iz)__builtin_strlen(pa->buf)}));
+                pa->err = fileaskok(g, a, trim({(u8 *)pa->buf, (iz)__builtin_strlen(pa->buf)}));
                 if (!pa->err.len && !g->fask.statid) {
                     ImGui::CloseCurrentPopup();
                 }
@@ -13019,10 +13026,10 @@ struct ImgDrawn {
 // shortens to the width, so a narrow window keeps it; then a note, in
 // red if bad, as "Loading..." or why it cannot be shown. The Screenshot
 // window's, and a Files tab's for an image file.
-static ImgDrawn drawimage(Gui *g, GuiTex *tex, i32 w, i32 h, b32 *fit, Str desc,
+static ImgDrawn drawimage(Gui *g, Arena scratch, GuiTex *tex, i32 w, i32 h, b32 *fit, Str desc,
                           Str fittip, Str note = {}, b32 bad = 0)
 {
-    Arena    a = g->frame;
+    Arena    a = scratch;
     ImgDrawn r = {};
     checkbox("Fit", fit);
     itemnamed(g, "Fit");
@@ -13100,7 +13107,7 @@ static void drawshot(Gui *g)
     Str desc = finish(&b);
     Str note = v->state==IMG_FAILED ? concat(a, "Cannot show the screenshot: ", imgstr(&v->err)) :
                v->state!=IMG_READY  ? Str("Loading...") : Str{};
-    ImgDrawn d = drawimage(g, v->state==IMG_READY ? v->tex : 0, w, h, &v->fit, desc,
+    ImgDrawn d = drawimage(g, g->frame, v->state==IMG_READY ? v->tex : 0, w, h, &v->fit, desc,
                            "Scale it to fit the window", note, v->state==IMG_FAILED);
     if (d.shown) {
         g->shotshown = 1;
@@ -13224,7 +13231,7 @@ static void drawremote(Gui *g, Arena a, Str name, i32 rect)
         ImGui::PopStyleColor();
     }
     // Not with a path in its section, which names the engine there
-    Str why = deploywhy(g, h, name);
+    Str why = deploywhy(g, a, h, name);
     if (!live && !closing && !(h && h->r) && !remoteset(g, name, "path").len) {
         ImGui::BeginDisabled(why.len > 0);
         if (ImGui::SmallButton("Deploy engine")) {
@@ -14639,9 +14646,9 @@ static void drawcfgtable(Gui *g, Str kind, Str name)
 
 // A model's chat template argument: a name and a value, side by side
 // when they fit, else one above the other.
-static void drawcfgtemplate(Gui *g, Str model)
+static void drawcfgtemplate(Gui *g, Arena scratch, Str model)
 {
-    Arena       a  = g->frame;
+    Arena       a  = scratch;
     f32         sc = g->scale;
     ImGuiStyle &st = ImGui::GetStyle();
     ImGui::Spacing();
@@ -14787,9 +14794,9 @@ static void drawcfgdiags(Gui *g)
         docset(g->diagdoc, doc);
         g->diaghash = hash(doc);
     }
-    Str link = drawdoc(g, g->diagdoc, "##diags", "Diagnostics");
+    Str link = drawdoc(g, a, g->diagdoc, "##diags", "Diagnostics");
     if (link.len) {
-        followlink(g, link);
+        followlink(g, a, link);
     }
 }
 
@@ -15363,7 +15370,7 @@ static void drawcfgpage(Gui *g)
     }
     drawcfgtable(g, kind, name);
     if (kind == "model") {
-        drawcfgtemplate(g, name);
+        drawcfgtemplate(g, a, name);
     }
 }
 
@@ -15691,7 +15698,7 @@ static void drawcfgtoast(Gui *g, ImVec2 r0, ImVec2 r1)
         schedat(&g->sched, g->cfgstatusat + TOAST_LIFE, DUE_CLOCK);
     }
     u32 c = g->cfgok ? g->pal->ok : g->pal->bad;
-    if (toastbox(g, g->cfgstatus, c, g->cfgok ? g->pal->rule : c,
+    if (toastbox(g, g->frame, g->cfgstatus, c, g->cfgok ? g->pal->rule : c,
                  "\xc3\x97", "settings dismiss", "Dismiss", -1, r0, r1, 1)) {  // a multiplication sign
         g->cfgstatus = {};
     }
@@ -16007,7 +16014,7 @@ static void drawlog(Gui *g)
         docset(g->logdoc, mdcodeblock(&a, g->logs));
         g->logshown = g->logn;
     }
-    drawdoc(g, g->logdoc, "##log", "Log");
+    drawdoc(g, a, g->logdoc, "##log", "Log");
 }
 
 // The fonts' licenses, which their files ask to be shown.
@@ -16171,7 +16178,7 @@ static void drawhelp(Gui *g)
         }
         namedrect(g, "help topics", at, v2(at.x+w, at.y+ImGui::GetFrameHeight()));
     }
-    Str link = drawdoc(g, g->helpdoc, "##helppage", "Help");
+    Str link = drawdoc(g, a, g->helpdoc, "##helppage", "Help");
     itemnamed(g, "help text");
     if (pick>=0 && pick!=cur) {
         navjump(g);  // a topic picked from the list
@@ -16190,7 +16197,7 @@ static void drawhelp(Gui *g)
         scheddirty(&g->sched);
     }
     if (link.len) {
-        followlink(g, link);
+        followlink(g, a, link);
     }
 }
 

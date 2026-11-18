@@ -12,10 +12,25 @@ its first allocation in scratch writes over results it made before (as
 of arguments is unspecified, so the copy may be taken before g
 allocates, and the callee's scratch then writes over what g returned. A Buf in a struct bound to a local arena that is then
 copied into that struct grows, once past its first block, through the
-dead local (base.cpp's reserve). Each such call in src/ and src/test/ is
-printed, as FILE:LINE: and why, and any fails the check. Nothing is
-built: the sources are read with comments and literals blanked out.
-The matcher first checks itself on snippets.
+dead local (base.cpp's reserve).
+
+The GUI's frame arena, g->frame, is a root: each copy of it starts at
+its base, so two live copies share their bytes. A function given a
+string (Str, char *, u8 *, a Slice) that copies the root for scratch
+writes over that string when its caller made it in its own copy (the
+find bar's count read "find previ"). Such a function takes its scratch
+from its caller instead, unless the comment above it says
+"arenalint: frame ok" and why: its strings are never in the frame
+(literals, the platform's), or are done with first. A function holding
+a copy of the root likewise uses that copy, not the root, while the
+copy is in scope: where the root has moved since (a string put in the
+frame itself, &g->frame, by a callee), the copy is done with, so it
+ends its block first.
+
+Each finding in src/ and src/test/ is printed, as FILE:LINE: and why,
+and any fails the check. Nothing is built: the sources are read with
+comments and literals blanked out. The matcher first checks itself on
+snippets.
 
   uv run tests/arenalint.py
 """
@@ -159,12 +174,73 @@ def callee(stripped, open_):
     return m.group(1) if m else "a call"
 
 
+# The frame root by value: not &g->frame, g->frame.beg, or an assignment
+ROOT  = re.compile(r"(&\s*)?(?:\b\w+(?:->|\.))*\b(?:g|gui)->frame\b(?!\s*(?:[.(\[]|=(?!=)))")
+FUNC  = re.compile(r"^(?![ \t#}])[^\n;{}()=]*?\b([A-Za-z_]\w*)\s*\(((?:[^()]|\([^()]*\))*)\)"
+                   r"\s*(?:const\s*)?\{", re.M)
+STRS  = re.compile(r"\bStr\b|\bchar\b[^,]*\*|\bu8\b[^,]*\*|\bSlice\s*<")
+COPY  = re.compile(r"\bArena\s+([A-Za-z_]\w*)\s*=\s*$")
+EXEMPT = "arenalint: frame ok"
+
+
+def functions(s):
+    """Each function definition, as (name, parameters, body start, end)."""
+    for m in FUNC.finditer(s):
+        if m.group(1) in ("if", "for", "while", "switch", "return"):
+            continue
+        i, depth = m.end(), 1
+        while depth and i < len(s):
+            depth += {"{": 1, "}": -1}.get(s[i], 0)
+            i += 1
+        yield m, m.group(2), m.end(), i
+
+
+def leading(text, off):
+    """The comment lines just above offset off's line."""
+    lines = text[:off].split("\n")[:-1]
+    out = []
+    while lines and lines[-1].lstrip().startswith("//"):
+        out.append(lines.pop())
+    return "\n".join(out)
+
+
+def framelint(text, s, line):
+    found = []
+    for m, params, beg, end in functions(s):
+        uses = [u for u in ROOT.finditer(s, beg, end) if not u.group(1)]
+        if not uses:
+            continue
+        strs = [p.strip() for p in params.split(",") if STRS.search(p)]
+        if strs and EXEMPT not in leading(text, m.start()):
+            found.append((line(m.start()), f"{m.group(1)}() is given {strs[0]} yet copies "
+                          f"the frame for scratch, where its caller may have made it: "
+                          f"take the caller's scratch"))
+        copies = []  # (name, offset after the declaration)
+        for u in uses:
+            for name, at in copies:
+                depth = 0
+                for c in s[at:u.start()]:
+                    depth += {"{": 1, "}": -1}.get(c, 0)
+                    if depth < 0:
+                        break
+                if depth >= 0:
+                    found.append((line(u.start()), f"{m.group(1)}() holds {name}, a copy "
+                                  f"of the frame, yet uses the frame for scratch here, "
+                                  f"over it: use {name}, or end its block first"))
+                    break
+            d = COPY.search(s, beg, u.start())
+            if d and d.end() == u.start():
+                copies.append((d.group(1), u.end()))
+    return found
+
+
 def lint(text, values, pointers):
     """Findings in one file's text, as (line, message)."""
     s = strip(text)
     found = []
     def line(off):
         return s.count("\n", 0, off) + 1
+    found += framelint(text, s, line)
     for open_, args in calls(s):
         given = set(args)
         for a in args:
@@ -228,6 +304,25 @@ SNIPPETS = [
      "    q->in = Buf(&q->arena, 1<<12);\n}\n", 0),
     ("static void f()\n{\n    Arena a = newarena(r);\n    Buf b(&a, 64);\n"
      "    x->mem = a;\n}\n", 0),
+    # The frame root
+    ("static void f(Gui *g, Str s)\n{\n    Arena a = g->frame;\n}\n", 1),
+    ("static void f(Gui *g, char const *id, i32 n)\n{\n    h(g->os, g->frame, n);\n}\n", 1),
+    ("static b32 f(Gui *g, Slice<Item> items)\n{\n    Arena a = p->gui->frame;\n}\n", 1),
+    ("// Opens it.\n// arenalint: frame ok, as s is SDL's\n"
+     "void f(Gui *g, Str s)\n{\n    Arena a = g->frame;\n}\n", 0),
+    ("static void f(Gui *g, Arena scratch, Str s)\n{\n    Arena a = scratch;\n}\n", 0),
+    ("static void f(Gui *g, Session *s)\n{\n    Arena a = g->frame;\n}\n", 0),
+    ("static void f(Gui *g, Str s)\n{\n    g->frame.beg = g->framebase;\n"
+     "    g->frame = newarena(r);\n    Str t = concat(&g->frame, s, s);\n"
+     "    i32 c = g->pal->frame;\n}\n", 0),
+    ("static void f(Gui *g)\n{\n    Arena a = g->frame;\n    h(g, g->frame, x);\n}\n", 1),
+    ("static void f(Gui *g)\n{\n    Arena a = g->frame;\n    Arena t = g->frame;\n}\n", 1),
+    ("static void f(Gui *g)\n{\n    if (x) {\n        Arena a = g->frame;\n    }\n"
+     "    Arena t = g->frame;\n    h(g, t);\n}\n", 0),
+    ("static void f(Gui *g)\n{\n    switch (x) {\n    case 1: {\n        Arena a = g->frame;\n"
+     "    } break;\n    case 2: {\n        Arena a = g->frame;\n    } break;\n    }\n}\n", 0),
+    ("static void f(Gui *g)\n{\n    Arena a = g->frame;\n    if (x) {\n"
+     "        h(g->os, g->frame);\n    }\n}\n", 1),
 ]
 
 
@@ -265,10 +360,10 @@ def main():
             print(f"{rel}:{line}: {why}")
             count += 1
     if count:
-        print(f"arenalint: {count} finding{'s' * (count != 1)}: give the callee's "
-              f"results and its scratch separate arenas (carve, or the caller's scratch)")
+        print(f"arenalint: {count} finding{'s' * (count != 1)}: give no arena's bytes "
+              f"to two at once (carve, or the caller's scratch)")
         return 1
-    print(f"arenalint: {len(paths)} files, no arena given twice")
+    print(f"arenalint: {len(paths)} files, no arena given twice, no frame copied over")
     return 0
 
 

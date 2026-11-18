@@ -111,7 +111,7 @@ struct AxGui {
     i64                 calledlag;// the checklist's "aged": calls dated this much earlier
     Str                 tracepath;
     void              (*published)(AxGui *);  // the OS adapter's, after each publish
-    void              (*osdrive)(Gui *, Str); // its checklist verbs ("ns ...")
+    void              (*osdrive)(Gui *, Arena, Str); // its checklist verbs ("ns ...")
 };
 
 enum { AXLINT_CAP = 1<<12 };
@@ -121,10 +121,10 @@ static Str axcstr(char const *);
 // --a11y-lint: log a visible control with no name, once, as where it is
 // and its ImGui label (tests/gui.py checks these against
 // tests/a11y_allow.txt).
-static void axlintnote(AxGui *x, AxRole role, ImGuiWindow *w, Str label)
+static void axlintnote(AxGui *x, Arena scratch, AxRole role, ImGuiWindow *w, Str label)
 {
     Gui  *g = x->g;
-    Arena a = g->frame;
+    Arena a = scratch;
     Buf   b(&a, 256);
     print(&b, "a11y-lint: unnamed ");
     print(&b, axrolenames[role]);
@@ -723,7 +723,7 @@ static void axbuild(AxGui *x, ImGuiContext *ctx)
         }
         AxNode *n    = axadd(b, parent, it->key ? it->key : it->id, role, name);
         if (g->axlint && role!=AX_NONE && (it->actions & AXA_NAMED) && !name.len) {
-            axlintnote(x, role, w, it->label);
+            axlintnote(x, x->g->frame, role, w, it->label);
         }
         n->id      = it->id;
         n->rect    = {it->rect.Min.x, it->rect.Min.y, it->rect.Max.x, it->rect.Max.y};
@@ -1349,9 +1349,9 @@ static void axcount(Gui *g, Arena *a, Str what, i64 got, Str want)
     axcheck(g, a, parseint(want).val==got, msg);
 }
 
-static void driveax(Gui *g, Str cmd)
+static void driveax(Gui *g, Arena scratch, Str cmd)
 {
-    Arena   a   = g->frame;
+    Arena   a   = scratch;
     Cut     c   = cut(cmd, ' ');
     Str     verb = c.head;
     Cut     r   = cut(c.tail, ' ');
@@ -1378,7 +1378,7 @@ static void driveax(Gui *g, Str cmd)
         // the OS's calls; with nothing drawn, that may be long ago)
         i64 was = g->sched.now;
         g->sched.now -= parseint(r.head).val * 1000;
-        driveax(g, r.tail);
+        driveax(g, a, r.tail);
         g->sched.now = was;
     } else if (verb == "aged") {
         // aged MS CMD: CMD as a tool's call made MS ago, so that what it
@@ -1386,7 +1386,7 @@ static void driveax(Gui *g, Str cmd)
         if (g->ax) {
             g->ax->calledlag = parseint(r.head).val * 1000;
         }
-        driveax(g, r.tail);
+        driveax(g, a, r.tail);
         if (g->ax) {
             g->ax->calledlag = 0;
         }
@@ -1565,7 +1565,7 @@ static void driveax(Gui *g, Str cmd)
                 concat(&a, "accessibility log: ", c.tail));
     } else if (verb == "ns") {
         if (g->ax->osdrive) {
-            g->ax->osdrive(g, c.tail);
+            g->ax->osdrive(g, a, c.tail);
         } else {
             guilog(g, concat(&a, "drive: skipped (no OS adapter here): ", cmd));
         }

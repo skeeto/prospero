@@ -3400,12 +3400,12 @@ static void mcpsigned(Gui *g, Str msg, b32 bad)
     g->mcplistat = 0;  // listed again at once
 }
 
-static void mcpbrowse(Gui *g, Str url)
+static void mcpbrowse(Gui *g, Arena scratch, Str url)
 {
     if (g->mcpbrowser) {
         os_httpfree(g->os, g->mcpbrowser);
     }
-    Arena   a = g->frame;
+    Arena   a = scratch;
     HttpReq r = {};
     r.method    = "GET";
     r.url       = url;
@@ -3499,7 +3499,7 @@ static void mcpsignin(Gui *g, Str name)
 
 // A device flow's code came (endpoint.auth): shown with GitHub's page,
 // which the browser opens, while mcp.code waits for it to be entered.
-static void ondevicecode(Gui *g, Str url, Str code)
+static void ondevicecode(Gui *g, Arena scratch, Str url, Str code)
 {
     g->mcpcode    = clone(&g->perm, code);
     g->mcpcodeurl = clone(&g->perm, url);
@@ -3514,14 +3514,15 @@ static void ondevicecode(Gui *g, Str url, Str code)
     cmdsend(g, &w, a);
     if (g->drive && !g->realreveal) {
         // The checklist's stand-in enters it
-        mcpbrowse(g, concat(&g->frame, concat(&g->frame, url, "?user_code="), code));
-    } else if (!os_guiopenurl(g->os, g->frame, url)) {
+        Str to = concat(&scratch, concat(&scratch, url, "?user_code="), code);
+        mcpbrowse(g, scratch, to);
+    } else if (!os_guiopenurl(g->os, scratch, url)) {
         mcpsay(g, g->mcpname, concat(&g->frame, "Visit ", url), 0);
     }
 }
 
 // mcp.auth's reply: the browser sent to sign in.
-static void onmcpauth(Gui *g, Json *j, b32 ok, Str err)
+static void onmcpauth(Gui *g, Arena scratch, Json *j, b32 ok, Str err)
 {
     Str url  = jsonstr(jsonget(j, "url"));
     Str code = jsonstr(jsonget(j, "code"));
@@ -3529,14 +3530,14 @@ static void onmcpauth(Gui *g, Json *j, b32 ok, Str err)
         mcpsigned(g, err.len ? err : Str("the engine gave no page to sign in at"), 1);
         return;
     } else if (code.len) {
-        ondevicecode(g, url, code);
+        ondevicecode(g, scratch, url, code);
         return;
     }
     g->mcpcmd = 0;
     mcpsay(g, g->mcpname, "Sign in in the browser, which then comes back here", 0);
     if (g->drive && !g->realreveal) {
-        mcpbrowse(g, url);
-    } else if (!os_guiopenurl(g->os, g->frame, url)) {
+        mcpbrowse(g, scratch, url);
+    } else if (!os_guiopenurl(g->os, scratch, url)) {
         mcpsigned(g, concat(&g->frame, "the browser could not be opened: visit ", url), 1);
     }
 }
@@ -3591,7 +3592,7 @@ static void mcpbrowsed(Gui *g, Record r)
         g->mcpnext = status/100==3 && to.len ? clone(&g->perm, to) : Str{};
     } else if (r.type == HTTP_DONE) {
         if (g->mcpnext.len) {
-            mcpbrowse(g, g->mcpnext);
+            mcpbrowse(g, g->frame, g->mcpnext);
         } else if (g->mcpbrowser) {
             os_httpfree(g->os, g->mcpbrowser);
             g->mcpbrowser = 0;
@@ -4152,7 +4153,7 @@ static void planreaddone(Gui *g, Str text, b32 put)
 }
 
 // A part of the plan read again (planreadpart) arrived.
-static void onplanread(Gui *g, Json *j, b32 ok, Str err)
+static void onplanread(Gui *g, Arena scratch, Json *j, b32 ok, Str err)
 {
     PlanRead   *r = &g->planread;
     GuiSession *s = r->s;
@@ -4169,7 +4170,7 @@ static void onplanread(Gui *g, Json *j, b32 ok, Str err)
         planreaddone(g, {}, 1);
         return;
     } else if (!ok) {
-        Arena a = g->frame;
+        Arena a = scratch;
         Buf   b(&a, 256 + err.len);
         print(&b, "cannot read the plan from ");
         print(&b, s->host->name);
@@ -5505,11 +5506,11 @@ static void palbuild(Gui *, b32);
 
 // The settings window's rows, from a config.get reply line, and the
 // theme they set.
-static void loadcfg(Gui *g, Str line)
+static void loadcfg(Gui *g, Arena scratch, Str line)
 {
     // What is typed in a field and not yet sent, as the field just gone
     // to after another's edit went out, outlives the rows made anew
-    Arena      t     = g->frame;
+    Arena      t     = scratch;
     Slice<CfgRow> typed = {};
     for (iz i = 0; i < g->cfgrows.len; i++) {
         CfgRow *o = &g->cfgrows[i];
@@ -5872,13 +5873,13 @@ static GuiTex *attthumb(Gui *g, Str data)
 // agent gets as read shows it, its bytes copied, or a PDF, whose text
 // the engine extracts, if it can ("pdf"). A binary file, by read's
 // measure, is refused. Returns why not, or empty if attached.
-static Str attachadd(Gui *g, GuiSession *s, Str data, Str label, Str src = {})
+static Str attachadd(Gui *g, Arena scratch, GuiSession *s, Str data, Str label, Str src = {})
 {
     Str why = attachwhy(s);
     if (why.len) {
         return why;
     }
-    ImageKind k    = imagekind(g->frame, data);
+    ImageKind k    = imagekind(scratch, data);
     Str       name = label.len ? label : Str("the pasted file");
     b32       pdf  = !k.mime.len && pdfsniff(data) && pdflikely(data);
     if (!k.mime.len && !hostcap(s->host, "files")) {
@@ -5946,7 +5947,7 @@ static Str attachadd(Gui *g, GuiSession *s, Str data, Str label, Str src = {})
 }
 
 // Attach a file, an image or text, by its path.
-static Str attachfile(Gui *g, GuiSession *s, Str path)
+static Str attachfile(Gui *g, Arena scratch, GuiSession *s, Str path)
 {
     Str why = attachwhy(s);
     if (why.len) {
@@ -5967,7 +5968,7 @@ static Str attachfile(Gui *g, GuiSession *s, Str path)
     } else if (rd.err != READ_OK) {
         err = concat(&g->frame, "cannot read ", path);
     } else {
-        err = attachadd(g, s, rd.data, name, path);
+        err = attachadd(g, scratch, s, rd.data, name, path);
     }
     os_release(g->os, r);
     return err;
@@ -6322,9 +6323,9 @@ static void fieldput(char *, Str);
 // A new session in dir, with the configured model, in Build mode, as a
 // launch (prospero DIR) or an open event asked (why): shown once made,
 // or failing that, the new session dialog with dir and the error.
-static void opendirnew(Gui *g, Str dir, Str why)
+static void opendirnew(Gui *g, Arena scratch, Str dir, Str why)
 {
-    Arena a = g->frame;
+    Arena a = scratch;
     g->opened++;
     g->newhost = g->main;
     g->cwdhost = 0;
@@ -6335,10 +6336,10 @@ static void opendirnew(Gui *g, Str dir, Str why)
 }
 
 // A dropped file attached to the draft shown, saying why not.
-static void dropattach(Gui *g, Str path)
+static void dropattach(Gui *g, Arena scratch, Str path)
 {
     GuiSession *s   = g->sess;
-    Str         err = attachfile(g, s, path);
+    Str         err = attachfile(g, scratch, s, path);
     if (err.len && s) {
         setnote(g, s, concat(&g->frame, "not attached: ", err), 1);
     } else if (err.len) {
@@ -6357,6 +6358,7 @@ static void dropattach(Gui *g, Str path)
 // session dialog, dropped on the window perhaps only to be attached.
 // The open event macOS makes of prospero DIR's argument is ignored, as
 // the launch has that session already.
+// arenalint: frame ok, as path is the platform's, or the checklist's in perm
 static void gui_drop(Gui *g, Str path, b32 app, f32 x, f32 y, b32 at)
 {
     g->drops++;
@@ -6367,7 +6369,7 @@ static void gui_drop(Gui *g, Str path, b32 app, f32 x, f32 y, b32 at)
             g->opendup = 0;
             guilog(g, "the launch's directory came as an open event too: ignored");
         } else if (app) {
-            opendirnew(g, real, "opened in the application");
+            opendirnew(g, g->frame, real, "opened in the application");
         } else {
             g->newhost = g->main;
             g->newerr  = {};
@@ -6400,7 +6402,7 @@ static void gui_drop(Gui *g, Str path, b32 app, f32 x, f32 y, b32 at)
             return;
         }
     }
-    dropattach(g, path);
+    dropattach(g, g->frame, path);
 }
 
 // Text dropped on the window, where the platform could not refuse it
@@ -6440,9 +6442,9 @@ static b32 attachpaste(Gui *g, GuiSession *s)
     Str err  = {};
     b32 got  = c.data.len>0 || file;
     if (c.data.len) {
-        err = attachadd(g, s, c.data, {});
+        err = attachadd(g, g->frame, s, c.data, {});
     } else if (file) {
-        err = attachfile(g, s, c.path);
+        err = attachfile(g, g->frame, s, c.path);
     }
     os_release(g->os, r);
     if (err.len) {
@@ -6922,7 +6924,7 @@ static Str  termruntip(Gui *, Arena *, GuiSession *, i32, Str, u64);
 static void termadd(Gui *, GuiSession *);
 static void termgrab(Gui *);
 static Str  termscreen(Gui *, Arena *);
-static ImVec2 termtextat(Gui *, Str);
+static ImVec2 termtextat(Gui *, Arena, Str);
 static b32  termsizecheck(Gui *);
 
 static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
@@ -7060,7 +7062,7 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
         } else if (id && id==g->plan.id) {
             onplanfile(g, j, ok, err);
         } else if (id && id==g->planread.id) {
-            onplanread(g, j, ok, err);
+            onplanread(g, scratch, j, ok, err);
         } else if (id == g->img.fetch.id) {
             onimgfile(g, scratch, j, ok, err);
         } else if (id && id==g->exp.id) {
@@ -7281,7 +7283,7 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
     case CMD_MCPAUTH:
     case CMD_EPAUTH:
         if (id==g->mcpcmd && g->mcpname.len) {
-            onmcpauth(g, j, ok, err);
+            onmcpauth(g, scratch, j, ok, err);
         }
         return;
     case CMD_MCPCODE:
@@ -7325,7 +7327,7 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
             cfgsay(g, ok ? Str("Includes fetched again") : err, ok);
         }
         if (ok) {
-            loadcfg(g, line);
+            loadcfg(g, scratch, line);
         }
         if (g->mcppendfor.data && id>g->mcppendid) {
             g->mcppendfor = {};
@@ -8077,9 +8079,9 @@ static void cfgedit(Gui *g, Arena a, Str path, b32 exists)
 // A file of this computer, selected in the system's file manager. The
 // checklist only notes it, so that it opens no windows, unless asked to
 // (PROSPERO_TEST_REVEAL).
-static void guishow(Gui *g, Str path)
+static void guishow(Gui *g, Arena scratch, Str path)
 {
-    Arena a = g->frame;
+    Arena a = scratch;
     g->revealed = clone(&g->perm, path);
     g->reveals++;
     if (!g->drive || g->realreveal) {
@@ -8992,6 +8994,7 @@ static b32 guiapply(Gui *g, GuiHost *h, Arena a, EvRec *r, Str line)
 // parsed in the frame itself, so that copies of the frame taken while it
 // is applied start past the parse, which is given back after unless more
 // was put in the frame meanwhile.
+// arenalint: frame ok, as line is in a mailbox or held back
 static b32 guirecord(Gui *g, GuiHost *h, Str line)
 {
     byte *base = g->frame.beg;
@@ -10875,7 +10878,7 @@ static void importstart(Gui *g, GuiHost *h)
 }
 
 // The log picked: read, whole, and the new session dialog opened for it.
-static void importread(Gui *g, Str path)
+static void importread(Gui *g, Arena scratch, Str path)
 {
     Import *x = &g->imp;
     x->state = IMP_IDLE;
@@ -10897,7 +10900,7 @@ static void importread(Gui *g, Str path)
     x->path = clone(&x->mem, path);
 
     // What its records say, of those the dialog shows
-    Arena a = g->frame;
+    Arena a = scratch;
     Cut   c = cut(x->data, '\n');
     EvRec e = evparse(&a, c.head);
     if (!c.ok || e.ev!=EV_SESSION) {
@@ -11089,7 +11092,7 @@ static void updatestatus(Gui *g, GuiHost *h, b32 idle)
 
 static void fieldput(char *, Str);
 
-static void toastbg(Gui *, Str);
+static void toastbg(Gui *, Arena, Str);
 
 // What another thread finished: a save or open dialog answered, a
 // deployment's progress and outcome, a launch that handed off to this
@@ -11134,7 +11137,7 @@ static void ontask(Gui *g, Record r)
     case TASK_OPENED:
         if (g->imp.state==IMP_ASKING && r.id==g->imp.ask) {
             if (r.data.len) {
-                importread(g, r.data);
+                importread(g, g->frame, r.data);
             } else {
                 g->imp.state = IMP_IDLE;  // cancelled
             }
@@ -11143,7 +11146,7 @@ static void ontask(Gui *g, Record r)
     case TASK_ATTACH:
         g->attpend &= r.id != g->attask;  // answered, or cancelled
         if (r.id==g->attask && g->attsess && r.data.len) {
-            Str err = attachfile(g, g->attsess, r.data);
+            Str err = attachfile(g, g->frame, g->attsess, r.data);
             if (err.len) {
                 setnote(g, g->attsess, concat(&g->frame, "not attached: ", err), 1);
             }
@@ -11177,7 +11180,7 @@ static void ontask(Gui *g, Record r)
         mcpback(g, r);
         return;
     case TASK_TOAST:
-        toastbg(g, r.data);
+        toastbg(g, g->frame, r.data);
         return;
     case TASK_OPENFILE:
         if (r.id == g->fask.p.id) {
@@ -11307,15 +11310,15 @@ static void guideploy(Gui *g, Str name)
 // Why Deploy engine or Update engine cannot run for a remote, or null:
 // one under way, or a path in its section naming the engine there,
 // which connecting uses instead of a deployed one.
-static Str deploywhy(Gui *g, GuiHost *h, Str name)
+static Str deploywhy(Gui *g, Arena scratch, GuiHost *h, Str name)
 {
     Reach l = remotelink(g, name);
     if (h && updating(h)) {
         return "Deploying already";
     } else if (!l.ssh.len && !l.wsl.len && !l.exec.len) {
         return "Its section has no ssh destination (or wsl, or exec)";
-    } else if (linkbad(g->frame, l).len) {
-        return linkbad(g->frame, l);
+    } else if (linkbad(scratch, l).len) {
+        return linkbad(scratch, l);
     } else if (remoteset(g, name, "path").len) {
         return "Its section's path names the engine there, which connecting runs instead";
     }
@@ -11625,6 +11628,9 @@ static Str ctrnew(Gui *g, Str image, i32 ws, Str folder, b32 net, Str ep, Str mo
     HomePath hp = ws==CTR_EMPTY ? HomePath{} :
                   tildepath(&g->frame, folder, g->main->home, HOST_WINDOWS);
     folder = hp.path;
+    // In the frame itself, past folder, not a copy of it, which is gone
+    // on return
+    Arena scratch = carve(&g->frame, 1<<16);
     if (!g->ctrrt.up) {
         return g->ctrrt.why.len ? g->ctrrt.why : Str("no container runtime answers");
     } else if (!image.len) {
@@ -11635,12 +11641,10 @@ static Str ctrnew(Gui *g, Str image, i32 ws, Str folder, b32 net, Str ep, Str mo
         return "Choose a folder";
     } else if (hp.err.len) {
         return hp.err;
-    } else if (ws != CTR_EMPTY && os_stat(g->os, g->frame, folder).type != STAT_DIR) {
+    } else if (ws != CTR_EMPTY && os_stat(g->os, scratch, folder).type != STAT_DIR) {
         return "No such folder here";
     }
-    // In the frame itself, not a copy of it, which is gone on return
-    Arena scratch = carve(&g->frame, 1<<16);
-    Str   noeng   = ctrnoengine(g->os, &g->frame, scratch);
+    Str noeng = ctrnoengine(g->os, &g->frame, scratch);
     if (noeng.len) {
         noeng = clone(&g->frame, noeng);  // as a sentence, for the dialog
         noeng.data[0] = noeng[0]>='a' && noeng[0]<='z' ? (u8)(noeng[0]-32) : noeng[0];
@@ -12330,7 +12334,7 @@ static void gui_toastfail(Gui *g, i32 id, Str why)
 // stopped by itself ("SID\nWHY\nSEQ\nTEXT"): a toast, whose click brings
 // the window back on it. The turn's end is marked as told of, so that
 // the window, back, does not tell of it again.
-static void toastbg(Gui *g, Str msg)
+static void toastbg(Gui *g, Arena scratch, Str msg)
 {
     Cut sid  = cut(msg, '\n');
     Cut why  = cut(sid.tail, '\n');
@@ -12345,7 +12349,7 @@ static void toastbg(Gui *g, Str msg)
     }
     Int n = parseint(seq.head);
     s->endmark = n.ok && n.val>s->endmark ? n.val : s->endmark;
-    Arena a  = g->frame;
+    Arena a  = scratch;
     Str   ti = s->view ? toasttitle(&a, s->view, s->title)
                        : s->title.len ? s->title : Str("Prospero");
     Str   bo = why.head=="budget" ? Str("Stopped at the step budget") :
@@ -12588,7 +12592,7 @@ static void raisenow(Gui *g)
     }
     gui_tray(g, TRAY_OPEN);
     for (iz i = 0; i < g->raisedirs.len; i++) {
-        opendirnew(g, g->raisedirs[i], "another launch asked");
+        opendirnew(g, g->frame, g->raisedirs[i], "another launch asked");
     }
     g->raisedirs = {};
 }
@@ -14469,9 +14473,9 @@ static b32 lessi64(i64 *a, i64 *b)
     return *a < *b;
 }
 
-static void benchreport(Gui *g, Str what)
+static void benchreport(Gui *g, Arena scratch, Str what)
 {
-    Arena a = g->frame;
+    Arena a = scratch;
     i64  *t = alloc<i64>(&a, g->benchn+1);
     for (i32 i = 0; i < g->benchn; i++) {
         t[i] = g->benchtimes[i];
@@ -14573,7 +14577,7 @@ static void benchframe(Gui *g, i64 cpu)
         f64  total = last->top + last->h;
         f64  y     = (f64)g->benchstep * 400 * g->scale;
         if (y > total || g->benchstep > 3000) {
-            benchreport(g, "scroll");
+            benchreport(g, g->frame, "scroll");
             g->bench     = 3;
             g->benchstep = 0;
         } else {
@@ -14585,7 +14589,7 @@ static void benchframe(Gui *g, i64 cpu)
             benchsample(g, cpu);
         }
         if (g->benchstep > 30) {
-            benchreport(g, "resize relayout");
+            benchreport(g, g->frame, "resize relayout");
             g->bench = 0;
             g->quit  = 1;
         } else {
@@ -20896,12 +20900,12 @@ static ViewTool *ctrtaskcall(Gui *g, GuiHost **h)
 // found the runtime, for its sessions after.
 static b32 pathendswith(Str, Str);
 
-static b32 ctrwait(Gui *g, Str what)
+static b32 ctrwait(Gui *g, Arena scratch, Str what)
 {
     GuiCtr *c = ctrfirst(g);
     if (what == "probed") {
         // As the engine caches it (farctrok)
-        Arena a = g->frame;
+        Arena a = scratch;
         Str   p = join(&a, join(&a, g->statedir, "containers"), "runtime");
         return os_stat(g->os, a, p).type != STAT_MISSING;
     } else if (what == "keptshown") {
@@ -20926,7 +20930,7 @@ static b32 ctrwait(Gui *g, Str what)
     } else if (what == "connected") {
         return c && c->h && c->h->up && !c->job;
     } else if (what == "removed") {
-        Arena a = g->frame;
+        Arena a = scratch;
         Str   d = c ? ctrdir(&a, g->statedir, c->c.name) : Str{};
         return c && c->removed && !c->job && os_stat(g->os, a, d).type==STAT_MISSING;
     }
@@ -20944,16 +20948,16 @@ static b32 ctrwait(Gui *g, Str what)
 // is a subagent of the session, and its host is gone. Of the session
 // shown, "keptshown": that copy, titled (here, a subagent of a parent
 // in Build mode, it is no longer in Bypass).
-static b32 ctrcheck(Gui *g, Str what)
+static b32 ctrcheck(Gui *g, Arena scratch, Str what)
 {
     GuiCtr *c = ctrfirst(g);
     if (what == "keptshown") {
-        return ctrwait(g, what) && g->sess->title.len;
+        return ctrwait(g, scratch, what) && g->sess->title.len;
     } else if (what=="tasklive" || what=="taskkept") {
         GuiHost    *h = 0;
         ViewTool   *t = ctrtaskcall(g, &h);
         GuiSession *k = t ? taskchild(g, g->sess, t) : 0;
-        if (!ctrwait(g, what)) {
+        if (!ctrwait(g, scratch, what)) {
             return 0;
         } else if (what == "tasklive") {
             return k->view->bypass && !hostready(g, h);
@@ -20970,7 +20974,7 @@ static b32 ctrcheck(Gui *g, Str what)
         }
     }
     if (what == "made") {
-        Arena a = g->frame;
+        Arena a = scratch;
         Str   d = ctrdir(&a, g->statedir, c->c.name);
         Read  r = os_read(g->os, &a, join(&a, d, "container.ini"), 1<<16);
         Ctr   k = r.err==READ_OK ? ctrparse(&a, c->c.name, r.data) : Ctr{};
@@ -20978,7 +20982,7 @@ static b32 ctrcheck(Gui *g, Str what)
                  g->driverwd.len && pathendswith(k.folder, g->driverwd);
         return ok;
     } else if (what == "nofolder") {
-        Arena a   = g->frame;
+        Arena a   = scratch;
         Str   why = {};
         if (!g->sess || g->sess->host!=c->h) {
             return 0;
@@ -21172,7 +21176,7 @@ static ViewMsg *lastof(View *, i32 role);
 // with r (tests/gui.py): "listed", from this computer, the user's alone;
 // "used", its fetch done, and the prompt that invoked it shown as typed,
 // the instructions it sent naming r's copy, from this computer.
-static b32 thinskill(Gui *g, Str what)
+static b32 thinskill(Gui *g, Arena scratch, Str what)
 {
     GuiSession *s = g->sess;
     if (!s || !s->view || s->host->kind!=GH_REMOTE) {
@@ -21185,7 +21189,7 @@ static b32 thinskill(Gui *g, Str what)
         }
         return 0;
     }
-    Arena    a    = g->frame;
+    Arena    a    = scratch;
     View    *v    = s->view;
     ViewMsg *u    = lastof(v, VIEW_USER);
     ViewMsg *n    = lastof(v, VIEW_NOTE);
@@ -24753,7 +24757,7 @@ static ImVec2 targetpos(Gui *g, i32 t)
         return v2((r.x0+r.x1)/2, r.y0 + 24*g->scale);
     }
     case T_TERMTEXT:
-        return termtextat(g, g->ops[g->drivepc-1].text);
+        return termtextat(g, g->frame, g->ops[g->drivepc-1].text);
     case T_PROMPTTEXT:
         return prompttextat(g, g->ops[g->drivepc-1].text);
     case T_TERMGRID: {
@@ -25136,7 +25140,7 @@ static b32 docktreecheck(Gui *g)
 
 // The layout saved under the name text, back as it was saved: the same
 // tree, panes and fronts, its shares within a little for the rounding.
-static b32 layoutbackcheck(Gui *g, Str name)
+static b32 layoutbackcheck(Gui *g, Arena scratch, Str name)
 {
     DockLayout *want = 0;
     for (iz i = 0; i < g->layouts.len; i++) {
@@ -25159,7 +25163,7 @@ static b32 layoutbackcheck(Gui *g, Str name)
         }
     }
     if (!ok) {
-        Arena a = g->frame;
+        Arena a = scratch;
         Buf   b(&a, 4096);
         print(&b, "drive: the layout now:\n");
         dockwrite(&b, &got);
@@ -25480,12 +25484,12 @@ static void quietwhy(Gui *g, Buf *b)
     print(b, ")");
 }
 
-static b32 drivequiet(Gui *g, Str what, i64 allow)
+static b32 drivequiet(Gui *g, Arena scratch, Str what, i64 allow)
 {
     i64   n     = g->total.frames - g->driveframes;
     i64   us    = g->sched.now - g->markat;
     i64   other = (g->metricsshown ? 4*us/1000000 : 0) + allow;
-    Arena a     = g->frame;
+    Arena a     = scratch;
     Buf   b(&a, 512);
     print(&b, "drive: frames ");
     print(&b, what);
@@ -25590,9 +25594,9 @@ static Str lastmark(Gui *g, Arena *a)
 // Terminals open, in every session.
 // Whether Run in Terminal takes the block OP_SELRUN aimed at as want
 // says: none, show, send or new (termroute), logged with log.
-static b32 driverunto(Gui *g, Str want, b32 log)
+static b32 driverunto(Gui *g, Arena scratch, Str want, b32 log)
 {
-    Arena a = g->frame;
+    Arena a = scratch;
     if (!g->sess || !g->view || g->drivecodemsg<0 || g->drivecodemsg>=g->view->msgs.len) {
         guilog(g, "drive: no block aimed at to run");
         return 0;
@@ -25843,7 +25847,7 @@ static b32 drivefilecheck(Gui *g, i32 chk)
              (op->dy<=0 || g->fileloads<=(i64)op->dy);
     } break;
     case CHK_FILEQUIET:
-        return g->panes[PANE_FILES] && drivequiet(g, "idle with a file shown", 2);
+        return g->panes[PANE_FILES] && drivequiet(g, a, "idle with a file shown", 2);
     case CHK_FILELINK: {
         LinkFrom  from = filelinkfrom(g->sess, g->view->cwd);
         Str       name = concat(&a, "codelink ", op->text);
@@ -26240,15 +26244,15 @@ static b32 drivewaitdone(Gui *g)
         return h && h->up && h->thin;
     }
     case W_CTR:
-        return ctrwait(g, g->ops[g->drivepc-1].text);
+        return ctrwait(g, g->frame, g->ops[g->drivepc-1].text);
     case W_THINSKILL:
-        return thinskill(g, g->ops[g->drivepc-1].text);
+        return thinskill(g, g->frame, g->ops[g->drivepc-1].text);
     case W_TERM: {
         Arena a = g->frame;
         return find(termscreen(g, &a), g->ops[g->drivepc-1].text) >= 0;
     }
     case W_RUNTO:
-        return driverunto(g, g->ops[g->drivepc-1].text, 0);
+        return driverunto(g, g->frame, g->ops[g->drivepc-1].text, 0);
     case W_TERMBUSY: {
         TermTab *tt   = termfront(g);
         b32      idle = g->ops[g->drivepc-1].text == Str("idle");
@@ -26543,7 +26547,7 @@ static b32 clipownmark(Gui *g)
     return e.x >= 0;
 }
 
-static void clipownafter(Gui *g, Str what)
+static void clipownafter(Gui *g, Arena scratch, Str what)
 {
     GuiEvent e = {};
     e.kind = GEV_CLIPOWN;
@@ -26552,7 +26556,7 @@ static void clipownafter(Gui *g, Str what)
     if (e.x < 0) {
         return;
     } else if (e.x == 0) {
-        Arena a = g->frame;
+        Arena a = scratch;
         guilog(g, concat(&a, concat(&a, "drive: FAIL ", what),
                          " did not reach the checklist's own pasteboard"));
         g->drivechecks++;
@@ -26564,6 +26568,7 @@ static void clipownafter(Gui *g, Str what)
     }
 }
 
+// arenalint: frame ok, as text is done with before clipownafter's scratch
 static void driveclipset(ImGuiContext *c, char const *text)
 {
     Gui *g = clipgui;
@@ -26575,7 +26580,7 @@ static void driveclipset(ImGuiContext *c, char const *text)
         clipset(c, text);
     }
     if (mark) {
-        clipownafter(g, "a copied text");
+        clipownafter(g, g->frame, "a copied text");
     }
 }
 
@@ -26842,9 +26847,9 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_DRAGQUIET:
         if (g->ops[g->drivepc-1].dx == 0) {
-            return g->drag.on && drivequiet(g, "with a drag resting over the window", 2);
+            return g->drag.on && drivequiet(g, g->frame, "with a drag resting over the window", 2);
         }
-        return !g->drag.on && drivequiet(g, "after a drag", 2);
+        return !g->drag.on && drivequiet(g, g->frame, "after a drag", 2);
     case CHK_FILEFOCUS:
         return g->panes[PANE_FILES] && g->filesfocus;
     case CHK_PANEFOCUS: {
@@ -27057,7 +27062,7 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_COPYQUIET:
         // Copied back to Copy at its deadline: that frame and its settling,
         // the probe's, and the checklist's own at the mark and the check
-        return !g->copiedshown && drivequiet(g, "after Copied", 5);
+        return !g->copiedshown && drivequiet(g, g->frame, "after Copied", 5);
     case CHK_FRESHLAYOUT: {
         // Each message laid out at this width and size, laid out again
         // with no cache: the same runs where the same, so that none was
@@ -27156,7 +27161,7 @@ static b32 drivecheck(Gui *g, i32 chk)
         return g->search->cur==g->drivefound && hitshown(g) && findcountshown(g);
     case CHK_FINDQUIET:
         return g->findopen && !g->findactive && g->search->hits.len==2 &&
-               drivequiet(g, "with the find bar's matches shown", 3);
+               drivequiet(g, g->frame, "with the find bar's matches shown", 3);
     case CHK_FINDHIDDEN:
         return g->findopen && !g->search->hits.len;
     case CHK_FINDCLOSED:
@@ -27500,7 +27505,7 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_DOCKTREE:      return docktreecheck(g);
     case CHK_COMPACT:       return compactcheck(g);
     case CHK_FOCUSED:       return focuscheck(g);
-    case CHK_LAYOUTBACK:    return layoutbackcheck(g, g->ops[g->drivepc-1].text);
+    case CHK_LAYOUTBACK:    return layoutbackcheck(g, g->frame, g->ops[g->drivepc-1].text);
     case CHK_HELPTAB:       return tabselected("Help");
     case CHK_HELPLOOSE:     return helploose(g);
     case CHK_TRANSCRIPTTAB: return tabselected("Transcript");
@@ -28350,7 +28355,7 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_KEYLOST:
         // Frames since the mark: the probe's and the script's own
         return !ImGui::IsKeyDown(ImGuiKey_G) &&
-               drivequiet(g, "2 s after a key's release was lost", 2);
+               drivequiet(g, g->frame, "2 s after a key's release was lost", 2);
     case CHK_PLANMODE:
         return g->sess && v->plan==(b32)g->ops[g->drivepc-1].dx;
     case CHK_BYPASS: {
@@ -28398,7 +28403,7 @@ static b32 drivecheck(Gui *g, i32 chk)
                got==g->ops[g->drivepc-1].text;
     }
     case CHK_GITQUIET:
-        return g->changesshown && drivequiet(g, "idle with the changes shown", 2);
+        return g->changesshown && drivequiet(g, g->frame, "idle with the changes shown", 2);
     case CHK_TERMFOCUS:
         return g->termfocused && GImGui->ActiveId==g->termid;
     case CHK_TERMSCREEN: {
@@ -28546,7 +28551,7 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_TERMCOUNT:
         return (f32)drivetermcount(g) == g->ops[g->drivepc-1].dx;
     case CHK_RUNTO:
-        return driverunto(g, g->ops[g->drivepc-1].text, 1);
+        return driverunto(g, g->frame, g->ops[g->drivepc-1].text, 1);
     case CHK_TERMCWD: {
         TermTab *tt  = termfront(g);
         Str      cwd = tt ? Str{tt->cmds->cwd, tt->cmds->cwdlen} : Str{};
@@ -28627,7 +28632,7 @@ static b32 drivecheck(Gui *g, i32 chk)
         // A file opened before (an editor's) saves the layout up to 5 s
         // later: a save's frame, and a probe after
         return g->panes[PANE_TERMINAL] &&
-               drivequiet(g, "idle with the terminal shown",
+               drivequiet(g, g->frame, "idle with the terminal shown",
                           2 + 3*(g->saves - g->marksaves));
     case CHK_TERMFORCE: {
         DriveOp *op = &g->ops[g->drivepc-1];
@@ -28797,9 +28802,9 @@ static b32 drivecheck(Gui *g, i32 chk)
         return h && h->up && h->thin && h->offered && g->offer.len && !g->offerempty;
     }
     case CHK_CTR:
-        return ctrcheck(g, g->ops[g->drivepc-1].text);
+        return ctrcheck(g, g->frame, g->ops[g->drivepc-1].text);
     case CHK_THINSKILL:
-        return thinskill(g, g->ops[g->drivepc-1].text);
+        return thinskill(g, g->frame, g->ops[g->drivepc-1].text);
     case CHK_VIA:
         // The view names this computer, as the session bar shows it
         return g->sess && g->sess->host->kind==GH_REMOTE && g->machine.len &&
@@ -29737,7 +29742,7 @@ static void drivestep(Gui *g)
                 g->drivechecks++;
                 g->drivefails++;
             } else if (mark) {
-                clipownafter(g, "a copied image");
+                clipownafter(g, a, "a copied image");
             }
             break;
         }
@@ -29775,27 +29780,29 @@ static void drivestep(Gui *g)
     case OP_DRAG: {
         // Its items as GEV_DROP has them, each ending in a NUL, kept for
         // the events, which outlive this frame; or its words
-        Arena a = g->frame;
-        Buf   items(&g->perm, 4096);
-        b32   ok = 1;
+        Buf items(&g->perm, 4096);
+        b32 ok = 1;
         if (op->dy == 1) {
             print(&items, op->text);
             putbyte(&items, 0);
         }
-        for (Str rest = op->dy==1 ? Str{} : op->text; ok && rest.len;) {
-            Cut c    = cut(rest, ',');
-            rest     = c.tail;
-            b32 dir  = endswith(c.head, "/");
-            Str path = join(&a, g->drivecwd, dir ? cuttail(c.head, 1) : c.head);
-            i32 st   = os_stat(g->os, a, path).type;
-            if (dir && st!=STAT_DIR) {
-                ok = os_mkdirs(g->os, a, path);
-            } else if (!dir && st==STAT_MISSING) {
-                Str body = dropbody(&a, ".txt", 0, 0, 3);
-                ok = os_write(g->os, a, path, body);
+        {
+            Arena a = g->frame;  // done with before the inject
+            for (Str rest = op->dy==1 ? Str{} : op->text; ok && rest.len;) {
+                Cut c    = cut(rest, ',');
+                rest     = c.tail;
+                b32 dir  = endswith(c.head, "/");
+                Str path = join(&a, g->drivecwd, dir ? cuttail(c.head, 1) : c.head);
+                i32 st   = os_stat(g->os, a, path).type;
+                if (dir && st!=STAT_DIR) {
+                    ok = os_mkdirs(g->os, a, path);
+                } else if (!dir && st==STAT_MISSING) {
+                    Str body = dropbody(&a, ".txt", 0, 0, 3);
+                    ok = os_write(g->os, a, path, body);
+                }
+                print(&items, path);
+                putbyte(&items, 0);
             }
-            print(&items, path);
-            putbyte(&items, 0);
         }
         if (!ok) {
             guilog(g, "drive: FAIL could not make the files to drag");
@@ -29816,7 +29823,7 @@ static void drivestep(Gui *g)
         os_guiinject(g->os, &e);
         g->drivedragfx = e.x;
         // A fresh scratch: on Windows the inject reenters through the
-        // drop target's hook, whose own scratch went over a's
+        // drop target's hook, which puts the path in the frame itself
         Arena l = g->frame;
         Buf   b(&l, 128);
         print(&b, "drive: drag ");
@@ -30363,7 +30370,7 @@ static void drivestep(Gui *g)
         filesopen(g, g->sess, 0, p.path, ref.line0, ref.line1, ref.section);
     } break;
     case OP_A11Y:
-        driveax(g, op->text);
+        driveax(g, g->frame, op->text);
         break;
     case OP_PLACE:
         if (op->dx != 0) {
@@ -30432,6 +30439,7 @@ static b32 guiwanted(Str *args, i32 nargs)
 // prompt comes back after the window, or after its errors, read back
 // from the log; a window slower than DETACH_WAIT is left to it. Returns
 // the exit status.
+// arenalint: frame ok, as args are the command line's and here is in perm
 static i32 detachgui(Gui *g, Str *args, i32 nargs, Str here)
 {
     Os        *os   = g->os;
@@ -30692,6 +30700,7 @@ static Str guiusage =
 "  --quit-after S quit after S seconds\n"
 "  --shot FILE    at --quit-after, save the window as a PNG first (SDL only)\n";
 
+// arenalint: frame ok, as the strings are literals
 extern "C" void prospero_imassert(char const *expr, char const *file, int line)
 {
     ImGuiContext *ctx = ImGui::GetCurrentContext();
@@ -30848,6 +30857,7 @@ static b32 startsubprocess(Gui *g, Arena scratch)
     return 1;
 }
 
+// arenalint: frame ok, as args are the command line's
 static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
 {
     Gui *g = alloc<Gui>(&mem);
@@ -31341,7 +31351,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
         guilist(g);
         guiconfigget(g);
         if (g->opendir.len) {
-            opendirnew(g, g->opendir, "the launch asked");
+            opendirnew(g, g->frame, g->opendir, "the launch asked");
         }
     }
     if (!fake) {

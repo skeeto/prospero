@@ -2355,6 +2355,7 @@ static void os_wake(Os *os)
     }
 }
 
+// arenalint: frame ok, as title is a literal
 static b32 os_guiopen(Os *os, Gui *g, Str title)
 {
     Arena t = g->frame;
@@ -2406,8 +2407,7 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
     gui_systheme(g, w32gui_systheme(os->gui));  // the title bar before it shows
     w32gui_show(os->gui);
     if (g->drive) {
-        Arena a = g->frame;
-        Buf   b(&a, 64);
+        Buf b(&t, 64);
         print(&b, "drive: GUI thread ");
         print(&b, (i64)GetCurrentThreadId());
         guilog(g, finish(&b));

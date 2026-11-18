@@ -3409,9 +3409,9 @@ static b32 macreaches(void *el, void *win)
     return 0;
 }
 
-static void macdrive(Gui *g, Str cmd)
+static void macdrive(Gui *g, Arena scratch, Str cmd)
 {
-    Arena a    = g->frame;
+    Arena a    = scratch;
     void *pool = objc_autoreleasePoolPush();
     Cut   c    = cut(cmd, ' ');
     Str   verb = c.head;
