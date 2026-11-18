@@ -150,14 +150,19 @@ struct GmKern {
                 i32 mask, i32 hd, iz stride);
 };
 
-// The caches for one sequence: each sliding layer's ring of the newest
-// GM_RING positions, then the full layers' keys and values, a position
-// at a time (GM_POSFLOATS), committed as the sequence grows.
+// The caches for one sequence: its tokens, each sliding layer's ring of
+// the newest GM_RING positions, then the full layers' keys and values, a
+// position at a time (GM_POSFLOATS), committed as the sequence grows.
 struct GmKv {
     Region *region;
+    i32    *tokens;
     f32    *ring;
     f32    *full;
     i32     cap;   // positions the full caches can hold
+};
+
+enum : iz {
+    GM_RINGFLOATS = (iz)GM_SETS*(GM_EVERY-1)*2*GM_RING*GM_SLIDEHD,  // 25 MB
 };
 
 struct Gemma {
@@ -1230,14 +1235,16 @@ static i32 gmargmax(f32 *v, i32 n)
 // Caches for a sequence of up to cap positions, or a null region.
 static GmKv gmkvnew(Os *os, i32 cap)
 {
-    GmKv kv  = {};
-    iz   ring = (iz)GM_SETS*(GM_EVERY-1)*2*GM_RING*GM_SLIDEHD;
-    kv.region = os_reserve(os, (ring + (iz)cap*GM_POSFLOATS)*(iz)sizeof(f32) + (1<<16));
+    GmKv kv   = {};
+    iz   toks = ((iz)cap*4 + 63) & -64;
+    iz   head = toks + GM_RINGFLOATS*(iz)sizeof(f32);
+    kv.region = os_reserve(os, head + (iz)cap*GM_POSFLOATS*(iz)sizeof(f32) + (1<<16));
     if (kv.region) {
-        kv.ring = (f32 *)kv.region->base;
-        kv.full = kv.ring + ring;
-        kv.cap  = cap;
-        if (!os_commit(kv.region, ring*(iz)sizeof(f32))) {
+        kv.tokens = (i32 *)kv.region->base;
+        kv.ring   = (f32 *)(kv.region->base + toks);
+        kv.full   = kv.ring + GM_RINGFLOATS;
+        kv.cap    = cap;
+        if (!os_commit(kv.region, head)) {
             os_release(os, kv.region);
             kv = {};
         }
@@ -2122,20 +2129,15 @@ static GmLoaded gmload(GmPool *pool, Arena *perm, Arena scratch, Str file,
 //   prospero builtin-logits MODEL TEXT  (every position's, f32, on stdout)
 
 #if PROSPERO_DEVTOOLS
-static i32 gmmain(Os *os, Arena perm, Str *args, i32 nargs)
+// Load the model for a dev command, telling how on stderr, or null.
+static Gemma *gmdevload(Os *os, Arena *perm, Arena scratch, Str path, i32 ctx)
 {
-    Arena scratch = newarena(os_reserve(os, (iz)1<<30));
-    b32   bench   = args[1] == "builtin-bench";
-    if (nargs<3 || (!bench && nargs!=4) || !scratch.beg) {
-        os_print(os, 2, "usage: prospero builtin-bench MODEL [PREFILL [GENERATE]]\n"
-                        "       prospero builtin-logits MODEL TEXT\n");
-        return 1;
-    }
-    Arena model = newarena(os_reserve(os, (iz)4<<30));
-    Str   file  = os_guimap(os, scratch, args[2]);
-    if (!file.len || !model.beg) {
+    Arena *model = alloc<Arena>(perm);
+    *model = newarena(os_reserve(os, (iz)4<<30));
+    Str file = os_guimap(os, scratch, path);
+    if (!file.len || !model->beg) {
         os_print(os, 2, "prospero: could not map the model\n");
-        return 1;
+        return 0;
     }
 
     i32 threads = gmthreads(os_guicores(os, scratch));
@@ -2145,32 +2147,44 @@ static i32 gmmain(Os *os, Arena perm, Str *args, i32 nargs)
         threads = n.ok && n.val>0 ? (i32)n.val : threads;
     }
     i32 isa = gmisa(1);
-    i32 ctx = 32768;
     i64 t0  = os_ticks(os);
     os_guithreadfast(os);
-    GmPool  *pool = gmpool(os, &perm, threads, ctx>GM_WIDTH ? ctx : GM_WIDTH,
+    GmPool  *pool = gmpool(os, perm, threads, ctx>GM_WIDTH ? ctx : GM_WIDTH,
                            os_guithreadfast);
-    GmLoaded m    = gmload(pool, &model, scratch, file, ctx, isa);
+    GmLoaded m    = gmload(pool, model, scratch, file, ctx, isa);
+    Buf b(&scratch);
     if (!m.g) {
-        Buf b(&scratch);
         print(&b, "prospero: ");
         print(&b, m.err);
         print(&b, "\n");
         os_print(os, 2, finish(&b));
+        return 0;
+    }
+    print(&b, "loaded in ");
+    print(&b, (os_ticks(os) - t0)/1000);
+    print(&b, " ms, ");
+    print(&b, (i64)pool->n);
+    print(&b, isa==GM_AVX2 ? Str(" threads, AVX2\n") :
+              isa==GM_NEONDOT ? Str(" threads, NEON dot\n") : Str(" threads, scalar\n"));
+    os_print(os, 2, finish(&b));
+    return m.g;
+}
+
+static i32 gmmain(Os *os, Arena perm, Str *args, i32 nargs)
+{
+    Arena scratch = newarena(os_reserve(os, (iz)1<<30));
+    b32   bench   = args[1] == "builtin-bench";
+    if (nargs<3 || (!bench && nargs!=4) || !scratch.beg) {
+        os_print(os, 2, "usage: prospero builtin-bench MODEL [PREFILL [GENERATE]]\n"
+                        "       prospero builtin-logits MODEL TEXT\n");
         return 1;
     }
-    Gemma *g  = m.g;
-    GmKv   kv = gmkvnew(os, ctx);
-    {
-        Buf b(&scratch);
-        print(&b, "loaded in ");
-        print(&b, (os_ticks(os) - t0)/1000);
-        print(&b, " ms, ");
-        print(&b, (i64)pool->n);
-        print(&b, isa==GM_AVX2 ? Str(" threads, AVX2\n") :
-                  isa==GM_NEONDOT ? Str(" threads, NEON dot\n") : Str(" threads, scalar\n"));
-        os_print(os, 2, finish(&b));
+    i32    ctx = 32768;
+    Gemma *g   = gmdevload(os, &perm, scratch, args[2], ctx);
+    if (!g) {
+        return 1;
     }
+    GmKv kv = gmkvnew(os, ctx);
 
     if (!bench) {
         Slice<i32> enc = gmencode(&g->tok, &perm, scratch, args[3], 0);
