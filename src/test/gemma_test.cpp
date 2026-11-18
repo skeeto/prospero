@@ -222,7 +222,6 @@ static void test_gemmakernels(Test *t)
         print(&b, (i64)trial);
         expect(t, finish(&b), istr(&a, gmtclose(s1, s2, n, 1e-5f)), "1");
 
-        gmsoftmax(s1, n);
         f32 *m1 = alloc<f32>(&a, HD);
         f32 *m2 = alloc<f32>(&a, HD);
         ref.mix(m1, s1, keys + HD, first, n, mask, HD, stride);
@@ -232,10 +231,96 @@ static void test_gemmakernels(Test *t)
         print(&b, (i64)trial);
         expect(t, finish(&b), istr(&a, gmtclose(m1, m2, HD, 1e-5f)), "1");
     }
+}
 
-    f32 p[] = {1, 2, 3, 10};
-    gmsoftmax(p, countof(p));
-    expect(t, "gemma.softmax", istr(&a, p[3]>0.998f && p[3]<0.999f && p[0]>0 && p[2]>p[1]), "1");
+// Tiled attention, a tile at a time and in pieces, against plain
+// attention in doubles: a full layer across key blocks, and a sliding
+// one at its window's edge, wrapping around its ring.
+static void test_gemmaattend(Test *t)
+{
+    Arena a   = t->perm;
+    u64   rng = 7;
+    Gemma *g  = alloc<Gemma>(&a);
+    g->k      = gmkern(gmisa(1));
+    GmWork w  = {};
+    w.n       = 1;
+    w.scratch = alloc<f32>(&a, GM_SCRATCH);
+
+    for (i32 trial = 0; trial < 2; trial++) {
+        b32 full   = !trial;
+        i32 hd     = full ? GM_FULLHD : GM_SLIDEHD;
+        i32 qw     = GM_HEADS*hd;
+        i32 n      = full ? 9 : 7;
+        i32 pos    = full ? 70 : GM_RING - 3;
+        i32 mask   = full ? -1 : GM_RING-1;
+        iz  stride = full ? 2*hd : hd;
+        iz  cache  = full ? (iz)(pos+n)*stride : 2*(iz)GM_RING*hd;
+        f32 *keys  = alloc<f32>(&a, cache);
+        f32 *vals  = keys + (full ? hd : (iz)GM_RING*hd);
+        for (iz i = 0; i < cache; i++) {
+            keys[i] = gmtunit(&rng) * 2;
+        }
+        g->aux    = alloc<f32>(&a, (iz)n*qw);
+        g->hidden = alloc<f32>(&a, (iz)n*qw);
+        for (iz i = 0; i < (iz)n*qw; i++) {
+            g->aux[i] = gmtunit(&rng);
+        }
+        GmLayer l = {};
+        l.hd   = hd;
+        l.full = full;
+        GmFwd f = {};
+        f.g    = g;
+        f.pos  = pos;
+        f.ntok = n;
+
+        // Tiles of 4 tokens and all heads (the last one partial), then
+        // the first token again a head at a time
+        for (i32 t0 = 0; t0 < n; t0 += GM_TILE) {
+            i32 t1 = t0+GM_TILE<n ? t0+GM_TILE : n;
+            gmattendtile(&w, &f, &l, keys, vals, mask, stride, t0, t1, 0, GM_HEADS);
+        }
+        f32 *whole = alloc<f32>(&a, qw);
+        copybytes(whole, g->hidden, qw*(iz)sizeof(f32));
+        for (i32 h = 0; h < GM_HEADS; h++) {
+            gmattendtile(&w, &f, &l, keys, vals, mask, stride, 0, 1, h, h+1);
+        }
+        b32 same = gmtclose(whole, g->hidden, qw, 1e-6f);
+
+        f64 *sc  = alloc<f64>(&a, pos+n);
+        f32 *ref = alloc<f32>(&a, (iz)n*qw);
+        for (i32 tk = 0; tk < n; tk++) {
+            i32 p     = pos + tk;
+            i32 first = !full && p+1>GM_WINDOW ? p+1-GM_WINDOW : 0;
+            for (i32 h = 0; h < GM_HEADS; h++) {
+                f32 *q   = g->aux + (iz)tk*qw + h*hd;
+                f64  top = -1e300, sum = 0;
+                for (i32 i = first; i <= p; i++) {
+                    f32 *key = keys + (iz)(i & mask)*stride;
+                    f64  dot = 0;
+                    for (i32 j = 0; j < hd; j++) {
+                        dot += (f64)q[j] * key[j];
+                    }
+                    sc[i] = dot;
+                    top   = dot>top ? dot : top;
+                }
+                for (i32 i = first; i <= p; i++) {
+                    sc[i] = __builtin_exp(sc[i] - top);
+                    sum  += sc[i];
+                }
+                for (i32 j = 0; j < hd; j++) {
+                    f64 v = 0;
+                    for (i32 i = first; i <= p; i++) {
+                        v += sc[i] * vals[(iz)(i & mask)*stride + j];
+                    }
+                    ref[(iz)tk*qw + h*hd + j] = (f32)(v / sum);
+                }
+            }
+        }
+        Buf b(&a, 32);
+        print(&b, "gemma.attend.");
+        print(&b, full ? Str("full") : Str("sliding"));
+        expect(t, finish(&b), istr(&a, same && gmtclose(ref, g->hidden, (iz)n*qw, 1e-5f)), "1");
+    }
 }
 
 // GGUF strings, as a tokenizer's arrays hold them

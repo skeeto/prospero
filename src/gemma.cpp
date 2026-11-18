@@ -55,6 +55,12 @@ enum {
     GM_BOS      = 2,
     GM_EOS      = 1,
     GM_ENDTURN  = 106,
+    GM_TILE     = 4,        // attention's tokens per job, at most
+    GM_QTILE    = GM_TILE*GM_HEADS,  // and so its queries
+    GM_BLOCK    = 16,       // keys at a time
+    // A worker's scratch floats: a row of the model, or attention's
+    GM_SCRATCH  = GM_WIDTH > GM_BLOCK+GM_FULLHD+2*GM_QTILE
+                ? GM_WIDTH : GM_BLOCK+GM_FULLHD+2*GM_QTILE,
 };
 
 enum {
@@ -1029,22 +1035,6 @@ static void gmplembed(GmWork *w, Gemma *g, f32 *out, i32 *tokens, i32 ntok, f32 
     gmbarrier(w);
 }
 
-static void gmsoftmax(f32 *v, i32 n)
-{
-    f32 max = v[0], sum = 1;
-    for (i32 i = 1; i < n; i++) {
-        if (v[i] > max) {
-            sum = sum*__builtin_expf(max - v[i]) + 1;  // rescale as it grows
-            max = v[i];
-        } else {
-            sum += __builtin_expf(v[i] - max);
-        }
-    }
-    for (i32 i = 0; i < n; i++) {
-        v[i] = __builtin_expf(v[i] - max) / sum;
-    }
-}
-
 
 // The forward pass
 
@@ -1065,6 +1055,87 @@ static f32 *gmkeys(GmKv *kv, i32 owner, b32 full)
     }
     iz set = owner/GM_EVERY*(GM_EVERY-1) + owner%GM_EVERY;
     return kv->ring + set*2*GM_RING*GM_SLIDEHD;
+}
+
+// Causal attention for tokens t0 to t1 and heads h0 to h1, a block of
+// keys at a time for all of them, so that each block is read from memory
+// once per tile rather than once per query. The softmax goes online: each
+// query keeps its running maximum and sum, and rescales its output.
+static void gmattendtile(GmWork *w, GmFwd *f, GmLayer *l, f32 *keys,
+                         f32 *vals, i32 mask, iz stride, i32 t0, i32 t1,
+                         i32 h0, i32 h1)
+{
+    Gemma *g   = f->g;
+    i32    hd  = l->hd;
+    i32    qw  = GM_HEADS*hd;
+    i32    nq  = (t1 - t0)*(h1 - h0);
+    f32   *p   = w->scratch;
+    f32   *tmp = p + GM_BLOCK;
+    f32   *max = tmp + GM_FULLHD;
+    f32   *sum = max + GM_QTILE;
+    assert(nq <= GM_QTILE);
+
+    for (i32 i = 0; i < nq; i++) {
+        max[i] = -1e30f;
+        sum[i] = 0;
+    }
+    for (i32 t = t0; t < t1; t++) {
+        for (i32 h = h0; h < h1; h++) {
+            f32 *out = g->hidden + (iz)t*qw + h*hd;
+            for (i32 j = 0; j < hd; j++) {
+                out[j] = 0;
+            }
+        }
+    }
+
+    i32 last  = f->pos + t1;  // past the last query's own position
+    i32 first = l->full || f->pos+t0+1<=GM_WINDOW ? 0 : f->pos+t0+1-GM_WINDOW;
+    for (i32 b0 = first; b0 < last; b0 += GM_BLOCK) {
+        i32 b1 = b0+GM_BLOCK<last ? b0+GM_BLOCK : last;
+        i32 qi = 0;
+        for (i32 t = t0; t < t1; t++) {
+            i32 pp  = f->pos + t;
+            i32 beg = !l->full && pp+1>GM_WINDOW ? pp+1-GM_WINDOW : 0;
+            beg     = beg>b0 ? beg : b0;
+            i32 end = pp+1<b1 ? pp+1 : b1;
+            for (i32 h = h0; h < h1; h++, qi++) {
+                if (beg >= end) {
+                    continue;
+                }
+                i32  count = end - beg;
+                f32 *q     = g->aux + (iz)t*qw + h*hd;
+                f32 *out   = g->hidden + (iz)t*qw + h*hd;
+                g->k.scores(p, q, keys, beg, count, mask, hd, stride);
+                f32 top = max[qi];
+                for (i32 i = 0; i < count; i++) {
+                    top = p[i]>top ? p[i] : top;
+                }
+                f32 scale = __builtin_expf(max[qi] - top);
+                f32 add   = 0;
+                for (i32 i = 0; i < count; i++) {
+                    p[i] = __builtin_expf(p[i] - top);
+                    add += p[i];
+                }
+                max[qi] = top;
+                sum[qi] = sum[qi]*scale + add;
+                g->k.mix(tmp, p, vals, beg, count, mask, hd, stride);
+                for (i32 j = 0; j < hd; j++) {
+                    out[j] = out[j]*scale + tmp[j];
+                }
+            }
+        }
+    }
+
+    i32 qi = 0;
+    for (i32 t = t0; t < t1; t++) {
+        for (i32 h = h0; h < h1; h++, qi++) {
+            f32 *out = g->hidden + (iz)t*qw + h*hd;
+            f32  inv = 1 / sum[qi];
+            for (i32 j = 0; j < hd; j++) {
+                out[j] *= inv;
+            }
+        }
+    }
 }
 
 // Queries, this layer's keys and values if it has its own, and causal
@@ -1101,21 +1172,22 @@ static void gmattend(GmWork *w, GmFwd *f, i32 layer)
         gmrope(w, g, l->full, k, 1, hd, f->pos, n, stride);
     }
 
+    // Jobs are tiles of tokens by heads, the latest tokens (with the most
+    // keys) first. Small batches go a query at a time, for parallelism.
+    i32 tt    = n / (2*w->n);
+    tt        = tt<1 ? 1 : tt>GM_TILE ? GM_TILE : tt;
+    i32 hh    = tt>1 ? GM_HEADS : 1;
+    i32 tiles = (n + tt - 1) / tt;
+    i32 per   = GM_HEADS / hh;
     for (;;) {
         i32 job = __atomic_fetch_add(&f->ticket, 1, __ATOMIC_RELAXED);
-        if (job >= GM_HEADS*n) {
+        if (job >= tiles*per) {
             break;
         }
-        i32 head  = job / n;
-        i32 t     = job % n;
-        i32 p     = f->pos + t;
-        i32 first = !l->full && p+1>GM_WINDOW ? p+1-GM_WINDOW : 0;
-        i32 count = p + 1 - first;
-        f32 *q    = g->aux + (iz)t*qw + head*hd;
-        f32 *out  = g->hidden + (iz)t*qw + head*hd;
-        g->k.scores(w->scratch, q, keys, first, count, mask, hd, stride);
-        gmsoftmax(w->scratch, count);
-        g->k.mix(out, w->scratch, vals, first, count, mask, hd, stride);
+        i32 t0 = (tiles - 1 - job/per) * tt;
+        i32 t1 = t0+tt<n ? t0+tt : n;
+        i32 h0 = job%per * hh;
+        gmattendtile(w, f, l, keys, vals, mask, stride, t0, t1, h0, h0+hh);
     }
     gmbarrier(w);
 
@@ -2154,7 +2226,7 @@ static Gemma *gmdevload(Os *os, Arena *perm, Arena scratch, Str path, i32 ctx)
     i32 isa = gmisa(os_guiarmdot(os));
     i64 t0  = os_ticks(os);
     os_guithreadfast(os);
-    GmPool  *pool = gmpool(os, perm, threads, ctx>GM_WIDTH ? ctx : GM_WIDTH,
+    GmPool  *pool = gmpool(os, perm, threads, GM_SCRATCH,
                            os_guithreadfast);
     GmLoaded m    = gmload(pool, model, scratch, file, ctx, isa);
     Buf b(&scratch);
@@ -2217,8 +2289,9 @@ static i32 gmmain(Os *os, Arena perm, Str *args, i32 nargs)
     }
     if (nargs > 4) {
         Int n = parseint(args[4]);
-        tg = n.ok && n.val>=0 && n.val<ctx ? (i32)n.val : tg;
+        tg = n.ok && n.val>=0 ? (i32)(n.val<ctx ? n.val : ctx) : tg;
     }
+    tg = tg<ctx-pp ? tg : ctx-pp;
     Buf b(&scratch);
     if (pp) {
         i32 *tokens = alloc<i32>(&scratch, pp);
@@ -2243,7 +2316,7 @@ static i32 gmmain(Os *os, Arena perm, Str *args, i32 nargs)
         i32 token = GM_BOS;
         i64 start = os_ticks(os);
         for (i32 pos = 0; pos < tg; pos++) {
-            gmforward(g, &kv, &token, 1, pos);
+            gmforward(g, &kv, &token, 1, pp+pos);  // after the prefill
             token = gmargmax(gmlogits(g, 0), GM_VOCAB);
         }
         f64 secs = (f64)(os_ticks(os) - start) / 1e6;

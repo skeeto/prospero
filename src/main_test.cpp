@@ -904,6 +904,7 @@ int main()
     test_a11ydoc(&t);
     test_gemmanumbers(&t);
     test_gemmakernels(&t);
+    test_gemmaattend(&t);
     test_gemmatokens(&t);
     test_gemmagguf(&t);
     test_gemmarender(&t);
