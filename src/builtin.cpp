@@ -416,7 +416,7 @@ static void blthread(void *arg)
 
 // The UI thread's
 
-static Builtin *blget(Gui *g)
+static Builtin *blget(Gui *g, Arena t)
 {
     if (g->bl) {
         return g->bl;
@@ -428,7 +428,6 @@ static Builtin *blget(Gui *g)
     if (!b->out || !os_eventinit(&b->ready) || !os_eventinit(&b->nap)) {
         return 0;
     }
-    Arena t   = g->frame;
     Str   env = os_getenv(g->os, &t, "PROSPERO_BUILTIN_MODEL");
     b->path   = env.len ? clone(&g->perm, env) :
                 concat(&g->perm, concat(&t, g->statedir, "/models/"), blfile);
@@ -471,7 +470,7 @@ static void bloffer(Gui *g, b32 force)
     putend(&w);
     Str offer = finish(&o);
 
-    Builtin *b = any || (g->bl && g->bl->offering) ? blget(g) : 0;
+    Builtin *b = any || (g->bl && g->bl->offering) ? blget(g, a) : 0;
     if (!b || (!force && b->offered.data && b->offered==offer)) {
         return;
     }
@@ -581,7 +580,7 @@ static b32 blrelayin(Gui *g, Arena a, Json *j)
     }
 
     if (!c) {
-        b = blget(g);
+        b = blget(g, a);
         for (i32 i = 0; b && !c && i < BL_CALLS; i++) {
             c = b->calls[i].state ? 0 : b->calls+i;
         }
@@ -1067,14 +1066,13 @@ static Str blpart(Arena *a, Builtin *b)
 
 // Whether the file, or a part of it, is there, looked at again at most
 // every 2 s.
-static void blstat(Gui *g, Builtin *b)
+static void blstat(Gui *g, Builtin *b, Arena a)
 {
     i64 now = os_ticks(g->os);
     if (b->statat && now-b->statat<2000000) {
         return;
     }
     b->statat = now;
-    Arena a   = g->frame;
     Str   part = blpart(&a, b);
     Stat  f    = os_stat(g->os, a, b->path);
     Stat  p    = os_stat(g->os, a, part);
@@ -1094,13 +1092,12 @@ static i64 bltestsize(Gui *g, Arena a)
     return n.ok && n.val>0 ? n.val : BL_SIZE;
 }
 
-static void bldownload(Gui *g)
+static void bldownload(Gui *g, Arena a)
 {
-    Builtin *b = blget(g);
+    Builtin *b = blget(g, a);
     if (!b || blfetchstate(b)==BL_FETCHING) {
         return;
     }
-    Arena   a = g->frame;
     BlDown *d = b->down;
     if (!d) {
         d = alloc<BlDown>(&g->perm);
@@ -1128,7 +1125,7 @@ static void bldownload(Gui *g)
     if (!why.len && dir.len && !os_mkdirs(g->os, a, dir)) {
         why = concat(&a, "could not make ", dir);
     }
-    blstat(g, b);
+    blstat(g, b, a);
     i64 free = why.len ? 0 : os_guidiskfree(g->os, a, dir.len ? dir : Str("."));
     if (!why.len && free>=0 && free<d->size-b->partlen+BL_SLACK) {
         Buf m(&a, 128);
@@ -1219,7 +1216,7 @@ static void blsize(Buf *b, i64 n)
 // the first-run card (card), else on a builtin endpoint's page.
 static void bldrawfetch(Gui *g, Arena a, b32 card)
 {
-    Builtin *b = blget(g);
+    Builtin *b = blget(g, a);
     if (!b) {
         return;
     }
@@ -1234,7 +1231,7 @@ static void bldrawfetch(Gui *g, Arena a, b32 card)
     }
     i32 st = blfetchstate(b);
     if (st != BL_FETCHING) {
-        blstat(g, b);
+        blstat(g, b, a);
     }
     i64 size = b->down ? b->down->size : bltestsize(g, a);
     if (st == BL_FETCHING) {
@@ -1300,7 +1297,7 @@ static void bldrawfetch(Gui *g, Arena a, b32 card)
     }
     putbyte(&m, 0);
     if (ImGui::Button((char const *)finish(&m).data)) {
-        bldownload(g);
+        bldownload(g, a);
     }
     itemnamed(g, "builtin download");
     itemtip("Download the built-in model from Hugging Face into Prospero's "
