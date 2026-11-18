@@ -1185,10 +1185,11 @@ static void bluse(Gui *g)
     if (blendpoint(g).len) {
         return;
     }
-    Str name = "gemma";
+    // Its models then read as builtin/gemma-4-e2b
+    Str name = "builtin";
     for (iz i = 0; i < g->cfgrows.len; i++) {
         CfgRow *r = &g->cfgrows[i];
-        name = r->kind=="endpoint" && r->name==name ? Str("gemma-builtin") : name;
+        name = r->kind=="endpoint" && r->name==name ? Str("builtin-gemma") : name;
     }
     guiconfigset(g, "endpoint", name, "kind", "builtin");
 }

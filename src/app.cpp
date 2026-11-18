@@ -19157,6 +19157,13 @@ static DriveOp e2eops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 800, ""},
     {OP_WAIT, W_CONFIG, 0, 0, 5000, ""},
+    // Settings opens on Defaults: the endpoint's page, as the settings
+    // mode goes to it
+    {OP_SHOWPAGE, 0, 0, 0, 300, "endpoint local"},
+    {OP_MOVE, T_PAGEITEM, 0, 0, 100, "endpoint local"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PAGE, 0, 0, 0, "endpoint local"},
     {OP_REVEAL, RECT_SETTING, 0, 0, 500, ""},
     {OP_MOVE, T_SETTING, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -21597,7 +21604,7 @@ static DriveOp builtinops[] = {
     {OP_MOVE, T_NAMED, 0, 0, 100, "builtin download"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
-    {OP_WAIT, W_CFGVAL, 0, 0, 60000, "endpoint gemma kind=builtin"},
+    {OP_WAIT, W_CFGVAL, 0, 0, 60000, "endpoint builtin kind=builtin"},
     {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
     {OP_MARK, 0, 0, 0, 500, ""},
     {OP_SHOT, 0, 0, 0, 300, "builtin-4-ready"},

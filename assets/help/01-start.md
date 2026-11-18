@@ -33,7 +33,7 @@ up a model... button opens the Add endpoint dialog: step 2 below.
 It also offers the built-in model, Gemma 4 E2B by Google, for trying
 Prospero without a server or an account: Download fetches its file
 (3.3 GB) into Prospero's state directory, checks it, and adds an
-endpoint for it, `gemma`. Prospero's window runs it on this computer,
+endpoint for it, `builtin`. Prospero's window runs it on this computer,
 so it is free and private, but slow, and far less capable than a
 service's models. Cancel keeps what came, to resume. See
 [The built-in model](help:config#the-built-in-model).

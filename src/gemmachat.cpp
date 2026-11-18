@@ -547,6 +547,8 @@ static b32 gmliteral(Arena scratch, Str lit)
     return lit.len && d.ok && d.root->type==JSON_NUMBER;
 }
 
+static i32 gmunfinished(Str);
+
 // One value of the call syntax at *s, as JSON into out, advancing *s.
 static b32 gmcallvalue(Str *s, Buf *out, i32 depth)
 {
@@ -658,6 +660,106 @@ static GmCall gmparsecall(Arena *a, Str text)
     return r;
 }
 
+// As gmcallvalue, for a call still being written: what is settled of
+// its JSON so far, a prefix of what the whole makes, into out. Returns 1
+// if the value ended, 0 if more may change it (nothing past that goes).
+// An open string goes as far as its last whole character; a key or a
+// bare value only once it ends.
+static b32 gmcallprefix(Str *s, Buf *out, i32 depth)
+{
+    Str c = gmws(*s);
+    if (startswith(c, gmquote)) {
+        Str rest = cuthead(c, gmquote.len);
+        iz  end  = find(rest, gmquote);
+        if (end < 0) {
+            // Held back: a delimiter's start, and a character's
+            iz keep = 0;
+            for (iz k = gmquote.len-1; k>0 && !keep; k--) {
+                keep = endswith(rest, takehead(gmquote, k)) ? k : 0;
+            }
+            Str body = takehead(rest, rest.len-keep);
+            body = takehead(body, body.len-gmunfinished(body));
+            printjsonstr(out, body);
+            out->len--;  // still open: its quote yet to come
+            return 0;
+        }
+        printjsonstr(out, takehead(rest, end));
+        *s = cuthead(rest, end+gmquote.len);
+        return 1;
+    }
+    if (c.len && (c[0]=='{' || c[0]=='[')) {
+        b32 object = c[0] == '{';
+        u8  close  = object ? '}' : ']';
+        if (depth >= JSON_MAXDEPTH) {
+            return 0;
+        }
+        putbyte(out, c[0]);
+        c = gmws(cuthead(c, 1));
+        for (b32 first = 1;; first = 0) {
+            if (!c.len) {
+                return 0;
+            } else if (c[0] == close) {
+                putbyte(out, close);
+                *s = cuthead(c, 1);
+                return 1;
+            } else if (!first) {
+                if (c[0] != ',') {
+                    return 0;
+                }
+                c = gmws(cuthead(c, 1));
+                putbyte(out, ',');
+            }
+            if (object) {
+                Str key = {};
+                if (startswith(c, gmquote)) {
+                    Str rest = cuthead(c, gmquote.len);
+                    iz  end  = find(rest, gmquote);
+                    if (end < 0) {
+                        return 0;
+                    }
+                    key = takehead(rest, end);
+                    c   = cuthead(rest, end+gmquote.len);
+                } else {
+                    iz colon = find(c, ":");
+                    if (colon < 0) {
+                        return 0;
+                    }
+                    key = takehead(c, colon);
+                    for (; key.len && gmspace(key[key.len-1]); key.len--) {}
+                    c = cuthead(c, colon);
+                }
+                c = gmws(c);
+                if (!c.len || c[0]!=':') {
+                    return 0;
+                }
+                c = cuthead(c, 1);
+                printjsonstr(out, key);
+                putbyte(out, ':');
+            }
+            if (!gmcallprefix(&c, out, depth+1)) {
+                return 0;
+            }
+            c = gmws(c);
+        }
+    }
+    // A bare value: once it ends, kept if a JSON literal, else a string
+    iz end = 0;
+    for (; end<c.len && c[end]!=',' && c[end]!='}' && c[end]!=']'; end++) {}
+    if (end == c.len) {
+        return 0;
+    }
+    Str lit = takehead(c, end);
+    for (; lit.len && gmspace(lit[lit.len-1]); lit.len--) {}
+    Arena t = *out->a;
+    if (gmliteral(t, lit)) {
+        print(out, lit);
+    } else {
+        printjsonstr(out, lit);
+    }
+    *s = cuthead(c, end);
+    return 1;
+}
+
 
 // The response, as Chat Completions SSE
 
@@ -680,7 +782,9 @@ struct GmStream {
     i32        thought;  // in a thought channel
     i32        label;    // reading its label, "thought\n"
     i32        call;     // in a tool call
-    i32        calls;    // tool calls sent
+    i32        calls;    // tool calls sent, or begun
+    i32        callsent; // this call's name went: its arguments stream
+    iz         argsent;  // bytes of its arguments sent
 };
 
 static GmStream gmstream(Arena *perm, GmTok *tok, GmIds ids, Json *req, Os *os,
@@ -786,11 +890,12 @@ static void gmdelta(GmStream *s, Arena scratch, i32 field, Str text)
     s->pendfield = field;
 }
 
-static void gmcallchunk(GmStream *s, Arena scratch, Str name, Str args)
+// A tool call's chunk: its first, with its id and name, or more of its
+// arguments, as llama.cpp streams them.
+static void gmcallchunk(GmStream *s, Arena scratch, i32 i, Str name, Str args)
 {
     Buf     b(&scratch, 256 + name.len + 2*args.len);
     JsonOut w = gmchunkopen(&b);
-    i32     i = s->calls++;
     putkey(&w, "choices");
     putarray(&w);
     putobject(&w);
@@ -801,17 +906,19 @@ static void gmcallchunk(GmStream *s, Arena scratch, Str name, Str args)
     putarray(&w);
     putobject(&w);
     putintkey(&w, "index", i);
-    {
+    if (name.len) {
         Buf id(&scratch, s->callid.len + 16);
         print(&id, s->callid);
         putbyte(&id, '_');
         print(&id, (i64)i);
         putstrkey(&w, "id", finish(&id));
+        putstrkey(&w, "type", "function");
     }
-    putstrkey(&w, "type", "function");
     putkey(&w, "function");
     putobject(&w);
-    putstrkey(&w, "name", name);
+    if (name.len) {
+        putstrkey(&w, "name", name);
+    }
     putstrkey(&w, "arguments", args);
     putend(&w);
     putend(&w);
@@ -824,6 +931,35 @@ static void gmcallchunk(GmStream *s, Arena scratch, Str name, Str args)
     putend(&w);
     print(&b, "\n\n");
     gmsend(s, finish(&b));
+}
+
+// A call being written: its name once its header ends, then what is
+// settled of its arguments, so a frontend sees it grow.
+static void gmcallgrow(GmStream *s, Arena scratch)
+{
+    Str held = gmws(Str(s->held, s->nheld));
+    if (!startswith(held, "call:")) {
+        return;
+    }
+    held = cuthead(held, 5);
+    iz brace = find(held, "{");
+    if (brace<=0 || brace>128) {
+        return;
+    }
+    if (!s->callsent) {
+        gmflushtext(s, scratch);
+        s->callsent = 1;
+        s->argsent  = 0;
+        gmcallchunk(s, scratch, s->calls++, takehead(held, brace), "");
+    }
+    Str c = cuthead(held, brace);
+    Buf b(&scratch, 2*c.len + 16);
+    gmcallprefix(&c, &b, 0);
+    if (b.len > s->argsent) {
+        Str more = cuthead(finish(&b), s->argsent);
+        s->argsent += more.len;
+        gmcallchunk(s, scratch, s->calls-1, {}, more);
+    }
 }
 
 static void gmhold(GmStream *s, Str text)
@@ -850,17 +986,25 @@ static b32 gmstreamtoken(GmStream *s, Arena scratch, i32 token)
         s->thought = s->label = 0;
         return 0;
     } else if (token == d->call) {
-        s->thought = s->label = 0;
-        s->call    = 1;
-        s->nheld   = 0;
+        s->thought  = s->label = 0;
+        s->call     = 1;
+        s->callsent = 0;
+        s->nheld    = 0;
         return 0;
     } else if (token == d->callend) {
         s->call = 0;
         Str    held = Str(s->held, s->nheld);
         GmCall c    = gmparsecall(&scratch, held);
-        if (c.ok) {
+        if (s->callsent) {
+            // The rest of its arguments: what streamed is their prefix,
+            // unless they were malformed, which the harness then says
+            if (c.ok && c.args.len>s->argsent) {
+                gmcallchunk(s, scratch, s->calls-1, {}, cuthead(c.args, s->argsent));
+            }
+            s->callsent = 0;
+        } else if (c.ok) {
             gmflushtext(s, scratch);
-            gmcallchunk(s, scratch, c.name, c.args);
+            gmcallchunk(s, scratch, s->calls++, c.name, c.args);
         } else {
             // Not a call after all: it goes on as text
             gmdelta(s, scratch, GM_CONTENT, "<|tool_call>");
@@ -874,6 +1018,7 @@ static b32 gmstreamtoken(GmStream *s, Arena scratch, i32 token)
     Str text = token==d->quote ? gmquote : s->tok->text[token];
     if (s->call) {
         gmhold(s, text);
+        gmcallgrow(s, scratch);
     } else if (s->label) {
         gmhold(s, text);
         Str h  = Str(s->held, s->nheld);
@@ -961,6 +1106,11 @@ static void gmkeepalive(GmStream *s)
     if (s->os && os_ticks(s->os)-s->lastsent>=GM_PINGUS) {
         gmsend(s, ": keepalive\n\n");
     }
+}
+
+static void gmkeepalivefn(void *s)
+{
+    gmkeepalive((GmStream *)s);
 }
 
 static void gmfinish(GmStream *s, Arena scratch, Str why, i32 prompt,
@@ -1488,7 +1638,9 @@ static GmTurn gmturn(GmChat *c, Arena *perm, Arena scratch, Json *req, iz bodyle
     i64 maxnew = jsonint(mt, GM_MAXNEW);
     r.maxnew   = (i32)(maxnew>0 && maxnew<ctx ? maxnew : (i64)GM_MAXNEW);
 
-    r.sp.temp = gmnum(jsonget(req, "temperature"), 0);
+    // Gemma's own defaults (its generation_config), as llama.cpp reads
+    // them from a GGUF: greedy decoding falls into repeated calls
+    r.sp.temp = gmnum(jsonget(req, "temperature"), 1);
     r.sp.topp = gmnum(jsonget(req, "top_p"), 0.95f);
     r.sp.minp = gmnum(jsonget(req, "min_p"), 0);
     i64 topk  = jsonint(jsonget(req, "top_k"), 0);
@@ -1550,7 +1702,14 @@ static GmStats gmgenerate(GmChat *c, Arena scratch, GmTurn *t, Str sid, Json *re
         chunk = chunk<n-done ? chunk : n-done;
         chunk = t->sysend>done && t->sysend<done+chunk ? t->sysend-done : chunk;
         copybytes(q->kv.tokens+done, tok+done, (iz)chunk*4);
-        if (!gmgrowseq(q, done+chunk) || !gmforward(g, &q->kv, tok+done, chunk, done)) {
+        // A batch deep in a long context takes seconds: comments between
+        // its layers keep the watchdog, and the window's clock, waiting
+        g->tick    = gmkeepalivefn;
+        g->tickctx = &s;
+        b32 ok = gmgrowseq(q, done+chunk) && gmforward(g, &q->kv, tok+done, chunk, done);
+        g->tick    = 0;
+        g->tickctx = 0;
+        if (!ok) {
             gmstreamerror(&s, scratch, "out of memory for the built-in model's cache");
             return st;
         }
@@ -1599,7 +1758,9 @@ static GmStats gmgenerate(GmChat *c, Arena scratch, GmTurn *t, Str sid, Json *re
     if (gmcancelled(out)) {
         return st;
     }
-    if (s.calls) {
+    if (s.call && s.callsent) {
+        // Cut off in a call that began streaming: it stays "length"
+    } else if (s.calls) {
         why = "tool_calls";
     } else if (s.call) {
         gmdelta(&s, scratch, GM_CONTENT, Str(s.held, s.nheld));  // cut off

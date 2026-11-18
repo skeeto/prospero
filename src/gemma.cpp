@@ -181,6 +181,8 @@ struct Gemma {
     GmPool *pool;
     i32     isa;
     i32     ctx;        // positions the rope tables cover
+    void  (*tick)(void *);  // after each layer, on worker 0, if set
+    void   *tickctx;
 
     // A pass's buffers
     f32    *residual;   // GM_BATCH x GM_WIDTH
@@ -1165,6 +1167,9 @@ static void gmforwardpass(void *arg, GmWork *w)
         gmmatmul(w, g, &l->plproj, g->hidden, GM_WIDTH, n);
         gmrmsnorm(w, g->hidden, g->hidden, l->postpl, GM_WIDTH, 1e-6f, n, GM_WIDTH);
         gmaddscale(w, g->residual, g->hidden, (iz)n*GM_WIDTH, l->scalar);
+        if (!w->id && g->tick) {
+            g->tick(g->tickctx);  // the others go on to the next barrier
+        }
     }
 }
 
