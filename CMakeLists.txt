@@ -473,9 +473,14 @@ if(NOT CMAKE_CROSSCOMPILING OR PROSPERO_CROSS_TESTS)
   target_link_libraries(prospero_test PRIVATE prospero_core_flags wuffs ariel)
   target_compile_definitions(prospero_test PRIVATE PROSPERO_ARENACHECK=1)
   if(PROSPERO_GUI)
-    # The GUI's pure modules: scheduler, markdown, layout, view model.
+    # The GUI's pure modules: scheduler, markdown, layout, view model,
+    # and the built-in model's, whose math (expf) needs libm, which
+    # -nostdlib++ leaves out on Linux.
     target_link_libraries(prospero_test PRIVATE md4c)
     target_compile_definitions(prospero_test PRIVATE PROSPERO_GUI=1)
+    if(UNIX AND NOT APPLE)
+      target_link_libraries(prospero_test PRIVATE m)
+    endif()
   endif()
   if(PROSPERO_HAS_NOSTDLIBXX)
     target_link_options(prospero_test PRIVATE -nostdlib++)
