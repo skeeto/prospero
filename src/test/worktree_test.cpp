@@ -315,7 +315,7 @@ static void testlonghead(Test *t)
         b32 want = i < countof(names)-1;
         expect(t, concat(&tmp, "wtrecorded ", names[i]),
                istr(&tmp, wtrecorded(e, tmp, "/w", names[i], 0)), istr(&tmp, want));
-        Str path = wtpath(&tmp, "/w", names[i], 0);
+        Str path = wtpath(&tmp, "/w", names[i], HOST_WINDOWS);
         expect(t, concat(&tmp, "wtrecorders ", names[i]),
                istr(&tmp, wtrecorders(e, &tmp, path).len), istr(&tmp, want));
         Str sid = concat(&tmp, "20260101-00000", concat(&tmp, istr(&tmp, i+1), "-bbbb"));
