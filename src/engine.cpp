@@ -2814,6 +2814,20 @@ static void request(Session *s, Arena scratch)
 
 static void discover(Session *, Arena);
 
+// Take the steers waiting into the conversation, for the request at hand.
+static void takesteers(Session *s, Arena scratch)
+{
+    for (iz i = 0; i < s->steers.len; i++) {
+        adduser(s, scratch, s->steers[i].text, "steer", s->steers[i].images,
+                s->steers[i].files, s->steers[i].sessions);
+        userinput(s);
+    }
+    if (s->steers.len) {
+        s->steers = {};
+        sendqueue(s, scratch);
+    }
+}
+
 // Carry on toward the step's request: the model's listing first, then
 // room in the context, then its turn at the endpoint.
 static void proceed(Session *s, Arena scratch)
@@ -2841,6 +2855,12 @@ static void proceed(Session *s, Arena scratch)
             compact(s, scratch, at*COMPACT_PRUNETO/100, at*4/5, CW_THRESHOLD);
             return;
         }
+    }
+    if (s->purpose == REQ_CHAT) {
+        // Steers sent since the step began (prepare), during a
+        // compaction, say, which can take many minutes: else this
+        // request goes without them, and they wait for the next (#76)
+        takesteers(s, scratch);
     }
     request(s, scratch);
 }
@@ -16220,15 +16240,7 @@ static void prepare(Session *s, Arena scratch)
     if (!s->cancelled && pausehold(s)) {
         return;  // steers wait with it: continue goes on
     }
-    for (iz i = 0; i < s->steers.len; i++) {
-        adduser(s, scratch, s->steers[i].text, "steer", s->steers[i].images,
-                s->steers[i].files, s->steers[i].sessions);
-        userinput(s);
-    }
-    if (s->steers.len) {
-        s->steers = {};
-        sendqueue(s, scratch);
-    }
+    takesteers(s, scratch);
     if (s->cancelled) {
         endturn(s, scratch, "cancel", {});
         return;
@@ -16482,14 +16494,15 @@ static void endturn(Session *s, Arena scratch, Str why, Str err)
     }
     setstate(s, S_IDLE);
 
-    // Steering that came too late becomes the next prompt
+    // Steering that came too late becomes the next prompt. Not after a
+    // Stop, which starts nothing: they wait for the next turn's end
     b32 changed = s->steers.len > 0;
     for (iz i = 0; i < s->steers.len; i++) {
         s->queued = push(&s->perm, s->queued, s->steers[i]);
     }
     s->steers = {};
     Queued next = {};
-    if (s->queued.len && !s->e->quitting) {
+    if (s->queued.len && !s->e->quitting && why!="cancel") {
         next = s->queued[0];
         s->queued.data++;
         s->queued.len--;
@@ -16551,10 +16564,8 @@ static void cancelturn(Session *s, Arena scratch)
     if (!s->e->quitting) {
         setpause(s, scratch, 0);  // Stop ends it; a quit keeps it
     }
-    if (s->queued.len) {
-        s->queued = {};
-        sendqueue(s, scratch);
-    }
+    // What waits in the queue stays there, shown with its Withdraw, and
+    // goes after the next turn the user starts (endturn) (#76)
     switch (s->state) {
     case S_TOOL:
         if (s->web) {
@@ -21241,8 +21252,8 @@ static void cmdopen(Engine *e, Arena scratch, i64 id, Json *j)
         }
     }
     live(s);  // the state of a session that was open already
-    if (busy(s)) {
-        sendqueue(s, scratch);  // what waits in it, if anything
+    if (busy(s) || s->steers.len || s->queued.len) {
+        sendqueue(s, scratch);  // what waits in it: kept by a Stop, too
     }
 }
 

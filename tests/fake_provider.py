@@ -1661,6 +1661,33 @@ def sc_unqueue(model, n, req):
         yield from answer(model, f"Answer number {n}.")
 
 
+def sc_compact_steer(model, n, req):
+    # sc_compaction's reads, then an answer naming the steers it was given
+    if n < 8:
+        yield from real_tool(model, req, n, "read", {"path": f"f{n}.txt"})
+    else:
+        yield from real_answer(model, req, "All files read.")
+
+
+def sc_compact_steer_compact(model, n, req):
+    # A slow summary, for steers to arrive while it is made (#76)
+    yield S.sleep(1.5)
+    yield from compact_default(model, n, req)
+
+
+def sc_stop_queue(model, n, req):
+    # A slow stream to Stop, while messages queue up behind it, then
+    # each turn after it answered at once (#76)
+    if n == 0:
+        yield S.head()
+        for i in range(100):
+            yield from text(model, f"slow{i} ")
+            yield S.sleep(0.1)
+        yield from finish(model)
+    else:
+        yield from answer(model, f"Answer number {n}.")
+
+
 def sc_queue_b(model, n, req):
     yield from answer(model, "The other model answered.")
 

@@ -6175,6 +6175,92 @@ def kv_full(t):
 
 
 @scenario(conf=SMALL, bound=30, alone=True)
+def compact_steer(t):
+    """Steers sent while a compaction in the middle of a turn summarizes
+    go in the request right after it, not a step later, nor, after a
+    Stop, as turns of their own (#76)."""
+    bigfiles(t, 8, 150)
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="go")
+        h.wait(lambda e: e.get("ev") == "live" and e.get("sid") == sid and
+               e.get("state") == "compacting", timeout=20)
+        for text in ("steer one", "steer two"):
+            t.check(h.call("steer", sid=sid, text=text).get("ok") == 1, text)
+        end = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid,
+                     timeout=20)
+        t.check(end["why"] == "done", f"the turn ends done: {end}")
+        cp = [e for e in h.all("compact", sid) if e["kind"] == "summary"]
+        steers = [e for e in h.all("user", sid) if e.get("via") == "steer"]
+        t.check(len(cp) == 1 and [e["text"] for e in steers] == ["steer one", "steer two"]
+                and all(e["seq"] > cp[0]["seq"] for e in steers),
+                f"taken in after the summary: {cp} {steers}")
+        t.check(not [e for e in h.all("user", sid) if e.get("via") == "queue"],
+                "no turn of their own")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+    reqs = t.requests()
+    k = next((i for i, x in enumerate(reqs) if checkpointed(chat(x))), None)
+    t.check(k is not None, "a request after the summary")
+    if k is not None:
+        said = [str(m.get("content")) for m in chat(reqs[k]) if m["role"] == "user"]
+        t.check("steer one" in said and "steer two" in said,
+                f"the first request after it has them: {said[-3:]}")
+
+
+@scenario(bound=20)
+def stop_queue(t):
+    """Stop ends the turn and starts nothing: prompts and steers waiting
+    stay queued, withdrawable, and go after the next turn (#76)."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="go")
+        h.wait(lambda e: e.get("ev") == "delta" and e.get("sid") == sid)
+        sent = [("prompt", "first prompt"), ("prompt", "second prompt"),
+                ("steer", "a steer")]
+        for cmd, text in sent:
+            t.check(h.call(cmd, sid=sid, text=text).get("ok") == 1, f"{cmd} {text}")
+        t.check(h.call("cancel", sid=sid).get("ok") == 1, "stopped")
+        end = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        t.check(end["why"] == "cancel", f"cancelled: {end}")
+        time.sleep(1)
+        t.check(len(h.all("turn", sid)) == 1, f"no turn begun: {h.all('turn', sid)}")
+        items = h.all("queue", sid)[-1]["items"]
+        t.check([i["text"] for i in items] == ["first prompt", "second prompt", "a steer"],
+                f"still queued: {items}")
+
+        # Withdrawn while idle, whole
+        ids = {i["text"]: i["id"] for i in items}
+        r = h.call("unqueue", sid=sid, item=ids["second prompt"])
+        t.check(r.get("ok") == 1 and r.get("text") == "second prompt", f"unqueue: {r}")
+
+        # Opened again: the queue as it is
+        n = len(h.all("queue", sid))
+        t.check(h.call("open", sid=sid, **{"from": 1 << 40}).get("ok") == 1, "reopened")
+        deadline = time.monotonic() + 5
+        while len(h.all("queue", sid)) <= n and time.monotonic() < deadline:
+            time.sleep(0.02)
+        left = [i["text"] for i in h.all("queue", sid)[-1]["items"]]
+        t.check(left == ["first prompt", "a steer"], f"on open: {left}")
+
+        # A new prompt goes at once, then the queue, a turn each
+        t.check(h.call("prompt", sid=sid, text="new prompt").get("ok") == 1, "prompted")
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid
+               and e.get("turn") == 4, timeout=10)
+        users = [(e["text"], e.get("via")) for e in h.all("user", sid)]
+        t.check(users == [("go", "prompt"), ("new prompt", "prompt"),
+                          ("first prompt", "queue"), ("a steer", "queue")],
+                f"messages: {users}")
+        t.check(h.all("queue", sid)[-1]["items"] == [], "the queue ends empty")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf=SMALL, bound=30, alone=True)
 def compact_notice(t):
     """A job's notice before a compaction's cut: the session opened again
     rebuilds the history the live one had, without the notice."""
