@@ -908,6 +908,7 @@ int main()
     test_gemmagguf(&t);
     test_gemmarender(&t);
     test_gemmacalls(&t);
+    test_gemmacallprefix(&t);
     test_gemmastream(&t);
     test_gemmasample(&t);
     test_gemmacache(&t);

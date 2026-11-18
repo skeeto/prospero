@@ -210,6 +210,36 @@ static Str gmtdeltas(Arena *a, Str sse)
     return finish(&b);
 }
 
+// What streams of a call's arguments as each byte comes: always a prefix
+// of the whole's JSON, which it reaches at the end.
+static void test_gemmacallprefix(Test *t)
+{
+    Arena a = t->perm;
+    struct { Str call; Str json; } cases[] = {
+        {"{path:<|\"|>a b<|\"|>,n:12,ok:true,v:[1,x,{k:2}],s:x y}",
+         "{\"path\":\"a b\",\"n\":12,\"ok\":true,\"v\":[1,\"x\",{\"k\":2}],\"s\":\"x y\"}"},
+        {"{text:<|\"|>\xc3\xa9\"\\\n<|\"|>}", "{\"text\":\"\xc3\xa9\\\"\\\\\\n\"}"},
+        {"{}", "{}"},
+    };
+    for (iz i = 0; i < countof(cases); i++) {
+        Str  call   = cases[i].call;
+        b32  prefix = 1;
+        Str  last   = {};
+        for (iz n = 0; n <= call.len; n++) {
+            Arena t2 = a;
+            Str   c  = takehead(call, n);
+            Buf   b(&t2, 256);
+            gmcallprefix(&c, &b, 0);
+            last    = clone(&a, finish(&b));
+            prefix &= startswith(cases[i].json, last);
+        }
+        expect(t, "gemmachat.callprefix.prefix", istr(&a, prefix), "1");
+        expect(t, "gemmachat.callprefix.whole", last, cases[i].json);
+        GmCall g = gmparsecall(&a, concat(&a, "call:f", call));
+        expect(t, "gemmachat.callprefix.parse", g.args, cases[i].json);
+    }
+}
+
 static void test_gemmastream(Test *t)
 {
     Arena a   = t->perm;
@@ -239,7 +269,12 @@ static void test_gemmastream(Test *t)
            "content=Hello\n"
            "content=\xc3\xa9\n"
            "content= w\xc3\xb6rld\n"
-           "tool_calls=read {\"path\":\"a\"}\n"
+           "tool_calls=read \n"
+           "tool_calls= {\"path\":\n"
+           "tool_calls= \"\n"
+           "tool_calls= a\n"
+           "tool_calls= \"\n"
+           "tool_calls= }\n"
            "finish=tool_calls\n");
     Str sse = finish(&out);
     expect(t, "gemmachat.stream.callid",

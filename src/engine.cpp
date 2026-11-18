@@ -1316,8 +1316,9 @@ static void live(Session *s)
             putintkey(&w.json, "watchdog_ms", (at>now ? at-now : 0)/MS);
             putintkey(&w.json, "watchdog_of", of/MS);
         }
-        if (ep->relay.len && s->relaybylen) {
-            // The computer relaying it (at most 63 bytes), and its line
+        if (ep->relay.len && s->relaybylen && ep->kind!=EP_BUILTIN) {
+            // The computer relaying it (at most 63 bytes), and its line,
+            // but not the window running the built-in model
             putstrkey(&w.json, "relay", Str(s->relayby, s->relaybylen));
             if (s->relayq) {
                 putintkey(&w.json, "queue_pos", s->relayqpos);

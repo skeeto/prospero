@@ -146,15 +146,16 @@ import slots  # noqa: E402
 import pids as P  # noqa: E402
 
 
-def e2econfig(url, model):
+def e2econfig(url, model, builtin=False):
+    where = "kind = builtin\n" if builtin else f"url = {url}\n"
     return (
         "# The end-to-end checklist's configuration\n"
         "endpoint = local\n"
         f"model = {model}\n"
         "\n"
-        "# The router\n"
+        "# The model's host\n"
         "[endpoint local]\n"
-        f"url = {url}\n"
+        f"{where}"
         "idle_timeout = 120\n"
         "\n"
         "# Asks wait a little, and the temporary directory asks too\n"
@@ -2098,6 +2099,9 @@ def main():
                     help="with --ssh: a Windows host whose login shell is cmd.exe, "
                          "with w64devkit for the test's scripts")
     ap.add_argument("--model", help="with --mode e2e: the model (required)")
+    ap.add_argument("--builtin", metavar="FILE",
+                    help="with --mode e2e: the window's own model, from this GGUF "
+                         "(no --model or --url)")
     ap.add_argument("--image", default="alpine:latest",
                     help="with --mode containers: the image, already pulled")
     ap.add_argument("--runtime", default="auto",
@@ -2175,6 +2179,13 @@ def main():
             return 0
     if args.mode == "remote" and args.ssh and not args.remote_prospero:
         ap.error("--ssh needs --remote-prospero")
+    if args.builtin:
+        if args.mode != "e2e" or args.model or args.url:
+            ap.error("--builtin goes with --mode e2e, and no --model or --url")
+        if not os.path.isfile(args.builtin):
+            ap.error(f"--builtin: no file {args.builtin}")
+        args.model = "gemma-4-e2b"
+        os.environ["PROSPERO_BUILTIN_MODEL"] = os.path.abspath(args.builtin)
     if args.mode == "e2e" and not args.model:
         ap.error("--mode e2e needs --model")
     # A remote host over ssh reaches the provider on this machine's address
@@ -2210,7 +2221,7 @@ def main():
         args.subprocess = True  # the GUI's --enginestop implies it
     curl = host.url if args.host else url
     if args.mode == "e2e":
-        before = e2econfig(args.url or "http://localhost/", args.model)
+        before = e2econfig(args.url or "http://localhost/", args.model, bool(args.builtin))
     elif args.mode == "settings":
         # Asks wait out the screenshots; a role holds the long value; an
         # included model, which cannot be deleted here, an endpoint to

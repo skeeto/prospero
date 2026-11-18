@@ -191,7 +191,7 @@ at your own risk. Prospero sends none of its own.
 desktop window runs itself, on this computer's processor. It has no
 URL, and no key:
 
-    [endpoint gemma]
+    [endpoint builtin]
     kind = builtin
 
 Its file, 3.3 GB, is downloaded once, from Hugging Face, into the state
