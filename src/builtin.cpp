@@ -41,6 +41,7 @@ enum : i32 {
 enum : u32 {
     BL_LINE = 1,  // a relay.data line for the engine, id its call's slot
     BL_FREE = 2,  // the model's thread is done with that slot
+    BL_TICK = 3,  // the download's news (blnews)
 };
 
 enum : i32 {
@@ -80,6 +81,11 @@ struct Builtin {
     b32      started;  // the model's thread
 
     // The UI thread's
+    struct BlDown *down;  // the download, once one starts
+    i64      statat;   // when have and partlen were looked at
+    b32      have;     // the file is there
+    i64      partlen;  // bytes of a download to resume
+    b32      applied;  // a download's end was seen
     Mail     pend;     // taken, not all sent
     Region  *offermem;
     Str      offered;  // the offer last sent, or null for none
@@ -183,6 +189,18 @@ static void blanswer(Builtin *b, BlCall *c, Arena *a, i32 status, Str json)
     blpost(b, c, bldone(a, c, "ok", {}));
 }
 
+// Why the call can't be answered: the file isn't there.
+static Str blmissing(Builtin *b, BlCall *c, Arena *a)
+{
+    Buf m(a);
+    print(&m, "The built-in model is not downloaded yet: its file would be ");
+    print(&m, b->path);
+    print(&m, ". Download it (3.3 GB) from Settings, on endpoint ");
+    print(&m, c->endpoint);
+    print(&m, "'s page.");
+    return finish(&m);
+}
+
 // Load the model if it isn't yet. Returns why it can't be, or null.
 static Str blload(Builtin *b, BlCall *c, Arena scratch)
 {
@@ -202,13 +220,7 @@ static Str blload(Builtin *b, BlCall *c, Arena scratch)
     }
     Str file = os_guimap(os, scratch, b->path);
     if (!file.len) {
-        Buf m(&scratch);
-        print(&m, "The built-in model is not downloaded yet: its file would be ");
-        print(&m, b->path);
-        print(&m, ". Download it (3.3 GB) from Settings, endpoint ");
-        print(&m, c->endpoint);
-        print(&m, ".");
-        return finish(&m);
+        return blmissing(b, c, &scratch);
     }
 
     if (!b->pool) {
@@ -322,7 +334,13 @@ static void blrun(Builtin *b, BlCall *c, Arena scratch)
     }
     os_guibusy(os, 1);
     if (b->fake) {
-        blfake(b, c, scratch);
+        // Its file there, if only a stand-in
+        if (os_stat(os, scratch, b->path).type == STAT_FILE) {
+            blfake(b, c, scratch);
+        } else {
+            Str why = blmissing(b, c, &scratch);
+            blanswer(b, c, &scratch, 400, gmerrbody(&scratch, why));
+        }
         os_guibusy(os, 0);
         os_release(os, work.region);
         return;
@@ -653,6 +671,8 @@ static b32 blrelayin(Gui *g, Arena a, Json *j)
     return 1;
 }
 
+static void blnews(Gui *);
+
 // Lines from the model's thread to the main engine, as it takes them.
 // Returns whether some wait for room.
 static b32 blflush(Gui *g)
@@ -670,7 +690,10 @@ static b32 blflush(Gui *g)
         }
         iz     at = b->pend.off;
         Record r  = mailnext(&b->pend);
-        if (r.id >= (u64)BL_CALLS) {
+        if (r.type == BL_TICK) {
+            blnews(g);
+            continue;
+        } else if (r.id >= (u64)BL_CALLS) {
             continue;
         }
         BlCall *c = b->calls + r.id;
@@ -707,4 +730,600 @@ static void blgone(Gui *g)
         blsend(g, finish(&m));
     }
     b->offered = {};
+}
+
+
+// The model's file, downloaded
+//
+// From Hugging Face, at a pinned revision, into the state directory's
+// models folder. It arrives in FILE.part, hashed as it comes, and takes
+// its name only once all of it is there and its SHA-256 is the one
+// pinned here. A download cancelled, or cut off, resumes from the part
+// (Range), hashing what is there first; a server that answers a resume
+// with the whole file starts it over. Redirects are followed by hand
+// (Hugging Face's go to its CDN), never from https to http, at most 5.
+//
+// The URL, size and hash can be another's for tests:
+// PROSPERO_TEST_BUILTIN_URL, _SIZE and _SHA256.
+
+static Str const blurl =
+    "https://huggingface.co/wellons/gemma-4-E2B-it-qat-q4_0-refit-GGUF/resolve/"
+    "4bf900f6bf9617f9edf36aaf8b727eaec9fc5861/gemma-4-E2B-it-qat-q4_0-refit.gguf";
+static Str const blsha =
+    "ad5ae441f8efc3f5588a9567ff6cc31d99e104f94815996fc2dae0ff6d06cf28";
+
+enum : i64 {
+    BL_SIZE  = 3349516256,
+    BL_SLACK = (i64)64 << 20,  // disk space to spare beyond the file
+};
+
+enum : i32 {
+    BL_IDLE,      // no download since the window opened, or it was taken
+    BL_FETCHING,
+    BL_FAILED,    // err says why, a cancel among them
+    BL_FETCHED,   // the file is in place
+};
+
+struct BlDown {
+    Os      *os;
+    Mailbox *out;      // the window's, for BL_TICK
+    Mailbox *mb;       // HTTP records
+    Str      url;
+    Str      sha;
+    Str      path;
+    Str      part;
+    i64      size;
+    i64      got;      // atomic: bytes there so far
+    i32      state;    // atomic
+    i32      cancel;   // atomic
+    Lock     lock;
+    Http    *http;     // the request in flight, under the lock
+    i64      tickat;   // the thread's: when it last told the window
+    u8       err[512];
+    iz       errlen;   // set before state goes BL_FAILED
+};
+
+static void bltick(BlDown *d, b32 now)
+{
+    i64 t = os_ticks(d->os);
+    if (now || t-d->tickat>=200000) {
+        d->tickat = t;
+        mailpost(d->out, BL_TICK, 0, {}, now);
+    }
+}
+
+static b32 blcancelled(BlDown *d)
+{
+    return __atomic_load_n(&d->cancel, __ATOMIC_RELAXED);
+}
+
+// Hash the part already there, which a resume goes on from, counting it
+// as got. Returns its length, 0 if it is unusable (and then gone).
+static i64 blrehash(BlDown *d, Arena scratch, Sha256 *h)
+{
+    Os  *os = d->os;
+    Stat st = os_stat(os, scratch, d->part);
+    if (st.type!=STAT_FILE || !st.size) {
+        return 0;
+    } else if (st.size > d->size) {
+        os_remove(os, scratch, d->part);
+        return 0;
+    }
+    Str m = os_guimap(os, scratch, d->part);
+    if (m.len != st.size) {
+        if (m.len) {
+            os_guiunmap(os, m);
+        }
+        return 0;
+    }
+    for (iz off = 0; off < m.len && !blcancelled(d);) {
+        iz n = m.len-off<((iz)16<<20) ? m.len-off : (iz)16<<20;
+        sha256put(h, Str(m.data+off, n));
+        off += n;
+        __atomic_store_n(&d->got, (i64)off, __ATOMIC_RELAXED);
+        bltick(d, 0);
+    }
+    os_guiunmap(os, m);
+    return st.size;
+}
+
+// One request for the rest, from have on, its body appended to the log,
+// into the hash. Its status, and where a redirect points.
+struct BlGot {
+    i32 status;
+    Str location;
+    Str err;
+    b32 restart;  // a whole file in answer to a resume: started over
+};
+
+static BlGot blget(BlDown *d, Arena *perm, Arena scratch, Str url, iz log,
+                   Sha256 *h, i64 *have, u64 id)
+{
+    Os   *os = d->os;
+    BlGot r  = {};
+    Buf   hb(&scratch, 128);
+    print(&hb, "User-Agent: Prospero\r\n");
+    if (*have) {
+        print(&hb, "Range: bytes=");
+        print(&hb, *have);
+        print(&hb, "-\r\n");
+    }
+    HttpReq q = {};
+    q.method    = "GET";
+    q.url       = url;
+    q.headers   = finish(&hb);
+    q.connectms = 15000;
+    q.readms    = 60000;
+    q.maxbytes  = d->size + ((i64)1<<20);
+    q.mbox      = d->mb;
+    q.id        = id;
+    Http *http = os_http(os, &q, scratch);
+    if (!http) {
+        r.err = concat(perm, "could not connect: ", os_lasterr(os, &scratch));
+        return r;
+    }
+    os_lock(&d->lock);
+    d->http = http;
+    os_unlock(&d->lock);
+    if (blcancelled(d)) {
+        os_httpcancel(os, http);
+    }
+
+    b32 ok   = 0;  // the body is the file's
+    b32 done = 0;
+    while (!done) {
+        mailwait(d->mb, -1);
+        Mail m = mailtake(d->mb);
+        for (Record rec = mailnext(&m); rec.ok && !done; rec = mailnext(&m)) {
+            if (rec.id != id) {
+                continue;  // an earlier request's, given up on
+            }
+            switch (rec.type) {
+            case HTTP_HEAD: {
+                r.status = get32(rec.data);
+                Str range = {};
+                for (Str rest = cuthead(rec.data, 4); rest.len;) {
+                    Cut line = cut(rest, '\n');
+                    Cut kv   = cut(line.head, ':');
+                    rest = line.tail;
+                    if (kv.ok && equalfold(trim(kv.head), "location")) {
+                        r.location = clone(perm, trim(kv.tail));
+                    } else if (kv.ok && equalfold(trim(kv.head), "content-range")) {
+                        range = trim(kv.tail);
+                    }
+                }
+                if (r.status==200 && *have) {
+                    // The whole file again: over from the start
+                    if (!os_logtrunc(os, log, 0)) {
+                        r.err = "could not start the file over";
+                        os_httpcancel(os, http);
+                        break;
+                    }
+                    *h        = sha256init();
+                    *have     = 0;
+                    r.restart = 1;
+                    ok        = 1;
+                } else if (r.status == 200) {
+                    ok = 1;
+                } else if (r.status == 206) {
+                    Buf want(&scratch, 64);
+                    print(&want, "bytes ");
+                    print(&want, *have);
+                    putbyte(&want, '-');
+                    ok = startswith(range, finish(&want));
+                    if (!ok) {
+                        r.err = "the server resumed from the wrong place";
+                        os_httpcancel(os, http);
+                    }
+                }
+            } break;
+            case HTTP_BODY:
+                if (!ok || r.err.len) {
+                    break;
+                } else if (rec.data.len > d->size-*have) {
+                    r.err = "the file is larger than it should be";
+                    os_httpcancel(os, http);
+                } else if (!os_logwrite(os, log, rec.data)) {
+                    r.err = "could not write the file: is the disk full?";
+                    os_httpcancel(os, http);
+                } else {
+                    sha256put(h, rec.data);
+                    *have += rec.data.len;
+                    __atomic_store_n(&d->got, *have, __ATOMIC_RELAXED);
+                    bltick(d, 0);
+                }
+                break;
+            case HTTP_DONE: {
+                i32 err = get32(rec.data);
+                done = 1;
+                if (!r.err.len && err==HTTP_ECANCEL) {
+                    r.err = "cancelled";
+                } else if (!r.err.len && err!=HTTP_OK) {
+                    Str why = trim(cuthead(rec.data, 4));
+                    r.err = concat(perm, "the connection failed: ",
+                                   why.len ? why : Str("no reason given"));
+                }
+            } break;
+            }
+        }
+    }
+    os_lock(&d->lock);
+    d->http = 0;
+    os_unlock(&d->lock);
+    os_httpfree(os, http);
+    r.err = r.err.len ? clone(perm, r.err) : r.err;
+    return r;
+}
+
+// The download, start to end. Returns why it failed, or null.
+static Str blfetch(BlDown *d, Arena *perm, Arena scratch)
+{
+    Os    *os   = d->os;
+    Sha256 h    = sha256init();
+    i64    have = blrehash(d, scratch, &h);
+    if (blcancelled(d)) {
+        return "cancelled";
+    }
+    iz log = os_logopen(os, scratch, d->part);
+    if (log < 0) {
+        return concat(perm, "could not write ", d->part);
+    } else if (!os_logtrunc(os, log, have)) {
+        os_logclose(os, log);
+        return concat(perm, "could not write ", d->part);
+    }
+
+    Str url = d->url;
+    Str err = {};
+    for (i32 hops = 0;; hops++) {
+        BlGot g = blget(d, perm, scratch, url, log, &h, &have, (u64)hops+1);
+        b32   moved = g.status==301 || g.status==302 || g.status==303 ||
+                      g.status==307 || g.status==308;
+        Str   next  = moved && g.location.len ? iniurlresolve(perm, url, g.location) : Str{};
+        if (g.err.len) {
+            err = g.err;
+        } else if (moved && hops==5) {
+            err = "more than 5 redirects";
+        } else if (moved && !next.data) {
+            err = "redirected without an http or https URL";
+        } else if (moved && startswith(url, "https:") && !startswith(next, "https:")) {
+            err = "redirected from https to http";
+        } else if (moved) {
+            url = next;
+            continue;
+        } else if (g.status!=200 && g.status!=206) {
+            Buf b(perm, 64);
+            print(&b, "the server answered HTTP ");
+            print(&b, (i64)g.status);
+            err = finish(&b);
+        }
+        break;
+    }
+    os_logsync(os, log);
+    os_logclose(os, log);
+    if (err.len) {
+        return err;
+    } else if (have != d->size) {
+        Buf b(perm, 128);
+        print(&b, "the download ended early, ");
+        printfloat(&b, (f64)have/1e9, 1);
+        print(&b, " of ");
+        printfloat(&b, (f64)d->size/1e9, 1);
+        print(&b, " GB");
+        return finish(&b);
+    }
+    Str sum = sha256hex(&scratch, h);
+    if (!(sum == d->sha)) {
+        os_remove(os, scratch, d->part);
+        return "the file that came is not the one expected (its SHA-256 differs)";
+    } else if (!os_rename(os, scratch, d->part, d->path)) {
+        return concat(perm, "could not rename the file to ", d->path);
+    }
+    return {};
+}
+
+static void blfetchthread(void *arg)
+{
+    BlDown *d   = (BlDown *)arg;
+    Region *mem = os_reserve(d->os, (iz)64<<20);
+    Str     err = mem ? Str{} : Str("out of memory");
+    if (mem) {
+        Arena a       = newarena(mem);
+        Arena scratch = carve(&a, (iz)48<<20);
+        err = blfetch(d, &a, scratch);
+    }
+    iz n = err.len<countof(d->err) ? err.len : countof(d->err);
+    if (n) {
+        copybytes(d->err, err.data, n);
+    }
+    d->errlen = n;
+    __atomic_store_n(&d->state, n ? BL_FAILED : BL_FETCHED, __ATOMIC_RELEASE);
+    if (mem) {
+        os_release(d->os, mem);
+    }
+    bltick(d, 1);
+}
+
+
+// The download, as the window shows it
+
+// Why this computer can't run the model, or null if it can.
+static Str blcannot(Gui *g)
+{
+    if (gmisa(os_guiarmdot(g->os)) == GM_SCALAR) {
+        return "its processor lacks AVX2 (x86-64) or the dot product "
+               "instructions (arm64)";
+    }
+    i64 ram = os_guiram(g->os);
+    if (ram && ram<((i64)BL_MINRAM<<30) - ((i64)256<<20)) {
+        return "it has less than 6 GB of memory";
+    }
+    return {};
+}
+
+static Str blpart(Arena *a, Builtin *b)
+{
+    return concat(a, b->path, ".part");
+}
+
+// Whether the file, or a part of it, is there, looked at again at most
+// every 2 s.
+static void blstat(Gui *g, Builtin *b)
+{
+    i64 now = os_ticks(g->os);
+    if (b->statat && now-b->statat<2000000) {
+        return;
+    }
+    b->statat = now;
+    Arena a   = g->frame;
+    Str   part = blpart(&a, b);
+    Stat  f    = os_stat(g->os, a, b->path);
+    Stat  p    = os_stat(g->os, a, part);
+    b->have    = f.type == STAT_FILE;
+    b->partlen = p.type==STAT_FILE ? p.size : 0;
+}
+
+static i32 blfetchstate(Builtin *b)
+{
+    return b->down ? __atomic_load_n(&b->down->state, __ATOMIC_ACQUIRE) : BL_IDLE;
+}
+
+// The test's stand-ins for the pinned file, if any.
+static i64 bltestsize(Gui *g, Arena a)
+{
+    Int n = parseint(os_getenv(g->os, &a, "PROSPERO_TEST_BUILTIN_SIZE"));
+    return n.ok && n.val>0 ? n.val : BL_SIZE;
+}
+
+static void bldownload(Gui *g)
+{
+    Builtin *b = blget(g);
+    if (!b || blfetchstate(b)==BL_FETCHING) {
+        return;
+    }
+    Arena   a = g->frame;
+    BlDown *d = b->down;
+    if (!d) {
+        d = alloc<BlDown>(&g->perm);
+        d->os  = g->os;
+        d->out = b->out;
+        d->mb  = newmailbox(&g->perm, (iz)1<<20, 0, 0);
+        os_lockinit(&d->lock);
+        Str url  = os_getenv(g->os, &a, "PROSPERO_TEST_BUILTIN_URL");
+        Str sha  = os_getenv(g->os, &a, "PROSPERO_TEST_BUILTIN_SHA256");
+        d->url   = url.len ? clone(&g->perm, url) : blurl;
+        d->sha   = sha.len ? clone(&g->perm, sha) : blsha;
+        d->size  = bltestsize(g, a);
+        d->path  = b->path;
+        d->part  = blpart(&g->perm, b);
+        b->down  = d;
+    }
+    d->got    = 0;
+    d->cancel = 0;
+    d->errlen = 0;
+    d->tickat = 0;
+
+    Str why = !d->mb ? Str("out of memory") : Str{};
+    Str dir = d->path;
+    for (; dir.len && dir[dir.len-1]!='/' && dir[dir.len-1]!='\\'; dir.len--) {}
+    if (!why.len && dir.len && !os_mkdirs(g->os, a, dir)) {
+        why = concat(&a, "could not make ", dir);
+    }
+    blstat(g, b);
+    i64 free = why.len ? 0 : os_guidiskfree(g->os, a, dir.len ? dir : Str("."));
+    if (!why.len && free>=0 && free<d->size-b->partlen+BL_SLACK) {
+        Buf m(&a, 128);
+        print(&m, "too little disk space: it needs ");
+        printfloat(&m, (f64)(d->size-b->partlen+BL_SLACK)/1e9, 1);
+        print(&m, " GB, and ");
+        printfloat(&m, (f64)free/1e9, 1);
+        print(&m, " GB is free");
+        why = finish(&m);
+    }
+    d->state = BL_FETCHING;
+    if (!why.len && !os_thread(g->os, blfetchthread, d)) {
+        why = "could not start the download's thread";
+    }
+    if (why.len) {
+        iz n = why.len<countof(d->err) ? why.len : countof(d->err);
+        copybytes(d->err, why.data, n);
+        d->errlen = n;
+        d->state  = BL_FAILED;
+    }
+    b->applied = 0;
+    scheddirty(&g->sched);
+}
+
+static void blstopdown(Gui *g)
+{
+    BlDown *d = g->bl ? g->bl->down : 0;
+    if (!d || blfetchstate(g->bl)!=BL_FETCHING) {
+        return;
+    }
+    __atomic_store_n(&d->cancel, 1, __ATOMIC_RELAXED);
+    os_lock(&d->lock);
+    if (d->http) {
+        os_httpcancel(g->os, d->http);
+    }
+    os_unlock(&d->lock);
+}
+
+// The configuration's builtin endpoint, or null.
+static Str blendpoint(Gui *g)
+{
+    for (iz i = 0; i < g->cfgrows.len; i++) {
+        CfgRow *r = &g->cfgrows[i];
+        if (r->kind=="endpoint" && r->key=="kind" && trim(r->value)=="builtin") {
+            return r->name;
+        }
+    }
+    return {};
+}
+
+// The file is there: an endpoint for it, unless there is one.
+static void bluse(Gui *g)
+{
+    if (blendpoint(g).len) {
+        return;
+    }
+    Str name = "gemma";
+    for (iz i = 0; i < g->cfgrows.len; i++) {
+        CfgRow *r = &g->cfgrows[i];
+        name = r->kind=="endpoint" && r->name==name ? Str("gemma-builtin") : name;
+    }
+    guiconfigset(g, "endpoint", name, "kind", "builtin");
+}
+
+// The download's news, from blflush: a frame to show it, and at its end
+// the endpoint, once.
+static void blnews(Gui *g)
+{
+    Builtin *b = g->bl;
+    scheddirty(&g->sched);
+    if (blfetchstate(b)!=BL_FETCHING && !b->applied) {
+        b->applied = 1;
+        b->statat  = 0;
+        if (blfetchstate(b) == BL_FETCHED) {
+            bluse(g);
+        }
+    }
+}
+
+static void blsize(Buf *b, i64 n)
+{
+    printfloat(b, (f64)n/1e9, 1);
+}
+
+// The model's state and what to do about it: download, its progress and
+// Cancel, a failure and Retry or Resume, or Use once it is there. On
+// the first-run card (card), else on a builtin endpoint's page.
+static void bldrawfetch(Gui *g, Arena a, b32 card)
+{
+    Builtin *b = blget(g);
+    if (!b) {
+        return;
+    }
+    Str cannot = blcannot(g);
+    if (cannot.len) {
+        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->dim);
+        ImGui::TextWrapped("This computer can't run the built-in model: %s.",
+                           cstr0(&a, cannot));
+        ImGui::PopStyleColor();
+        itemnamed(g, "builtin cannot");
+        return;
+    }
+    i32 st = blfetchstate(b);
+    if (st != BL_FETCHING) {
+        blstat(g, b);
+    }
+    i64 size = b->down ? b->down->size : bltestsize(g, a);
+    if (st == BL_FETCHING) {
+        i64 got = __atomic_load_n(&b->down->got, __ATOMIC_RELAXED);
+        Buf m(&a, 64);
+        blsize(&m, got);
+        print(&m, " of ");
+        blsize(&m, size);
+        print(&m, " GB");
+        putbyte(&m, 0);
+        f32 w = ImGui::GetContentRegionAvail().x;
+        ImGui::ProgressBar(size ? (f32)((f64)got/(f64)size) : 0,
+                           v2(w<360*g->scale ? w : 360*g->scale, 0),
+                           (char const *)finish(&m).data);
+        itemnamed(g, "builtin progress");
+        if (ImGui::Button("Cancel##builtin")) {
+            blstopdown(g);
+        }
+        itemnamed(g, "builtin cancel");
+        itemtip("Stop the download, keeping what came, to resume later");
+        return;
+    }
+
+    if (st==BL_FAILED && !(Str(b->down->err, b->down->errlen) == "cancelled")) {
+        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
+        ImGui::TextWrapped("The download failed: %s.",
+                           cstr0(&a, Str(b->down->err, b->down->errlen)));
+        ImGui::PopStyleColor();
+        itemnamed(g, "builtin failed");
+    }
+    if (b->have) {
+        if (!card) {
+            Buf m(&a, 256);
+            print(&m, "Gemma 4 E2B is downloaded, at ");
+            print(&m, b->path);
+            print(&m, ".");
+            putbyte(&m, 0);
+            ImGui::PushStyleColor(ImGuiCol_Text, g->pal->dim);
+            ImGui::TextWrapped("%s", (char const *)finish(&m).data);
+            ImGui::PopStyleColor();
+            itemnamed(g, "builtin have");
+        } else if (ImGui::Button("Use the built-in model")) {
+            bluse(g);
+        }
+        if (card) {
+            itemnamed(g, "builtin use");
+            itemtip("Add an endpoint for it, its file being here already");
+        }
+        return;
+    }
+
+    Buf m(&a, 64);
+    if (b->partlen) {
+        print(&m, "Resume the download (");
+        blsize(&m, b->partlen);
+        print(&m, " of ");
+        blsize(&m, size);
+        print(&m, " GB)");
+    } else {
+        print(&m, "Download Gemma 4 E2B (");
+        blsize(&m, size);
+        print(&m, " GB)");
+    }
+    putbyte(&m, 0);
+    if (ImGui::Button((char const *)finish(&m).data)) {
+        bldownload(g);
+    }
+    itemnamed(g, "builtin download");
+    itemtip("Download the built-in model from Hugging Face into Prospero's "
+            "state directory, its SHA-256 checked, then add an endpoint for it");
+}
+
+// On the first-run card, under Set up a model: the built-in model, for
+// someone with no server or service yet.
+static void bldrawcard(Gui *g, Arena a)
+{
+    ImGui::Spacing();
+    ImGui::Spacing();
+    ImGui::PushStyleColor(ImGuiCol_Text, g->pal->dim);
+    ImGui::TextWrapped("Or try the built-in model, Gemma 4 E2B by Google "
+                       "(Apache 2.0): free and private, it runs on this "
+                       "computer, but it is slow, and far less capable than "
+                       "the models of a service. A 3.3 GB download.");
+    ImGui::PopStyleColor();
+    bldrawfetch(g, a, 1);
+}
+
+// On a builtin endpoint's page in Settings.
+static void bldrawpage(Gui *g, Arena a)
+{
+    ImGui::Spacing();
+    bldrawfetch(g, a, 0);
 }

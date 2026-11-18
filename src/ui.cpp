@@ -5805,6 +5805,13 @@ static void drawsetup(Gui *g, ImVec2 wpos, f32 winh, f32 width)
     itemnamed(g, "setup model");
     itemtip("Add an endpoint in the settings: the API it speaks, then its "
             "URL and key on its page");
+    // Its lines at x too, as a group keeps them
+    ImGui::SetCursorScreenPos(v2(x, ImGui::GetCursorScreenPos().y));
+    ImGui::BeginGroup();
+    ImGui::PushTextWrapPos(ImGui::GetCursorPos().x + wrap);
+    bldrawcard(g, a);
+    ImGui::PopTextWrapPos();
+    ImGui::EndGroup();
 }
 
 #if !PROSPERO_ITCH
@@ -15533,6 +15540,8 @@ static void drawcfgpage(Gui *g, Arena scratch)
         Str epkind = cfgepkind(g, name);
         if (epkind=="chatgpt" || epkind=="copilot") {
             drawsignin(g, a, name, epkind=="copilot");
+        } else if (epkind == "builtin") {
+            bldrawpage(g, a);
         }
     }
     ImGui::Spacing();

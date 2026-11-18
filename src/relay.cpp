@@ -544,6 +544,24 @@ static void relayoffer(Engine *e, Arena scratch, i64 id, Json *j)
     } else {
         relaylayers(e);  // the same text, but in the new offer's memory
     }
+    // The window's own model is known from its offer: it lists as the
+    // default model before discovery, so a new session can take it
+    for (iz i = 0; i < p->eps.len; i++) {
+        RelayEp *ep = &p->eps[i];
+        if (ep->kind!=EP_BUILTIN || !ep->models.len) continue;
+        Arena t    = scratch;
+        Str   url  = relayurlof(&t, EP_BUILTIN, ep->name);
+        Str  *have = upsert(&e->listings, url, (Arena *)0);
+        if (have && have->len) continue;
+        Buf ids(&t, 256);
+        for (iz m = 0; m < ep->models.len; m++) {
+            print(&ids, ep->models[m]);
+            putbyte(&ids, '\n');
+        }
+        Str list = finish(&ids);
+        have = have ? have : upsert(&e->listings, clone(&e->perm, url), &e->perm);
+        *have = clone(&e->perm, list);
+    }
     relayreply(e, scratch, id, e->cfg->thin);
     relaywake(e, scratch);
 }

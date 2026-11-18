@@ -47,7 +47,9 @@ Other endpoints:
   POST /v1/chat/completions/control reasoning_end for a stream that asks
                                     for it (wants_end), else no success
   GET  /fake/requests?model=M       requests received for M, with times
-  GET  /fake/bytes?n=N              N bytes of zeros
+  GET  /fake/bytes?n=N[&rate=R]     N bytes of zeros, at R bytes a second
+                                    if given; a Range of bytes=K- is 206
+  GET  /fake/moved?to=PATH          302 to PATH, on this server
   GET|POST /fake/stall              read the request, then never answer
   GET|POST /fake/stallbody          answer 200, send 16 bytes, then stall
 
@@ -7042,18 +7044,38 @@ class Handler(BaseHTTPRequestHandler):
         elif url.path == "/fake/requests":
             self.send_json(200, STATE.log(q.get("model", [""])[0]))
         elif url.path == "/fake/bytes":
-            n = int(q.get("n", ["0"])[0])
-            self.send_response(200)
+            n     = int(q.get("n", ["0"])[0])
+            rate  = int(q.get("rate", ["0"])[0])
+            rng   = self.headers.get("Range") or ""
+            start = 0
+            if rng.startswith("bytes=") and rng.endswith("-"):
+                start = min(int(rng[6:-1]), n)
+                self.send_response(206)
+                self.send_header("Content-Range", f"bytes {start}-{n - 1}/{n}")
+            else:
+                self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")
-            self.send_header("Content-Length", str(n))
+            self.send_header("Content-Length", str(n - start))
             self.send_header("Connection", "close")
             self.end_headers()
-            block = bytes(1 << 20)
-            while n > 0:
-                k = min(n, len(block))
-                self.wfile.write(block[:k])
-                n -= k
+            block = bytes(max(rate // 10, 1) if rate else 1 << 20)
+            n -= start
+            try:
+                while n > 0:
+                    k = min(n, len(block))
+                    self.wfile.write(block[:k])
+                    n -= k
+                    if rate:
+                        self.wfile.flush()
+                        time.sleep(0.1)
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # cancelled, to resume
             self.close_connection = True
+        elif url.path == "/fake/moved":
+            self.send_response(302)
+            self.send_header("Location", q.get("to", ["/"])[0])
+            self.send_header("Content-Length", "0")
+            self.end_headers()
         elif url.path in ("/fake/stall", "/fake/stallbody"):
             self.stall(url.path)
         elif url.path.startswith(("/web/", "/searxng/")):

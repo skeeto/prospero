@@ -187,6 +187,27 @@ as, or of the request's `Copilot-Integration-Id`. `integration_id` in
 the endpoint's section sends that header, naming the product, likewise
 at your own risk. Prospero sends none of its own.
 
+`kind = builtin` is the built-in model, Gemma 4 E2B, which Prospero's
+desktop window runs itself, on this computer's processor. It has no
+URL, and no key:
+
+    [endpoint gemma]
+    kind = builtin
+
+Its file, 3.3 GB, is downloaded once, from Hugging Face, into the state
+directory's `models` folder (the first-run card's Download, or the
+endpoint's page in Settings), its SHA-256 checked. It is free and
+private, but slow, and far less capable than a service's models: for
+trying Prospero. It takes a processor with AVX2 (x86-64) or the dot
+product instructions (arm64, every Apple processor), and 6 GB of
+memory. The engine relays its calls to the window, as it relays a thin
+remote's to this computer, so a session on it waits, paused, while no
+window is open (Prospero in the background, or `prospero run`). It runs
+one request at a time (`max_concurrent` is 1): another session's turn
+waits in line. It takes no images. Its context window is 32768 tokens,
+and the prompts of the last few sessions stay cached in memory, up to
+2 GB, so each turn computes only what is new.
+
 For an OpenAI-compatible server, `template.NAME = VALUE` in a
 `[model NAME]` section is an argument of the model's chat template,
 sent in `chat_template_kwargs` (as llama.cpp and vLLM take it): `true`
