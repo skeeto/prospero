@@ -1354,6 +1354,9 @@ static void live(Session *s)
     } else if (s->state == S_RELAY) {
         i64 left = s->timers[T_RELAY] - now;
         putintkey(&w.json, "relay_until", os_time(os) + left/MS);
+        if (reqep(s)->kind == EP_BUILTIN) {
+            putintkey(&w.json, "relay_window", 1);  // it waits for the window
+        }
     } else if (s->state == S_BACKOFF) {
         i64 left = s->timers[T_BACKOFF] - now;
         putintkey(&w.json, "retry_at", os_time(os) + left/MS);
@@ -2286,7 +2289,7 @@ static b32 admit(Session *s, Arena scratch)
     Endpoint *ep    = reqep(s);
     Str       model = reqmodel(s);
     Str       id    = reqmc(s)->name;  // variants of a model share it
-    if (ep->relay.len) {
+    if (ep->relay.len && ep->kind!=EP_BUILTIN) {
         return 1;  // the computer relaying it admits it there
     }
     AdmPoint *p     = admpoint(&e->adm, &e->perm, ep->url);
@@ -2309,8 +2312,11 @@ static b32 admit(Session *s, Arena scratch)
         probe(e, p, ep, scratch);
     }
     pointlimits(p);
+    // The built-in model takes one call at a time, as it uses every core
+    b32 one = ep->kind == EP_BUILTIN;
+    p->maxreq = p->maxreq ? p->maxreq : one;
     i32 cap = confint(cfg, "model", epmodel(e, &scratch, ep->name, model), "max_concurrent");
-    cap = cap ? cap : mi.slots ? mi.slots : p->slots ? p->slots : 4;
+    cap = cap ? cap : one ? 1 : mi.slots ? mi.slots : p->slots ? p->slots : 4;
 
     s->admid     = s->admid ? s->admid : ++e->nextid;
     s->point     = p;
@@ -2827,10 +2833,17 @@ static b32 relaygate(Session *s, Arena scratch, Endpoint *ep)
         i64     budget = scaled(e, cfgms(e->cfg, "endpoint", ep->name,
                                          "slow_retry_budget", 0)*MS);
         Buf b(&scratch, 256 + ep->relay.len);
-        print(&b, "paused: no connected computer relays model calls for "
-                  "endpoint ");
-        print(&b, ep->relay);
-        print(&b, ", so the turn waits for one, for at most ");
+        if (ep->kind == EP_BUILTIN) {
+            print(&b, "paused: Prospero's window runs the built-in model of "
+                      "endpoint ");
+            print(&b, ep->relay);
+            print(&b, ", so the turn waits for the window to open, for at most ");
+        } else {
+            print(&b, "paused: no connected computer relays model calls for "
+                      "endpoint ");
+            print(&b, ep->relay);
+            print(&b, ", so the turn waits for one, for at most ");
+        }
         print(&b, secstr(&scratch, budget));
         print(&b, " s");
         note(s, scratch, "info", finish(&b));
@@ -16923,6 +16936,13 @@ static b32 endpointconf(Engine *e, Arena *perm, Str which, Endpoint *ep)
     if (!endpointurl(which)) {
         name = which;
         url  = trim(cfgget(cfg, "endpoint", which, "url", 0));
+        if (trim(cfgget(cfg, "endpoint", which, "kind", 0)) == "builtin") {
+            // The window runs it, as a computer that relays it: any url
+            // is unused (config.cpp notes so)
+            url = relayurlof(perm, EP_BUILTIN, which);
+        }
+    } else if (relayurl(which).kind == EP_BUILTIN) {
+        name = relayurl(which).name;  // its section, which has no url
     } else {
         for (IniSection *s = inifirst(e->ini, "endpoint"); s; s = ininext(s)) {
             if (trim(iniget(e->ini, "endpoint", s->name, "url")) == url) {
@@ -16933,16 +16953,18 @@ static b32 endpointconf(Engine *e, Arena *perm, Str which, Endpoint *ep)
     RelayUrl ru = relayurl(url);
     if (ru.ok) {
         // Relayed: the kind is the URL's, and with no section (none was
-        // offered since a restart) the settings are the defaults
+        // offered since a restart) the settings are the defaults. The
+        // built-in model's are a local endpoint's.
+        b32 local = ru.kind == EP_BUILTIN;
         *ep = {};
         ep->name      = clone(perm, name);
         ep->url       = clone(perm, url);
         ep->relay     = clone(perm, ru.name);
-        ep->firstbyte = cfgms(cfg, "endpoint", name, "first_byte_timeout", 0)*MS;
-        ep->idle      = cfgms(cfg, "endpoint", name, "idle_timeout", 0)*MS;
-        ep->progress  = cfgms(cfg, "endpoint", name, "progress_timeout", 0)*MS;
+        ep->firstbyte = cfgms(cfg, "endpoint", name, "first_byte_timeout", local)*MS;
+        ep->idle      = cfgms(cfg, "endpoint", name, "idle_timeout", local)*MS;
+        ep->progress  = cfgms(cfg, "endpoint", name, "progress_timeout", local)*MS;
         ep->kind      = ru.kind;
-        ep->wire      = ru.kind==EP_COPILOT ? EP_OPENAI : ru.kind;  // until discovered
+        ep->wire      = ru.kind==EP_COPILOT || local ? EP_OPENAI : ru.kind;  // until discovered
         return 1;
     }
     Url u = parseurl(url);
@@ -17081,6 +17103,11 @@ static void modelconf(Engine *e, Arena *perm, Str which, Str bare, ModelConf *mc
     Int ip = parseint(trim(cfgget(cfg, "model", model, "image_pixels", 0)));
     mc->coords    = co=="norm1000" ? COORDS_NORM1000 : COORDS_PIXELS;
     mc->novision  = !cfgbool(cfgget(cfg, "model", model, "vision", 0));
+    if (!cfgfind(cfg, "model", model, "vision").e &&
+            (relayurl(which).kind==EP_BUILTIN ||
+             trim(cfgget(cfg, "endpoint", which, "kind", 0))=="builtin")) {
+        mc->novision = 1;  // the built-in model takes text alone
+    }
     mc->nopdf     = !cfgbool(cfgget(cfg, "model", model, "pdf", 0));
     mc->imgedge   = ie.ok && ie.val>=16 && ie.val<=16384 ? ie.val : 0;
     mc->imgpixels = ip.ok && ip.val>=256 && ip.val<=(i64)1<<28 ? ip.val : 0;
@@ -26883,8 +26910,11 @@ static void ontimer(Session *s, Arena scratch, i32 t)
         return;
     case T_RELAY: {
         Endpoint *ep  = reqep(s);
-        Str       msg = concat(&scratch, "no connected computer relayed model "
-                               "calls for endpoint ", ep->relay);
+        Str       msg = concat(&scratch, ep->kind==EP_BUILTIN ?
+                               Str("Prospero's window, which runs the built-in "
+                                   "model, was not open for endpoint ") :
+                               Str("no connected computer relayed model calls "
+                                   "for endpoint "), ep->relay);
         endturn(s, scratch, "error", msg);
     } return;
     case T_LIVE:

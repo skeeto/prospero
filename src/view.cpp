@@ -668,6 +668,7 @@ struct View {
     u8              relay[64];  // the computer relaying its calls, if any
     i32             relaylen;
     i64             relayuntil; // paused for a relay: epoch ms it gives up
+    b32             relaywin;   // for the window, which runs the built-in model
     Str             retrymodel; // the next attempt's model, from a retry
     b32             retryslow;  // minutes-long waits
     i32             fallback;   // switched to this fallback (1-based)
@@ -3577,6 +3578,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         copybytes(v->relay, relay.data, relay.len);
         v->relaylen   = (i32)relay.len;
         v->relayuntil = jsonint(jsonget(j, "relay_until"), 0);
+        v->relaywin   = jsonint(jsonget(j, "relay_window"), 0) != 0;
         v->state    = livestate(jsonstr(jsonget(j, "state")));
         v->novision = jsonint(jsonget(j, "novision"), 0) != 0;
         v->queuepos = (i32)jsonint(jsonget(j, "queue_pos"), 0);

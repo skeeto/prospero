@@ -818,6 +818,11 @@ static RelayCall *relaystart(Engine *e, Endpoint *ep, HttpReq *req,
         }
     }
 
+    // Whole to the window's built-in model, which would only spend
+    // time undoing a delta or deflate
+    b32 whole = ep && ep->kind==EP_BUILTIN;
+    keep &= !whole;
+
     // A delta against the last body sent there, if smaller, then
     // deflated, if that is smaller
     Str        data = body;
@@ -833,7 +838,7 @@ static RelayCall *relaystart(Engine *e, Endpoint *ep, HttpReq *req,
     }
     iz size = data.len;
     iz zlen = 0;
-    if (data.len>=256 && data.len<=relaybodymax()) {
+    if (!whole && data.len>=256 && data.len<=relaybodymax()) {
         iz  cap = data.len*9/8 + 16;
         u8 *z   = alloc<u8>(&scratch, cap);
         iz  n   = zdeflate(scratch, z, cap, data.data, data.len);

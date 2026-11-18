@@ -14,6 +14,7 @@ static void testrelayurl(Test *t)
         {"relay+anthropic://an.1",  "an.1:anthropic"},
         {"relay+responses://r",     "r:responses"},
         {"relay+chatgpt://c",       "c:chatgpt"},
+        {"relay+builtin://gemma",   "gemma:builtin"},
         {"relay+nosuch://x",        "-"},
         {"relay+chatgpt:/c",        "-"},
         {"relay://",                "-"},
@@ -143,6 +144,36 @@ static void testrelaylayer(Test *t)
     cfgload(c, v.scratch);
     expect(t, "layer.relayedown", istr(&a, c->thin), "1");
     expect(t, "layer.relayedurl", cfgget(c, "endpoint", "x", "url", 0), "relay://x");
+
+    // The built-in model is the file's own, with no url
+    os_write(v.os, a, "/c/p.ini", "[endpoint g]\nkind = builtin\n");
+    cfgload(c, v.scratch);
+    expect(t, "layer.builtin", istr(&a, c->thin), "0");
+    cfgfree(c);
+}
+
+// An endpoint of kind builtin: no url, yet an endpoint, the default
+// one, and one to name a model by; a url in it is unused.
+static void testrelaybuiltin(Test *t)
+{
+    Arena  a = t->perm;
+    CfgEnv v = newcfgenv(&a);
+    os_write(v.os, a, "/c/p.ini", "model = g/gemma-4-e2b\n[endpoint g]\nkind = builtin\n");
+    Config *c = newconfig(v.os, &a, v.scratch, "/c/p.ini", 0);
+    expect(t, "builtin.quiet", inidiags(&a, c->ini), "");
+    CfgDefaults d = cfgdefaults(c);
+    expect(t, "builtin.default", concat(&a, concat(&a, d.endpoint, " "), d.model),
+           "g gemma-4-e2b");
+    expect(t, "builtin.qualified", istr(&a, d.qualified), "1");
+
+    os_write(v.os, a, "/c/p.ini", "[endpoint g]\nkind = builtin\n");
+    cfgload(c, v.scratch);
+    d = cfgdefaults(c);
+    expect(t, "builtin.guessed", concat(&a, d.endpoint, istr(&a, d.guessed)), "g1");
+
+    os_write(v.os, a, "/c/p.ini", "[endpoint g]\nkind = builtin\nurl = http://h/\n");
+    cfgload(c, v.scratch);
+    expect(t, "builtin.url", istr(&a, contains(inidiags(&a, c->ini), "unused")), "1");
     cfgfree(c);
 }
 
@@ -380,6 +411,7 @@ static void test_relay(Test *t)
     testrelayurl(t);
     testrelayparse(t);
     testrelaylayer(t);
+    testrelaybuiltin(t);
     testrelaycall(t);
     testrelayskills(t);
     testownskills(t);

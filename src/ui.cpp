@@ -940,7 +940,8 @@ static Str livelabel(View *v, i32 state)
     return state==LIVE_TASK     ? Str("subagents") :
            state==LIVE_MCP      ? Str("starting MCP servers") :
            state==LIVE_WORKTREE ? Str("making the worktree") :
-           state==LIVE_RELAY    ? Str("paused: no relay") :
+           state==LIVE_RELAY    ? (v && v->relaywin ? Str("paused: no window")
+                                                    : Str("paused: no relay")) :
            state==LIVE_AUTH     ? Str("signing in again") : livenames[state];
 }
 
@@ -6810,7 +6811,21 @@ static void drawstrip(Gui *g, Arena scratch)
         }
         stripadd(&st, full, brief, g->pal->amber);
     }
-    if (v->state == LIVE_RELAY) {
+    if (v->state==LIVE_RELAY && v->relaywin) {
+        // The built-in model's session, whose window is closed
+        Buf b(&a, 128);
+        print(&b, "until Prospero's window opens");
+        if (v->relayuntil > nowms) {
+            print(&b, ", for up to ");
+            printsecs(&b, (v->relayuntil - nowms + 59999)/60000*60);
+        }
+        StripItem *it = stripadd(&st, finish(&b), "until the window opens");
+        if (it) {
+            it->tip = "Prospero's window runs the built-in model. Its turn "
+                      "resumes once the window opens, or ends after the "
+                      "endpoint's slow_retry_budget.";
+        }
+    } else if (v->state == LIVE_RELAY) {
         // A thin host's session, with no computer to make its calls
         Buf b(&a, 128 + v->model.len);
         print(&b, "until a computer offering ");
@@ -15620,6 +15635,7 @@ static void drawcfgadd(Gui *g, Arena scratch)
             "responses: OpenAI's Responses API",
             "chatgpt: ChatGPT, signed in to your account",
             "copilot: GitHub Copilot, signed in to your account",
+            "builtin: the built-in model, Gemma 4 E2B, on this computer",
         };
         static_assert(countof(kinds) == countof(epkinds), "a label for each kind");
         i32 k = g->addepkind>=0 && g->addepkind<(i32)countof(kinds) ? g->addepkind : 0;
@@ -15640,7 +15656,10 @@ static void drawcfgadd(Gui *g, Arena scratch)
         namedrect(g, "addkind", at, v2(at.x+cw, at.y+ImGui::GetFrameHeight()));
         Str url = epkindurl(g->addepkind);
         ImGui::PushTextWrapPos(0);
-        ImGui::TextDisabled("%s", cstr0(&a, epsigned(g->addepkind) ?
+        ImGui::TextDisabled("%s", cstr0(&a, g->addepkind==EP_BUILTIN ?
+            Str("No URL: Prospero's window runs it, slowly, and its file is "
+                "a 3.3 GB download") :
+            epsigned(g->addepkind) ?
             concat(&a, concat(&a, "URL ", url), ": then Sign in on its page, with "
                    "the account whose subscription it uses") :
             url.len ? concat(&a, "URL ", url) :
@@ -15741,7 +15760,9 @@ static void drawcfgadd(Gui *g, Arena scratch)
             // The kind first, then its URL, so the file reads in that order
             Str url = epkindurl(g->addepkind);
             guiconfigset(g, kind, name, "kind", epkindname(g->addepkind));
-            guiconfigset(g, kind, name, "url", url.len ? url : val);
+            if (g->addepkind != EP_BUILTIN) {
+                guiconfigset(g, kind, name, "url", url.len ? url : val);
+            }
             cfgselect(g, kind, name);
             g->cfgshowsel = 1;
             ImGui::CloseCurrentPopup();

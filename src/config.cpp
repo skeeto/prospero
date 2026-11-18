@@ -283,12 +283,13 @@ static CfgKey cfgschema[] = {
      "names it, at the endpoint above, else at one that lists it"},
 
     {"endpoint", "kind", CFG_ENUM, "openai", {},
-     "openai anthropic responses chatgpt copilot",
+     "openai anthropic responses chatgpt copilot builtin",
      "endpoint", "The API it speaks: openai (Chat Completions), anthropic "
      "(Messages), responses (OpenAI's Responses), chatgpt (Responses at "
-     "ChatGPT, signed in with a ChatGPT account instead of a key), or "
+     "ChatGPT, signed in with a ChatGPT account instead of a key), "
      "copilot (GitHub Copilot, signed in with a GitHub account, each model "
-     "in the format it takes)"},
+     "in the format it takes), or builtin (the built-in model, Gemma 4 "
+     "E2B, which Prospero's window runs on this computer, with no url)"},
     {"endpoint", "url", CFG_URL, "", {}, {}, "endpoint",
      "Base URL: chat requests go to URL/v1/chat/completions, for kind "
      "anthropic to URL/v1/messages, for responses and chatgpt to "
@@ -1731,14 +1732,29 @@ static iz cfgdistance(Str a, Str b)
 
 enum { CFG_LIKEMAX = 16 };
 
+// Whether an [endpoint] section is of kind builtin, which has no url.
+static b32 cfgbuiltin(IniSection *s)
+{
+    IniEntry *e = s && s->kind=="endpoint" ? inientry(s, "kind") : 0;
+    return e && trim(e->value)=="builtin";
+}
+
+// Whether [endpoint name] is an endpoint to use: it has a url, or is of
+// kind builtin.
+static b32 cfgisendpoint(Ini *ini, Str name)
+{
+    IniSection *s = name.len ? inisection(ini, "endpoint", name) : 0;
+    IniEntry   *u = s ? inientry(s, "url") : 0;
+    return (u && trim(u->value).len) || cfgbuiltin(s);
+}
+
 // MODEL split from ENDPOINT/MODEL, where ENDPOINT is a configured
 // endpoint's name, else null: a model's own name may hold a slash
 // (Qwen/Qwen3-8B).
 static Cut cfgsplitmodel(Ini *ini, Str spec)
 {
-    Cut       m = cut(spec, '/');
-    IniEntry *u = m.ok && m.head.len ? inilookup(ini, "endpoint", m.head, "url") : 0;
-    m.ok = m.ok && m.tail.len && u && trim(u->value).len;
+    Cut m = cut(spec, '/');
+    m.ok = m.ok && m.tail.len && cfgisendpoint(ini, m.head);
     return m;
 }
 
@@ -2076,7 +2092,8 @@ static Cut cfgqualified(Config *c, Str spec)
 {
     Cut m = cut(spec, '/');
     m.ok = m.ok && m.head.len && m.tail.len &&
-           trim(cfgget(c, "endpoint", m.head, "url", 0)).len;
+           (trim(cfgget(c, "endpoint", m.head, "url", 0)).len ||
+            trim(cfgget(c, "endpoint", m.head, "kind", 0))=="builtin");
     return m;
 }
 
@@ -2098,7 +2115,7 @@ static CfgDefaults cfgdefaults(Config *c)
     IniSection *s = inifirst(c->ini, "endpoint");
     for (; !r.endpoint.len && s; s = ininext(s)) {
         Str url = trim(cfgget(c, "endpoint", s->name, "url", 0));
-        if (s->name.len && endpointurl(url)) {
+        if (s->name.len && (endpointurl(url) || cfgbuiltin(s))) {
             r.endpoint = s->name;
             r.guessed  = 1;
         }
@@ -2478,7 +2495,7 @@ static void cfgsectionline(Ini *ini, Arena *perm, IniFile *f, IniFile *user,
     b32      unnamed = k && k->named && !l->value.len;
     b32      named   = k && !k->named && l->value.len;
     b32      nourl   = k && l->key=="endpoint" && l->value.len &&
-                       !inientry(l->section, "url");
+                       !inientry(l->section, "url") && !cfgbuiltin(l->section);
     b32      mcpcmd  = k && l->key=="mcp" && cfgheeded(user, l->section, "command");
     b32      mcpurl  = k && l->key=="mcp" && cfgheeded(user, l->section, "url");
     // A section of neither only adjusts projects' servers of its name:
@@ -2628,6 +2645,13 @@ static void cfgkeyline(Ini *ini, Arena *perm, IniFile *f, IniFile *user,
                       "in your own file or a local include"));
         return;
     }
+    if (l->key=="url" && cfgbuiltin(s) && trim(l->value).len) {
+        cfgreport(ini, perm, f, l, INI_WARNING, l->keybeg,
+                  cfgmuted(f) ? Str{} :
+                  Str("unused: Prospero's window runs the built-in model, "
+                      "which has no url"));
+        return;
+    }
     i32 j = cfgjudge(key, l->value, shared);
     if (j != CFG_OK) {
         Str msg = {};
@@ -2710,7 +2734,8 @@ static void cfgvalidate(Config *c, Ini *ini, IniFile *user, Arena *perm)
             CfgKey *k = cfgkey(s->kind, e->key);
             Str     v = trim(e->value);
             if (k && k->key=="endpoint" && v.len && !parseurl(v).ok &&
-                    !inientry(inisection(ini, "endpoint", v), "url")) {
+                    !inientry(inisection(ini, "endpoint", v), "url") &&
+                    !cfgbuiltin(inisection(ini, "endpoint", v))) {
                 Str msg = {};
                 if (!cfgmuted(e->file)) {
                     msg = concat(perm, "no [endpoint ", v);
@@ -2818,7 +2843,8 @@ static void cfgvalidate(Config *c, Ini *ini, IniFile *user, Arena *perm)
                 IniEntry *me = inilookup(ini, "", "", "model");
                 Cut       m  = cut(me ? trim(me->value) : Str{}, '/');
                 if (m.ok && m.head.len && m.tail.len && m.head!=v &&
-                        inientry(inisection(ini, "endpoint", m.head), "url")) {
+                        (inientry(inisection(ini, "endpoint", m.head), "url") ||
+                         cfgbuiltin(inisection(ini, "endpoint", m.head)))) {
                     Str msg = {};
                     if (!cfgmuted(e->file)) {
                         msg = concat(perm, "model names endpoint ", m.head);
@@ -3664,7 +3690,7 @@ static u64 cfgfingerprint(Os *os, Slice<Str> paths, Arena scratch, u64 h = 0x100
 
 // Whether ini defines no endpoint of its own: no [endpoint] url, nor a
 // top-level endpoint, that is a real URL outside the relay layer, whose
-// files are the first nlayer.
+// files are the first nlayer, and no builtin endpoint there.
 static b32 cfgthin(Ini *ini, i32 nlayer)
 {
     IniFile *own = ini->files;
@@ -3672,17 +3698,21 @@ static b32 cfgthin(Ini *ini, i32 nlayer)
         own = own->next;
     }
     for (IniSection *s = ini->sections; s; s = s->next) {
-        if (!(s->kind=="endpoint") && !(s->kind=="" && s->name=="")) {
+        b32 ep = s->kind == "endpoint";
+        if (!ep && !(s->kind=="" && s->name=="")) {
             continue;
         }
-        Str key = s->kind=="endpoint" ? Str("url") : Str("endpoint");
-        for (IniEntry *e = inientry(s, key); e; e = e->older) {
-            b32 layer = 1;
-            for (IniFile *f = own; layer && f; f = f->next) {
-                layer = f != e->file;
-            }
-            if (!layer && parseurl(trim(e->value)).ok) {
-                return 0;
+        for (i32 k = 0; k < 2; k++) {
+            Str key = k ? Str("kind") : ep ? Str("url") : Str("endpoint");
+            for (IniEntry *e = k && !ep ? 0 : inientry(s, key); e; e = e->older) {
+                b32 layer = 1;
+                for (IniFile *f = own; layer && f; f = f->next) {
+                    layer = f != e->file;
+                }
+                Str v = trim(e->value);
+                if (!layer && (k ? v=="builtin" : parseurl(v).ok)) {
+                    return 0;
+                }
             }
         }
     }
