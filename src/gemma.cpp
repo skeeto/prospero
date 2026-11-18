@@ -2256,7 +2256,7 @@ static i32 gmmain(Os *os, Arena perm, Str *args, i32 nargs)
                         "       prospero builtin-logits MODEL TEXT\n");
         return 1;
     }
-    i32    ctx = 32768;
+    i32    ctx = 65536;  // as the window lists (GM_CONTEXT)
     Gemma *g   = gmdevload(os, &perm, scratch, args[2], ctx);
     if (!g) {
         return 1;
