@@ -80,6 +80,7 @@
 #include "dropto.cpp"
 #include "a11y.cpp"
 #include "gemma.cpp"   // after dock.cpp: PROSPERO_DEVTOOLS
+#include "gemmachat.cpp"
 
 enum : i64 {
     STREAM_PERIOD = 1000000/30,  // µs between frames showing new deltas
@@ -30865,6 +30866,8 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     #if PROSPERO_DEVTOOLS
     if (nargs>1 && (args[1]=="builtin-bench" || args[1]=="builtin-logits")) {
         return gmmain(os, mem, args, nargs);  // gemma.cpp
+    } else if (nargs>1 && (args[1]=="builtin-chat" || args[1]=="builtin-render")) {
+        return gmchatmain(os, mem, args, nargs);  // gemmachat.cpp
     }
     #endif
     Gui *g = alloc<Gui>(&mem);
