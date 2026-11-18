@@ -106,9 +106,12 @@ enum : i32 {
     EP_RESPONSES,  // Responses (responses.cpp)
     EP_CHATGPT,    // Responses at ChatGPT's Codex backend, signed in
     EP_COPILOT,    // GitHub Copilot, signed in: each model's own format
+    EP_BUILTIN,    // the built-in model, which the desktop window runs
 };
 
-static Str const epkinds[] = {"openai", "anthropic", "responses", "chatgpt", "copilot"};
+static Str const epkinds[] = {
+    "openai", "anthropic", "responses", "chatgpt", "copilot", "builtin",
+};
 
 // A kind by its name, openai if unknown.
 static i32 epkindof(Str name)
@@ -212,7 +215,9 @@ static Str copilotpath(i32 wire)
 // A thin engine's endpoint, whose model calls a connected computer makes
 // (relay.cpp): relay://NAME for kind openai, relay+KIND://NAME for the
 // others (relay+anthropic://NAME), NAME being the [endpoint] section it
-// offered. The URL is the endpoint's identity, the kind included.
+// offered. The URL is the endpoint's identity, the kind included. An
+// endpoint of kind builtin is relay+builtin://NAME, its own section,
+// which the desktop window offers to its own engine.
 struct RelayUrl {
     Str name;
     i32 kind;

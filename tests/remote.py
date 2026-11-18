@@ -3857,6 +3857,47 @@ def relay_queued(t):
 
 
 @scenario
+def builtin_relay(t):
+    """An endpoint of kind builtin, which the window serves as a relay
+    peer of its own engine: with no window, a pause that names it; once
+    offered, its calls relayed whole (no delta, no deflate), and one at
+    a time, so a second session waits in line."""
+    model = t.model("remote_slow")
+    with open(t.config, "w", newline="") as f:
+        f.write(f"model = {model}\n[endpoint gemma]\nkind = builtin\n")
+    c = Client(t)
+    c.attach()
+    c.call("hello")
+    a = c.call("new", cwd=t.work, prompt="go")["sid"]
+    live = c.stream.wait(lambda r: r.get("ev") == "live" and r.get("sid") == a and
+                         r.get("state") == "relay", what="the pause")
+    t.check(live.get("relay_window") == 1, f"live {live}")
+    note = c.stream.wait(lambda r: r.get("ev") == "note" and r.get("sid") == a,
+                         what="its note")
+    t.check("window" in note.get("text", ""), f"note {note}")
+    r = c.call("relay.offer", offer=offer(t, model, machine="", name="gemma",
+                                          kind="builtin", listed=[model]))
+    t.check(r.get("ok") == 1 and r.get("thin") == 0, f"relay.offer: {r}")
+    rl = Relayer(t, c)
+    try:
+        b = c.call("new", cwd=t.work, prompt="go " * 200)["sid"]
+        c.stream.wait(lambda r: r.get("ev") == "live" and r.get("sid") == b and
+                      r.get("state") == "queued", timeout=30, what="the second in line")
+        for sid in (a, b):
+            end = c.stream.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid,
+                                timeout=60, what="turn.end")
+            t.check(end.get("why") == "done", f"turn.end {end}")
+        posts = [h for h, _ in rl.calls if h["method"] == "POST"]
+        t.check(len(posts) == 2 and all(h.get("kind") == "builtin" and
+                                        h["path"] == "v1/chat/completions" and
+                                        not h.get("base") and not h.get("zlen") and
+                                        not h.get("keep") for h in posts),
+                f"calls: {posts}")
+    finally:
+        rl.stop = True
+
+
+@scenario
 def relay_restart(t):
     """A thin host started again, with no offers yet: a session on a
     relayed endpoint keeps it, pauses, and goes on once one is offered."""
