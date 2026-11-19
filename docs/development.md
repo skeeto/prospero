@@ -143,6 +143,12 @@ llama.cpp router on this machine, and a model at Anthropic:
     $ prospero eval -m anthropic/claude-haiku-5-5 -f all -t t00-operator,t09-delete \
           -o claude.jsonl tests/bench/editbench
 
+`tests/bench/starter` is six small agentic tasks (write a program,
+fix a failing test, rename across files, add a feature, answer from
+the code), each checked by a script, for tuning what small local models
+such as the built-in one are given: compare roles with a copy of the
+suite whose `suite.ini` adds `role = NAME`.
+
 `tests/pdfcorpus.py` builds a corpus of PDFs for testing PDF reading,
 from this machine's programs (TeX Live, Chrome, Quartz, Ghostscript,
 qpdf, tesseract), each skipped if missing: real producers' output,

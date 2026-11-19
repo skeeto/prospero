@@ -1,0 +1,1 @@
+int serve(Config *c);
