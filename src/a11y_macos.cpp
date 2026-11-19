@@ -747,9 +747,10 @@ static void *macnsstr(Str s, Arena a)
 {
     void *r = nsstringn(s);
     if (!r && s.len) {
-        // Not UTF-8: each bad byte as U+FFFD, as ImGui shows it
-        if (fits(&a, s.len*3 + 1)) {
-            r = nsstring(toastclean(&a, s, s.len*3));
+        // Not UTF-8: cleaned step by step as the unit counts read it
+        // (axclean), or a range would land off by the difference
+        if (fits(&a, 2*(s.len*3 + 1))) {
+            r = nsstring(axclean(&a, s).cdata);
         }
     }
     return r ? r : nsstring("");

@@ -769,6 +769,33 @@ static AxSpan axselection(AxText *t)
     return s;
 }
 
+// Whether utf8decode's code point c takes a surrogate pair in UTF-16:
+// one past U+10FFFF becomes U+FFFD (axclean), a single unit.
+static b32 axpair(i32 c)
+{
+    return c>0xffff && c<=0x10ffff;
+}
+
+// Text as a platform's string takes it: valid UTF-8 without NULs, made
+// step by step as utf8decode reads it, so that each step is one code
+// point there and the unit counts here (axunits, axcount) hold for it.
+// What is not a code point (a NUL, a surrogate, a bad sequence) is
+// U+FFFD. Null-terminated, at most three times the length.
+static Str axclean(Arena *a, Str s)
+{
+    Buf b(a, 3*s.len + 1);
+    for (iz i = 0; i < s.len;) {
+        i32 c = utf8decode(s, &i);
+        b32 ok = c>0 && c<=0x10ffff && (c<0xd800 || c>0xdfff);
+        u8  e[4];
+        print(&b, Str{e, utf8encode(e, ok ? c : 0xfffd)});
+    }
+    putbyte(&b, 0);
+    Str r = finish(&b);
+    r.len--;  // the terminator past its length
+    return r;
+}
+
 static void axunits(A11y *x, AxUnit u)
 {
     AxText *t = &x->text;
@@ -782,7 +809,7 @@ static void axunits(A11y *x, AxUnit u)
         i32 beg = (i32)i;
         i32 c   = utf8decode(s, &i);
         r[n++] = beg;
-        if (u==AXU_UTF16 && c>0xffff) {
+        if (u==AXU_UTF16 && axpair(c)) {
             r[n++] = beg;  // the low surrogate: the same code point
         }
     }
@@ -839,7 +866,7 @@ static i32 axcount(Str s, AxUnit u, i32 b)
     i32 n = 0;
     for (iz i = 0; i < b && i < s.len;) {
         i32 c = utf8decode(s, &i);
-        n += u==AXU_BYTE ? 0 : u==AXU_UTF16 && c>0xffff ? 2 : 1;
+        n += u==AXU_BYTE ? 0 : u==AXU_UTF16 && axpair(c) ? 2 : 1;
     }
     return u==AXU_BYTE ? axclamp(b, 0, (i32)s.len) : n;
 }
@@ -850,7 +877,7 @@ static i32 axadvance(Str s, AxUnit u, i32 n)
     for (i32 k = 0; i < s.len;) {
         iz  beg = i;
         i32 c   = utf8decode(s, &i);
-        k += u==AXU_BYTE ? (i32)(i - beg) : u==AXU_UTF16 && c>0xffff ? 2 : 1;
+        k += u==AXU_BYTE ? (i32)(i - beg) : u==AXU_UTF16 && axpair(c) ? 2 : 1;
         if (k > n) {
             return (i32)beg;
         }

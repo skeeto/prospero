@@ -302,6 +302,20 @@ static void test_a11ytext(Test *t)
     Arena a = t->perm;
     A11y *x = newtesta11y(&a);
 
+    // Bad UTF-8: the platform's string (axclean) has as many UTF-16
+    // units as the counts here, whatever the decoder made of each step
+    {
+        Str bad = "a\xc0\x80" "b\xe0\x80\x80" "c\xe2\x82" "d\xf7\xbf\xbf\xbf" "e\xed\xa0\x80";
+        axtestsync(x, &a, 0, 1, bad, 0, 0);
+        Str c  = axclean(&a, bad);
+        i32 n  = 0;
+        for (iz i = 0; i < c.len;) {
+            i32 cp = utf8strict(c, &i);
+            n += cp>0xffff ? 2 : 1;
+        }
+        expect(t, "a11ytext.badunits", istr(&a, axunitlen(x, AXU_UTF16)), istr(&a, n));
+    }
+
     // UTF-8, UTF-16 and code points: an emoji past U+FFFF is a
     // surrogate pair, a CJK character one unit
     Str s = "a\xf0\x9f\x98\x80" "b\xe4\xb8\xad\n";  // a😀b中\n
