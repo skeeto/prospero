@@ -1821,23 +1821,30 @@ static void onparam(void *data, u32 id, void const *param)
     if (podget(p+4) != SPA_OBJECT || size < 8) {
         return;
     }
-    for (u32 off = 8; off+16 <= size;) {
+    // Each property's value read only within its size, and that within
+    // the object's: the pod's sizes are taken from it, not trusted
+    for (u64 off = 8; off+16 <= size;) {
         u8 *prop  = p + 8 + off;
         u32 key   = podget(prop);
-        u32 vsize = podget(prop+8);
+        u64 vsize = podget(prop+8);
         u32 vtype = podget(prop+12);
         u8 *val   = prop + 16;
+        u64 vlen  = vsize;
+        if (off+16+vsize > size) {
+            break;
+        }
         if (vtype==SPA_CHOICE && vsize>=16) {
             vtype = podget(val+12);  // the child's type, its first value
             val  += 16;
+            vlen -= 16;
         }
-        if (key==SPA_FVFORMAT && vtype==SPA_ID) {
+        if (key==SPA_FVFORMAT && vtype==SPA_ID && vlen>=4) {
             g->format = podget(val);
-        } else if (key==SPA_FVSIZE && vtype==SPA_RECT) {
+        } else if (key==SPA_FVSIZE && vtype==SPA_RECT && vlen>=8) {
             g->w = (i32)podget(val);
             g->h = (i32)podget(val+4);
         }
-        off += 16 + ((vsize + 7) & ~7u);
+        off += 16 + ((vsize + 7) & ~(u64)7);
     }
     void const *params[] = {g->params.data};
     g->pl->pw_stream_update_params(g->stream, params, 1);
