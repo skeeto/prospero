@@ -11309,16 +11309,25 @@ static Str jobstate(Arena *a, ViewJob *j)
     return finish(&b);
 }
 
-// A job's item's tooltip: its number, as the agent knows it, its whole
-// command, and where all its output is.
+// A job's item's tooltip: its number, as the agent knows it, and its
+// whole name, which its row may cut; its whole command; and where all
+// its output is.
 static void jobtip(Arena *a, ViewJob *j, Str spill)
 {
-    if (spill.len) {
-        itemtip("Job %lld\n%s\nFull output: %s", (long long)j->n,
-                cstr0(a, j->command), cstr0(a, spill));
-    } else {
-        itemtip("Job %lld\n%s", (long long)j->n, cstr0(a, j->command));
+    Buf b(a, 256);
+    print(&b, "Job ");
+    print(&b, j->n);
+    if (j->desc.len) {
+        print(&b, ": ");
+        print(&b, j->desc);
     }
+    print(&b, "\n");
+    print(&b, j->command);
+    if (spill.len) {
+        print(&b, "\nFull output: ");
+        print(&b, spill);
+    }
+    itemtip("%s", cstr0(a, finish(&b)));
 }
 
 // The session's background jobs, newest first: a dot in its state's
