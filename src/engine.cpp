@@ -126,7 +126,11 @@ enum : i64 {
     ERRBODY_MAX  = 64 << 10,
     MODELS_MAX   = 8 << 20,
     LOG_MAX      = (i64)1 << 30,
-    SSE_MAX      = 16 << 20,      // longest line or event of a stream
+    // Longest line or event of a stream. Its line, data and type buffers
+    // each grow toward it by doubling in the attempt region, which is
+    // 64 MiB in a 32-bit build: a quarter there, or a broken stream's
+    // long lines exit the engine.
+    SSE_MAX      = sizeof(void *)==8 ? 16 << 20 : 4 << 20,
     QUIT_WAIT    = 5*SEC,         // for turns to end after quit
     LIVE_EVERY   = 1*SEC,         // live records while a request runs
     TITLE_MAX    = 60,            // code points
