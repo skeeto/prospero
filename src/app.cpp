@@ -8581,6 +8581,12 @@ static b32 guirelayq(Gui *g, GuiHost *h, Str line)
         }
         h->rq = newarena(h->rqmem);
     }
+    // rqbytes counts the lines, but the slice moves as it grows, the
+    // lines between: what the arena has left decides too
+    iz grow = (h->rqueue.cap + 8) * 2 * (iz)sizeof(Str);
+    if (!fits(&h->rq, line.len + grow)) {
+        return 0;
+    }
     h->rqueue   = push(&h->rq, h->rqueue, clone(&h->rq, line));
     h->rqbytes += line.len;
     return 1;
