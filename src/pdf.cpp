@@ -1740,6 +1740,33 @@ static PdfData pdffilter(Pdf *p, Arena *a, i32 id, PdfObj parms, Str in, iz cap)
     return r;
 }
 
+// A filter's /DecodeParms with the values pdffilter reads resolved now,
+// in a dict of their own, in a: resolving parses into keep, and once a
+// chain's output is in keep, its stages move and trim over what is after
+// it, so nothing may be resolved after the first stage.
+static PdfObj pdfparmsnow(Pdf *p, Arena *a, PdfObj parms)
+{
+    static Str const keys[] = {
+        "EarlyChange", "Predictor", "Colors", "BitsPerComponent", "Columns",
+    };
+    if (parms.kind != PDFO_DICT) {
+        return parms;
+    }
+    PdfObj r = {};
+    r.kind  = PDFO_DICT;
+    r.items = pdfnew<PdfObj>(p, a, 2*countof(keys));
+    for (iz i = 0; r.items && i<countof(keys); i++) {
+        PdfObj v = pdfget(p, pdfkey(parms, keys[i]));
+        if (v.kind==PDFO_INT || v.kind==PDFO_REAL) {
+            r.items[2*r.len].kind = PDFO_NAME;
+            r.items[2*r.len].s    = keys[i];
+            r.items[2*r.len+1]    = v;
+            r.len++;
+        }
+    }
+    return r;
+}
+
 // A stream's data, from raw through the filters its dict names (/Filter,
 // or an inline image's /F, with /DecodeParms or /DP aligned, a lone dict
 // for every filter), in a and at most cap bytes: PDF_STREAMMAX if zero.
@@ -1783,6 +1810,9 @@ static PdfData pdfdecode(Pdf *p, Arena *a, PdfObj dict, Str raw, iz cap)
                     : parms.kind==PDFO_DICT  ? parms : PdfObj{};
         ids[i] = name.kind==PDFO_NAME ? pdffilterid(name.s) : PDFF_UNKNOWN;
         fps[i] = pdfget(p, fp);
+        if (ids[i]==PDFF_FLATE || ids[i]==PDFF_LZW) {
+            fps[i] = pdfparmsnow(p, a, fps[i]);  // its values too
+        }
     }
 
     // The last stage decoded here takes the caller's cap, the rest the

@@ -607,6 +607,27 @@ static void test_pdffilters(Test *t)
                chain).data, data);
         expect(t, "pdf.chain inline", pdfdec(&a, "<</F[/AHx/LZW]/DP[null<</EarlyChange 0>>]>>",
                chain).data, data);
+        // Into keep, as object streams decode, a parameter by reference
+        // to an object not yet parsed: parsing it (a dict, which LZW takes
+        // as the default) lands in keep after the first stage's output,
+        // which the next stage must not move or trim over
+        {
+            Str    early = pdfahxenc(&a, pdflzwenc(&a, data, 1));
+            Str    doc   = "%PDF-1.5\n3 0 obj\n<< /K 7 /L [1 2 3] >>\nendobj\n";
+            Arena  s     = carve(&a, 1<<20);
+            Pdf    p     = pdfstart(s, doc, {});
+            pdfload(&p);
+            PdfLex x     = {&p, &p.keep, "<</F[/AHx/LZW]/DP[null<</EarlyChange 3 0 R>>]>>",
+                            0, 1, 0};
+            PdfObj  d    = pdfparse(&x);
+            PdfData o    = pdfdecode(&p, &p.keep, d, early, 0);
+            expect(t, "pdf.chain keep", o.data, data);
+            PdfObj ref = {};
+            ref.kind    = PDFO_REF;
+            ref.ref.num = 3;
+            PdfObj three = pdfget(&p, ref);
+            expect(t, "pdf.chain keep memo", istr(&a, pdfint(&p, three, "K", -1)), "7");
+        }
         // Stopped by the budget before the last stage: no data, as the
         // first stage's output is not the stream's
         PdfDecoded e = pdfdec(&a, "<</Filter[/LZW/AHx]>>", pdflzwenc(&a, pdfahxenc(&a, data), 1),
