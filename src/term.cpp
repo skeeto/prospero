@@ -1741,7 +1741,7 @@ static void termpaste(Gui *g, TermTab *tt, Arena a)
     if (g->termpasteregion) {
         os_release(g->os, g->termpasteregion);
     }
-    g->termpasteregion = os_reserve(g->os, in.len);
+    g->termpasteregion = os_reserve(g->os, in.len + 4096);  // and its header
     if (!g->termpasteregion) {
         return;
     }
