@@ -13594,6 +13594,38 @@ EXTRA_TOOLS = [
 ]
 
 
+@scenario(conf=mcpconf(), bound=30)
+def mcp_toollist_big(t):
+    """mcp {tools}: a tool whose schema runs to hundreds of KB is listed,
+    its parameters summed up as for any, and one far larger is listed
+    without them, the engine still up."""
+    def wide(name, n):
+        props = {f"p{i}": {"type": "string", "enum": [f"v{k}" for k in range(8)]}
+                 for i in range(n)}
+        return {"name": name, "description": "Wide.",
+                "inputSchema": {"type": "object", "properties": props, "required": ["p0"]}}
+    t.put("extra.json", json.dumps([wide("wide", 3000), wide("wider", 60000)]))
+    env = mcpenv(t, FAKE_MCP_EXTRA="@" + t.host.join(t.work, "extra.json"))
+    h = t.headless(env=env)
+    try:
+        h.call("mcp", name="fake", tools=1, start=1)
+        deadline = time.monotonic() + 15
+        srv = {}
+        while time.monotonic() < deadline:
+            srv = h.call("mcp", name="fake", tools=1)["servers"][0]
+            if srv["state"] != "starting":
+                break
+            time.sleep(0.1)
+        t.check(srv["state"] == "ready", f"ready {str(srv)[:300]}")
+        tl = {x["tool"]: x for x in srv["toollist"]}
+        t.check(tl["wide"].get("params", "").startswith("p0: string, p1?: string"),
+                f"wide {str(tl.get('wide'))[:300]}")
+        t.check("wider" in tl and "params" not in tl["wider"], f"wider {str(tl.get('wider'))[:300]}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 @scenario(conf=mcpconf(tools="-where, -big"), bound=30)
 def mcp_toollist(t):
     """mcp {name, tools, start}: a server of the configuration started by

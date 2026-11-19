@@ -15043,9 +15043,14 @@ static b32 mcpfilterable(Str tool)
 }
 
 // A tool's parameters, briefly, for a person: "name: type, name?: type"
-// from its schema, cut.
+// from its schema, cut. None for a schema whose parse may not fit in a,
+// which may be a carve.
 static Str mcpparams(Arena *a, Str schema)
 {
+    iz need = schema.len + (schema.len/2 + 64)*(iz)sizeof(Json) + 4096;
+    if (!fits(a, need)) {
+        return {};
+    }
     Json *root  = jsonparse(a, schema).root;
     Json *props = jsonget(root, "properties");
     Json *req   = jsonget(root, "required");
@@ -15187,7 +15192,7 @@ static void cmdmcp(Engine *e, Arena scratch, i64 id, Json *j)
     }
     // What each server's entry needs for a while, apart from the reply,
     // which grows at the end of scratch
-    Arena tmp = carve(&scratch, 1<<20);
+    Arena tmp = carve(&scratch, 1<<24);  // a tool's schema parsed, up to about 400 KB
     Buf   b(&scratch, 1<<14);
     EvOut w = evbegin(&b, {}, 0, os_time(e->os), EV_REPLY);
     putintkey(&w.json, "id", id);
