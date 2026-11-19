@@ -232,6 +232,8 @@ static void termrowtext(TermSink *k, ariel_Term *t, i64 row, i32 x0)
 {
     ariel_Cell cells[TERMCMD_ROW];
     i32 n   = ariel_line(t, row, cells, countof(cells));
+    // ariel_line returns the row's column count, which may be more
+    n = n<(i32)countof(cells) ? n : (i32)countof(cells);
     b32 wrp = (ariel_lineinfo(t, row).flags & ARIEL_R_WRAPPED) != 0;
     i32 end = n;
     for (; !wrp && end>x0 && !cells[end-1].cp; end--) {}
