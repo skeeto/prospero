@@ -2879,17 +2879,28 @@ static Slice<FontFile> os_guifonts(Os *os, Arena *a, Arena scratch, Str statedir
                 find(loc, "Hant")>=0 ? Str("zh-tw") : Str("zh-cn");
     Str langs[] = {first, "zh-cn", "ja", "ko", "zh-tw"};
 
-    DeployConf c = {};
+    // The mailbox in a region of its own: an fc-match given up on (stuck
+    // past its kill, as on a dead network font directory) may still post
+    // to it from its reader and waiter threads, so then it is never
+    // released, unlike this thread's scratch
+    Region *mr = os_reserve(os, 1<<20);
+    if (!mr) {
+        return {};
+    }
+    Arena      ma = newarena(mr);
+    DeployConf c  = {};
     c.localstate = statedir;
     Deploy d = {};
     d.os   = os;
     d.conf = &c;
-    d.mb   = newmailbox(&scratch, 1<<16, 0, 0);
+    d.mb   = newmailbox(&ma, 1<<16, 0, 0);
     d.env  = os_environ(os, &scratch);
     if (!d.mb) {
+        os_release(os, mr);
         return {};
     }
-    Slice<FontFile> r = {};
+    b32             stuck = 0;
+    Slice<FontFile> r     = {};
     for (iz i = 0; i < countof(langs); i++) {
         if (!langs[i].len || (i && langs[i]==first)) {
             continue;
@@ -2901,6 +2912,7 @@ static Slice<FontFile> os_guifonts(Os *os, Arena *a, Arena scratch, Str statedir
         argv = push(&scratch, argv, concat(&scratch, ":lang=", langs[i]));
         DeployRun run = deployrun(&d, &scratch, argv, 5*SEC);
         Cut       l   = cut(run.out, '\n');
+        stuck |= run.timeout;
         if (run.code || !l.head.len) {
             continue;
         }
@@ -2908,6 +2920,9 @@ static Slice<FontFile> os_guifonts(Os *os, Arena *a, Arena scratch, Str statedir
         ff.path  = clone(a, l.head);
         ff.index = (i32)parseint(trim(cut(l.tail, '\n').head)).val;
         r = push(a, r, ff);
+    }
+    if (!stuck) {
+        os_release(os, mr);
     }
     return r;
 }

@@ -9731,7 +9731,7 @@ static void guifontsthread(void *arg)
         Slice<FontFile> cands = {};
         if (!named) {
             // Its own scratch, apart from the list it makes in scratch:
-            // fc-match's mailbox and records live there
+            // fc-match's records live there
             Arena work = carve(&scratch, (iz)1<<22);
             cands = os_guifonts(os, &scratch, work, f->statedir);
         } else {
