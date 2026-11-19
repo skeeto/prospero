@@ -1628,7 +1628,8 @@ static void webnotenotice(Session *, Arena, Str kind, Str text, Slice<Str> urls)
 static void webnotetool(Session *, Arena, Str name, Str status, Str text,
                         Slice<Str> urls);
 static void webnote(Session *, Arena, Str text, b32 bare);
-static Slice<Str> webvouch(Session *, Arena *, Str text);
+static Slice<Str> webvouched(Session *, Arena *, Str text);
+static Slice<Str> webvouch(Session *, Arena *, Arena, Str text);
 
 // The urls key of a record: URLs one session vouches for to another.
 static void puturls(JsonOut *w, Slice<Str> urls)
@@ -1663,7 +1664,7 @@ static void adduser(Session *s, Arena scratch, Str text, Str via,
                     Slice<MsgImage> images = {}, Slice<MsgFile> files = {},
                     Slice<MsgSess> refs = {})
 {
-    Slice<Str> urls = via=="task" ? webvouch(s->parent, &scratch, text) : Slice<Str>{};
+    Slice<Str> urls = via=="task" ? webvouched(s->parent, &scratch, text) : Slice<Str>{};
     iz    reflen = 0;
     for (iz i = 0; i < refs.len; i++) {
         reflen += 64 + refs[i].sid.len + 2*refs[i].title.len;
@@ -9327,23 +9328,31 @@ static void webnotetool(Session *s, Arena scratch, Str name, Str status, Str tex
 }
 
 // The URLs in text that s was shown, for s to vouch for to another
-// session: none without s.
-static Slice<Str> webvouch(Session *s, Arena *a, Str text)
+// session: none without s. In a, with what finding them took, and
+// perhaps in text.
+static Slice<Str> webvouched(Session *s, Arena *a, Str text)
 {
-    Slice<Str> r = {};
-    if (!s) {
-        return r;
-    }
-    Arena      tmp  = *a;
-    Slice<Str> urls = weburls(&tmp, text, 0);
     Slice<Str> keep = {};
+    if (!s) {
+        return keep;
+    }
+    Slice<Str> urls = weburls(a, text, 0);
     for (iz i = 0; i < urls.len; i++) {
         if (upsert(&s->webseen, urls[i], (Arena *)0)) {
-            keep = push(&tmp, keep, urls[i]);
+            keep = push(a, keep, urls[i]);
         }
     }
+    return keep;
+}
+
+// The same, found in scratch, then copied into a, apart from it and
+// from text, for a result that outlives both.
+static Slice<Str> webvouch(Session *s, Arena *a, Arena scratch, Str text)
+{
+    Slice<Str> keep = webvouched(s, &scratch, text);
+    Slice<Str> r    = {};
     for (iz i = 0; i < keep.len; i++) {
-        r = push(a, r, clone(a, keep[i]));  // a's own copies, past tmp's
+        r = push(a, r, clone(a, keep[i]));
     }
     return r;
 }
@@ -18951,7 +18960,7 @@ static void taskreport(Session *c, Arena scratch, Str why, Str err, Str wtline =
     t->text = clone(&p->perm, text);
     t->spent = clone(&p->perm, taskspent(&scratch, c));
     t->wtline = wtline.len ? clone(&p->perm, wtline) : Str{};
-    t->urls = webvouch(c, &p->perm, text);  // for the parent's webseen
+    t->urls = webvouch(c, &p->perm, scratch, text);  // for the parent's webseen
     t->took = os_ticks(p->e->os) - t->start;
     t->done = 1;
     arm(p, T_TASK, 0);
@@ -19154,7 +19163,7 @@ static void bgreport(Session *c, Arena scratch, Str why, Str err, Str wtline)
     Str tail   = spentline(&scratch, ms, taskspent(&scratch, c));
     tail = wtline.len ? concat(&scratch, concat(&scratch, wtline, "\n\n"), tail) : tail;
     bgnotice(p, scratch, c->pcall, c->sid, c->title, {}, status, text,
-             webvouch(c, &p->perm, text), tail);
+             webvouch(c, &p->perm, scratch, text), tail);
 }
 
 // Whether a subagent's report waits that may start a turn.
