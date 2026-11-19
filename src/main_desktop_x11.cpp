@@ -967,6 +967,9 @@ static Str x11open(Dk *dk)
         if (!dk->x.XOpenDisplay) {
             Str why = loadxlib(dk, perm);
             if (why.data) {
+                // Part may have loaded (libX11 without libXtst): not taken
+                // as loaded next time, which may clear why (Wayland)
+                dk->x.XOpenDisplay = 0;
                 dk->why = why;  // for good
                 return why;
             }
