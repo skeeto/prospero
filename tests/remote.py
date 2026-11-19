@@ -4328,6 +4328,10 @@ def relay_offer(t):
     c = Client(t)
     c.attach()
     c.call("hello")
+    model = t.model("relay_offer")  # listed, so the offer has a listing to give
+    r = c.call("models", timeout=15)
+    listed = [e.get("models", []) for e in r.get("endpoints", []) if e.get("name") == "fake"]
+    t.check(r.get("ok") == 1 and len(listed) == 1 and model in listed[0], f"models {r}")
     r = c.call("offer")
     t.check(r.get("ok") == 1, f"offer {r}")
     o = r["offer"]
@@ -4337,6 +4341,7 @@ def relay_offer(t):
     eps = o["endpoints"]
     t.check(len(eps) == 1 and eps[0]["name"] == "fake" and eps[0]["kind"] == "openai"
             and eps[0]["first_byte_timeout"] == "5", f"endpoints {eps}")
+    t.check(listed and eps[0].get("models") == listed[0], f"listing {eps}")
     kid = [m for m in o["models"] if m["name"] == "kid"][0]["settings"]
     t.check(kid.get("context") == "1000" and kid.get("reasoning_budget") == "50" and
             kid.get("template.enable_thinking") == "false" and "max_concurrent" not in kid
