@@ -525,6 +525,7 @@ struct Prop {
     u8 *data;    // format 8: bytes; 32: Xlong items, whatever the size
     iz  len;     // items
     Xid type;
+    i32 format;  // 8, 16 or 32, as the server returned it
     b32 ok;
 };
 
@@ -551,8 +552,9 @@ static Prop getprop(Dk *dk, Arena *a, Xid w, Xid prop, Xid type, iz max)
         }
         iz size = format==32 ? (iz)sizeof(Xlong) : format==16 ? 2 : 1;
         copybytes(r.data, data, r.len*size);
-        r.type = actual;
-        r.ok   = 1;
+        r.type   = actual;
+        r.format = format==32 || format==16 ? format : 8;
+        r.ok     = 1;
     }
     if (data) {
         dk->x.XFree(data);
@@ -560,9 +562,15 @@ static Prop getprop(Dk *dk, Arena *a, Xid w, Xid prop, Xid type, iz max)
     return r;
 }
 
+// Item i, by the format the property came in: a client may set a
+// property of the expected type in any format.
 static Xlong propitem(Prop p, iz i)
 {
-    return ((Xlong *)p.data)[i];
+    switch (p.format) {
+    case 32: return ((Xlong *)p.data)[i];
+    case 16: return ((unsigned short *)p.data)[i];
+    }
+    return p.data[i];
 }
 
 struct Card {
