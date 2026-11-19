@@ -9642,7 +9642,8 @@ static void termlaunch(Gui *g, Arena a, GuiSession *s, Slice<Str> env, Str distr
     g->termenv = env.len > 0;
     if (!g->drive || g->realterm) {
         Str dir = p.dir.len ? p.dir : userhome(g->os, &a);
-        if (!os_launch(g->os, a, argv, dir, env.len ? env : guienv(g, &a))) {
+        Slice<Str> ev = env.len ? env : guienv(g, &a);  // before a is copied
+        if (!os_launch(g->os, a, argv, dir, ev)) {
             g->lasterr = clone(&g->perm, concat(&a, "cannot open a terminal: ",
                                                 os_lasterr(g->os, &a)));
         }

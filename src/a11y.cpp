@@ -1691,7 +1691,8 @@ static b32 axselect(A11y *x, i32 anchor, i32 caret, i64 now)
     e.when   = now;
     e.anchor = axtobyte(x, AXU_BYTE, anchor);
     e.caret  = axtobyte(x, AXU_BYTE, caret);
-    x->queue = push(axqueue(x), x->queue, e);
+    Arena *q = axqueue(x);  // may reset x->queue, so before reading it
+    x->queue = push(q, x->queue, e);
     t->anchor = e.anchor;
     t->caret  = e.caret;
     return 1;
