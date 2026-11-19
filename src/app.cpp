@@ -5505,7 +5505,7 @@ static void setcfgstr(Gui *g, Str *dst, CfgRow r)
 }
 
 static void wslremotes(Gui *);
-static void setnotify(Gui *, u32);
+static void setnotify(Gui *, Arena, u32);
 
 static void palbuild(Gui *, Arena, b32);
 
@@ -5607,7 +5607,7 @@ static void loadcfg(Gui *g, Arena scratch, Str line)
         } else if (r.kind=="ui" && r.key=="mentions") {
             g->nomentions = cfgbool(r.valid && r.value.len ? r.value : r.dflt) == 0;
         } else if (r.kind=="ui" && r.key=="notify") {
-            setnotify(g, notifyparse(r.valid && r.value.len ? r.value : r.dflt));
+            setnotify(g, t, notifyparse(r.valid && r.value.len ? r.value : r.dflt));  // past typed
         } else if (r.kind=="tools" && r.key=="path_prepend") {
             setcfgstr(g, &g->pathpre, r);
         } else if (r.kind=="tools" && r.key=="path_append") {
@@ -12104,24 +12104,26 @@ static i32 toastasks(Gui *g, GuiSession *root, i64 now, GuiSession **who, ViewTo
     return n;
 }
 
-// A refusal: said once in the log for each cause.
+// A refusal: said once in the log for each cause, the line made in perm
+// with the cause, as it is kept anyway, so that it needs no scratch.
 static void toastrefused(Gui *g, Str why)
 {
     if (why != g->toastwhy) {
-        g->toastwhy = clone(&g->perm, why);
-        guilog(g, concat(&g->frame, "desktop notifications: ", g->toastwhy));
+        Str head = "desktop notifications: ";
+        Str line = concat(&g->perm, head, why);
+        g->toastwhy = cuthead(line, head.len);
+        guilog(g, line);
     }
 }
 
 // Make the platform ready for toasts, once they are wanted.
-static void toastready(Gui *g)
+static void toastready(Gui *g, Arena scratch)
 {
     if (g->toastprep || !g->notify || (g->drive && !g->realtoast)) {
         return;
     }
     g->toastprep = 1;
-    Arena a   = g->frame;
-    Str   why = os_guitoastprep(g->os, &a);
+    Str why = os_guitoastprep(g->os, &scratch);
     if (why.len) {
         toastrefused(g, why);
     }
@@ -12372,10 +12374,10 @@ static void toastbg(Gui *g, Arena scratch, Str msg)
 }
 
 // [ui] notify, as read or set
-static void setnotify(Gui *g, u32 notify)
+static void setnotify(Gui *g, Arena scratch, u32 notify)
 {
     g->notify = notify;
-    toastready(g);
+    toastready(g, scratch);
 }
 
 // The window goes, and the tray icon stays, if there is one. Never from
@@ -30231,7 +30233,7 @@ static void drivestep(Gui *g)
         g->drivefocus = (i32)op->dx;
         break;
     case OP_NOTIFY:
-        setnotify(g, (u32)op->dx);
+        setnotify(g, g->frame, (u32)op->dx);
         break;
     case OP_TOASTMARK:
         g->drivetoasts = g->toastsshown;
@@ -31371,7 +31373,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
         }
     }
     g->sched.pace = os_guirefresh(os);
-    toastready(g);
+    toastready(g, g->frame);
 
     switch (g->enginekind) {
     case ENGINE_FAKE:
