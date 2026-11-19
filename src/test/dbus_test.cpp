@@ -79,6 +79,15 @@ static void test_dbus(Test *t)
         }
         expect(t, "body wrong sig", istr(a, dbparse(a, r.body, "oa{sv}i") != 0), "0");
         expect(t, "body short", istr(a, dbparse(a, cuttail(r.body, 1), r.h.sig) != 0), "0");
+
+        // An array too big for the arena: refused, not an exit
+        Arena s    = *a;
+        iz    n    = 1 << 20;
+        Str   big  = {allocbytes(&s, 4+n), 4+n};
+        for (iz i = 0; i < big.len; i++) big[i] = 0;
+        big[0] = 0; big[1] = 0; big[2] = 0x10; big[3] = 0;  // 1 MiB, little-endian
+        Arena small = carve(&s, 1<<16);
+        expect(t, "body too big", istr(&s, dbparse(&small, big, "ay") != 0), "0");
     }
 
     // A portal's Start response: a(ua{sv}) streams with (ii) tuples

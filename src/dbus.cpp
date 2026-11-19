@@ -250,6 +250,7 @@ struct DbReader {
     Str    data;
     iz     pos;
     b32    ok;
+    DbVal  spare;  // what dbvalue gives once out of room, the parse failed
 };
 
 static b32 dbalign(DbReader *r, iz align)
@@ -342,6 +343,13 @@ static DbVal *dbvalues(DbReader *r, Str sig, i32 depth, iz *count)
 
 static DbVal *dbvalue(DbReader *r, Str sig, i32 depth)
 {
+    // Out of room fails the parse, not the process: a message's array
+    // of 2^26 bytes is a node each, more than any arena here
+    if (!fits(r->a, (iz)(2*sizeof(DbVal) + alignof(DbVal)))) {  // as alloc asks
+        r->ok    = 0;
+        r->spare = {};
+        return &r->spare;
+    }
     DbVal *v = alloc<DbVal>(r->a);
     v->type = sig.len ? sig[0] : 0;
     if (depth > DB_MAXDEPTH) {
