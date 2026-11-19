@@ -2543,8 +2543,7 @@ static b32 authgate(Session *, Arena, Endpoint *);
 
 // What Copilot is told of a request, beyond its body: who began it (the
 // user, only for the step that answers the user's own message, else the
-// agent), what for, and whether it shows images. Its premium requests
-// are counted by the first.
+// agent), what for, and whether it shows images, as VS Code tells it.
 struct CpHint {
     Str initiator;    // "user" or "agent"
     Str interaction;  // "conversation-agent", -subagent or -compaction
