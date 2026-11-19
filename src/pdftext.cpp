@@ -1731,7 +1731,8 @@ static void pdfrun(PdfRun *r, Str content, PdfObj res)
     i32     n    = 0;
     Arena   mark = pdfmark(p);
     for (;;) {
-        PdfTok t = pdflex(&x);
+        iz     at = x.i;
+        PdfTok t  = pdflex(&x);
         if (!t.kind) {
             break;
         } else if (t.kind==PDFT_BAD || t.kind==PDFT_BOPEN || t.kind==PDFT_BCLOSE ||
@@ -1739,8 +1740,12 @@ static void pdfrun(PdfRun *r, Str content, PdfObj res)
             continue;
         } else if (t.kind!=PDFT_KEY || t.s=="true" || t.s=="false" || t.s=="null") {
             if (n == PDF_OPERANDS) {
+                // Dropped, and the token lexed again past the mark, as
+                // its string was in what the rewind gives back
                 n = 0;
                 pdfrewind(p, &mark);
+                x.i = at;
+                t   = pdflex(&x);
             }
             ops[n++] = pdfparsetok(&x, t, 0);
             continue;

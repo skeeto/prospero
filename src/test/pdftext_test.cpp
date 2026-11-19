@@ -323,6 +323,16 @@ static void test_pdftext(Test *t)
            "31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 "
            "58 59 60 61 62 63 64 65 66 67 68 69 70 BT /F1 12 Tf 72 400 Td (last) Tj ET"),
            "Big\n\none\ntwo\nthree\nfour\nhidden\n\nlast\n");
+    {
+        // The 65th operand drops the 64 before it, itself kept
+        Buf b(&a, 1024);
+        print(&b, "BT /F1 12 Tf 72 700 Td ");
+        for (i32 i = 0; i < PDF_OPERANDS; i++) {
+            print(&b, "(junk) ");
+        }
+        print(&b, "(\\101fter) Tj ET");
+        expect(t, "pdftext.operands", pdftone(&a, finish(&b)), "After\n");
+    }
 
     // Lines by baseline, a superscript joining its line, top to bottom,
     // each ordered along it whatever the drawing order
