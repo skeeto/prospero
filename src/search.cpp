@@ -795,8 +795,14 @@ static i32 globclass(Str p, iz *pi, i32 c)
     return in != neg;
 }
 
-static b32 globat(Str p, iz pi, Str s, iz si, i32 *budget)
+// One level per star: depth bounds it on a worker's small stack, where a
+// pattern of thousands (an agent's, a cloned repo's .gitignore) would
+// overflow. Past it, no match.
+enum : i32 { GLOB_DEPTH = 256 };
+
+static b32 globat(Str p, iz pi, Str s, iz si, i32 *budget, i32 depth = 0)
 {
+    if (depth > GLOB_DEPTH) return 0;
     while (pi < p.len) {
         if (--*budget < 0) return 0;
         u8 c = p[pi];
@@ -809,7 +815,7 @@ static b32 globat(Str p, iz pi, Str s, iz si, i32 *budget)
                 } else if (p[q] == '/') {
                     // "**/": any number of whole directories
                     for (iz k = si; k <= s.len; k++) {
-                        if ((k==si || s[k-1]=='/') && globat(p, q+1, s, k, budget)) {
+                        if ((k==si || s[k-1]=='/') && globat(p, q+1, s, k, budget, depth+1)) {
                             return 1;
                         }
                     }
@@ -818,7 +824,7 @@ static b32 globat(Str p, iz pi, Str s, iz si, i32 *budget)
                 pi++;  // any other "**" is a "*"
             }
             for (iz k = si;; k++) {
-                if (globat(p, pi+1, s, k, budget)) return 1;
+                if (globat(p, pi+1, s, k, budget, depth+1)) return 1;
                 if (k>=s.len || s[k]=='/') return 0;
             }
         }

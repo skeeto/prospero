@@ -220,6 +220,18 @@ static void test_search(Test *t)
             expect(t, finish(&n), istr(&tmp, globone(cases[i].glob, cases[i].path)),
                    istr(&tmp, cases[i].want));
         }
+
+        // A star is a level of recursion: a pattern of thousands stops
+        // at a bound, while a hundred still match
+        Arena tmp = *a;
+        Buf   g(&tmp, 1<<16);
+        for (i32 i = 0; i < 100; i++) putbyte(&g, '*');
+        print(&g, "a");
+        expect(t, "glob 100 stars", istr(&tmp, globone(finish(&g), "xa")), "1");
+        Buf   h(&tmp, 1<<16);
+        for (i32 i = 0; i < 60000; i++) putbyte(&h, '*');
+        print(&h, "b");
+        expect(t, "glob 60000 stars", istr(&tmp, globone(finish(&h), "a")), "0");
     }
 
     // .gitignore rules: the last match wins, and deeper files win
