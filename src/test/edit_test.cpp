@@ -129,6 +129,19 @@ static void test_edit(Test *t)
         expect(t, "loose ambiguous", istr(a, startswith(rep(a, "  a\nb\n    a\n", "a\n", "c\n", 0),
                                                         "!old_string matches 2 places")), "1");
         expect(t, "loose replace all", rep(a, "  a\nb\n    a\n", "a\n", "c\n", 1), "  c\nb\n    c\n");
+        {
+            // Every match, to a result past what the arena holds: told,
+            // not changed, rather than run out
+            Arena  tmp = *a;  // megabytes, given back
+            Arena *a   = &tmp;
+            Buf d(a, 1<<15), n(a, 1<<11);
+            for (i32 i = 0; i < 10000; i++) print(&d, "x\n");
+            for (i32 i = 0; i < 1000; i++)  putbyte(&n, 'y');
+            Arena   small = carve(a, 1<<22);
+            EditOut o     = editreplace(&small, finish(&d), "f.c", "x", finish(&n), 1);
+            expect(t, "replace all too large", istr(a, !o.data.data && find(o.text, "too large")>=0),
+                   "1");
+        }
     }
 
     // Fuzzy: used when clearly the place, else shown

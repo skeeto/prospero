@@ -866,6 +866,24 @@ static Slice<Str> relines(Arena *a, EditText *t, Slice<EditSpan> m,
     return out;
 }
 
+// Whether replacing n matches in data, each with add bytes in lines
+// lines, surely fits in a, with room after: replace_all may grow a file
+// past any arena, and the result is made whole before its size is told.
+static b32 editfits(Arena *a, iz datalen, iz n, iz add, iz lines)
+{
+    iz most = ((iz)((uz)-1 >> 1) - datalen) / 4;
+    if (n>0 && (add>most/n || lines>most/n/(iz)sizeof(Str))) {
+        return 0;
+    }
+    return fits(a, 2*datalen + n*(2*add + lines*(iz)sizeof(Str)) + ((iz)1<<20));
+}
+
+static Str edittoobig(Arena *a, Str show)
+{
+    return concat(a, show, ": not changed: replacing every match would make it too "
+                  "large to hold; replace fewer, or in parts");
+}
+
 // Replace oldstr with newstr in a file's content (data), which show
 // names to the agent; every match if all, else exactly one.
 static EditOut editreplace(Arena *a, Str data, Str show, Str oldstr, Str newstr, b32 all)
@@ -906,6 +924,9 @@ static EditOut editreplace(Arena *a, Str data, Str show, Str oldstr, Str newstr,
             if (m.len>1 && !all) {
                 r.text = ambiguous(a, &t, show, spanlines(a, data, m));
                 return r;
+            } else if (m.len && !editfits(a, data.len, m.len, newstr.len, 0)) {
+                r.text = edittoobig(a, show);
+                return r;
             } else if (m.len) {
                 r.data = splice(a, bom, data, m, newstr);
                 r.text = replaced(a, show, m.len, lineat(data, m[0].beg), rungnote(rung));
@@ -921,6 +942,9 @@ static EditOut editreplace(Arena *a, Str data, Str show, Str oldstr, Str newstr,
         Slice<EditSpan> m     = matchrun(a, have, wantn);
         if (m.len>1 && !all) {
             r.text = ambiguous(a, &t, show, m);
+            return r;
+        } else if (m.len && !editfits(a, data.len, m.len, gnew.len, now.len)) {
+            r.text = edittoobig(a, show);
             return r;
         } else if (m.len) {
             Slice<Str> out = relines(a, &t, m, want, now, rung>RUNG_RTRIM);
