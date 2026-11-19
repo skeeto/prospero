@@ -1898,8 +1898,7 @@ static Str termstart(Engine *e, Arena *scratch, i64 id, Json *j, Session *s, Str
         old = k->kept && (!old || k->used<old->used) ? k : old;
     }
     if (!t && old) {
-        termfree(e, old);
-        t = old;
+        t = old;  // freed only once the terminal surely opens, below
     }
     if (!t || termcount(e, peer)>=TERM_PERPEER) {
         return "too many terminals are open";
@@ -2125,6 +2124,9 @@ static Str termstart(Engine *e, Arena *scratch, i64 id, Json *j, Session *s, Str
                    run.on ? Str("cannot run the command: ") :
                    Str("cannot start the shell: ");
         return concat(scratch, what, os_lasterr(e->os, scratch));
+    }
+    if (t == old) {
+        termfree(e, old);  // the kept screen longest unused makes room
     }
     *t = {};
     t->tid    = ++e->terms->nexttid;
