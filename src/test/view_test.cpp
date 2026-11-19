@@ -436,6 +436,15 @@ static void test_view(Test *t)
         // Empty
         selset(v, 0, 3, 0, 3);
         expect(t, "view.copyempty", copysel(v, &a, COPY_TEXT), "");
+
+        // A selection to the end of a message whose text then gets shorter,
+        // as a running command's output tail can, copies what is there
+        selset(v, 1, 5, 1, 18);
+        settext(v, &v->msgs[1], "short", 0);
+        expect(t, "view.copyshrunk", copysel(v, &a, COPY_MARKDOWN), "");
+        selset(v, 0, 0, 1, 18);
+        expect(t, "view.copyshrunk2", istr(&a, endswith(copysel(v, &a, COPY_MARKDOWN),
+                                                        "\n\nshort")), "1");
     }
 
     // Copy as markdown: the source within a block, whole blocks' lines

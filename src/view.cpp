@@ -4282,7 +4282,7 @@ static Str copysel(View *v, Arena *perm, i32 how)
         return {};
     }
     Buf b(perm, 1<<12);
-    for (i32 i = r.beg.msg; i <= r.end.msg; i++) {
+    for (i32 i = r.beg.msg; i<=r.end.msg && i<v->msgs.len; i++) {
         ViewMsg *m = &v->msgs[i];
         i32  s = i==r.beg.msg ? r.beg.off : 0;
         i32  e = i==r.end.msg ? r.end.off : (i32)m->text.len;
@@ -4298,6 +4298,11 @@ static Str copysel(View *v, Arena *perm, i32 how)
             print(&b, "\n\n");
         }
         Doc *d = msgdoc(v, i);
+        // Within its text now: a running command's output, or a plan
+        // read again, may have replaced it with a shorter one
+        i32 n = (i32)d->src.len;
+        s = s<0 ? 0 : s>n ? n : s;
+        e = e<s ? s : e>n ? n : e;
         if (how == COPY_MARKDOWN) {
             copymarkdown(&b, d, s, e);
         } else {
