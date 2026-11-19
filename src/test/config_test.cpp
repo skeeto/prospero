@@ -953,6 +953,17 @@ static void testcfgpoll(Test *t)
     expect(t, "poll.watch", showlist(&a, c->watch),
            "/c/h.ini|/c/t.ini|/c/later.ini");
 
+    // A ~/ include is watched where the reader finds it: from home
+    {
+        Arena  b = a;
+        CfgEnv w = newcfgenv(&b);
+        addenv(w.os, &b, "HOME=/home/u");
+        os_write(w.os, b, "/c/h.ini", "include = ~/x.ini\n");
+        Config *hc = newconfig(w.os, &b, w.scratch, "/c/h.ini", 0);
+        expect(t, "poll.watchhome", showlist(&b, hc->watch), "/c/h.ini|/home/u/x.ini");
+        cfgfree(hc);
+    }
+
     Str steps[] = {
         "rate limited", "unchanged", "user file", "include", "new include",
         "too soon", "after a second", "forced", "removed",

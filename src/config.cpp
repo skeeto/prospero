@@ -3710,7 +3710,14 @@ static b32 cfgloadini(Config *c, Arena scratch, Arena *a, Ini *ini, i32 nlayer)
             IniLine *l = &f->lines[i];
             if (l->type==INI_INCLUDE && !iniurl(l->value) &&
                     !inidevice(l->value)) {
-                Str p = inipath(a, inidir(f->path), l->value);
+                // As the reader resolves it (ini.cpp): ~/ from home
+                Str  name = l->value;
+                b32  home = name.len>=2 && name[0]=='~' && inisep(name[1]);
+                if (home && !ini->home.len) {
+                    continue;
+                }
+                Str p = home ? inipath(a, ini->home, cuthead(name, 2))
+                             : inipath(a, inidir(f->path), name);
                 watch = push(a, watch, p);
             }
         }
