@@ -30023,7 +30023,7 @@ static void drivestep(Gui *g)
         g->holduntil = g->sched.now + (i64)op->dx*1000;
         break;
     case OP_SNAPCFG: {
-        Arena a = g->perm;
+        Arena a = g->frame;  // not perm, which the clone would copy over
         Read  rd = os_read(g->os, &a, cfgfile(g, &a), 1<<20);
         g->cfgsnap = rd.err==READ_OK ? clone(&g->perm, rd.data) : Str{};
         g->cfgsets = 0;
