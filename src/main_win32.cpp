@@ -2092,6 +2092,7 @@ static Proc *spawnproc(Os *os, Spawn *sp, Arena scratch, b32 io)
     if (!os_thread(os, procwaiter, p)) {
         killproc(job, pi.process);  // the reader then finishes
         closeall(input, countof(input));
+        p->input = 0;  // closed just now, not again by procrelease
         if (io) procrelease(p);  // the writer's
         procrelease(p);  // the waiter's
         procrelease(p);  // the caller's
