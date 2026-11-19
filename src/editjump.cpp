@@ -274,10 +274,22 @@ struct EditJump {
     Str why;   // why not, else null
 };
 
-// A word for the shell: sh's quotes, or cmd.exe's double quotes.
+// A word for the shell: sh's quotes, or cmd.exe's double quotes. There
+// a program's own parser reads \" as a quote, so the backslashes that
+// end a word (C:\, a folder's path) are doubled to stay its own.
 static Str jumpquote(Arena *a, Str s, b32 windows)
 {
-    return windows ? concat(a, concat(a, "\"", s), "\"") : shquote(a, s);
+    if (!windows) {
+        return shquote(a, s);
+    }
+    iz n = 0;
+    for (; n<s.len && s[s.len-1-n]=='\\'; n++) {}
+    Buf b(a, s.len + n + 2);
+    putbyte(&b, '"');
+    print(&b, s);
+    for (iz i = 0; i < n; i++) putbyte(&b, '\\');
+    putbyte(&b, '"');
+    return finish(&b);
 }
 
 // An ssh remote, for an editor's address of a file there: its [remote
