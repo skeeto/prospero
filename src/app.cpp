@@ -2673,6 +2673,12 @@ static void cmdfail(Gui *g, GuiHost *h, Arena scratch, i64 id, Str err)
 static void cmdsend(Gui *g, EvOut *w, Arena scratch)
 {
     Str      line  = evend(w);
+    byte    *past  = (byte *)(line.data + line.len);
+    if (past>scratch.beg && past<=scratch.end) {
+        // The copy was taken before evend, which may have grown the
+        // buffer in place into it
+        scratch.beg = past;
+    }
     GuiHost *h     = g->cmdhost;
     b32      quiet = g->cmdquiet;
     g->cmdquiet = 0;
