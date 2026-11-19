@@ -1667,6 +1667,9 @@ static b32 wltext(Wl *wl, Arena scratch, Str s)
             if (i%32 == 31) {
                 eipump(wl, 0, eiany);
                 nap(2);
+                if (!eicheck(wl)) {
+                    return 0;  // the keyboard went (kbd null), mid-text
+                }
             }
         }
         return eicheck(wl);
