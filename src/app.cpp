@@ -9136,6 +9136,22 @@ static void resync(Gui *g, GuiSession *s)
 // After lost records: the engine's commands whose replies may be gone,
 // sent again where that is harmless. The library never loses records
 // of the other hosts.
+// A command whose reply the engine lost, answered here as failed, as if
+// by its host, so that what waits on it lets go, as each command's own
+// reply does: its request back to be taken.
+static void lostreply(Gui *g, GuiHost *h, Request q)
+{
+    request(g, q.id, q.cmd, q.s, q.h);
+    alignas(16) byte mem[512];
+    Arena a = {mem, mem+sizeof(mem)};
+    Buf   b(&a, 256);
+    EvOut w = evbegin(&b, {}, 0, os_time(g->os), EV_REPLY);
+    putintkey(&w.json, "id", q.id);
+    putintkey(&w.json, "ok", 0);
+    putstrkey(&w.json, "err", "the engine lost its reply: try again");
+    guirecord(g, h, cuttail(evend(&w), 1));
+}
+
 static void reissue(Gui *g)
 {
     GuiHost *e = g->hosts;
@@ -9197,7 +9213,30 @@ static void reissue(Gui *g)
                 g->out.id = 0;
             } else if (g->img.fetch.id == q.id) {
                 imgrequest(g);  // the same part again
+            } else {
+                lostreply(g, e, q);  // the plan's, an export's...
             }
+            break;
+        case CMD_PROMPT:
+        case CMD_STEER:
+            // It may well have gone: only its attachments let go, kept
+            if (q.s && q.s->att && q.s->att->state==ATT_SENDING &&
+                    q.s->att->id==q.id) {
+                q.s->att->state = ATT_IDLE;
+                q.s->att->id    = 0;
+            }
+            break;
+        case CMD_SKILLS:
+        case CMD_SKILLFETCH:
+        case CMD_UNQUEUE:
+        case CMD_UPLOAD:
+        case CMD_IMPORT:
+        case CMD_OFFER:
+        case CMD_MCP:
+        case CMD_APPROVE:
+            // Each holds an id that its reply clears, until which no
+            // other is asked for
+            lostreply(g, e, q);
             break;
         }
     }
