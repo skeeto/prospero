@@ -3182,6 +3182,17 @@ def sc_mcp_timeout(model, n, req):
 sc_mcp_cancel = sc_mcp_timeout
 
 
+def sc_mcp_restart_queued(model, n, req):
+    # Two calls to the server at once: the second waits on the first
+    if step(req) == 0:
+        yield S.head()
+        yield from call(model, 0, f"call_{n}a", "mcp__fake__slow", {"seconds": 30}, 2)
+        yield from call(model, 1, f"call_{n}b", "mcp__fake__echo", {"text": "after"}, 2)
+        yield from finish(model, "tool_calls")
+    else:
+        yield from answer(model, "Done.")
+
+
 def sc_mcp_crash(model, n, req):
     # The restart waits for half of PROSPERO_TEST_MINUTE_MS, 1 s here
     yield from mcp_steps(model, n, req, [

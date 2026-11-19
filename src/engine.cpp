@@ -11465,16 +11465,23 @@ static b32  mcphttppost(Engine *, Arena, McpServer *, i64 rpc, Str body,
                         Str method = "POST", b32 retried = 0);
 
 // Stop a server: its input closed, so that it ends by itself, and the
-// kills to follow (mcptick). The calls waiting on it fail with why.
-static void mcpstop(Engine *e, Arena scratch, McpServer *m, Str why)
+// kills to follow (mcptick). The calls that waited on it are returned,
+// copied into the scratch, which advances past them, for mcpcallsfail
+// once the server's state is final: failing one runs its session's next
+// call, which must find the server as it is to be (stopped, failed, or
+// started again), and which may start it again, resetting its arena.
+static Slice<McpPending> mcphalt(Engine *e, Arena *scratch, McpServer *m)
 {
-    Slice<McpPending> pend = m->pending;
-    m->pending = {};
-    for (iz i = 0; i < pend.len; i++) {
-        if (pend[i].kind == MCPREQ_CALL) {
-            mcpcallfail(e, scratch, &pend[i], why);
+    Slice<McpPending> pend = {};
+    for (iz i = 0; i < m->pending.len; i++) {
+        McpPending p = m->pending[i];
+        if (p.kind == MCPREQ_CALL) {
+            p.sid  = clone(scratch, p.sid);
+            p.call = clone(scratch, p.call);
+            pend   = push(scratch, pend, p);
         }
     }
+    m->pending = {};
     if (m->proc && !m->stopping) {
         os_procwrite(e->os, m->proc, {});
         m->stopping  = 1;
@@ -11487,12 +11494,28 @@ static void mcpstop(Engine *e, Arena scratch, McpServer *m, Str why)
         }
     }
     if (m->session.len) {
-        mcphttppost(e, scratch, m, 0, {}, "DELETE");  // as the server asks
+        mcphttppost(e, *scratch, m, 0, {}, "DELETE");  // as the server asks
         m->session = {};
     }
     if (m->state != MCP_FAILED) {
         m->state = MCP_STOPPED;
     }
+    return pend;
+}
+
+// Fail the calls a stopped server had waiting (mcphalt) with why.
+static void mcpcallsfail(Engine *e, Arena scratch, Slice<McpPending> pend, Str why)
+{
+    for (iz i = 0; i < pend.len; i++) {
+        mcpcallfail(e, scratch, &pend[i], why);
+    }
+}
+
+// Stop a server, and fail the calls waiting on it with why.
+static void mcpstop(Engine *e, Arena scratch, McpServer *m, Str why)
+{
+    Slice<McpPending> pend = mcphalt(e, &scratch, m);
+    mcpcallsfail(e, scratch, pend, why);
 }
 
 // Let a stopped server's process go.
@@ -11804,11 +11827,12 @@ static void mcpneedapprove(Engine *e, Arena scratch, McpServer *m)
     Str why  = mcpapprovemsg(&scratch, m->name);
     Str told = concat(&scratch, concat(&scratch, "The MCP server ", m->name),
                       concat(&scratch, " failed: ", why));
-    mcpstop(e, scratch, m, told);
+    Slice<McpPending> pend = mcphalt(e, &scratch, m);
     m->state    = MCP_FAILED;
     m->approve  = 1;
     m->err      = clone(&e->perm, why);
     m->retryat  = I64MAX;  // not until approved
+    mcpcallsfail(e, scratch, pend, told);
     mcpwake(e, scratch, m);
 }
 
@@ -12049,15 +12073,21 @@ static McpServer *mcpserver(Session *s, Arena scratch, Str name)
     Str def    = d ? concat(&scratch, concat(&scratch, origin, "\n"), d->raw)
                    : concat(&scratch, concat(&scratch, url, "\n"), cmd);
     if (m->def.data && m->def!=def) {
-        if (m->state != MCP_STOPPED) {
-            Str why = concat(&scratch, concat(&scratch, "The MCP server ", name),
-                             Str(" started again, as its definition changed."));
-            mcpstop(e, scratch, m, why);
-            m->state = MCP_STOPPED;
-        }
+        // All of it before the stop, whose failed calls run their
+        // sessions' next ones, which may start it again, as defined now
+        b32 running = m->state != MCP_STOPPED;
         m->approve  = 0;
         m->needauth = 0;
         m->tools    = {};
+        m->def      = clone(&e->perm, def);
+        m->origin   = clone(&e->perm, origin);
+        if (running) {
+            Str why = concat(&scratch, concat(&scratch, "The MCP server ", name),
+                             Str(" started again, as its definition changed."));
+            Slice<McpPending> pend = mcphalt(e, &scratch, m);
+            m->state = MCP_STOPPED;  // even if failed: it starts afresh
+            mcpcallsfail(e, scratch, pend, why);
+        }
     }
     if (m->def != def) {
         m->def    = clone(&e->perm, def);
@@ -13739,11 +13769,12 @@ static void mcpneedauth(Engine *e, Arena scratch, McpServer *m)
     Str why  = mcpsigninmsg(&scratch, m->name);
     Str told = concat(&scratch, concat(&scratch, "The MCP server ", m->name),
                       concat(&scratch, " failed: ", why));
-    mcpstop(e, scratch, m, told);
+    Slice<McpPending> pend = mcphalt(e, &scratch, m);
     m->state    = MCP_FAILED;
     m->needauth = 1;
     m->err      = clone(&e->perm, why);
     m->retryat  = I64MAX;  // not until signed in
+    mcpcallsfail(e, scratch, pend, told);
     mcpwake(e, scratch, m);
 }
 
@@ -13769,10 +13800,11 @@ static void mcprestartall(Engine *e, Arena scratch, Str name, Str url)
         if (m->name==name && m->url==url) {
             Str why = concat(&scratch, concat(&scratch, "The MCP server ", name),
                              Str(" started again."));
-            mcpstop(e, scratch, m, why);
+            Slice<McpPending> pend = mcphalt(e, &scratch, m);
             m->state    = MCP_STOPPED;
             m->needauth = 0;
             mcpstart(e, scratch, m, 0);
+            mcpcallsfail(e, scratch, pend, why);
         }
     }
 }
@@ -14240,9 +14272,10 @@ static void mcpunauthorized(Engine *e, Arena scratch, McpServer *m, McpHttp *q)
     }
     Str why     = concat(&scratch, concat(&scratch, "The MCP server ", m->name),
                          Str(" signs in again; try the call again."));
-    mcpstop(e, scratch, m, why);
+    Slice<McpPending> pend = mcphalt(e, &scratch, m);
     m->state   = MCP_STARTING;  // until it is started again
     m->readyby = os_ticks(e->os) + m->startms*MS;
+    mcpcallsfail(e, scratch, pend, why);
     if (!mcpauthhttp(e, scratch, x, "POST", x->tokenurl,
                      "application/x-www-form-urlencoded", form)) {
         mcpauthfail(e, scratch, x, "the token request could not be made");
@@ -14921,12 +14954,13 @@ static void cmdmcprestart(Engine *e, Arena scratch, i64 id, Json *j)
         any = 1;
         Str why = concat(&scratch, concat(&scratch, "The MCP server ", name),
                          Str(" started again."));
-        mcpstop(e, scratch, m, why);
+        Slice<McpPending> pend = mcphalt(e, &scratch, m);
         m->state    = MCP_STOPPED;
         m->needauth = 0;
         if (m->url.len) {
             mcpstart(e, scratch, m, 0);
         }
+        mcpcallsfail(e, scratch, pend, why);
     }
     if (!any && !inisection(e->ini, "mcp", name)) {
         Str why = concat(&scratch, "no MCP server is named ", name.len ? name : Str("\"\""));

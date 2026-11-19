@@ -13202,6 +13202,32 @@ def mcp_cancel(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+@scenario(conf=mcpconf(trust="yes", timeout=8), bound=30)
+def mcp_restart_queued(t):
+    """A server started again during a call fails that call, and the
+    call queued after it goes to the server as started again: not to the
+    old one, where it would be lost and time out."""
+    h = t.headless(env=mcpenv(t))
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="go")
+        deadline = time.monotonic() + 10
+        while not mcpcalls(t) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        start = time.monotonic()
+        h.call("mcp.restart", name="fake")
+        ended(h, sid, 1)
+        took = time.monotonic() - start
+        st = [(e["status"], e["text"]) for e in h.all("tool.end", sid)]
+        t.check(len(st) == 2 and st[0][0] == "error" and "started again" in st[0][1],
+                f"the first {st}")
+        t.check(len(st) == 2 and st[1] == ("ok", "echo: after"), f"the second {st}")
+        t.check(took < 6, f"no wait for the timeout: {took:.1f} s")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 @scenario(conf=mcpconf(trust="yes"), bound=20)
 def mcp_crash(t):
     """A server that exits fails its call with what it wrote to standard
