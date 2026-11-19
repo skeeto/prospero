@@ -11580,7 +11580,16 @@ static void ctrkeep(Gui *g, Arena scratch, GuiCtr *c)
     Slice<CtrSess> l = {};
     for (GuiSession *s = g->sessions; s; s = s->next) {
         if (s->host==c->h && !s->gone && s->listed && !s->parent.len) {
+            // Its own copy of the title, which lives in the view's
+            // arena, released when the session closes: the last one
+            // kept if it is the same
             CtrSess k = {s->sid, sesstitle(s)};
+            Str     t = {};
+            for (iz i = 0; i < c->c.sessions.len; i++) {
+                CtrSess o = c->c.sessions[i];
+                t = o.sid==k.sid && o.title==k.title ? o.title : t;
+            }
+            k.title = t.len ? t : clone(&g->perm, k.title);
             l = push(&g->perm, l, k);
         }
     }
