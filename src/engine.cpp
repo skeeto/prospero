@@ -12822,7 +12822,7 @@ static b32 mcpgate(Session *s, Arena scratch)
 
 // A server became ready, or failed: the sessions waiting for it go on,
 // and a call waiting for it is sent, or fails.
-static void mcpcallsend(Session *s, Arena scratch);
+static void mcpcallsend(Session *s, Arena scratch, b32 inrun = 0);
 
 static void mcpwake(Engine *e, Arena scratch, McpServer *m)
 {
@@ -12845,15 +12845,18 @@ static void mcpwake(Engine *e, Arena scratch, McpServer *m)
 
 // Calls
 
-// End the current call of a session, and go on to its next.
-static void mcpend(Session *s, Arena scratch, Str status, Str text)
+// End the current call of a session, and go on to its next, unless
+// inrun: from mcprun, inside nexttool's loop, which goes on itself.
+static void mcpend(Session *s, Arena scratch, Str status, Str text, b32 inrun = 0)
 {
     disarm(s, T_TOOL);
     s->mcpsrv  = 0;
     s->mcpcall = 0;
     setstate(s, S_IDLE);
     toolend(s, scratch, status, text, 0, 0, {}, 0);
-    nexttool(s, scratch);
+    if (!inrun) {
+        nexttool(s, scratch);
+    }
 }
 
 // A call that cannot be answered: its session, if still waiting, hears
@@ -12867,9 +12870,9 @@ static void mcpcallfail(Engine *e, Arena scratch, McpPending *p, Str why)
     }
 }
 
-// Send the current call to its server, ready by now: 0 if it could not
-// go, and the call is ended.
-static void mcpcallsend(Session *s, Arena scratch)
+// Send the current call to its server, ready by now, else end it (as
+// mcpend, inrun as there).
+static void mcpcallsend(Session *s, Arena scratch, b32 inrun)
 {
     Engine    *e = s->e;
     McpServer *m = s->mcpsrv;
@@ -12881,7 +12884,7 @@ static void mcpcallsend(Session *s, Arena scratch)
                          concat(&scratch, " failed, so the call was not made: ", m->err))
                 : concat(&scratch, concat(&scratch, "The MCP server ", m->name),
                          Str(" is not running, so the call was not made."));
-        mcpend(s, scratch, "error", why);
+        mcpend(s, scratch, "error", why, inrun);
         return;
     }
     Repair  r = repairargs(&scratch, c->args);
@@ -12899,8 +12902,14 @@ static void mcpcallsend(Session *s, Arena scratch)
     putend(&w);
     i64 id = mcprequest(e, scratch, m, MCPREQ_CALL, "tools/call", finish(&b), s->sid, c->id);
     if (!id) {
+        // Apart from the server first, so that its failure does not wake
+        // this session into ending the call too, nested
+        s->mcpsrv = 0;
         mcpfail(e, scratch, m, "it stopped taking messages");
-        return;  // which ended the call, as no request waits for it
+        Str why = concat(&scratch, concat(&scratch, "The MCP server ", m->name),
+                         concat(&scratch, " failed, so the call was not made: ", m->err));
+        mcpend(s, scratch, "error", why, inrun);
+        return;
     }
     s->mcpcall = id;
     arm(s, T_TOOL, m->callms*MS);
@@ -12943,7 +12952,7 @@ static b32 mcprun(Session *s, Arena scratch, McpTool *t)
     s->mcpcall = -1;
     setstate(s, S_TOOL);
     if (m->state == MCP_READY) {
-        mcpcallsend(s, scratch);
+        mcpcallsend(s, scratch, 1);
     } else {
         i64 left = m->readyby - os_ticks(e->os);
         arm(s, T_TOOL, (left>0 ? left : 0) + m->callms*MS);
