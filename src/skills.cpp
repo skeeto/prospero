@@ -619,9 +619,10 @@ static void skillpackfile(JsonOut *w, Arena scratch, SkillFile *f)
 }
 
 // A skill's package, at most max bytes but for SKILL.md alone (cut).
+// A file read whole, up to max, then its base64, a third larger again.
 static Str skillpack(Os *os, Arena *a, Skill *k, iz max)
 {
-    Arena            rd    = carve(a, max + (iz)SKILL_BYTES + (1<<16));
+    Arena            rd    = carve(a, 3*max + (iz)SKILL_BYTES + (1<<16));
     Slice<SkillFile> files = skillpackfiles(os, &rd, k->dir);
     Buf              b(a, 1<<12);
     JsonOut          w = {&b};

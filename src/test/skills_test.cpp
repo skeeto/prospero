@@ -391,6 +391,27 @@ static void test_skillpack(Test *t)
     Str h2 = skillhash(a, skillunpack(a, jsonparse(a, skillpack(os, a, &k, SKILL_PACK)).root, 0).files);
     expect(t, "hash changes", istr(a, h1 == h2), "0");
 
+    // A binary file under the size, but not once in base64: SKILL.md
+    // alone, with cut, its encoding made in room enough
+    {
+        Arena  tmp  = *a;  // megabytes, given back
+        Arena *a    = &tmp;
+        Skill  bk   = {};
+        bk.name = "big";
+        bk.dir  = "/s/big";
+        bk.path = "/s/big/SKILL.md";
+        os_mkdirs(os, *a, "/s/big");
+        os_write(os, *a, "/s/big/SKILL.md", "---\nname: big\ndescription: Big\n---\n");
+        u8 *bin = alloc<u8>(a, 3<<19);
+        for (iz i = 0; i < 3<<19; i++) {
+            bin[i] = (u8)(i*2654435761u >> 24);
+        }
+        os_write(os, *a, "/s/big/blob.bin", Str{bin, 3<<19});
+        JsonDoc c = jsonparse(a, skillpack(os, a, &bk, SKILL_PACK));
+        expect(t, "pack binary cut", packpaths(a, c.root), "SKILL.md");
+        expect(t, "pack binary cut flag", istr(a, jsonflag(jsonget(c.root, "cut"), 0)), "1");
+    }
+
     // Past the size, as encoded: SKILL.md alone, with cut
     {
         JsonDoc c = jsonparse(a, skillpack(os, a, &k, 100));
