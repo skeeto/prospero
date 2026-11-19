@@ -17005,6 +17005,9 @@ static void dropsession(Engine *e, Session *s)
             break;
         }
     }
+    for (Session *t = e->sessions; t; t = t->next) {
+        t->parent = t->parent==s ? 0 : t->parent;  // none points into it
+    }
     logclose(&s->log);
     if (s->lock >= 0) {
         os_unlockfile(e->os, s->lock);
@@ -19310,9 +19313,6 @@ static void park(Engine *e, Session *s)
     k.forget   = s->forget;
     e->parked  = push(&e->perm, e->parked, k);
     s->lock    = -1;  // kept for its revival
-    for (Session *t = e->sessions; t; t = t->next) {
-        t->parent = t->parent==s ? 0 : t->parent;
-    }
     dropsession(e, s);
 }
 
@@ -19332,9 +19332,6 @@ static b32 forgettable(Session *s)
 // for an open to read.
 static void forget(Engine *e, Session *s)
 {
-    for (Session *t = e->sessions; t; t = t->next) {
-        t->parent = t->parent==s ? 0 : t->parent;
-    }
     dropsession(e, s);
 }
 
