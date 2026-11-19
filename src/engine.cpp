@@ -16002,7 +16002,7 @@ static Str titletext(Arena *a, Str t)
             again = 1;
         }
         static char const marks[] = "\"'`*_#";
-        for (char const *m = marks; *m; m++) {
+        for (char const *m = marks; *m && line.len; m++) {  // a mark may empty it
             if (line[0]==(u8)*m || line[line.len-1]==(u8)*m) {
                 line  = trim(line[0]==(u8)*m ? cuthead(line, 1) : line);
                 line  = line.len && line[line.len-1]==(u8)*m

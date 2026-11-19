@@ -1593,6 +1593,10 @@ static void test_engine(Test *t)
                titles[i].want);
     }
 
+    // A title of only marks: emptied, never indexed past
+    expect(t, "titletext quotes", titletext(a, "\"\""), "");
+    expect(t, "titletext stars", titletext(a, "**"), "");
+
     // Exactly 60 code points of two-byte characters: no ellipsis
     Buf b(a, 256);
     for (i32 i = 0; i < 60; i++) {
