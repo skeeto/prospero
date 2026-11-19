@@ -10972,10 +10972,12 @@ static void importread(Gui *g, Arena scratch, Str path)
         importfail(g, "not a session's raw log: it must begin with its session record");
         return;
     }
-    x->cwd   = clone(&x->mem, jsonstr(jsonget(e.root, "cwd")));
-    x->model = clone(&x->mem, jsonstr(jsonget(e.root, "model")));
+    // Kept in the 1 MiB past the log in x->r: each cut short, and only
+    // the last title and model, not each one met
+    Str model = jsonstr(jsonget(e.root, "model"));
+    Str title = {}, modelline = {};
+    x->cwd   = clone(&x->mem, utf8head(jsonstr(jsonget(e.root, "cwd")), 64<<10));
     x->nofolder = jsonint(jsonget(e.root, "nofolder"), 0) == 1;
-    x->title = {};
     for (Str rest = c.tail; rest.len;) {
         Cut l = cut(rest, '\n');
         rest  = l.tail;
@@ -10985,11 +10987,22 @@ static void importread(Gui *g, Arena scratch, Str path)
         Arena t = a;
         EvRec r = evparse(&t, l.head);
         if (r.ev == EV_TITLE) {
-            x->title = clone(&x->mem, jsonstr(jsonget(r.root, "text")));
+            title = l.head;
         } else if (r.ev == EV_MODEL) {
-            x->model = clone(&x->mem, jsonstr(jsonget(r.root, "model")));
+            modelline = l.head;
         }
     }
+    if (title.len) {
+        EvRec r  = evparse(&a, title);
+        x->title = clone(&x->mem, utf8head(jsonstr(jsonget(r.root, "text")), 64<<10));
+    } else {
+        x->title = {};
+    }
+    if (modelline.len) {
+        EvRec r = evparse(&a, modelline);
+        model   = jsonstr(jsonget(r.root, "model"));
+    }
+    x->model = clone(&x->mem, utf8head(model, 64<<10));
     x->state   = IMP_DIALOG;
     x->filled  = 0;
     g->newerr  = {};
