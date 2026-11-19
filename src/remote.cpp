@@ -221,9 +221,10 @@ struct Remote {
     iz                room;     // the link's, as of the last pass (atomic)
 };
 
-static void remoteemit(Remote *r, Str line)
+// A line for the frontend: 0 if it could not take it, too long.
+static b32 remoteemit(Remote *r, Str line)
 {
-    mailpost(r->out, MAIL_OUT, r->conf.outid, line, 1);
+    return mailpost(r->out, MAIL_OUT, r->conf.outid, line, 1);
 }
 
 static void remotestatus(Remote *r, Arena scratch, i32 state, Str msg, i64 retry)
@@ -994,7 +995,10 @@ static void remoterecord(Remote *r, Arena scratch, Str line)
         if (rec.seq <= s->lastseq) {
             return;  // the frontend has it
         }
-        s->lastseq = rec.seq;
+        if (remoteemit(r, line)) {
+            s->lastseq = rec.seq;  // only once it has it
+        }
+        return;
     }
     remoteemit(r, line);
 }
@@ -1511,7 +1515,8 @@ static i32 connectmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
     rc.config  = config;
     rc.envpath = cfgownpath(cfg, &perm);
 
-    Mailbox *out = newmailbox(&perm, 4<<20, 0, 0);
+    // Room for the longest line a host sends, a whole frame
+    Mailbox *out = newmailbox(&perm, FRAME_MAX + ((iz)1<<16), 0, 0);
     Remote  *r   = out ? newremote(os, &perm, &rc, out) : 0;
     if (!r || !remotego(r)) {
         hostsay(os, scratch, "cannot start");
