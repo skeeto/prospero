@@ -950,19 +950,23 @@ static TermRun termargv(Arena *a, i32 os, Str prog, Str dir, Slice<Str> cmd,
         }
         return r;
     } else if (os==TERM_WIN && equalfold(name, "wt")) {
-        // Windows Terminal splits its own command line on semicolons
-        r.argv = push(a, r.argv, prog);
-        r.argv = push(a, r.argv, Str("-d"));
-        r.argv = push(a, r.argv, dir);
-        for (iz i = 0; i < cmd.len; i++) {
-            Buf b(a, cmd[i].len + 8);
-            for (iz k = 0; k < cmd[i].len; k++) {
-                if (cmd[i][k] == ';') {
+        // Windows Terminal splits its own command line on semicolons,
+        // the directory's too: each escaped
+        auto wtword = [&](Str w) {
+            Buf b(a, 2*w.len);
+            for (iz k = 0; k < w.len; k++) {
+                if (w[k] == ';') {
                     putbyte(&b, '\\');
                 }
-                putbyte(&b, cmd[i][k]);
+                putbyte(&b, w[k]);
             }
-            r.argv = push(a, r.argv, finish(&b));
+            return finish(&b);
+        };
+        r.argv = push(a, r.argv, prog);
+        r.argv = push(a, r.argv, Str("-d"));
+        r.argv = push(a, r.argv, wtword(dir));
+        for (iz i = 0; i < cmd.len; i++) {
+            r.argv = push(a, r.argv, wtword(cmd[i]));
         }
         return r;
     }

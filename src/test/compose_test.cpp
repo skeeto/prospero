@@ -370,6 +370,8 @@ static void test_compose(Test *t)
     semi = push(&a, semi, Str("a;b"));
     tr = termargv(&a, TERM_WIN, "wt.exe", "C:\\p", semi);
     expect(t, "term.wtsemi", argstr(&a, tr.argv), "wt.exe|-d|C:\\p|a\\;b");
+    tr = termargv(&a, TERM_WIN, "wt.exe", "C:\\src\\x;calc", none);
+    expect(t, "term.wtdirsemi", argstr(&a, tr.argv), "wt.exe|-d|C:\\src\\x\\;calc");
     tr = termargv(&a, TERM_WIN, {}, "C:\\p", none);
     expect(t, "term.console", argstr(&a, tr.argv), "cmd.exe");
     tr = termargv(&a, TERM_WIN, {}, "C:\\p", wsl);
