@@ -2015,7 +2015,7 @@ static u8 *wlcapture(Wl *wl, Arena *a, DkRect r, DkSize *size)
     i32 h = (i32)((r.bottom - r.top)*scale + 0.5);
     w = w<1 ? 1 : w;
     h = h<1 ? 1 : h;
-    u8 *dst = allocbytes(a, (iz)w*h*4);  // zero outside every monitor
+    u8 *dst = alloc<u8>(a, (iz)w*h*4);  // zeroed: black outside every monitor
     for (i32 k = 0; k < nparts; k++) {
         Part *p = &parts[k];
         f64 sx = (f64)p->sz.w / p->s->w;
