@@ -1200,6 +1200,23 @@ static void test_tools(Test *t)
         expect(t, "todo add remove", apply(three, "{\"add\":[\"Ship\",\"fix  THE bug\"],"
                                                   "\"remove\":\"Run tests\"}"),
                "[>] Read the parser (in progress)\n[ ] Fix the bug\n[ ] Ship\n");
+        // #81: an item added and started in one call
+        expect(t, "todo add then start", apply(three, "{\"add\":\"Ship it\",\"start\":\"ship it\"}"),
+               "[ ] Read the parser\n[ ] Fix the bug\n[ ] Run tests\n[>] Ship it (in progress)\n");
+        expect(t, "todo add with status",
+               apply(three, "{\"add\":[{\"content\":\"Bisect\",\"status\":\"done\"},"
+                            "{\"content\":\"Ship\",\"status\":\"in_progress\"},"
+                            "{\"content\":\"Tag\",\"status\":\"in_progress\"},"
+                            "{\"content\":\"Announce\"}]}"),
+               "[ ] Read the parser\n[ ] Fix the bug\n[ ] Run tests\n[x] Bisect\n"
+               "[>] Ship (in progress)\n[ ] Tag\n[ ] Announce\n");
+        expect(t, "todo add status, start wins",
+               apply(three, "{\"add\":{\"content\":\"Ship\",\"status\":\"in_progress\"},"
+                            "\"start\":\"Run tests\"}"),
+               "[ ] Read the parser\n[ ] Fix the bug\n[>] Run tests (in progress)\n[ ] Ship\n");
+        expect(t, "todo add bad status",
+               argsshow(a, TOOL_TODO, "{\"add\":[{\"content\":\"Ship\",\"status\":\"soon\"}]}"),
+               "add[0]: status must be pending, in_progress or done; ");
         expect(t, "todo unknown", apply(three, "{\"done\":[\"parser\",\"deploy\"],\"start\":\"the\"}"),
                "error: done: no item \"deploy\"\nstart: more than one item matches \"the\"\n"
                "The list is unchanged:\n[>] Read the parser (in progress)\n[ ] Fix the bug\n"

@@ -757,7 +757,9 @@ static Str tooljson(Arena *a, ToolEnv *te)
             "it with done, start, add, remove and rename, naming items by their "
             "text, and don't send the whole list again, not even to reword an "
             "item. One item is in progress at a time: when none is, the first "
-            "pending one starts. Never call it on its own: put it in the same "
+            "pending one starts. Changes apply in the order add, remove, "
+            "rename, done, start, so one call can add an item and start it. "
+            "Never call it on its own: put it in the same "
             "response as your other tool calls, such as the list with the "
             "first call of the task, or an item marked done with the first "
             "call of the next.",
@@ -1582,9 +1584,27 @@ static Str argtodoname(Arena *a, Args *r, Str where, Json *e)
     return c;
 }
 
+// The status of an item named as an object ({content, status}), into
+// *st: TODO_PENDING when it has none.
+static void argtodostatus(Arena *a, Args *r, Str where, Json *e, Slice<i32> *st)
+{
+    i32  s = TODO_PENDING;
+    Json *v = e->type==JSON_OBJECT ? jsonget(e, "status") : e;
+    if (e->type==JSON_OBJECT && v->type!=JSON_MISSING && v->type!=JSON_NULL) {
+        s = todostatus(jsonstr(v));
+        if (s < 0) {
+            issue(a, r, where, "status must be pending, in_progress or done");
+            s = TODO_PENDING;
+        }
+    }
+    *st = push(a, *st, s);
+}
+
 // Items named by text: an array of strings, one string, or an array
-// encoded as a string, which some models send.
-static Slice<Str> argtodonames(Arena *a, Args *r, Json *root, Str key)
+// encoded as a string, which some models send. With st, each item's
+// status too, for an item given as {content, status}.
+static Slice<Str> argtodonames(Arena *a, Args *r, Json *root, Str key,
+                               Slice<i32> *st = 0)
 {
     Slice<Str> names = {};
     Json *v = jsonget(root, key);
@@ -1597,6 +1617,9 @@ static Slice<Str> argtodonames(Arena *a, Args *r, Json *root, Str key)
         return names;
     } else if (v->type != JSON_ARRAY) {
         Str n = argtodoname(a, r, key, v);
+        if (n.data && st) {
+            argtodostatus(a, r, key, v, st);
+        }
         return n.data ? push(a, names, n) : names;
     }
     iz n = 0;
@@ -1606,9 +1629,13 @@ static Slice<Str> argtodonames(Arena *a, Args *r, Json *root, Str key)
         putbyte(&at, '[');
         print(&at, (i64)n);
         putbyte(&at, ']');
-        Str c = argtodoname(a, r, finish(&at), e);
+        Str where = finish(&at);
+        Str c     = argtodoname(a, r, where, e);
         if (c.data) {
             names = push(a, names, c);
+            if (st) {
+                argtodostatus(a, r, where, e, st);
+            }
         }
     }
     if (n > TODO_ITEMS) {
@@ -1678,13 +1705,25 @@ static Slice<TodoRename> argtodorenames(Arena *a, Args *r, Json *root)
 // done, start, add, remove and rename, each naming items by their text.
 static void argtodos(Arena *a, Args *r, Json *root)
 {
+    Slice<i32> addst = {};
     r->tdone   = argtodonames(a, r, root, "done");
-    r->tadd    = argtodonames(a, r, root, "add");
+    r->tadd    = argtodonames(a, r, root, "add", &addst);
     r->tremove = argtodonames(a, r, root, "remove");
     r->trename = argtodorenames(a, r, root);
     Json *sv = jsonget(root, "start");
     if (sv->type!=JSON_MISSING && sv->type!=JSON_NULL) {
         r->tstart = argtodoname(a, r, "start", sv);
+    }
+
+    // An item added as {content, status} keeps its status (#81): done
+    // joins done, and in_progress is start, unless start names another,
+    // the first such item if several
+    for (iz i = 0; i < addst.len; i++) {
+        if (addst[i] == TODO_DONE) {
+            r->tdone = push(a, r->tdone, r->tadd[i]);
+        } else if (addst[i]==TODO_ACTIVE && !r->tstart.data) {
+            r->tstart = r->tadd[i];
+        }
     }
 
     Json *v = jsonget(root, "todos");
