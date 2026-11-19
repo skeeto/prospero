@@ -6299,8 +6299,10 @@ static void drawtranscript(Gui *g)
         ImGui::PopID();
     }
     sp->Merge(dl);
-    if (shows.len) {
-        drawqueue(g, g->frame, g->sess, shows, tail0, wpos, scrolly, winh, width, pad);
+    if (shows.len && gs->view==v && gs->view->queue.len>=shows.len) {
+        // The session measured, which a click above may have made no
+        // longer the current one
+        drawqueue(g, g->frame, gs, shows, tail0, wpos, scrolly, winh, width, pad);
     }
     if (!v->msgs.len && !shows.len && nosetup(g)) {
         drawsetup(g, wpos, winh, width + 2*pad);
