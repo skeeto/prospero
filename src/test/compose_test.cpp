@@ -353,6 +353,7 @@ static void test_compose(Test *t)
            "ssh|-t|--|me@box|cd '/home/me/it'\\''s' && exec \"$SHELL\" -l");
     expect(t, "term.sshwin", argstr(&a, termssh(&a, "ssh", "box", "C:\\w", 1)),
            "ssh|-t|--|box|cmd /k cd /d \"C:\\w\"");
+    expect(t, "term.sshwinpct", istr(&a, termssh(&a, "ssh", "box", "C:\\%OS%", 1).len), "0");
     expect(t, "term.sshport", argstr(&a, termssh(&a, "ssh", "me@[::1]:2222", "/w", 0)),
            "ssh|-t|-p|2222|--|me@::1|cd '/w' && exec \"$SHELL\" -l");
     Slice<Str> wsl = termwsl(&a, "wsl.exe", "Debian", "/mnt/c/w");

@@ -9618,6 +9618,10 @@ static TermPlan termplan(Gui *g, Arena *a, GuiSession *s, Str distro = {})
         Reach l = remotelink(g, h->name);
         if (l.ssh.len) {
             cmd = termssh(a, Str("ssh"), l.ssh, dir, hostwin(h));
+            if (!cmd.len) {
+                r.why = "Its folder has a % or \" that cmd.exe cannot take";
+                return r;
+            }
         } else if (l.wsl.len) {
             cmd = termwsl(a, Str("wsl.exe"), l.wsl, dir);
         } else if (l.exec.len) {

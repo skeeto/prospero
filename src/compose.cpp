@@ -998,10 +998,14 @@ static TermRun termargv(Arena *a, i32 os, Str prog, Str dir, Slice<Str> cmd,
 
 // The command that opens a shell in dir on a remote over ssh: a login
 // shell there, or on Windows cmd.exe, in a terminal of its own (-t). A
-// destination's own port (host:port) goes as -p (sshdest).
+// destination's own port (host:port) goes as -p (sshdest). None for a
+// Windows folder cmd.exe cannot hold in quotes: it expands %NAME% there.
 static Slice<Str> termssh(Arena *a, Str ssh, Str dest, Str dir, b32 windows)
 {
     Slice<Str> r = {};
+    if (windows && cmdwordok(dir)==CMDWORD_CMD) {
+        return r;
+    }
     SshDest    d = sshdest(a, dest);
     r = push(a, r, ssh);
     r = push(a, r, Str("-t"));
