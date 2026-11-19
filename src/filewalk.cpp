@@ -44,9 +44,11 @@ enum : i32 {
 };
 
 enum : iz {
-    FILEWALK_SCRATCH = 4<<20,  // bytes for one step's listings
-    FILEWALK_ENTRY   = 512,    // bytes one listed entry can take: a name's
-                               // worst case, its clone, and its Dirent
+    FILEWALK_SCRATCH = 16<<20, // bytes for one step's listings: room for
+                               // FILEWALK_DIRMAX at the worst case
+    FILEWALK_ENTRY   = 1024,   // bytes one listed entry can take: its Dirent
+                               // and its name, to 765 bytes of UTF-8 where
+                               // the system counts 255 UTF-16 units
     FILEWALK_REAL    = 4096,   // and the PATH_MAX os_realpath takes as it runs
     FILEWALK_RULES   = 64<<10, // and a level's .gitignore, which is read whole
 };
