@@ -132,6 +132,13 @@ static void test_base(Test *t)
     expect(t, "equalfold", istr(&a, equalfold("Content-Type", "content-TYPE")), "1");
     expect(t, "equalfold.diff", istr(&a, equalfold("ab", "ac")), "0");
     expect(t, "equalfold.len", istr(&a, equalfold("ab", "a")), "0");
+    {
+        Buf pb(&a, 64);
+        printpad(&pb, 7, 3);
+        putbyte(&pb, ' ');
+        printpad(&pb, -7, 3);
+        expect(t, "printpad", finish(&pb), "007 -07");
+    }
     expect(t, "join", join(&a, "a/b", "c"), "a/b/c");
     expect(t, "join.empty", join(&a, "", "c"), "c");
     expect(t, "join.dot", join(&a, ".", "c"), "c");

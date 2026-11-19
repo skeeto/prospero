@@ -588,6 +588,11 @@ static void print(Buf *b, i64 v)
 // Zero-padded decimal of at least width digits.
 static void printpad(Buf *b, i64 v, i32 width)
 {
+    if (v < 0) {
+        putbyte(b, '-');  // the sign, then the zeros
+        v = v==I64MIN ? I64MAX : -v;
+        width--;
+    }
     i64 limit = 1;
     for (i32 i = 1; i < width; i++) {
         limit *= 10;
