@@ -337,7 +337,11 @@ static int mdtext(MD_TEXTTYPE type, MD_CHAR const *text, MD_SIZE size, void *ud)
     // A <kbd> tag in plain text (with raw HTML off, md4c passes it on as
     // text): the text around it goes on as before, and the tag only
     // switches the style. A </kbd> with none open is text.
-    if (type==MD_TEXT_NORMAL && p->kbdtags && insource(p, s)) {
+    // A loop over the tags, not a call per tag: md4c passes a whole line
+    // at once, and a line of many tags would recurse as deep. The text
+    // before a tag holds none, so its call goes one level only.
+    for (b32 again = type==MD_TEXT_NORMAL && p->kbdtags && insource(p, s); again;) {
+        again = 0;
         for (iz i = 0; i < (iz)size; i++) {
             if (s[i] != '<') {
                 continue;
@@ -359,10 +363,14 @@ static int mdtext(MD_TEXTTYPE type, MD_CHAR const *text, MD_SIZE size, void *ud)
             p->kbd0    = open>0;
             iz n       = open ? open : close;
             p->lastoff = (i32)(s + i + n - p->base);
-            if (i+n < (iz)size) {
-                mdtext(type, text+i+n, (MD_SIZE)(size-i-n), ud);
+            if (i+n >= (iz)size) {
+                return 0;
             }
-            return 0;
+            text  += i + n;
+            size  -= (MD_SIZE)(i + n);
+            s      = (u8 *)text;
+            again  = 1;
+            break;
         }
     }
 

@@ -328,6 +328,22 @@ static void test_doc(Test *t)
         expect(t, "doc.typedkbd", docshow(&a, d2), "P: <kbd>x</kbd>\n");
     }
 
+    // A line of many <kbd> spans: read in a loop, not a call per tag
+    {
+        Arena a = perm;
+        i32   n = 80000;  // under DOC_MAXSIZE
+        Buf   b(&a, 12*n);
+        for (i32 i = 0; i < n; i++) {
+            print(&b, "<kbd>a</kbd>");
+        }
+        Doc *d    = parsedoc(&a, finish(&b), 0);
+        i32  kbds = 0;
+        for (iz i = 0; i < d->pieces.len; i++) {
+            kbds += !!(d->pieces[i].flags & PIECE_KBD1);
+        }
+        expect(t, "doc.kbdmany", istr(&a, kbds), istr(&a, n));
+    }
+
     // The layout key follows content, not position
     {
         Arena a  = perm;
