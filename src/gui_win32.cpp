@@ -2807,7 +2807,7 @@ static Str dibpng(Os *os, Arena *a, Str dib)
         rgba[i*4+3] = 255;
     }
     Str png = pngencodez(&t, rgba, w, h, 0);
-    if (png.len <= (iz)ATTACH_UPLOAD) {
+    if (png.len<=(iz)ATTACH_UPLOAD && fits(a, png.len)) {  // a holds the DIB too
         r = clone(a, png);
     }
     os_release(os, reg);
