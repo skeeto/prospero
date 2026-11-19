@@ -108,6 +108,13 @@ static void test_edit(Test *t)
         expect(t, "crlf reindented", rep(a, "\xef\xbb\xbf" "a\r\n  b\r\n  c\r\n", "b\nc \n",
                                          "b\nB2\nc\n", 0),
                "\xef\xbb\xbf" "a\r\n  b\r\n  B2\r\n  c\r\n");
+
+        // Mixed files follow their majority: one stray CRLF line does
+        // not make lines added to an LF file CRLF (issue #82)
+        expect(t, "mostly lf", rep(a, "a\nb\nc\r\nd\n", "b\n", "B\nB2\n", 0),
+               "a\nB\nB2\nc\r\nd\n");
+        expect(t, "mostly crlf", rep(a, "a\r\nb\r\nc\nd\r\n", "b\n", "B\nB2\n", 0),
+               "a\r\nB\r\nB2\r\nc\nd\r\n");
     }
 
     // Ambiguity is shown, never guessed

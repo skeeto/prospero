@@ -878,13 +878,16 @@ static EditOut editreplace(Arena *a, Str data, Str show, Str oldstr, Str newstr,
         bom  = takehead(data, 3);
         data = cuthead(data, 3);
     }
-    if (find(data, "\r\n")>=0 && find(oldstr, "\r")<0) {
-        oldstr = lfcrlf(a, oldstr);
-        newstr = lfcrlf(a, newstr);
-    }
     EditText t     = splittext(a, data);
     t.bom          = bom;
     b32      loose = data.len <= EDIT_LOOSEMAX;
+
+    // In a CRLF file, as splittext decides it, given LF text is CRLF
+    // text, as lines added by the other rungs are
+    if (t.crlf && find(oldstr, "\r")<0) {
+        oldstr = lfcrlf(a, oldstr);
+        newstr = lfcrlf(a, newstr);
+    }
 
     // Whole lines, compared loosely. When old_string does not end in a
     // newline, the newline after the lines it matched stays, as it would
