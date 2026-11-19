@@ -30743,22 +30743,25 @@ static Str guiusage =
 "  --quit-after S quit after S seconds\n"
 "  --shot FILE    at --quit-after, save the window as a PNG first (SDL only)\n";
 
-// arenalint: frame ok, as the strings are literals
+// Its line is made on the stack, not in the frame: an assertion fails
+// mid-frame, where callers hold strings in copies of the frame that a
+// release build, which goes on, would then draw.
 extern "C" void prospero_imassert(char const *expr, char const *file, int line)
 {
     ImGuiContext *ctx = ImGui::GetCurrentContext();
     Gui          *g   = ctx ? (Gui *)ImGui::GetIO().UserData : 0;
     if (g) {
-        Arena a = g->frame;
-        Buf   b(&a, 256);
+        alignas(16) byte mem[1024];
+        Arena a = {mem, mem+sizeof(mem)};
+        Buf   b(&a, 512);  // at most 24+200+2+200+1+11+1, never grown
         Str   e = {(u8 *)expr, 0};
         Str   f = {(u8 *)file, 0};
         while (e.data[e.len]) e.len++;
         while (f.data[f.len]) f.len++;
         print(&b, "imgui assertion failed: ");
-        print(&b, e);
+        print(&b, utf8head(e, 200));
         print(&b, " (");
-        print(&b, f);
+        print(&b, utf8head(f, 200));
         putbyte(&b, ':');
         print(&b, (i64)line);
         putbyte(&b, ')');
