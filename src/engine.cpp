@@ -5849,7 +5849,7 @@ static void grantline(Buf *b, Grant g, b32 on, b32 again)
         print(b, grantclass(g));
         print(b, on ? Str(" actions without asking.") : Str(" actions ask again."));
     } else if (g.mcp.len) {
-        Str name = cuthead(g.mcp, 5);  // past "mcp__"
+        Str name = startswith(g.mcp, "mcp__") ? cuthead(g.mcp, 5) : g.mcp;  // past "mcp__"
         Cut c    = cut(name, '_');
         b32 one  = c.ok && startswith(c.tail, "_");
         print(b, on ? may : Str("Calls to "));

@@ -1597,6 +1597,15 @@ static void test_engine(Test *t)
     expect(t, "titletext quotes", titletext(a, "\"\""), "");
     expect(t, "titletext stars", titletext(a, "**"), "");
 
+    // A damaged log's MCP grant shorter than its prefix
+    {
+        Buf  gb(a, 256);
+        Grant g = {};
+        g.mcp = "mcp";
+        grantline(&gb, g, 1, 0);
+        expect(t, "grantline short mcp", istr(a, finish(&gb).len > 0), "1");
+    }
+
     // Exactly 60 code points of two-byte characters: no ellipsis
     Buf b(a, 256);
     for (i32 i = 0; i < 60; i++) {
