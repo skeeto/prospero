@@ -3522,7 +3522,7 @@ static b32 drawbranch(Gui *g, Arena *a, GuiSession *s, f32 end, b32 lead)
     if (w->state!=GITW_REPO || !hostcap(s->host, "git")) {
         return 0;
     }
-    Str name = w->detached ? takehead(w->oid, 7) : w->branch;
+    Str name = w->detached ? utf8head(w->oid, 7) : w->branch;
     Buf op(a, 64 + w->op.len);
     if (w->op.len) {
         print(&op, "  ");
@@ -11123,7 +11123,7 @@ static void drawchanges(Gui *g)
     f32         rx = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - bw;
     Str         name = c->branch.len ? c->branch : w->branch;
     if (!c->branch.len && w->detached) {
-        name = concat(&a, "Detached at ", takehead(w->oid, 12));
+        name = concat(&a, "Detached at ", utf8head(w->oid, 12));
     }
     Measure m = {};
     m.advance = widgetadvance;
@@ -12203,7 +12203,7 @@ static b32 wtfields(Gui *g, Arena a, GuiHost *host, Str cwd)
         print(&b, p->branch);
         print(&b, " at ");
     }
-    print(&b, takehead(p->oid, 7));
+    print(&b, utf8head(p->oid, 7));
     if (p->dirty > 0) {
         print(&b, " \xc2\xb7 ");
         print(&b, p->dirty);
