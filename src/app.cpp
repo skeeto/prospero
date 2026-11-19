@@ -9708,12 +9708,13 @@ static void guifontsthread(void *arg)
     GuiFonts *f       = (GuiFonts *)arg;
     Os       *os      = f->os;
     Arena     perm    = newarena(f->perm);
-    Arena     scratch = newarena(f->scratch);
+    Arena     base    = newarena(f->scratch);
     Buf       b(&perm, 1<<12);
     u32       all  = (1u<<countof(fontcjk)) - 1;
     u32       have = 0;
     for (Str rest = f->setting; rest.len;) {
-        Cut c = cut(rest, ';');
+        Arena scratch = base;  // each entry's own: auto's carve is 4 MiB
+        Cut   c       = cut(rest, ';');
         rest  = c.tail;
         Str e = trim(c.head);
         if (!e.len || e=="none") {
