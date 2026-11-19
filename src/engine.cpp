@@ -23813,7 +23813,8 @@ static void cmdfork(Engine *e, Arena scratch, i64 id, Json *j)
     }
     Arena  lines = newarena(e->replay);
     Replay rp    = logreplay(os, &lines, scratch, path, sid, 0, LOG_MAX);
-    if (!rp.ok) {
+    if (!rp.ok || !rp.lines.len) {
+        // An empty log has no session record for the cwd below
         reply(e, scratch, id, 0, "cannot read the session's log", sid);
         return;
     }
