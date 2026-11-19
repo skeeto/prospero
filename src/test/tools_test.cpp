@@ -712,6 +712,14 @@ static void test_tools(Test *t)
         }
         expect(t, "env windows", istr(a, !gitdir && drive && utf8 && !key), "1");
 
+        // An entry with no '=' is no variable, PATH's or another's
+        {
+            Str bare[] = {"PATH", "HOME", "PATH=/usr/bin"};
+            Slice<Str> e = {bare, countof(bare), countof(bare)};
+            expect(t, "env bare path", envpath(e, 0), "/usr/bin");
+            expect(t, "env bare get", istr(a, envget(e, "HOME", 0).data==0), "1");
+        }
+
         // A window the desktop started: the login shell's environment
         expect(t, "login wanted", istr(a, loginwanted("/usr/bin:/bin:/usr/sbin:/sbin")), "1");
         expect(t, "login not wanted", istr(a, loginwanted("/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin")), "0");

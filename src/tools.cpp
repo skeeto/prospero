@@ -3375,7 +3375,10 @@ static b32 envnameis(Str entry, Str name, b32 fold)
     // Windows keeps per-drive directories as "=C:=C:\x": skip the first =
     iz eq = 1;
     for (; eq<entry.len && entry[eq]!='='; eq++) {}
-    Str n = takehead(entry, eq<entry.len ? eq : entry.len);
+    if (eq >= entry.len) {
+        return 0;  // no '=': no variable, and callers cut past one
+    }
+    Str n = takehead(entry, eq);
     return fold ? equalfold(n, name) : n==name;
 }
 
