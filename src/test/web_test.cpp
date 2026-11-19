@@ -450,6 +450,16 @@ static void testwebhtml(Test *t)
         print(&b, "a<div hidden>no</div>");
         Str s = finish(&b);
         expect(t, "webhtml.deep", webhtml(&a, s, base).text, "a");
+
+        // Four hidden ones there: once counted in a 32-bit sum, the
+        // fourth wrapped it to nothing hidden
+        Buf c(&a, 1<<14);
+        for (i32 i = 0; i < 300; i++) {
+            print(&c, "<span>");
+        }
+        print(&c, "a<div hidden>1</div><div hidden>2</div><div hidden>3</div>"
+                  "<div hidden>4</div>no");
+        expect(t, "webhtml.deepmany", webhtml(&a, finish(&c), base).text, "a");
     }
 
     // Elements left open by habit end when the next begins, so they do

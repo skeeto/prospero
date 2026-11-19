@@ -1226,7 +1226,7 @@ static void webstart(WebHtml *h, Str name, i32 kind, i32 arg, WebAttrs *at)
     } else if (h->depth == WEB_DEPTH) {
         // Too deep to track: hide the rest rather than show what was
         // meant to be hidden
-        h->hide += hide ? 1<<30 : 0;
+        h->hide |= hide ? 1<<30 : 0;  // for good: never counted back down
         return;
     }
     WebElem *e = h->stack + h->depth++;
