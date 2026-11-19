@@ -598,6 +598,29 @@ static void testcfgvalidate(Test *t)
     expect(t, "file.secrets", showlist(&a, cfgsecrets(c, &a)), "");
     cfgfree(c);
 
+    // A secret's file made after the load is a change, its warning gone
+    // at the next poll, and the file emptied brings it back (#84). An
+    // include's file:PATH, ignored, is not watched.
+    os_write(v.os, a, "/c/late.ini",
+             "include = late-team.ini\n"
+             "[endpoint a]\nurl = http://a/\nkey = file:/c/late.key\n");
+    os_write(v.os, a, "/c/late-team.ini",
+             "[endpoint b]\nurl = http://b/\nkey = file:/c/team.key\n");
+    c = newconfig(v.os, &a, v.scratch, "/c/late.ini", 0);
+    expect(t, "late.keys", showlist(&a, c->keys), "/c/late.key");
+    expect(t, "late.before", istr(&a, find(inidiags(&a, c->ini), "/c/late.key cannot") >= 0), "1");
+    expect(t, "late.same", istr(&a, cfgpoll(c, v.scratch, 1)), "0");
+    os_write(v.os, a, "/c/late.key", "sk-late\n");
+    expect(t, "late.poll", istr(&a, cfgpoll(c, v.scratch, 1)), "1");
+    expect(t, "late.after", istr(&a, find(inidiags(&a, c->ini), "/c/late.key cannot") >= 0), "0");
+    expect(t, "late.secret", cfgsecret(c, &a, "endpoint", "a", "key"), "sk-late");
+    os_write(v.os, a, "/c/team.key", "sk-team\n");
+    expect(t, "late.include", istr(&a, cfgpoll(c, v.scratch, 1)), "0");
+    os_write(v.os, a, "/c/late.key", "");
+    expect(t, "late.emptied", istr(&a, cfgpoll(c, v.scratch, 1)), "1");
+    expect(t, "late.again", istr(&a, find(inidiags(&a, c->ini), "/c/late.key cannot") >= 0), "1");
+    cfgfree(c);
+
     // The variables of every secret setting, overridden ones too, which
     // the agent's commands do not get
     os_write(v.os, a, "/c/secrets.ini",

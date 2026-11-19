@@ -1047,6 +1047,7 @@ struct Config {
     Ini        *ini;         // the current load, never null
     IniFile    *user;        // the user's file in ini, null if unread
     Slice<Str>  watch;       // the files whose stamps make the fingerprint
+    Slice<Str>  keys;        // file:PATH secrets' files, stamped too (#84)
     u64         stamp;       // fingerprint at the last load, 0 to reload
     i64         polled;      // os_ticks of the last check
     i64         rev;         // loads so far
@@ -3605,10 +3606,10 @@ static Str cfgdefault(Os *os, Arena *a)
                      "APPDATA", "prospero/prospero.ini", STAT_FILE);
 }
 
-// A hash over the type, size and mtime of each path, never 0.
-static u64 cfgfingerprint(Os *os, Slice<Str> paths, Arena scratch)
+// A hash over the type, size and mtime of each path, never 0, going on
+// from h, another's.
+static u64 cfgfingerprint(Os *os, Slice<Str> paths, Arena scratch, u64 h = 0x100)
 {
-    u64 h = 0x100;
     for (iz i = 0; i < paths.len; i++) {
         Stat s    = os_stat(os, scratch, paths[i]);
         u64  v[3] = {(u64)s.type, (u64)s.size, (u64)s.mtime};
@@ -3715,13 +3716,35 @@ static b32 cfgloadini(Config *c, Arena scratch, Arena *a, Ini *ini, i32 nlayer)
         }
     }
 
+    // The files the user's own file:PATH secrets name, which load nothing
+    // but are checked (cfgkeyline): one made, mended or emptied later is
+    // a change too, or its warning would outlive the problem (#84)
+    Slice<Str> keys = {};
+    for (IniSection *s = user ? ini->sections : 0; s; s = s->next) {
+        for (IniEntry *k = s->keys; k; k = k->next) {
+            CfgKey *key = cfgkey(s->kind, k->key);
+            for (IniEntry *e = k; key && key->type==CFG_SECRET && e; e = e->older) {
+                Str v    = trim(e->value);
+                Str path = {};
+                if (e->file==user && startswith(v, "file:") &&
+                        cfgjudge(key, v, 0)==CFG_OK) {
+                    path = cfgsecretfile(c->os, a, v);
+                }
+                if (path.len) {
+                    keys = push(a, keys, path);
+                }
+            }
+        }
+    }
+
     c->cur    = next;
     c->ini    = ini;
     c->user   = user;
     c->watch  = watch;
+    c->keys   = keys;
     c->rev++;
     c->polled = os_ticks(c->os);
-    c->stamp  = cfgfingerprint(c->os, watch, scratch);
+    c->stamp  = cfgfingerprint(c->os, keys, scratch, cfgfingerprint(c->os, watch, scratch));
     if (c->path.len) {
         // Changed while loading: load again at the next poll
         Stat post = os_stat(c->os, scratch, c->path);
@@ -3816,7 +3839,9 @@ static b32 cfgpoll(Config *c, Arena scratch, b32 force)
         return 0;
     }
     c->polled = now;
-    if (c->stamp && cfgfingerprint(c->os, c->watch, scratch)==c->stamp) {
+    u64 stamp = cfgfingerprint(c->os, c->keys, scratch,
+                               cfgfingerprint(c->os, c->watch, scratch));
+    if (c->stamp && stamp==c->stamp) {
         cfgrefresh(c, scratch, 0);
         return 0;
     }
