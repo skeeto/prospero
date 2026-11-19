@@ -6198,11 +6198,14 @@ static void onattach(Gui *g, GuiSession *s, EvRec *r)
         // A mention its host's engine attached, or could not: one that
         // could not goes as a path, as a mention here does, and the
         // message is sent all the same
+        // What the chip keeps comes from the host, into the chip's few
+        // KiB (mentionchip): cut short, or refused as garbled
         b32 image = jsonstr(jsonget(j, "kind")) == "image";
+        Str mime  = jsonstr(jsonget(j, "mime"));
         Str why   = {};
         if (!jsonint(jsonget(j, "ok"), 0)) {
-            why = err.len ? err : Str("the host could not attach it");
-        } else if (!name.len || name.len>128) {
+            why = err.len ? utf8head(err, 1024) : Str("the host could not attach it");
+        } else if (!name.len || name.len>128 || mime.len>64) {
             why = "the host's answer came garbled";
         } else if (image && s->view && s->view->novision) {
             why = "this model takes no images";
@@ -6215,7 +6218,7 @@ static void onattach(Gui *g, GuiSession *s, EvRec *r)
             m->name  = clone(m->mem, name);
             m->file  = !image;
             m->pdf   = !image && endswith(name, ".pdf.txt");
-            m->mime  = clone(m->mem, jsonstr(jsonget(j, "mime")));
+            m->mime  = clone(m->mem, mime);
             m->w     = (i32)jsonint(jsonget(j, "w"), 0);
             m->h     = (i32)jsonint(jsonget(j, "h"), 0);
             m->bytes = jsonint(jsonget(j, "bytes"), 0);
