@@ -21513,6 +21513,18 @@ static RewindRun rewindfiles(Session *s, Arena *a, Arena scratch, i64 turn0,
     return r;
 }
 
+// The room rewindfiles needs for its results: per snapshot, its file's
+// path, its result and its name, in slices that may double. A long
+// session's edits outgrow any fixed carve.
+static iz rewindroom(Session *s)
+{
+    iz n = (iz)1 << 16;
+    for (iz i = 0; i < s->snaps.len; i++) {
+        n += 256 + 2*s->snaps[i].path.len;
+    }
+    return n;
+}
+
 // rewind {sid, to, force}: put back, newest first, the files that write
 // and edit changed at or after a call (to: its id) or a turn (to: its
 // number), unless something else changed them since, which is a
@@ -21557,7 +21569,7 @@ static void cmdrewind(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
         return;
     }
 
-    Arena     keep   = carve(&scratch, 1<<20);
+    Arena     keep   = carve(&scratch, rewindroom(s));
     RewindRun run    = rewindfiles(s, &keep, scratch, turn0, seq0, force, 0, 0);
     Slice<RewindFile> files  = run.files;
     Slice<Str>        undone = run.undone;
@@ -21913,7 +21925,7 @@ static void cmduncut(Engine *e, Session *s, Arena scratch, i64 id)
         }
     }
 
-    Arena     keep = carve(&scratch, 1<<20);
+    Arena     keep = carve(&scratch, rewindroom(s));
     RewindRun run  = rewindfiles(s, &keep, scratch, -1, -1, 0, 0, cut);
     Slice<Str> redone = {};
     for (iz i = 0; i < names.len; i++) {
