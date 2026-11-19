@@ -227,6 +227,24 @@ static void test_filewalk(Test *t)
         filewalkfree(&w);
     }
 
+    // A .gitignore whose rules would not fit in mem: the walk ends there,
+    // truncated, rather than running mem out
+    {
+        Os *os = newos(a, 1<<20);
+        os_mkdirs(os, *a, "/g");
+        Buf rules(a, 1<<18);
+        for (i32 i = 0; i < 100000; i++) {
+            print(&rules, "a\n");
+        }
+        os_write(os, *a, "/g/.gitignore", finish(&rules));
+        os_write(os, *a, "/g/x.txt", "x\n");
+        Arena    mem = carve(a, 1<<20);
+        FileWalk w   = {};
+        walkto(&w, os, &mem, "/g", 0, 0, 0);
+        expect(t, "walk.rules.full", istr(a, w.truncated), "1");
+        filewalkfree(&w);
+    }
+
     // A walk resumed a step at a time is the walk to the end, and no path
     // comes twice
     {

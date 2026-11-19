@@ -124,9 +124,17 @@ static void filewalkbegin(FileWalk *w, Os *os, Arena *mem, Str root, b32 win)
         w->done = 1;
         return;
     }
+    // The files above, as a level's below: too large, and the walk is
+    // empty, rather than one that lists what they leave out
+    b32        full    = 0;
+    GitIgnore *parents = ignoreparents(os, &w->mem, w->root, win, &full);
+    if (full) {
+        w->done = w->truncated = 1;
+        return;
+    }
     w->dirs       = push(&w->mem, w->dirs, w->root);
     w->rels       = push(&w->mem, w->rels, Str{});
-    w->chains     = push(&w->mem, w->chains, ignoreparents(os, &w->mem, w->root, win));
+    w->chains     = push(&w->mem, w->chains, parents);
     w->reals      = push(&w->mem, w->reals, rootreal.len ? rootreal : w->root);
     w->depths     = push(&w->mem, w->depths, 0);
 }
@@ -230,13 +238,15 @@ static b32 filewalkstep(FileWalk *w)
         // The level's .gitignore, in mem with the rest of its chain: a
         // level's rules must outlive the step that loaded them, or nested
         // files stop applying once a walk is resumed. Its size is the
-        // file's, so the room for it is checked here, not in filewalkroom.
-        if (!fits(&w->mem, FILEWALK_RULES)) {
+        // file's, so the room for it is checked as it loads (full), not
+        // in filewalkroom.
+        b32 full = !fits(&w->mem, FILEWALK_RULES);
+        chain = full ? chain : ignoreload(w->os, &w->mem, chain, dir, &full);
+        if (full) {
             w->truncated = 1;
             stop = 1;
             break;
         }
-        chain = ignoreload(w->os, &w->mem, chain, dir);
         // What the listing may be given: the scratch's room, at an entry's
         // worst case, so that os_listall cannot reach os_oom either
         iz      room = filewalkleft(&w->scratch) / FILEWALK_ENTRY;

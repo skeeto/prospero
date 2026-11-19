@@ -963,10 +963,46 @@ static b32 ignored(GitIgnore *chain, Str path, b32 isdir)
     return 0;
 }
 
-// Load a directory's .gitignore onto the chain, if it has one.
-static GitIgnore *ignoreload(Os *os, Arena *a, GitIgnore *chain, Str dir)
+// Load a directory's .gitignore onto the chain, if it has one. With
+// full, only when the file and its rules surely fit in a, else nothing
+// is kept and *full is set. A rule costs at most IGNORE_RULE bytes and
+// twice its line (the rules' slice as it grows and is copied, a slice
+// for its glob, the pattern cloned and anchored).
+enum : i32 { IGNORE_RULE = 320 };
+
+static GitIgnore *ignoreload(Os *os, Arena *a, GitIgnore *chain, Str dir, b32 *full = 0)
 {
-    Read rd = os_read(os, a, join(a, dir, ".gitignore"), 1<<20);
+    Arena save = *a;
+    Str   path = join(a, dir, ".gitignore");
+    if (full) {
+        byte *limit = a->region ? a->region->base+a->region->cap : a->end;
+        iz    left  = limit - a->beg;
+        iz    max   = left/3<(1<<20) ? left/3 : (iz)(1<<20);
+        Read  rd    = os_read(os, a, path, max);
+        if (rd.err && rd.size>max && max<(1<<20)) {
+            *a    = save;
+            *full = 1;
+            return chain;
+        } else if (rd.err || !rd.data.len) {
+            *a = save;
+            return chain;
+        }
+        iz lines = 1;
+        for (iz i = 0; i < rd.data.len; i++) {
+            lines += rd.data[i] == '\n';
+        }
+        if (!fits(a, 64 + lines*IGNORE_RULE + 2*rd.data.len)) {
+            *a    = save;
+            *full = 1;
+            return chain;
+        }
+        GitIgnore *f = alloc<GitIgnore>(a);
+        f->next  = chain;
+        f->dir   = dir;
+        f->rules = ignoreparse(a, rd.data);
+        return f->rules.len ? f : chain;
+    }
+    Read rd = os_read(os, a, path, 1<<20);
     if (rd.err || !rd.data.len) {
         return chain;
     }
@@ -1118,8 +1154,9 @@ static void walkdir(SearchWalk *w, Arena scratch, GitIgnore *chain, Str dir,
 }
 
 // The .gitignore files above the search directory, out to the root of
-// the repository holding it, if any: as ripgrep reads them.
-static GitIgnore *ignoreparents(Os *os, Arena *a, Str root, b32 win)
+// the repository holding it, if any: as ripgrep reads them. With full,
+// as ignoreload's: set, and the chain so far, if one would not fit.
+static GitIgnore *ignoreparents(Os *os, Arena *a, Str root, b32 win, b32 *full = 0)
 {
     Slice<Str> dirs = {};
     Str        top  = {};
@@ -1140,7 +1177,10 @@ static GitIgnore *ignoreparents(Os *os, Arena *a, Str root, b32 win)
     }
     for (iz i = dirs.len-1; i >= 0; i--) {
         if (dirs[i].len >= top.len) {  // at or below the repository root
-            chain = ignoreload(os, a, chain, dirs[i]);
+            chain = ignoreload(os, a, chain, dirs[i], full);
+        }
+        if (full && *full) {
+            break;
         }
     }
     return chain;
