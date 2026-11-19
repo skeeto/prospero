@@ -3650,7 +3650,9 @@ static b32 os_removetree(Os *, Arena scratch, Str path)
             if (fd.attr&FILE_ATTRIBUTE_REPARSE_POINT || !isd) {
                 ok &= rmentry(p, isd, rdo);
             } else {
-                iz    n   = d.path.len + 1 + len;
+                // As rmchild joined it: a separator only if none ended it
+                b32   sep = !d.path.len || d.path.data[d.path.len-1]!='\\';
+                iz    n   = d.path.len + sep + len;
                 RmDir sub = {{p, n}, 0, rdo};
                 stack = push(&scratch, stack, sub);
             }
