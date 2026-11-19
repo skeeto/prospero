@@ -438,10 +438,13 @@ static i32 utf8prev(Str s, iz i, iz *start)
     return r;
 }
 
-// Encode a code point (at most 0x10ffff) as UTF-8, returning the length.
+// Encode a code point as UTF-8, one past 0x10ffff as U+FFFD, returning
+// the length.
 static iz utf8encode(u8 *s, i32 c)
 {
-    assert(c>=0 && c<=0x10ffff);
+    // utf8decode yields up to 0x1fffff for leads F5..F7, and callers pass
+    // it on (a terminal's title): replaced, as towide does
+    c = c>=0 && c<=0x10ffff ? c : 0xfffd;
     if (c < 0x80) {
         s[0] = (u8)c;
         return 1;

@@ -146,4 +146,13 @@ static void test_base(Test *t)
         expect(t, "utf8.roundtrip", istr(&a, c), istr(&a, points[i]));
         expect(t, "utf8.length", istr(&a, off), istr(&a, s.len));
     }
+
+    // What utf8decode makes of F5..F7 leads, encoded again: replaced
+    {
+        Str s   = "\xf7\xbf\xbf\xbf";
+        iz  off = 0;
+        u8  buf[4];
+        Str e   = {buf, utf8encode(buf, utf8decode(s, &off))};
+        expect(t, "utf8.beyond", e, "\xef\xbf\xbd");
+    }
 }
