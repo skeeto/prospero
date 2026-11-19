@@ -210,6 +210,11 @@ static b32 tooloffered(ToolEnv *te, i32 tool)
                       "job_output job_kill task skill sessions send_message " \
                       "memory web_search web_fetch read_terminal"
 
+// The tools of a session on the built-in model, unless its role or its
+// caller names some: a small model did as well with these alone in the
+// starter evals (tests/bench/starter), on half the prompt.
+#define TOOLS_SMALL "read write edit shell grep glob"
+
 // The tools a word of a tool list names, as bits: a tool's own, "*" for
 // every tool a role may have (the default's and the desktop's), and
 // "default" for TOOLS_DEFAULT. Zero for none, and for a leading "-",

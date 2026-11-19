@@ -206,7 +206,11 @@ window is open (Prospero in the background, or `prospero run`). It runs
 one request at a time (`max_concurrent` is 1): another session's turn
 waits in line. It takes no images. Its context window is 65536 tokens,
 and the prompts of the last few sessions stay cached in memory, up to
-2 GB, so each turn computes only what is new.
+2 GB, so each turn computes only what is new. A session on it, unless
+its role or its caller names tools, gets only read, write, edit, shell,
+grep and glob, which halves the prompt the model must read before it
+answers, and its system prompt asks it to test its work before it
+replies: a small model did best so in `tests/bench/starter`.
 
 For an OpenAI-compatible server, `template.NAME = VALUE` in a
 `[model NAME]` section is an argument of the model's chat template,
