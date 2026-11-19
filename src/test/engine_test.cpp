@@ -573,6 +573,15 @@ static void testtargets(Test *t)
            "No subagent was started: no model \"nope\" is configured or listed "
            "at http://fast/v1. Give one of these, or none for the default: "
            "small, big, solo, listed, other.");
+    {
+        // A huge name from the agent, in the 64 KiB carve the task uses
+        Arena s    = v.scratch;
+        Arena keep = carve(&s, 1<<16);
+        Buf   mb(&s, 100001);
+        for (i32 i = 0; i < 100000; i++) putbyte(&mb, 'x');
+        Str why = submodel(e, &keep, s, finish(&mb), "fast", url);
+        expect(t, "submodel huge", istr(&a, why.len>0 && why.len<2000), "1");
+    }
     notekinds(e, v.scratch, url, "{\"data\":[{\"id\":\"nope\"}]}");
     expect(t, "submodel listed anew", submodel(e, &a, v.scratch, "nope", "fast", url), "");
     expect(t, "submodel listed no more", istr(&a,

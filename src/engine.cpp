@@ -18403,15 +18403,17 @@ static Str submodel(Engine *e, Arena *perm, Arena scratch, Str model, Str which,
         }
         rest = c.tail;
     }
+    // Each part cut short: the model is the agent's to write, and the
+    // message goes in a 64 KiB carve
     Buf b(perm, 512);
     print(&b, "No subagent was started: no model \"");
-    print(&b, model);
+    print(&b, utf8head(model, 200));
     print(&b, "\" is configured or listed at ");
-    print(&b, url);
+    print(&b, utf8head(url, 1000));
     print(&b, ". Give one of these, or none for the default: ");
     for (iz i = 0; i<names.len && i<40; i++) {
         print(&b, i ? Str(", ") : Str(""));
-        print(&b, names[i]);
+        print(&b, utf8head(names[i], 200));
     }
     print(&b, names.len>40 ? Str(", ...") : Str(""));
     print(&b, names.len ? Str(".") : Str("(none)."));
