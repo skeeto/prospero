@@ -17868,6 +17868,33 @@ def fork_folder(t):
 
 
 @scenario(bound=40)
+def worktree_side_packed(t):
+    """fork {side, worktree} in a repository whose packed-refs runs to
+    hundreds of KB: planning reads it whole, in scratch that grows."""
+    env = gitrepo(t)
+    oid = gitrun(t, env, "rev-parse", "HEAD")
+    lines = "".join(f"create refs/tags/many-{i:05d}-{'x' * 40} {oid}\n" for i in range(6000))
+    r = subprocess.run(["git", "update-ref", "--stdin"], cwd=t.work, env=env, input=lines,
+                       capture_output=True, text=True)
+    t.check(r.returncode == 0, f"update-ref: {r.stderr}")
+    gitrun(t, env, "pack-refs", "--all")
+    size = os.path.getsize(os.path.join(t.work, ".git", "packed-refs"))
+    t.check(size > 1<<19, f"packed-refs {size}")
+    h = t.headless(env={k: env[k] for k in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM")})
+    try:
+        r = h.call("new", cwd=t.work, model=wtmodel(t), endpoint="fake")
+        parent = r["sid"]
+        wtturn(t, h, parent, "the original")
+        r = h.call("fork", sid=parent, side=1, worktree={"name": "side-packed"})
+        t.check(r.get("ok") == 1 and r.get("side") == 1, f"fork: {r}")
+        r = h.call("fork", sid=parent, side=1, worktree={"name": "side-packed"})
+        t.check(r.get("ok") == 0 and "taken" in r.get("err", ""), f"taken: {r}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=40)
 def worktree_side(t):
     """fork {side, worktree}: a side chat in a worktree of its own, on a
     branch cut from its original's HEAD, at the same subdirectory. The

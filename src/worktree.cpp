@@ -1999,7 +1999,7 @@ static Str wtfallback(Session *s, Arena *a)
     Arena   oid = carve(&t, 128);   // apart from the scratch it is read in
     Str     git = gitcommon(e->os, &t, join(&t, s->wt.main, ".git"), win);
     Str     ref = concat(&t, "refs/heads/", s->wt.branch);
-    Str     tip = gitrefoid(e->os, &oid, t, git, ref);
+    Str     tip = gitrefoid(e->os, &oid, *a, git, ref);  // packed-refs past t
     Buf     b(a, 512 + s->wt.path.len + 2*s->wt.branch.len);
     if ((s->wtdefer || !wtexists(e, t, &s->wt)) && (!tip.len || tip==s->wt.oid)) {
         print(&b, "[Its worktree, ");

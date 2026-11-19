@@ -23806,8 +23806,10 @@ static void cmdfork(Engine *e, Arena scratch, i64 id, Json *j)
             reply(e, scratch, id, 0, "a session of no folder has no worktree", sid);
             return;
         }
+        // What it plans in keep, as it reads (packed-refs, the
+        // sessions' records) in the scratch past it, which grows
         Arena keep = carve(&scratch, 1<<18);
-        Str   err  = wtfork(e, &scratch, keep, wtj, sid, title, pcwd, &wt, &cw);
+        Str   err  = wtfork(e, &keep, scratch, wtj, sid, title, pcwd, &wt, &cw);
         if (err.len) {
             reply(e, scratch, id, 0, err, sid);
             return;
