@@ -26676,9 +26676,13 @@ static void clipownafter(Gui *g, Arena scratch, Str what)
     if (e.x < 0) {
         return;
     } else if (e.x == 0) {
-        Arena a = scratch;
-        guilog(g, concat(&a, concat(&a, "drive: FAIL ", what),
-                         " did not reach the checklist's own pasteboard"));
+        // In perm: scratch may be a copy of the frame taken mid-frame
+        // (ImGui's clipboard setter), the base of which is in use
+        Buf b(&g->perm, what.len + 64);
+        print(&b, "drive: FAIL ");
+        print(&b, what);
+        print(&b, " did not reach the checklist's own pasteboard");
+        guilog(g, finish(&b));
         g->drivechecks++;
         g->drivefails++;
     } else if (e.y != 0) {
