@@ -1561,13 +1561,14 @@ static i64 httpdate(Str s)
     i32 mon  = 0;
     for (; mon<12 && !equalfold(months[mon], f[1]); mon++) {}
     Str hms = f[3];
-    if (!day.ok || !year.ok || mon==12 || hms.len!=8) {
-        return -1;
+    if (!day.ok || !year.ok || mon==12 || hms.len!=8 ||
+            day.val<1 || day.val>31 || year.val<1970 || year.val>9999) {
+        return -1;  // nor one whose arithmetic would overflow
     }
     Int hh = parseint(takehead(hms, 2));
     Int mm = parseint(Str{hms.data+3, 2});
     Int ss = parseint(Str{hms.data+6, 2});
-    if (!hh.ok || !mm.ok || !ss.ok) {
+    if (!hh.ok || !mm.ok || !ss.ok || hh.val>23 || mm.val>59 || ss.val>60) {
         return -1;
     }
     i64 days = epochdays(year.val, mon+1, day.val);

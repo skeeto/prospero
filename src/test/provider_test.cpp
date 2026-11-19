@@ -191,6 +191,10 @@ static void test_provider(Test *t)
         expect(t, "retry-after past date",
                istr(a, retryafter("Retry-After: Sun, 06 Nov 1994 08:49:27 GMT\r\n", at)), "0");
         expect(t, "httpdate bad", istr(a, httpdate("yesterday")), "-1");
+        expect(t, "httpdate huge day", istr(a, httpdate("Sun, 9223372036854775807 Nov "
+                                                       "1994 08:49:37 GMT")), "-1");
+        expect(t, "httpdate huge year", istr(a, httpdate("Sun, 06 Nov "
+                                                        "922337203685477580 08:49:37 GMT")), "-1");
 
         i64 bases[] = {500, 1000, 2000, 4000, 8000, 8000, 8000, 8000, 8000, 8000};
         for (i32 n = 1; n <= 10; n++) {
