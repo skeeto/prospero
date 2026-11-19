@@ -2775,7 +2775,7 @@ static Str dibpng(Os *os, Arena *a, Str dib)
     // BI_BITFIELDS: its masks follow a short header, or are in a long
     // one, and only the usual BGRA is taken
     iz off = hdr + (comp==3 && hdr==40 ? 12 : 0);
-    if (comp==3 && (off>dib.len || dibint(p+40)!=0xff0000 ||
+    if (comp==3 && (off>dib.len || dib.len<52 || dibint(p+40)!=0xff0000 ||
                     dibint(p+44)!=0xff00 || dibint(p+48)!=0xff)) {
         return r;
     }
