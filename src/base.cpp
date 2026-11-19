@@ -86,8 +86,8 @@ inline void arenafresh(Region *, byte *, byte *);
 static void arenagrow(Arena *a, iz pad, iz count, iz size)
 {
     Region *r = a->region;
-    if (!r || count >= (r->base + r->cap - a->beg - pad)/size) {
-        os_oom();
+    if (!r || count<0 || count >= (r->base + r->cap - a->beg - pad)/size) {
+        os_oom();  // a negative count too: never the frontier moved back
     }
     iz grain = (iz)1 << 20;
     iz upto  = a->beg - r->base + pad + (count+1)*size;
@@ -119,7 +119,7 @@ static T *alloc(Arena *a, iz count = 1)
 {
     iz size = sizeof(T);
     iz pad  = -(uz)a->beg & (alignof(T) - 1);
-    if (count >= (a->end - a->beg - pad)/size) {
+    if (count<0 || count >= (a->end - a->beg - pad)/size) {
         arenagrow(a, pad, count, size);
     }
     T *r = (T *)(a->beg + pad);
@@ -136,7 +136,7 @@ static T *alloc(Arena *a, iz count = 1)
 // Like alloc<u8>, but does not zero the memory.
 static u8 *allocbytes(Arena *a, iz count)
 {
-    if (count > a->end - a->beg) {
+    if (count<0 || count > a->end - a->beg) {
         arenagrow(a, 0, count, 1);
     }
     u8 *r = (u8 *)a->beg;
