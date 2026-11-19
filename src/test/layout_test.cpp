@@ -165,6 +165,26 @@ static void test_layout(Test *t)
         expect(t, "layout.markers", finish(&b), "3.@4 4.@4 ");
     }
 
+    // A cache key collision (forged here) never hands a block a layout
+    // whose runs reach past its pieces
+    {
+        Arena        a     = perm;
+        Measure      m     = fixedmeasure();
+        LayoutCache *cache = 0;
+        Doc         *d1    = parsedoc(&a, "a *longer* paragraph of text", 0);
+        Doc         *d2    = parsedoc(&a, "x", 0);
+        getlayout(&cache, &a, &m, d1, 0, 200, 1);
+        d2->blocks[0].hash = d1->blocks[0].hash;
+        BlockLayout *bl = getlayout(&cache, &a, &m, d2, 0, 200, 1);
+        b32 fits = 1;
+        for (iz i = 0; i < bl->runs.len; i++) {
+            Run *r = &bl->runs[i];
+            fits &= r->piece < d2->pieces.len &&
+                    r->b1 <= d2->pieces[r->piece].text.len;
+        }
+        expect(t, "layout.collision", istr(&a, fits), "1");
+    }
+
     // Hit testing maps every offset's x back to that offset
     {
         Arena        a     = perm;

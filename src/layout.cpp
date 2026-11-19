@@ -679,6 +679,26 @@ static u64 layoutkey(u64 hash, f32 width, f32 scale)
     return hashfinal(&h);
 }
 
+// Whether a cached layout's runs all fall within the document's pieces
+// from block bi's first. The key is a hash and nothing else, so a
+// collision (a made one: the hash is not cryptographic) could hand over
+// another block's layout. With this, it shows the wrong text at worst,
+// and never reads past a piece.
+static b32 layoutfits(BlockLayout *bl, Doc *d, i32 bi)
+{
+    iz     piece0 = d->blocks[bi].piece0;
+    iz     npiece = d->pieces.len - piece0;
+    Piece *pieces = d->pieces.data + piece0;
+    for (iz i = 0; i < bl->runs.len; i++) {
+        Run *r = &bl->runs[i];
+        if (r->piece<0 || r->piece>=npiece || r->b0<0 || r->b0>r->b1 ||
+            r->b1>pieces[r->piece].text.len) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 // The layout of block bi, from the cache or made and cached. Tables come
 // whole from their first cell.
 static BlockLayout *getlayout(LayoutCache **cache, Arena *perm, Measure *m,
@@ -690,16 +710,21 @@ static BlockLayout *getlayout(LayoutCache **cache, Arena *perm, Measure *m,
     LayoutCache **slot = cache;
     for (u64 h = key; *slot; h <<= 2) {
         if ((*slot)->key == key) {
-            return (*slot)->bl;
+            if (layoutfits((*slot)->bl, d, bi)) {
+                return (*slot)->bl;
+            }
+            break;  // a collision: laid out afresh, and that one kept
         }
         slot = &(*slot)->child[h>>62];
     }
     BlockLayout *bl = b->type==DOC_CELL
         ? layouttable(perm, m, d, bi, width, scale)
         : layoutblock(perm, m, d, bi, width, scale);
-    *slot = alloc<LayoutCache>(perm);
-    (*slot)->key = key;
-    (*slot)->bl  = bl;
+    if (!*slot) {
+        *slot = alloc<LayoutCache>(perm);
+        (*slot)->key = key;
+    }
+    (*slot)->bl = bl;
     return bl;
 }
 
