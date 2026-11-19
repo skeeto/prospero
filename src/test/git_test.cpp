@@ -41,6 +41,20 @@ static void testgithead(Test *t)
 {
     Arena *a = &t->perm;
 
+    // A deep folder in no repository: the walk's 256 levels of a long
+    // path in the 64 KiB the engine gives it
+    {
+        Arena s = *a;
+        Os   *os = newos(&s, 1<<16);
+        Buf   p(&s, 1<<17);
+        for (i32 i = 0; i < 200; i++) {
+            print(&p, "/abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz");
+        }
+        Arena   w = carve(&s, 1<<16);
+        GitHead h = githead(os, &w, finish(&p), {}, 0);
+        expect(t, "githead deep", istr(&s, h.repo), "0");
+    }
+
     // Found from below, through a worktree's file (by its path, and
     // relative), past a .git with no HEAD and one leading nowhere, and
     // not past a ceiling, though the ceiling itself counts

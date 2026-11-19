@@ -214,9 +214,13 @@ static GitHead githead(Os *os, Arena *a, Str cwd, Str ceiling, b32 win)
     win = win && pathroot(cwd, 1);
     Str d   = normpath(a, cwd, ".", win);
     Str top = ceiling.len ? normpath(a, ceiling, ".", win) : Str{};
+    // Each level's look in a copy of a, kept only where a repository is:
+    // a walk of 256 levels of a long path would outgrow a's 64 KiB
     for (i32 i = 0; i < GIT_WALKMAX; i++) {
-        Str gitdir = gitdirat(os, a, d, win);
+        Arena t      = *a;
+        Str   gitdir = gitdirat(os, &t, d, win);
         if (gitdir.len) {
+            *a = t;
             Read rd = os_read(os, a, join(a, gitdir, "HEAD"), GIT_HEADMAX);
             if (rd.err == READ_OK) {
                 h.repo   = 1;
@@ -236,7 +240,10 @@ static GitHead githead(Os *os, Arena *a, Str cwd, Str ceiling, b32 win)
         if (top.len && (win ? equalfold(d, top) : d==top)) {
             break;
         }
-        Str up = normpath(a, d, "..", win);
+        // The parent is a prefix of d, normalized: taken from d, not made
+        Arena u  = *a;
+        Str   up = normpath(&u, d, "..", win);
+        up = startswith(d, up) ? takehead(d, up.len) : clone(a, up);
         if (up == d) {
             break;
         }
