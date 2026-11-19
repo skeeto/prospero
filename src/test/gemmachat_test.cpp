@@ -303,16 +303,118 @@ static void test_gemmastream(Test *t)
     // tokens toward a tool's name, and no end
     f32 *logits = alloc<f32>(&a, GM_VOCAB);
     s = gmstream(&a, &tok, ids, jsonparse(&a, "{}").root, 0, gmtcollect, &out, "c");
-    gmconstrain(&s, logits);
+    gmconstrain(&s, a, logits);
     expect(t, "gemmachat.constrain.nocall", istr(&a, logits[48] < -1e30f), "1");
     s = gmstream(&a, &tok, ids, req, 0, gmtcollect, &out, "c");
     for (i32 i = 0; i < GM_VOCAB; i++) logits[i] = 0;
     gmstreamtoken(&s, a, 48);
     gmstreamtoken(&s, a, GMT_HEAD);
-    gmconstrain(&s, logits);
+    gmconstrain(&s, a, logits);
     expect(t, "gemmachat.constrain.header",
            istr(&a, logits[GMT_READ]==0 && logits[GMT_A]==0 && logits[GMT_WORLD]<-1e30f &&
                     logits[GM_EOS]<-1e30f && logits[106]<-1e30f), "1");
+
+    // With a schema: past the name, a required key's string still open
+    // or its arguments unclosed, no end; once closed, only the end
+    Json *schema = jsonparse(&a, "{\"tools\":[{\"type\":\"function\",\"function\":"
+                                 "{\"name\":\"read\",\"parameters\":{\"properties\":"
+                                 "{\"path\":{}},\"required\":[\"path\"]}}}]}").root;
+    s = gmstream(&a, &tok, ids, schema, 0, gmtcollect, &out, "c");
+    i32 open[] = {48, GMT_HEAD, GMT_READ, 52, GMT_A, 52};
+    for (iz i = 0; i < countof(open); i++) {
+        gmstreamtoken(&s, a, open[i]);
+    }
+    for (i32 i = 0; i < GM_VOCAB; i++) logits[i] = 0;
+    gmconstrain(&s, a, logits);
+    expect(t, "gemmachat.constrain.open",
+           istr(&a, logits[49]<-1e30f && logits[GMT_CLOSE]==0 && logits[GMT_HELLO]<-1e30f &&
+                    logits[48]<-1e30f && logits[100]<-1e30f), "1");
+    gmstreamtoken(&s, a, GMT_CLOSE);
+    for (i32 i = 0; i < GM_VOCAB; i++) logits[i] = 0;
+    gmconstrain(&s, a, logits);
+    expect(t, "gemmachat.constrain.closed",
+           istr(&a, logits[49]==0 && logits[GMT_CLOSE]<-1e30f && logits[GMT_A]<-1e30f), "1");
+}
+
+// A call's arguments held to its tool's schema, as llama.cpp's grammar
+// would: edit wants path, old_string, new_string; ask_user's questions
+// each a question.
+static void test_gemmaargs(Test *t)
+{
+    Arena a      = t->perm;
+    Json *params = jsonparse(&a,
+        "{\"properties\":{\"path\":{},\"old_string\":{},\"new_string\":{},"
+        "\"q\":{\"type\":\"array\",\"items\":{\"properties\":"
+        "{\"question\":{},\"header\":{}},\"required\":[\"question\"]}}},"
+        "\"required\":[\"path\"]}").root;
+    GmArgs s = gmargs(&a, params, "path:<|\"|>a,b<|\"|>,old");
+    expect(t, "gemmachat.args.key",
+           istr(&a, s.top && s.top->seen.len==1 && s.top->seen[0]=="path" &&
+                    s.top->atkey && s.key=="old" && !s.instr), "1");
+    s = gmargs(&a, params, "content:<|\"|>x{y,z:");
+    expect(t, "gemmachat.args.instr", istr(&a, s.instr && !s.top->atkey), "1");
+    s = gmargs(&a, params, "q:[{a:1,b:2}],");
+    expect(t, "gemmachat.args.after",
+           istr(&a, s.top->schema==params && s.top->seen.len==1 && s.top->atkey &&
+                    !s.key.len), "1");
+    s = gmargs(&a, params, "q:[{header:<|\"|>x<|\"|>,qu");
+    expect(t, "gemmachat.args.nested",
+           istr(&a, s.top->schema==jsonget(jsonget(jsonget(params, "properties"), "q"), "items") &&
+                    s.top->seen.len==1 && s.top->seen[0]=="header" && s.key=="qu"), "1");
+    s = gmargs(&a, params, "n:1}");
+    expect(t, "gemmachat.args.closed", istr(&a, !s.top && s.closed), "1");
+
+    // Where a value begins, and of what type
+    Str fresh[][2] = {
+        {"path:", "1"}, {"path: ", "1"}, {"path:<|\"|>", "0"}, {"q:[", "1"},
+        {"q:[{question:<|\"|>a<|\"|>},", "1"}, {"q:[{", "0"}, {"path:1", "0"},
+    };
+    for (iz i = 0; i < countof(fresh); i++) {
+        s = gmargs(&a, params, fresh[i][0]);
+        expect(t, concat(&a, "gemmachat.args.fresh ", fresh[i][0]), istr(&a, s.fresh), fresh[i][1]);
+    }
+    struct { Str type; b32 quote; Str text; Str want; } begins[] = {
+        {"string", 1, "", "1"}, {"string", 0, "a", "0"}, {"object", 0, "{", "1"},
+        {"object", 0, "<", "0"}, {"array", 0, "[{", "1"}, {"array", 1, "", "0"},
+        {"boolean", 0, "tr", "1"}, {"boolean", 0, "false", "1"}, {"boolean", 0, "true}", "1"},
+        {"boolean", 0, "yes", "0"}, {"integer", 0, "-3", "1"}, {"number", 0, "x", "0"},
+        {"", 0, "x", "1"},
+    };
+    for (iz i = 0; i < countof(begins); i++) {
+        Buf b(&a, 64);
+        print(&b, "gemmachat.args.begins.");
+        print(&b, (i64)i);
+        expect(t, finish(&b), istr(&a, gmvaluebegins(begins[i].type, begins[i].quote, begins[i].text)),
+               begins[i].want);
+    }
+
+    Str  left[] = {"old_string", "new_string", "replace_all"};
+    Slice<Str> unused = {left, countof(left)};
+    struct { Str args; Str text; b32 done; Str want; } cases[] = {
+        {"path:<|\"|>a<|\"|>,", "new",      0, "1"},
+        {"path:<|\"|>a<|\"|>,", "content",  0, "0"},
+        {"path:<|\"|>a<|\"|>,", "}",        0, "0"},
+        {"path:<|\"|>a<|\"|>,", "}",        1, "1"},
+        {"path:<|\"|>a<|\"|>,", "",         0, "0"},  // a special
+        {"path:<|\"|>a<|\"|>,old_", "string:", 0, "1"},
+        {"path:<|\"|>a<|\"|>,old_", "str:",    0, "0"},
+        {"path:<|\"|>a<|\"|>", "}",         0, "0"},
+        {"path:<|\"|>a<|\"|>", "}",         1, "1"},
+        {"path:<|\"|>a<|\"|>", ",new",      0, "1"},
+        {"path:<|\"|>a<|\"|>", ",content",  0, "0"},
+        {"path:",               "",           0, "1"},  // the delimiter
+        {"path:<|\"|>a<|\"|>", "",          0, "0"},
+        {"path:<|\"|>a<|\"|>", "Hello",     1, "0"},
+        {"n:",                  "12",         0, "1"},
+    };
+    for (iz i = 0; i < countof(cases); i++) {
+        GmArgs st = gmargs(&a, params, cases[i].args);
+        Buf b(&a, 64);
+        print(&b, "gemmachat.args.allow.");
+        print(&b, (i64)i);
+        expect(t, finish(&b), istr(&a, gmargsallow(&st, unused, cases[i].done, cases[i].text)),
+               cases[i].want);
+    }
 }
 
 static void test_gemmasample(Test *t)

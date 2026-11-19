@@ -911,6 +911,7 @@ int main()
     test_gemmacalls(&t);
     test_gemmacallprefix(&t);
     test_gemmastream(&t);
+    test_gemmaargs(&t);
     test_gemmasample(&t);
     test_gemmacache(&t);
     test_a11ylog(&t);
