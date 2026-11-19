@@ -25,6 +25,11 @@
 // The window going to the background hangs up (relay.peer gone): the
 // engine's turns on builtin endpoints wait until a window offers again.
 //
+// A thin remote is offered the model too (relayoffers), and its calls
+// come here the same way: its own window's engine serves them
+// (relayserve), sending each to this window as one of its own sessions'
+// calls, whole, under the same admission (one at a time).
+//
 // This is free and unencumbered software released into the public domain.
 
 enum : i64 {
@@ -489,6 +494,7 @@ static void bloffer(Gui *g, b32 force)
     putkey(&e.json, "offer");
     putraw(&e.json, offer);
     cmdsend(g, &e, a);
+    guiofferask(g);  // thin hosts' offer names its models, after this
 }
 
 // Main engine came up (again): what it had is gone.

@@ -14759,6 +14759,8 @@ enum : i32 {
     OP_REVEAL,    // scroll the settings window to the RECT_* target
     OP_TOUCH,     // write over a file in --cwd, as something else would
     OP_RMMODEL,   // remove the built-in model's file (builtin.cpp)
+    OP_CFGSET,    // text "KIND NAME KEY VAR": set KEY as Settings would, to
+                  // the environment's VAR (gui.py's), then wait W_CONFIGSET
     OP_TRAY,      // pick the tray icon's menu item dx (TRAY_*)
     OP_DROPLINK,  // break the shown session's host's stream (remotedrop)
     OP_TEXTRCWD,  // type the --rcwd directory, the remote one
@@ -14779,6 +14781,7 @@ enum : i32 {
     OP_IFWSL,     // unless wsl.exe has a stand-in (PROSPERO_TEST_WSL), skip
                   // dx ops
     OP_IFSCP,     // unless scp has a stand-in (PROSPERO_TEST_SCP), skip dx ops
+    OP_IFENV,     // unless the environment has text, skip dx ops
     OP_MAXIMIZE,  // maximize the window (macOS: zoom), as its button would;
                   // dx 1: fill the primary display unmaximized (macOS's
                   // Fill), else skip the next op where that is no maximum
@@ -21329,8 +21332,10 @@ static DriveOp thinops[] = {
 // endpoint of kind builtin in the configuration, and the card gone. A
 // turn streams; a second session's waits in line behind it
 // (max_concurrent = 1), then runs; one cancelled while it streams ends
-// so, and the next runs as usual. With the file gone, a turn ends with
-// the error that says so.
+// so, and the next runs as usual. A thin host, r, added then, runs a
+// session's turn on this window's model, its live record naming this
+// computer as the relay. With the file gone, a turn ends with the error
+// that says so.
 static DriveOp builtinops[] = {
     {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
     {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
@@ -21383,12 +21388,66 @@ static DriveOp builtinops[] = {
     {OP_CHECK, CHK_NOTED, 0, 0, 0, "Cancelled"},
     {OP_PROMPT, 0, 0, 0, 100, "Say hello once more."},
     {OP_WAIT, W_SAID, 0, 0, 30000, "Hello from the built-in model."},
+    // A thin host, r, added and connected: its session's turn runs on
+    // this window's model, by way of this computer's engine (where
+    // gui.py made r: not with --host)
+    {OP_IFENV, 0, 56, 0, 0, "PROSPERO_TEST_R_SSH"},
+    {OP_CFGSET, 0, 0, 0, 0, "remote r path PROSPERO_TEST_R_PATH"},
+    {OP_WAIT, W_CONFIGSET, 0, 0, 10000, ""},
+    {OP_CFGSET, 0, 0, 0, 0, "remote r state PROSPERO_TEST_R_STATE"},
+    {OP_WAIT, W_CONFIGSET, 0, 0, 10000, ""},
+    {OP_CFGSET, 0, 0, 0, 0, "remote r config PROSPERO_TEST_R_CONFIG"},
+    {OP_WAIT, W_CONFIGSET, 0, 0, 10000, ""},
+    {OP_CFGSET, 0, 0, 0, 0, "remote r ssh PROSPERO_TEST_R_SSH"},
+    {OP_WAIT, W_CONFIGSET, 0, 0, 10000, ""},
+    {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
+    SHOWPANE("Hosts"),
+    {OP_MOVE, T_HOSTSTAB, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "connect r"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_THIN, 0, 0, 90000, ""},
+    {OP_MARK, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_THIN, 0, 0, 0, ""},
+    {OP_MOVE, T_SESSMENU, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NEWBTN, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1000, ""},
+    {OP_MOVE, T_HOSTCOMBO, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_HOSTITEM, 0, 0, 100, "r"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_WAIT, W_NEWLISTED, 0, 0, 15000, ""},
+    {OP_MOVE, T_NEWCWD, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},  // selects it all, to be typed over
+    {OP_TEXTRCWD, 0, 0, 0, 300, ""},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_MOVE, T_NEWCREATE, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 30000, ""},
+    {OP_CHECK, CHK_REMOTESESSION, 0, 0, 0, ""},
+    {OP_PROMPT, 0, 0, 0, 100, "Say hello from r."},
+    {OP_WAIT, W_VIA, 0, 0, 30000, ""},
+    {OP_CHECK, CHK_VIA, 0, 0, 0, ""},
+    {OP_CHECK, CHK_MODEL, 0, 0, 0, "gemma-4-e2b"},
+    {OP_SHOT, 0, 0, 0, 300, "builtin-6-thin"},
+    {OP_WAIT, W_SAID, 0, 0, 60000, "Hello from the built-in model."},
+    {OP_MAIN, 0, 0, 0, 300, ""},
     // Its file gone
     {OP_RMMODEL, 0, 0, 0, 100, ""},
     {OP_PROMPT, 0, 0, 0, 100, "Say hello without it."},
     {OP_WAIT, W_IDLE, 0, 0, 30000, ""},
     {OP_CHECK, CHK_NOTED, 0, 0, 0, "The turn ended with an error.|not downloaded yet"},
-    {OP_SHOT, 0, 0, 0, 300, "builtin-6-missing"},
+    {OP_SHOT, 0, 0, 0, 300, "builtin-7-missing"},
     {OP_SUMMARY, 0, 0, 0, 0, ""},
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
@@ -29837,6 +29896,21 @@ static void drivestep(Gui *g)
             g->drivefails++;
         }
         break;
+    case OP_CFGSET: {
+        Arena a     = g->frame;
+        Str   rest  = op->text;
+        Str   kind  = cfgnextword(&rest);
+        Str   name  = cfgnextword(&rest);
+        Str   key   = cfgnextword(&rest);
+        Str   value = os_getenv(g->os, &a, cfgnextword(&rest));
+        if (!value.len) {
+            guilog(g, "drive: FAIL no value in the environment for OP_CFGSET");
+            g->drivechecks++;
+            g->drivefails++;
+        } else {
+            guiconfigset(g, kind, name, key, value);
+        }
+    } break;
     case OP_TOUCH: {
         Arena a    = g->frame;
         Str   path = join(&a, g->drivecwd, op->text);
@@ -30383,6 +30457,12 @@ static void drivestep(Gui *g)
     case OP_IFWSL:
         if (!os_getenv(g->os, &g->frame, "PROSPERO_TEST_WSL").len) {
             guilog(g, "drive: skip, with no stand-in for wsl.exe");
+            g->drivepc += (i32)op->dx;
+        }
+        break;
+    case OP_IFENV:
+        if (!os_getenv(g->os, &g->frame, op->text).len) {
+            guilog(g, "drive: skip, with no such variable in the environment");
             g->drivepc += (i32)op->dx;
         }
         break;

@@ -105,7 +105,8 @@ opens maximized.
 The builtin mode's one endpoint is of kind builtin, the window's own
 model, which PROSPERO_TEST_BUILTIN=fake answers for: a turn streams, a
 second session's waits in line behind it, and one cancelled while it
-streams ends so.
+streams ends so. Then a thin host r, added as Settings would, runs a
+session's turn on it, relayed by this computer.
 
 On Linux without a display it makes a desktop of its own
 (tests/headless.py: Xvfb at --screen, openbox or --wm, and a session
@@ -1892,10 +1893,17 @@ class Far:
     def env(self):
         if not self.local:
             return {}
-        elif self.args.mode in ("hosttask", "thin", "terminal"):
+        elif self.args.mode in ("hosttask", "thin", "terminal", "builtin"):
             env = {"PROSPERO_TEST_SSH": self.ssh}
             if self.scp:
                 env["PROSPERO_TEST_SCP"] = self.scp
+            if self.args.mode == "builtin":
+                # [remote r], which the checklist adds as Settings would
+                # (OP_CFGSET): a remote in the file from the start would
+                # hide the first-run card
+                env.update(PROSPERO_TEST_R_SSH="here", PROSPERO_TEST_R_PATH=self.prospero,
+                           PROSPERO_TEST_R_STATE=self.state,
+                           PROSPERO_TEST_R_CONFIG=self.config)
             return env
         elif self.winfar:
             return dict(FSSTALL, PROSPERO_TEST_SSH=self.ssh, PROSPERO_TEST_FARMG="1")
@@ -2318,7 +2326,8 @@ def main():
     elif args.mode == "firstrun":
         before = firstconfig(curl)
     elif args.mode == "builtin":
-        # Nothing set up: the first-run card offers the built-in model
+        # Nothing set up: the first-run card offers the built-in model.
+        # Then r, with no endpoint, runs a session on it
         before = firstconfig(curl)
         os.environ.update(builtinenv(curl))
     elif args.mode == "changes":
@@ -2412,6 +2421,10 @@ def main():
         # environment (PS1), runs the same shell for its sessions' tabs
         far = Far(args, host, curl, model, nonce, extra=termcfg)
         before += far.hostsection().replace("[remote far]", "[remote r]")
+    elif args.mode == "builtin" and not (args.host or args.ssh):
+        # r, with no endpoint, added later (OP_CFGSET), runs on the
+        # window's built-in model: here only, through the fake ssh
+        far = Far(args, host, curl, model, nonce, thin=True)
     elif args.mode == "thin":
         # r has no endpoint: it runs on this window's models, and has the
         # user's skills here, one of them theirs alone
@@ -2579,7 +2592,7 @@ def main():
     elif status != 0:
         problems.append(f"exit status {status}")
     out = "".join(lines)
-    if args.mode in ("hosttask", "thin"):
+    if args.mode in ("hosttask", "thin") or (args.mode == "builtin" and far):
         problems += far.close(args.keep)
     if ctrwatch:
         problems += ctrwatch.close(state)
