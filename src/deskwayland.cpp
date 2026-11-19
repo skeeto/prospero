@@ -1558,11 +1558,11 @@ static Str keyfail(Arena *a, u32 sym, i32 c)
         putbyte(&b, '\'');
         print(&b, Str{tmp, utf8encode(tmp, c)});
         print(&b, "' (U+");
-        printhex(&b, (u64)c, 4);
+        printhex(&b, (u64)c, c>0xffff ? (c>0xfffff ? 6 : 5) : 4);  // U+1F600
         putbyte(&b, ')');
     } else {
         print(&b, "the keysym 0x");
-        printhex(&b, sym, 4);
+        printhex(&b, sym, sym>0xffff ? 8 : 4);  // Unicode keysyms are 0x01xxxxxx
     }
     print(&b, ", and Wayland lets no program add one; no input was sent");
     return finish(&b);
