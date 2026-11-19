@@ -1312,7 +1312,7 @@ static void relaysearch(Engine *e, Arena scratch, RelayServe *v)
     if (w->service == WEBS_ANTHROPIC) {
         why = webanthropicep(e, &w->arena, &w->ep, &w->model);
     }
-    why = why.len ? why : websend(e, w, scratch);
+    why = why.len ? why : websend(e, w, &scratch);
     if (why.len) {
         relayfinish(v, "connect", why);  // before its arena goes
         webfree(e, w);

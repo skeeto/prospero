@@ -9485,9 +9485,11 @@ static void webputquerystr(Buf *b, Str s)
     }
 }
 
-// Send the web call's next request. Null if it went, else why not.
-static Str websend(Engine *e, WebRun *w, Arena scratch)
+// Send the web call's next request. Null if it went, else why not, in
+// the scratch, which then advances past it.
+static Str websend(Engine *e, WebRun *w, Arena *sa)
 {
+    Arena   scratch = *sa;
     Buf     h(&scratch, 1024);
     HttpReq r = {};
     i64     max = WEB_REPLYMAX;
@@ -9571,6 +9573,7 @@ static Str websend(Engine *e, WebRun *w, Arena scratch)
     if (!w->http) {
         w->hid = 0;
         Str why = os_lasterr(e->os, &scratch);
+        *sa = scratch;
         return why.len ? why : Str("the request could not be made");
     }
     return {};
@@ -9607,7 +9610,7 @@ static b32 webrun(Session *s, Arena scratch, i32 tool, Args *args)
     }
     s->web = w;
     if (!why.len) {
-        why = websend(e, w, scratch);
+        why = websend(e, w, &scratch);
     }
     if (why.len) {
         Str text = concat(&scratch, concat(&scratch, "Not done: ", why), Str("."));
@@ -9827,7 +9830,7 @@ static void webpage(Session *s, Arena scratch)
             w->hops++;
             w->url     = d.url;
             w->retried = 0;
-            Str why = websend(e, w, scratch);
+            Str why = websend(e, w, &scratch);
             if (why.len) {
                 Str text = webfailure(&scratch, w, HTTP_ECONNECT, why);  // before scratch is passed on
                 webcallend(s, scratch, "error", text);
@@ -10161,7 +10164,7 @@ static void websearched(Engine *e, WebRun *w, Arena scratch)
         if (h.pause && w->conts<2) {
             w->conts++;
             w->retried = 0;
-            Str why = websend(e, w, scratch);
+            Str why = websend(e, w, &scratch);
             if (why.len) {
                 Str text = webfailure(&scratch, w, HTTP_ECONNECT, why);  // before scratch is passed on
                 webend(e, w, scratch, "error", text);
@@ -10201,7 +10204,7 @@ static void webdone(Engine *e, WebRun *w, Arena scratch, i32 err, Str why)
         return;
     } else if (!w->retried && (again || st==408 || st==429 || st>=500)) {
         w->retried = 1;
-        Str bad = websend(e, w, scratch);
+        Str bad = websend(e, w, &scratch);
         if (bad.len) {
             Str text = webfailure(&scratch, w, HTTP_ECONNECT, bad);  // before scratch is passed on
             webend(e, w, scratch, "error", text);
