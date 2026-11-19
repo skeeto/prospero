@@ -1810,7 +1810,7 @@ static b32 relayserveout(Engine *e, Arena scratch, RelayServe *v)
         if (!relayemit(e, relayout(e, &a, v, "body"), v)) return 0;
         iz n = v->held<RELAY_PART ? v->held : (iz)RELAY_PART;
         v->held -= n;
-        copybytes(v->hold, v->hold+n, v->held);  // memmove
+        if (v->held) __builtin_memmove(v->hold, v->hold+n, (uz)v->held);  // overlaps
     }
     if (v->done && !v->finished) {
         if (!relayemit(e, relayout(e, &scratch, v, "done"), v)) return 0;
