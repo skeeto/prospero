@@ -5915,7 +5915,9 @@ static void drawtranscript(Gui *g)
     // Going to a find hit: its message and the screen above it laid out
     // first, so that it lands a third of the way down
     ViewSearch *srch = g->search;
-    if (g->findjump && g->findopen && srch->v==v && srch->cur>=0) {
+    if (g->findjump && g->findopen && srch->v==v && srch->cur>=0 &&
+            srch->cur<srch->hits.len && srch->hits[srch->cur].msg<v->msgs.len) {
+        // A hit searchstep has yet to revalidate: messages may have gone
         FindHit *h = &srch->hits[srch->cur];
         msglayout(v, h->msg, &g->measure, width, sc);
         viewtops(v, width, charw, fm.lineh);
