@@ -228,7 +228,7 @@ static void test_search(Test *t)
         GitIgnore *root = alloc<GitIgnore>(&tmp);
         root->dir   = "/r";
         root->rules = ignoreparse(&tmp, "# comment\n*.log\n!keep.log\nbuild/\n"
-                                        "/top.txt\ndocs/*.tmp\n\\#hash\n  \n");
+                                        "/top.txt\ndocs/*.tmp\n\\#hash\n  \n{a,b}.txt\n");
         GitIgnore *sub = alloc<GitIgnore>(&tmp);
         sub->dir   = "/r/sub";
         sub->next  = root;
@@ -250,6 +250,8 @@ static void test_search(Test *t)
             {"/r/#hash", 0, 1},
             {"/r/a.c", 0, 0},
             {"/r/sub/a.log", 0, 0},
+            {"/r/{a,b}.txt", 0, 1},  // braces literal, as git takes them
+            {"/r/a.txt", 0, 0},
         };
         for (iz i = 0; i < countof(cases); i++) {
             Arena t2 = tmp;

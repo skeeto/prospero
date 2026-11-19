@@ -893,7 +893,7 @@ static b32 globmatch(Slice<Str> globs, Str path)
 // .gitignore
 
 struct GitIgnoreRule {
-    Slice<Str> globs;   // expanded alternatives
+    Slice<Str> globs;   // one: braces are literal in .gitignore
     b32        neg;     // !pattern: include again
     b32        dironly; // pattern/: directories only
 };
@@ -905,7 +905,8 @@ struct GitIgnore {
 };
 
 // A .gitignore's rules. Patterns with a slash anywhere but at the end
-// are anchored to the file's directory, as globone takes them.
+// are anchored to the file's directory, as globone takes them. Braces
+// are not alternatives, as git has them.
 static Slice<GitIgnoreRule> ignoreparse(Arena *a, Str text)
 {
     Slice<GitIgnoreRule> r = {};
@@ -936,7 +937,9 @@ static Slice<GitIgnoreRule> ignoreparse(Arena *a, Str text)
         if (slash && l[0]!='/') {
             l = concat(a, "/", l);  // anchored, as globone wants it
         }
-        rule.globs = globexpand(a, clone(a, l));
+        // As one glob: git takes braces literally here, unlike in a
+        // glob given to search
+        rule.globs = push(a, rule.globs, clone(a, l));
         r = push(a, r, rule);
     }
     return r;
