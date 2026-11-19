@@ -2165,6 +2165,12 @@ static b32 os_launch(Os *, Arena scratch, Slice<Str> argv, Str cwd, Slice<Str> e
         if (dir[0] && chdir(dir)) {
             _exit(127);
         }
+        // As childsignals does for a tool: what this process ignores,
+        // the program it starts does not (an editor's SIGPIPE)
+        i32 sigs[] = {SIGTERM, SIGINT, SIGHUP, SIGPIPE};
+        for (i32 sig : sigs) {
+            signal(sig, SIG_DFL);
+        }
         sigset_t none;
         sigemptyset(&none);
         sigprocmask(SIG_SETMASK, &none, 0);
