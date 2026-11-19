@@ -2969,7 +2969,10 @@ static ToolOut toolread(Os *os, Arena *a, Str cwd, Str path, Args *args, b32 tag
         print(&h, "]\n");
         head = finish(&h);
     }
-    iz first = args->offset ? (iz)args->offset : 1;
+    i64 most  = (i64)((uz)-1 >> 1);  // an iz's largest: 32-bit builds' too
+    iz  first = !args->offset    ? 1
+              : args->offset>most ? (iz)most
+              :                     (iz)args->offset;
     iz limit = args->limit && args->limit<READ_LINES ? (iz)args->limit : (iz)READ_LINES;
     r.text = readbody(a, data, head, first, limit);
     r.ok   = 1;
