@@ -5348,6 +5348,15 @@ def sc_compact_manual(model, n, req):
 
 
 sc_compact_cancel = sc_compact_manual
+
+
+def sc_compact_chat(model, n, req):
+    # Chat alone, no tools, each answer about 12k tokens, its first piece
+    # short, as most are: written where the summarizer's text was
+    yield S.head()
+    yield from text(model, f"Answer {n}. ")
+    yield from text(model, " ".join(f"w{n}x{i}" for i in range(9600)), 3)
+    yield from real_finish(model, req)
 sc_mcp_compact = sc_compact_manual
 sc_compact_shell = sc_compact_manual
 

@@ -324,6 +324,10 @@ static void test_compact(Test *t)
                "T\n\n## Files (kept by the harness)\n- wrote y.c\n- wrote x.c\n"
                "- read x.c");
         expect(t, "withfiles none", withfiles(a, "T", {}), "T");
+        Str text = clone(a, "T");
+        Str bare = withfiles(a, text, {});
+        expect(t, "withfiles none copied", bare.data==text.data ? Str("in place")
+                                                                : Str("copied"), "copied");
         Slice<Str> many = {};
         for (i32 i = 0; i < COMPACT_FILES+5; i++) {
             many = addfile(a, many, istr(a, i));

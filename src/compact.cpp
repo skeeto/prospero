@@ -634,11 +634,12 @@ static Files addfiles(Arena *a, Files f, Slice<Msg> h, iz beg, iz end)
     return f;
 }
 
-// A summary's text with the files section after it.
+// A summary's text with the files section after it, in a even with no
+// files: the text is the attempt's, which the next request resets.
 static Str withfiles(Arena *a, Str text, Files f)
 {
     if (!f.read.len && !f.wrote.len) {
-        return text;
+        return clone(a, text);
     }
     Buf b(a, text.len + 1024);
     print(&b, text);

@@ -8696,6 +8696,37 @@ def compact_manual(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+@scenario(conf=BIG, bound=40, alone=True)
+def compact_chat(t):
+    """compact twice over chat alone, no files to list: the second
+    summarizer is given the first summary to update, as it was written,
+    though requests between the two reset the arena it was read into."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        turns = 0
+        for round in range(2):
+            for i in range(3):
+                h.send("prompt", sid=sid, text=f"say more {round} {i}")
+                turns += 1
+                end = ended(h, sid, turns)
+                t.check(end["why"] == "done", f"turn {turns}: {end}")
+            r = h.call("compact", sid=sid)
+            t.check(r.get("ok") == 1, f"compact {round}: {r}")
+            turns += 1
+            t.check(ended(h, sid, turns)["why"] == "done", f"compacted {round}")
+        sreq = t.compactions()
+        t.check(len(sreq) == 2, f"two summaries {len(sreq)}")
+        first = h.all("compact", sid)[0]["summary"]
+        t.check("SUMMARY-0" in first and "## Files" not in first, f"first {first[:200]}")
+        user = sreq[1]["body"]["messages"][1]["content"]
+        t.check(f"<previous-summary>\n{first}\n</previous-summary>" in user,
+                f"the previous summary as written: {user[:400]!r}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 @scenario(conf=SMALL, bound=40, alone=True)
 def compact_heed_now(t):
     """A summary at the threshold, mid-turn and in Build mode: the step
