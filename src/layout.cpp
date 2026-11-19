@@ -274,6 +274,7 @@ static void wrappieces(Wrap *w, i32 p0, i32 p1)
                 // Stops every 4 of its own font's spaces: code's, not
                 // the prose font's
                 f32 tab = 4*m->advance(m->ctx, pc->style, ' ');
+                tab = tab>=1 ? tab : 1;  // a face with no space's width
                 f32 col = w->x - w->x0;
                 adv   = tab*(f32)((i32)(col/tab) + 1) - col;
                 flags = RUN_NODRAW;

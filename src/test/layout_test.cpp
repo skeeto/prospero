@@ -32,6 +32,12 @@ static FontMetrics smallcodefont(void *ctx, i32 style)
     return f;
 }
 
+// A face whose glyphs have no width at all
+static f32 zeroadvance(void *, i32, i32)
+{
+    return 0;
+}
+
 static Measure fixedmeasure()
 {
     Measure m = {};
@@ -183,6 +189,18 @@ static void test_layout(Test *t)
                     r->b1 <= d2->pieces[r->piece].text.len;
         }
         expect(t, "layout.collision", istr(&a, fits), "1");
+    }
+
+    // A face with no widths: a tab in code is laid out, not divided by
+    // a zero advance
+    {
+        Arena        a     = perm;
+        Measure      m     = fixedmeasure();
+        m.advance          = zeroadvance;
+        LayoutCache *cache = 0;
+        Doc         *d     = parsedoc(&a, "```\n\tx\ty\n```", 0);
+        MsgLayout    ml    = layoutmsg(&cache, &a, &m, d, 200, 1);
+        expect(t, "layout.zerowidth", istr(&a, ml.blocks.len), "1");
     }
 
     // Hit testing maps every offset's x back to that offset

@@ -3828,6 +3828,7 @@ static f32 estimate(ViewMsg *m, f32 width, f32 charw, f32 lineh)
     if (m->collapsed || (m->role==VIEW_ASK && !m->text.len)) {
         return 0;
     }
+    charw = charw>=1 ? charw : 1;  // a face whose 'n' has no width
     i64 perline = width>charw ? (i64)(width/charw) : 1;
     if (m->lines) {
         // A file's lines: a row each, a chunk's final '\n' ending its
