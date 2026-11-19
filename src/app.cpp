@@ -28170,10 +28170,14 @@ static b32 drivecheck(Gui *g, i32 chk)
         GuiSession *p    = g->drivemain;
         ViewMsg    *m    = p && p->view ? lastof(p->view, VIEW_TOOL) : 0;
         Str         dump = {g->sidedump, g->sidelen};
-        Str         line = concat(&a, concat(&a, "S ", sesstitle(k ? k : p)), "@\n");
-        return k && p && k->host->kind==GH_REMOTE && k->host->name=="far" &&
-               k->view->remote && sessup(g, k)==p && m && m->tool->name=="task" &&
-               m->tool->host=="far" && m->tool->child==k->sid && find(dump, line)>0;
+        if (!k || !p) {
+            return 0;  // until both appear: sesstitle takes no null
+        }
+        Str line = concat(&a, concat(&a, "S ", sesstitle(k)), "@\n");
+        return k->host->kind==GH_REMOTE && k->host->name=="far" &&
+               k->view && k->view->remote && sessup(g, k)==p && m &&
+               m->tool->name=="task" && m->tool->host=="far" &&
+               m->tool->child==k->sid && find(dump, line)>0;
     }
     case CHK_FARREPORT: {
         Arena       a = g->frame;
