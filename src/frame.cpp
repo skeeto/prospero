@@ -120,11 +120,13 @@ struct FrameIn {
     b32 ok;       // a whole frame; else more input is needed, or bad
 };
 
+// A decoder of frames up to max, which buffers a frame that comes in
+// pieces: room for a disconnect's payload too, which may be longer.
 static FrameDec newframedec(Arena *perm, iz max)
 {
     FrameDec d = {};
     d.max = max;
-    d.buf = allocbytes(perm, FRAME_HEAD+max);
+    d.buf = allocbytes(perm, FRAME_HEAD + (max>FRAME_CTLMAX ? max : (iz)FRAME_CTLMAX));
     return d;
 }
 

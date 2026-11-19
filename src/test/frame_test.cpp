@@ -231,6 +231,23 @@ static void test_frame(Test *t)
         d = newframedec(&tmp, 64);
         Str want = concat(&tmp, concat(&tmp, "1/9/0:", big), ";");
         expect(t, "frame.max", frameshow(&tmp, &d, in), want);
+
+        // A disconnect's payload past a small decoder's max, in pieces:
+        // buffered, as a large decoder has it
+        Str bye  = {allocbytes(&tmp, 500), 500};
+        for (iz i = 0; i < bye.len; i++) bye[i] = 'b';
+        Str whole = frameof(&tmp, FRAME_DISCONNECT, 0, 0, bye);
+        in = {};
+        in = push(&tmp, in, takehead(whole, 100));
+        in = push(&tmp, in, cuthead(whole, 100));
+        FrameDec small = newframedec(&tmp, 64);
+        Str      guard = {allocbytes(&tmp, 1024), 1024};  // just past its buffer
+        for (iz i = 0; i < guard.len; i++) guard[i] = 'g';
+        FrameDec large = newframedec(&tmp, FRAME_MAX);
+        expect(t, "frame.byesmall", frameshow(&tmp, &small, in), frameshow(&tmp, &large, in));
+        b32 kept = 1;
+        for (iz i = 0; i < guard.len; i++) kept &= guard[i] == 'g';
+        expect(t, "frame.byeguard", istr(&tmp, kept), "1");
     }
 
     // Two links: lines both ways, in pieces of every size
