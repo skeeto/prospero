@@ -143,14 +143,21 @@ static void mentionidxsort(MentionIdx *idx)
     sort(ord, n, mentionidxless, idx->w->mem);
     mentionidxsorts = {};
     mentionidxpaths = {};
+    // ord[i] is the entry that goes at i: gathered into copies, then
+    // back, as an in-place swap along ord would scatter instead
+    Arena t  = idx->w->mem;
+    Str  *ps = alloc<Str>(&t, n);
+    i64  *ms = alloc<i64>(&t, n);
+    u8   *ds = alloc<u8>(&t, n);
     for (iz i = 0; i < n; i++) {
-        while ((iz)ord[i] != i) {
-            iz j = (iz)ord[i];
-            Str p = paths[i];  paths[i] = paths[j];   paths[j] = p;
-            i64 m = mtimes[i]; mtimes[i] = mtimes[j]; mtimes[j] = m;
-            u8  d = isdirs[i]; isdirs[i] = isdirs[j]; isdirs[j] = d;
-            i32 k = ord[i];    ord[i] = ord[j];      ord[j] = k;
-        }
+        ps[i] = paths[ord[i]];
+        ms[i] = mtimes[ord[i]];
+        ds[i] = isdirs[ord[i]];
+    }
+    for (iz i = 0; i < n; i++) {
+        paths[i]  = ps[i];
+        mtimes[i] = ms[i];
+        isdirs[i] = ds[i];
     }
 }
 
