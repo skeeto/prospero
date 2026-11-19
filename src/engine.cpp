@@ -25626,6 +25626,9 @@ static void reconfigure(Engine *e, Arena scratch)
         Str      which = s->ep.name.len && !s->ep.relay.len ? s->ep.name : s->ep.url;
         Endpoint ep    = {};
         if (endpointconf(e, &s->perm, which, &ep)) {
+            if (ep.kind==EP_COPILOT && s->ep.kind==EP_COPILOT && s->discovered) {
+                ep.wire = s->ep.wire;  // learned by discovery, per model
+            }
             s->ep = ep;
         }
         ModelConf mc = {};

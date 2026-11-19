@@ -6848,6 +6848,7 @@ sc_cp_unlicensed = sc_plain
 sc_cp_clientid = sc_plain
 sc_cp_wire = sc_read_edit_shell
 sc_cp_wire_an = sc_an_tools
+sc_cp_wire_reload = sc_plain
 sc_rs_compaction = sc_compaction
 
 

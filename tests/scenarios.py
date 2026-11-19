@@ -8015,6 +8015,30 @@ def cp_signin(t):
 
 
 @scenario(conf=CP, bound=40)
+def cp_wire_reload(t):
+    """A model Copilot lists as Responses stays at /responses after the
+    configuration is reloaded: what discovery learned is kept."""
+    cpsignin(t)
+    model = t.model + "+rs"
+    fake_provider.STATE.register(model)
+    h = t.headless(env=cpenv(t))
+    try:
+        sid = h.call("new", cwd=t.work, model=model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="first")
+        t.check(ended(h, sid, 1)["why"] == "done", "the first turn ends")
+        r = h.call("config.set", kind="skills", key="hidden", value="x")
+        t.check(r.get("ok") == 1, f"config.set {r}")
+        h.send("prompt", sid=sid, text="second")
+        t.check(ended(h, sid, 2)["why"] == "done", "the second turn ends")
+        calls = [c["_call"] for c in cplog(t, "_call", model)]
+        t.check(len(calls) == 2 and all(c == "/responses" for c in calls),
+                f"each at /responses: {calls}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf=CP, bound=40)
 def cp_wire(t):
     """Each model in the format Copilot's listing says it takes: Messages
     at /v1/messages, Responses at /responses, Chat Completions, and with
