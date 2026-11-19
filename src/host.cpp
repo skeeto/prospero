@@ -1186,7 +1186,9 @@ static void hostcommand(Host *h, HostClient *c, Arena scratch, Str line)
         hostreply(h, c, scratch, cid, 0, "too many commands are waiting", sid);
         return;
     }
-    q->client = c;
+    // A full late list's oldest reply may have dropped c itself, which
+    // hostreap then releases: no reply to wait for then
+    q->client = c->gone ? 0 : c;
     q->cid    = cid;
     if (sid.len <= countof(q->sid)) {
         copybytes(q->sid, sid.data, sid.len);
