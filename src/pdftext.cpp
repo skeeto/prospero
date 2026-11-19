@@ -2683,7 +2683,9 @@ static iz pdfbands(PdfRun *r, PdfLine *L, iz gb, iz ge, PdfBand *out)
             sizes[nsizes] = q;
             count[nsizes++] = 0;
         }
-        count[j] += j < nsizes;
+        if (j < nsizes) {
+            count[j]++;  // else a size past the first PDF_SIZES, not kept
+        }
     }
     f32 body = 3.4e38f;
     for (i32 j = 0, most = 0; j < nsizes; j++) {
