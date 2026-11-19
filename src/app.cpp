@@ -3384,7 +3384,13 @@ static void mcpsay(Gui *g, Str name, Str msg, b32 bad)
     g->mcpmsg    = clone(&g->perm, msg);
     g->mcpmsgfor = clone(&g->perm, name);
     g->mcpbad    = bad;
-    Str line = concat(&g->frame, concat(&g->frame, name, ": "), msg);
+    // In perm: a caller (drawmcptools) may be drawing from a copy of
+    // the frame, which a line at its base would write over
+    Buf b(&g->perm, name.len + 2 + msg.len);
+    print(&b, name);
+    print(&b, ": ");
+    print(&b, msg);
+    Str line = finish(&b);
     guilog(g, line);
     cfgsay(g, line, !bad);
 }
