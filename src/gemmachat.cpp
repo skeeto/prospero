@@ -771,6 +771,7 @@ struct GmStream {
     GmTok     *tok;
     GmIds      ids;
     Slice<Str> heads;    // call:NAME{ for each tool offered
+    Slice<Json *> params;    // and its parameters' schema
     Os        *os;
     void     (*emit)(void *, Str);
     void      *ctx;
@@ -806,6 +807,7 @@ static GmStream gmstream(Arena *perm, GmTok *tok, GmIds ids, Json *req, Os *os,
         if (name.len && s.heads.len<256) {
             Str head = concat(perm, concat(perm, "call:", name), "{");
             s.heads  = push(perm, s.heads, head);
+            s.params = push(perm, s.params, jsonget(jsonget(t, "function"), "parameters"));
         }
     }
     s.lastsent = os ? os_ticks(os) : 0;
@@ -1057,9 +1059,201 @@ static b32 gmheaderallows(GmStream *s, Str header, Str text)
     return 0;
 }
 
+// An object or array open in a call's arguments, and its schema.
+struct GmFrame {
+    Json      *schema;  // or missing
+    Slice<Str> seen;    // an object's keys written
+    Str        pend;    // the key whose value comes next
+    iz         keyat;
+    b32        object;
+    b32        atkey;   // reading a key
+};
+
+enum { GM_FRAMES = 32 };
+
+// Where a call's arguments stand, from just after their opening brace,
+// with params the tool's schema for them.
+struct GmArgs {
+    GmFrame *top;    // the innermost open, null if none
+    Str      key;    // the key so far, when at one
+    b32      instr;  // inside a string
+    b32      closed; // the arguments ended
+    b32      ended;  // a string or a container just ended
+    b32      fresh;  // a value is next, not yet begun
+};
+
+static GmArgs gmargs(Arena *perm, Json *params, Str args)
+{
+    GmArgs   r      = {};
+    GmFrame *frames = alloc<GmFrame>(perm, GM_FRAMES);
+    i32      depth  = 1;
+    frames[0].schema = params;
+    frames[0].object = frames[0].atkey = 1;
+    for (iz i = 0; i < args.len && depth;) {
+        Str      rest = cuthead(args, i);
+        GmFrame *f    = frames + depth - 1;
+        if (r.instr) {
+            iz end = find(rest, gmquote);
+            if (end < 0) {
+                break;
+            }
+            r.instr = 0;
+            r.ended = 1;
+            i += end + gmquote.len;
+            continue;
+        } else if (startswith(rest, gmquote)) {
+            r.instr = 1;
+            r.fresh = 0;
+            i += gmquote.len;
+            continue;
+        }
+        r.ended = r.ended && gmspace(args[i]);
+        r.fresh = r.fresh && gmspace(args[i]);
+        switch (args[i]) {
+        case '{': case '[':
+            if (depth == GM_FRAMES) {
+                return {};
+            } else {
+                GmFrame *c = frames + depth++;
+                *c = {};
+                c->schema = f->object ? jsonget(jsonget(f->schema, "properties"), f->pend)
+                                      : jsonget(f->schema, "items");
+                c->object = c->atkey = args[i] == '{';
+                c->keyat  = i + 1;
+                r.fresh   = !c->object;
+            }
+            break;
+        case '}': case ']':
+            depth--;
+            r.ended = 1;
+            break;
+        case ',':
+            if (f->object) {
+                f->atkey = 1;
+                f->keyat = i + 1;
+            } else {
+                r.fresh = 1;
+            }
+            break;
+        case ':':
+            if (f->object && f->atkey) {
+                f->pend  = trim(takehead(cuthead(args, f->keyat), i-f->keyat));
+                f->seen  = push(perm, f->seen, f->pend);
+                f->atkey = 0;
+                r.fresh  = 1;
+            }
+            break;
+        }
+        i++;
+    }
+    r.closed = !depth;
+    r.top    = depth ? frames+depth-1 : 0;
+    r.key = r.top && r.top->atkey && !r.instr ? cuthead(args, r.top->keyat) : Str{};
+    return r;
+}
+
+// Whether have then text could begin "prop:".
+static b32 gmkeyfits(Str have, Str text, Str prop)
+{
+    iz n = have.len + text.len;
+    for (iz i = 0; i < n && i <= prop.len; i++) {
+        u8 c    = i<have.len ? have[i] : text[i-have.len];
+        u8 want = i<prop.len ? prop[i] : ':';
+        if (c != want) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static b32 gmhas(Slice<Str> list, Str s)
+{
+    for (iz i = 0; i < list.len; i++) {
+        if (list[i] == s) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Whether a token may begin a value of the schema's type, if it has
+// one: a string with the delimiter, the others by their first character.
+static b32 gmvaluebegins(Str type, b32 quote, Str text)
+{
+    if (type == "string") {
+        return quote;
+    } else if (quote || !text.len) {
+        return 0;
+    }
+    u8 c = text[0];
+    if (type == "object") {
+        return c == '{';
+    } else if (type == "array") {
+        return c == '[';
+    } else if (type == "boolean") {
+        Str t = takehead(text, text.len<5 ? text.len : 5);
+        return startswith("true", takehead(t, t.len<4 ? t.len : 4)) || startswith("false", t);
+    } else if (type=="integer" || type=="number") {
+        return c=='-' || (c>='0' && c<='9');
+    }
+    return 1;
+}
+
+// Whether token text may come next in a call's arguments at state a, in
+// the innermost object, as llama.cpp's grammar for the tool's schema
+// would have it: only keys the schema names, each once, and no closing
+// brace while a required one is missing. Values go unchecked.
+static b32 gmargsallow(GmArgs *a, Slice<Str> unused, b32 done, Str text)
+{
+    Str key = a->key;
+    if (!a->top->atkey) {
+        // In a value: the rest of it, its end, and maybe a next key; but
+        // once it ended, only what follows a value
+        Str next = text;
+        for (; next.len && gmspace(next[0]); next = cuthead(next, 1)) {}
+        if (a->ended && next.len && next[0]!=',' && next[0]!='}') {
+            return 0;
+        } else if (a->ended && !next.len) {
+            return text.len > 0;  // spaces; no special
+        }
+        i32 depth = 1;
+        iz  i     = 0;
+        for (; i < text.len; i++) {
+            u8 c = text[i];
+            if (c=='{' || c=='[') {
+                depth++;
+            } else if ((c=='}' || c==']') && !--depth) {
+                return done;
+            } else if (c==',' && depth==1) {
+                break;
+            }
+        }
+        if (i == text.len) {
+            return 1;  // specials too, the string delimiter among them
+        }
+        key  = {};
+        text = cuthead(text, i+1);
+        if (!text.len) {
+            return 1;
+        }
+    }
+    if (!text.len) {
+        return 0;  // no special token where a key goes
+    } else if (!key.len && text[0]=='}') {
+        return done;
+    }
+    for (iz i = 0; i < unused.len; i++) {
+        if (gmkeyfits(key, text, unused[i])) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 // Mask logits so the next token is one the protocol allows: a call names
-// a tool offered, and ends before the turn does.
-static void gmconstrain(GmStream *s, f32 *logits)
+// a tool offered, its arguments keep to the tool's schema (gmargsallow),
+// and it ends once they close, before the turn does.
+static void gmconstrain(GmStream *s, Arena scratch, f32 *logits)
 {
     f32 no = -__builtin_inff();
     if (!s->heads.len) {
@@ -1069,12 +1263,98 @@ static void gmconstrain(GmStream *s, f32 *logits)
         return;
     }
     logits[GM_EOS] = logits[s->ids.turnend] = logits[s->ids.response] = no;
+    logits[s->ids.call] = logits[s->ids.channel] = logits[s->ids.channelend] = no;
+    logits[s->ids.turn] = no;  // nor a new call, a channel or a turn inside one
     Str header = Str(s->held, s->nheld);
-    if (find(header, "{") >= 0) {
-        return;  // its name is settled
+    iz  brace  = find(header, "{");
+    if (brace < 0) {
+        for (i32 t = 0; t < GM_VOCAB; t++) {
+            if (logits[t]>no && !gmheaderallows(s, header, s->tok->text[t])) {
+                logits[t] = no;
+            }
+        }
+        return;
+    }
+
+    // Its name is settled: its arguments' keys, by the tool's schema
+    Json *params = 0;
+    for (iz i = 0; i < s->heads.len && !params; i++) {
+        params = startswith(header, s->heads[i]) ? s->params[i] : 0;
+    }
+    GmArgs a = gmargs(&scratch, params, cuthead(header, brace+1));
+    if (a.closed) {
+        // The arguments closed: the call's end, and only that, follows
+        f32 end = logits[s->ids.callend];
+        for (i32 t = 0; t < GM_VOCAB; t++) {
+            logits[t] = no;
+        }
+        logits[s->ids.callend] = end>no ? end : 0;
+        return;
+    }
+    logits[s->ids.callend] = no;  // not while they are open
+    if (!params || !a.top || a.instr) {
+        return;
+    }
+    if (a.fresh) {
+        // A value begins, of the type its schema says
+        Json *vs   = a.top->object
+                   ? jsonget(jsonget(a.top->schema, "properties"), a.top->pend)
+                   : jsonget(a.top->schema, "items");
+        Str   type = jsonstr(jsonget(vs, "type"));
+        if (!type.len) {
+            return;
+        }
+        i32 allowed = 0;
+        for (i32 t = 0; t < GM_VOCAB; t++) {
+            Str text = s->tok->text[t];
+            allowed += logits[t]>no && (gmvaluebegins(type, t==s->ids.quote, text) ||
+                                        (!a.top->object && text.len && text[0]==']'));
+        }
+        for (i32 t = 0; allowed && t < GM_VOCAB; t++) {
+            Str text = s->tok->text[t];
+            if (!gmvaluebegins(type, t==s->ids.quote, text) &&
+                    !(!a.top->object && text.len && text[0]==']')) {
+                logits[t] = no;
+            }
+        }
+        return;
+    }
+    if (!a.top->object) {
+        return;
+    }
+    Json *props = jsonget(a.top->schema, "properties");
+    if (props->type!=JSON_OBJECT || !props->child) {
+        return;
+    }
+    Slice<Str> unused = {};
+    b32        done   = 1;
+    for (Json *p = props->child; p; p = p->next) {
+        if (!gmhas(a.top->seen, p->key)) {
+            unused = push(&scratch, unused, p->key);
+        }
+    }
+    Json *req = jsonget(a.top->schema, "required");
+    for (Json *r = req->type==JSON_ARRAY ? req->child : 0; r; r = r->next) {
+        done &= r->type!=JSON_STRING || gmhas(a.top->seen, r->str);
+    }
+    if (a.top->atkey) {
+        b32 fits = !a.key.len && done;
+        for (iz i = 0; i < unused.len && !fits; i++) {
+            fits = gmkeyfits(a.key, {}, unused[i]);
+        }
+        if (!fits) {
+            return;  // a key the schema lacks: past helping
+        }
+    }
+    i32 allowed = 0;
+    for (i32 t = 0; t < GM_VOCAB; t++) {
+        allowed += logits[t]>no && gmargsallow(&a, unused, done, s->tok->text[t]);
+    }
+    if (!allowed) {
+        return;
     }
     for (i32 t = 0; t < GM_VOCAB; t++) {
-        if (logits[t]>no && !gmheaderallows(s, header, s->tok->text[t])) {
+        if (logits[t]>no && !gmargsallow(&a, unused, done, s->tok->text[t])) {
             logits[t] = no;
         }
     }
@@ -1740,7 +2020,7 @@ static GmStats gmgenerate(GmChat *c, Arena scratch, GmTurn *t, Str sid, Json *re
     end = end<g->ctx ? end : g->ctx;
     for (b32 first = 1; pos<end && !gmcancelled(out); first = 0) {
         f32 *v = gmlogits(g, first ? last : 0);
-        gmconstrain(&s, v);
+        gmconstrain(&s, scratch, v);
         i32 next = gmsample(&t->sp, v, GM_VOCAB);
         if (gmstreamtoken(&s, scratch, next)) {
             why = "stop";
