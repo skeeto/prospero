@@ -10665,7 +10665,7 @@ static void skillgrant(Session *s, Arena scratch, Str dir)
     }
 }
 
-static SkillFetch *skillfetchstart(Session *, Arena, Skill *, i64 cmd, Str args, Str *why);
+static SkillFetch *skillfetchstart(Session *, Arena *, Skill *, i64 cmd, Str args, Str *why);
 static SkillCopy  *skillcopyof(Session *, Str name);
 static Str         skillcopynote(Arena *, SkillCopy *);
 static void        reply(Engine *, Arena, i64 id, b32 ok, Str err, Str sid);
@@ -10699,7 +10699,7 @@ static b32 toolskill(Session *s, Arena scratch, Args *args)
         return 1;
     } else if (k->peer) {
         Str why = {};
-        s->skillcall = skillfetchstart(s, scratch, k, 0, args->args, &why);
+        s->skillcall = skillfetchstart(s, &scratch, k, 0, args->args, &why);
         if (!s->skillcall) {
             Str text = concat(&scratch, concat(&scratch, "Not loaded: ", why), Str("."));
             s->callfail = "skill";
@@ -10807,8 +10807,9 @@ static b32 skillfetchsend(Engine *e, SkillFetch *f, Arena scratch)
 }
 
 // Start fetching skill k for session s, for a skill.fetch (cmd) or the
-// skill tool (args). Null if it could not start, with why.
-static SkillFetch *skillfetchstart(Session *s, Arena scratch, Skill *k, i64 cmd,
+// skill tool (args). Null if it could not start, with why, made in the
+// scratch, which advances past it.
+static SkillFetch *skillfetchstart(Session *s, Arena *scratch, Skill *k, i64 cmd,
                                    Str args, Str *why)
 {
     Engine *e   = s->e;
@@ -10828,8 +10829,8 @@ static SkillFetch *skillfetchstart(Session *s, Arena scratch, Skill *k, i64 cmd,
     f->args  = clone(&a, args);
     f->by    = os_ticks(e->os) + 2*e->minute;
     f->arena = a;
-    if (!skillfetchsend(e, f, scratch)) {
-        *why = os_lasterr(e->os, &scratch);
+    if (!skillfetchsend(e, f, *scratch)) {
+        *why = os_lasterr(e->os, scratch);
         *why = why->len ? *why : Str("the fetch could not be made");
         os_release(e->os, mem);
         return 0;
@@ -11116,7 +11117,7 @@ static void cmdskillfetch(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
         reply(e, scratch, id, 0, why, s->sid);
     } else if (!k->peer) {
         reply(e, scratch, id, 1, {}, s->sid);
-    } else if (!skillfetchstart(s, scratch, k, id, {}, &why)) {
+    } else if (!skillfetchstart(s, &scratch, k, id, {}, &why)) {
         why = concat(&scratch, "fetching the skill failed: ", why);
         reply(e, scratch, id, 0, why, s->sid);
     }
