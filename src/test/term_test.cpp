@@ -570,7 +570,9 @@ static void test_termsecret(Test *t)
         expect(t, "termmask count", n==4 ? Str("4") : Str("not 4"), "4");
         Str plain = "nothing here";
         Str r     = termmask(&s, plain, &ss, &n);
-        expect(t, "termmask none", r.data==plain.data && !n ? Str("same") : Str("copied"), "same");
+        expect(t, "termmask none", r.data==plain.data && n==4 ? Str("same") : Str("copied"), "same");
+        termmask(&s, "pass", &ss, &n);
+        expect(t, "termmask adds", istr(&s, n), "5");  // counts kept across texts
         expect(t, "termmask edges", termmask(&s, "pass", &ss, &n), "[hidden]");
         expect(t, "termmask unicode", termmask(&s, "\xc3\xa9pass", &ss, &n), "\xc3\xa9pass");
     }

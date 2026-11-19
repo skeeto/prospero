@@ -279,11 +279,10 @@ static b32 termsecretadd(TermSecrets *ss, Str v, i32 rank)
 }
 
 // Text with each occurrence of a secret as "[hidden]", the longest
-// first where several begin at once; *hidden counts them. The text
-// itself if none occurs.
+// first where several begin at once; each is added to *hidden, a count
+// that callers keep across texts. The text itself if none occurs.
 static Str termmask(Arena *a, Str text, TermSecrets *ss, iz *hidden)
 {
-    *hidden = 0;
     Buf b   = {};
     iz  from = 0;  // text not yet copied
     for (iz i = 0; i < text.len;) {
