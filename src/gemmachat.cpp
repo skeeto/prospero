@@ -361,7 +361,9 @@ static void gmtool(GmPrompt *p, Arena scratch, Json *tool)
 }
 
 // Whether the request asks for thinking: chat_template_kwargs'
-// enable_thinking if given, else any reasoning_effort but none.
+// enable_thinking if given, else unless reasoning_effort is none. On by
+// default, as llama.cpp has it: without thoughts, the 2B model's agent
+// turns come out muddled.
 static b32 gmthinking(Json *req)
 {
     Json *on = jsonget(jsonget(req, "chat_template_kwargs"), "enable_thinking");
@@ -369,7 +371,7 @@ static b32 gmthinking(Json *req)
         return on->boolean;
     }
     Json *effort = jsonget(req, "reasoning_effort");
-    return effort->type==JSON_STRING && effort->str!="none";
+    return effort->type!=JSON_STRING || effort->str!="none";
 }
 
 static b32 gmrole(Json *msg, Str role)
@@ -1217,9 +1219,9 @@ static i32 gmsample(GmSampler *sp, f32 *logits, i32 n)
         return gmargmax(logits, n);
     }
 
-    f32 sum = 0;
+    f32 top = v[0], sum = 0;
     for (i32 i = 0; i < have; i++) {
-        v[i] = __builtin_expf((v[i] - v[0]) / sp->temp);
+        v[i] = __builtin_expf((v[i] - top) / sp->temp);
         sum += v[i];
     }
     // The smallest prefix holding top_p of it, each at least min_p of
@@ -1639,10 +1641,11 @@ static GmTurn gmturn(GmChat *c, Arena *perm, Arena scratch, Json *req, iz bodyle
     r.maxnew   = (i32)(maxnew>0 && maxnew<ctx ? maxnew : (i64)GM_MAXNEW);
 
     // Gemma's own defaults (its generation_config), as llama.cpp reads
-    // them from a GGUF: greedy decoding falls into repeated calls
+    // them from a GGUF, and llama.cpp's own min_p: greedy decoding falls
+    // into repeated calls
     r.sp.temp = gmnum(jsonget(req, "temperature"), 1);
     r.sp.topp = gmnum(jsonget(req, "top_p"), 0.95f);
-    r.sp.minp = gmnum(jsonget(req, "min_p"), 0);
+    r.sp.minp = gmnum(jsonget(req, "min_p"), 0.05f);
     i64 topk  = jsonint(jsonget(req, "top_k"), 0);
     r.sp.topk = (i32)(topk>0 && topk<GM_TOPK ? topk : (i64)GM_TOPK);
     Json *seed = jsonget(req, "seed");
