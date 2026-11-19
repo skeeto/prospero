@@ -18486,6 +18486,8 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err,
     s->shellfrom.name = clone(&s->perm, p->te.shell.name);
     s->shellfrom.path = clone(&s->perm, p->te.shell.path);
     s->shellfrom.desc = clone(&s->perm, p->te.shell.desc);
+    s->shellfrom.distro  = clone(&s->perm, p->te.shell.distro);
+    s->shellfrom.prelude = clone(&s->perm, p->te.shell.prelude);
     Str why = opensession(s, scratch);
     if (why.data) {
         dropsession(e, s);
