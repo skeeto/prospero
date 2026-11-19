@@ -279,7 +279,7 @@ static void dbstash(DbConn *c, Arena scratch, DbIn *in)
 {
     DbMsg *m = &in->m;
     if ((m->h.type==DB_SIGNAL && m->h.member=="Response") ||
-            (m->h.type==DB_CALL && m->h.path=="/prospero")) {
+            (m->h.type==DB_CALL && startswith(m->h.path, "/prospero/"))) {
         DbPend *p = alloc<DbPend>(c->perm);
         p->raw = clone(c->perm, in->raw);
         p->fd  = in->fd;
@@ -2127,9 +2127,17 @@ static Str kwinrun(Wl *wl, Arena *a, Str body)
     Buf js(a, 1024);
     print(&js, "(function () {\nvar r = (function () {\n");
     print(&js, body);
+    // Its reply at a path of its own: one from an earlier script, late,
+    // is never taken for this one's
+    Buf rp(a, 32);
+    print(&rp, "/prospero/");
+    print(&rp, (i64)wl->nscript);
+    Str rpath = finish(&rp);
     print(&js, "\n})();\ncallDBus(\"");
     print(&js, wl->bus.unique);
-    print(&js, "\", \"/prospero\", \"com.nullprogram.Prospero\", \"reply\", "
+    print(&js, "\", \"");
+    print(&js, rpath);
+    print(&js, "\", \"com.nullprogram.Prospero\", \"reply\", "
                "JSON.stringify(r === undefined ? null : r));\n})();\n");
     i32 fd = open(cstr(a, path), O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC, 0600);
     if (fd<0 || !writeall(fd, finish(&js))) {
@@ -2157,9 +2165,21 @@ static Str kwinrun(Wl *wl, Arena *a, Str body)
                 "run", {}, {}, WL_CALLMS);
     DbIn reply = {};
     if (dbresult(a, &in)) {
-        reply = dbwait(&wl->bus, a, DB_CALL, "/prospero", "reply", wlms() + WL_CALLMS);
+        reply = dbwait(&wl->bus, a, DB_CALL, rpath, "reply", wlms() + WL_CALLMS);
         if (reply.ok) {
             dbreplyto(&wl->bus, *a, &reply.m, {});
+        }
+    }
+    // Earlier scripts' replies, come too late to be waited for: dropped
+    for (DbPend **p = &wl->bus.pend; *p;) {
+        DbMsg m = dbreadmsg(a, (*p)->raw);
+        if (m.ok && m.h.type==DB_CALL && startswith(m.h.path, "/prospero/")) {
+            if ((*p)->fd >= 0) {
+                close((*p)->fd);
+            }
+            *p = (*p)->next;
+        } else {
+            p = &(*p)->next;
         }
     }
     b = Buf(a, 64);
