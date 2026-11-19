@@ -14851,6 +14851,7 @@ enum : i32 {
     T_EMPTY,       // an empty part of the menu bar
     T_TERMGRID,    // the middle of the terminal's grid
     T_TERMTEXT,    // the terminal's text, where it last shows
+    T_TERMTOP,     // the middle of the terminal grid's top edge
     T_SPLITTER,    // the dock splitter between the columns
     T_HELPTAB,
     T_TRANSCRIPTTAB,
@@ -21993,6 +21994,20 @@ static DriveOp termops[] = {
     {OP_TEXT, 0, 0, 0, 300, "x"},
     {OP_CHECK, CHK_TERMVIEW, 0, 0, 0, ""},
     TERMKEY(GKEY_BACKSPACE, 300),
+    // A drag-select past the grid's top scrolls back while held; a click
+    // clears the selection, and typing comes back to the bottom
+    {OP_MOVE, T_TERMGRID, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 100, ""},
+    {OP_MOVE, T_TERMGRID, 0, -10, 100, ""},
+    {OP_MOVE, T_TERMTOP, 0, -6, 800, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_TERMVIEW, 1, 0, 0, ""},
+    {OP_MOVE, T_TERMGRID, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 30, ""}, {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_TERMSEL, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 300, "x"},
+    {OP_CHECK, CHK_TERMVIEW, 0, 0, 0, ""},
+    TERMKEY(GKEY_BACKSPACE, 300),
     // A double-click selects a word, a triple-click its line; a click
     // clears it. The drive's clicks come a few frames apart, too slow
     // for ImGui's double-click time, so it is longer meanwhile.
@@ -24770,6 +24785,10 @@ static ImVec2 targetpos(Gui *g, Arena scratch, i32 t)
     case T_TERMGRID: {
         ImRect r = g->termgrid;
         return r.Max.x>r.Min.x ? v2((r.Min.x+r.Max.x)/2, (r.Min.y+r.Max.y)/2) : v2(-1, -1);
+    }
+    case T_TERMTOP: {
+        ImRect r = g->termgrid;
+        return r.Max.x>r.Min.x ? v2((r.Min.x+r.Max.x)/2, r.Min.y) : v2(-1, -1);
     }
     case T_EMPTY: {
         Rect r = g->rects[RECT_TOOLBAR];
