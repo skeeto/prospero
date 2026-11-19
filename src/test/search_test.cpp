@@ -165,6 +165,18 @@ static void test_search(Test *t)
         expect(t, "glob braces nested", globshow(a, "x{a,{b,c}}"), "xa xb xc");
         expect(t, "glob brace open", globshow(a, "x{"), "x{");
         expect(t, "glob brace quoted", globshow(a, "\\{a,b}"), "\\{a,b}");
+        {
+            // 40 groups, 2 to the 40 combinations: the first 64, made
+            // in about as much as they take
+            Buf p(a, 256);
+            for (i32 i = 0; i < 40; i++) {
+                print(&p, "{a,b}");
+            }
+            Arena      small = carve(a, 1<<20);
+            Slice<Str> g     = globexpand(&small, finish(&p));
+            expect(t, "glob braces many", istr(a, g.len), "64");
+            expect(t, "glob braces many last", g.len==64 ? cuthead(g[63], 33) : Str{}, "abbbbbb");
+        }
 
         struct {
             Str glob;

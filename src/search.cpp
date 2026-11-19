@@ -713,10 +713,14 @@ static b32 rxmatch(RxRun *r, Str line)
 // Globs
 
 // Expand {a,b} alternatives, nested or not, into every combination, at
-// most 64 of them. A brace without a matching close stays literal.
-static Slice<Str> globexpand(Arena *a, Str pat)
+// most 64 of them. A brace without a matching close stays literal. Once
+// 64 are kept nothing more is expanded, so that N groups cost about 64
+// times N, not 2 to the N.
+static void globexpand(Arena *a, Str pat, Slice<Str> *r)
 {
-    Slice<Str> r = {};
+    if (r->len >= 64) {
+        return;
+    }
     iz open = -1, depth = 0, close = -1;
     for (iz i = 0; i < pat.len; i++) {
         if (pat[i] == '\\') {
@@ -731,13 +735,13 @@ static Slice<Str> globexpand(Arena *a, Str pat)
         }
     }
     if (close < 0) {
-        r = push(a, r, pat);
-        return r;
+        *r = push(a, *r, pat);
+        return;
     }
     Str head = takehead(pat, open);
     Str tail = cuthead(pat, close+1);
     Str body = span(pat.data+open+1, pat.data+close);
-    for (iz i = 0, start = 0, d = 0; i <= body.len; i++) {
+    for (iz i = 0, start = 0, d = 0; i<=body.len && r->len<64; i++) {
         if (i<body.len && body[i]=='\\') {
             i++;
             continue;
@@ -746,14 +750,16 @@ static Slice<Str> globexpand(Arena *a, Str pat)
         if (i<body.len && body[i]=='}') d--;
         if (i==body.len || (body[i]==',' && !d)) {
             Str alt = span(body.data+start, body.data+(i<body.len ? i : body.len));
-            Str one = concat(a, concat(a, head, alt), tail);
-            Slice<Str> more = globexpand(a, one);
-            for (iz k = 0; k<more.len && r.len<64; k++) {
-                r = push(a, r, more[k]);
-            }
+            globexpand(a, concat(a, concat(a, head, alt), tail), r);
             start = i + 1;
         }
     }
+}
+
+static Slice<Str> globexpand(Arena *a, Str pat)
+{
+    Slice<Str> r = {};
+    globexpand(a, pat, &r);
     return r;
 }
 
