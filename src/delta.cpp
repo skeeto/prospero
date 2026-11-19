@@ -79,7 +79,8 @@ struct DeltaSlot {
 };
 
 // The ops that make next from base, in a, temporaries in scratch, which
-// needs about base.len/2 bytes.
+// needs up to twice base.len bytes: a slot of 16 for each 32-byte block,
+// the table at most four times as many slots.
 static Str deltamake(Arena *a, Arena scratch, Str base, Str next)
 {
     u8 *bp  = base.data;
