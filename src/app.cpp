@@ -11795,7 +11795,7 @@ static void ctrgone(Gui *g, GuiCtr *c)
 static void ctrdelete(Gui *g, GuiCtr *c)
 {
     ctrgone(g, c);
-    if (c->made) {
+    if (c->made) {  // else once made, if being made (ctrdone)
         ctrjob(g, CJOB_REMOVE, c);
     }
 }
@@ -11970,7 +11970,11 @@ static void ctrdone(Gui *g, Record r)
                              concat(&a, ": not made: ", c->err)));
             break;
         }
-        c->made  = 1;
+        c->made = 1;
+        if (c->removed) {
+            ctrjob(g, CJOB_REMOVE, c);  // deleted while it was being made
+            break;
+        }
         c->state = "running";
         remoteconnect(g, a, c->h->name);
         break;
