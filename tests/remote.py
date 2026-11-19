@@ -4012,6 +4012,16 @@ def relay_serve(t):
     t.check(d["err"] == "connect" and "nowhere" in d["text"], f"endpoint: {d}")
     d = sv.done(sv.call(b'{"query":"x"}', path="search", endpoint="", keep=0))
     t.check(d["err"] == "connect" and "off here" in d["text"], f"no search: {d}")
+    # Strings it would send or hold that are not plain, or too long:
+    # unsound, the call never made
+    n = len(fake_provider.STATE.log(model))
+    for what, kw in (("session", dict(session="s1\r\nX-Evil: 1")),
+                     ("accept", dict(extra={"accept": "text/event-stream\r\nX-Evil: 1"})),
+                     ("model", dict(extra={"model": "m" * 5000})),
+                     ("path", dict(path="v1/chat/completions?" + "x" * 5000))):
+        d = sv.done(sv.call(b2, model=model, **kw))
+        t.check(d["err"] == "lost" and d["text"] == "an unsound relayed call", f"{what}: {d}")
+    t.check(len(fake_provider.STATE.log(model)) == n, "none made")
 
     # Cancelled while it streams
     e = sv.call(chatbody(model, "slow"), model=model)

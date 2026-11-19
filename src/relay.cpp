@@ -1428,6 +1428,19 @@ static Str relaycallline(Arena *a, Json *rec, i64 cid, Str origin, b32 invoked =
     return finish(&b);
 }
 
+// Whether a relayed call's string is one it may hold and send: short,
+// and with no control characters, as it goes into the request's line or
+// its headers, made with the user's key.
+static b32 relayplain(Str s, iz max)
+{
+    for (iz i = 0; i < s.len; i++) {
+        if (s[i]<0x20 || s[i]==0x7f) {
+            return 0;
+        }
+    }
+    return s.len <= max;
+}
+
 // Part of a thin engine's call, which its client passed on (relay.call)
 // or a hostlink's host sent (far), or a cancel of one, or of every call
 // of the origin without a cid.
@@ -1459,7 +1472,12 @@ static void relayserve(Engine *e, Arena scratch, Json *j, i64 cid, Str origin,
         i64  total = zlen ? zlen : size;
         b32  sound = len>=0 && len<=max && size>=0 && size<=max &&
                      zlen>=0 && zlen<=size+size/8+64 &&
-                     parts>=1 && parts<=total/RELAY_PART+1;
+                     parts>=1 && parts<=total/RELAY_PART+1 &&
+                     relayplain(jsonstr(jsonget(j, "session")), 256) &&
+                     relayplain(jsonstr(jsonget(j, "path")), 4096) &&
+                     relayplain(jsonstr(jsonget(j, "method")), 16) &&
+                     relayplain(jsonstr(jsonget(j, "accept")), 256) &&
+                     relayplain(jsonstr(jsonget(j, "model")), 1024);
         Region *mem = sound ? os_reserve(e->os, (iz)(total + size + len) + (1<<20) + RELAY_HOLD) : 0;
         if (!mem) {
             // Unsound, or no memory for it: answered at once, from
