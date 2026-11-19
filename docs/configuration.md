@@ -153,7 +153,9 @@ the kind's URL; changing the kind later moves a URL that is still
 another kind's own, but keeps one you typed.
 
 `kind = copilot` is GitHub Copilot, billed to your Copilot plan
-(Copilot Free included). It takes no key either: Sign in, or
+(Copilot Free included) by the tokens each request uses, at its
+model's rates. An agent's tool steps, compactions and subagents count
+like your own messages. It takes no key either: Sign in, or
 `prospero endpoint auth NAME`, shows a code to enter at GitHub's page,
 github.com/login/device, in any browser on any computer, so it suits
 an engine over ssh as well. The token is kept as ChatGPT's is, needs no
@@ -168,9 +170,7 @@ sign-in names (such as `api.individual.githubcopilot.com`); a URL you
 typed is used as it is. Copilot serves each model by one of three
 APIs, and Prospero speaks to each in the one its listing names:
 Anthropic's Messages API for Claude, the Responses API for newer GPT
-models, Chat Completions for the rest. Each request says whether you
-or the agent began it (a tool's results, compaction, a subagent), as
-Copilot bills only the first as a premium request.
+models, Chat Completions for the rest.
 
 GitHub gives each app that signs in its own set of models. Prospero
 signs in as its own GitHub app, which GitHub gives only its older
