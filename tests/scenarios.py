@@ -1825,6 +1825,29 @@ def rewind_reopen(t):
 
 
 @scenario(bound=30)
+def cut_big(t):
+    """cut back to a turn after prompts over a MiB in all: only the
+    chosen turn's prompt is kept for the reply, not every one before it."""
+    model = t.model.replace(":cut_big:", ":plain:")
+    fake_provider.STATE.register(model, meta={"n_ctx": 4000000, "n_ctx_train": 4000000})
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=model, endpoint="fake")["sid"]
+        bigs = [" ".join(f"p{k}w{i}" for i in range(60000)) for k in range(3)]  # 500 KB
+        for n, text in enumerate(bigs + ["last"], 1):
+            r = h.call("prompt", sid=sid, text=text)
+            t.check(r.get("ok") == 1, f"prompt {n}: {str(r)[:300]}")
+            end = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid
+                         and e.get("turn") == n)
+            t.check(end["why"] == "done", f"turn {n}: {end}")
+        r = h.call("cut", sid=sid, turn=4)
+        t.check(r.get("ok") == 1 and r.get("next") == "last", f"cut {str(r)[:300]}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=30)
 def cut(t):
     """cut rewinds the conversation to before a turn, in the same session:
     a cut record, the turn's prompt in the reply, with files the files

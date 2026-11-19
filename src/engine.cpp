@@ -21700,8 +21700,8 @@ static void cmdcut(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
     i64     from    = 0;   // the turn's first record
     i64     user    = 0;   // the latest user record between turns
     i64     compact = 0;   // the latest compaction
-    Str     next    = {};
-    Str     text    = {};
+    iz      at      = -1;  // user's line
+    iz      nextat  = -1;  // the turn's prompt's line
     for (iz i = 0; i<rp.lines.len && !from; i++) {
         Str ev = lineev(rp.lines[i]);
         if (ev!="user" && ev!="turn" && ev!="turn.end") {
@@ -21711,16 +21711,22 @@ static void cmdcut(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
         EvRec r = evparse(&t, rp.lines[i]);
         if (r.ev==EV_USER && !incut(&cuts, r.seq)) {
             user = user ? user : r.seq;
-            text = user==r.seq ? clone(&keep, jsonstr(jsonget(r.root, "text"))) : text;
+            at   = user==r.seq ? i : at;
         } else if (r.ev == EV_TURN) {
             if (jsonint(jsonget(r.root, "n"), 0) == turn) {
-                from = user ? user : r.seq;
-                next = user ? text : Str{};
+                from   = user ? user : r.seq;
+                nextat = user ? at : -1;
             }
             user = 0;
         } else if (r.ev == EV_TURNEND) {
             user = 0;
         }
+    }
+    // Only the chosen turn's prompt, which may be large, past keep
+    Str next = {};
+    if (nextat >= 0) {
+        EvRec r = evparse(&scratch, rp.lines[nextat]);
+        next = jsonstr(jsonget(r.root, "text"));
     }
     for (iz i = rp.lines.len-1; i>=0 && from && !compact; i--) {
         if (lineev(rp.lines[i]) == "compact") {
