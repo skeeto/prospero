@@ -1139,6 +1139,9 @@ static void relayauthwake(Engine *e, Str name)
 static void relaysend(Engine *e, Arena scratch, RelayServe *v)
 {
     v->go = 0;
+    if (v->done) {
+        return;  // cancelled, or failed, since it was let go
+    }
     if (v->ep.kind==EP_CHATGPT && !v->search && !v->authtried) {
         Str why = {};
         v->authtried = 1;
@@ -1268,6 +1271,8 @@ static void relayservecancel(Engine *e, RelayServe *v)
     } else {
         relayrelease(e, v);
         relayfinish(v, "cancel", "cancelled");
+        v->go       = 0;  // admitted but not yet sent: never sent now
+        v->authwait = 0;
     }
 }
 
