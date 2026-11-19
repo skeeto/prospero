@@ -585,6 +585,9 @@ struct View {
     b32             showthink;
     f32             lastw;      // the width laid out last
     f32             head;       // a message's header line, as drawn
+    b32             foldkeep;   // a fold since last drawn: keep the place,
+    f64             slack;      //   with this much room past the end, which
+                                //   the place's coming back up uses up
     Str             body;       // a lines view: the text its chunks slice
     Slice<HlTok>    toks;       //   and its tokens, over the whole of it
 
@@ -1145,6 +1148,7 @@ static void rethink(View *v)
         }
     }
     v->topsdirty = 1;
+    v->foldkeep  = 1;
 }
 
 // Show reasoning as [ui] thinking says (THINK_*), all of it at once but
@@ -1186,6 +1190,7 @@ static void retool(View *v)
             m->measured  = 0;
             m->ver++;
             v->topsdirty = 1;
+            v->foldkeep  = 1;
         }
     }
 }
@@ -3913,6 +3918,7 @@ static void togglemsg(View *v, i32 i)
     m->collapsed = !m->collapsed;
     m->ver++;
     v->topsdirty = 1;
+    v->foldkeep  = 1;
 }
 
 // What is at a height in the transcript, as a place in the source that a

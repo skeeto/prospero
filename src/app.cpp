@@ -2316,6 +2316,11 @@ struct Gui {
     b32                workedshown;  // a turn's work, in its last message's header
     i32                railfold;     // the message the fold rail last folded, plus one
     b32                railseen;     //   its header drawn in view this frame
+    View              *flashview;    // the view of the message last folded or
+    i32                flashmsg;     //   opened by hand, plus one, outlined a
+    i64                flashms;      //   moment from then, folded (foldflash)
+    f32                flashy0;      //   where its header was to stay
+    f32                flashy;       //   and where it was drawn last
     i32                gaugeshown;   // the gauge drew: 1, 2 if amber, 3 a count
                                      // alone (no window known)
     i32                drivecodemsg; // the code block selectcode chose, or
@@ -27704,8 +27709,17 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_WORKED:
         return g->workedshown;
     case CHK_RAILFOLD:
+        // and its header where the fold left it, though near the end
+        if (g->flashmsg==g->railfold && __builtin_fabsf(g->flashy - g->flashy0) >= 1) {
+            Arena a = g->frame;
+            Buf   b(&a, 96);
+            print(&b, "drive: the folded header moved by ");
+            print(&b, (i32)(g->flashy - g->flashy0));
+            guilog(g, finish(&b));
+        }
         return g->railfold>0 && g->railfold<=v->msgs.len &&
-               v->msgs[g->railfold-1].collapsed && g->railseen;
+               v->msgs[g->railfold-1].collapsed && g->railseen &&
+               g->flashmsg==g->railfold && __builtin_fabsf(g->flashy - g->flashy0) < 1;
     case CHK_RAILOPEN:
         return g->railfold>0 && g->railfold<=v->msgs.len &&
                !v->msgs[g->railfold-1].collapsed;

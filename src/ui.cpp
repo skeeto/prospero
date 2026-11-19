@@ -5752,6 +5752,21 @@ static void drawgreeting(Gui *g, ImVec2 wpos, f32 winh, f32 width)
 }
 #endif
 
+// A message folded or opened by hand: kept where it is on screen, the
+// end of the transcript not followed for it (the stick below), and,
+// folded, outlined for a moment where its header is left (at y now).
+static const f32 FLASH_MS = 1200;
+
+static void foldflash(Gui *g, View *v, i32 i, f32 y)
+{
+    v->foldkeep  = 2;
+    g->flashview = v;
+    g->flashmsg  = i + 1;
+    g->flashms   = os_time(g->os);
+    g->flashy0   = y;
+    g->flashy    = y;
+}
+
 static void drawtranscript(Gui *g)
 {
     GuiSession *gs = g->sess ? g->sess : &g->nosession;
@@ -5877,6 +5892,7 @@ static void drawtranscript(Gui *g)
         }
         v->topsdirty = 1;
         v->lastw     = width;
+        v->slack     = 0;  // the place is the anchor's now
         if (an.msg >= 0) {
             viewtops(v, width, charw, fm.lineh);
             msglayout(v, an.msg, &g->measure, width, sc);
@@ -5887,6 +5903,7 @@ static void drawtranscript(Gui *g)
     // A new text size (fontsize, sizekeep): the place found in the old
     // size's layouts put back in the new ones, the same way
     if (sized && !bottom) {
+        v->slack = 0;
         msglayout(v, gs->sizeat.msg, &g->measure, width, sc);
         viewtops(v, width, charw, fm.lineh);
         scrolly = (f32)anchory(v, gs->sizeat, &g->measure, width, sc, head);
@@ -5994,10 +6011,25 @@ static void drawtranscript(Gui *g)
         want = g->scrollto;  // a benchmark or a drag past the edge
         g->scrollto = -1;
     }
-    want = want>total+pad-winh ? total+pad-winh : want;
+    // A fold keeps what is on screen where it was, though less is left
+    // below it than a screen: room past the end, as much as that takes
+    // (slack). Coming back up to the end, by scrolling or by output
+    // filling it, uses it up, and none is ever added but by a fold, so
+    // the view never otherwise shows room past the end. While some is
+    // left, the view is not at the end, so it does not follow it.
+    f64 end  = total + pad - winh;
+    f64 past = want - end;
+    past = past<0 || bottom ? 0 : past;
+    if (v->foldkeep) {
+        v->slack = past;
+    }
+    v->slack    = v->slack<past ? v->slack : past;
+    v->foldkeep = 0;
+    end += v->slack;
+    want = want>end ? end : want;
     want = want<0 ? 0 : want;
 
-    ImGui::SetNextWindowContentSize(v2(0, (f32)total + pad));
+    ImGui::SetNextWindowContentSize(v2(0, (f32)(total + pad + v->slack)));
     if ((f32)want != scroll0) {
         ImGui::SetNextWindowScroll(v2(-1, (f32)want));
     }
@@ -6156,12 +6188,14 @@ static void drawtranscript(Gui *g)
         if (m->fold || m->role==VIEW_TOOL || m->role==VIEW_THINK) {
             // The header toggles the body, but for its action
             ImGui::SetCursorScreenPos(v2(x, y));
-            if (ImGui::InvisibleButton("##toggle", v2(width - actw, head))) {
-                togglemsg(v, i);
-            }
+            b32   go = ImGui::InvisibleButton("##toggle", v2(width - actw, head));
             Arena ha = g->frame;
             axname(g, headername(&ha, v, m));
             axexpanded(g, !m->collapsed);
+            if (go) {
+                togglemsg(v, i);
+                foldflash(g, v, i, y);
+            }
             if (m->role == VIEW_COMPACT) {
                 itemrect(g, RECT_COMPACTHDR);
             } else if (m->role == VIEW_THINK) {
@@ -6205,11 +6239,23 @@ static void drawtranscript(Gui *g)
                     g->scrollto = m->top;  // its header at the top
                 }
                 togglemsg(v, i);
+                foldflash(g, v, i, box0.y<top ? top : y);
                 g->railfold = i + 1;
             }
         }
         if (g->railfold==i+1 && y>=top && y+head<=bot) {
             g->railseen = 1;  // the message the rail folded, its header in view
+        }
+        if (g->flashview==v && g->flashmsg==i+1) {
+            g->flashy = y;  // where its header is drawn now
+            f32 t = (f32)(nowms - g->flashms) / FLASH_MS;
+            if (t < 1 && m->collapsed) {
+                // Folded: its outline for a moment, fading, so that the
+                // eye finds it where it is left
+                sp->SetCurrentChannel(dl, CH_TEXT);
+                dl->AddRect(box0, box1, fade(g->pal->active, 0.8f*(1 - t)), 4*sc, 1.5f*sc);
+                schedat(&g->sched, g->sched.now + 16000, DUE_APP);
+            }
         }
         if (act.bgw > 0) {
             MsgAction bg = {};
@@ -6265,7 +6311,10 @@ static void drawtranscript(Gui *g)
     }
     textkeys(g, g->frame, v);
 
-    gs->stick = scrolly >= ImGui::GetScrollMaxY()-2 || total<=winh;
+    // A message folded by hand keeps its place even at the end, where
+    // following the end would carry it down
+    gs->stick = v->foldkeep!=2 && v->slack<=0 &&
+                (scrolly >= ImGui::GetScrollMaxY()-2 || total<=winh);
     ImGui::EndChild();
     ImGui::PopID();
     ImVec2 tr0 = ImGui::GetItemRectMin();

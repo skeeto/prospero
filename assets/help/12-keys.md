@@ -138,6 +138,10 @@ as does Run in Terminal on the right-click menu. A click on a tool row's or reas
 opens or folds it. So does a click on the bar at its left (a tool
 row's colored bar, reasoning's gray one), from anywhere along it,
 which, folding, scrolls back to its header if that was above the view.
+Either way the header stays where it is on screen, even near the end
+of the transcript, where a little empty room is left below the end
+until you scroll back up or more output fills it, and a folded one is
+outlined for a moment so that your eye finds it.
 A click on a tool row's file path, though, opens that file in the
 Files pane.
 
