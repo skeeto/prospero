@@ -316,14 +316,16 @@ static FileTab *filesetdrop(FileSet *s, i32 i)
 }
 
 // Add a tab last, shown. A full set first drops the tab least recently
-// opened, which is returned for the caller to free, else null.
+// opened, never the front one, which may be the one being drawn: it is
+// returned for the caller to free, else null.
 static FileTab *filesetadd(FileSet *s, FileTab *ft)
 {
     FileTab *gone = 0;
     if (s->n == FILES_TABS) {
-        i32 old = 0;
-        for (i32 i = 1; i < s->n; i++) {
-            old = s->tabs[i]->opened<s->tabs[old]->opened ? i : old;
+        i32 old = s->front==0 ? 1 : 0;
+        for (i32 i = 0; i < s->n; i++) {
+            b32 older = s->tabs[i]->opened < s->tabs[old]->opened;
+            old = i!=s->front && older ? i : old;
         }
         gone = filesetdrop(s, old);
     }

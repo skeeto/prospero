@@ -101,6 +101,16 @@ static void test_fileset(Test *t)
     expect(t, "fileset.evictnext", gone==tabs+2 ? Str("c") : Str("other"), "c");
     expect(t, "fileset.evictednext", filesetstr(&a, &full, tabs), "adefghi*b");
 
+    // Never the front tab, being drawn, even if it is the oldest, as a
+    // restored layout can make it (its front and ranks are apart)
+    FileSet old = {};
+    for (i32 i = 0; i < FILES_TABS; i++) {
+        filesetadd(&old, tabs+i);
+    }
+    old.front = 0;
+    gone = filesetadd(&old, tabs+FILES_TABS);
+    expect(t, "fileset.evictfront", gone==tabs+1 ? Str("b") : Str("other"), "b");
+
     // Found by host and path, without case on Windows
     FileSet f = {};
     tabs[0].host = 0;
