@@ -128,6 +128,26 @@ static void test_json(Test *t)
 {
     Arena a = t->perm;
 
+    // A document too big for its arena is an error, not an exit: here a
+    // 64 KiB arena and an array of 32k small values, a node each
+    {
+        Arena s = a;
+        Arena c = carve(&s, 1<<16);
+        Buf   b(&s, 1<<17);
+        putbyte(&b, '[');
+        for (i32 i = 0; i < 1<<15; i++) {
+            print(&b, i ? Str(",0") : Str("0"));
+        }
+        putbyte(&b, ']');
+        Str     in = finish(&b);
+        byte   *at = c.beg;
+        JsonDoc d  = jsonparse(&c, in);
+        expect(t, "json out of room", istr(&s, !d.ok && c.beg==at), "1");
+        Str esc = "\"\\n\\n\\n\\n\"";
+        Arena tiny = carve(&s, 4);
+        expect(t, "json string out of room", istr(&s, jsonparse(&tiny, esc).ok), "0");
+    }
+
     // Must accept: each also round-trips canonically (write, reparse,
     // write again gives identical bytes).
     struct { Str name, in; } yes[] = {

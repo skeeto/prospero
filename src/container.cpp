@@ -728,7 +728,9 @@ static void ctrkeep(Os *os, Arena scratch, Str localstate, Str name)
         Read rd  = os_read(os, &a, log, CTR_KEEPMAX);
         Cut  c   = cut(rd.data, '\n');
         Json *j  = rd.err==READ_OK ? jsonparse(&a, c.head).root : (Json *)&jsonmissing;
-        if (c.ok && j->type==JSON_OBJECT) {
+        // A first line too big to parse here, or to write again after, is
+        // left as it is: the session keeps remote and lists as a root
+        if (c.ok && j->type==JSON_OBJECT && fits(&a, 2*(rd.data.len + name.len + 32))) {
             Buf     b(&a, rd.data.len + name.len + 32);
             JsonOut w = {&b};
             putobject(&w);

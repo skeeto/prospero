@@ -192,6 +192,10 @@ static Str jsonstring(JsonParser *p)
     }
 
     // Escapes only shrink, so the raw length is enough.
+    if (!fits(p->perm, raw.len)) {
+        jsonerror(p, beg, "out of memory");
+        return {};
+    }
     Str r = {allocbytes(p->perm, raw.len), 0};
     for (iz k = 0; k < raw.len;) {
         // Plain bytes up to the next escape, copied at once
@@ -299,6 +303,12 @@ static Json *jsonvalue(JsonParser *p, i32 depth)
         return 0;
     }
 
+    // Out of room is a parse error, not an exit: a document from outside
+    // (a container's log, a peer) can be all small values, each a node
+    if (!fits(p->perm, (iz)(2*sizeof(Json) + alignof(Json)))) {  // as alloc asks
+        jsonerror(p, beg, "out of memory");
+        return 0;
+    }
     Json *j = alloc<Json>(p->perm);
     switch (s[beg]) {
     case '{':
