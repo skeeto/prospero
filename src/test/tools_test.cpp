@@ -654,6 +654,22 @@ static void test_tools(Test *t)
                                                   startswith(plan.text, "The patch was not applied, "
                                                   "and no file was changed: *** Delete File: File "
                                                   "not found: none.c")), "1");
+        // One file under two spellings that differ in case: on macOS,
+        // where a volume ignores case, the same file, and refused
+        os_write(os, *a, "/w/Foo.c", "a\n");
+        Args pd = parseargs(a, TOOL_EDIT, "{\"patch\":\"*** Begin Patch\\n*** Update File: Foo.c\\n"
+                            "@@\\n-a\\n+b\\n*** Update File: foo.c\\n@@\\n-a\\n+c\\n"
+                            "*** End Patch\"}", EDIT_PATCH);
+        pd.patch.files[0].file = "/w/Foo.c";
+        pd.patch.files[1].file = "/w/foo.c";
+        plan = planpatch(os, a, "/w", &pd.patch);
+#ifdef __APPLE__
+        Str folded = "1";
+#else
+        Str folded = "0";
+#endif
+        expect(t, "patch case twice", istr(a, !plan.ok && find(plan.text, "appears twice")>=0),
+               folded);
         Args pb = parseargs(a, TOOL_EDIT, "{\"input\":\"*** Begin Patch\\n*** End Patch\"}", EDIT_PATCH);
         expect(t, "patch bad args", pb.issues.len ? pb.issues[0] : Str{},
                "patch: not a valid patch: it changes no files");

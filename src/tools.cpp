@@ -3193,10 +3193,16 @@ static Str patchfailed(Arena *a, Str why)
 
 // Check a parsed patch against the files, whose absolute paths the
 // caller gave in each file's file and fileto, and work out every change
-// before any is made. With win, paths differing in case are one file.
+// before any is made. With win, or on macOS, whose volumes ignore case
+// unless made otherwise, paths differing in case are taken as one file.
 static PatchPlan planpatch(Os *os, Arena *a, Str cwd, Patch *p, b32 win = 0)
 {
     PatchPlan r = {};
+#ifdef __APPLE__
+    b32 fold = 1;
+#else
+    b32 fold = win;
+#endif
 
     // Each change is worked out from the file as it is, so a file named
     // twice, if spelled two ways (f.txt and ./f.txt), would lose the
@@ -3210,7 +3216,7 @@ static PatchPlan planpatch(Os *os, Arena *a, Str cwd, Patch *p, b32 win = 0)
             b32        dup = 0;
             for (i32 x = 0; x < 2; x++) {
                 for (i32 y = 0; y < 2; y++) {
-                    dup |= n[x].len && (win ? equalfold(n[x], m[y]) : n[x]==m[y]);
+                    dup |= n[x].len && (fold ? equalfold(n[x], m[y]) : n[x]==m[y]);
                 }
             }
             if (dup) {
