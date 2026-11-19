@@ -61,22 +61,22 @@ static void test_gemmarender(Test *t)
     expect(t, "gemmachat.render.mask",
            istr(&a, r.p.mask[mine]*10 + r.p.mask[user+5]), "10");
 
-    // A user's message last: the reply opens a model turn, no thoughts
+    // A user's message last, thinking off: the reply opens a model turn
     d = jsonparse(&a, "{\"messages\":[{\"role\":\"user\",\"content\":"
                       "[{\"type\":\"text\",\"text\":\"Hi\"},{\"type\":\"image_url\"},"
                       "{\"type\":\"text\",\"text\":\" there\"}]},"
                       "{\"role\":\"assistant\",\"content\":\"Yo\",\"reasoning_content\":\"x\"},"
                       "{\"role\":\"user\",\"content\":\"Bye\"}]}");
-    r = gmrender(&a, d.root, gmthinking(d.root), 4096);
+    r = gmrender(&a, d.root, 0, 4096);
     expect(t, "gemmachat.render.plain", Str(r.p.text, r.p.len),
            "<bos><|turn>user\nHi there<turn|>\n<|turn>model\nYo<turn|>\n"
            "<|turn>user\nBye<turn|>\n<|turn>model\n");
     expect(t, "gemmachat.render.plainflags",
            istr(&a, r.system*100 + r.userlast*10 + r.inthought), "10");
 
-    // Thinking as the request says
+    // Thinking as the request says, on if it says nothing
     struct { Str req; Str want; } th[] = {
-        {"{}", "0"},
+        {"{}", "1"},
         {"{\"reasoning_effort\":\"none\"}", "0"},
         {"{\"reasoning_effort\":\"high\"}", "1"},
         {"{\"reasoning_effort\":\"high\",\"chat_template_kwargs\":{\"enable_thinking\":false}}", "0"},
@@ -355,6 +355,27 @@ static void test_gemmasample(Test *t)
         only &= gmsample(&sp, x, 3) == 0;
     }
     expect(t, "gemmachat.sample.topp", istr(&a, only), "1");
+
+    // Unequal logits sample as their softmax: 5, 3, 0 gives the first
+    // 0.876 of the time, the second 0.118
+    f32 y[3] = {5, 3, 0};
+    sp.topp = 1;
+    sp.rng  = 3;
+    i32 hits[3] = {};
+    for (i32 i = 0; i < 4000; i++) {
+        hits[gmsample(&sp, y, 3)]++;
+    }
+    expect(t, "gemmachat.sample.softmax",
+           istr(&a, hits[0]>3380 && hits[0]<3620 && hits[1]>360 && hits[1]<580), "1");
+
+    // min_p drops what is under that share of the likeliest: e^-3 < 0.1
+    f32 z[3] = {5, 2, 2};
+    sp.minp = 0.1f;
+    only = 1;
+    for (i32 i = 0; i < 200; i++) {
+        only &= gmsample(&sp, z, 3) == 0;
+    }
+    expect(t, "gemmachat.sample.minp", istr(&a, only), "1");
 }
 
 // A sequence as though the model had run tokens 0 to n-1, each token its
