@@ -1042,6 +1042,10 @@ static AxSpan axlinespan(A11y *x, i32 k)
 {
     i32  n;
     i32 *lines = axlines(x, &n);
+    if (n < 1) {
+        AxSpan all = {0, axtextlen(x)};  // a field too big to have lines
+        return all;
+    }
     k = axclamp(k, 0, n-1);
     AxSpan s = {};
     s.lo = lines[k];
