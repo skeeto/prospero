@@ -5600,6 +5600,44 @@ def role_tools(t):
             f"nope {ends[2]}")
 
 
+SMALLMODEL = """[endpoint g]
+kind = builtin
+[role peek]
+tools = read glob
+"""
+
+
+@scenario(conf={"_extra": SMALLMODEL}, bound=15)
+def builtin_small(t):
+    """A session on the built-in model, with no role or tools of its own,
+    gets the small model's tools and is told to test its work, as the
+    starter evals measured; a role keeps its own tools, and a session
+    elsewhere neither. No window is needed for the session to open."""
+    h = t.headless()
+    try:
+        def opened(**kw):
+            sid = h.call("new", cwd=t.work, **kw)["sid"]
+            recs = logged(t, sid)
+            rec  = [e for e in recs if e["ev"] == "session"][0]
+            pre  = [e for e in recs if e["ev"] == "prefix"][0]
+            return rec, pre["system"]
+
+        rec, system = opened(model="gemma-4-e2b", endpoint="g")
+        t.check(rec.get("tools") == ["read", "write", "edit", "shell", "grep", "glob"],
+                f"small tools {rec}")
+        t.check("# Testing" in system and "character by character" in system,
+                "told to test")
+        rec, system = opened(model="gemma-4-e2b", endpoint="g", role="peek")
+        t.check(rec.get("tools") == ["read", "glob"], f"the role's tools {rec}")
+        t.check("# Testing" in system, "told to test with a role too")
+        rec, system = opened(model=t.model, endpoint="fake")
+        t.check("todo_write" in rec.get("tools", ["todo_write"]) and
+                "# Testing" not in system, f"elsewhere {rec}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 PROMPTFILES = """[role filed]
 prompt = Inline first. INLINE-MARK
 prompt_file = roles/filed.md

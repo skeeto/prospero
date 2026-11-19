@@ -17686,6 +17686,20 @@ static void buildprefix(Session *s, Arena scratch)
         s->system = concat(&s->perm, s->system, "\n\n");
         s->system = concat(&s->perm, s->system, s->rolepr);
     }
+    if (s->ep.kind == EP_BUILTIN) {
+        // Measured on the starter evals, for a small model
+        s->system = concat(&s->perm, s->system,
+            "\n\n# Testing\n\n"
+            "You are not done until you have tested your work:\n"
+            "- After you write or change a program, run it with shell on a "
+            "small example, and compare its output with what the task asks "
+            "for, character by character.\n"
+            "- If the output is wrong, fix the code and run it again.\n"
+            "- Only reply when a test run shows the right output. Say what "
+            "you ran.\n"
+            "To change a file, read it first, then copy the text to replace "
+            "exactly from what read showed.");
+    }
     if (s->depth) {
         s->system = concat(&s->perm, s->system,
             "\n\n# Subagent\n\nYou are a subagent: another agent gave you "
@@ -20471,6 +20485,9 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
     endpointconf(e, &s->perm, which, &s->ep);
     modelconf(e, &s->perm, s->ep.name, model, &s->mc);
     s->te.edit = fmt.len ? editformat(fmt) : s->mc.edit;
+    if (s->ep.kind==EP_BUILTIN && !role.ok && !tools.data) {
+        s->te.deny |= tooldeny(TOOLS_SMALL);  // and kept as it began
+    }
     if (wtask->type != JSON_MISSING) {
         Str err = wtnew(s, scratch, wtask, real);  // in the session's arena
         if (err.len) {
