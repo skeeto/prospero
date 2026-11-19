@@ -983,8 +983,12 @@ static i32 mcpmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
         return 2;
     }
 
-    i32  code = 0;
-    Buf  out(&scratch, 1<<12);
+    // The output in a carve of its own: each verb reads a reply into the
+    // scratch after it while out grows, which would otherwise grow in
+    // place over that reply
+    i32   code = 0;
+    Arena outa = carve(&scratch, 1<<24);
+    Buf   out(&outa, 1<<12);
     if (verb == "list") {
         Arena a = scratch;
         Json *r = mcpcliwait(&c, &a, mcpcmdline(&a, CMD_MCP, 1, {}), 1, 0);
