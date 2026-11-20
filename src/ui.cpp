@@ -5185,7 +5185,10 @@ static void findbarend(Gui *g, FindBar *fb, Str count, Arena a)
 // The transcript's find bar (findbarbegin): the text to find, the hits
 // counted, and the buttons to go between them. A new text or session
 // searches again, a budget of bytes a frame, and the first hit at or
-// below the top of the screen becomes the current one. Drawn after the
+// below the top of the screen becomes the current one, gone to for a new
+// text. Another session shown keeps its place, as the Files pane's find
+// does for another body: going back to one left at its end would
+// otherwise land on its first hit, wrapped around to. Drawn after the
 // transcript, to be over it, so a jump it asks for lands next frame.
 static void drawfind(Gui *g, View *v, f64 scrolly, ImVec2 r0, ImVec2 r1)
 {
@@ -5217,7 +5220,8 @@ static void drawfind(Gui *g, View *v, f64 scrolly, ImVec2 r0, ImVec2 r1)
                                                     ImGuiInputTextFlags_AutoSelectAll);
     itemrect(g, RECT_FINDFIELD);
     fieldmenu(g, a, g->findbuf);
-    b32 again = ImGui::IsItemEdited() || s->v!=v;
+    b32 edited = ImGui::IsItemEdited();
+    b32 again  = edited || s->v!=v;
     b32 esc   = ImGui::IsKeyPressed(ImGuiKey_Escape, false) &&
                 (ImGui::IsItemDeactivated() || held);
     g->findactive = ImGui::IsItemActive();
@@ -5228,7 +5232,8 @@ static void drawfind(Gui *g, View *v, f64 scrolly, ImVec2 r0, ImVec2 r1)
     if (again) {
         Str q = {(u8 *)g->findbuf, (iz)__builtin_strlen(g->findbuf)};
         searchreset(s, v, q);
-        g->findfrom = viewfind(v, scrolly);
+        g->findfrom  = viewfind(v, scrolly);
+        g->findstill = !edited;
     }
     b32 done = searchstep(s, a, FIND_BUDGET);
     if (!done) {
@@ -5244,7 +5249,7 @@ static void drawfind(Gui *g, View *v, f64 scrolly, ImVec2 r0, ImVec2 r1)
         } else if (done && s->hits.len) {
             s->cur = 0;
         }
-        g->findjump |= s->cur >= 0;
+        g->findjump |= s->cur>=0 && !g->findstill;
         g->findfrom  = done && s->cur<0 ? viewfind(v, scrolly) : g->findfrom;
     }
 

@@ -1885,6 +1885,7 @@ struct Gui {
     b32                askactive;  // a question form's field had it
     f32                qformdrawn; // the latest question form's height, drawn
     b32                findjump;   // scroll to the current hit
+    b32                findstill;  // searched again for another session: it stays put
     i32                findfrom;   // a first hit is from this message on
 
     // Dialogs and settings
@@ -17337,6 +17338,33 @@ static DriveOp m3ops[] = {
     {OP_XDOWN, 0, 1, 0, 60, ""},
     {OP_XUP, 0, 1, 0, 800, ""},
     {OP_CHECK, CHK_PARENTSHOWN, 0, 0, 0, ""},
+    // With the find bar open on a match far above, back at the end: the
+    // other session and back again keep the end, not the first match
+    {OP_KEYDOWN, 0, GKEY_CMD, KEY_CMD, 50, ""},
+    {OP_KEYDOWN, 0, GKEY_F, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_F, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_CMD, 0, 300, ""},
+    {OP_TEXT, 0, 0, 0, 800, "Run the tools"},
+    {OP_CHECK, CHK_SCROLLED, 0, 0, 0, ""},
+    {OP_MOVE, T_TRANSCRIPT, 0, 0, 100, ""},
+    {OP_WHEEL, 0, 0, -100, 50, ""},
+    {OP_WHEEL, 0, 0, -100, 50, ""},
+    {OP_WHEEL, 0, 0, -100, 800, ""},
+    {OP_CHECK, CHK_NAVPLACE, 0, 0, 0, "stuck"},
+    {OP_XDOWN, 0, 0, 0, 60, ""},
+    {OP_XUP, 0, 0, 0, 800, ""},
+    {OP_CHECK, CHK_MARKSHOWN, 0, 0, 0, ""},
+    {OP_XDOWN, 0, 1, 0, 60, ""},
+    {OP_XUP, 0, 1, 0, 800, ""},
+    {OP_CHECK, CHK_PARENTSHOWN, 0, 0, 0, ""},
+    {OP_CHECK, CHK_NAVPLACE, 0, 0, 0, "stuck"},
+    {OP_KEYDOWN, 0, GKEY_CMD, KEY_CMD, 50, ""},
+    {OP_KEYDOWN, 0, GKEY_F, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_F, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_CMD, 0, 300, ""},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_CHECK, CHK_FINDCLOSED, 0, 0, 0, ""},
     // M4, in the light theme first. Two subagents, counted at work in
     // their parent's strip, then listed under it; the parent's task row
     // shows one, and the subagent's up arrow goes back, as does Alt+Up
