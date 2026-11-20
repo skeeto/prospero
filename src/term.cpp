@@ -1392,6 +1392,12 @@ static b32 termapply(Gui *g, GuiHost *h, Arena scratch, EvRec *r)
 
     case EV_TERMEND: {
         i64 off = jsonint(jsonget(j, "off"), -1);
+        if (tt->state==TT_LIVE && off>tt->fed && !jsonstr(jsonget(j, "err")).len) {
+            // A gap before the end: the tail again, from where it was
+            // lost, then the end again (the host sends it once all is)
+            termack(g, tt, tt->fed, 1);
+            return 0;
+        }
         tt->code   = (i32)jsonint(jsonget(j, "code"), -1);
         tt->signal = (i32)jsonint(jsonget(j, "signal"), 0);
         tt->busy   = 0;

@@ -2335,6 +2335,9 @@ static void termcmd(Engine *e, Arena scratch, i32 cmd, Json *j)
         os_ptytake(e->os, t->proc, (iz)k.take);
         t->acked   = off;
         t->sent    = k.sent;
+        if (t->sent < t->total) {
+            t->ended = 0;  // sent again: its term.end goes again after
+        }
         t->tries   = k.take ? 0 : t->tries;
         t->stallat = t->sent>t->acked && !t->away ? os_ticks(e->os) + (i64)TERM_STALL*SEC : 0;
         termpump(e, scratch, t);
