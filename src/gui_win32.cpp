@@ -2230,7 +2230,18 @@ static_assert(FLASH_CANCEL==0 && FLASH_BRIEFLY==1 && FLASH_UNTILFOCUSED==2);
 W32(i32, GetCurrentThreadId());
 
 static void hookinput(void *g, int kind) { gui_input((Gui *)g, kind); }
-static void hookwake(void *g)            { gui_wake((Gui *)g); }
+// A wake, a tray pick, a toast's answer or a drop inside a frame (a COM
+// call's reentry) is held for after it (guilater).
+static void hookwake(void *p)
+{
+    Gui *g = (Gui *)p;
+    if (g->sched.inframe) {
+        g->wakelater = 1;
+        scheddirty(&g->sched);
+        return;
+    }
+    gui_wake(g);
+}
 static void hookforce(void *g)           { gui_force((Gui *)g); }
 static void hookframe(void *g)           { gui_frame((Gui *)g); }
 static void hookscale(void *g, float s)  { gui_scale((Gui *)g, s); }
@@ -2238,13 +2249,31 @@ static void hookminimized(void *g, int m){ gui_minimized((Gui *)g, m); }
 static void hookmodal(void *g, int m)    { gui_modal((Gui *)g, m); }
 static void hookclose(void *g)           { gui_close((Gui *)g, ((Gui *)g)->frame); }
 static void hooksystheme(void *g, int d) { gui_systheme((Gui *)g, d); }
-static void hooktray(void *g, int item)  { gui_tray((Gui *)g, ((Gui *)g)->frame, item); }
-static void hooktoasted(void *g, int id, int refused)
+static void hooktray(void *p, int item)
 {
-    if (refused) {
-        gui_toastfail((Gui *)g, id, "refused");
+    Gui *g = (Gui *)p;
+    if (g->sched.inframe) {
+        GuiLater l = {};
+        l.kind = LATER_TRAY;
+        l.item = item;
+        guihold(g, l);
+        return;
+    }
+    gui_tray(g, g->frame, item);
+}
+
+static void hooktoasted(void *p, int id, int refused)
+{
+    Gui *g = (Gui *)p;
+    if (g->sched.inframe) {
+        GuiLater l = {};
+        l.kind = refused ? LATER_TOASTFAIL : LATER_TOAST;
+        l.item = id;
+        guihold(g, l);
+    } else if (refused) {
+        gui_toastfail(g, id, "refused");
     } else {
-        gui_toasted((Gui *)g, id);
+        gui_toasted(g, id);
     }
 }
 
@@ -2268,6 +2297,16 @@ static void hookdrop(void *p, unsigned short const *path, int x, int y, int at)
     Gui *g = (Gui *)p;
     iz   n = 0;
     for (; path[n]; n++) {}
+    if (g->sched.inframe) {
+        GuiLater l = {};
+        l.kind = LATER_DROP;
+        l.path = fromwide(&g->perm, (c16 *)path, n);
+        l.x    = (f32)x;
+        l.y    = (f32)y;
+        l.at   = at;
+        guihold(g, l);
+        return;
+    }
     Str  s = fromwide(&g->frame, (c16 *)path, n);  // until the next frame
     gui_drop(g, s, 0, (f32)x, (f32)y, at);
 }

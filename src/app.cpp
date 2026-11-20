@@ -1605,6 +1605,20 @@ struct NavTo {
     Anchor      an;
 };
 
+// What a platform hook delivered inside a frame, held for after it
+// (guilater): Win32 dispatches posted messages within a COM call the
+// frame makes (ShellExecuteW, SHOpenFolderAndSelectItems), where these
+// would change sessions and write the frame arena under live copies.
+enum : i32 { LATER_TRAY, LATER_TOAST, LATER_TOASTFAIL, LATER_DROP };
+
+struct GuiLater {
+    i32 kind;
+    i32 item;   // tray item, toast id
+    Str path;   // a drop's, in perm
+    f32 x, y;
+    b32 at;
+};
+
 struct Gui {
     Os                *os;
     Arena              perm;
@@ -2432,6 +2446,8 @@ struct Gui {
     i32                attshown;     // attached images drawn above it
     i32                attready;     // of them with their thumbnail
     i64                drops;        // files dropped on the window
+    b32                wakelater;    // a wake came inside a frame (guilater)
+    Slice<GuiLater>    later;        // and what else did, to replay after it
     Region            *dropr;        // those dropped at a point, until the
     Arena              dropa;        // next frame routes them (DROP_QUEUE)
     DropAt            *drophead;
@@ -13475,6 +13491,34 @@ static void gui_wake(Gui *g)
     }
 }
 
+static void gui_drop(Gui *, Str, b32, f32, f32, b32);
+
+// Hold what a platform hook delivered inside a frame (GuiLater).
+static void guihold(Gui *g, GuiLater l)
+{
+    g->later = push(&g->perm, g->later, l);
+    scheddirty(&g->sched);  // a frame, after which they go
+}
+
+// What came inside the frame just ended, in order: the wake first.
+static void guilater(Gui *g)
+{
+    if (g->wakelater) {
+        g->wakelater = 0;
+        gui_wake(g);
+    }
+    for (iz i = 0; i < g->later.len; i++) {
+        GuiLater *l = &g->later[i];
+        switch (l->kind) {
+        case LATER_TRAY:      gui_tray(g, g->frame, l->item);          break;
+        case LATER_TOAST:     gui_toasted(g, l->item);                 break;
+        case LATER_TOASTFAIL: gui_toastfail(g, l->item, "refused");    break;
+        case LATER_DROP:      gui_drop(g, l->path, 0, l->x, l->y, l->at); break;
+        }
+    }
+    g->later.len = 0;
+}
+
 // The user asked to close the window, or to quit: at once with nothing
 // running, which needs no frame (the window may be minimized, or quit
 // from the Dock while covered). Otherwise the UI asks first (ui.cpp),
@@ -14509,6 +14553,7 @@ static void gui_frame(Gui *g)
     if (g->drive && g->driveat!=I64MAX) {
         schedat(s, g->driveat, DUE_APP);
     }
+    guilater(g);
 }
 
 // With no window: wait for the tray, a wake, or the checklist's next
