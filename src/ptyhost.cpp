@@ -1622,6 +1622,14 @@ static void termpump(Engine *e, Arena scratch, Term *t)
             break;
         }
         s = s.len<can ? s : takehead(s, can);
+        if (t->screen && s.len > t->fed-t->sent) {
+            // What the reader added since termscan isn't on the screen:
+            // sent past fed, an ack could take what the screen never saw
+            if (t->fed <= t->sent) {
+                break;
+            }
+            s = takehead(s, (iz)(t->fed - t->sent));
+        }
         Arena a = scratch;
         Buf   b(&a, 256 + base64len(s.len));
         EvOut w = termbegin(e, &b, t, EV_TERM);
