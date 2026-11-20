@@ -31477,14 +31477,26 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
 
     // No layout file is a first run: Help floats in front, with Settings
     // and Hosts unless the configuration says what to use already
-    g->firstrun = 1;
+    // Any other failure to read it is no first run, and the file is
+    // left alone rather than saved over: one over 1 MiB is read too, as
+    // saveini may write one
+    g->firstrun = !g->inipath.len;
     if (g->inipath.len) {
-        Arena t  = g->frame;
-        Read  rd = os_read(os, &t, g->inipath, 1<<20);
-        if (rd.err == READ_OK) {
+        Region *r  = os_reserve(os, 64<<20);
+        Arena   t  = newarena(r);
+        Read    rd = r ? os_read(os, &t, g->inipath, (64<<20) - 4096) : Read{};
+        if (r && rd.err == READ_OK) {
             ImGui::LoadIniSettingsFromMemory((char *)rd.data.data, (uz)rd.data.len);
-            g->firstrun = 0;
             g->restored = 1;
+        } else if (r && rd.err == READ_NOTFOUND) {
+            g->firstrun = 1;
+        } else {
+            guilog(g, concat(&g->frame, "cannot read the layout, so it is not saved: ",
+                             g->inipath));
+            g->inipath = {};
+        }
+        if (r) {
+            os_release(os, r);
         }
     }
     if (g->firstrun) {
