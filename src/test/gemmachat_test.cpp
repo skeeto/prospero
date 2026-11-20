@@ -487,9 +487,9 @@ static void gmtfill(GmSeq *s, i32 n, i32 base)
     for (i32 i = 0; i < n; i++) {
         s->kv.tokens[i] = i + base;
     }
+    gmgrowseq(s, n);  // committed, as a forward's are: a fork reads them
     s->n      = n;
     s->ringlo = n>GM_RING ? n-GM_RING : 0;
-    s->hi     = n>s->hi ? n : s->hi;
 }
 
 static void test_gemmacache(Test *t)

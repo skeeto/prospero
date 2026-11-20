@@ -2109,7 +2109,7 @@ def main():
     ap.add_argument("--model", help="with --mode e2e: the model (required)")
     ap.add_argument("--builtin", metavar="FILE",
                     help="with --mode e2e: the window's own model, from this GGUF "
-                         "(no --model or --url)")
+                         "(no --model or --url; with --host, a path there)")
     ap.add_argument("--image", default="alpine:latest",
                     help="with --mode containers: the image, already pulled")
     ap.add_argument("--runtime", default="auto",
@@ -2190,10 +2190,11 @@ def main():
     if args.builtin:
         if args.mode != "e2e" or args.model or args.url:
             ap.error("--builtin goes with --mode e2e, and no --model or --url")
-        if not os.path.isfile(args.builtin):
+        if not args.host and not os.path.isfile(args.builtin):
             ap.error(f"--builtin: no file {args.builtin}")
         args.model = "gemma-4-e2b"
-        os.environ["PROSPERO_BUILTIN_MODEL"] = os.path.abspath(args.builtin)
+        if not args.host:  # with --host, a path there, given in run's env
+            os.environ["PROSPERO_BUILTIN_MODEL"] = os.path.abspath(args.builtin)
     if args.mode == "e2e" and not args.model:
         ap.error("--mode e2e needs --model")
     # A remote host over ssh reaches the provider on this machine's address
@@ -2564,6 +2565,8 @@ def main():
         env = far.env() if far else None
         if args.mode == "drive" and args.host and not args.fake:
             env = FSSTALL
+        if args.builtin and args.host:
+            env = {"PROSPERO_BUILTIN_MODEL": args.builtin}
         axdone = threading.Event()
         axthread = None
         if args.mode == "a11y" and sys.platform == "darwin" and isinstance(host, Local):
