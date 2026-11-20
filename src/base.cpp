@@ -188,6 +188,7 @@ static Arena newarena(Region *r ARENASITE)
 
 static void copybytes(void *dst, void *src, iz len)
 {
+    assert(len >= 0);  // also tells GCC, lest it warn of a huge memcpy
     if (len) __builtin_memcpy(dst, src, (uz)len);
 }
 
