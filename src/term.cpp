@@ -54,6 +54,7 @@ enum : i32 {
 enum : i32 {
     TERMTAB_TEXT  = 160,       // bytes kept of its shell's name and errors
     TERMTAB_RESIZE = 100*1000,  // µs a new size waits to settle
+    TERMTAB_SYNC   = 150*1000,  // µs a synchronized update holds the screen
     TERMTAB_INPUT  = 16 << 10,  // bytes per term.input (ptyhost's TERM_INPUT)
     TERMTAB_OPEN   = 16,        // open on one engine (ptyhost's TERM_PERPEER)
 };
@@ -75,6 +76,18 @@ struct TermTab {
     i32         wantrows;
     i64         wantat;    // when it last changed, sched µs
     i64         fed;       // output offset fed to ariel
+    // A synchronized update (mode 2026) under way: the screen as it was
+    // when it began, drawn in place of the live one until it ends, the
+    // view moves, or TERMTAB_SYNC passes, so that a program's redraw
+    // (brew's progress bars) shows whole, never half done
+    Arena       spare;     // the rest of its region, for held
+    ariel_Cell *held;      // capcols*caprows cells, made at the first
+    b32         holding;
+    i64         heldat;    // when it began, µs
+    i32         heldcols;
+    i32         heldrows;
+    i32         heldoff;   // the view's offset
+    ariel_Cursor heldcur;
     u32         mheld;     // mouse buttons whose press went to the app
     f32         wheel;     // wheel notches not yet sent, fractions kept
     b32         pasteins;  // Insert, held since it pasted with Shift
@@ -288,7 +301,8 @@ static b32 termblock(Gui *g, TermTab *tt, i32 cols, i32 rows)
     if (!size) {
         return 0;
     }
-    Region *r = os_reserve(g->os, size + ((iz)1<<16));
+    iz      heldsize = (iz)capcols * caprows * (iz)sizeof(ariel_Cell);
+    Region *r        = os_reserve(g->os, size + heldsize + ((iz)1<<16));
     if (!r) {
         return 0;
     }
@@ -310,6 +324,9 @@ static b32 termblock(Gui *g, TermTab *tt, i32 cols, i32 rows)
     tt->t       = t;
     tt->capcols = capcols;
     tt->caprows = caprows;
+    tt->spare   = a;
+    tt->held    = 0;
+    tt->holding = 0;
     return 1;
 }
 
@@ -1275,6 +1292,48 @@ static Str termcmddrive(Arena *a, TermTab *tt, i64 i)
     return finish(&b);
 }
 
+// A synchronized update begun (on) or ended: the screen as it stands
+// held for drawing, its room taken from the region's spare at the first.
+static void termhold(Gui *g, TermTab *tt, b32 on)
+{
+    tt->holding = 0;
+    if (!on) {
+        return;  // drawn anew, as its record says
+    }
+    ariel_Modes mo = ariel_modes(tt->t);
+    if (mo.cols>tt->capcols || mo.rows>tt->caprows) {
+        return;
+    }
+    if (!tt->held) {
+        iz size = (iz)tt->capcols * tt->caprows * (iz)sizeof(ariel_Cell);
+        iz pad  = -(uz)tt->spare.beg & (alignof(ariel_Cell) - 1);
+        if (!fits(&tt->spare, pad+size)) {
+            return;
+        }
+        allocbytes(&tt->spare, pad);
+        tt->held = (ariel_Cell *)allocbytes(&tt->spare, size);
+    }
+    for (i32 y = 0; y < mo.rows; y++) {
+        ariel_row(tt->t, y, tt->held + (iz)y*mo.cols, mo.cols);
+    }
+    tt->heldcur  = ariel_cursor(tt->t);
+    tt->heldcols = mo.cols;
+    tt->heldrows = mo.rows;
+    tt->heldoff  = ariel_view(tt->t).offset;
+    tt->heldat   = os_ticks(g->os);
+    tt->holding  = 1;
+    schedat(&g->sched, tt->heldat + TERMTAB_SYNC, DUE_APP);  // drawn live then
+}
+
+// Whether tt draws its held screen now: its update under way, its time
+// not up, and the view as it was.
+static b32 termheld(Gui *g, TermTab *tt, ariel_Modes mo)
+{
+    return tt->holding && g->sched.now<tt->heldat+TERMTAB_SYNC &&
+           mo.cols==tt->heldcols && mo.rows==tt->heldrows &&
+           ariel_view(tt->t).offset==tt->heldoff;
+}
+
 // Feed the shell's output to ariel, sending its replies back.
 static void termfeed(Gui *g, TermTab *tt, Str data)
 {
@@ -1287,6 +1346,9 @@ static void termfeed(Gui *g, TermTab *tt, Str data)
             return;
         case ARIEL_EV_REPLY:
             terminput(g, tt, {f.ev.data.data, f.ev.data.len});
+            break;
+        case ARIEL_EV_SYNC:
+            termhold(g, tt, f.ev.arg);
             break;
         case ARIEL_EV_CWD: {
             // Its hooked shell's folder (OSC 7 with its nonce)
@@ -1500,14 +1562,20 @@ static void termcells(Gui *g, TermTab *tt, TermMetrics *m, ImVec2 o, b32 focused
     ImDrawList *dl    = ImGui::GetWindowDrawList();
     ariel_Modes modes = ariel_modes(tt->t);
     i32         cols  = modes.cols;
+    b32         held  = termheld(g, tt, modes);
     ariel_Cell *cells = alloc<ariel_Cell>(&a, cols);
     f32         cw = m->cw, ch = m->ch;
     f32         top = termsnap((ch - m->size)/2, m->density);  // the glyphs' in a cell
     dl->PushDrawFlag(ImDrawFlags_TextNoPixelSnap, true);
 
     for (i32 y = 0; y < modes.rows; y++) {
-        i32 n  = ariel_row(tt->t, y, cells, cols);
+        i32 n  = cols;
         f32 cy = o.y + (f32)y*ch;
+        if (held) {
+            cells = tt->held + (iz)y*cols;
+        } else {
+            n = ariel_row(tt->t, y, cells, cols);
+        }
 
         // Backgrounds, in runs of one color, the default left as it is
         for (i32 x = 0; x < n;) {
@@ -1551,7 +1619,7 @@ static void termcells(Gui *g, TermTab *tt, TermMetrics *m, ImVec2 o, b32 focused
     }
 
     // The cursor: a block, else a bar or underline; hollow unfocused
-    ariel_Cursor cur = ariel_cursor(tt->t);
+    ariel_Cursor cur = held ? tt->heldcur : ariel_cursor(tt->t);
     if (cur.visible && cur.y>=0 && cur.y<modes.rows && cur.x>=0 && cur.x<cols &&
             tt->state==TT_LIVE) {
         f32 cx  = o.x + (f32)cur.x*cw;
@@ -1567,7 +1635,11 @@ static void termcells(Gui *g, TermTab *tt, TermMetrics *m, ImVec2 o, b32 focused
             dl->AddRectFilled(v2(cx, cy + ch - t), v2(cx + w, cy + ch), col);
         } else {
             dl->AddRectFilled(v2(cx, cy), v2(cx + w, cy + ch), col);
-            ariel_row(tt->t, cur.y, cells, cols);
+            if (held) {
+                cells = tt->held + (iz)cur.y*cols;
+            } else {
+                ariel_row(tt->t, cur.y, cells, cols);
+            }
             ariel_Cell *c = cells + cur.x;
             if (c->cp && c->cp!=' ' && !(c->attr & ARIEL_A_HIDDEN)) {
                 ImFontBaked *f  = c->attr&ARIEL_A_BOLD ? m->bold : m->regular;
@@ -3183,6 +3255,30 @@ static Str termscreen(Gui *g, Arena *a)
     }
     for (; n>0 && buf[n-1]==' '; n--) {}
     return {buf, n};
+}
+
+// The front tab's held screen (termhold) as text, a line a row, while
+// it holds one, else null.
+static Str termheldscreen(Gui *g, Arena *a)
+{
+    TermTab *tt = termfront(g);
+    if (!tt || !tt->t || !tt->holding) {
+        return {};
+    }
+    Buf b(a, 256);
+    for (i32 y = 0; y < tt->heldrows; y++) {
+        ariel_Cell *row = tt->held + (iz)y*tt->heldcols;
+        for (i32 x = 0; x < tt->heldcols; x++) {
+            if (row[x].width) {
+                u8 utf8[4];
+                i32 c = row[x].cp ? (i32)row[x].cp : ' ';
+                print(&b, Str{utf8, utf8encode(utf8, c)});
+            }
+        }
+        for (; b.len>0 && b.data[b.len-1]==' '; b.len--) {}
+        putbyte(&b, '\n');
+    }
+    return finish(&b);
 }
 
 // Where the screen last shows text, its first cell's middle, else

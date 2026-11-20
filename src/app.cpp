@@ -7003,6 +7003,7 @@ static Str  termruntip(Gui *, Arena *, GuiSession *, i32, Str, u64);
 static void termadd(Gui *, GuiSession *);
 static void termgrab(Gui *);
 static Str  termscreen(Gui *, Arena *);
+static Str  termheldscreen(Gui *, Arena *);
 static ImVec2 termtextat(Gui *, Arena, Str);
 static b32  termsizecheck(Gui *);
 
@@ -15541,6 +15542,8 @@ enum : i32 {
     CHK_MENTIONTAG,   // its pick was drawn marked attached (dx 1) or not (0)
     CHK_TERMFOCUS,    // the terminal has the keyboard
     CHK_TERMSCREEN,   // the terminal's screen has text, or not with dx 1
+    CHK_TERMHELD,     // it holds a synchronized update, its held screen
+                      // having text, or not with dx 1
     CHK_RUNTO,        // Run takes the aimed block as text: none, show, send, new
     CHK_TERMKIND,     // the front tab's shell's family is text; dx 1: hooked, marked
     CHK_TERMCWD,      // the front tab's folder by OSC 7 ends with text; dx 1: doesn't
@@ -15938,6 +15941,7 @@ static Str chknames[] = {
     "the '@' picker's pick is the path it should be",
     "the '@' picker's pick says it is attached, or does not",
     "the terminal has the keyboard", "the terminal shows the text, or not, as said",
+    "the terminal holds a synchronized update, showing the text, or not, as said",
     "Run in Terminal takes the block as said", "the front tab's shell is of that family, hooked as said",
     "the front tab's folder is as its shell said", "the front tab's command line is as said",
     "the draft's last attachment is the text file said",
@@ -22169,6 +22173,17 @@ static DriveOp termops[] = {
     {OP_TEXT, 0, 0, 0, 100, "echo after"},
     TERMKEY(GKEY_ENTER, 100),
     {OP_WAIT, W_TERM, 0, 0, 5000, "\nafter"},
+#if !defined(_WIN32)
+    // A synchronized update (mode 2026) holds the screen drawn as it
+    // began, so a redraw (brew's progress bars) shows whole, until it
+    // ends (not checked through ConPTY, which need not pass it on)
+    {OP_TEXT, 0, 0, 0, 100, "printf 'pre%d\\033[?2026hpost%d' 6 7; sleep 3; printf '\\033[?2026l\\n'"},
+    TERMKEY(GKEY_ENTER, 100),
+    {OP_WAIT, W_TERM, 0, 0, 5000, "pre6post7"},
+    {OP_CHECK, CHK_TERMHELD, 0, 0, 0, "pre6"},
+    {OP_CHECK, CHK_TERMHELD, 1, 0, 0, "post7"},
+    {OP_WAIT, W_TERM, 0, 0, 5000, "pre6post7\ntty$"},
+#endif
 #if !defined(__APPLE__)
     // Alt+Left is the shell's while the terminal has the keyboard, not
     // Back's (#58)
@@ -28885,6 +28900,16 @@ static b32 drivecheck(Gui *g, i32 chk)
         b32   ok     = (find(screen, g->ops[g->drivepc-1].text) >= 0) != absent;
         if (!ok) {
             guilog(g, concat(&a, "drive: the terminal shows:\n", screen));
+        }
+        return ok;
+    }
+    case CHK_TERMHELD: {
+        Arena a      = g->frame;
+        Str   screen = termheldscreen(g, &a);
+        b32   absent = g->ops[g->drivepc-1].dx != 0;
+        b32   ok     = screen.data && (find(screen, g->ops[g->drivepc-1].text) >= 0) != absent;
+        if (!ok) {
+            guilog(g, concat(&a, "drive: the terminal holds:\n", screen));
         }
         return ok;
     }
