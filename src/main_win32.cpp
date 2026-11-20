@@ -321,6 +321,8 @@ W32(void,   Sleep(i32));
 W32(u32,    GetTickCount());
 W32(b32,    AttachConsole(i32));
 W32(b32,    FreeConsole());
+W32(u32,    GetConsoleProcessList(u32 *, u32));
+W32(i32,    GetCurrentProcessId());  // again below, where the rest are
 W32(b32,    GenerateConsoleCtrlEvent(i32, i32));
 W32(b32,    SetConsoleCtrlHandler(uz, b32));
 W32(b32,    SetStdHandle(i32, uz));
@@ -2184,6 +2186,20 @@ static void ctrlbreak(Os *os, Proc *p)
         return;
     }
     EnterCriticalSection(&os->console);
+    // Back afterward to another process of this console, not the parent,
+    // which may be on none (started from Explorer, or exited): and if no
+    // other is on it, freeing it would destroy it, so not this way
+    u32 pids[16];
+    u32 n     = GetConsoleProcessList(pids, countof(pids));
+    u32 self  = (u32)GetCurrentProcessId();
+    u32 other = 0;
+    for (u32 i = 0; i<n && i<countof(pids) && !other; i++) {
+        other = pids[i]!=self && pids[i]!=(u32)p->pid ? pids[i] : 0;
+    }
+    if (n && !other) {
+        LeaveCriticalSection(&os->console);
+        return;
+    }
     b32 con[3] = {};
     for (i32 fd = 0; fd < 3; fd++) {
         con[fd] = GetConsoleMode(os->std[fd], &mode);
@@ -2195,7 +2211,7 @@ static void ctrlbreak(Os *os, Proc *p)
         FreeConsole();
         SetConsoleCtrlHandler(0, 0);
     }
-    b32 back = had && AttachConsole(ATTACH_PARENT_PROCESS);
+    b32 back = had && AttachConsole((i32)other);
     for (i32 fd = 0; fd < 3; fd++) {
         if (con[fd] && back) {
             c16 *name = fd ? (c16 *)u"CONOUT$" : (c16 *)u"CONIN$";
