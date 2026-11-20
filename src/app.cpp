@@ -1126,6 +1126,7 @@ struct CfgHead {
 enum : u32 {
     SAVE_LAYOUT = 1,
     SAVE_LAST,
+    SAVE_BIG,     // a SaveBig: a layout too big for the mailbox, in a region
 };
 
 struct Saver {
@@ -1134,6 +1135,13 @@ struct Saver {
     Str      path;
     Arena    scratch;
     Event    done;     // the last layout is written
+};
+
+// A layout posted by reference: the saver writes it, then releases its
+// region, so that every write goes through the one thread, in order.
+struct SaveBig {
+    Region *r;
+    Str     data;
 };
 
 // Screenshots: a desktop call's PNG, out/CALL.png in its session's
@@ -13692,14 +13700,29 @@ static void savermain(void *arg)
     for (;;) {
         mailwait(s->in, -1);
         Mail   m    = mailtake(s->in);
-        Record save = {};
-        b32    last = 0;
+        Record  save = {};
+        SaveBig big  = {};  // save's, if it is one
+        b32     last = 0;
         for (Record r = mailnext(&m); r.ok; r = mailnext(&m)) {
-            save  = r;
             last |= r.type == SAVE_LAST;
+            if (r.type==SAVE_LAST && !r.data.len) {
+                continue;  // the last, its layout posted before it
+            }
+            if (big.r) {
+                os_release(s->os, big.r);  // a newer one replaces it
+                big = {};
+            }
+            if (r.type==SAVE_BIG && r.data.len==(iz)sizeof(big)) {
+                copybytes(&big, r.data.data, sizeof(big));
+            }
+            save = r;
         }
-        if (save.ok && !os_write(s->os, s->scratch, s->path, save.data)) {
+        Str data = big.r ? big.data : save.data;
+        if (save.ok && !os_write(s->os, s->scratch, s->path, data)) {
             os_print(s->os, 2, "prospero: could not save the layout\n");
+        }
+        if (big.r) {
+            os_release(s->os, big.r);
         }
         if (last) {
             os_signal(&s->done);
@@ -13735,7 +13758,24 @@ static void saveini(Gui *g, b32 last)
     char const *ini = ImGui::SaveIniSettingsToMemory(&len);
     Str  data = {(u8 *)ini, (iz)len};
     Saver *s  = g->saver;
-    if (s && mailpost(s->in, last ? SAVE_LAST : SAVE_LAYOUT, 0, data, 1)) {
+    b32    ok = 0;
+    if (s && data.len > mailmax(s->in)) {
+        // Too big to post: by reference, still through the saver, which
+        // may be writing an older one that would otherwise land last
+        Region *r = os_reserve(g->os, data.len + 64);
+        if (r) {
+            Arena   a   = newarena(r);
+            SaveBig big = {r, clone(&a, data)};
+            ok = mailpost(s->in, SAVE_BIG, 0, {(u8 *)&big, (iz)sizeof(big)}, 1);
+            ok = ok && (!last || mailpost(s->in, SAVE_LAST, 0, {}, 1));
+            if (!ok) {
+                os_release(g->os, r);
+            }
+        }
+    } else if (s) {
+        ok = mailpost(s->in, last ? SAVE_LAST : SAVE_LAYOUT, 0, data, 1);
+    }
+    if (ok) {
         if (last && !os_wait(&s->done, 5000)) {
             guilog(g, "the layout is not saved yet");
         }
