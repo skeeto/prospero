@@ -947,7 +947,7 @@ static void mentionlate(Gui *g)
 // token made them, and they stay. The
 // token is compared as mentiontext writes it, not as a bare substring, so
 // "@a.cpp" does not keep what "@aa.cpp" attached.
-static void mentionreconcile(Gui *g, GuiSession *s, Str text)
+static void mentionreconcile(Gui *g, Arena scratch, GuiSession *s, Str text)
 {
     View   *v    = s->view;
     Str     root = v && v->cwd.len ? v->cwd : s->cwd;
@@ -963,7 +963,8 @@ static void mentionreconcile(Gui *g, GuiSession *s, Str text)
         } else if (m->src[off] == '/') {
             off++;     // the separator join put between them
         }
-        Str t = mentiontext(&g->frame, cuthead(m->src, off), 0);
+        Arena a = scratch;
+        Str   t = mentiontext(&a, cuthead(m->src, off), 0);
         if (t.len && !mentionholds(text, t)) {
             attachremove(g, s, k);
         }

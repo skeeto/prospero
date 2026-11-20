@@ -3566,7 +3566,7 @@ static void ondevicecode(Gui *g, Arena scratch, Str url, Str code)
         Str to = concat(&scratch, concat(&scratch, url, "?user_code="), code);
         mcpbrowse(g, scratch, to);
     } else if (!os_guiopenurl(g->os, scratch, url)) {
-        mcpsay(g, g->mcpname, concat(&g->frame, "Visit ", url), 0);
+        mcpsay(g, g->mcpname, concat(&scratch, "Visit ", url), 0);
     }
 }
 
@@ -11032,7 +11032,7 @@ static void importread(Gui *g, Arena scratch, Str path)
     Read rd  = os_read(g->os, &x->mem, path, EXPORT_MAX);
     if (rd.err != READ_OK) {
         importfail(g, rd.err==READ_TOOBIG ? Str("the log is too big to import")
-                                          : concat(&g->frame, "cannot read ", path));
+                                          : concat(&scratch, "cannot read ", path));
         return;
     }
     x->data = rd.data;
@@ -11780,18 +11780,17 @@ static void ctrnewafter(Gui *g, Arena scratch, GuiCtr *c)
 // Make a container for a new session, from image, with folder copied
 // in, mounted, or neither (ws, CTR_*), and connect to it once made, its
 // session then started as the rest says (guinew). Returns why it cannot
-// start, else null.
-static Str ctrnew(Gui *g, Str image, i32 ws, Str folder, b32 net, Str ep, Str model,
-                  Str role, b32 plan)
+// start, in a, else null.
+static Str ctrnew(Gui *g, Arena *a, Str image, i32 ws, Str folder, b32 net, Str ep,
+                  Str model, Str role, b32 plan)
 {
     image  = trim(image);
     folder = trim(folder);
     HomePath hp = ws==CTR_EMPTY ? HomePath{} :
-                  tildepath(&g->frame, folder, g->main->home, HOST_WINDOWS);
+                  tildepath(a, folder, g->main->home, HOST_WINDOWS);
     folder = hp.path;
-    // In the frame itself, past folder, not a copy of it, which is gone
-    // on return
-    Arena scratch = carve(&g->frame, 1<<16);
+    // In a, past folder, not a copy of it, which is gone on return
+    Arena scratch = carve(a, 1<<16);
     if (!g->ctrrt.up) {
         return g->ctrrt.why.len ? g->ctrrt.why : Str("no container runtime answers");
     } else if (!image.len) {
@@ -11805,9 +11804,9 @@ static Str ctrnew(Gui *g, Str image, i32 ws, Str folder, b32 net, Str ep, Str mo
     } else if (ws != CTR_EMPTY && os_stat(g->os, scratch, folder).type != STAT_DIR) {
         return "No such folder here";
     }
-    Str noeng = ctrnoengine(g->os, &g->frame, scratch);
+    Str noeng = ctrnoengine(g->os, a, scratch);
     if (noeng.len) {
-        noeng = clone(&g->frame, noeng);  // as a sentence, for the dialog
+        noeng = clone(a, noeng);  // as a sentence, for the dialog
         noeng.data[0] = noeng[0]>='a' && noeng[0]<='z' ? (u8)(noeng[0]-32) : noeng[0];
         return noeng;
     }
@@ -11835,8 +11834,8 @@ static Str ctrnew(Gui *g, Str image, i32 ws, Str folder, b32 net, Str ep, Str mo
         c->removed = 1;
         return c->err;
     }
-    guilog(g, concat(&g->frame, concat(&g->frame, "container ", c->c.name),
-                     concat(&g->frame, ": making it from ", image)));
+    guilog(g, concat(a, concat(a, "container ", c->c.name),
+                     concat(a, ": making it from ", image)));
     return {};
 }
 

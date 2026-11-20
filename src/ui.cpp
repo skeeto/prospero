@@ -7250,7 +7250,7 @@ static void runslash(Gui *g, Arena scratch, GuiSession *s, Slash sl, Str text)
         break;
     case SLASH_SIDE:
         if (sessparent(s).len) {
-            setnote(g, s, concat(&g->frame, "/side: ", sidewhy(g, s)), 1);
+            setnote(g, s, concat(&scratch, "/side: ", sidewhy(g, s)), 1);
             return;
         } else if ((sent = hostcap(h, "side"))) {
             guiside(g, s, {});
@@ -7259,7 +7259,7 @@ static void runslash(Gui *g, Arena scratch, GuiSession *s, Slash sl, Str text)
     case SLASH_WORKTREE: {
         Str why = wtwhy(g, s);
         if (why.len) {
-            setnote(g, s, concat(&g->frame, "/worktree: ", why), 1);
+            setnote(g, s, concat(&scratch, "/worktree: ", why), 1);
             return;
         } else if (!sl.arg.len) {
             draftput(g, s, "");
@@ -7287,7 +7287,7 @@ static void runslash(Gui *g, Arena scratch, GuiSession *s, Slash sl, Str text)
             why = "Plan mode is not on";
         }
         if (why.len) {
-            setnote(g, s, concat(&g->frame, "/plan: ", why), 1);
+            setnote(g, s, concat(&scratch, "/plan: ", why), 1);
             return;
         }
         guimode(g, s, sl.off ? Str("default") : Str("plan"));
@@ -7298,8 +7298,8 @@ static void runslash(Gui *g, Arena scratch, GuiSession *s, Slash sl, Str text)
         b32 cont = sl.cmd == SLASH_CONTINUE;
         Str why  = hostcap(h, "pause") ? pausewhy(g, s, cont) : Str{};
         if (why.len) {
-            setnote(g, s, concat(&g->frame, slashinfo[sl.cmd].name,
-                                 concat(&g->frame, ": ", why)), 1);
+            setnote(g, s, concat(&scratch, slashinfo[sl.cmd].name,
+                                 concat(&scratch, ": ", why)), 1);
             return;
         } else if ((sent = hostcap(h, "pause"))) {
             if (cont) {
@@ -8227,7 +8227,7 @@ static void drawprompt(Gui *g)
         } else if (s->att && s->att->len) {
             // A token deleted from the box takes its attachment with it, so
             // the message sent and the box cannot disagree
-            mentionreconcile(g, s, p);
+            mentionreconcile(g, a, s, p);
             draftdone(&s->dclock);
             attachsend(g, s, p);
             draftput(g, s, "");
@@ -12931,7 +12931,7 @@ static void drawnew(Gui *g)
             importbegin(g, host, cwd, ep, model, nofolder);
         } else if (ctr) {
             Str image = {(u8 *)g->newimage, (iz)__builtin_strlen(g->newimage)};
-            err = ctrnew(g, image, g->newws, cwd, g->newnet, ep, model,
+            err = ctrnew(g, &a, image, g->newws, cwd, g->newnet, ep, model,
                          hasrole ? g->newrole : Str{}, plan && g->newplan && !hasrole);
         } else {
             guinew(g, host, cwd, ep, model, hasrole ? g->newrole : Str{},
