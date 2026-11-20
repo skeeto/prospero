@@ -150,6 +150,7 @@ struct McpServer {
     Str               url;       // over HTTP: its endpoint, else null
     Str               headers;   // and its own headers, "Name: value\r\n"
     Str               session;   // Mcp-Session-Id, once it gave one
+    i64               initrpc;   // the initialize request, whose answer gives it
     McpHttp          *http;      // requests under way
     Str               bearer;    // signed in: its Authorization header
     b32               needauth;  // failed, until the user signs in

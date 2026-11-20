@@ -11920,7 +11920,8 @@ static void mcpstart(Engine *e, Arena scratch, McpServer *m, Session *s)
     }
     if (m->url.len) {
         Str init = mcpinitparams(&scratch);
-        if (!mcprequest(e, scratch, m, MCPREQ_INIT, "initialize", init)) {
+        m->initrpc = mcprequest(e, scratch, m, MCPREQ_INIT, "initialize", init);
+        if (!m->initrpc) {
             Str why = concat(&scratch, "its url could not be requested: ",
                              os_lasterr(e->os, &scratch));
             mcpfail(e, scratch, m, why);
@@ -13594,7 +13595,11 @@ static void mcphttprecord(Engine *e, Arena scratch, McpServer *m, McpHttp *q, Re
         if (q->status == 401) {
             q->challenge = clone(&q->arena, headervalue(head, "WWW-Authenticate"));
         }
-        if (sid.len && q->status/100==2 && !m->session.len) {
+        // Only initialize's answer names the session: a late answer to
+        // a request of the incarnation before (or its DELETE) would name
+        // one the server already forgot
+        if (sid.len && q->status/100==2 && !m->session.len && q->rpc &&
+                q->rpc==m->initrpc) {
             m->session = clone(&m->arena, sid);
         }
     } return;
