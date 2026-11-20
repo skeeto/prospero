@@ -252,6 +252,14 @@ offers it there only, and it takes those settings wherever it is used.
 ENDPOINT must be a configured endpoint with a URL: otherwise the name
 is a model's own, as for `Qwen/Qwen3-8B`.
 
+`context` is the model's window in tokens, which the gauge shows and
+compaction works from: it begins at the window less max(15%, 16384).
+A server that reports no window needs it to compact before the server
+refuses a prompt. Where the server reports one (Anthropic's listing, a
+model llama.cpp has loaded), a smaller `context` caps it, so that a
+model with a 1M window can compact as one with a 256k window would,
+and a larger one changes nothing.
+
 A default `model` that names no endpoint, with no `endpoint` set, goes
 to the first endpoint whose listing has it. When others list it too, a
 new session's note says which it went to; `model = ENDPOINT/MODEL`

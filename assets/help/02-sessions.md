@@ -179,7 +179,8 @@ shows a count of tokens instead, and the session compacts only once
 the server refuses a prompt as too long. If that refusal states the
 window, the session keeps it from then on, reopened too, and compacts
 ahead of it. Set the model's `context` in Settings to compact ahead
-from the start.
+from the start. Set below the window a server reports, it caps that
+window, and the session compacts as it would in the smaller one.
 
 Attach adds files to the message: drop them on the window (but not on
 the Files pane, which opens them, or while Open file asks for a path,

@@ -1270,6 +1270,21 @@ static void putgauge(Session *s, JsonOut *w, i64 tokens)
     putintkey(w, "tokens", tokens);
 }
 
+// The model's window, given the configured context (cfg, 0 if unset),
+// the endpoint's listing and the window until now (was). A configured
+// context caps the window a server reports of a loaded model (learned):
+// a smaller one is a choice, to compact as in a smaller window (issue
+// #88), and a larger one yields to the server's. Any other window from
+// the listing, a --ctx-size that may be a pool shared by slots, fills in
+// only where there is none.
+static i64 windowof(i64 cfg, ModelInfo mi, i64 was)
+{
+    if (mi.learned && mi.ctx>0) {
+        return cfg>0 && cfg<mi.ctx ? cfg : mi.ctx;
+    }
+    return was ? was : mi.ctx;
+}
+
 // A window a server gave in refusing a prompt (ovctx) caps the model's,
 // configured or discovered, from then on.
 static void ctxheed(Session *s)
@@ -2987,10 +3002,7 @@ static void discovered(Session *s, Arena scratch, b32 ok)
                 *cached = mi.trained;
                 savetrained(e, scratch);
             }
-            if (!s->mc.ctx || mi.learned) {
-                // A configured limit holds until a server reports one
-                s->mc.ctx = s->mc.ctx && !mi.learned ? s->mc.ctx : mi.ctx;
-            }
+            s->mc.ctx = windowof(s->mc.cfgctx, mi, s->mc.ctx);
             ctxheed(s);
             s->mc.maxout = mi.maxout;
             if (s->ep.kind == EP_COPILOT) {
@@ -17000,7 +17012,8 @@ static void modelconf(Engine *e, Arena *perm, Str which, Str bare, ModelConf *mc
         }
     }
     Int ctx = parseint(trim(cfgget(cfg, "model", model, "context", 0)));
-    mc->ctx = ctx.ok && ctx.val>0 ? ctx.val : 0;
+    mc->ctx    = ctx.ok && ctx.val>0 ? ctx.val : 0;
+    mc->cfgctx = mc->ctx;
     Int rb  = parseint(trim(cfgget(cfg, "model", model, "reasoning_budget", 0)));
     mc->thinkmax = rb.ok && rb.val>0 ? rb.val : 0;
     mc->edit     = editformat(cfgget(cfg, "model", model, "edit_format", 0));
@@ -25678,7 +25691,7 @@ static void reconfigure(Engine *e, Arena scratch)
             continue;
         }
         mc.llamacpp = s->mc.llamacpp;  // learned by discovery
-        mc.ctx      = mc.ctx ? mc.ctx : s->mc.ctx;
+        mc.ctx      = windowof(mc.cfgctx, s->info, mc.ctx ? mc.ctx : s->mc.ctx);
         s->mc = mc;
         ctxheed(s);
     }

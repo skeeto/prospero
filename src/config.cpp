@@ -341,7 +341,8 @@ static CfgKey cfgschema[] = {
      "Field that returns the model's reasoning to it in later requests, "
      "or none"},
     {"model", "context", CFG_INT, "", {}, {}, "model",
-     "Context limit in tokens, for a server that does not report it"},
+     "Context limit in tokens, for a server that does not report it, or "
+     "less than one reports, to compact sooner"},
     {"model", "compactor", CFG_STRING, "", {}, {}, "model",
      "Model that summarizes long conversations, MODEL or ENDPOINT/MODEL, "
      "by default this one"},

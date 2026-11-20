@@ -8565,6 +8565,42 @@ def gauge(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+@scenario(conf={"_listing": {"meta": {"n_ctx": 1000000, "n_ctx_train": 1000000}},
+                "_extra": "[model {model}]\ncontext = 262144\n"
+                          "[model {model2}]\ncontext = 2000000\n"}, bound=20)
+def context_cap(t):
+    """A configured context caps the window a server reports (issue
+    #88): smaller, it wins, and so after the setting changes; larger,
+    the server's stands."""
+    h = t.headless()
+    try:
+        def window(sid, turn):
+            h.send("prompt", sid=sid, text="measure")
+            ended(h, sid, turn)
+            at = h.all("attempt", sid)[-1]
+            return at.get("ctx"), at.get("compact_at")
+
+        a = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        b = h.call("new", cwd=t.work, model=t.model2, endpoint="fake")["sid"]
+        got = window(a, 1)
+        t.check(got == (262144, 222823), f"capped at 256k: {got}")
+        got = window(b, 1)
+        t.check(got == (1000000, 850000), f"the server's under a larger one: {got}")
+
+        r = h.call("config.set", kind="model", name=t.model, key="context",
+                   value="131072")
+        t.check(r.get("ok") == 1, f"config.set {r}")
+        got = window(a, 2)
+        t.check(got == (131072, 111412), f"capped anew: {got}")
+        r = h.call("config.set", kind="model", name=t.model, key="context", value="")
+        t.check(r.get("ok") == 1, f"config.set {r}")
+        got = window(a, 3)
+        t.check(got == (1000000, 850000), f"the server's once unset: {got}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 @scenario(conf={"_extra": "[model {model2}]\nedit_format = patch\n"}, bound=20)
 def model_switch(t):
     """model: another model from the next request on, while idle, kept
