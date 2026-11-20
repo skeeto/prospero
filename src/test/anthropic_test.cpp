@@ -293,6 +293,14 @@ static void test_anthropic(Test *t)
         Str four = anencode(a, tmp, &r);
         JsonDoc d4 = jsonparse(a, four);
         expect(t, "an.max_tokens", jsonget(d4.root, "max_tokens")->raw, "64000");
+        mc.maxtokens = 0;
+        expect(t, "an.max_tokens listed",
+               jsonget(jsonparse(a, anencode(a, tmp, &r)).root, "max_tokens")->raw, "64000");
+        mc.maxout = 0;
+        expect(t, "an.max_tokens default",
+               jsonget(jsonparse(a, anencode(a, tmp, &r)).root, "max_tokens")->raw, "32000");
+        mc.maxtokens = 100000;
+        mc.maxout    = 64000;
         expect(t, "an.budget", jsonget(d4.root, "thinking")->raw,
                "{\"type\":\"enabled\",\"budget_tokens\":2000}");
         expect(t, "an.effort", jsonget(d4.root, "output_config")->raw,

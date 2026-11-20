@@ -7030,8 +7030,11 @@ def an_max_tokens(t):
     anok(t, r)
     end = r.all("tool.end")
     t.check(len(end) == 1 and end[0]["status"] == "error" and
-            "length limit" in end[0]["text"], f"tool.end {end}")
+            end[0]["text"].startswith("Your response hit the length limit")
+            and "JSON" not in end[0]["text"], f"tool.end {end}")
     t.check(r.all("assistant")[0]["finish"] == "length", "finish length")
+    t.check(t.requests()[0]["body"]["max_tokens"] == 16000,
+            "max_tokens is the model's listed limit")
     t.check(t.file("big.txt") is None, "nothing written")
     res = anblocks(t.requests()[1]["body"]["messages"][2], "tool_result")
     t.check(len(res) == 1 and res[0].get("is_error") is True, f"result {res}")

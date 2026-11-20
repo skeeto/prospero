@@ -335,7 +335,10 @@ static void shellintro(Buf *b, Shell *sh)
                                "tools. Write"));
             print(b, " POSIX sh ([ ] not [[ ]], no arrays or {1..3}). Paths "
                      "are Windows paths, C:/x or relative ones; /c/x and "
-                     "/cygdrive/c/x do not exist here.");
+                     "/cygdrive/c/x do not exist here. The tools are "
+                     "busybox's, with fewer options than GNU's (no tar "
+                     "--wildcards), and perl may be missing. Windows programs "
+                     "get arguments as written: taskkill /F, not //F.");
             break;
         case FLAVOR_MSYS:
             print(b, ", an MSYS2 shell, as Git Bash is. It names drives as "
@@ -4189,6 +4192,50 @@ static b32 todoprogress(Slice<TodoItem> old, Slice<TodoItem> now)
         }
     }
     return 0;
+}
+
+// What todo_write's summary line hides, as whole sentences, or null: an
+// item added after open ones, which lands at the end and not beside
+// them, and an item in progress set back to pending by starting
+// another. An agent once added "1a" for part of item 1, started it, and
+// never learned that it sat last while item 1 went back to pending.
+static Str todomoved(Arena *a, Slice<TodoItem> old, Slice<TodoItem> now, Args *r)
+{
+    Buf b(a, 256);
+    if (r->tadd.len) {
+        iz at = todofind(*a, now, r->tadd[0]);
+        b32 open = 0;  // an open item before the one just before it
+        for (iz i = 0; i < at-1; i++) {
+            open |= now[i].status != TODO_DONE;
+        }
+        if (at>0 && open) {
+            print(&b, r->tadd.len==1 ? Str("The added item is ")
+                                     : Str("The added items are "));
+            print(&b, "at the end, after \"");
+            print(&b, now[at-1].content);
+            print(&b, "\": add puts items there. ");
+        }
+    }
+    for (iz i = 0; i < old.len; i++) {
+        if (old[i].status != TODO_ACTIVE) {
+            continue;
+        }
+        for (iz k = 0; k < now.len; k++) {
+            if (now[k].content==old[i].content && now[k].status==TODO_PENDING) {
+                print(&b, "\"");
+                print(&b, now[k].content);
+                print(&b, "\" is pending again, as one item is in progress "
+                          "at a time. ");
+                break;
+            }
+        }
+        break;
+    }
+    if (!b.len) {
+        return {};
+    }
+    print(&b, "To note progress on an item still underway, rename it.\n");
+    return finish(&b);
 }
 
 

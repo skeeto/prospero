@@ -433,7 +433,7 @@ static CfgKey cfgschema[] = {
      "Sampling seed, sent only when set"},
     {"model", "max_tokens", CFG_INT, "", {}, {}, "sampling",
      "Most tokens in one response, sent only when set (always for kind "
-     "anthropic: by default 32000, at most the model's limit)"},
+     "anthropic: by default the model's limit as listed, else 32000)"},
     {"model", "template.", CFG_TEMPLATE, "", {}, {}, "template",
      "template.NAME = VALUE: an argument of the chat template, sent in "
      "chat_template_kwargs to an OpenAI-compatible server (never to kind "

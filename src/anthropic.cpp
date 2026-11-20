@@ -59,17 +59,20 @@
 // This is free and unencumbered software released into the public domain.
 
 enum : i64 {
-    AN_MAXTOKENS = 32000,  // max_tokens unless configured
+    AN_MAXTOKENS = 32000,  // max_tokens unless configured or listed
     AN_BUDGET    = 8192,   // thinking budget_tokens unless configured
     AN_MINBUDGET = 1024,   // the least budget the API takes
     AN_SLOWRATE  = 10,     // output tokens a second, below any model's
 };
 
-// The max_tokens of a request: configured, or the default, within the
-// model's limit.
+// The max_tokens of a request: configured, else the model's own limit
+// as listed, else the default, never past that limit. A cap below the
+// model's cut a long tool call short, the whole response lost.
 static i64 anmaxtokens(ModelConf *mc)
 {
-    i64 most = mc->maxtokens ? mc->maxtokens : AN_MAXTOKENS;
+    i64 most = mc->maxtokens ? mc->maxtokens
+             : mc->maxout    ? mc->maxout
+             :                 AN_MAXTOKENS;
     return mc->maxout && most>mc->maxout ? mc->maxout : most;
 }
 

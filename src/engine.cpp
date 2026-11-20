@@ -7620,6 +7620,7 @@ static void tooltodo(Session *s, Arena scratch, Args *args)
 {
     Block          *c      = &s->calls[s->callidx];
     Str             err    = {};
+    Slice<TodoItem> was    = s->todos;
     i32             resent = todoresent(s->todos, args);
     Slice<TodoItem> now    = todoapply(&scratch, s->todos, args, &err);
     if (err.data) {
@@ -7662,6 +7663,10 @@ static void tooltodo(Session *s, Arena scratch, Args *args)
     // finished, as there's nothing left to send with it.
     Str  text  = todoshow(&scratch, items);
     b32  alone = s->calls.len == 1;
+    Str  moved = resent ? Str{} : todomoved(&scratch, was, items, args);
+    if (moved.data) {
+        text = concat(&scratch, text, moved);
+    }
     if ((resent || alone) && todoleft(&scratch, items).data) {
         Str how = resent==TODO_REWORDED ? Str("reword items with rename")
                                         : Str("mark items with done and start");
@@ -7760,9 +7765,11 @@ static void todoremind(Session *s, Arena scratch)
     }
     s->mutations = 0;
     nudge(s, scratch, N_REMIND, "You have made 12 changes since your todo "
-          "list last changed. Update it with todo_write (done, start, add, "
-          "remove or rename), in the same response as your next tool call, "
-          "so that it shows what is done and what comes next.");
+          "list last changed. If an item is finished, mark it with todo_write "
+          "(done, start), in the same response as your next tool call. If "
+          "the item in progress is still what you are doing, rename it to say "
+          "how far it got, or leave the list as it is; don't add items for "
+          "parts of it, as add puts them at the end.");
 }
 
 
@@ -15444,12 +15451,22 @@ static b32 runtool(Session *s, Arena scratch)
     }
     if (args.issues.len) {
         s->callfail = "args";
-        Str text = argserror(&scratch, c->name, c->args, &args);
+        Str text = {};
         if (s->lengthcut && s->callidx==s->calls.len-1) {
-            text = concat(&scratch, text, " Your response hit the length "
-                          "limit while writing these arguments: write less "
-                          "at once, for example a file in several smaller "
-                          "edits.");
+            // Cut off, not malformed: say that first, as nothing else in
+            // the arguments is worth reading back
+            Buf b(&scratch, 256);
+            print(&b, "Your response hit the length limit while writing the "
+                      "arguments for tool \"");
+            print(&b, c->name);
+            print(&b, "\", so they were cut off after ");
+            print(&b, c->args.len);
+            print(&b, " bytes and the tool was not run. Write less at once, "
+                      "for example a file in several smaller writes or "
+                      "edits.");
+            text = finish(&b);
+        } else {
+            text = argserror(&scratch, c->name, c->args, &args);
         }
         toolend(s, scratch, "error", text, 0, 0, {}, 0);
         return 1;

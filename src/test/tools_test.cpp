@@ -1202,6 +1202,32 @@ static void test_tools(Test *t)
         alldone = push(a, alldone, d2);
         expect(t, "todoshow all done", todoshow(a, alldone), "Todo list, 2 of 2 done.\n");
 
+        // What the summary hides: an item added past open ones, and the
+        // item in progress set back by starting another (the "1a" case)
+        {
+            Slice<TodoItem> three = {};
+            TodoItem m1 = {"1. Scaffold", TODO_ACTIVE}, m2 = {"2. Rules", TODO_PENDING},
+                     m3 = {"3. Saving", TODO_PENDING};
+            three = push(a, three, m1);
+            three = push(a, three, m2);
+            three = push(a, three, m3);
+            Str  json = "{\"add\":[\"1a. part\"],\"start\":\"1a. part\"}";
+            Args r    = parseargs(a, TOOL_TODO, json, EDIT_REPLACE);
+            Str  err  = {};
+            Slice<TodoItem> l = todoapply(a, three, &r, &err);
+            expect(t, "todomoved 1a", todomoved(a, three, l, &r),
+                   "The added item is at the end, after \"3. Saving\": add puts "
+                   "items there. \"1. Scaffold\" is pending again, as one item "
+                   "is in progress at a time. To note progress on an item still "
+                   "underway, rename it.\n");
+            Args r2 = parseargs(a, TOOL_TODO, "{\"done\":[\"1. Scaffold\"]}", EDIT_REPLACE);
+            Slice<TodoItem> l2 = todoapply(a, three, &r2, &err);
+            expect(t, "todomoved done", istr(a, !todomoved(a, three, l2, &r2).data), "1");
+            Args r3 = parseargs(a, TOOL_TODO, "{\"add\":[\"4. Sound\"]}", EDIT_REPLACE);
+            Slice<TodoItem> l3 = todoapply(a, alldone, &r3, &err);
+            expect(t, "todomoved after done", istr(a, !todomoved(a, alldone, l3, &r3).data), "1");
+        }
+
         // Changes applied to a list, by name
         auto apply = [&](Slice<TodoItem> cur, Str json) -> Str {
             Args r   = parseargs(a, TOOL_TODO, json, EDIT_REPLACE);
