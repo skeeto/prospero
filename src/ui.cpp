@@ -3432,6 +3432,84 @@ static b32 drawshellpick(Gui *g, Arena a, GuiSession *s, View *v)
     return 1;
 }
 
+// The session's effort, a list of the levels its model's requests can
+// carry (effort), at any time: the next request carries it. The first
+// is the model's own, its [model] effort if any, else none sent, shown
+// muted while it is the one. Whether it drew: only on hosts whose engine
+// can, once the session's effort record says what there is.
+static b32 draweffortpick(Gui *g, Arena a, GuiSession *s, View *v)
+{
+    if (!hostcap(s->host, "effort") || !v->effset) {
+        if (g->pickeffort == s) {
+            setnote(g, s, "/effort: this host's engine is too old for it", 1);
+            g->pickeffort = 0;
+        }
+        return 0;
+    }
+    Str why = g->enginekind==ENGINE_FAKE ? Str("No engine") :
+              sesswhy(g, s, "effort", 0, 0);
+    if (!why.len && v->effoff.len) {
+        why = concat(&a, "No effort to pick for this model: ", v->effoff);
+    } else if (!why.len && !v->efflevels.len) {
+        why = "No effort to pick for this model";
+    }
+    Str now   = v->effort.len ? v->effort : v->effdflt.len ? v->effdflt : Str("effort");
+    Str label = concat(&a, now, "  \xe2\x96\xbe##effortpick");  // a small down triangle
+    if (why.len) {
+        ImGui::BeginDisabled();
+    }
+    if (!v->effort.len) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetColorU32(ImGuiCol_TextDisabled));
+    }
+    b32 click = ImGui::Button(cstr0(&a, label));
+    if (!v->effort.len) {
+        ImGui::PopStyleColor();
+    }
+    if (why.len) {
+        ImGui::EndDisabled();
+    }
+    itemnamed(g, "effort picker");
+    Str tip = v->effort.len  ? concat(&a, "Effort picked for this session: ", v->effort) :
+              v->effdflt.len ? concat(&a, "Effort: the model's own, as its settings say, ",
+                                      v->effdflt)
+                             : Str("Effort: the model's own default, none sent");
+    whytip(why.len ? why : concat(&a, tip, ". How much the model thinks and writes, "
+                                  "from its next request. Changing it can cost a "
+                                  "prompt cache miss."));
+    if (click || (g->pickeffort==s && !why.len)) {
+        ImGui::OpenPopup("##effortpop");
+    }
+    if (g->pickeffort == s) {
+        if (why.len) {
+            setnote(g, s, concat(&a, "/effort: ", why), 1);
+        }
+        g->pickeffort = 0;
+    }
+    if (ImGui::BeginPopup("##effortpop")) {
+        Str dflt = v->effdflt.len ? concat(&a, concat(&a, "Default (", v->effdflt), ")")
+                                  : Str("Default");
+        if (ImGui::Selectable(cstr0(&a, dflt), !v->effort.len) && v->effort.len) {
+            guieffort(g, s, {});
+        }
+        itemnamed(g, "effort default");
+        itemtip("The model's own: as its settings say ([model] effort), else none "
+                "sent, for the server's default");
+        for (Cut c = {{}, v->efflevels, 1}; c.ok;) {
+            c = cut(c.tail, ' ');
+            if (!c.head.len) {
+                continue;
+            }
+            b32 cur = c.head == v->effort;
+            if (ImGui::Selectable(cstr0(&a, c.head), cur) && !cur) {
+                guieffort(g, s, c.head);
+            }
+            itemnamed(g, concat(&a, "effort ", c.head));
+        }
+        ImGui::EndPopup();
+    }
+    return 1;
+}
+
 // The session's mode, Build, Plan or Bypass, a list of them like the
 // model's and shell's: amber in Plan, where the list also shows the
 // plan, and red in Bypass, which only the user picks, trusted to know
@@ -3634,6 +3712,9 @@ static void drawsesspicks(Gui *g, Arena a, GuiSession *s, View *v)
     }
     drawmodelpick(g, a, s, v);
     ImGui::SameLine();
+    if (draweffortpick(g, a, s, v)) {
+        ImGui::SameLine();
+    }
     if ((!sessparent(s).len || sessside(s).len) && drawshellpick(g, a, s, v)) {
         ImGui::SameLine();
     }
@@ -7120,6 +7201,16 @@ static void runslash(Gui *g, Arena scratch, GuiSession *s, Slash sl, Str text)
             guishell(g, s, sl.arg);
         }
         break;
+    case SLASH_EFFORT:
+        if (!sl.arg.len) {
+            g->pickeffort = s;  // the Prompt's effort picker
+            draftput(g, s, "");
+            drafttyped(&s->dclock, g->sched.now);
+            return;
+        } else if ((sent = hostcan(h, "effort"))) {
+            guieffort(g, s, sl.arg=="default" ? Str{} : sl.arg);
+        }
+        break;
     case SLASH_RENAME:
         if ((sent = hostcan(h, "rename"))) {
             guirename(g, s, sl.arg);
@@ -8120,7 +8211,7 @@ static void drawprompt(Gui *g)
             s->note      = {};  // sent: no note, fixed or not
             s->notefixed = 0;
         }
-        if (!g->pickmodel && !g->pickshell && !g->openexport) {
+        if (!g->pickmodel && !g->pickshell && !g->pickeffort && !g->openexport) {
             // To type the next, unless a popup of another window's
             // opens (/model, /export), which the box would close
             ImGui::ActivateItemByID(id);

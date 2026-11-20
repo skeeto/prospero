@@ -4168,7 +4168,7 @@ def hello_caps(t):
                                                    "term.ack", "term.close",
                                                    "fs.read", "fs.stat",
                                                    "pause", "continue", "skill.fetch",
-                                                   "grants", "grant"]
+                                                   "grants", "grant", "effort"]
         t.check(cmds == want, f"cmds: {cmds}")
         caps = hello.get("caps", [])
         t.check(isinstance(caps, list) and all(isinstance(c, str) for c in caps) and
@@ -4180,7 +4180,7 @@ def hello_caps(t):
                  "mcp", "mcp.auth", "task.remote", "task.host", "memory", "shell",
                  "git", "answer.trust", "trash", "cut", "endpoint.auth",
                  "endpoint.copilot", "term", "ask.hold", "fs", "pause", "skill.fetch",
-                 "term.edit", "term.run", "grants"} <= set(caps)
+                 "term.edit", "term.run", "grants", "effort"} <= set(caps)
                 and "host" not in caps,
                 f"caps: {caps}")
         want = 0 if isinstance(t.host, XpHost) else 1  # ConPTY, from 10 1809
@@ -5176,6 +5176,48 @@ def effort_chat(t):
     t.check("reasoning_effort" not in said and
             said.get("chat_template_kwargs") == {"thinking": True, "reasoning_effort": "max"},
             f"set by hand, it wins: {said}")
+
+
+@scenario(conf={"_extra": (
+    "[model {model}]\n"
+    "effort_as = template.reasoning_effort\n"
+    "effort_map = low:25 high:100\n"
+    "[model said-{nonce}]\n"
+    "like = {model}\n"
+    "template.reasoning_effort = max\n")}, bound=20)
+def effort_pick_chat(t):
+    """A pick on an OpenAI-compatible chat endpoint goes where effort_as
+    says, as effort_map turns it, with effort_map's words the levels;
+    none is sent until one is picked; and where a template argument set by
+    hand says it, there is nothing to pick."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        rec = h.wait(lambda e: e.get("sid") == sid and e.get("ev") == "effort")
+        t.check(rec.get("levels") == "low high" and rec.get("default") == "",
+                f"the first record {rec}")
+        for pick in ["", "low"]:
+            if pick:
+                t.check(h.call("effort", sid=sid, effort=pick).get("ok") == 1, "picked")
+            n = len(h.all("turn.end", sid))
+            h.call("prompt", sid=sid, text="go")
+            h.wait(lambda e: e.get("sid") == sid and e.get("ev") == "turn.end" and
+                   len(h.all("turn.end", sid)) > n)
+        a, b = [x["body"] for x in t.requests()][-2:]
+        t.check("reasoning_effort" not in a and
+                "reasoning_effort" not in a.get("chat_template_kwargs", {}),
+                f"none sent at first: {a}")
+        t.check(b.get("chat_template_kwargs", {}).get("reasoning_effort") == 25,
+                f"the pick, mapped: {b}")
+        said = h.call("new", cwd=t.work, model=f"said-{t.nonce}", endpoint="fake")["sid"]
+        rec = h.wait(lambda e: e.get("sid") == said and e.get("ev") == "effort")
+        t.check(rec.get("levels") == "" and "by hand" in rec.get("off", ""),
+                f"nothing to pick: {rec}")
+        r = h.call("effort", sid=said, effort="low")
+        t.check(r.get("ok") == 0 and "no effort to pick" in r.get("err", ""), f"refused {r}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
 
 
 MINUTE = {"PROSPERO_TEST_MINUTE_MS": "60"}  # a minute in 60 ms
@@ -6790,6 +6832,58 @@ def an_plain(t):
     u = r.last("assistant").get("usage", {})
     t.check(u.get("cached") == 0 and u.get("written", 0) > 0 and
             u.get("in", 0) > u["written"] and u.get("out") == 10, f"usage {u}")
+
+
+@scenario(conf={**AN, "_extra": "[model {model}]\neffort = high\n"}, bound=20)
+def effort_pick(t):
+    """The session's effort, picked (effort): its record lists Anthropic's
+    levels and the model's own default; a pick goes in output_config from
+    the next request, marked as the user's; "" is the model's own again;
+    a level the model does not take is refused; and a pick outlives the
+    engine."""
+    def turn(h, sid):
+        n = len(h.all("turn.end", sid))
+        h.call("prompt", sid=sid, text="go")
+        h.wait(lambda e: e.get("sid") == sid and e.get("ev") == "turn.end" and
+               len(h.all("turn.end", sid)) > n)
+        reqs = t.requests()
+        t.check(reqs, f"a request: {h.all('turn.end', sid)[-1]}")
+        return reqs[-1]["body"].get("output_config")
+
+    h = t.headless(env=ANENV)
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        rec = h.wait(lambda e: e.get("sid") == sid and e.get("ev") == "effort")
+        t.check(rec.get("effort") == "" and rec.get("default") == "high" and
+                rec.get("levels") == "low medium high xhigh max" and "by" not in rec,
+                f"the first record {rec}")
+        t.check(turn(h, sid) == {"effort": "high"}, "the model's own, configured")
+        r = h.call("effort", sid=sid, effort="max")
+        t.check(r.get("ok") == 1 and r.get("effort") == "max", f"picked {r}")
+        recs = h.all("effort", sid)
+        t.check(recs[-1].get("effort") == "max" and recs[-1].get("by") == "user",
+                f"the user's record {recs[-1]}")
+        t.check(turn(h, sid) == {"effort": "max"}, "the pick carried")
+        r = h.call("effort", sid=sid, effort="minimal")
+        t.check(r.get("ok") == 0 and "not an effort this model takes" in r.get("err", ""),
+                f"refused {r}")
+        r = h.call("effort", sid=sid, effort="")
+        t.check(r.get("ok") == 1 and r.get("effort") == "", f"the model's own {r}")
+        t.check(turn(h, sid) == {"effort": "high"}, "the model's own again")
+        h.call("effort", sid=sid, effort="low")
+        n = len(h.all("effort", sid))
+        turn(h, sid)
+        t.check(len(h.all("effort", sid)) == n, "no record while nothing changed")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+    h = t.headless(env=ANENV)
+    try:
+        h.call("open", sid=sid)
+        t.check(turn(h, sid) == {"effort": "low"}, "the pick, after a restart")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
 
 
 @scenario(conf=AN, bound=10)

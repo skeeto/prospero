@@ -56,6 +56,7 @@ enum : i32 {
     EV_PAUSE,       // the user paused its model requests, or resumed them
     EV_REVOKE,      // a grant, or a deny, taken back (the Permissions pane)
     EV_DENY,        // a path the user keeps the file tools out of
+    EV_EFFORT,      // the session's effort from here on, and its choices
     // Transient: sent, never logged
     EV_DELTA,
     EV_PROGRESS,
@@ -126,6 +127,7 @@ static EvInfo evinfo[] = {
     {"pause",      1, 1},  // a restart keeps it paused
     {"revoke",     1, 1},  // lost, it would leave the access open
     {"deny",       1, 1},  // likewise
+    {"effort",     1, 0},
     {"delta",      0, 0},
     {"progress",   0, 0},
     {"tool.out",   0, 0},
@@ -223,6 +225,7 @@ enum : i32 {
     CMD_SKILLFETCH,  // a session's copy of a relayed skill, made current, late
     CMD_GRANTS,      // a session's permissions: workspace, grants, denies
     CMD_GRANT,       // one of them given, changed or taken back (the pane)
+    CMD_EFFORT,      // the session's effort from here on, or its model's own
     CMD_COUNT,
 };
 
@@ -239,7 +242,7 @@ static Str cmdnames[] = {
     "uncut", "approve", "endpoint.auth", "endpoint.logout", "term.open",
     "term.input", "term.resize", "term.ack", "term.close", "fs.read", "fs.stat",
     "pause", "continue",
-    "skill.fetch", "grants", "grant",
+    "skill.fetch", "grants", "grant", "effort",
 };
 static_assert(countof(cmdnames) == CMD_COUNT);
 
@@ -422,6 +425,10 @@ static Str capnames[] = {
                        // pane's, with the revoke and deny records, a
                        // grant's pane, and notices "grants" telling the
                        // agent of the changes
+    "effort",          // effort {sid, effort}: the session's effort from
+                       // here on, "" for its model's own; the effort
+                       // record says it, with the model's default, the
+                       // levels to pick from, and off, why there are none
 };
 
 static Str evname(i32 ev)

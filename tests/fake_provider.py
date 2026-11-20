@@ -4300,6 +4300,7 @@ def sc_qualified_model(model, n, req):
 
 
 sc_effort_chat = sc_qualified_model
+sc_effort_pick_chat = sc_qualified_model
 
 
 def sc_template_variant(model, n, req):
@@ -4599,6 +4600,10 @@ def an_check(req, prefill=False):
             return "thinking: between_tools takes no other field"
         elif kind not in ("adaptive", "disabled", "between_tools"):
             return f"thinking.type: unknown type {kind}"
+    oc = req.get("output_config")
+    if oc is not None and (set(oc) != {"effort"} or
+                           oc["effort"] not in ("low", "medium", "high", "xhigh", "max")):
+        return f"output_config: unexpected value {oc}"
     msgs = req.get("messages")
     if not isinstance(msgs, list) or not msgs:
         return "messages: at least one message is required"
@@ -4793,6 +4798,9 @@ def an_compact_default(model, n, req):
 
 def sc_an_plain(model, n, req):
     yield from an_answer(model, req, "Hello from the Messages API.")
+
+
+sc_effort_pick = sc_an_plain  # each request's output_config is what counts
 
 
 def sc_an_tools(model, n, req):

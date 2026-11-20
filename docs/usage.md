@@ -177,7 +177,7 @@ and Down, opens the draft in an editor with Ctrl+G (`[ui] editor`,
 else `$VISUAL` or `$EDITOR`, one with a window of its own: a terminal
 editor is refused, or on macOS, named only by `$VISUAL` or `$EDITOR`,
 gives way to the default text editor), and takes `/compact`, `/model`,
-`/rename`, `/fork`, `/side`, `/worktree`, `/export`, `/plan`, `/background` and a skill's
+`/effort`, `/shell`, `/rename`, `/fork`, `/side`, `/worktree`, `/export`, `/plan`, `/background` and a skill's
 `/NAME`. Run in background (Ctrl+B, Cmd+B on macOS) moves a running
 command to a job, or a subagent at work on by itself, so that the
 agent goes on and can be talked to; it is told when either ends, a

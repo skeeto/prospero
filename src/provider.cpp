@@ -629,6 +629,8 @@ struct ModelConf {
     Str          effjson;    // and its value, or null (cfgeffort)
     Str          chatkw;     // kwargs for OpenAI chat, effort in them where
                              // effort_as is template.NAME
+    Str          effas;      // [model] effort_as and effort_map, for an
+    Str          effmap;     // effort picked later (effortapply)
     b32          llamacpp;   // llama.cpp extras (return_progress,
                              // reasoning_control)
     i64          ctx;        // context limit in tokens, 0 if unknown

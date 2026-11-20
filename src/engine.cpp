@@ -880,6 +880,9 @@ struct Session {
     Str          home;       // the primary endpoint (name or URL)
     Str          homemodel;  // and model
     i32          target;     // 0 for the primary, else 1 + fallback index
+    // Effort, as the user picked it (effort)
+    i32          effort;     // effortnames index, 0: the model's own
+    Str          effinfo;    // the effort record as last logged (effortkey)
     i64          homeat;     // ticks: the primary may be tried again
     i64          slowfrom;   // ticks: the slow retries began, 0 if none
     i32          slown;      // slow waits so far
@@ -2726,6 +2729,9 @@ static void resetattempt(Session *s)
 {
     s->attempt = newarena(s->aregion);
 }
+static void effortapply(Arena *, ModelConf *, i32 wire, i32 effort);
+static b32  effortsync(Session *, Arena, b32 byuser);
+static Str  effortkey(Arena *, Json *);
 
 // A new attempt's response state, in its fresh arena.
 static void newattempt(Session *s)
@@ -2761,8 +2767,13 @@ static void sendchat(Session *s, Arena scratch)
     newattempt(s);
 
     // The body goes into the attempt arena, temporaries into scratch
+    if (!s->target) {
+        effortsync(s, scratch, 0);  // a wire learned, a configuration reloaded
+    }
+    ModelConf mc = s->mc;
+    effortapply(&scratch, &mc, s->ep.wire, s->effort);
     ChatReq req = {};
-    req.mc        = &s->mc;
+    req.mc        = &mc;
     req.system    = s->system;
     req.tools     = s->tools;
     req.history   = deskimages(s, &scratch);
@@ -15678,6 +15689,7 @@ static void compactor(Session *s, Arena scratch, Compact *cp)
     cp->model = clone(&s->perm, model);
     if (cp->model==s->model && cp->ep.url==s->ep.url) {
         cp->mc = s->mc;  // with what discovery learned
+        effortapply(&s->perm, &cp->mc, s->ep.wire, s->effort);  // as cached
         return;
     }
     modelconf(e, &s->perm, cp->ep.name, cp->model, &cp->mc);
@@ -16122,6 +16134,7 @@ static void titlestart(Session *s, Arena scratch)
         tt.model = clone(&s->perm, t.model);
         if (tt.model==s->model && tt.ep.url==s->ep.url) {
             tt.mc = s->mc;
+            effortapply(&s->perm, &tt.mc, s->ep.wire, s->effort);  // as cached
         } else {
             modelconf(e, &s->perm, tt.ep.name, tt.model, &tt.mc);
             i64 *k = upsert(&e->kinds, kindkey(&scratch, tt.ep.url, tt.mc.name), (Arena *)0);
@@ -17034,13 +17047,12 @@ static void modelconf(Engine *e, Arena *perm, Str which, Str bare, ModelConf *mc
                     th=="default"       ? THINK_DEFAULT : THINK_ADAPTIVE;
     mc->hidethink = td == "omitted";
     mc->effort    = ef.len ? clone(perm, ef) : Str{};
+    mc->effas     = clone(perm, trim(cfgget(cfg, "model", model, "effort_as", 0)));
+    mc->effmap    = clone(perm, trim(cfgget(cfg, "model", model, "effort_map", 0)));
 
     // For OpenAI chat: effort where effort_as says, as effort_map says
     {
-        CfgEffort ce = cfgeffort(perm, mc->effort,
-                                 trim(cfgget(cfg, "model", model, "effort_as", 0)),
-                                 trim(cfgget(cfg, "model", model, "effort_map", 0)),
-                                 mc->kwargs);
+        CfgEffort ce = cfgeffort(perm, mc->effort, mc->effas, mc->effmap, mc->kwargs);
         mc->effkey  = ce.key;
         mc->effjson = ce.json;
         mc->chatkw  = ce.kwargs;
@@ -17055,6 +17067,92 @@ static void modelconf(Engine *e, Arena *perm, Str which, Str bare, ModelConf *mc
     mc->nopdf     = !cfgbool(cfgget(cfg, "model", model, "pdf", 0));
     mc->imgedge   = ie.ok && ie.val>=16 && ie.val<=16384 ? ie.val : 0;
     mc->imgpixels = ip.ok && ip.val>=256 && ip.val<=(i64)1<<28 ? ip.val : 0;
+}
+
+// Effort picked by the user for a session (effort), in place of its
+// model's [model] effort: one of the levels its requests can carry at
+// its endpoint's wire, by name. Index 0 is none picked: the model's own.
+static Str const effortnames[] = {
+    "", "none", "minimal", "low", "medium", "high", "xhigh", "max",
+};
+
+static i32 effortindex(Str name)
+{
+    for (i32 i = 1; i < countof(effortnames); i++) {
+        if (name == effortnames[i]) {
+            return i;
+        }
+    }
+    return name.len ? -1 : 0;
+}
+
+// Whether a space-separated list of levels holds one.
+static b32 effortin(Str levels, Str level)
+{
+    for (Cut c = {{}, levels, 1}; c.ok;) {
+        c = cut(c.tail, ' ');
+        if (c.head.len && c.head==level) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// The levels a model's requests carry at a wire, in effortnames' order
+// and space-separated, or none with *off saying why. Anthropic's and the
+// Responses API's are their own; on OpenAI chat, effort_map's words if
+// it has any, else the common ones, which effort_as puts in place. None
+// where effort_as is none, or a template argument set by hand already
+// says it (cfgeffort adds nothing): there a pick would change nothing.
+static Str effortlevels(Arena *a, ModelConf *mc, i32 wire, Str *off)
+{
+    *off = {};
+    if (wire == EP_ANTHROPIC) {
+        return "low medium high xhigh max";
+    } else if (epresponses(wire)) {
+        return "none minimal low medium high xhigh";
+    }
+    if (mc->effas == "none") {
+        *off = "effort_as is none: no effort is sent";
+        return {};
+    }
+    CfgEffort ce = cfgeffort(a, "high", mc->effas, mc->effmap, mc->kwargs);
+    if (!ce.key.len && ce.kwargs.data==mc->kwargs.data) {
+        *off = "a template argument set by hand says it";
+        return {};
+    }
+    if (!mc->effmap.len) {
+        return "none low medium high";
+    }
+    Buf b(a, 64);
+    for (i32 i = 1; i < countof(effortnames); i++) {
+        for (Cut c = {{}, mc->effmap, 1}; c.ok;) {
+            c = cut(c.tail, ' ');
+            if (cut(trim(c.head), ':').head == effortnames[i]) {
+                if (b.len) putbyte(&b, ' ');
+                print(&b, effortnames[i]);
+                break;
+            }
+        }
+    }
+    return finish(&b);
+}
+
+// A model's settings with the session's pick of effort (index), if its
+// requests at the wire can carry that level: else as configured. In a,
+// as the request is.
+static void effortapply(Arena *a, ModelConf *mc, i32 wire, i32 effort)
+{
+    Str off = {};
+    if (effort<=0 || effort>=countof(effortnames) ||
+            !effortin(effortlevels(a, mc, wire, &off), effortnames[effort])) {
+        return;
+    }
+    mc->effort   = effortnames[effort];
+    CfgEffort ce = cfgeffort(a, mc->effort, mc->effas, mc->effmap, mc->kwargs);
+    mc->effkey   = ce.key;
+    mc->effjson  = ce.json;
+    mc->chatkw   = ce.kwargs;
 }
 
 static Session *newsession(Engine *e, Arena scratch, Str sid)
@@ -18587,6 +18685,9 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err,
     }
     sessionready(s, scratch);
     logsession(s, scratch);
+    // The parent's effort, where it is the parent's model
+    s->effort = s->model==p->model && s->ep.url==p->ep.url ? p->effort : 0;
+    effortsync(s, scratch, 0);
     instrlogstart(s, scratch);
     memlogstart(s, scratch);
     if (!s->wtdefer) {
@@ -20575,6 +20676,7 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
     s->scratch = newscratch(e, &s->perm, scratch, s->sid);
     sessionready(s, scratch);
     logsession(s, scratch);
+    effortsync(s, scratch, 0);
     instrlogstart(s, scratch);
     memlogstart(s, scratch);
     if (!s->wtdefer) {
@@ -20993,6 +21095,12 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
                 }
             }
             break;
+        case EV_EFFORT: {
+            // The effort picked from here on, and the choices as they were
+            i32 ix = effortindex(jsonstr(jsonget(j, "effort")));
+            s->effort  = ix>0 ? ix : 0;
+            s->effinfo = effortkey(&s->perm, j);
+        } break;
         case EV_SHELL: {
             // Switched (shell): the shell from here on, if it is found
             Shell sh = shellrec(e, &s->perm, t, j, "path", "kind", "name");
@@ -21340,6 +21448,7 @@ static void cmdopen(Engine *e, Arena scratch, i64 id, Json *j)
             return;
         }
     }
+    effortsync(s, scratch, 0);  // the choices, as the configuration has them now
     // from < 0 asks for only what this open added (repairs)
     if (from < 0) {
         from = first==I64MAX ? s->log.seq : first;
@@ -22881,9 +22990,16 @@ static void cmdmodel(Engine *e, Arena scratch, i64 id, Json *j)
     s->thinkfrom = s->log.seq;
     s->ctxhint   = s->mc.ctx;
     sidecarput(e, scratch, sid, "model", s->model);
+    i32 effort   = s->effort;
+    b32 effdrop  = effortsync(s, scratch, 0);
 
     // What the new model's settings would change, were they not frozen
     Buf note(&scratch, 512);
+    if (effdrop) {
+        print(&note, "Effort is this model's own again: it takes no ");
+        print(&note, effortnames[effort]);
+        print(&note, ". ");
+    }
     if (s->mc.edit != s->te.edit) {
         print(&note, "The edit tool keeps the session's format, ");
         print(&note, editnames[s->te.edit]);
@@ -22998,6 +23114,121 @@ static Shell shellprog(Engine *e, Arena *perm, Arena scratch, b32 win)
         return {};
     }
     return sh;
+}
+
+// The effort record's fields as one string, to tell whether the choices
+// changed since it was logged (effortsync).
+static Str effortkey(Arena *a, Json *j)
+{
+    Str k[] = {"effort", "default", "levels", "off"};
+    Buf b(a, 128);
+    for (iz i = 0; i < countof(k); i++) {
+        print(&b, jsonstr(jsonget(j, k[i])));
+        putbyte(&b, '\n');
+    }
+    return finish(&b);
+}
+
+// Log the session's effort, and what a frontend shows of it: the model's
+// own default ([model] effort, else empty: none sent), the levels its
+// requests can carry (effortlevels), and off, why there are none. Only
+// when that changed since it was last logged, as for another model, a
+// configuration loaded again, or a wire learned by discovery (Copilot),
+// unless the user just picked it (by). A pick the model cannot carry
+// goes back to its own: returns whether it did.
+static b32 effortsync(Session *s, Arena scratch, b32 byuser)
+{
+    if (s->readonly || !s->log.ok) {
+        return 0;
+    }
+    Str off    = {};
+    Str levels = effortlevels(&scratch, &s->mc, s->ep.wire, &off);
+    b32 drop   = s->effort>0 && !effortin(levels, effortnames[s->effort]);
+    s->effort  = drop ? 0 : s->effort;
+
+    Buf   b(&scratch, 256 + s->mc.effort.len + levels.len + off.len);
+    EvOut w = sbegin(s, &b, EV_EFFORT);
+    putstrkey(&w.json, "effort", effortnames[s->effort]);
+    putstrkey(&w.json, "default", s->mc.effort);
+    putstrkey(&w.json, "levels", levels);
+    if (off.len) {
+        putstrkey(&w.json, "off", off);
+    }
+    if (byuser) {
+        putstrkey(&w.json, "by", "user");
+    }
+    // As effortkey makes it of the record
+    Arena a = scratch;
+    Buf   kb(&a, 256 + s->mc.effort.len + levels.len + off.len);
+    print(&kb, effortnames[s->effort]);
+    putbyte(&kb, '\n');
+    print(&kb, s->mc.effort);
+    putbyte(&kb, '\n');
+    print(&kb, levels);
+    putbyte(&kb, '\n');
+    print(&kb, off);
+    putbyte(&kb, '\n');
+    Str key = finish(&kb);
+    if (!byuser && key==s->effinfo) {
+        return drop;  // the record begun in b goes unsent
+    }
+    s->effinfo = clone(&s->perm, key);
+    ssend(s, &w);
+    return drop;
+}
+
+// effort {sid, effort}: the session's effort from here on, one of the
+// levels its effort record lists, or "" for its model's own ([model]
+// effort, else none sent). At any time: the next request carries it.
+// Only the session's own model's requests do, and its compactor's and
+// titler's where they are that model, so that the cache serves them; a
+// fallback's carry it if they can. A change can cost a cache miss on
+// Anthropic. The reply names the effort.
+static void cmdeffort(Engine *e, Arena scratch, i64 id, Json *j)
+{
+    Str sid   = jsonstr(jsonget(j, "sid"));
+    Str level = trim(jsonstr(jsonget(j, "effort")));
+    if (!validsid(sid)) {
+        reply(e, scratch, id, 0, "invalid session id", {});
+        return;
+    }
+    b32      transient = 0;
+    Session *s         = borrow(e, scratch, sid, &transient);
+    Str      err       = !s          ? Str("no such session") :
+                         s->readonly ? Str("open in another process") : Str{};
+    i32      ix        = effortindex(level);
+    if (!err.len) {
+        Str off    = {};
+        Str levels = effortlevels(&scratch, &s->mc, s->ep.wire, &off);
+        if (ix>0 && off.len) {
+            err = concat(&scratch, "no effort to pick for this model: ", off);
+        } else if (ix<0 || (ix>0 && !effortin(levels, level))) {
+            err = concat(&scratch, concat(&scratch, "not an effort this model takes: ",
+                                          level), concat(&scratch, " (it takes ",
+                                          concat(&scratch, levels, ")")));
+        }
+    }
+    if (err.len) {
+        if (transient) {
+            forget(e, s);
+        }
+        reply(e, scratch, id, 0, err, sid);
+        return;
+    }
+
+    s->effort = ix;
+    effortsync(s, scratch, 1);
+
+    Buf   b(&scratch, 256);
+    EvOut w = evbegin(&b, sid, 0, os_time(e->os), EV_REPLY);
+    putintkey(&w.json, "id", id);
+    putintkey(&w.json, "ok", 1);
+    putstrkey(&w.json, "effort", effortnames[s->effort]);
+    Str line = evend(&w);  // in scratch, before s may go
+    if (transient) {
+        forget(e, s);
+    }
+    emit(e, line);
 }
 
 // shell {sid, shell}: the shell the agent's commands run in from here
@@ -25955,6 +26186,7 @@ static void command(Engine *e, Arena scratch, Str line)
         case CMD_APPROVE:
         case CMD_EPAUTH:
         case CMD_SHELL:
+        case CMD_EFFORT:
         case CMD_GIT:
         case CMD_TERMOPEN:
             reply(e, scratch, id, 0, "the engine is stopping", sid);
@@ -26117,6 +26349,9 @@ static void command(Engine *e, Arena scratch, Str line)
         return;
     case CMD_SHELL:
         cmdshell(e, scratch, id, j);
+        return;
+    case CMD_EFFORT:
+        cmdeffort(e, scratch, id, j);
         return;
     case CMD_SHELLS:
         cmdshells(e, scratch, id);

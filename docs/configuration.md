@@ -236,6 +236,18 @@ variants above, with effort:
 A `template.NAME` set by hand for the same argument (`reasoning_effort`,
 or effort_as's NAME) wins over `effort`.
 
+The effort list after the model list on the Prompt's status line, or
+`/effort LEVEL`, picks a session's effort without a section, from its
+next request, for the rest of the session and its subagents on the same
+model. Its first item, Default, is the model's `effort`, or none sent
+where it has none, for the server's own; the rest are the levels the
+endpoint takes: `low` to `max` on Anthropic, `none` to `xhigh` on the
+Responses API, and on an OpenAI-compatible server effort_map's words,
+else `none`, `low`, `medium` and `high`, each sent as `effort` would
+send it. A pick the next model cannot carry goes back to Default.
+Changing it mid-session can cost a cache miss, as Anthropic renders the
+effort into the prompt.
+
 A `[model NAME]` section applies wherever an endpoint lists NAME. Where
 two endpoints list the same model, `[model ENDPOINT/MODEL]` sets it on
 one of them only, each of its settings winning over `[model MODEL]`'s:

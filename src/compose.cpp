@@ -33,6 +33,7 @@ enum : i32 {
     SLASH_WORKTREE,
     SLASH_BACKGROUND,
     SLASH_SHELL,
+    SLASH_EFFORT,
     SLASH_PAUSE,
     SLASH_CONTINUE,
     SLASH_COUNT,
@@ -58,6 +59,8 @@ static SlashInfo slashinfo[] = {
                             "in a new worktree, on a branch of its own"},
     {"/background", "",     "Let the running command or subagents go on in the background, and the agent with them"},
     {"/shell",   "[NAME]",  "Switch this session's shell, or pick one from a list"},
+    {"/effort",  "[LEVEL]", "Set how much this session's model thinks, or pick from a list "
+                            "(default: the model's own)"},
     {"/pause",   "",        "Hold the agent before its next model request, until /continue"},
     {"/continue", "",       "Resume a paused agent, or go on after Stop, without a message"},
 };

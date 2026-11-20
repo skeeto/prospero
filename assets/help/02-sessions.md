@@ -125,8 +125,10 @@ session's shell in its folder, as <kbd>Ctrl+\`</kbd> does, on whatever host the
 session runs ([Hosts](help:hosts)). Each is always there, dimmed when
 it can do nothing, so none moves as a turn begins or ends. While the
 agent works, Send becomes Steer (a curved arrow). The status line
-above the box begins with the session's mode, model and shell, each a
-list to switch it. What you send while it works waits at the end of
+above the box begins with the session's mode, model, effort and shell,
+each a list to switch it. Effort is how much the model thinks: Default
+is its own, as its settings say, and a level picked holds from the next
+request (changing it can cost a cache miss). What you send while it works waits at the end of
 the transcript, dimmed and marked "Next step", until the agent reads
 it at its next step (or marked "Queued", for a turn of its own, as it
 is when sent too late for this turn), and its Withdraw button takes it
@@ -230,6 +232,8 @@ agent (<kbd>Tab</kbd> completes the name):
 - `/compact [focus]` summarizes older messages now, keeping what the
   focus names;
 - `/model [NAME]` switches the model, or picks one from a list;
+- `/effort [LEVEL]` sets the model's effort (`default`: its own), or
+  picks one from a list;
 - `/shell [NAME]` switches the shell, or picks one from a list;
 - `/rename TITLE` sets the title;
 - `/fork [TURN]` forks the session, or only its first turns;

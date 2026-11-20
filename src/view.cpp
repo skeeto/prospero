@@ -609,6 +609,12 @@ struct View {
     Str             shellpath;  // and its program
     Str             shellkind;  // and its kind (tools.cpp shellkinds)
     b32             shellset;   // by a shell record, not the prefix
+    // Effort, as the latest effort record has it (none: no picker)
+    b32             effset;     // there is one
+    Str             effort;     // picked, else empty: the model's own
+    Str             effdflt;    // the model's own, empty: none sent
+    Str             efflevels;  // space-separated, to pick from
+    Str             effoff;     // why there are none
     Str             role;
     Str             parent;     // a subagent's parent session, else empty
     Str             pcall;      // and the parent's task call
@@ -2461,6 +2467,22 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
             v->shellkind = clone(&v->aux, jsonstr(jsonget(j, "shell_kind")));
         }
         return 1;
+
+    case EV_EFFORT: {
+        // The effort from here on, marked where the user picked it
+        v->effset    = 1;
+        v->effort    = clone(&v->aux, jsonstr(jsonget(j, "effort")));
+        v->effdflt   = clone(&v->aux, jsonstr(jsonget(j, "default")));
+        v->efflevels = clone(&v->aux, jsonstr(jsonget(j, "levels")));
+        v->effoff    = clone(&v->aux, jsonstr(jsonget(j, "off")));
+        if (jsonstr(jsonget(j, "by")) != "user") {
+            return 0;
+        }
+        Str shown = v->effort.len ? v->effort
+                  : v->effdflt.len ? concat(&v->aux, "the model's own, ", v->effdflt)
+                                   : Str("the model's own");
+        switchmark(v, r->seq, "Effort", shown);
+    } return 1;
 
     case EV_SHELL: {
         // Switched for the rest of the session (shell)

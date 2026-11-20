@@ -2116,6 +2116,7 @@ struct Gui {
                                      //   the source's status, without its keys
     GuiSession        *pickmodel;  // /model's list is open for it
     GuiSession        *pickshell;  // /shell's list is open for it
+    GuiSession        *pickeffort; // /effort's list is open for it
     i32                menuact;    // a context menu pick waiting for its field
     u32                menuid;     // that field (fieldmenu)
     i32                menuwait;   // frames it has waited
@@ -5023,6 +5024,21 @@ static void guishell(Gui *g, GuiSession *s, Str shell)
     cmdsend(g, &w, a);
 }
 
+// The session's effort from here on, one of its levels, or "" for its
+// model's own: its next request carries it.
+static void guieffort(Gui *g, GuiSession *s, Str effort)
+{
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 128 + effort.len);
+    EvOut w = cmdopen(g, &b, CMD_EFFORT, s);
+    putkey(&w.json, "effort");
+    putstr(&w.json, effort);
+    s->cmdid   = g->nextid;
+    s->cmdtext = {};
+    s->note    = {};
+    cmdsend(g, &w, a);
+}
+
 // The session's mode, "plan", "bypass" or "default" (Build): the agent
 // hears of it at its next request.
 static void guimode(Gui *g, GuiSession *s, Str mode)
@@ -6568,6 +6584,7 @@ static void onsesscmd(Gui *g, GuiHost *h, Arena scratch, Request *q, EvRec *r)
         s->note = {};  // the transcript's mark says so
     } break;
     case CMD_SHELL:
+    case CMD_EFFORT:
         s->note = {};  // the transcript's mark says so
         break;
     case CMD_FORK: {
@@ -7198,6 +7215,7 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
     case CMD_MODEL:
     case CMD_MODE:
     case CMD_SHELL:
+    case CMD_EFFORT:
     case CMD_FORK:
     case CMD_BACKGROUND:
     case CMD_CALLSTOP:
@@ -19993,6 +20011,25 @@ static DriveOp sessionsops[] = {
     {OP_UP, 0, 0, 0, 1500, ""},
     {OP_WAIT, W_MARK, 0, 0, 5000, "Shell"},
     {OP_CHECK, CHK_MARK, 0, 0, 0, "Shell: other"},
+    // Its effort, from the picker beside the model's: a level of the
+    // chat endpoint's, then the model's own again, each marked
+    {OP_MOVE, T_NAMED, 0, 0, 100, "effort picker"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-effortpick"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "effort low"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1500, ""},
+    {OP_WAIT, W_MARK, 0, 0, 5000, "Effort"},
+    {OP_CHECK, CHK_MARK, 0, 0, 0, "Effort: low"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "effort picker"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "effort default"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1500, ""},
+    {OP_WAIT, W_MARK, 0, 0, 5000, "the model's own"},
+    {OP_CHECK, CHK_MARK, 0, 0, 0, "Effort: the model's own"},
     // Exported: Markdown, then the raw log
     {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Greeting"},
     {OP_RDOWN, 0, 0, 0, 60, ""},
