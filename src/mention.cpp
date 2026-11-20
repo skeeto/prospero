@@ -887,7 +887,7 @@ static Str mentionattach(Arena *a, Gui *g, GuiSession *s, Str rel)
         }
     }
     if (!shortwhy.len) {
-        why = attachfile(g, *a, s, abs);
+        why = attachfile(g, a, s, abs);
         if (!why.len) {
             s->att->imgs[s->att->len-1].mention = 1;
             return {};

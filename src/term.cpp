@@ -2407,9 +2407,9 @@ static void termask(Gui *g, TermTab *tt, i64 row, Arena a)
     }
     Str label = {};
     Str text  = termasktext(g, tt, row, &a, &label);
-    Str err   = attachadd(g, a, s, text, label);
+    Str err   = attachadd(g, &a, s, text, label);
     if (err.len) {
-        setnote(g, s, concat(&g->frame, "not attached: ", err), 1);
+        setnote(g, s, concat(&a, "not attached: ", err), 1);
         return;
     }
     if (s != g->sess) {

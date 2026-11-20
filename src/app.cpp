@@ -5947,24 +5947,24 @@ static GuiTex *attthumb(Gui *g, Str data)
 // converts to a PNG if not a PNG or JPEG, or else a text file, which the
 // agent gets as read shows it, its bytes copied, or a PDF, whose text
 // the engine extracts, if it can ("pdf"). A binary file, by read's
-// measure, is refused. Returns why not, or empty if attached.
-static Str attachadd(Gui *g, Arena scratch, GuiSession *s, Str data, Str label, Str src = {})
+// measure, is refused. Returns why not, in a, or empty if attached.
+static Str attachadd(Gui *g, Arena *a, GuiSession *s, Str data, Str label, Str src = {})
 {
     Str why = attachwhy(s);
     if (why.len) {
         return why;
     }
-    ImageKind k    = imagekind(scratch, data);
+    ImageKind k    = imagekind(*a, data);
     Str       name = label.len ? label : Str("the pasted file");
     b32       pdf  = !k.mime.len && pdfsniff(data) && pdflikely(data);
     if (!k.mime.len && !hostcap(s->host, "files")) {
         return "not an image: only PNG, JPEG, GIF, WebP and BMP can be attached "
                "here, as this host's engine is too old to take text files";
     } else if (pdf && !hostcap(s->host, "pdf")) {
-        return concat(&g->frame, name, " is a PDF, which this host's engine is too "
+        return concat(a, name, " is a PDF, which this host's engine is too "
                                        "old to read: update the engine");
     } else if (!pdf && !k.mime.len && readbinary(data)) {
-        return concat(&g->frame, name, " is a binary file: only text files, PDFs "
+        return concat(a, name, " is a binary file: only text files, PDFs "
                                        "and images can be attached");
     } else if (!k.mime.len && data.len>ATTACH_FILE) {
         return pdf ? Str("too large to attach: a PDF is at most 16 MiB")
@@ -5994,8 +5994,8 @@ static Str attachadd(Gui *g, Arena scratch, GuiSession *s, Str data, Str label, 
     } else if (s->view->novision) {
         return "This model takes no images: [model] vision is off for it";
     } else if (k.w<1 || k.h<1) {
-        return concat(&g->frame, concat(&g->frame, "a damaged ", k.name),
-                      concat(&g->frame, ": its size cannot be read: ", k.err));
+        return concat(a, concat(a, "a damaged ", k.name),
+                      concat(a, ": its size cannot be read: ", k.err));
     } else if (data.len > ATTACH_UPLOAD) {
         return "too large to attach: an image is at most 64 MiB";
     }
@@ -6021,8 +6021,9 @@ static Str attachadd(Gui *g, Arena scratch, GuiSession *s, Str data, Str label, 
     return {};
 }
 
-// Attach a file, an image or text, by its path.
-static Str attachfile(Gui *g, Arena scratch, GuiSession *s, Str path)
+// Attach a file, an image or text, by its path. Returns why not, in a,
+// or empty if attached.
+static Str attachfile(Gui *g, Arena *a, GuiSession *s, Str path)
 {
     Str why = attachwhy(s);
     if (why.len) {
@@ -6032,8 +6033,8 @@ static Str attachfile(Gui *g, Arena scratch, GuiSession *s, Str path)
     if (!r) {
         return "out of memory to attach it";
     }
-    Arena a    = newarena(r);
-    Read  rd   = os_read(g->os, &a, path, ATTACH_UPLOAD);
+    Arena mem  = newarena(r);
+    Read  rd   = os_read(g->os, &mem, path, ATTACH_UPLOAD);
     iz    i    = path.len;
     for (; i>0 && path[i-1]!='/' && path[i-1]!='\\'; i--) {}
     Str   name = cuthead(path, i);
@@ -6041,9 +6042,9 @@ static Str attachfile(Gui *g, Arena scratch, GuiSession *s, Str path)
     if (rd.err == READ_TOOBIG) {
         err = "too large to attach: an image is at most 64 MiB, a text file 16 MiB";
     } else if (rd.err != READ_OK) {
-        err = concat(&g->frame, "cannot read ", path);
+        err = concat(a, "cannot read ", path);
     } else {
-        err = attachadd(g, scratch, s, rd.data, name, path);
+        err = attachadd(g, a, s, rd.data, name, path);
     }
     os_release(g->os, r);
     return err;
@@ -6417,11 +6418,11 @@ static void opendirnew(Gui *g, Arena scratch, Str dir, Str why)
 static void dropattach(Gui *g, Arena scratch, Str path)
 {
     GuiSession *s   = g->sess;
-    Str         err = attachfile(g, scratch, s, path);
+    Str         err = attachfile(g, &scratch, s, path);
     if (err.len && s) {
-        setnote(g, s, concat(&g->frame, "not attached: ", err), 1);
+        setnote(g, s, concat(&scratch, "not attached: ", err), 1);
     } else if (err.len) {
-        guilog(g, concat(&g->frame, "not attached: ", err));
+        guilog(g, concat(&scratch, "not attached: ", err));
     }
     scheddirty(&g->sched);
 }
@@ -6520,13 +6521,13 @@ static b32 attachpaste(Gui *g, Arena scratch, GuiSession *s)
     Str err  = {};
     b32 got  = c.data.len>0 || file;
     if (c.data.len) {
-        err = attachadd(g, scratch, s, c.data, {});
+        err = attachadd(g, &scratch, s, c.data, {});
     } else if (file) {
-        err = attachfile(g, scratch, s, c.path);
+        err = attachfile(g, &scratch, s, c.path);
     }
     os_release(g->os, r);
     if (err.len) {
-        setnote(g, s, concat(&g->frame, "not attached: ", err), 1);
+        setnote(g, s, concat(&scratch, "not attached: ", err), 1);
     }
     return got;
 }
@@ -11297,7 +11298,7 @@ static void ontask(Gui *g, Record r)
     case TASK_ATTACH:
         g->attpend &= r.id != g->attask;  // answered, or cancelled
         if (r.id==g->attask && g->attsess && r.data.len) {
-            Str err = attachfile(g, g->frame, g->attsess, r.data);
+            Str err = attachfile(g, &g->frame, g->attsess, r.data);
             if (err.len) {
                 setnote(g, g->attsess, concat(&g->frame, "not attached: ", err), 1);
             }
