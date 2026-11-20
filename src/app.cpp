@@ -31465,6 +31465,23 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     }
     {
         Str cwd = g->drivecwd.len ? g->drivecwd : os_realpath(os, &g->perm, ".");
+        // A launcher's folder, System32 from the Start menu or "/" from
+        // the Dock, is no one's to work in: new sessions start at home
+        // instead (#90). Only the dialog's default: relative arguments
+        // were made absolute above from the launch's folder as it is.
+        if (!g->drivecwd.len) {
+            Arena a    = g->frame;
+            Str   root = HOST_WINDOWS ? os_getenv(os, &a, "SystemRoot") : Str{};
+            if (launcherdir(a, cwd, root, HOST_WINDOWS)) {
+                Str home = userhome(os, &a);
+                home = home.len ? os_realpath(os, &g->perm, home) : home;
+                if (home.len && os_stat(os, a, home).type==STAT_DIR) {
+                    guilog(g, concat(&a, concat(&a, "launched in ", cwd),
+                                     ": new sessions start at home"));
+                    cwd = home;
+                }
+            }
+        }
         copybytes(g->newcwd, cwd.data, cwd.len<FIELD_MAX ? cwd.len : FIELD_MAX-1);
         g->firstcwd = cwd;
     }

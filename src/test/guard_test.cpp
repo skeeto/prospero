@@ -109,6 +109,26 @@ static void test_guard(Test *t)
     expect(t, "within other drive", istr(a, within("C:/", "D:/x", 1)), "0");
     expect(t, "within unc", istr(a, within("//srv/share/", "//SRV/Share/x", 1)), "1");
 
+    struct { Str dir; Str sysroot; b32 win; Str want; } launch[] = {
+        {"/",                     {},             0, "1"},
+        {"/Users/me",             {},             0, "0"},
+        {"/usr/..",               {},             0, "1"},
+        {"rel",                   {},             0, "0"},
+        {"C:/Windows/System32",   "C:\\WINDOWS",  1, "1"},
+        {"c:\\windows\\SysWOW64", "C:\\Windows",  1, "1"},
+        {"C:/Windows",            "C:\\Windows",  1, "1"},
+        {"C:/WindowsApps",        "C:\\Windows",  1, "0"},
+        {"C:/Users/me",           "C:\\Windows",  1, "0"},
+        {"D:/Windows/System32",   "C:\\Windows",  1, "0"},
+        {"C:/Windows/System32",   {},             1, "0"},
+        {"C:/x",                  "C:\\",         1, "0"},
+        {"C:/",                   "C:\\Windows",  1, "0"},
+    };
+    for (iz i = 0; i < countof(launch); i++) {
+        b32 got = launcherdir(t->perm, launch[i].dir, launch[i].sysroot, launch[i].win);
+        expect(t, concat(a, "launcherdir ", launch[i].dir), istr(a, got), launch[i].want);
+    }
+
     struct { Str path; Str home; Str want; } homes[] = {
         {"~", "/home/u", "/home/u"},
         {"~/x", "/home/u", "/home/u/x"},

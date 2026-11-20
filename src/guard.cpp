@@ -182,6 +182,26 @@ static b32 within(Str root, Str path, b32 win)
     return path.len==root.len || root[root.len-1]=='/' || path[root.len]=='/';
 }
 
+// Whether dir, absolute, is where a launcher leaves a process rather
+// than a folder anyone works in (#90): the root, as the Dock and Finder
+// leave it, or on Windows the Windows folder or below, sysroot (its
+// %SystemRoot%), as the Start menu leaves it in System32.
+static b32 launcherdir(Arena scratch, Str dir, Str sysroot, b32 win)
+{
+    if (!pathroot(dir, win)) {
+        return 0;
+    }
+    Str d = normpath(&scratch, dir, dir, win);
+    if (!win) {
+        return d == "/";
+    }
+    if (!pathroot(sysroot, 1)) {
+        return 0;
+    }
+    Str s = normpath(&scratch, sysroot, sysroot, 1);
+    return pathroot(s, 1)<s.len && within(s, d, 1);  // never a whole drive
+}
+
 // "~" and "~/x" in the home directory, given one; anything else as is.
 static Str expandhome(Arena *a, Str path, Str home, b32 win)
 {
