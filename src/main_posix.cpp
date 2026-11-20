@@ -2124,8 +2124,11 @@ static b32 os_launch(Os *, Arena scratch, Slice<Str> argv, Str cwd, Slice<Str> e
         for (Str rest = path; rest.len && prog==argv[0];) {
             Cut c = cut(rest, ':');
             rest = c.tail;
+            if (!c.head.len || c.head[0]!='/') {
+                continue;  // relative (empty is "."): here, not in cwd, where it runs
+            }
             Arena a = scratch;
-            Str   p = join(&a, c.head.len ? c.head : Str("."), argv[0]);
+            Str   p = join(&a, c.head, argv[0]);
             if (!access(cstr(&a, p), X_OK)) {
                 prog = clone(&scratch, p);
             }
@@ -2149,9 +2152,15 @@ static b32 os_launch(Os *, Arena scratch, Slice<Str> argv, Str cwd, Slice<Str> e
     if (pid < 0) {
         return 0;
     } else if (!pid) {
+        // The folder and the second fork in the middle child, whose exit
+        // status says whether either failed
         setsid();
-        if (fork()) {
-            _exit(0);
+        if (dir[0] && chdir(dir)) {
+            _exit(127);
+        }
+        pid_t gpid = fork();
+        if (gpid) {
+            _exit(gpid<0 ? 127 : 0);
         }
         i32 null = open("/dev/null", O_RDWR);
         if (null >= 0) {
@@ -2161,9 +2170,6 @@ static b32 os_launch(Os *, Arena scratch, Slice<Str> argv, Str cwd, Slice<Str> e
         }
         for (i32 fd = 3; fd < 1024; fd++) {
             close(fd);
-        }
-        if (dir[0] && chdir(dir)) {
-            _exit(127);
         }
         // As childsignals does for a tool: what this process ignores,
         // the program it starts does not (an editor's SIGPIPE)
@@ -2179,6 +2185,10 @@ static b32 os_launch(Os *, Arena scratch, Slice<Str> argv, Str cwd, Slice<Str> e
     }
     i32 status = 0;
     while (waitpid(pid, &status, 0)<0 && errno==EINTR) {}
+    if (!WIFEXITED(status) || WEXITSTATUS(status)) {
+        errno = ECHILD;  // no folder there, or no second fork
+        return 0;
+    }
     return 1;
 }
 
