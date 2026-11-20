@@ -142,6 +142,12 @@ static void test_provider(Test *t)
             {500, "Context size has been exceeded.", CLASS_TRANSIENT},
             {400, "{\"error\":{\"type\":\"exceed_context_size_error\"}}", CLASS_OVERFLOW},
             {400, "This model's maximum context length is 8192 tokens", CLASS_OVERFLOW},
+            {400, "{\"error\":{\"code\":\"invalid_parameter_error\",\"message\":"
+                  "\"Range of input length should be [1, 983616]\","
+                  "\"type\":\"invalid_request_error\"}}", CLASS_OVERFLOW},
+            {400, "{\"error\":{\"code\":\"invalid_parameter_error\",\"message\":"
+                  "\"Range of max_tokens should be [1, 65536]\","
+                  "\"type\":\"invalid_request_error\"}}", CLASS_DETERMINISTIC},
             {400, "Error rendering prompt with jinja template", CLASS_DETERMINISTIC},
             {400, "bad request", CLASS_DETERMINISTIC},
             {401, "", CLASS_FATAL},
@@ -263,6 +269,9 @@ static void test_provider(Test *t)
              "8192 tokens. However, you requested 9000 tokens (8000 in the "
              "messages, 1000 in the completion).\"}}", 8000, 8192},
             {"maximum context length is 4096 tokens", 0, 4096},
+            {"{\"error\":{\"code\":\"invalid_parameter_error\",\"param\":null,"
+             "\"message\":\"Range of input length should be [1, 983616]\","
+             "\"type\":\"invalid_request_error\"},\"id\":\"x\"}", 0, 983616},
             {"prompt is too long", 0, 0},
             {"", 0, 0},
         };

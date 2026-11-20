@@ -1422,6 +1422,7 @@ static i32 classify(i32 status, Str text)
         "reduce the length of the messages",
         "request_too_large",          // Anthropic: the body, 413
         "exceed context limit",       // Anthropic: input plus max_tokens
+        "range of input length",      // DashScope: "should be [1, N]"
     };
     if (contains(text, "failed to parse tool call arguments") ||
             contains(text, "raise_exception") ||
@@ -1496,8 +1497,8 @@ struct Overflow {
 
 // The sizes an overflow error reports: llama.cpp's n_prompt_tokens and
 // n_ctx, OpenAI's and vLLM's "maximum context length is N tokens" with
-// "(N in the messages", or Anthropic's "prompt is too long: N tokens >
-// M maximum".
+// "(N in the messages", Anthropic's "prompt is too long: N tokens >
+// M maximum", or DashScope's "Range of input length should be [1, M]".
 static Overflow overflowsizes(Arena scratch, Str body)
 {
     Overflow r = {};
@@ -1508,6 +1509,9 @@ static Overflow overflowsizes(Arena scratch, Str body)
     r.ctx    = jsonint(jsonget(e, "n_ctx"), 0);
     if (!r.ctx) {
         r.ctx = numberafter(body, "maximum context length is");
+    }
+    if (!r.ctx) {
+        r.ctx = numberafter(body, "range of input length should be [1,");
     }
     if (!r.prompt && findfold(body, "prompt is too long:")>=0) {
         r.prompt = numberafter(body, "prompt is too long:");
