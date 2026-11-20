@@ -1522,7 +1522,10 @@ static LinkFrom filelinkfrom(GuiSession *s, Str base)
         r.host  = s->host->kind==GH_REMOTE ? s->host->uid : 0;
         r.base  = base;
         r.win   = hostwin(s->host);
-        r.opens = 1;
+        // A folder that is no absolute path there, as a container's
+        // subagent's /work is on Windows, where its log is kept: its
+        // paths name another machine's files, so its links open nothing
+        r.opens = !base.len || pathroot(base, r.win)>0;
     }
     return r;
 }

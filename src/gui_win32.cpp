@@ -2394,10 +2394,15 @@ static void os_wake(Os *os)
     }
 }
 
-// arenalint: frame ok, as title is a literal
+// Opening the window draws frames at once (WM_SIZE), which start over
+// the frame arena that callers pass as scratch: nothing from it may be
+// held across w32gui_open, w32gui_reopen or w32gui_show. So the title
+// is widened onto the stack.
+// arenalint: frame ok, as scratch is copied only after the window's frames
 static b32 os_guiopen(Os *os, Gui *g, Arena scratch, Str title)
 {
-    Arena t = scratch;
+    alignas(16) byte mem[1<<10];
+    Arena t = {mem, mem+countof(mem)};
     unsigned short *wtitle = (unsigned short *)towide(&t, title).data;
     // Where it was last, if anywhere, else its first size: the work
     // area's pixels hold it at the primary display's scale, or not
@@ -2446,7 +2451,8 @@ static b32 os_guiopen(Os *os, Gui *g, Arena scratch, Str title)
     gui_systheme(g, w32gui_systheme(os->gui));  // the title bar before it shows
     w32gui_show(os->gui);
     if (g->drive) {
-        Buf b(&t, 64);
+        Arena a = scratch;  // the window's frames are done
+        Buf   b(&a, 64);
         print(&b, "drive: GUI thread ");
         print(&b, (i64)GetCurrentThreadId());
         guilog(g, finish(&b));

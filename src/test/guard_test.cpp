@@ -66,6 +66,12 @@ static void test_guard(Test *t)
         expect(t, concat(a, "windows idempotent ", win[i].path), again, got);
     }
 
+    // A working directory that is no Windows path, as a Linux
+    // container's session's is, and a rooted path: no drive to borrow,
+    // and no crash (a session on biron, 2026-11-20)
+    expect(t, "windows rooted, posix cwd", istr(a, normpath(a, "/work", "/tmp/x", 1).len >= 0), "1");
+    expect(t, "windows relative, posix cwd", istr(a, normpath(a, "/work", "src/a.c", 1).len >= 0), "1");
+
     // Random paths from the characters that matter: always rooted, no
     // empty, "." or ".." names, and normalized already once normalized
     {

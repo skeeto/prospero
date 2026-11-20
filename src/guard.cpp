@@ -124,8 +124,10 @@ static Str normpath(Arena *a, Str cwd, Str path, b32 win)
                 full = concat(a, concat(a, takehead(full, 2), "/"), rest);
             }
         } else if (win && full.len>=1 && issep(full[0], 1)) {
-            // Rooted on the working directory's drive
-            full = concat(a, takehead(cwd, pathroot(cwd, 1) - 1), full);
+            // Rooted on the working directory's drive, if it has one: a
+            // working directory from elsewhere (a log's) may not
+            iz croot = pathroot(cwd, 1);
+            full = croot ? concat(a, takehead(cwd, croot - 1), full) : full;
         } else {
             full = concat(a, concat(a, cwd, "/"), full);
         }
