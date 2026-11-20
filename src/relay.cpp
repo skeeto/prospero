@@ -64,6 +64,7 @@ struct RelayPeer {
     i64            seq;      // offers before it: the newest wins
     Str            machine;  // at most 63 bytes, of [A-Za-z0-9._-]
     Str            layer;    // its configuration layer, INI
+    u8             layername[80];  // "relayed from MACHINE", for cfg->layers
     Slice<RelayEp> eps;
     b32            search;   // it runs web searches ([web] search)
     Slice<Skill>   skills;   // its user's own that it shares, with no files
@@ -423,9 +424,11 @@ static void relayparse(RelayPeer *p, Arena *a, Json *o)
     }
 }
 
-// Load the configuration again with the offers as they are now, oldest
-// first, so that the newest definitions win, under the user's file.
-static void relayload(Engine *e, Arena scratch)
+// Point the configuration's layers at the offers as they are now,
+// oldest first, so that the newest definitions win, under the user's
+// file. The layers stay, for every later load (the file changed, a URL
+// fetched), so this runs whenever an offer is replaced or forgotten.
+static void relaylayers(Engine *e)
 {
     Relay *r = e->relay;
     i32    n = 0;
@@ -441,14 +444,24 @@ static void relayload(Engine *e, Arena scratch)
         }
         last = next->seq;
         if (next->layer.len) {
-            r->layers[n].name = concat(&scratch, "relayed from ", next->machine);
+            Str pre  = "relayed from ";
+            iz  room = countof(next->layername) - pre.len;
+            Str m    = next->machine.len<=room ? next->machine : takehead(next->machine, room);
+            copybytes(next->layername, pre.data, pre.len);
+            copybytes(next->layername+pre.len, m.data, m.len);
+            r->layers[n].name = Str{next->layername, pre.len+m.len};
             r->layers[n].text = next->layer;
             n++;
         }
     }
     e->cfg->layers = {r->layers, n};
+}
+
+// Load the configuration again with the offers as they are now.
+static void relayload(Engine *e, Arena scratch)
+{
+    relaylayers(e);
     cfgload(e->cfg, scratch);
-    e->cfg->layers = {};  // the next load as offers then are, or none
     cfgapply(e, scratch);
 }
 
@@ -528,6 +541,8 @@ static void relayoffer(Engine *e, Arena scratch, i64 id, Json *j)
     p->seq  = ++r->seq;
     if (changed) {
         relayload(e, scratch);
+    } else {
+        relaylayers(e);  // the same text, but in the new offer's memory
     }
     relayreply(e, scratch, id, e->cfg->thin);
     relaywake(e, scratch);

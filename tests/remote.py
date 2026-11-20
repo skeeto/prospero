@@ -3893,6 +3893,28 @@ def relay_restart(t):
         rl2.stop = True
 
 
+@scenario
+def relay_reload(t):
+    """A thin host's file edited after an offer: the load that follows
+    keeps the relayed endpoint under it, and a turn still goes there."""
+    thinconfig(t)
+    model = t.model("remote_tool")
+    c, rl = relayclient(t, model)
+    try:
+        time.sleep(1.1)  # a new modification time
+        thinconfig(t, "# edited\n")
+        r = c.call("new", cwd=t.work, prompt="go")
+        t.check(r.get("ok") == 1, f"new: {r}")
+        sid = r["sid"]
+        end = c.stream.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid,
+                            timeout=30, what="turn.end")
+        t.check(end.get("why") == "done", f"turn.end {end}")
+        att = [r for r in c.all() if r.get("ev") == "attempt" and r.get("sid") == sid]
+        t.check(att and att[-1]["endpoint"] == "relay://fake", f"attempts {att[-1:]}")
+    finally:
+        rl.stop = True
+
+
 def varint(v):
     out = bytearray()
     while True:
