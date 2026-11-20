@@ -15958,6 +15958,47 @@ def read_image(t):
             f"the others stand in: {alts}")
 
 
+@scenario(bound=20)
+def read_image_refused(t):
+    """An image the endpoint refuses (its moderation: HTTP 400, as #93's)
+    is not sent again, the step retried at once with a text saying why
+    in its place, so the agent goes on rather than every request after
+    failing; an older image the endpoint took still goes."""
+    readimages(t)
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    retries = r.all("retry")
+    t.check(len(retries) == 1 and retries[0].get("class") == "deterministic" and
+            "inappropriate content" in retries[0].get("msg", ""),
+            f"one retry {retries}")
+    reqs = [q["body"] for q in t.requests()]
+    t.check(len(reqs) == 4, f"two reads, the refused request and its retry: {len(reqs)}")
+    last = reqs[-1]
+    calls = [m["tool_call_id"] for m in last["messages"] if m["role"] == "tool"]
+    imgs = fake_provider.desk_images(last)
+    t.check(len(imgs) == 1 and calls[0] in imgs[0][0], f"the first still sent {imgs}")
+    alts = [p["text"] for m in last["messages"]
+            if m["role"] == "user" and isinstance(m["content"], list)
+            for p in m["content"] if p["type"] == "text" and p["text"].startswith("[image")]
+    t.check(len(alts) == 1 and
+            alts[0].startswith(f"[image omitted: {calls[1]}, which the endpoint refused: "
+                               "HTTP 400: ") and
+            "inappropriate content" in alts[0] and alts[0].endswith("Go on without it.]"),
+            f"the second stands in: {alts}")
+    t.check(r.text().endswith("Went on without it."), f"answered {r.text()!r}")
+
+
+@scenario(bound=10)
+def image_refused_none(t):
+    """A refusal that speaks of images, with no image to leave out, ends
+    the turn as any deterministic error does, without a retry."""
+    r = t.run()
+    t.check(r.rc == 1, f"exit {r.rc}")
+    end = r.last("turn.end")
+    t.check(end.get("err", "").startswith("deterministic"), f"deterministic: {end}")
+    t.check(not r.all("retry") and len(t.requests()) == 1, "never retried")
+
+
 @scenario(conf={"_extra": "[model {model}]\nvision = false\n"}, bound=15)
 def read_image_blind(t):
     """A model with vision off is told what an image file is, not shown

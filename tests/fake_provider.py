@@ -2952,6 +2952,28 @@ def sc_read_image(model, n, req):
         yield from answer(model, "Looked.")
 
 
+def sc_read_image_refused(model, n, req):
+    # Its moderation takes one image and refuses a request with two (#93)
+    if len(desk_images(req)) >= 2:
+        yield S.error(400, {"error": {
+            "code": "data_inspection_failed", "param": None,
+            "message": "Input image data may contain inappropriate content.",
+            "type": "data_inspection_failed"}})
+        return
+    files = ["red.png", "four.gif"]
+    k = step(req)
+    if k < len(files):
+        yield from tool(model, n, "read", {"path": files[k]})
+    else:
+        yield from answer(model, "Went on without it.")
+
+
+def sc_image_refused_none(model, n, req):
+    # Refused as about images, with none in the request
+    yield S.error(400, {"error": {"message": "image input is not supported",
+                                  "type": "invalid_request_error"}})
+
+
 def sc_read_image_blind(model, n, req):
     if step(req) == 0:
         yield from tool(model, n, "read", {"path": "red.png"})

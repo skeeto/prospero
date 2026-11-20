@@ -439,6 +439,8 @@ struct Msg {
                           // pages: Anthropic's document, else imgalt
     Str          pdfbad;  // why the API refused that PDF, which is
                           // then not sent (this run only)
+    Str          imgbad;  // why the endpoint refused this message's
+                          // images (refuseimage): not sent (this run only)
     Str          imgb64;  // in a request's history: the screenshot as
                           // base64, or null where it is left out,
     Str          imgalt;  // with this text in its place

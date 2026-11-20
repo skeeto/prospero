@@ -899,6 +899,10 @@ struct Session {
     u8           relayby[64];  // its name, for live
     i32          relaybylen;
     i32          relaylost;  // calls lost in a row before visible output
+    // Images an endpoint refused (refuseimage)
+    i64          reqseq;     // the log's seq when the last step was sent
+    i64          okseq;      // and when the last one taken was (200),
+                             // 0 since the session opened
     // A chatgpt endpoint's sign-in (epauth)
     u64          authsent;   // the access token sent last, hashed
     u64          authstale;  // the one refused (401), to be refreshed
@@ -2794,6 +2798,7 @@ static void sendchat(Session *s, Arena scratch)
     req.history   = deskimages(s, &scratch);
     req.thinkfrom = s->thinkfrom;
     req.cachekey  = s->sid;
+    s->reqseq     = s->log.seq;
     i32 wire      = s->ep.wire;
     Str body      = wire==EP_ANTHROPIC ? anencode(&s->attempt, scratch, &req) :
                     epresponses(wire)  ? rsencode(&s->attempt, scratch, &req,
@@ -3352,6 +3357,7 @@ static b32 unbind(Session *s)
 }
 
 static b32 refusepdf(Session *, Str);
+static b32 refuseimage(Session *, Str);
 
 // Fail the current attempt. Transient failures back off and retry while
 // nothing visible has streamed, and otherwise commit what streamed and
@@ -3413,6 +3419,18 @@ static void fail(Session *s, Arena scratch, i32 cls, i32 status, Str msg, i64 re
         // A PDF read that the API takes for one but refuses (damaged),
         // which every request after would carry: the newest left out,
         // which is the one this request added, and the step goes again
+        retryevent(s, scratch, RETRY_QUICK, cls, status, 0, msg);
+        request(s, scratch);
+        return;
+    }
+    if (cls==CLASS_DETERMINISTIC && !visible &&
+            (contains(msg, "image") || contains(msg, "vision")) &&
+            refuseimage(s, msg)) {
+        // Images the endpoint refuses (its moderation, a server without
+        // a vision encoder), which every request after would carry, so
+        // that no step could go (#93): the newest message's that no
+        // request it took carried are left out, a text saying why in
+        // their place, and the step goes again, the agent told
         retryevent(s, scratch, RETRY_QUICK, cls, status, 0, msg);
         request(s, scratch);
         return;
@@ -3773,6 +3791,7 @@ static void onhead(Session *s, i32 status, Str headers)
     if (status == 200) {
         Str type = headervalue(headers, "content-type");
         s->plain = type.len && !contains(type, "event-stream");
+        s->okseq = s->purpose==REQ_CHAT ? s->reqseq : s->okseq;
         arm(s, T_IDLE, reqep(s)->idle);
         arm(s, T_PROGRESS, reqep(s)->progress);
         setstate(s, S_STREAM);
@@ -7944,6 +7963,23 @@ static b32 refusepdf(Session *s, Str why)
     return 0;
 }
 
+// An endpoint refused a step's images, as why says (fail): mark the
+// newest message with images sent that no request taken this run
+// carried (okseq), which are then left out. Returns 0 if none is left,
+// as the images are not the cause, or not those, and the turn ends.
+static b32 refuseimage(Session *s, Str why)
+{
+    for (iz i = s->history.len-1; !s->mc.novision && i>=0; i--) {
+        Msg *m   = &s->history[i];
+        b32  any = (m->image.len && !m->pages) || m->images.len;
+        if (any && m->seq>s->okseq && !m->imgbad.len) {
+            m->imgbad = clone(&s->perm, utf8head(why, 1000));
+            return 1;
+        }
+    }
+    return 0;
+}
+
 // The most pages of PDFs a request carries: Anthropic's limit, and no
 // more than half the model's window holds, as estimated (PDF_TOKENS).
 static i64 pdfpagesmax(Session *s)
@@ -8095,7 +8131,9 @@ static i64 deskkept(Session *s, b32 *keep, i64 drop, iz len)
     }
     for (iz i = len-1; i >= 0; i--) {
         Msg *m = &s->history[i];
-        if (pdfattachset(m)) {
+        if (pdfattachset(m) && m->imgbad.len) {
+            continue;  // refused, so passed over (refuseimage)
+        } else if (pdfattachset(m)) {
             i64 cnt  = 0;
             i64 size = 0;
             for (iz k = 0; k < m->images.len; k++) {
@@ -8126,7 +8164,7 @@ static i64 deskkept(Session *s, b32 *keep, i64 drop, iz len)
         if (!deskitem(m) || --n<drop) {
             continue;
         } else if (!m->image.len) {
-            if (nosets || m->images.len>PDF_REQIMAGES) {
+            if (nosets || m->imgbad.len || m->images.len>PDF_REQIMAGES) {
                 continue;
             }
             i64 size = 0;
@@ -8178,7 +8216,7 @@ static i64 deskimagetokens(Session *s)
     i64 r    = deskkept(s, 0, drop, s->history.len);
     for (iz i = 0, n = 0; !s->mc.novision && i<s->history.len; i++) {
         Msg *m = &s->history[i];
-        if (deskitem(m) && n++>=drop && m->image.len && !m->pages) {
+        if (deskitem(m) && n++>=drop && m->image.len && !m->pages && !m->imgbad.len) {
             r += imagetokens(m->imgw, m->imgh);
         }
     }
@@ -8196,7 +8234,7 @@ static i64 attachtokens(Session *s)
     for (iz i = 0; !s->mc.novision && i<s->history.len; i++) {
         Msg *m = &s->history[i];
         for (iz k = 0; m->role==ROLE_USER && k<m->images.len; k++) {
-            if (pdfattached(&m->images[k])) {
+            if (pdfattached(&m->images[k]) || m->imgbad.len) {
                 continue;
             }
             i64 w    = m->images[k].w;
@@ -8358,6 +8396,21 @@ static Slice<MsgImage> toolimagesin(Session *s, Arena *a, Slice<MsgImage> images
 // the text files attached, as text before their message's own. For a
 // model that takes no images (one switched to), a note in place of each
 // image. The history itself if it has none of them.
+// In a, the text in place of what the endpoint refused (refuseimage),
+// for an image, a screenshot or a set of images, by its call or name.
+static Str refusedalt(Arena *a, Str what, Str id, Str why)
+{
+    Buf b(a, 128 + id.len + why.len);
+    print(&b, "[");
+    print(&b, what);
+    print(&b, " omitted: ");
+    print(&b, id);
+    print(&b, ", which the endpoint refused: ");
+    print(&b, why);
+    print(&b, what=="images" ? Str(". Go on without them.]") : Str(". Go on without it.]"));
+    return finish(&b);
+}
+
 static Slice<Msg> deskimages(Session *s, Arena *a)
 {
     Engine *e   = s->e;
@@ -8396,7 +8449,11 @@ static Slice<Msg> deskimages(Session *s, Arena *a)
             m.floor = FLOOR_READ;  // an attached PDF's images crowded out
         }
         if (!m.image.len && deskitem(&m)) {
-            if (n++<d.drop || !keep[i]) {
+            b32 gone = n++ < d.drop;
+            if (!gone && m.imgbad.len) {
+                m.imgalt = refusedalt(a, "images", m.callid, m.imgbad);
+                m.images = {};
+            } else if (gone || !keep[i]) {
                 m.imgalt = concat(a, concat(a, "[PDF images omitted: ", m.callid),
                                   "; read the file again to see them]");
                 m.images = {};
@@ -8426,6 +8483,8 @@ static Slice<Msg> deskimages(Session *s, Arena *a)
                 m.imgalt = concat(a, concat(a, "[PDF omitted: ", m.callid),
                                   ", for room in the request for newer ones; read "
                                   "the file again to see it]");
+            } else if (!m.pages && m.imgbad.len) {
+                m.imgalt = refusedalt(a, what, m.callid, m.imgbad);
             } else if (!m.pages && blind) {
                 m.imgalt = concat(a, concat(a, concat(a, "[", what), " omitted: "),
                                   concat(a, m.callid, ", since this model takes no images]"));
@@ -8447,13 +8506,15 @@ static Slice<Msg> deskimages(Session *s, Arena *a)
             for (iz k = 0; k < m.images.len; k++) {
                 MsgImage g    = m.images[k];
                 b32      room = !pdfattached(&g) || keep[i];
-                b32      ok   = !blind && room && validimage(g.name);
+                b32      ok   = !blind && room && !m.imgbad.len && validimage(g.name);
                 Read     rd   = {};
                 if (ok) {
                     rd = os_read(e->os, a, join(a, s->dir, g.name), ATTACH_UPLOAD);
                     ok = rd.err==READ_OK && imagetypes[imagesniff(rd.data)].mime==g.mime;
                 }
-                if (!blind && !room) {
+                if (!blind && m.imgbad.len) {
+                    g.alt = refusedalt(a, "image", g.name, m.imgbad);
+                } else if (!blind && !room) {
                     g.alt = concat(a, concat(a, "[image omitted: ", g.label),
                                    ", for room in the request for newer images; read "
                                    "the PDF again to see it]");
