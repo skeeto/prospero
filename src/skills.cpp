@@ -38,8 +38,10 @@ enum : i64 {
     SKILL_NAME  = 64,         // bytes of a name
     SKILL_DEPTH = 4,          // levels a skill may sit below its skills directory
     SKILL_DIRS  = 1000,       // directories listed in one skills directory
+    SKILL_LISTMAX = 256 << 20,  // bytes of one folder's listing (skilllist)
     SKILL_PACK  = 2 << 20,    // a package's JSON (skillpack), at most
     SKILL_FILES = 500,        // files in a package
+    SKILL_LISTED = 2000,      // entries a package's folders hold, all told
     SKILL_PACKDEPTH = 8,      // levels of a path in a package
     SKILL_PATHLEN   = 200,    // bytes of a path in a package
 };
@@ -303,6 +305,26 @@ static b32 skillless(Skill *a, Skill *b)
     return compare(a->name, b->name) < 0;
 }
 
+// A folder's entries as os_list has them, links left out, in a
+// reservation of their own rather than the caller's arena, which may be
+// a carve: a folder of any size is listed, then given back whole once
+// what is kept is copied out (os_release).
+struct SkillList {
+    Region *r;
+    Dirent *head;
+};
+
+static SkillList skilllist(Os *os, Str dir)
+{
+    SkillList l = {};
+    l.r = os_reserve(os, SKILL_LISTMAX);
+    if (l.r) {
+        Arena t = newarena(l.r);
+        l.head = os_list(os, &t, dir);
+    }
+    return l;
+}
+
 // The directories under a skills directory that hold a SKILL.md, in a
 // fixed order. A skill may sit below folders that group skills, as
 // Cursor allows, down to SKILL_DEPTH levels, though a skill's own
@@ -321,7 +343,8 @@ static Slice<Str> skillwalk(Os *os, Arena *a, Str root, b32 win)
         stack.len--;
         depth.len--;
         Slice<Dirent *> ents = {};
-        for (Dirent *e = os_list(os, a, dir); e; e = e->next) {
+        SkillList       l    = skilllist(os, dir);
+        for (Dirent *e = l.head; e; e = e->next) {
             if (e->isdir && e->name.len && e->name[0]!='.') {
                 ents = push(a, ents, e);
             }
@@ -340,6 +363,9 @@ static Slice<Str> skillwalk(Os *os, Arena *a, Str root, b32 win)
         for (iz k = sub.len-1; k >= 0; k--) {  // first listed first
             stack = push(a, stack, sub[k]);
             depth = push(a, depth, dep+1);
+        }
+        if (l.r) {
+            os_release(os, l.r);  // the names kept were copied by normpath
         }
     }
     return r;
@@ -578,17 +604,28 @@ static b32 skillfileless(SkillFile *a, SkillFile *b)
 }
 
 // The paths of the files under a skill's directory that a package may
-// have, with their sizes in data.len (no data), up to SKILL_FILES+1.
+// have, with their sizes in data.len (no data), up to SKILL_FILES+1, or
+// none if its folders hold more than SKILL_LISTED entries in all, files,
+// folders and names skipped: too many to pack, and to look through in a.
 static Slice<SkillFile> skillpackfiles(Os *os, Arena *a, Str dir)
 {
     Slice<SkillFile> r     = {};
     Slice<Str>       stack = {};  // relative folders to list
+    iz               seen  = 0;
     stack = push(a, stack, Str{});
     while (stack.len && r.len<=SKILL_FILES) {
         Str rel = stack[stack.len-1];
         stack.len--;
-        Str abs = rel.len ? concat(a, concat(a, dir, "/"), rel) : dir;
-        for (Dirent *d = os_list(os, a, abs); d && r.len<=SKILL_FILES; d = d->next) {
+        Str       abs = rel.len ? concat(a, concat(a, dir, "/"), rel) : dir;
+        SkillList l   = skilllist(os, abs);
+        if (!l.r) {
+            return {};  // unlisted: too little memory to pack it whole
+        }
+        for (Dirent *d = l.head; d && r.len<=SKILL_FILES; d = d->next) {
+            if (++seen > SKILL_LISTED) {
+                os_release(os, l.r);
+                return {};
+            }
             Str p = rel.len ? concat(a, concat(a, rel, "/"), d->name) : clone(a, d->name);
             if (!skillpackpath(p, 0)) {
                 continue;  // dot-names too
@@ -601,6 +638,7 @@ static Slice<SkillFile> skillpackfiles(Os *os, Arena *a, Str dir)
                 r = push(a, r, f);
             }
         }
+        os_release(os, l.r);  // p is a copy of each name kept
     }
     sort(r.data, r.len, skillfileless, *a);
     return r;
@@ -622,7 +660,10 @@ static void skillpackfile(JsonOut *w, Arena scratch, SkillFile *f)
 // A file read whole, up to max, then its base64, a third larger again.
 static Str skillpack(Os *os, Arena *a, Skill *k, iz max)
 {
-    Arena            rd    = carve(a, 3*max + (iz)SKILL_BYTES + (1<<16));
+    // Past the files read, the listing's paths and stack, under 1 KiB an
+    // entry (skillpackfiles)
+    Arena            rd    = carve(a, 3*max + (iz)SKILL_BYTES + (1<<16) +
+                                      ((iz)SKILL_LISTED<<10));
     Slice<SkillFile> files = skillpackfiles(os, &rd, k->dir);
     Buf              b(a, 1<<12);
     JsonOut          w = {&b};

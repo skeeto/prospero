@@ -319,7 +319,8 @@ static Str packpaths(Arena *a, Json *pkg)
 // takes of one to copy
 static void test_skillpack(Test *t)
 {
-    Arena *a = &t->perm;
+    Arena  perm = t->perm;  // packages carve megabytes: all given back after
+    Arena *a    = &perm;
 
     // The path rule
     {
@@ -419,6 +420,30 @@ static void test_skillpack(Test *t)
         expect(t, "cut flag", istr(a, jsonflag(jsonget(c.root, "cut"), 0)), "1");
         SkillPack q = skillunpack(a, c.root, 0);
         expect(t, "cut unpack", istr(a, !q.err.data && q.cut), "1");
+    }
+
+    // A folder of more entries than a package looks through, here names
+    // it skips, listed apart from the package's carve: SKILL.md alone,
+    // with cut, not out of memory
+    {
+        Arena  tmp = *a;
+        Arena *a   = &tmp;
+        Os    *os  = newos(a, 8<<20);  // its own, as the files above fill that one
+        Skill  wk  = {};
+        wk.name = "wide";
+        wk.dir  = "/s/wide";
+        wk.path = "/s/wide/SKILL.md";
+        os_mkdirs(os, *a, "/s/wide");  // as newos's Os has no /s
+        os_write(os, *a, "/s/wide/SKILL.md", "---\nname: wide\ndescription: Wide\n---\n");
+        for (i32 i = 0; i < 6000; i++) {  // three times SKILL_LISTED
+            Buf b(a, 96);
+            print(&b, "/s/wide/.cached-entry-with-a-long-enough-name-");
+            print(&b, (i64)i);
+            os_write(os, *a, finish(&b), "");
+        }
+        JsonDoc c = jsonparse(a, skillpack(os, a, &wk, 100));
+        expect(t, "wide paths", packpaths(a, c.root), "SKILL.md");
+        expect(t, "wide cut", istr(a, jsonflag(jsonget(c.root, "cut"), 0)), "1");
     }
 
     // Unpacking refuses what a copy may not have
