@@ -2418,7 +2418,7 @@ def sc_plan(model, n, req):
         note = last.split("The user's note: ", 1)[-1].split("\n", 1)[0]
         yield from tool(model, n, "write", {"path": plan_path(req),
                                             "content": f"# Plan v2\n\n- {note}\n"})
-    elif "There is no plan to approve yet" in last:
+    elif "There is no plan to approve yet" in last or "too long to put to the user" in last:
         yield from tool(model, n, "write", {"path": plan_path(req),
                                             "content": "# Plan\n\n- Write **inside.txt**.\n"})
     elif "Not done: plan mode is on" in last:
@@ -2459,6 +2459,7 @@ def sc_plan_midturn(model, n, req):
     else:
         yield from answer(model, "Done.")
 sc_plan_model = sc_plan_model_b = sc_plan_gui = sc_plan_gui_b = sc_plan_revised = sc_plan
+sc_plan_long = sc_plan
 
 
 def sc_plan_patch(model, n, req):

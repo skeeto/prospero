@@ -11010,6 +11010,16 @@ static void drawplan(Gui *g)
     if (!shown) {
         return;  // on its way
     }
+    if (mine && f->cut) {
+        // Past what an ask could put to the user, so the agent was
+        // told to shorten it, but all of it is in the file
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextDisabled("Only the first %d KiB of the plan show here: "
+                            "it is longer than a plan to approve may be. The "
+                            "editor shows all of it.", (i32)(PLAN_MAX>>10));
+        ImGui::PopTextWrapPos();
+        itemnamed(g, "plan cut");
+    }
     f->doc->from = filelinkfrom(s, termcwd(s));
     Str link = drawdoc(g, a, f->doc, "##plan", "Plan");
     if (link.len) {

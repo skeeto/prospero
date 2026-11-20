@@ -11949,6 +11949,55 @@ def plan_revised(t):
 
 
 @scenario(bound=15)
+def plan_long(t):
+    """A plan past what is repeated to the agent (64 KiB) is put to the
+    user whole, and approved, the result names the file rather than
+    pasting it; one past what is put to the user (256 KiB) is refused,
+    the agent told to shorten it, and so is one grown past it by hand
+    before approval."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1,
+                     plan=1)["sid"]
+        mode = h.wait(lambda e: e.get("ev") == "mode" and e.get("sid") == sid)
+        plan = mode["path"]
+        line = "- Write **inside.txt**, carefully, in exactly this way.\n"
+        long = "# Long plan\n\n" + line*(100*1024//len(line))
+        t.host.write(plan, long)
+        h.send("prompt", sid=sid, text="Write inside.")
+        ask = planask(h, sid)
+        t.check(ask["detail"] == long.rstrip(), f"put whole: {len(ask['detail'])} bytes")
+        h.call("answer", sid=sid, req=ask["req"], decision="allow")
+        ended(h, sid, 1)
+        res = [e["text"] for e in h.all("tool.end", sid) if "approved your plan" in e["text"]]
+        t.check(len(res) == 1 and f"is the one in {plan}" in res[0] and
+                "Long plan" not in res[0] and len(res[0]) < 1024, f"named: {res}")
+        t.check(t.file("inside.txt") == "done\n", "carried out")
+
+        # Too long to put to the user: refused, then a short plan
+        h.call("mode", sid=sid, mode="plan")
+        huge = "# Huge plan\n\n" + line*(300*1024//len(line))
+        t.host.write(plan, huge)
+        h.send("prompt", sid=sid, text="Write inside again.")
+        again = planask(h, sid, ask["seq"])
+        ends = [e["text"] for e in h.all("tool.end", sid) if "too long" in e["text"]]
+        t.check(len(ends) == 1 and "under 256 KiB" in ends[0] and plan in ends[0],
+                f"refused: {ends}")
+        t.check(again["detail"] == "# Plan\n\n- Write **inside.txt**.", f"short: {again}")
+
+        # Grown past it by hand while asked
+        t.host.write(plan, huge)
+        h.call("answer", sid=sid, req=again["req"], decision="allow")
+        ended(h, sid, 2)
+        res = [e["text"] for e in h.all("tool.end", sid) if "approved your plan" in e["text"]]
+        t.check(len(res) == 2 and "grew over 256 KiB" in res[1] and
+                "Huge plan" not in res[1], f"grown: {res[-1:]}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=15)
 def plan_enter(t):
     """enter_plan_mode: unattended, denied by policy; attended, allowed,
     which the call's result tells, with no notice, then the plan approved."""

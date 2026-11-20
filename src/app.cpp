@@ -962,6 +962,7 @@ struct PlanFile {
     i64         id;     // the command in flight, 0 if none
     Str         err;
     b32         have;   // the file was read whole: it exists
+    b32         cut;    // or its first PLAN_MAX bytes, with more after
     i32         got;    // reads finished, the text whole
     Arena       mem;
     byte       *base;
@@ -4014,6 +4015,8 @@ static void planpart(Gui *g)
     putstr(&w.json, "plan.md");  // in the session's directory
     putkey(&w.json, "off");
     putint(&w.json, f->off);
+    putkey(&w.json, "max");
+    putint(&w.json, PLAN_MAX - f->off);
     f->id = g->nextid;
     cmdsend(g, &w, a);
 }
@@ -4045,6 +4048,7 @@ static void guiplan(Gui *g)
     f->off  = 0;
     f->err  = {};
     f->have = 0;
+    f->cut  = 0;
     planpart(g);
 }
 
@@ -4074,8 +4078,8 @@ static void showfile(Gui *g, GuiSession *s, Str path)
     scheddirty(&g->sched);
 }
 
-// A part of the plan arrived, and then the next, if more, as long as
-// the plan is no longer than the engine takes (PLAN_MAX).
+// A part of the plan arrived, and then the next, if more, up to what
+// the engine puts to the user (PLAN_MAX): past it, the start shows.
 static void onplanfile(Gui *g, Json *j, b32 ok, Str err)
 {
     PlanFile *f = &g->plan;
@@ -4085,16 +4089,13 @@ static void onplanfile(Gui *g, Json *j, b32 ok, Str err)
         f->err = err=="no such file" ? Str{} : clone(&f->mem, err);
         return;
     }
-    Str text = jsonstr(jsonget(j, "text"));
-    if (f->text.len+text.len > (iz)64<<10) {
-        f->err = "too long to show";
-        return;
-    }
-    print(&f->text, text);
-    f->off = jsonint(jsonget(j, "off"), f->off);
-    if (jsonint(jsonget(j, "more"), 0) && f->s) {
+    print(&f->text, jsonstr(jsonget(j, "text")));
+    f->off   = jsonint(jsonget(j, "off"), f->off);
+    b32 more = jsonint(jsonget(j, "more"), 0) != 0;
+    if (more && f->s && f->off<PLAN_MAX) {
         planpart(g);
     } else {
+        f->cut  = more && f->off>=PLAN_MAX;
         f->have = 1;
         f->got++;
     }

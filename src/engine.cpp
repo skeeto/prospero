@@ -141,6 +141,8 @@ enum : i64 {
     SNAPSHOT_MAX = 256 << 10,     // bytes of text in a snapshot
     QUEUE_SHOW   = 4 << 10,       // bytes of a queued message a queue shows
     FILECMD_MAX  = 1 << 20,       // bytes of a file a file command gives
+    PLAN_MAX     = 256 << 10,     // bytes of a plan put to the user (the Plan pane's too)
+    PLAN_INLINE  = 64 << 10,      // and repeated to the agent on approval
     DIRCMD_MAX   = 2000,          // entries a dir command gives
     DIRCMD_BYTES = 256 << 10,     // and bytes of their names
     FSSTAT_MAX   = 64,            // paths an fs.stat command takes
@@ -4657,10 +4659,6 @@ static void toolmemory(Session *s, Arena scratch, Args *args)
 // agent did not ask for reaches it as a notice (planheed), as changed
 // instructions do, and so does the mode again after a compaction.
 
-enum : iz {
-    PLAN_MAX = 64 << 10,  // bytes of a plan put to the user
-};
-
 // What plan mode allows, for the agent.
 static Str planrules(Session *s, Arena *a)
 {
@@ -5003,7 +5001,9 @@ static PlanText readplan(Session *s, Arena *a)
         Buf b(a, 256 + s->planfile.len);
         print(&b, "The plan is too long to put to the user: keep ");
         print(&b, s->planfile);
-        print(&b, " under 64 KiB, then call exit_plan_mode again.");
+        print(&b, " under ");
+        print(&b, (i64)PLAN_MAX>>10);
+        print(&b, " KiB, then call exit_plan_mode again.");
         r.err = finish(&b);
         r.big = 1;
     } else if (rd.err || !trim(rd.data).len) {
@@ -5057,18 +5057,35 @@ static void planresolve(Session *s, Arena scratch, b32 allow, i32 by, Str note,
             // The user emptied it, or made it too long, since the ask
             print(&b, "The plan file, ");
             print(&b, s->planfile);
-            print(&b, plan.big ? Str(", grew over 64 KiB before the user approved it: "
-                                     "read it there, and carry out what it says.")
-                               : Str(", was empty or unreadable when the user approved "
-                                     "it: carry out the plan as you wrote it."));
+            if (plan.big) {
+                print(&b, ", grew over ");
+                print(&b, (i64)PLAN_MAX>>10);
+                print(&b, " KiB before the user approved it: read it there, and "
+                          "carry out what it says.");
+            } else {
+                print(&b, ", was empty or unreadable when the user approved it: "
+                          "carry out the plan as you wrote it.");
+            }
         } else if (hash(plan.text) != s->ask.plansum) {
             // Revised by hand (Edit plan), which the user approved
             print(&b, "The user revised the plan before approving it, so it is "
-                      "not the one you wrote: carry out the revised plan, below "
-                      "and in ");
+                      "not the one you wrote: carry out the revised plan");
+            if (plan.text.len > PLAN_INLINE) {
+                // Too long to repeat in the context: the file has it
+                print(&b, ", in ");
+                print(&b, s->planfile);
+                print(&b, ". Read it there first.");
+            } else {
+                print(&b, ", below and in ");
+                print(&b, s->planfile);
+                print(&b, ".\n\n");
+                print(&b, plan.text);
+            }
+        } else if (plan.text.len > PLAN_INLINE) {
+            // The agent wrote it, so it has it: no second copy
+            print(&b, "The plan, as approved, is the one in ");
             print(&b, s->planfile);
-            print(&b, ".\n\n");
-            print(&b, plan.text);
+            print(&b, ".");
         } else {
             print(&b, "The plan, as approved, also in ");
             print(&b, s->planfile);
