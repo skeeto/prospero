@@ -898,6 +898,7 @@ static Str ctrcreate(CtrRun *run, Arena *perm, Arena scratch, Ctr *c, Str cpus,
                                          ctrsaid(&scratch, &p, Str("exec")));
     }
     if (why.len) {
+        // arenalint: carve ok, as keep is off: ctrkeep lists nothing
         ctrremove(run, &scratch, carve(&scratch, 1<<20), c);
         return clone(perm, why);
     }
@@ -997,6 +998,8 @@ static i32 ctrleftovers(CtrRun *run, Arena scratch, Str program, Str owner)
         Ctr   c    = rd.err==READ_OK ? ctrparse(&tmp, d->name, rd.data) : Ctr{};
         c.name     = d->name;
         c.program  = program;  // the runtime as found now
+        // arenalint: carve ok, as ctrkeep lists one container's sessions,
+        // about 100 bytes each, beside two of its 8 MiB logs at a time
         ctrremove(run, &tmp, carve(&tmp, 1<<25), &c, 1);  // its sessions kept
         n++;
     }
@@ -1015,7 +1018,7 @@ static i32 ctrleftovers(CtrRun *run, Arena scratch, Str program, Str owner)
         Ctr   c   = {};
         c.name    = ns.head;
         c.program = program;
-        ctrremove(run, &tmp, carve(&tmp, 1<<20), &c);
+        ctrremove(run, &tmp, carve(&tmp, 1<<20), &c);  // arenalint: carve ok, keep off
         n++;
     }
     return n;

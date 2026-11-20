@@ -6135,6 +6135,8 @@ static void attachclear(Gui *g, GuiSession *s)
 
 // The sending stopped short: the images stay, the text goes back in
 // the box if it is still empty, and the note says why.
+// arenalint: frame ok, as err is a literal or onattach's record, which
+// guirecord parsed in the frame itself, below its base
 static void attachfail(Gui *g, GuiSession *s, Str err)
 {
     AttBox *x = s->att;
