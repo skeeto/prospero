@@ -3854,6 +3854,14 @@ static Detached os_detach(Os *os, Arena scratch, Slice<Str> argv, Str cwd, Str e
         dup2(null, 0);
         dup2(null, 1);
         dup2(err>=0 ? err : null, 2);
+        // Nothing else inherited: a descriptor made close-on-exec only
+        // after its creation (a pipe on macOS, an accept), by another
+        // thread as this forked, would stay open in the engine for good
+        for (i32 fd = 3; fd < 1024; fd++) {
+            if (fd != p[1]) {
+                close(fd);
+            }
+        }
         if (chdir(ccwd)) {
             // It starts where this process is, then
         }
