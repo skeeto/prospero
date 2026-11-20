@@ -5360,6 +5360,7 @@ def sc_compact_manual(model, n, req):
 
 
 sc_compact_cancel = sc_compact_manual
+sc_compact_manual_cut = sc_compact_manual
 
 
 def sc_compact_chat(model, n, req):

@@ -8779,6 +8779,69 @@ def compact_manual(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+@scenario(conf=BIG, bound=25, alone=True)
+def compact_manual_cut(t):
+    """compact, then a prompt, which carries the notice of the summary;
+    rewound and sent again, it carries it again, as the notices waiting
+    before it come back (#85); an instruction file changed in the turn
+    rewound, which its own check told, is told once, by the check made
+    again; and an undo of the rewind takes the notice back, since the
+    turn it restores has it."""
+    bigfiles(t, 8, 256)
+    t.put("AGENTS.md", "Rule one.\n")
+    h = t.headless()
+
+    def told(req, start):
+        return [m for m in chat(req) if m.get("role") == "user" and
+                str(m.get("content")).startswith(start)]
+    summ  = "Your conversation was just summarized."
+    instr = "Instruction files changed since you read them."
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="read them")
+        t.check(ended(h, sid, 1)["why"] == "done", "the reads")
+        r = h.call("compact", sid=sid)
+        t.check(r.get("ok") == 1, f"compact {r}")
+        t.check(ended(h, sid, 2)["why"] == "done", "compacted")
+        t.put("AGENTS.md", "Rule two, longer.\n")
+        t.host.touch(t.host.join(t.work, "AGENTS.md"), time.time() + 10)
+        h.send("prompt", sid=sid, text="again")
+        ended(h, sid, 3)
+        req = t.requests()[-1]
+        t.check(len(told(req, summ)) == 1 and len(told(req, instr)) == 1,
+                "told of the summary and the instructions")
+
+        r = h.call("cut", sid=sid, turn=3)
+        t.check(r.get("ok") == 1 and r.get("next") == "again", f"cut {r}")
+        h.send("prompt", sid=sid, text="again")
+        ended(h, sid, 4)
+        after = t.requests()[-1]
+        t.check(chat(after)[:2] == chat(req)[:2] and
+                after["body"].get("tools") == req["body"].get("tools"),
+                "the same system prompt, checkpoint and tools")
+        t.check(len(told(after, summ)) == 1, f"told of the summary again: "
+                f"{[str(m.get('content'))[:40] for m in chat(after)[-4:]]}")
+        t.check(len(told(after, instr)) == 1, "told of the instructions once")
+        t.check(chat(after)[-1]["content"].startswith(summ) or
+                chat(after)[-1]["content"].startswith(instr),
+                "after the prompt, as before")
+
+        # Rewound again, then undone: the turn back has the notice, so
+        # the next prompt is not told it a second time
+        r = h.call("cut", sid=sid, turn=4)
+        t.check(r.get("ok") == 1, f"cut again {r}")
+        r = h.call("uncut", sid=sid)
+        t.check(r.get("ok") == 1, f"uncut {r}")
+        h.send("prompt", sid=sid, text="once more")
+        ended(h, sid, 5)
+        last = t.requests()[-1]
+        t.check(len(told(last, summ)) == 1 and chat(last)[-1]["content"] == "once more",
+                f"told once, in the turn restored: {len(told(last, summ))}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 @scenario(conf=BIG, bound=40, alone=True)
 def compact_chat(t):
     """compact twice over chat alone, no files to list: the second

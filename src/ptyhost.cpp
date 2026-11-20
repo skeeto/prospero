@@ -2764,7 +2764,8 @@ static Session *termnoticeto(Engine *e, Arena scratch, Str sid)
 // starting a turn: one of the same Run not yet delivered gives way.
 static void termnoticeput(Session *s, Notice n)
 {
-    n.text = clone(&s->perm, n.text);
+    n.text   = clone(&s->perm, n.text);
+    n.queued = s->log.seq;
     for (iz i = 0; i < s->notices.len; i++) {
         if (s->notices[i].kind=="terminal" && s->notices[i].key==n.key) {
             s->notices[i] = n;

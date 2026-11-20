@@ -328,6 +328,9 @@ struct Notice {
     u64 key;     // which a newer one replaces it
     Slice<Grant> grants;  // for "grants": what the agent knows of once
     Slice<Str>   denies;  // told, whole (grantheed)
+    i64 queued;  // the log's seq when queued: a rewind gives back one
+                 // queued before the turn it rewinds (cutnotices)
+    i64 recut;   // the cut that gave it back, which an uncut takes back
 };
 
 enum : i32 {
@@ -1888,6 +1891,7 @@ static void notify(Session *s, Str kind, Str text, i64 job)
     n.kind = kind;
     n.text = clone(&s->perm, text);
     n.job  = job;
+    n.queued = s->log.seq;
     s->notices = push(&s->perm, s->notices, n);
 }
 
@@ -1931,6 +1935,7 @@ static void deliver(Session *s, Arena scratch)
         Buf     b(&a, size);
         EvOut   w = sbegin(s, &b, EV_NOTICE);
         putstrkey(&w.json, "kind", n->kind);
+        putintkey(&w.json, "queued", n->queued);
         if (n->job) {
             putintkey(&w.json, "job", n->job);
         }
@@ -19229,6 +19234,7 @@ static void bgnotice(Session *p, Arena scratch, Str call, Str sid, Str title,
     n.ftitle = clone(&p->perm, title);
     n.host   = clone(&p->perm, host);
     n.urls   = urls;
+    n.queued = p->log.seq;
     p->notices = push(&p->perm, p->notices, n);
     if (!busy(p)) {
         beginturn(p, scratch, "task");
@@ -20020,6 +20026,7 @@ static void toolmessage(Session *s, Arena scratch, Args *args)
     n.text   = clone(&t->perm, msgnotice(&scratch, s, args->text, n.hop));
     n.from   = clone(&t->perm, s->sid);
     n.ftitle = clone(&t->perm, s->title);
+    n.queued = t->log.seq;
     t->notices = push(&t->perm, t->notices, n);
 
     b32 wake = !busy(t) && n.hop<HOP_MAX && !e->quitting;
@@ -21710,18 +21717,77 @@ static Notice noticecopy(Arena *a, Notice n)
     return n;
 }
 
+// The notices a cut gives back (cmdcut): those the turns it rewinds
+// were told that had been queued before the first of them began, at
+// from, such as the one that a summary happened (#85). They were
+// waiting before the prompt the rewind puts back, so they wait again,
+// to be told with it. Notices queued from then on, such as the turn's
+// own checks of instruction files, skills and memory, which the cut
+// takes back and its next turn makes again, are the rewound turns'.
+// So are mode, shell and permissions, which a revival tells anew if
+// need be. A record from before queued was logged has none to give.
+// The notices go in a, temporaries in scratch, another region's.
+static Slice<Notice> cutnotices(Arena *a, Arena scratch, Slice<Str> lines,
+                                LogCuts *cuts, i64 from)
+{
+    Slice<Notice> r = {};
+    for (iz i = 0; i < lines.len; i++) {
+        if (lineev(lines[i]) != "notice") {
+            continue;
+        }
+        Arena t = scratch;
+        EvRec v = evparse(&t, lines[i]);
+        Json *j = v.root;
+        Str   kind = jsonstr(jsonget(j, "kind"));
+        if (v.seq<from || incut(cuts, v.seq) || jsonint(jsonget(j, "queued"), from)>=from ||
+                kind=="mode" || kind=="shell" || kind=="grants") {
+            continue;
+        }
+        Notice n = {};
+        n.kind   = clone(a, kind);
+        n.text   = clone(a, jsonstr(jsonget(j, "text")));
+        n.job    = jsonint(jsonget(j, "job"), 0);
+        n.skills = jsonget(j, "skills")->type == JSON_ARRAY;
+        n.urls   = geturls(a, jsonget(j, "urls"));
+        n.queued = jsonint(jsonget(j, "queued"), 0);
+        if (kind == "message") {
+            n.from   = clone(a, jsonstr(jsonget(j, "from")));
+            n.ftitle = clone(a, jsonstr(jsonget(j, "from_title")));
+            n.hop    = (i32)jsonint(jsonget(j, "hop"), 0);
+        } else if (kind == "task") {
+            n.from   = clone(a, jsonstr(jsonget(j, "child")));
+            n.ftitle = clone(a, jsonstr(jsonget(j, "child_title")));
+            n.host   = clone(a, jsonstr(jsonget(j, "host")));
+        } else if (kind == "terminal") {
+            n.tid  = jsonint(jsonget(j, "tid"), 0);
+            n.code = (i32)jsonint(jsonget(j, "code"), 0);
+            n.ms   = jsonint(jsonget(j, "ms"), 0);
+        }
+        r = push(a, r, n);
+    }
+    return r;
+}
+
 // Build an idle session again from its log, whose meaning a rewind of
 // its conversation changed (cut, uncut), so that it is as a revival, or
 // a restart, would make it: parked, then revived at once. What it was
 // to tell the agent next, which no log has yet, goes along, but for
 // its mode, shell and permissions, which a revival tells anew if need
-// be. Null if it cannot be read again, which leaves it parked.
-static Session *reload(Engine *e, Arena scratch, Session *s)
+// be. Ahead of them, as queued before them, go those a cut gives back
+// (cutnotices); an uncut of cut untold drops those that cut gave back,
+// which the turns it restores have told. Null if it cannot be read
+// again, which leaves it parked.
+static Session *reload(Engine *e, Arena scratch, Session *s,
+                       Slice<Notice> back = {}, i64 untold = 0)
 {
     Slice<Notice> keep = {};
+    for (iz i = 0; i < back.len; i++) {
+        keep = push(&scratch, keep, noticecopy(&scratch, back[i]));
+    }
     for (iz i = 0; i < s->notices.len; i++) {
         Notice n = s->notices[i];
-        if (!(n.kind=="mode") && !(n.kind=="shell") && !(n.kind=="grants")) {
+        if (!(n.kind=="mode") && !(n.kind=="shell") && !(n.kind=="grants") &&
+                !(untold && n.recut==untold)) {
             keep = push(&scratch, keep, noticecopy(&scratch, n));
         }
     }
@@ -21857,6 +21923,8 @@ static void cmdcut(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
     }
 
     i64 last = s->turn;
+    // Temporaries in the log's arena, as reload's revive will reuse it
+    Slice<Notice> back = cutnotices(&scratch, lines, rp.lines, &cuts, from);
     {
         Buf   b(&scratch, 256);
         EvOut w = sbegin(s, &b, EV_CUT);
@@ -21888,8 +21956,11 @@ static void cmdcut(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
                                    "so they were not undone.");
         ssend(s, &w);
     }
+    for (iz i = 0; i < back.len; i++) {
+        back[i].recut = cut;
+    }
     Str sid = clone(&keep, s->sid);
-    s = reload(e, scratch, s);
+    s = reload(e, scratch, s, back);
     if (!s) {
         reply(e, scratch, id, 0, "rewound, but the session cannot be read again", sid);
         return;
@@ -22002,7 +22073,7 @@ static void cmduncut(Engine *e, Session *s, Arena scratch, i64 id)
         ssend(s, &w);
     }
     Str sid = clone(&keep, s->sid);
-    s = reload(e, scratch, s);
+    s = reload(e, scratch, s, {}, cut);
     if (!s) {
         reply(e, scratch, id, 0, "undone, but the session cannot be read again", sid);
         return;
