@@ -166,6 +166,8 @@ struct RemoteSess {
     b32  attended;
 };
 
+struct RemoteDeploy;
+
 struct Remote {
     Os               *os;
     RemoteConf        conf;
@@ -211,6 +213,7 @@ struct Remote {
     b32               nopty;    // and its pty 0: no pseudoconsoles (XP)
     i32               need;     // NEED_*: why deploying would help
     b32               deploying;
+    RemoteDeploy     *deploy;   // while deploying: its outcome, once done
     b32               deployed; // tried once: never again
     b32               redeploy; // deploy once this stream ends
     i32               cancel;   // stops a deployment (atomic)
@@ -638,6 +641,8 @@ struct RemoteDeploy {
     DeployConf conf;
     Region    *perm;     // kept: a child may post to its mailbox late
     Region    *scratch;
+    Str        outcome;  // REMOTE_DEPLOYED's data, once done is set
+    i32        done;     // atomic
 };
 
 static void remotedeploythread(void *arg)
@@ -651,7 +656,12 @@ static void remotedeploythread(void *arg)
     putbyte(&b, (u8)d.ok);
     print(&b, d.ok ? d.path : d.err);
     os_release(r->os, rd->scratch);
-    mailpost(r->in, REMOTE_DEPLOYED, 0, finish(&b), 0);
+    // The outcome stays here, the post only a wake: a non-blocking post
+    // is dropped once anything else was, and deploying would stay set
+    // for good (remotedeployed reads it after each take)
+    rd->outcome = finish(&b);
+    __atomic_store_n(&rd->done, 1, __ATOMIC_RELEASE);
+    mailpost(r->in, REMOTE_DEPLOYED, 0, {}, 0);
 }
 
 // Deploy an engine there, once, then connect to it.
@@ -682,6 +692,7 @@ static void remotedeploy(Remote *r, Arena scratch, Str why)
         return;
     }
     r->deploying = 1;
+    r->deploy    = rd;
     Str msg = concat(&scratch, "deploying an engine: ", why);
     remotestatus(r, scratch, RS_DEPLOYING, msg, -1);
 }
@@ -1185,19 +1196,8 @@ static void remotethread(void *arg)
                 }
                 break;
             case REMOTE_DEPLOYED:
-                r->deploying = 0;
-                if (rec.data.len && rec.data[0]) {
-                    r->need     = NEED_NONE;
-                    r->fresh    = 1;  // starting a host of the new engine
-                    r->tries    = 0;
-                    r->backoffs = 0;
-                    r->retryat  = os_ticks(os);
-                } else {
-                    Str err = cuthead(rec.data, rec.data.len>0);
-                    r->why = concat(&r->perm, "cannot deploy an engine: ", err);
-                    remoteend(r, a, RS_FAILED, r->why);
-                }
-                break;
+                break;  // a wake: the outcome is read below
+
             case MAIL_OUT:
                 remoteemit(r, rec.data);  // a deployment's progress
                 break;
@@ -1206,6 +1206,23 @@ static void remotethread(void *arg)
                     remotedown(r, a, "the host closed the connection", -1);
                 }
                 break;
+            }
+        }
+        RemoteDeploy *rd = r->deploy;
+        if (!r->done && rd && __atomic_load_n(&rd->done, __ATOMIC_ACQUIRE)) {
+            Str out = rd->outcome;
+            r->deploy    = 0;
+            r->deploying = 0;
+            if (out.len && out[0]) {
+                r->need     = NEED_NONE;
+                r->fresh    = 1;  // starting a host of the new engine
+                r->tries    = 0;
+                r->backoffs = 0;
+                r->retryat  = os_ticks(os);
+            } else {
+                Str err = cuthead(out, out.len>0);
+                r->why = concat(&r->perm, "cannot deploy an engine: ", err);
+                remoteend(r, scratch, RS_FAILED, r->why);
             }
         }
         if (!r->done && (asked & REMOTE_DROP) && r->live && !r->closing) {
