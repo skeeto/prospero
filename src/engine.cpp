@@ -1245,6 +1245,14 @@ static i64 tps10(Session *s)
     return (s->tokens - 1)*10*SEC / dt;
 }
 
+// Whether this computer's own window runs ep's model: a builtin endpoint
+// of the engine's own configuration. A thin engine's builtin endpoints
+// are another computer's, relayed as any other.
+static b32 epwindow(Engine *e, Endpoint *ep)
+{
+    return ep->kind==EP_BUILTIN && !e->cfg->thin;
+}
+
 // The endpoint of the current request.
 static Endpoint *reqep(Session *s)
 {
@@ -1343,7 +1351,7 @@ static void live(Session *s)
             putintkey(&w.json, "watchdog_ms", (at>now ? at-now : 0)/MS);
             putintkey(&w.json, "watchdog_of", of/MS);
         }
-        if (ep->relay.len && s->relaybylen && ep->kind!=EP_BUILTIN) {
+        if (ep->relay.len && s->relaybylen && !epwindow(s->e, ep)) {
             // The computer relaying it (at most 63 bytes), and its line,
             // but not the window running the built-in model
             putstrkey(&w.json, "relay", Str(s->relayby, s->relaybylen));
@@ -1355,7 +1363,7 @@ static void live(Session *s)
     } else if (s->state == S_RELAY) {
         i64 left = s->timers[T_RELAY] - now;
         putintkey(&w.json, "relay_until", os_time(os) + left/MS);
-        if (reqep(s)->kind == EP_BUILTIN) {
+        if (epwindow(s->e, reqep(s))) {
             putintkey(&w.json, "relay_window", 1);  // it waits for the window
         }
     } else if (s->state == S_BACKOFF) {
@@ -2337,7 +2345,7 @@ static b32 admit(Session *s, Arena scratch)
 // Model calls, made here or relayed (relay.cpp)
 
 static RelayCall *relaystart(Engine *, Endpoint *, HttpReq *, Session *,
-                             b32 keep, Arena scratch, i64 to);
+                             b32 keep, Arena scratch, i64 to, Str sid = {});
 struct RelayPeer;
 static Slice<Skill> relayskills(Engine *, Session *, Arena *);
 static void relaycancel(Engine *, RelayCall *);
@@ -2834,7 +2842,7 @@ static b32 relaygate(Session *s, Arena scratch, Endpoint *ep)
         i64     budget = scaled(e, cfgms(e->cfg, "endpoint", ep->name,
                                          "slow_retry_budget", 0)*MS);
         Buf b(&scratch, 256 + ep->relay.len);
-        if (ep->kind == EP_BUILTIN) {
+        if (epwindow(e, ep)) {
             print(&b, "paused: Prospero's window runs the built-in model of "
                       "endpoint ");
             print(&b, ep->relay);
@@ -26928,7 +26936,7 @@ static void ontimer(Session *s, Arena scratch, i32 t)
         return;
     case T_RELAY: {
         Endpoint *ep  = reqep(s);
-        Str       msg = concat(&scratch, ep->kind==EP_BUILTIN ?
+        Str       msg = concat(&scratch, epwindow(s->e, ep) ?
                                Str("Prospero's window, which runs the built-in "
                                    "model, was not open for endpoint ") :
                                Str("no connected computer relayed model calls "

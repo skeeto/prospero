@@ -204,7 +204,9 @@ memory. The engine relays its calls to the window, as it relays a thin
 remote's to this computer, so a session on it waits, paused, while no
 window is open (Prospero in the background, or `prospero run`). It runs
 one request at a time (`max_concurrent` is 1): another session's turn
-waits in line. It takes no images. Its context window is 65536 tokens,
+waits in line, a thin remote's too. A thin remote is offered it as any
+other endpoint here, and its calls come to this computer's engine, which
+passes them to the window: its sessions run while the window is open. It takes no images. Its context window is 65536 tokens,
 and the prompts of the last few sessions stay cached in memory, up to
 2 GB, so each turn computes only what is new. A session on it, unless
 its role or its caller names tools, gets only read, write, edit, shell,

@@ -213,7 +213,10 @@ processor), and 6 GB of memory; on another, its page says why it can't
 run. It answers one request at a time, so a second session's turn says
 "1 in line" until the first's is done. Its sessions wait, paused, while
 Prospero's window is closed, and go on once it opens. It reads no
-images.
+images. A remote host with no endpoint of its own can use it too, while
+this window is open: its sessions' turns run here, in the same line.
+Its sessions get fewer tools (read, write, edit, shell, grep and glob)
+and are asked to test their work, which a small model needs.
 
 ## Settings worth knowing
 

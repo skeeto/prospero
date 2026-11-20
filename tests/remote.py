@@ -3659,6 +3659,38 @@ def relay_turn(t):
 
 
 @scenario
+def relay_turn_builtin(t):
+    """A thin host offered another computer's built-in model lists it and
+    runs a turn on it, through the client, as on any relayed endpoint:
+    the bodies packed, the computer named, and the session given the
+    small model's tools."""
+    thinconfig(t)
+    model = t.model("remote_tool")
+    c, rl = relayclient(t, model, name="builtin", kind="builtin", listed=[model])
+    try:
+        r = c.call("models")
+        t.check(model in json.dumps(r), f"listed: {json.dumps(r)[:400]}")
+        r = c.call("new", cwd=t.work, prompt="go")
+        t.check(r.get("ok") == 1, f"new: {r}")
+        sid = r["sid"]
+        end = c.stream.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid,
+                            timeout=30, what="turn.end")
+        t.check(end.get("why") == "done", f"turn.end {end}")
+        posts = [h for h, b in rl.calls if h["method"] == "POST"]
+        t.check(len(posts) == 2 and posts[1].get("base") and
+                all(h.get("kind") == "builtin" for h in posts),
+                f"packed: {[(h.get('kind'), h.get('base')) for h in posts]}")
+        live = [x for x in c.all() if x.get("ev") == "live" and x.get("sid") == sid
+                and x.get("relay")]
+        t.check(live and live[0]["relay"] == "testbox", "live names the computer")
+        rec = [x for x in c.all() if x.get("ev") == "session" and x.get("sid") == sid]
+        t.check(rec and rec[0].get("tools") == ["read", "write", "edit", "shell", "grep", "glob"],
+                f"the small model's tools: {rec[:1]}")
+    finally:
+        rl.stop = True
+
+
+@scenario
 def relay_responses(t):
     """A thin host's turn at an endpoint of kind responses: the calls go to
     v1/responses, the records name the kind, and the second body is a
@@ -4093,6 +4125,73 @@ def relay_serve(t):
     c.stream.command({"cmd": "relay.call", "cid": e, "origin": "thin", "cancel": 1})
     d = sv.done(e)
     t.check(d["err"] == "cancel", f"cancel: {d}")
+
+
+@scenario
+def relay_serve_builtin(t):
+    """An engine offers its built-in model to thin engines, with a local
+    endpoint's timeouts, and makes their calls to it through its own
+    window, as its own sessions' go: whole, though the thin engine sent a
+    delta deflated, for the thin session's cache; its answer goes back
+    to the thin engine, and a cancel goes on to the window."""
+    with open(t.config, "a", newline="") as f:
+        f.write("\n[endpoint builtin]\nkind = builtin\n")
+    model = t.model("remote_slow")
+    c = Client(t)
+    c.attach()
+    c.call("hello")
+    # No window yet: the far side hears so at once
+    sv = Served(t, c)
+    d = sv.done(sv.call(chatbody(model, "early"), endpoint="builtin", kind="builtin",
+                        model=model, session="far0"))
+    t.check(d["err"] == "connect" and "window" in d["text"], f"no window: {d}")
+    # This client is the window, offering the model as bloffer does
+    win = {"machine": "", "endpoints": [{"name": "builtin", "kind": "builtin",
+                                         "models": [model]}]}
+    r = c.call("relay.offer", offer=win)
+    t.check(r.get("ok") == 1, f"the window's offer: {r}")
+    rl = Relayer(t, c)
+    try:
+        c.call("models")  # as the window lists them, before it asks for the offer
+        o = c.call("offer").get("offer", {})
+        eps = {e["name"]: e for e in o.get("endpoints", [])}
+        g = eps.get("builtin", {})
+        t.check(g.get("kind") == "builtin", f"offered: {list(eps)}")
+        t.check(g.get("first_byte_timeout") == "1800", f"a local endpoint's timeout: {g}")
+        t.check(g.get("models") == [model], f"the window's models, as it offered them: {g}")
+
+        b1 = chatbody(model, "first")
+        d = sv.done(sv.call(b1, endpoint="builtin", kind="builtin", model=model, session="far1"))
+        t.check(d["err"] == "ok", f"whole: {d}")
+        b2 = chatbody(model, "first, then more")
+        a = sv.call(b2, base=b1, endpoint="builtin", kind="builtin", model=model,
+                    session="far1", deflate=True)
+        d = sv.done(a)
+        t.check(d["err"] == "ok", f"delta: {d}")
+        t.check("w39" in sv.text(a), "the window's answer")
+        posts = [h for h, b in rl.calls if h["method"] == "POST"]
+        bodies = [b for h, b in rl.calls if h["method"] == "POST"]
+        t.check(len(posts) == 2 and all(h.get("endpoint") == "builtin" and h.get("kind") == "builtin"
+                                        and h.get("session") == "far1" for h in posts),
+                f"to the window: {posts}")
+        t.check(not any(h.get("zlen") or h.get("base") or h.get("keep") for h in posts),
+                f"whole to the window: {posts}")
+        t.check(bodies[1] == b2, "the body made from the delta")
+
+        # Cancelled while it streams: the window hears
+        e = sv.call(chatbody(model, "slow"), endpoint="builtin", kind="builtin", model=model,
+                    session="far1")
+        c.stream.wait(lambda r: r.get("ev") == "relay.data" and r.get("cid") == e
+                      and "body" in r, what="a body")
+        c.stream.command({"cmd": "relay.call", "cid": e, "origin": "thin", "cancel": 1})
+        d = sv.done(e)
+        t.check(d["err"] == "cancel", f"cancel: {d}")
+        deadline = time.time() + 10
+        while len(rl.cancelled) < 1 and time.time() < deadline:
+            time.sleep(0.05)
+        t.check(rl.cancelled, "the window's call cancelled")
+    finally:
+        rl.stop = True
 
 
 @scenario

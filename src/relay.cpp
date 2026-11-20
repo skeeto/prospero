@@ -158,6 +158,7 @@ struct RelayServe {
     i32         qlen;
     b32         go;       // admitted: send at the next pass
     Http       *http;
+    RelayCall  *rc;       // instead, to this computer's window (builtin)
     u64         httpid;
     i32         status;
     Buf         errbody;  // an error's first bytes, for the KV-full check
@@ -816,9 +817,10 @@ static void relayfailpeer(Engine *e, RelayPeer *p, Str why)
 // Start relaying a request for session s (or none), to the computer its
 // gate chose, or with no ep, at relay://PATH: a web search (search), to
 // one that searches, or a skill's fetch (skill/NAME), to the one that
-// listed it (to). Never fails here: a failure ends it at the next pass.
+// listed it (to). With no session, sid names the one it is for, if any.
+// Never fails here: a failure ends it at the next pass.
 static RelayCall *relaystart(Engine *e, Endpoint *ep, HttpReq *req,
-                             Session *s, b32 keep, Arena scratch, i64 to)
+                             Session *s, b32 keep, Arena scratch, i64 to, Str sid)
 {
     Relay *r    = e->relay;
     Str    pre  = ep ? concat(&scratch, ep->url, "/") : Str("relay://");
@@ -826,8 +828,8 @@ static RelayCall *relaystart(Engine *e, Endpoint *ep, HttpReq *req,
     b32    skill = !ep && startswith(path, "skill/");
     path = ep || skill || path=="search" ? path : Str{};
     i64    peer = skill ? to : !ep ? relaysearcher(e, s) : s ? s->relaypeer : 0;
-    Str    sid  = s ? s->sid : Str{};
     Str    body = req->body;
+    sid = s ? s->sid : sid;
     if (!peer && ep) {
         for (RelayPeer *p = r->peers; p; p = p->next) {
             if (relayeligible(p, ep, {}) && (!peer || p->seq>relaypeerbynum(e, peer)->seq)) {
@@ -836,9 +838,10 @@ static RelayCall *relaystart(Engine *e, Endpoint *ep, HttpReq *req,
         }
     }
 
-    // Whole to the window's built-in model, which would only spend
-    // time undoing a delta or deflate
-    b32 whole = ep && ep->kind==EP_BUILTIN;
+    // Whole to this computer's window's built-in model, which would only
+    // spend time undoing a delta or deflate; packed to another's, whose
+    // engine undoes it (relayserve)
+    b32 whole = ep && epwindow(e, ep);
     keep &= !whole;
 
     // A delta against the last body sent there, if smaller, then
@@ -919,9 +922,11 @@ static RelayCall *relaystart(Engine *e, Endpoint *ep, HttpReq *req,
     return c;
 }
 
+// Its computer is told, if it has the call, even when the call is freed
+// at the end the cancel delivered (relayfree, again)
 static void relaycancel(Engine *, RelayCall *c)
 {
-    c->tell = c->sent>0 && !c->ended && !c->failing;
+    c->tell |= c->sent>0 && !c->ended && !c->failing;
     relayend(c, HTTP_ECANCEL, "cancelled");
 }
 
@@ -1189,6 +1194,35 @@ static void relaysend(Engine *e, Arena scratch, RelayServe *v)
         }
     }
     Str path = v->path;
+    if (epwindow(e, &v->ep)) {
+        // To this computer's window, as its own sessions' calls go, its
+        // records coming back as HTTP's would (relaydeliver), if it is
+        // open: else the far side hears why at once
+        b32 open = 0;
+        for (RelayPeer *p = e->relay->peers; !open && p; p = p->next) {
+            open = relayeligible(p, &v->ep, {});
+        }
+        if (!open) {
+            relayrelease(e, v);
+            relayfinish(v, "connect", "Prospero's window, which runs the built-in "
+                                      "model there, is not open");
+            return;
+        }
+        HttpReq r = {};
+        r.method  = v->method;
+        r.url     = concat(&scratch, concat(&scratch, v->ep.url, "/"), path);
+        r.headers = concat(&scratch, concat(&scratch, "Accept: ", v->accept), "\r\n");
+        r.body    = v->body;
+        r.readms  = v->readms;
+        r.id      = v->httpid = ++e->nextid;
+        v->rc     = relaystart(e, &v->ep, &r, 0, 0, scratch, 0, v->session);
+        if (!v->rc) {
+            v->httpid = 0;
+            relayrelease(e, v);
+            relayfinish(v, "lost", "out of memory");
+        }
+        return;
+    }
     Str url  = startswith(path, "v1/") ? apiurl(&scratch, v->ep.url, cuthead(path, 3))
                                        : rooturl(&scratch, v->ep.url, path);
     if (v->ep.kind == EP_COPILOT) {
@@ -1304,6 +1338,8 @@ static void relayservecancel(Engine *e, RelayServe *v)
         webfree(e, v->web);
         v->web = 0;
         relayfinish(v, "cancel", "cancelled");
+    } else if (v->rc) {
+        relaycancel(e, v->rc);  // its HTTP_DONE ends it
     } else if (v->http) {
         os_httpcancel(e->os, v->http);  // its HTTP_DONE ends it
     } else {
@@ -1586,7 +1622,7 @@ static void relayserve(Engine *e, Arena scratch, Json *j, i64 cid, Str origin,
                    jsonflag(jsonget(j, "anthropic"), 0) ? EP_ANTHROPIC : EP_OPENAI;
         b32 known = !kn.len || epkindname(kind)==kn;
         b32 ok   = relayname(name) && endpointconf(e, &v->arena, name, &v->ep) &&
-                   v->ep.name==name && !v->ep.relay.len;
+                   v->ep.name==name && (!v->ep.relay.len || epwindow(e, &v->ep));
         i32 svc  = websearchservice(e);
         v->search = v->path=="search";
         v->skill  = startswith(v->path, "skill/");
@@ -1694,7 +1730,11 @@ static b32 relayrecord(Engine *e, Arena scratch, Record r)
         }
         if (v->held+r.data.len > RELAY_HOLD) {
             // Its client takes it too slowly: let it go, as lost
-            os_httpcancel(e->os, v->http);
+            if (v->rc) {
+                relaycancel(e, v->rc);
+            } else {
+                os_httpcancel(e->os, v->http);
+            }
             relayfinish(v, "lost", "the relayed response was taken too slowly");
             break;
         }
@@ -1702,8 +1742,13 @@ static b32 relayrecord(Engine *e, Arena scratch, Record r)
         v->held += r.data.len;
         break;
     case HTTP_DONE: {
-        os_httpfree(e->os, v->http);
+        if (v->rc) {
+            relayfree(e, v->rc);
+        } else {
+            os_httpfree(e->os, v->http);
+        }
         v->http   = 0;
+        v->rc     = 0;
         v->httpid = 0;
         if (v->slot==SLOT_HELD && contains(finish(&v->errbody), "Context size has been exceeded")) {
             // As fail does for a session's: llama.cpp's shared pool is full
@@ -1911,7 +1956,7 @@ static void relaytick(Engine *e, Arena scratch)
     }
     for (RelayServe **p = &r->serves; *p;) {
         RelayServe *v = *p;
-        if (v->finished && !v->http && !v->web && v->slot==SLOT_NONE) {
+        if (v->finished && !v->http && !v->rc && !v->web && v->slot==SLOT_NONE) {
             *p = v->next;
             os_release(e->os, v->mem);
         } else {
@@ -1933,7 +1978,7 @@ static i64 relaynext(Engine *e, i64 now)
     i64 next = I64MAX;
     for (RelayServe *v = r->serves; v; v = v->next) {
         work |= v->go || v->queued || v->sent || v->head || v->held ||
-                (v->done && !v->finished) || (v->finished && !v->http && !v->web);
+                (v->done && !v->finished) || (v->finished && !v->http && !v->rc && !v->web);
         next  = v->web && v->webby<next ? v->webby : next;
     }
     if (!work) {
@@ -1945,11 +1990,13 @@ static i64 relaynext(Engine *e, i64 now)
 
 // The offer: this engine's models, as a thin engine may relay them
 
-// Whether an offer has an endpoint: one with a URL of its own.
+// Whether an offer has an endpoint: one with a URL of its own, or the
+// built-in model that this computer's window runs.
 static b32 relayoffers(Engine *e, Arena scratch, Str name)
 {
     Endpoint ep = {};
-    return relayname(name) && endpointconf(e, &scratch, name, &ep) && !ep.relay.len;
+    return relayname(name) && endpointconf(e, &scratch, name, &ep) &&
+           (!ep.relay.len || epwindow(e, &ep));
 }
 
 // A model's settings for an offer, into w, flattened through like.
@@ -2002,6 +2049,48 @@ static void relaymodelput(Engine *e, JsonOut *w, Arena scratch, Str name)
     }
     putend(w);
     putend(w);
+}
+
+// Whether a model offered at ep comes before x's model k, in the order
+// relaywindowmodels goes.
+static b32 relayseenbefore(Engine *e, Endpoint *ep, RelayEp *x, iz k)
+{
+    for (RelayPeer *q = e->relay->peers; q; q = q->next) {
+        for (iz n = 0; !q->gone && n < q->eps.len; n++) {
+            RelayEp *y = &q->eps[n];
+            if (!(y->name==ep->relay) || y->kind!=ep->kind) {
+                continue;
+            }
+            for (iz m = 0; m < y->models.len; m++) {
+                if (y==x && m==k) {
+                    return 0;
+                } else if (y->models[m] == x->models[k]) {
+                    return 1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+// The built-in model's names at ep, as the windows here offered them,
+// each once, into w: no listing of it is kept (the window lists it), and
+// nothing is allocated, as w may be growing over scratch.
+static void relaywindowmodels(Engine *e, JsonOut *w, Endpoint *ep)
+{
+    for (RelayPeer *p = e->relay->peers; p; p = p->next) {
+        for (iz i = 0; !p->gone && i < p->eps.len; i++) {
+            RelayEp *x = &p->eps[i];
+            if (!(x->name==ep->relay) || x->kind!=ep->kind) {
+                continue;
+            }
+            for (iz k = 0; k < x->models.len; k++) {
+                if (!relayseenbefore(e, ep, x, k)) {
+                    putstr(w, x->models[k]);
+                }
+            }
+        }
+    }
 }
 
 // An offer, for relay.offer, into w: each endpoint that has a URL of its
@@ -2057,7 +2146,7 @@ static void relayofferput(Engine *e, JsonOut *w, Arena scratch, Str own, HostLin
         }
         endpointconf(e, &a, s->name, &ep);
         Url u     = parseurl(ep.url);
-        b32 local = u.ok && localhost(u.host);
+        b32 local = (u.ok && localhost(u.host)) || epwindow(e, &ep);
         named |= s->name == dep;
         putobject(w);
         putstrkey(w, "name", s->name);
@@ -2078,6 +2167,9 @@ static void relayofferput(Engine *e, JsonOut *w, Arena scratch, Str own, HostLin
         putkey(w, "models");
         putarray(w);
         Str *list = upsert(&e->listings, ep.url, (Arena *)0);
+        if (epwindow(e, &ep) && !(list && list->len)) {
+            relaywindowmodels(e, w, &ep);
+        }
         for (Str rest = list ? *list : Str{}; rest.len;) {
             Cut c = cut(rest, '\n');
             if (c.head.len) {
