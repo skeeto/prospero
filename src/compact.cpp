@@ -509,15 +509,16 @@ static Str encodesummary(Arena *a, Arena scratch, ModelConf *mc, Str prev,
 
 // The same request for Anthropic's Messages API (anthropic.cpp).
 static Str ansummary(Arena *a, Arena scratch, ModelConf *mc, Str prev,
-                     Str convo, i64 words, Str focus, i64 over)
+                     Str convo, i64 words, Str focus, i64 over, b32 claudecode = 0)
 {
     Msg m = {};
     m.role = ROLE_USER;
     m.text = summaryprompt(&scratch, prev, convo, words, focus, over);
     ChatReq r = {};
-    r.mc      = mc;
-    r.system  = compactsystem;
-    r.history = {&m, 1, 1};
+    r.mc         = mc;
+    r.system     = compactsystem;
+    r.history    = {&m, 1, 1};
+    r.claudecode = claudecode;
     return anencode(a, scratch, &r);
 }
 

@@ -287,12 +287,13 @@ static CfgKey cfgschema[] = {
      "their model takes, else its own default ([model] effort)"},
 
     {"endpoint", "kind", CFG_ENUM, "openai", {},
-     "openai anthropic responses chatgpt copilot builtin",
+     "openai anthropic responses chatgpt copilot anthropic-oauth builtin",
      "endpoint", "The API it speaks: openai (Chat Completions), anthropic "
      "(Messages), responses (OpenAI's Responses), chatgpt (Responses at "
      "ChatGPT, signed in with a ChatGPT account instead of a key), "
      "copilot (GitHub Copilot, signed in with a GitHub account, each model "
-     "in the format it takes), or builtin (the built-in model, Gemma 4 "
+     "in the format it takes), or anthropic-oauth (Messages, signed in "
+     "with a Claude account), or builtin (the built-in model, Gemma 4 "
      "E2B, which Prospero's window runs on this computer, with no url)"},
     {"endpoint", "url", CFG_URL, "", {}, {}, "endpoint",
      "Base URL: chat requests go to URL/v1/chat/completions, for kind "

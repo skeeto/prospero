@@ -16267,14 +16267,16 @@ static void drawmcp(Gui *g, Arena a, Str name)
 // A chatgpt endpoint's sign-in, on its page: who is signed in, as the
 // main host's engine lists it (models, asked as the page shows), with
 // Sign in and Sign out.
-// A signed-in endpoint's state (kind chatgpt, or copilot), Sign in,
-// and while GitHub's code waits to be entered, the code.
-static void drawsignin(Gui *g, Arena a, Str name, b32 copilot)
+// A signed-in endpoint's state (kind chatgpt, copilot, or
+// anthropic-oauth), Sign in, and while GitHub's code waits to be
+// entered (kind copilot), the code.
+static void drawsignin(Gui *g, Arena a, Str name, Str epkind)
 {
     f32         sc  = g->scale;
     ImGuiStyle &st  = ImGui::GetStyle();
     GuiHost    *h   = g->main;
-    b32         can = h && hostcan(h, copilot ? Str("endpoint.copilot") : Str("endpoint.auth"));
+    b32         cop = epkind=="copilot";
+    b32         can = h && hostcan(h, cop ? Str("endpoint.copilot") : Str("endpoint.auth"));
     if (can && g->eplistfor!=name && !h->listid && hostlist(g, h)) {
         g->eplistfor = clone(&g->perm, name);
     }
@@ -16283,7 +16285,7 @@ static void drawsignin(Gui *g, Arena a, Str name, b32 copilot)
         ep = h->eps[i].name==name ? &h->eps[i] : ep;
     }
     u32 dot  = 0;
-    Str line = epstatus(g, &a, name, &dot, copilot);
+    Str line = epstatus(g, &a, name, &dot, cop);
     pushstr(concat(&a, "chatgpt ", name));
     ImVec2 p  = ImGui::GetCursorScreenPos();
     f32    lh = ImGui::GetTextLineHeight();
@@ -16307,22 +16309,30 @@ static void drawsignin(Gui *g, Arena a, Str name, b32 copilot)
     itemnamed(g, concat(&a, "endpoint signin ", name));
     if (why.len) {
         whytip(why);
-    } else if (copilot) {
+    } else if (cop) {
         itemtip("Sign in through the browser, with a code, with the GitHub "
                 "account whose Copilot it uses, for a token kept in the state "
                 "directory");
+    } else if (epkind=="anthropic-oauth") {
+        itemtip("Sign in through the browser with your Claude account; "
+                "tokens are kept in the state directory and usage draws "
+                "from extra usage billed per token");
     } else {
         itemtip("Sign in through the browser with the ChatGPT account whose "
                 "subscription it uses, for tokens kept in the state directory");
     }
     if (in) {
-        epsignin(g, name, copilot);
+        i32 kind = cop ? EP_COPILOT :
+                   epkind=="anthropic-oauth" ? EP_ANTHROPIC_OAUTH : EP_CHATGPT;
+        epsignin(g, name, kind);
     }
     if (signed_) {
         ImGui::SameLine();
         b32 out = ImGui::SmallButton("Sign out");
         itemnamed(g, concat(&a, "endpoint signout ", name));
-        itemtip(copilot ? "Forget the GitHub token" : "Forget the ChatGPT tokens");
+        itemtip(cop                       ? "Forget the GitHub token"     :
+                epkind=="anthropic-oauth" ? "Forget the Anthropic tokens" :
+                                            "Forget the ChatGPT tokens");
         if (out) {
             mcpcmd(g, CMD_EPLOGOUT, name);
         }
@@ -16441,8 +16451,8 @@ static void drawcfgpage(Gui *g, Arena scratch)
     } else if (kind=="endpoint" && name.len) {
         drawapprove(g, a, kind, name);
         Str epkind = cfgepkind(g, name);
-        if (epkind=="chatgpt" || epkind=="copilot") {
-            drawsignin(g, a, name, epkind=="copilot");
+        if (epkind=="chatgpt" || epkind=="copilot" || epkind=="anthropic-oauth") {
+            drawsignin(g, a, name, epkind);
         } else if (epkind == "builtin") {
             bldrawpage(g, a);
         }
@@ -16547,6 +16557,7 @@ static void drawcfgadd(Gui *g, Arena scratch)
             "responses: OpenAI's Responses API",
             "chatgpt: ChatGPT, signed in to your account",
             "copilot: GitHub Copilot, signed in to your account",
+            "anthropic-oauth: Anthropic, signed in",
             "builtin: the built-in model, Gemma 4 E2B, on this computer",
         };
         static_assert(countof(kinds) == countof(epkinds), "a label for each kind");

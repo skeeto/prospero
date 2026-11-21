@@ -2290,6 +2290,8 @@ static Str authheaders(Arena *a, Endpoint *ep, Str accept)
             print(&b, ep->key);
             print(&b, "\r\n");
         }
+    } else if (ep->kind == EP_ANTHROPIC_OAUTH) {
+        // OAuth token is injected separately by anthropicaccheaders()
     } else if (ep->key.len) {
         print(&b, "Authorization: Bearer ");
         print(&b, ep->key);
@@ -2743,6 +2745,8 @@ static void stopreq(Session *s)
 }
 
 static Str chatgptheaders(Engine *, Arena *, Endpoint *, Str sid, u64 *sent);
+static Str anthropicaccheaders(Engine *, Arena *, Endpoint *, u64 *sent);
+static Str ghform(Arena *, Slice<Str>);
 static Str epsigninmsg(Arena *, Str name);
 static b32 authgate(Session *, Arena, Endpoint *);
 
@@ -2792,6 +2796,9 @@ static b32 startreq(Session *s, Arena scratch, Endpoint *ep, Str method,
         r.headers = concat(&scratch, r.headers, more);
     } else if (ep->kind==EP_COPILOT && !ep->relay.len) {
         Str more  = copilotheaders(e, &scratch, ep, s->sid, cphint(s));
+        r.headers = concat(&scratch, r.headers, more);
+    } else if (ep->kind==EP_ANTHROPIC_OAUTH && !ep->relay.len) {
+        Str more  = anthropicaccheaders(e, &scratch, ep, &s->authsent);
         r.headers = concat(&scratch, r.headers, more);
     }
     r.body      = body;
@@ -2982,6 +2989,7 @@ static void sendchat(Session *s, Arena scratch)
     req.history   = deskimages(s, &scratch);
     req.thinkfrom = s->thinkfrom;
     req.cachekey  = s->sid;
+    req.claudecode = s->ep.kind == EP_ANTHROPIC_OAUTH;
     s->reqseq     = s->log.seq;
     i32 wire      = s->ep.wire;
     Str body      = wire==EP_ANTHROPIC ? anencode(&s->attempt, scratch, &req) :
@@ -4089,14 +4097,16 @@ static void ondone(Session *s, Arena scratch, i32 err, Str text)
         }
         Endpoint *rep = reqep(s);
         b32       cgp = rep->kind==EP_CHATGPT;
-        if (cgp && !rep->relay.len && s->status==401 && !s->authretried) {
+        b32       aan = rep->kind==EP_ANTHROPIC_OAUTH;
+        if ((cgp || aan) && !rep->relay.len && s->status==401 && !s->authretried) {
             // Refused: refreshed, once a turn, and sent again at no cost
             s->authretried = 1;
             s->authstale   = s->authsent;
             stopreq(s);
             s->part = 0;
-            retryevent(s, scratch, RETRY_QUICK, CLASS_TRANSIENT, s->status, 0,
-                       "HTTP 401: ChatGPT refused the access token, so it is refreshed");
+            Str msg = cgp ? Str("HTTP 401: ChatGPT refused the access token, so it is refreshed")
+                          : Str("HTTP 401: Anthropic refused the access token, so it is refreshed");
+            retryevent(s, scratch, RETRY_QUICK, CLASS_TRANSIENT, s->status, 0, msg);
             request(s, scratch);
             return;
         }
@@ -8343,7 +8353,7 @@ static DeskLimits desklimits(Session *s)
 // to a model on an endpoint of kind anthropic, unless [model] pdf is off.
 static b32 pdfon(Session *s)
 {
-    return s->ep.kind==EP_ANTHROPIC && !s->mc.nopdf;
+    return (s->ep.kind==EP_ANTHROPIC || s->ep.kind==EP_ANTHROPIC_OAUTH) && !s->mc.nopdf;
 }
 
 // After a request the API refused over a PDF: the newest PDF read that
@@ -14657,7 +14667,7 @@ static Str mcprandom(Engine *e, Arena *a, i32 words)
 static void mcpauthgo(Engine *e, Arena scratch, McpAuth *x)
 {
     x->verifier = mcprandom(e, &x->arena, 4);  // 43 characters
-    x->state    = mcprandom(e, &x->arena, 2);
+    x->state    = x->state_is_verifier ? x->verifier : mcprandom(e, &x->arena, 2);
     x->stage    = MCPAUTH_WAIT;
     x->by       = os_ticks(e->os) + 10*60*SEC;
     Str url     = mcpauthurl(&scratch, x, mcpchallenge(&scratch, x->verifier));
@@ -14684,7 +14694,7 @@ static void mcpauthtokens(Engine *e, Arena scratch, McpAuth *x, Json *j)
     t.refresh  = t.refresh.len ? t.refresh : x->refresh;  // kept unless replaced
     i64 in     = jsonint(jsonget(j, "expires_in"), 0);
     t.expires  = in>0 ? os_time(e->os)/1000 + in : 0;
-    if (x->ep) {
+    if (x->ep && x->epkind != EP_ANTHROPIC_OAUTH) {
         // The account, from the id_token's claims, else the access
         // token's, else as it was; and when the access token expires
         Str   idt  = jsonstr(jsonget(j, "id_token"));
@@ -15031,18 +15041,29 @@ static void cmdmcpcode(Engine *e, Arena scratch, i64 id, Json *j)
         mcpauthfail(e, scratch, x, "the browser brought back no code");
         return;
     }
-    Buf g(&scratch, 256 + code.len);
-    print(&g, "grant_type=authorization_code&code=");
-    print(&g, pctencode(&scratch, code));
-    print(&g, "&redirect_uri=");
-    print(&g, pctencode(&scratch, x->redirect));
-    print(&g, "&code_verifier=");
-    print(&g, x->verifier);
-    Str form = mcpauthform(&scratch, x, finish(&g));
     x->stage = MCPAUTH_TOKEN;
-    if (!mcpauthhttp(e, scratch, x, "POST", x->tokenurl,
-                     "application/x-www-form-urlencoded", form)) {
-        mcpauthfail(e, scratch, x, "the token request could not be made");
+    if (x->json_tokens) {
+        // Anthropic's token endpoint takes JSON, not form-encoded
+        Str kv[]  = {"grant_type", "authorization_code", "client_id", x->client,
+                     "code", code, "state", x->state,
+                     "redirect_uri", x->redirect, "code_verifier", x->verifier};
+        Str body  = ghform(&scratch, {kv, countof(kv)});
+        if (!mcpauthhttp(e, scratch, x, "POST", x->tokenurl, "application/json", body)) {
+            mcpauthfail(e, scratch, x, "the token request could not be made");
+        }
+    } else {
+        Buf g(&scratch, 256 + code.len);
+        print(&g, "grant_type=authorization_code&code=");
+        print(&g, pctencode(&scratch, code));
+        print(&g, "&redirect_uri=");
+        print(&g, pctencode(&scratch, x->redirect));
+        print(&g, "&code_verifier=");
+        print(&g, x->verifier);
+        Str form = mcpauthform(&scratch, x, finish(&g));
+        if (!mcpauthhttp(e, scratch, x, "POST", x->tokenurl,
+                         "application/x-www-form-urlencoded", form)) {
+            mcpauthfail(e, scratch, x, "the token request could not be made");
+        }
     }
 }
 
@@ -15115,7 +15136,9 @@ static Str epsigninmsg(Arena *a, Str name)
 static Str epclient(Engine *e, Endpoint *ep)
 {
     Str c = trim(cfgget(e->cfg, "endpoint", ep->name, "client_id", 0));
-    return c.len ? c : ep->kind==EP_COPILOT ? copilotclient : chatgptclient;
+    return c.len                        ? c                  :
+           ep->kind==EP_COPILOT         ? copilotclient      :
+           ep->kind==EP_ANTHROPIC_OAUTH ? anthropicaccclient : chatgptclient;
 }
 
 static McpAuth *eprefreshing(Engine *e, Str name)
@@ -15154,15 +15177,17 @@ static i32 epauth(Engine *e, Arena *a, Endpoint *ep, u64 stale, Str *why)
     } else if (eprefreshing(e, ep->name)) {
         return EPAUTH_WAIT;
     } else if (!t.refresh.len) {
+        Str svc = epservice(ep->kind);
         Str msg = concat(a, "endpoint ", ep->name);
-        msg  = concat(a, msg, "'s ChatGPT sign-in expired: sign in again ");
+        msg  = concat(a, msg, concat(a, "'s ", concat(a, svc, " sign-in expired: sign in again ")));
         *why = concat(a, msg, epsigninmsg(a, ep->name));
         return EPAUTH_NONE;
     }
     for (McpAuth *x = e->mcpauths; x; x = x->next) {
         if (x->ep && x->name==ep->name) {
-            *why = "signing in to ChatGPT is under way: finish it in the "
-                   "browser, then try again";
+            Str svc = epservice(ep->kind);
+            *why = concat(a, concat(a, "signing in to ", svc),
+                          " is under way: finish it in the browser, then try again");
             return EPAUTH_NONE;
         }
     }
@@ -15171,25 +15196,41 @@ static i32 epauth(Engine *e, Arena *a, Endpoint *ep, u64 stale, Str *why)
         *why = "out of memory";
         return EPAUTH_NONE;
     }
-    x->stage    = MCPAUTH_REFRESH;
-    x->by       = os_ticks(e->os) + 60*SEC;
-    x->issuer   = clone(&x->arena, e->chatgptauth);
-    x->tokenurl = clone(&x->arena, concat(a, e->chatgptauth, "/oauth/token"));
-    x->client   = clone(&x->arena, epclient(e, ep));
-    x->refresh  = clone(&x->arena, t.refresh);
-    x->account  = clone(&x->arena, t.account);
-    x->email    = clone(&x->arena, t.email);
-    x->plan     = clone(&x->arena, t.plan);
-    Str grant   = concat(a, "grant_type=refresh_token&refresh_token=",
-                         pctencode(a, t.refresh));
-    grant = concat(a, grant, "&scope=openid%20profile%20email");
-    Str form    = mcpauthform(a, x, grant);
-    if (!mcpauthhttp(e, *a, x, "POST", x->tokenurl,
-                     "application/x-www-form-urlencoded", form)) {
-        mcpauthfree(e, x);
-        *why = "ChatGPT's sign-in could not be refreshed: the token request "
-               "could not be made";
-        return EPAUTH_NONE;
+    x->stage   = MCPAUTH_REFRESH;
+    x->by      = os_ticks(e->os) + 60*SEC;
+    x->epkind  = ep->kind;
+    x->client  = clone(&x->arena, epclient(e, ep));
+    x->refresh = clone(&x->arena, t.refresh);
+    if (ep->kind == EP_ANTHROPIC_OAUTH) {
+        x->json_tokens = 1;
+        x->issuer      = clone(&x->arena, anthropicaccissuer);
+        x->tokenurl    = clone(&x->arena, anthropicacctokenurl);
+        Str kv[]  = {"grant_type", "refresh_token", "client_id", x->client,
+                     "refresh_token", x->refresh};
+        Str body  = ghform(a, {kv, countof(kv)});
+        if (!mcpauthhttp(e, *a, x, "POST", x->tokenurl, "application/json", body)) {
+            mcpauthfree(e, x);
+            *why = "Anthropic's sign-in could not be refreshed: the token "
+                   "request could not be made";
+            return EPAUTH_NONE;
+        }
+    } else {
+        x->issuer   = clone(&x->arena, e->chatgptauth);
+        x->tokenurl = clone(&x->arena, concat(a, e->chatgptauth, "/oauth/token"));
+        x->account  = clone(&x->arena, t.account);
+        x->email    = clone(&x->arena, t.email);
+        x->plan     = clone(&x->arena, t.plan);
+        Str grant   = concat(a, "grant_type=refresh_token&refresh_token=",
+                             pctencode(a, t.refresh));
+        grant = concat(a, grant, "&scope=openid%20profile%20email");
+        Str form    = mcpauthform(a, x, grant);
+        if (!mcpauthhttp(e, *a, x, "POST", x->tokenurl,
+                         "application/x-www-form-urlencoded", form)) {
+            mcpauthfree(e, x);
+            *why = "ChatGPT's sign-in could not be refreshed: the token request "
+                   "could not be made";
+            return EPAUTH_NONE;
+        }
     }
     return EPAUTH_WAIT;
 }
@@ -15216,6 +15257,27 @@ static Str chatgptheaders(Engine *e, Arena *a, Endpoint *ep, Str sid, u64 *sent)
         print(&b, "session_id: ");
         print(&b, sid);
         print(&b, "\r\n");
+    }
+    if (sent) {
+        *sent = t.access.len ? hash(t.access) : 0;
+    }
+    return finish(&b);
+}
+
+// An anthropic-oauth endpoint's request headers, beyond authheaders':
+// its OAuth access token as a Bearer token, plus the beta headers that
+// Anthropic requires for OAuth inference. Nothing if not signed in.
+static Str anthropicaccheaders(Engine *e, Arena *a, Endpoint *ep, u64 *sent)
+{
+    McpTokens t = mcptokens(e, a, ep->name, epauthurl(e, a, ep), 1);
+    Buf       b(a, 128 + t.access.len);
+    if (t.access.len) {
+        print(&b, "Authorization: Bearer ");
+        print(&b, t.access);
+        print(&b, "\r\n");
+        print(&b, "anthropic-beta: claude-code-20250219,oauth-2025-04-20\r\n");
+        print(&b, "user-agent: claude-cli/2.1.75\r\n");
+        print(&b, "x-app: cli\r\n");
     }
     if (sent) {
         *sent = t.access.len ? hash(t.access) : 0;
@@ -15463,12 +15525,12 @@ static void epdevicerecord(Engine *e, Arena scratch, McpAuth *x, Json *j)
     }
 }
 
-// endpoint.auth {name, redirect}: for ChatGPT, replies, late, with the
-// URL the browser is to visit to sign in, its redirect to the given
-// one, which mcp.code {name, endpoint:1, ...} then completes. For
-// Copilot, no redirect: replies, late, with GitHub's page (url) and the
-// code to enter there (code), and mcp.code {name, endpoint:1} waits for
-// it to be.
+// endpoint.auth {name, redirect}: for ChatGPT and Anthropic account,
+// replies, late, with the URL the browser is to visit to sign in, its
+// redirect to the given one, which mcp.code {name, endpoint:1, ...}
+// then completes. For Copilot, no redirect: replies, late, with
+// GitHub's page (url) and the code to enter there (code), and
+// mcp.code {name, endpoint:1} waits for it to be.
 static void cmdepauth(Engine *e, Arena scratch, i64 id, Json *j)
 {
     Str      name     = jsonstr(jsonget(j, "name"));
@@ -15490,6 +15552,7 @@ static void cmdepauth(Engine *e, Arena scratch, i64 id, Json *j)
         return;
     }
     x->cmd    = id;
+    x->epkind = ep.kind;
     x->client = clone(&x->arena, epclient(e, &ep));
     if (cp) {
         x->issuer   = clone(&x->arena, e->ghauth);
@@ -15505,10 +15568,19 @@ static void cmdepauth(Engine *e, Arena scratch, i64 id, Json *j)
         return;
     }
     x->redirect = clone(&x->arena, redirect);
-    x->issuer   = clone(&x->arena, e->chatgptauth);
-    x->authz    = clone(&x->arena, concat(&scratch, e->chatgptauth, "/oauth/authorize"));
-    x->tokenurl = clone(&x->arena, concat(&scratch, e->chatgptauth, "/oauth/token"));
-    x->scope    = clone(&x->arena, chatgptscope);
+    if (ep.kind == EP_ANTHROPIC_OAUTH) {
+        x->json_tokens      = 1;
+        x->state_is_verifier = 1;
+        x->issuer   = clone(&x->arena, anthropicaccissuer);
+        x->authz    = clone(&x->arena, concat(&scratch, anthropicaccissuer, "/oauth/authorize"));
+        x->tokenurl = clone(&x->arena, anthropicacctokenurl);
+        x->scope    = clone(&x->arena, anthropicaccscope);
+    } else {
+        x->issuer   = clone(&x->arena, e->chatgptauth);
+        x->authz    = clone(&x->arena, concat(&scratch, e->chatgptauth, "/oauth/authorize"));
+        x->tokenurl = clone(&x->arena, concat(&scratch, e->chatgptauth, "/oauth/token"));
+        x->scope    = clone(&x->arena, chatgptscope);
+    }
     mcpauthgo(e, scratch, x);
 }
 
@@ -16350,7 +16422,7 @@ static void sendcompact(Session *s, Arena scratch)
     i32 wire  = cp->ep.wire;
     Str body  = wire==EP_ANTHROPIC ?
                     ansummary(&s->attempt, scratch, &cp->mc, prev, convo, words,
-                              cp->focus, over) :
+                              cp->focus, over, cp->ep.kind==EP_ANTHROPIC_OAUTH) :
                 epresponses(wire) ?
                     rssummary(&s->attempt, scratch, &cp->mc, prev, convo, words,
                               cp->focus, over, cp->ep.kind==EP_CHATGPT) :
@@ -16800,6 +16872,7 @@ static void sendtitle(Session *s, Arena scratch)
         req.system  = titlesystem;
         req.history = {&m, 1, 1};
     }
+    req.claudecode = tt->ep.kind == EP_ANTHROPIC_OAUTH;
     i32 wire = tt->ep.wire;
     Str body = wire==EP_ANTHROPIC ? anencode(&s->attempt, scratch, &req) :
                epresponses(wire)  ? rsencode(&s->attempt, scratch, &req,
@@ -17554,7 +17627,8 @@ static b32 endpointconf(Engine *e, Arena *perm, Str which, Endpoint *ep)
     ep->key       = ep->held ? Str{} : cfgsecret(cfg, perm, "endpoint", name, "key");
     Str kind      = trim(cfgget(cfg, "endpoint", name, "kind", 0));
     ep->kind      = epkindof(kind);
-    ep->wire      = ep->kind==EP_COPILOT ? EP_OPENAI : ep->kind;  // until discovered
+    ep->wire      = ep->kind==EP_COPILOT         ? EP_OPENAI    :
+                    ep->kind==EP_ANTHROPIC_OAUTH ? EP_ANTHROPIC : ep->kind;  // until discovered
     ep->api       = {};
     if (ep->kind==EP_COPILOT && name.len && sameurl(url, epkindurl(EP_COPILOT))) {
         // The account's own API, which signing in learned, in place of
@@ -26496,7 +26570,8 @@ static void listerreply(Engine *e, Arena scratch, Lister *l)
         putstrkey(&w.json, "name", p->name);
         putstrkey(&w.json, "url", p->url);
         putstrkey(&w.json, "kind", p->kind);
-        if ((p->kind=="chatgpt" || p->kind=="copilot") && !relayurl(p->url).ok) {
+        if ((p->kind=="chatgpt" || p->kind=="copilot" || p->kind=="anthropic-oauth") &&
+                !relayurl(p->url).ok) {
             // Who is signed in, for its page
             Endpoint  ep = {};
             ep.name      = p->name;

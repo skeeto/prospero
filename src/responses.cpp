@@ -593,6 +593,14 @@ static Str const chatgptclient     = "app_EMoamEEZ73f0CkXaXp7hrann";
 static Str const chatgptscope      = "openid profile email offline_access";
 static Str const chatgptoriginator = "prospero";
 
+// Anthropic OAuth: PKCE flow at claude.ai, tokens exchanged at platform.claude.com,
+// access token used as x-api-key.
+static Str const anthropicaccissuer   = "https://claude.ai";
+static Str const anthropicaccclient   = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+static Str const anthropicaccscope    = "org:create_api_key user:profile user:inference "
+                                        "user:sessions:claude_code user:mcp_servers user:file_upload";
+static Str const anthropicacctokenurl = "https://platform.claude.com/v1/oauth/token";
+
 // The Codex backend's listing, {models: [{slug, context_window}]}, as
 // a /v1/models listing: {data: [{id, max_input_tokens}]}. Any other
 // body is returned as it is. tmp is another arena than a's.

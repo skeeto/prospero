@@ -401,8 +401,9 @@ static AnPlan anplan(Arena *a, ChatReq *r)
     }
 
     // Four at most: the tools' gives way, as the system prompt's
-    // breakpoint covers the tools too
-    i32 marks = r->system.len ? 1 : 0;
+    // breakpoint covers the tools too. The claudecode identity block
+    // shares the system prompt's breakpoint.
+    i32 marks = (r->claudecode || r->system.len) ? 1 : 0;
     for (iz k = 0; k < p.mark.len; k++) {
         marks += p.mark[k];
     }
@@ -444,14 +445,25 @@ static Str anencode(Arena *a, Arena tmp, ChatReq *r)
     putobject(&w);
     putstrkey(&w, "model", mc->name);
     putintkey(&w, "max_tokens", most);
-    if (r->system.len) {
+    if (r->claudecode || r->system.len) {
         putkey(&w, "system");
         putarray(&w);
-        putobject(&w);
-        putstrkey(&w, "type", "text");
-        putstrkey(&w, "text", r->system);
-        ancache(&w);
-        putend(&w);
+        if (r->claudecode) {
+            // Required for Anthropic OAuth: identify as Claude Code.
+            putobject(&w);
+            putstrkey(&w, "type", "text");
+            putstrkey(&w, "text",
+                      "You are Claude Code, Anthropic's official CLI for Claude.");
+            if (!r->system.len) ancache(&w);
+            putend(&w);
+        }
+        if (r->system.len) {
+            putobject(&w);
+            putstrkey(&w, "type", "text");
+            putstrkey(&w, "text", r->system);
+            ancache(&w);
+            putend(&w);
+        }
         putend(&w);
     }
     AnPlan plan = anplan(&tmp, r);

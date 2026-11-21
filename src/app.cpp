@@ -3391,7 +3391,9 @@ static Str epstatus(Gui *g, Arena *a, Str name, u32 *dot, b32 copilot)
     GuiHost     *h   = g->main;
     b32          can = h && hostcan(h, copilot ? Str("endpoint.copilot") : Str("endpoint.auth"));
     GuiEndpoint *ep  = 0;
-    Str          svc = copilot ? Str("GitHub Copilot") : Str("ChatGPT");
+    Str          cfgkind = cfgepkind(g, name);
+    Str          svc = cfgkind=="copilot"         ? Str("GitHub Copilot") :
+                       cfgkind=="anthropic-oauth" ? Str("Anthropic")      : Str("ChatGPT");
     for (iz i = 0; can && i < h->eps.len; i++) {
         ep = h->eps[i].name==name ? &h->eps[i] : ep;
     }
@@ -3491,19 +3493,30 @@ static void mcpbrowse(Gui *g, Arena scratch, Str url)
 // but at the redirect ChatGPT takes.
 // Or to GitHub Copilot (device), with no loopback: the engine replies
 // with a code to enter at GitHub's page (onmcpauth).
-static void epsignin(Gui *g, Str name, b32 device)
+static void epsignin(Gui *g, Str name, i32 kind)
 {
     if (g->mcpname.len) {
         return;
     }
     Arena a        = newarena(g->cmdr);
     u64   back     = ++g->mcpback;
-    Str   redirect = device ? Str{} : chatgptloopback(g->os, &a, g->tasks, TASK_MCPBACK, back);
-    if (!device && !redirect.len) {
-        mcpsay(g, name, "Cannot listen on this computer's loopback at port 1455 or "
-                        "1457, where ChatGPT's sign-in comes back: is another "
-                        "sign-in, the Codex CLI's perhaps, waiting there?", 1);
-        return;
+    b32   device   = kind == EP_COPILOT;
+    Str   redirect = {};
+    if (!device) {
+        redirect = kind == EP_ANTHROPIC_OAUTH
+            ? anthropicloopback(g->os, &a, g->tasks, TASK_MCPBACK, back)
+            : chatgptloopback(g->os, &a, g->tasks, TASK_MCPBACK, back);
+        if (!redirect.len) {
+            Str msg = kind == EP_ANTHROPIC_OAUTH
+                ? Str("Cannot listen on this computer's loopback at port 53692, "
+                      "where Anthropic's sign-in comes back: is another "
+                      "sign-in, the Claude CLI perhaps, waiting there?")
+                : Str("Cannot listen on this computer's loopback at port 1455 or "
+                      "1457, where ChatGPT's sign-in comes back: is another "
+                      "sign-in, the Codex CLI's perhaps, waiting there?");
+            mcpsay(g, name, msg, 1);
+            return;
+        }
     }
     Buf   b(&a, 256);
     EvOut w = cmdopen(g, &b, CMD_EPAUTH, 0, g->main);

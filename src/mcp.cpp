@@ -873,6 +873,9 @@ struct McpAuth {
     Str        name;      // the server's, or the endpoint's
     Str        resource;  // and its URL
     b32        ep;        // an endpoint's, not a server's
+    i32        epkind;          // EP_ANTHROPIC_OAUTH for that kind, else 0
+    b32        json_tokens;     // token exchange/refresh body is JSON, not form
+    b32        state_is_verifier; // OAuth state = PKCE verifier (Anthropic)
     Str        account;   // the endpoint's, refreshing: kept unless replaced
     Str        email;
     Str        plan;
@@ -1116,7 +1119,7 @@ static Str mcpauthurl(Arena *a, McpAuth *x, Str challenge)
     print(&b, challenge);
     print(&b, "&code_challenge_method=S256&state=");
     print(&b, pctencode(a, x->state));
-    if (x->ep) {
+    if (x->ep && x->epkind != EP_ANTHROPIC_OAUTH) {
         // As the Codex CLI asks, for a token the Codex backend takes
         print(&b, "&id_token_add_organizations=true&codex_cli_simplified_flow=true");
         print(&b, "&originator=");
@@ -1129,6 +1132,21 @@ static Str mcpauthurl(Arena *a, McpAuth *x, Str challenge)
         print(&b, "&scope=");
         print(&b, pctencode(a, x->scope));
     }
+    return finish(&b);
+}
+
+// Listen for the browser's return from Anthropic's sign-in, which takes
+// localhost at port 53692 (Claude Code's registered redirect port).
+static Str anthropicloopback(Os *os, Arena *a, Mailbox *mbox, u32 type, u64 id)
+{
+    i32 port = 53692;
+    if (!os_loopback(os, mbox, type, id, 10*60*1000, "/callback", &port)) {
+        return {};
+    }
+    Buf b(a, 48);
+    print(&b, "http://localhost:");
+    print(&b, (i64)port);
+    print(&b, "/callback");
     return finish(&b);
 }
 

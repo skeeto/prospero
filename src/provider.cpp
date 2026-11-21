@@ -106,11 +106,12 @@ enum : i32 {
     EP_RESPONSES,  // Responses (responses.cpp)
     EP_CHATGPT,    // Responses at ChatGPT's Codex backend, signed in
     EP_COPILOT,    // GitHub Copilot, signed in: each model's own format
+    EP_ANTHROPIC_OAUTH, // Messages via OAuth (Claude Pro/Max)
     EP_BUILTIN,    // the built-in model, which the desktop window runs
 };
 
 static Str const epkinds[] = {
-    "openai", "anthropic", "responses", "chatgpt", "copilot", "builtin",
+    "openai", "anthropic", "responses", "chatgpt", "copilot", "anthropic-oauth", "builtin",
 };
 
 // A kind by its name, openai if unknown.
@@ -138,13 +139,14 @@ static b32 epresponses(i32 kind)
 // Whether a kind's endpoint is signed in to, with no key.
 static b32 epsigned(i32 kind)
 {
-    return kind==EP_CHATGPT || kind==EP_COPILOT;
+    return kind==EP_CHATGPT || kind==EP_COPILOT || kind==EP_ANTHROPIC_OAUTH;
 }
 
 // The service a signed-in kind signs in to, for messages.
 static Str epservice(i32 kind)
 {
-    return kind==EP_COPILOT ? Str("GitHub Copilot") : Str("ChatGPT");
+    return kind==EP_COPILOT         ? Str("GitHub Copilot") :
+           kind==EP_ANTHROPIC_OAUTH ? Str("Anthropic")      : Str("ChatGPT");
 }
 
 // A model call's path under the API root.
@@ -159,7 +161,7 @@ static Str eppath(i32 kind)
 // may use.
 static Str eplistpath(i32 kind)
 {
-    return kind==EP_ANTHROPIC ? Str("models?limit=1000") :
+    return (kind==EP_ANTHROPIC || kind==EP_ANTHROPIC_OAUTH) ? Str("models?limit=1000") :
            kind==EP_CHATGPT   ? Str("models?client_version=1.0.0") : Str("models");
 }
 
@@ -168,6 +170,7 @@ static Str eplistpath(i32 kind)
 static Str epkindurl(i32 kind)
 {
     switch (kind) {
+    case EP_ANTHROPIC_OAUTH: // fallthrough
     case EP_ANTHROPIC: return "https://api.anthropic.com";
     case EP_RESPONSES: return "https://api.openai.com/v1";
     case EP_CHATGPT:   return "https://chatgpt.com/backend-api/codex/responses";
@@ -687,6 +690,8 @@ struct ChatReq {
                            // is not sent back (Anthropic: compaction
                            // changed what it was bound to)
     Str        cachekey;   // the Responses API's prompt_cache_key, if any
+    b32        claudecode; // prepend Claude Code identity system block
+                           // (required for Anthropic OAuth / EP_ANTHROPIC_OAUTH)
 };
 
 // Base64 data as a JSON string, put raw (base64 needs no escapes): as
