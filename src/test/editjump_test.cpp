@@ -346,6 +346,9 @@ static void test_editjump(Test *t)
     expect(t, "editor.jump.winprog", ej.prog, "C:\\Program Files\\VS Code\\code.cmd");
     ej = editorjump(&a, {}, "sh C:/t/e.sh +{line} {file}", "C:\\f", 3, 0, 1);
     expect(t, "editor.jump.wintmpl", ej.prog, "sh");
+    expect(t, "editor.jump.wintmplline", ej.line, "sh C:/t/e.sh +3 \"C:\\f\"");
+    ej = editorjump(&a, "sh \"C:\\t\\e.sh\"", "sh \"C:\\t\\e.sh\" +{line} {file}", "C:\\f", 3, 0, 1);
+    expect(t, "editor.jump.wintmplq", ej.line, "sh \"C:\\t\\e.sh\" +3 \"C:\\f\"");
     // A folder's path ending in a backslash: doubled, or the program
     // reads \" as a quote and the rest of the line joins the path
     ej = editorjump(&a, {}, "ed {file} --wait", "C:\\dir\\", 1, 0, 1);

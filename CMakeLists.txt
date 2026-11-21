@@ -73,6 +73,15 @@ target_compile_options(prospero_core_flags INTERFACE
   -Wall -Wextra -Wconversion -Wno-sign-conversion
   -Wno-unused-parameter -Wno-unused-function
 )
+# GCC 16.2's interprocedural bit propagation took jumpfill's line, passed
+# as line>0 ? line : 1 (a MAX_EXPR), for the constant 1 in every bit, so
+# its clone ignored the line given: Open in editor opened each file at
+# line 1 in Windows release builds (w64devkit's GCC 16, -O3). GCC 15 was
+# not seen to do it, but the pass is off for every GCC, as its gain is
+# small and what it miscompiles goes unseen.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  target_compile_options(prospero_core_flags INTERFACE -fno-ipa-bit-cp)
+endif()
 target_compile_definitions(prospero_core_flags INTERFACE
   PROSPERO_VERSION="${PROJECT_VERSION}"
 )
