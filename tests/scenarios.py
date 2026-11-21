@@ -18280,9 +18280,10 @@ def worktree_side_packed(t):
     env = gitrepo(t)
     oid = gitrun(t, env, "rev-parse", "HEAD")
     lines = "".join(f"create refs/tags/many-{i:05d}-{'x' * 40} {oid}\n" for i in range(6000))
-    r = subprocess.run(["git", "update-ref", "--stdin"], cwd=t.work, env=env, input=lines,
-                       capture_output=True, text=True)
-    t.check(r.returncode == 0, f"update-ref: {r.stderr}")
+    # bytes, as text mode on Windows would send CRLF, a stray CR to git
+    r = subprocess.run(["git", "update-ref", "--stdin"], cwd=t.work, env=env,
+                       input=lines.encode(), capture_output=True)
+    t.check(r.returncode == 0, f"update-ref: {r.stderr.decode(errors='replace')}")
     gitrun(t, env, "pack-refs", "--all")
     size = os.path.getsize(os.path.join(t.work, ".git", "packed-refs"))
     t.check(size > 1<<19, f"packed-refs {size}")
