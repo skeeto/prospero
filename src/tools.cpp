@@ -3970,9 +3970,26 @@ static Str todofold(Arena *a, Str s)
     return finish(&b);
 }
 
+// A name wrapped in one pair of quote marks, ", ' or `, without them,
+// else null. A model once sent start as "\"ITEM\"" six times, its
+// arrays unquoted, and never saw the extra quotes in the error (#96).
+static Str todounquote(Str name)
+{
+    if (name.len < 3) {
+        return {};
+    }
+    u8 q = name[0];
+    if ((q!='"' && q!='\'' && q!='`') || name[name.len-1]!=q) {
+        return {};
+    }
+    Str inner = trim(takehead(cuthead(name, 1), name.len-2));
+    return inner.len ? inner : Str{};
+}
+
 // The item a name means: its exact text, else the same text but for
-// case and spacing, else the only item containing the name; -1 if none,
-// -2 if several contain it.
+// case and spacing, else the only item containing the name, else the
+// same for the name without quote marks around it; -1 if none, -2 if
+// several contain it.
 static iz todofind(Arena scratch, Slice<TodoItem> items, Str name)
 {
     for (iz i = 0; i < items.len; i++) {
@@ -3995,7 +4012,8 @@ static iz todofind(Arena scratch, Slice<TodoItem> items, Str name)
             found = i;
         }
     }
-    return found;
+    Str inner = found==-1 ? todounquote(name) : Str{};
+    return inner.data ? todofind(scratch, items, inner) : found;
 }
 
 static void todoerr(Buf *e, Str key, Str name, iz at)
@@ -4017,7 +4035,8 @@ static iz todofindr(Arena scratch, Slice<TodoItem> items, Str name, Args *r)
             at = todofind(scratch, items, r->trename[i].to);
         }
     }
-    return at;
+    Str inner = at==-1 ? todounquote(name) : Str{};
+    return inner.data ? todofindr(scratch, items, inner, r) : at;
 }
 
 // The list after a todo_write call: todos if given, else the list as it

@@ -1307,6 +1307,27 @@ static void test_tools(Test *t)
                    apply(q1, "{\"done\":\"Check printf \\\\\\\"a b\\\\\\\\n\\\\\\\" | ./wc\"}"),
                    "[x] Check printf \"a b\\n\" | ./wc\n");
         }
+        // #96: names wrapped in quote marks, the item's own quotes first
+        expect(t, "todo quoted start",
+               apply(three, "{\"start\":\"\\\"Run tests\\\"\",\"done\":[\"'Read the parser'\"],"
+                            "\"remove\":[\"`fix the bug`\"]}"),
+               "[x] Read the parser\n[>] Run tests (in progress)\n");
+        expect(t, "todo quoted renamed",
+               apply(three, "{\"rename\":{\"from\":\"Run tests\",\"to\":\"Run all\"},"
+                            "\"start\":\"\\\"Run tests\\\"\"}"),
+               "[ ] Read the parser\n[ ] Fix the bug\n[>] Run all (in progress)\n");
+        {
+            Slice<TodoItem> q2 = {};
+            TodoItem e1 = {"\"Run tests\"", TODO_PENDING}, e2 = {"Run tests", TODO_ACTIVE};
+            q2 = push(a, q2, e1);
+            q2 = push(a, q2, e2);
+            expect(t, "todo quoted item exact", apply(q2, "{\"done\":\"\\\"Run tests\\\"\"}"),
+                   "[x] \"Run tests\"\n[>] Run tests (in progress)\n");
+        }
+        expect(t, "todo quoted unknown", apply(three, "{\"done\":\"\\\"deploy\\\"\"}"),
+               "error: done: no item \"\"deploy\"\"\nThe list is unchanged:\n"
+               "[>] Read the parser (in progress)\n[ ] Fix the bug\n[ ] Run tests\n"
+               "Name items by their text, as listed.");
         {
             Args w = parseargs(a, TOOL_TODO, "{\"todos\":[{\"content\":\"Read the parser\","
                 "\"status\":\"done\"},{\"content\":\"Fix the bug\",\"status\":\"pending\"},"
