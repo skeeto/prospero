@@ -2747,8 +2747,6 @@ W32(b32, GetLogicalProcessorInformationEx(i32, void *, u32 *));
 W32(b32, GlobalMemoryStatusEx(void *));
 W32(b32, GetDiskFreeSpaceExW(c16 *, u64 *, u64 *, u64 *));
 W32(uz,  GetCurrentThread());
-W32(b32, SetThreadInformation(uz, i32, void *, u32));
-W32(b32, SetProcessInformation(uz, i32, void *, u32));
 W32(b32, IsProcessorFeaturePresent(u32));
 
 // Cores of the most efficient class, which on a hybrid processor is the
@@ -2808,22 +2806,28 @@ static i64 os_guidiskfree(Os *, Arena scratch, Str path)
 
 // THREAD_/PROCESS_POWER_THROTTLING_STATE: version 1, the execution
 // speed bit in the control mask, its state bit clear: never throttled.
+// The calls are looked up at startup (Windows 8 and later), and the
+// throttling itself is Windows 10 1709's: before, nothing to do.
 struct W32Throttle {
     u32 version;
     u32 control;
     u32 state;
 };
 
-static void os_guithreadfast(Os *)
+static void os_guithreadfast(Os *os)
 {
-    W32Throttle t = {1, 1, 0};
-    SetThreadInformation(GetCurrentThread(), 3, &t, sizeof(t));  // ThreadPowerThrottling
+    if (os->setthreadinfo) {
+        W32Throttle t = {1, 1, 0};
+        os->setthreadinfo(GetCurrentThread(), 3, &t, sizeof(t));  // ThreadPowerThrottling
+    }
 }
 
-static void os_guibusy(Os *, b32 on)
+static void os_guibusy(Os *os, b32 on)
 {
-    W32Throttle t = {1, on ? 1u : 0u, 0};  // off: the system decides again
-    SetProcessInformation(GetCurrentProcess(), 4, &t, sizeof(t));  // ProcessPowerThrottling
+    if (os->setprocinfo) {
+        W32Throttle t = {1, on ? 1u : 0u, 0};  // off: the system decides again
+        os->setprocinfo(GetCurrentProcess(), 4, &t, sizeof(t));  // ProcessPowerThrottling
+    }
 }
 
 static b32 os_guiarmdot(Os *)

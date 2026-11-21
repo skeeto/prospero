@@ -433,6 +433,10 @@ struct Os {
     i32  (__stdcall *presize)(uz, u32);
     void (__stdcall *pclose)(uz);
     i32  (__stdcall *prelease)(uz);
+    // Set{Thread,Process}Information, from Windows 8 on, else null: the
+    // GUI's power throttling (os_guithreadfast, os_guibusy)
+    b32  (__stdcall *setthreadinfo)(uz, i32, void *, u32);
+    b32  (__stdcall *setprocinfo)(uz, i32, void *, u32);
     i32             breakaway;  // a creation flag: tools leave our job
     b32             jobless;    // tools run without jobs (jobcheck)
     i32             warned;     // atomic: jobless was reported
@@ -4713,6 +4717,10 @@ void mainCRTStartup()
     os.finalpath = (u32 (__stdcall *)(uz, c16 *, u32, u32))
                    GetProcAddress(kernel32, (char *)"GetFinalPathNameByHandleW");
     ptyload(&os, kernel32);
+    os.setthreadinfo = (b32 (__stdcall *)(uz, i32, void *, u32))
+                       GetProcAddress(kernel32, (char *)"SetThreadInformation");
+    os.setprocinfo   = (b32 (__stdcall *)(uz, i32, void *, u32))
+                       GetProcAddress(kernel32, (char *)"SetProcessInformation");
     jobcheck(&os);
 
     // No dialogs from a crashing child, or from a missing disk
