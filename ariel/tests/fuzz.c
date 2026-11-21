@@ -635,7 +635,8 @@ static void host(ariel_Term *t, u8 op, u8 arg)
 static b32 linkeq(ariel_Term *ta, u32 x, ariel_Term *tb, u32 y)
 {
     ariel_Str ux = ariel_link(ta, x), uy = ariel_link(tb, y);
-    return ux.len==uy.len && !memcmp(ux.data, uy.data, (size_t)ux.len);
+    // no link is a null data, which memcmp may not be given even for 0
+    return ux.len==uy.len && (!ux.len || !memcmp(ux.data, uy.data, (size_t)ux.len));
 }
 
 static b32 peneq(ariel_Term *ta, Pen *a, ariel_Term *tb, Pen *b)
