@@ -126,11 +126,13 @@ static void test_gemmakernels(Test *t)
         }
     }
     ref.q4(&q4, got, LDO, in, insc, NTOK, 0, ROWS/8);
+    // Close, not equal: a compiler targeting FMA (as GCC on GitHub's
+    // Ubuntu 26.04 runner does by default) may fuse the two sums'
+    // multiply-adds differently, a few ulps apart, where a wrong layout
+    // is off by far more
     b32 same = 1;
     for (i32 tk = 0; tk < NTOK; tk++) {
-        for (i32 r = 0; r < ROWS; r++) {
-            same &= got[tk*LDO + r] == want[tk*LDO + r];
-        }
+        same &= gmtclose(want + tk*LDO, got + tk*LDO, ROWS, 1e-6f);
     }
     expect(t, "gemma.q4.layout", istr(&a, same), "1");
 
