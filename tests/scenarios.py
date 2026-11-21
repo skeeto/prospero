@@ -18068,10 +18068,12 @@ def worktree_probe(t):
 
 
 def sessionlog(t, sid):
-    """A session's records, from its log."""
+    """A session's records, from its log: whole lines only, as one
+    still being written (the log is buffered) is left for later."""
     path = os.path.join(t.state, "sessions", sid, "events.jsonl")
     with open(path) as f:
-        return [json.loads(line) for line in f if line.strip()]
+        lines = f.read().split("\n")[:-1]
+    return [json.loads(line) for line in lines if line.strip()]
 
 
 def wtmodel(t):
@@ -18400,6 +18402,7 @@ def worktree_from(t):
         sid = r["sid"]
         path = os.path.join(main, ".prospero", "worktrees", "from-one")
         h.wait(lambda e: e.get("ev") == "worktree" and e.get("path") == path, 60)
+        waitfor(lambda: sessionlog(t, sid), 10)
         first = sessionlog(t, sid)[0]
         t.check(first.get("side_of") == parent and first.get("cwd") == path and
                 "src" not in first.get("worktree", {}) and "forked_from" not in first,
@@ -20355,7 +20358,7 @@ def promptsof(tt):
 
 def markfolder(tt, path, timeout=20):
     """cd to path at the prompt: the prompt after it says so by OSC 7."""
-    tt.pump(lambda x: marksof(x)[-1:] == ["A"], timeout, "a prompt")
+    promptwait(tt, timeout)
     have = len(cwdsof(tt))
     if tt.reply.get("kind") == "ps":
         q = path.replace("'", "''")
@@ -20395,10 +20398,17 @@ def markwait(tt, n, timeout=20):
     return marksof(tt)
 
 
+def promptwait(tt, timeout=20):
+    """Until a prompt is drawn whole, through its B: typed sooner, the
+    line discipline may echo it into the prompt, before the line
+    editor takes the terminal (bash's readline sets it up first)."""
+    tt.pump(lambda x: marksof(x, True)[-2:] == ["A", "B"], timeout, "a prompt")
+
+
 def markrun(tt, line, want, timeout=20):
     """Type a line at the prompt; the marks it leaves, through the next
     prompt's A, must be want."""
-    tt.pump(lambda x: marksof(x)[-1:] == ["A"], timeout, "a prompt")
+    promptwait(tt, timeout)
     have = len(marksof(tt))
     tt.type(line + "\r")
     got = markwait(tt, have + len(want), timeout)[have:]
