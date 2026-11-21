@@ -5648,7 +5648,7 @@ static void drawtoast(Gui *g, GuiSession *s, ImVec2 r0, ImVec2 r1)
 // want of an engine there offers to deploy one. The pane's window
 // scrolls as a whole, so its content keeps the extent it had without the
 // toast. Its height, if drawn here, for a toast above it.
-static f32 drawhosttoast(Gui *g, i32 pane)
+static f32 drawhosttoast(Gui *g, i32 pane, f32 lift = 0)
 {
     GuiHost *h = 0;
     for (GuiHost *k = g->hosts; k && g->htoasthost; k = k->next) {
@@ -5666,7 +5666,8 @@ static f32 drawhosttoast(Gui *g, i32 pane)
     ImGuiWindow *w    = ImGui::GetCurrentWindow();
     ImVec2       maxp = w->DC.CursorMaxPos;
     ImVec2       r0   = ImGui::GetWindowPos();
-    ImVec2       r1   = v2(r0.x + ImGui::GetWindowWidth(), r0.y + ImGui::GetWindowHeight());
+    ImVec2       r1   = v2(r0.x + ImGui::GetWindowWidth(),
+                           r0.y + ImGui::GetWindowHeight() - lift);
     ToastBtn     btns[2] = {};
     iz           n       = 0;
     b32          deploy  = h->kind==GH_REMOTE && h->state==RS_FAILED && h->deploys &&
@@ -5701,12 +5702,14 @@ static GuiSession *dragged();
 // while, but not while hovered, nor while a session is dragged.
 static void drawtrashtoast(Gui *g, i32 pane, f32 lift)
 {
-    TrashToast *t = &g->trashtoast;
-    GuiHost    *h = 0;
+    TrashToast *t   = &g->trashtoast;
+    b32         any = 0;  // a host of theirs is still here
     for (GuiHost *k = g->hosts; k && t->host; k = k->next) {
-        h = k->uid==t->host ? k : h;
+        for (iz i = 0; !any && i < t->hosts.len; i++) {
+            any = k->uid == t->hosts[i];
+        }
     }
-    if (!h || g->sched.now>=t->until) {
+    if (!any || g->sched.now>=t->until) {
         t->host = 0;
         return;
     }
@@ -5732,7 +5735,11 @@ static void drawtrashtoast(Gui *g, i32 pane, f32 lift)
         t->until = g->sched.now + 2*1000*1000;  // kept while the mouse is on it
     }
     for (iz i = 0; b>=0 && b<2 && i < t->sids.len; i++) {
-        GuiSession *s = findsess(g, h, t->sids[i]);
+        GuiHost *h = 0;
+        for (GuiHost *k = g->hosts; k && !h; k = k->next) {
+            h = k->uid==t->hosts[i] ? k : 0;
+        }
+        GuiSession *s = h ? findsess(g, h, t->sids[i]) : 0;
         if (s && !s->gone && b==0) {
             guitrash(g, g->frame, s, 0);
         } else if (s && !s->gone) {
@@ -8642,6 +8649,7 @@ static void namedialog(Gui *g, i32 what, GuiSession *s, Str group, Str value)
 {
     g->nameask    = what;
     g->namesess   = s;
+    g->nameroots  = {};  // namegroupfor's, for several
     g->namegroup  = clone(&g->perm, group);
     iz n = value.len<FIELD_MAX ? value.len : FIELD_MAX-1;
     copybytes(g->namebuf, value.data, n);
@@ -9147,16 +9155,293 @@ static Slice<GuiSession *> grouproots(Gui *g, Arena *a, Str group)
     return r;
 }
 
-// Why every root of a group cannot have an operation, or empty.
-static Str groupwhy(Gui *g, Slice<GuiSession *> roots, Str cap, b32 idle)
+// Why roots (a group's, or the picks) cannot all have an operation, or
+// empty: the first reason found, which names its session when there are
+// several. It takes the caller's arena.
+static Str rootswhy(Gui *g, Arena *a, Slice<GuiSession *> roots, Str cap, b32 idle)
 {
     for (iz i = 0; i < roots.len; i++) {
         Str why = sesswhy(g, roots[i], cap, idle, 1);
-        if (why.len) {
+        if (why.len && roots.len>1) {
+            Buf b(a, 128);
+            print(&b, "\xe2\x80\x9c");  // quotation marks
+            print(&b, shorten(a, sesstitle(roots[i]), 40));
+            print(&b, "\xe2\x80\x9d: ");
+            print(&b, why);
+            return finish(&b);
+        } else if (why.len) {
             return why;
         }
     }
     return {};
+}
+
+// The sidebar's selection: roots picked by Ctrl-clicks (Cmd on macOS,
+// which ImGui calls Ctrl there) and Shift-clicks, for what is done to
+// several at once. A plain click opens one session and lets the picks
+// go. The picks are all in the Trash or none of them.
+
+// Whether a session's row can be picked: a root of its own, as the
+// row's actions are for (rowactions).
+static b32 pickable(GuiSession *s)
+{
+    return !s->gone && (s->view || s->listed) && !sessparent(s).len && !sessremote(s);
+}
+
+static void pickclear(Gui *g)
+{
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        s->picked = 0;
+    }
+    g->pickn = 0;
+}
+
+static void pickcount(Gui *g)
+{
+    g->pickn = 0;
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        g->pickn += s->picked;
+    }
+}
+
+// The picked sessions.
+static Slice<GuiSession *> pickroots(Gui *g, Arena *a)
+{
+    Slice<GuiSession *> r = {};
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        if (s->picked) {
+            r = push(a, r, s);
+        }
+    }
+    return r;
+}
+
+// What an action on s's row is for: the picks, if s is one of several,
+// else s alone.
+static Slice<GuiSession *> pickfor(Gui *g, Arena *a, GuiSession *s)
+{
+    if (s->picked && g->pickn>1) {
+        return pickroots(g, a);
+    }
+    Slice<GuiSession *> one = {};
+    return push(a, one, s);
+}
+
+// The picks as they stand, each frame before the rows are drawn: those
+// that can no longer be picked go, and so do any out of the anchor's
+// place (the Trash or not), which a change from elsewhere brings about.
+static void pickprune(Gui *g)
+{
+    GuiSession *k = g->pickanchor;
+    k = k && k->picked && pickable(k) ? k : 0;
+    for (GuiSession *s = g->sessions; !k && s; s = s->next) {
+        k = s->picked && pickable(s) ? s : 0;
+    }
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        s->picked = s->picked && k && pickable(s) && !s->trashed==!k->trashed;
+    }
+    pickcount(g);
+}
+
+// Whether every one of roots is archived: then Unarchive is what applies
+// to them, else Archive, to those not yet archived.
+static b32 rootsarchived(Slice<GuiSession *> roots)
+{
+    b32 all = roots.len > 0;
+    for (iz i = 0; i < roots.len; i++) {
+        all &= roots[i]->archived;
+    }
+    return all;
+}
+
+// Those of roots that archiving (on) or unarchiving would change.
+static Slice<GuiSession *> rootsarchiving(Arena *a, Slice<GuiSession *> roots, b32 on)
+{
+    Slice<GuiSession *> r = {};
+    for (iz i = 0; i < roots.len; i++) {
+        if (!roots[i]->archived != !on) {
+            r = push(a, r, roots[i]);
+        }
+    }
+    return r;
+}
+
+// Whether every host of roots keeps a Trash: else they are deleted, once
+// confirmed, as a group's are.
+static b32 rootstrashon(Slice<GuiSession *> roots)
+{
+    b32 on = roots.len > 0;
+    for (iz i = 0; i < roots.len; i++) {
+        on &= trashon(roots[i]->host);
+    }
+    return on;
+}
+
+// "N sessions", for a tip.
+static Str nsessions(Arena *a, iz n)
+{
+    Buf b(a, 32);
+    print(&b, (i64)n);
+    print(&b, n==1 ? Str(" session") : Str(" sessions"));
+    return finish(&b);
+}
+
+// The New group dialog for roots: one session's, or several at once.
+static void namegroupfor(Gui *g, Slice<GuiSession *> roots)
+{
+    namedialog(g, NAME_NEWGROUP, roots.len==1 ? roots[0] : 0, {}, {});
+    for (iz i = 0; roots.len>1 && i < roots.len; i++) {
+        g->nameroots = push(&g->perm, g->nameroots, roots[i]);
+    }
+}
+
+// The picks to the Trash, or for good once confirmed where a host keeps
+// no Trash, or from the Trash: the Delete key, and the selection's bar.
+// Where one of them cannot go, it says why, in the menu bar.
+static void picktrash(Gui *g, Arena a, Slice<GuiSession *> roots)
+{
+    if (!roots.len) {
+        return;
+    }
+    b32 on  = !roots[0]->trashed && rootstrashon(roots);
+    Str why = rootswhy(g, &a, roots, on ? Str("trash") : Str("delete"), 1);
+    if (why.len) {
+        g->lasterr = clone(&g->perm, concat(&a, on ? Str("Not moved to the Trash: ")
+                                                   : Str("Not deleted: "), why));
+    } else if (on) {
+        trashroots(g, a, roots);
+        pickclear(g);
+    } else {
+        askdelete(g, roots, {});
+    }
+}
+
+// A move to a group, for several at once: each of the groups, a new one,
+// or none. Disabled where all are in it already.
+static void pickgroupitems(Gui *g, Arena a, Slice<GuiSession *> roots)
+{
+    for (iz i = 0; i < g->groups.len; i++) {
+        Str n   = g->groups[i];
+        b32 all = 1;
+        for (iz k = 0; k < roots.len; k++) {
+            all &= roots[k]->group == n;
+        }
+        ImGui::PushID((i32)i);
+        if (ImGui::MenuItem(cstr0(&a, n), 0, all, !all)) {
+            for (iz k = 0; k < roots.len; k++) {
+                if (!(roots[k]->group == n)) {
+                    guigroup(g, roots[k], n);
+                }
+            }
+        }
+        itemnamed(g, concat(&a, "group ", n));
+        ImGui::PopID();
+    }
+    if (g->groups.len) {
+        ImGui::Separator();
+    }
+    if (menutip(g, &a, "New group...", {}, "Name a new group and move them there")) {
+        namegroupfor(g, roots);
+    }
+    b32 any = 0;
+    for (iz k = 0; k < roots.len; k++) {
+        any |= roots[k]->group.len > 0;
+    }
+    if (menutip(g, &a, "Remove from group", any ? Str{} : Str("None of them is in a group"),
+                "Back among the sessions in no group")) {
+        for (iz k = 0; k < roots.len; k++) {
+            if (roots[k]->group.len) {
+                guigroup(g, roots[k], {});
+            }
+        }
+    }
+}
+
+// A picked row's menu while there are several: what applies to them
+// all, as a group's menu has for its sessions, each item disabled, with
+// the first reason, where one of them cannot have it.
+static void pickitems(Gui *g, Arena a)
+{
+    Slice<GuiSession *> roots = pickroots(g, &a);
+    ImGui::TextDisabled("%d sessions", (int)roots.len);
+    ImGui::Separator();
+    if (roots.len && roots[0]->trashed) {
+        if (menutip(g, &a, "Restore", rootswhy(g, &a, roots, "trash", 0),
+                    "Back where they were, with their subagents")) {
+            for (iz i = 0; i < roots.len; i++) {
+                guitrash(g, a, roots[i], 0);
+            }
+            pickclear(g);
+        }
+        if (menutip(g, &a, "Delete Permanently...", rootswhy(g, &a, roots, "delete", 1),
+                    "Remove them and their subagents for good now, once you confirm")) {
+            askdelete(g, roots, {});
+        }
+    } else {
+        b32                 arch = rootsarchived(roots);
+        Slice<GuiSession *> them = rootsarchiving(&a, roots, !arch);
+        if (menutip(g, &a, arch ? Str("Unarchive") : Str("Archive"),
+                    rootswhy(g, &a, them, "archive", 0),
+                    arch ? Str("Back among the sessions above")
+                         : Str("Under Archived, at the end of the sidebar"))) {
+            for (iz i = 0; i < them.len; i++) {
+                guiarchive(g, them[i], !arch);
+            }
+        }
+        Str why = rootswhy(g, &a, roots, "group", 0);
+        b32 sub = ImGui::BeginMenu("Move to group", !why.len);
+        itemnamed(g, "Move to group");
+        whytip(why);
+        if (sub) {
+            pickgroupitems(g, a, roots);
+            ImGui::EndMenu();
+        }
+        ImGui::Separator();
+
+        // Close: those open here, once their turns end
+        Slice<GuiSession *> open  = {};
+        Str                 close = {};
+        for (iz i = 0; i < roots.len; i++) {
+            View *v = roots[i]->view;
+            if (v) {
+                open = push(&a, open, roots[i]);
+            }
+            if (v && v->busy && !roots[i]->readonly && !close.len) {
+                close = concat(&a, concat(&a, concat(&a, "\xe2\x80\x9c",
+                               shorten(&a, sesstitle(roots[i]), 40)), "\xe2\x80\x9d: "),
+                               "Close it once its turn ends");
+            }
+        }
+        close = close.len || open.len ? close : Str("None of them is open here");
+        if (menutip(g, &a, "Close", close,
+                    "Stop their background jobs and subagents, deny what they ask "
+                    "from now on, and let them go from memory here")) {
+            for (iz i = 0; i < open.len; i++) {
+                sessclose(g, open[i]);
+            }
+        }
+        ImGui::Separator();
+
+        if (rootstrashon(roots)) {
+            if (menutip(g, &a, "Move to Trash", rootswhy(g, &a, roots, "trash", 1),
+                        "Into the Trash with their subagents, then removed after "
+                        "the days their hosts keep them")) {
+                trashroots(g, a, roots);
+                pickclear(g);
+            }
+            if (menutip(g, &a, "Delete Permanently...", rootswhy(g, &a, roots, "delete", 1),
+                        "Remove them and their subagents for good now, once you confirm")) {
+                askdelete(g, roots, {});
+            }
+        } else if (menutip(g, &a, "Delete...", rootswhy(g, &a, roots, "delete", 1),
+                           "Remove them and their subagents for good, once you confirm")) {
+            askdelete(g, roots, {});
+        }
+    }
+    ImGui::Separator();
+    if (menutip(g, &a, "Clear selection", {}, "Let them go: no session picked (Esc)")) {
+        pickclear(g);
+    }
 }
 
 static void groupmove(Gui *g, Str group, i32 by)
@@ -9189,16 +9474,17 @@ static void groupdrop(Gui *g, Str group)
 static void groupitems(Gui *g, Arena a, Str group)
 {
     Slice<GuiSession *> roots = grouproots(g, &a, group);
-    if (menuitem(g, a, "Rename group...", groupwhy(g, roots, "group", 0))) {
+    Str gwhy = rootswhy(g, &a, roots, "group", 0);
+    if (menuitem(g, a, "Rename group...", gwhy)) {
         namedialog(g, NAME_GROUP, 0, group, group);
     }
-    Str why = !roots.len ? Str("It has no sessions") : groupwhy(g, roots, "archive", 0);
+    Str why = !roots.len ? Str("It has no sessions") : rootswhy(g, &a, roots, "archive", 0);
     if (menuitem(g, a, "Archive group", why)) {
         for (iz i = 0; i < roots.len; i++) {
             guiarchive(g, roots[i], 1);
         }
     }
-    if (menuitem(g, a, "Ungroup", groupwhy(g, roots, "group", 0))) {
+    if (menuitem(g, a, "Ungroup", gwhy)) {
         for (iz i = 0; i < roots.len; i++) {
             guigroup(g, roots[i], {});
         }
@@ -9220,7 +9506,8 @@ static void groupitems(Gui *g, Arena a, Str group)
     }
     if (trash) {
         // Into the Trash, host by host, told as one
-        if (menuitem(g, a, "Move group to Trash", groupwhy(g, roots, "trash", 1))) {
+        Str twhy = rootswhy(g, &a, roots, "trash", 1);
+        if (menuitem(g, a, "Move group to Trash", twhy)) {
             for (iz i = 0; i < roots.len; i++) {
                 guitrash(g, a, roots[i], 1);
             }
@@ -9228,8 +9515,11 @@ static void groupitems(Gui *g, Arena a, Str group)
             groupdrop(g, group);
         }
         itemtip("The group goes; its sessions go to the Trash");
-    } else if (menuitem(g, a, "Delete group and sessions...", groupwhy(g, roots, "delete", 1))) {
-        askdelete(g, roots, group);
+    } else {
+        Str dwhy = rootswhy(g, &a, roots, "delete", 1);
+        if (menuitem(g, a, "Delete group and sessions...", dwhy)) {
+            askdelete(g, roots, group);
+        }
     }
 }
 
@@ -9349,13 +9639,14 @@ static void foldrow(Gui *g, SideRow *r)
 // parent changes: the sections keep the sidebar's order. One in the Trash
 // dragged out is restored, into where it is dropped; the Trash heading
 // is no target, so close under Archived.
-static Str dragwhy(Gui *g, GuiSession *s)
+static Str dragwhy(Gui *g, Arena *a, GuiSession *s)
 {
+    Slice<GuiSession *> them = pickfor(g, a, s);  // the picks, if it is one
     if (s->trashed) {
-        return sesswhy(g, s, "trash", 0, 1);
+        return rootswhy(g, a, them, "trash", 0);
     }
-    Str why = sesswhy(g, s, "group", 0, 1);
-    return why.len ? why : sesswhy(g, s, "archive", 0, 1);
+    Str why = rootswhy(g, a, them, "group", 0);
+    return why.len ? why : rootswhy(g, a, them, "archive", 0);
 }
 
 // The session being dragged, else null.
@@ -9381,7 +9672,7 @@ static b32 dropok(GuiSession *s, GuiHost *h, Str group, b32 archived)
 // anywhere; else, dragged, why not.
 static void dragsource(Gui *g, Arena a, GuiSession *s)
 {
-    Str why = dragwhy(g, s);
+    Str why = dragwhy(g, &a, s);
     if (why.len) {
         if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
             tipnow("%s", cstr0(&a, why));
@@ -9411,9 +9702,18 @@ static void droptarget(Gui *g, Arena a, GuiHost *h, Str group, b32 archived, Str
         return;  // over the drop strip (dragstrip), drawn over this
     } else if (g->sideview==SIDEVIEW_FOLDERS && !archived) {
         return;  // no groups shown to drop into, nor out of
-    } else if (!dropok(s, h, group, archived)) {
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) &&
-                h && h!=s->host) {
+    }
+    // The picks go together, if it is one of them: none to another host,
+    // and only where that changes something for one of them at least
+    Slice<GuiSession *> them = pickfor(g, &a, s);
+    b32                 away = 0;
+    b32                 any  = 0;
+    for (iz i = 0; i < them.len; i++) {
+        away |= h && h!=them[i]->host;
+        any  |= dropok(them[i], h, group, archived);
+    }
+    if (away || !any) {
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) && away) {
             ImGui::SetMouseCursor(ImGuiMouseCursor_NotAllowed);
             fieldput(g->droplabel, concat(&a, "not to ", h->name));
         }
@@ -9426,14 +9726,24 @@ static void droptarget(Gui *g, Arena a, GuiHost *h, Str group, b32 archived, Str
             fieldput(g->droplabel, concat(&a, "\xe2\x86\x92 ", label));  // a rightwards arrow
         }
         if (p && p->IsDelivery()) {
-            if (s->trashed) {
-                guitrash(g, a, s, 0);
+            b32 restored = 0;
+            for (iz i = 0; i < them.len; i++) {
+                GuiSession *t = them[i];
+                if (t->gone) {
+                    continue;
+                } else if (t->trashed) {
+                    guitrash(g, a, t, 0);
+                    restored = 1;
+                }
+                if (!archived && !(t->group==group)) {
+                    guigroup(g, t, group);
+                }
+                if (!t->archived != !archived) {
+                    guiarchive(g, t, archived);
+                }
             }
-            if (!archived && !(s->group==group)) {
-                guigroup(g, s, group);
-            }
-            if (!s->archived != !archived) {
-                guiarchive(g, s, archived);
+            if (restored && s->picked) {
+                pickclear(g);  // out of the Trash: picked no more
             }
         }
         ImGui::EndDragDropTarget();
@@ -9771,7 +10081,7 @@ static void rowactions(Gui *g, Arena a, SideRow *r, GuiSession *s, ImVec2 r0, Im
     f32         bw   = iconw();
     f32         bh   = ImGui::GetFrameHeight();
     f32         gap  = 2*sc;
-    b32         grip = !dragwhy(g, s).len;
+    b32         grip = !dragwhy(g, &a, s).len;
     f32         gw   = grip ? ImGui::CalcTextSize(ICON_GRIPPER).x + 8*sc : 0;
     f32         x1   = r1.x - 2*sc;
     f32         x0   = x1 - (2*bw + gap + gw + 4*sc);
@@ -9789,52 +10099,79 @@ static void rowactions(Gui *g, Arena a, SideRow *r, GuiSession *s, ImVec2 r0, Im
         dl->AddRectFilledMultiColor(v2(x0 - fadew, r0.y), v2(x0, r1.y), c0, c, c, c0);
         dl->AddRectFilled(v2(x0, r0.y), r1, c);
 
-        // Copied, as trashing it closes its view, where the title is
+        // Copied, as trashing it closes its view, where the title is.
+        // On a picked row, while there are several, each acts on them all.
         Str                 title = clone(&a, sesstitle(s));
-        Slice<GuiSession *> one   = {};
-        one = push(&a, one, s);
+        Slice<GuiSession *> them  = pickfor(g, &a, s);
+        b32                 many  = them.len > 1;
+        Str                 n     = nsessions(&a, them.len);
         ImGui::SetCursorScreenPos(v2(x0 + 4*sc, y));
         if (r->trashed) {
-            Str why = sesswhy(g, s, "trash", 0, 1);
+            Str why = rootswhy(g, &a, them, "trash", 0);
             if (rowicon(g, ICON_DISCARD "##restore", why)) {
-                guitrash(g, a, s, 0);
+                for (iz i = 0; i < them.len; i++) {
+                    guitrash(g, a, them[i], 0);
+                }
+                if (s->picked) {
+                    pickclear(g);
+                }
             }
             axname(g, "Restore");
             itemnamed(g, concat(&a, "restore ", title));
-            whytip(why.len ? why : Str("Restore: back where it was, with its subagents"));
+            whytip(why.len ? why :
+                   many    ? concat(&a, concat(&a, "Restore ", n),
+                                    ": back where they were, with their subagents")
+                           : Str("Restore: back where it was, with its subagents"));
             ImGui::SameLine(0, gap);
-            why = sesswhy(g, s, "delete", 1, 0);
+            why = rootswhy(g, &a, them, "delete", 1);
             if (rowicon(g, ICON_TRASH "##delete", why)) {
-                askdelete(g, one, {});
+                askdelete(g, them, {});
             }
             axname(g, "Delete Permanently");
             itemnamed(g, concat(&a, "delete ", title));
-            whytip(why.len ? why : Str("Delete Permanently: remove it and its subagents "
-                                       "for good now, once you confirm"));
+            whytip(why.len ? why :
+                   many    ? concat(&a, concat(&a, "Delete ", n),
+                                    " permanently: remove them and their subagents for "
+                                    "good now, once you confirm")
+                           : Str("Delete Permanently: remove it and its subagents "
+                                 "for good now, once you confirm"));
         } else {
-            b32 arch = s->archived;
-            Str why  = sesswhy(g, s, "archive", 0, 1);
+            b32                 arch  = rootsarchived(them);
+            Slice<GuiSession *> moved = rootsarchiving(&a, them, !arch);
+            Str                 why   = rootswhy(g, &a, moved, "archive", 0);
             if (rowicon(g, arch ? ICON_UNARCHIVE "##archive" : ICON_ARCHIVE "##archive", why)) {
-                guiarchive(g, s, !arch);
+                for (iz i = 0; i < moved.len; i++) {
+                    guiarchive(g, moved[i], !arch);
+                }
             }
             itemnamed(g, concat(&a, "archive ", title));
-            whytip(why.len ? why : arch ? Str("Unarchive: back among the sessions above")
-                                        : Str("Archive: under Archived, at the end of "
-                                              "the sidebar"));
+            Str does = arch ? Str(": back among the sessions above")
+                            : Str(": under Archived, at the end of the sidebar");
+            whytip(why.len ? why :
+                   many    ? concat(&a, concat(&a, arch ? Str("Unarchive ") : Str("Archive "), n),
+                                    does)
+                           : concat(&a, arch ? Str("Unarchive") : Str("Archive"), does));
             ImGui::SameLine(0, gap);
-            b32 on = trashon(s->host);
-            why = on ? sesswhy(g, s, "trash", 1, 1) : sesswhy(g, s, "delete", 1, 0);
+            b32 on = rootstrashon(them);
+            why = rootswhy(g, &a, them, on ? Str("trash") : Str("delete"), 1);
             if (rowicon(g, ICON_TRASH "##trash", why)) {
                 if (on) {
-                    trashroots(g, a, one);
+                    trashroots(g, a, them);
+                    if (s->picked) {
+                        pickclear(g);
+                    }
                 } else {
-                    askdelete(g, one, {});
+                    askdelete(g, them, {});
                 }
             }
             axname(g, on ? Str("Move to Trash") : Str("Delete"));
             itemnamed(g, concat(&a, "trash ", title));
             if (why.len) {
                 whytip(why);
+            } else if (on && many) {
+                whytip(concat(&a, concat(&a, "Move ", n),
+                              " to the Trash, with their subagents, then removed after "
+                              "the days their hosts keep them"));
             } else if (on) {
                 Buf tip(&a, 128);
                 print(&tip, "Move to Trash, with its subagents, kept ");
@@ -9842,6 +10179,9 @@ static void rowactions(Gui *g, Arena a, SideRow *r, GuiSession *s, ImVec2 r0, Im
                 print(&tip, s->host->trashdays==1 ? Str(" day") : Str(" days"));
                 print(&tip, ", then removed");
                 whytip(finish(&tip));
+            } else if (many) {
+                whytip(concat(&a, concat(&a, "Delete ", n),
+                              ": remove them and their subagents for good, once you confirm"));
             } else {
                 whytip("Delete: remove it and its subagents for good, once you confirm");
             }
@@ -9884,21 +10224,47 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other, 
     i32         state = v ? v->state : s->state;
 
     pushstr(s->sid);
-    ImVec2 p = ImGui::GetCursorScreenPos();
-    f32    w = ImGui::GetContentRegionAvail().x;
+    ImVec2   p  = ImGui::GetCursorScreenPos();
+    f32      w  = ImGui::GetContentRegionAvail().x;
+    ImGuiIO &io = ImGui::GetIO();
+    ImVec4   pr = g->pickrect;  // the selection's bar, which takes the pointer
+    b32      bar = pr.w>pr.y && io.MousePos.x>=pr.x && io.MousePos.x<pr.z &&
+                   io.MousePos.y>=pr.y && io.MousePos.y<pr.w;
+    // Shown as selected: picked, or with nothing picked, the one in view.
+    // A click with Ctrl (Cmd on macOS) or Shift picks, once the rows are
+    // known (pickclick); a plain one lets the picks go and opens it, or
+    // in the Trash, where none opens, picks it alone.
+    b32 sel = s->picked || (!g->pickn && s==g->sess);
     ImGui::SetNextItemAllowOverlap();
-    if (ImGui::Selectable("##s", s==g->sess, 0, v2(0, 2*lineh + 4*sc)) && !r->trashed) {
-        sessgo(g, s);
+    if (ImGui::Selectable("##s", sel, 0, v2(0, 2*lineh + 4*sc)) && !bar) {
+        if (io.KeyCtrl || io.KeyShift) {
+            g->pickhit    = s;
+            g->picktoggle = io.KeyCtrl;
+            g->pickrange  = io.KeyShift;
+        } else {
+            pickclear(g);
+            g->pickanchor = s;
+            if (r->trashed) {
+                s->picked = pickable(s);
+                pickcount(g);
+            } else {
+                sessgo(g, s);
+            }
+        }
     }
     axname(g, sesstitle(s));
-    axselected(g, s==g->sess);
+    axselected(g, sel);
     ImVec2 r0 = ImGui::GetItemRectMin();
     ImVec2 r1 = ImGui::GetItemRectMax();
     s->row = {r0.x, r0.y, r1.x, r1.y};
+    if (g->pickn && s==g->sess && !s->picked) {
+        // In view but not picked: a mark at its edge says which it is
+        dl->AddRectFilled(r0, v2(r0.x + 3*sc, r1.y), g->pal->active);
+    }
     // A root's actions show while the pointer is on its row; a held
     // grip stays, as the source of its drag
     b32 held = g->gripsess==s && ImGui::IsMouseDown(ImGuiMouseButton_Left);
-    b32 acts = held || (!sessparent(s).len && !sessremote(s) && !dragged() &&
+    b32 acts = held || (!sessparent(s).len && !sessremote(s) && !dragged() && !bar &&
                         !g->dragcancel && ImGui::IsMouseHoveringRect(r0, r1) &&
                         ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows |
                                                ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) &&
@@ -9912,7 +10278,14 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other, 
         *other = 1;
     }
     Str cwd = sessnofolder(s) ? Str("No folder") : v && v->cwd.len ? v->cwd : s->cwd;
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal) && !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId)) {
+    if (g->picknope==s && !ImGui::IsItemHovered()) {
+        g->picknope = 0;
+    }
+    if (g->picknope==s && !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId)) {
+        // Clicked with Ctrl (Cmd) or Shift, though it cannot be picked
+        tipnow("%s", "A subagent goes with the session that started it: pick that one");
+    } else if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal) &&
+               !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId)) {
         Buf tip(&a, 256);
         print(&tip, cwd);
         if (s->wtname.len) {
@@ -9949,11 +10322,17 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other, 
         tipnow("%s", cstr0(&a, finish(&tip)));
     }
     if (uirclicked(g)) {
-        ImGui::OpenPopup("##sessmenu");
+        // One of several picked: the menu for them all
+        ImGui::OpenPopup(s->picked && g->pickn>1 ? "##pickmenu" : "##sessmenu");
     }
     if (ImGui::BeginPopup("##sessmenu")) {
         g->menusess = s;
         sessitems(g, a, s);
+        ImGui::EndPopup();
+    }
+    if (ImGui::BeginPopup("##pickmenu")) {
+        g->menusess = s;
+        pickitems(g, a);
         ImGui::EndPopup();
     }
     // Its menu's Close lets its view go (sessclose), arenas and all
@@ -9969,7 +10348,7 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other, 
         ImVec2 back = ImGui::GetCursorScreenPos();
         ImGui::SetCursorScreenPos(v2(dx - 7*sc, p.y));
         ImGui::InvisibleButton("##fold", v2(14*sc, lineh + 4*sc));
-        if (uiclicked() && !r->forced) {
+        if (uiclicked() && !r->forced && !bar) {
             foldrow(g, r);
         }
         if (ImGui::IsItemHovered() && !r->forced) {
@@ -10128,6 +10507,9 @@ static void dragcard(Gui *g, Arena a, GuiSession *s)
     i32   state = v ? v->state : s->state;
     drawdot(dl, v2(c0.x + 12*sc, c0.y + 2*sc + lineh/2), 3.5f*sc, livecolor(g->pal, state));
     Pen t = {dl, &g->fonts, c0.x + 23*sc, c0.y + 2*sc, c1.x - 8*sc, g->fonts.size};
+    if (s->picked && g->pickn>1) {
+        pen(&t, concat(&a, nsessions(&a, g->pickn), "  "), STYLE_BOLD, g->pal->active);
+    }
     pen(&t, sesstitle(s), 0, g->pal->text);
     Str where = {(u8 *)g->droplabel, (iz)__builtin_strlen(g->droplabel)};
     Pen b = {dl, &g->fonts, c0.x + 23*sc, c0.y + 2*sc + lineh, c1.x - 8*sc,
@@ -10238,7 +10620,7 @@ static void dragrest(Gui *g, Arena a, GuiSession *s, f32 foot)
                                            rest>2*lineh ? rest : 2*lineh));
     axrole(g, AX_NONE);  // a drag's place, as the row menu's Remove from group
     itemnamed(g, "sessions empty");
-    droptarget(g, a, s->host, {}, 0, "out of groups");
+    droptarget(g, a, 0, {}, 0, "out of groups");  // each on its own host
 
 
     ImGuiWindow *w    = ImGui::GetCurrentWindow();
@@ -10362,30 +10744,37 @@ static void dragstrip(Gui *g, Arena a, GuiSession *s)
     }
     dl->AddRectFilled(v2(w->InnerRect.Min.x, top), w->InnerRect.Max, g->pal->panel);
 
-    b32 arch = s->archived;
+    Slice<GuiSession *> them = pickfor(g, &a, s);  // the picks, if it is one
+    b32                 arch = rootsarchived(them);
+    Slice<GuiSession *> moved = rootsarchiving(&a, them, !arch);
+    Str                 awhy  = rootswhy(g, &a, moved, "archive", 0);
+    Str                 gwhy  = rootswhy(g, &a, them, "group", 0);
     if (stripdrop(g, a, t, t.x, xa, arch ? ICON_UNARCHIVE : ICON_ARCHIVE,
                   arch ? Str("Unarchive") : Str("Archive"),
                   arch ? Str("out of Archived") : Str("Archived"),
-                  sesswhy(g, s, "archive", 0, 1), g->pal->active, "sessions archive")) {
-        guiarchive(g, s, !arch);
+                  awhy, g->pal->active, "sessions archive")) {
+        for (iz i = 0; i < moved.len; i++) {
+            guiarchive(g, moved[i], !arch);
+        }
     }
     if (stripdrop(g, a, t, xa + gap, xb, ICON_NEWFOLDER, "New group...",
-                  "a new group, once named", sesswhy(g, s, "group", 0, 1),
+                  "a new group, once named", gwhy,
                   g->pal->active, "sessions newgroup")) {
-        namedialog(g, NAME_NEWGROUP, s, {}, {});
+        namegroupfor(g, them);
     }
-    b32 on  = trashon(s->host);
-    Str why = on ? sesswhy(g, s, "trash", 1, 1) : sesswhy(g, s, "delete", 1, 0);
+    b32 on  = rootstrashon(them);
+    Str why = rootswhy(g, &a, them, on ? Str("trash") : Str("delete"), 1);
     if (stripdrop(g, a, t, xb + gap, t.z, ICON_TRASH,
                   on ? Str("Move to Trash") : Str("Delete..."),
                   on ? Str("Trash") : Str("delete, once you confirm"),
                   why, g->pal->bad, "sessions trash")) {
-        Slice<GuiSession *> one = {};
-        one = push(&a, one, s);
         if (on) {
-            trashroots(g, a, one);
+            trashroots(g, a, them);
+            if (s->picked) {
+                pickclear(g);
+            }
         } else {
-            askdelete(g, one, {});
+            askdelete(g, them, {});
         }
     }
     w->DC.CursorMaxPos = maxp;
@@ -10469,6 +10858,202 @@ static void drawrails(Gui *g, Arena a, Slice<SideRow> rows, Slice<RowAt> at, b32
 
 // The sidebar: a "+" for a new session, then the tree (sidebar.cpp) of
 // groups, hosts, sessions and subagents, the archived, and the Trash.
+// A row clicked with Ctrl (Cmd on macOS) or Shift this frame
+// (g->pickhit), once the rows are known: Ctrl toggles it, the first
+// time with the one in view picked too, as a file manager has it; Shift
+// picks the rows from the anchor (else the one in view) to it in place
+// of the picks, or with Ctrl as well, adding to them. The picks are all
+// in the Trash or none of them: a row in the other place starts anew.
+static void pickclick(Gui *g, Arena a, SideIn *in, Slice<SideRow> rows,
+                      Slice<GuiSession *> sess)
+{
+    GuiSession *s = g->pickhit;
+    g->pickhit = 0;
+    if (!pickable(s)) {
+        g->picknope = s;
+        return;
+    }
+    b32 trash = s->trashed != 0;
+    for (GuiSession *k = g->sessions; k; k = k->next) {
+        if (k->picked && !k->trashed!=!trash) {
+            pickclear(g);
+            break;
+        }
+    }
+    GuiSession *c = g->sess;
+    if (g->pickrange) {
+        GuiSession *from = g->pickanchor && !g->pickanchor->gone ? g->pickanchor : c;
+        i32         i0   = -1;
+        i32         i1   = -1;
+        for (iz i = 0; i < sess.len; i++) {
+            i0 = sess[i]==from ? (i32)i : i0;
+            i1 = sess[i]==s    ? (i32)i : i1;
+        }
+        Slice<i32> got = sidepickrange(&a, in, rows, i0, i1);
+        if (!g->picktoggle) {
+            pickclear(g);
+        }
+        for (iz i = 0; i < got.len; i++) {
+            sess[got[i]]->picked = 1;
+        }
+        g->pickanchor = from ? from : s;  // where the next Shift-click goes from
+    } else {
+        if (!g->pickn && c && c!=s && pickable(c) && !c->trashed==!trash) {
+            c->picked = 1;
+        }
+        s->picked     = !s->picked;
+        g->pickanchor = s;
+    }
+    pickcount(g);
+    scheddirty(&g->sched);
+}
+
+// Keys for the picks, while the pane has the keyboard and nothing else
+// takes them: Delete, and on macOS Backspace (with Cmd too, as Finder
+// has it), moves them to the Trash, or deletes them once confirmed
+// where a host keeps none, as it does those in the Trash; Esc lets them
+// go, taken so that nothing else has it.
+static void pickkeys(Gui *g, Arena a)
+{
+    if (!g->pickn || dragged() || ImGui::IsAnyItemActive() ||
+            !ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) ||
+            ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel)) {
+        return;
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+        ImGui::SetKeyOwner(ImGuiKey_Escape, ImGui::GetID("##pickkeys"),
+                           ImGuiInputFlags_LockThisFrame);
+        pickclear(g);
+        scheddirty(&g->sched);
+    } else if (ImGui::IsKeyPressed(ImGuiKey_Delete, false) ||
+               (g->mac && ImGui::IsKeyPressed(ImGuiKey_Backspace, false))) {
+        Slice<GuiSession *> roots = pickroots(g, &a);
+        picktrash(g, a, roots);
+    }
+}
+
+// The selection's bar, while two or more are picked and none dragged:
+// at the pane's foot, in the drop strip's place, a line high.
+static ImVec4 pickbarrect(Gui *g)
+{
+    f32          sc = g->scale;
+    ImGuiWindow *w  = ImGui::GetCurrentWindow();
+    f32          h  = ImGui::GetFrameHeight() + 8*sc;
+    f32          x0 = w->InnerRect.Min.x + 6*sc;
+    f32          x1 = w->InnerRect.Max.x - 6*sc;
+    f32          y1 = w->InnerRect.Max.y - 6*sc;
+    return {x0, y1-h, x1, y1};
+}
+
+// The bar itself (pickbarrect, t), drawn over the rows as the drop strip
+// is: how many are picked, and what is done to them most, Archive (or
+// Unarchive), Move to group, and Move to Trash (or Delete); in the Trash,
+// Restore and Delete Permanently; and x to let them go. A picked row's
+// menu has the rest. The bar takes the pointer from the rows under it,
+// and its buttons, after it, from the bar.
+static void drawpickbar(Gui *g, Arena a, ImVec4 t)
+{
+    f32          sc   = g->scale;
+    ImGuiWindow *w    = ImGui::GetCurrentWindow();
+    ImVec2       back = w->DC.CursorPos;     // put back as it was, the bar
+    ImVec2       maxp = w->DC.CursorMaxPos;  // drawn over the rows
+    ImDrawList  *dl   = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(v2(t.x, t.y), v2(t.z, t.w), g->pal->panel, 6*sc);
+    dl->AddRect(v2(t.x, t.y), v2(t.z, t.w), g->pal->rule, 6*sc);
+    ImGui::SetCursorScreenPos(v2(t.x, t.y));
+    ImGui::SetNextItemAllowOverlap();
+    ImGui::InvisibleButton("##pickbar", v2(t.z - t.x, t.w - t.y));
+    axrole(g, AX_NONE);
+
+    Slice<GuiSession *> roots = pickroots(g, &a);
+    b32                 trash = roots.len && roots[0]->trashed;
+    Str                 n     = nsessions(&a, roots.len);
+    f32                 bw    = iconw();
+    f32                 bh    = ImGui::GetFrameHeight();
+    f32                 gap   = 2*sc;
+    i32                 nb    = trash ? 3 : 4;
+    f32                 x     = t.z - 4*sc - (f32)nb*bw - (f32)(nb-1)*gap;
+    char const         *count = cstr0(&a, concat(&a, n, " selected"));
+    ImVec2              ts    = ImGui::CalcTextSize(count);
+    if (t.x + 8*sc + ts.x < x - 4*sc) {
+        dl->AddText(v2(t.x + 8*sc, t.y + (t.w - t.y - ts.y)/2), g->pal->text, count);
+    }
+    ImGui::SetCursorScreenPos(v2(x, t.y + (t.w - t.y - bh)/2));
+    if (trash) {
+        Str why = rootswhy(g, &a, roots, "trash", 0);
+        if (rowicon(g, ICON_DISCARD "##pickrestore", why)) {
+            for (iz i = 0; i < roots.len; i++) {
+                guitrash(g, a, roots[i], 0);
+            }
+            pickclear(g);
+        }
+        axname(g, "Restore");
+        itemnamed(g, "picks restore");
+        whytip(why.len ? why : concat(&a, concat(&a, "Restore ", n),
+                                      ": back where they were, with their subagents"));
+        ImGui::SameLine(0, gap);
+        why = rootswhy(g, &a, roots, "delete", 1);
+        if (rowicon(g, ICON_TRASH "##pickdelete", why)) {
+            askdelete(g, roots, {});
+        }
+        axname(g, "Delete Permanently");
+        itemnamed(g, "picks delete");
+        whytip(why.len ? why : concat(&a, concat(&a, "Delete ", n),
+                                      " permanently: remove them and their subagents "
+                                      "for good now, once you confirm"));
+    } else {
+        b32                 arch  = rootsarchived(roots);
+        Slice<GuiSession *> moved = rootsarchiving(&a, roots, !arch);
+        Str                 why   = rootswhy(g, &a, moved, "archive", 0);
+        if (rowicon(g, arch ? ICON_UNARCHIVE "##pickarchive" : ICON_ARCHIVE "##pickarchive", why)) {
+            for (iz i = 0; i < moved.len; i++) {
+                guiarchive(g, moved[i], !arch);
+            }
+        }
+        axname(g, arch ? Str("Unarchive") : Str("Archive"));
+        itemnamed(g, "picks archive");
+        whytip(why.len ? why :
+               concat(&a, concat(&a, arch ? Str("Unarchive ") : Str("Archive "), n),
+                      arch ? Str(": back among the sessions above")
+                           : Str(": under Archived, at the end of the sidebar")));
+        ImGui::SameLine(0, gap);
+        why = rootswhy(g, &a, roots, "group", 0);
+        if (rowicon(g, ICON_NEWFOLDER "##pickgroup", why)) {
+            ImGui::OpenPopup("##pickgroupmenu");
+        }
+        axname(g, "Move to group");
+        itemnamed(g, "picks group");
+        whytip(why.len ? why : concat(&a, concat(&a, "Move ", n),
+                                      " to a group, a new one, or out of any"));
+        ImGui::SameLine(0, gap);
+        b32 on = rootstrashon(roots);
+        why = rootswhy(g, &a, roots, on ? Str("trash") : Str("delete"), 1);
+        if (rowicon(g, ICON_TRASH "##picktrash", why)) {
+            picktrash(g, a, roots);
+        }
+        axname(g, on ? Str("Move to Trash") : Str("Delete"));
+        itemnamed(g, "picks trash");
+        whytip(why.len ? why :
+               on      ? concat(&a, concat(&a, "Move ", n),
+                                " to the Trash, with their subagents (Delete)")
+                       : concat(&a, concat(&a, "Delete ", n),
+                                ": remove them and their subagents for good, once you confirm"));
+    }
+    ImGui::SameLine(0, gap);
+    if (rowicon(g, ICON_CLOSE "##pickclear", {})) {
+        pickclear(g);
+    }
+    axname(g, "Clear selection");
+    itemnamed(g, "picks clear");
+    whytip("Clear the selection (Esc)");
+    if (ImGui::BeginPopup("##pickgroupmenu")) {
+        pickgroupitems(g, a, roots);
+        ImGui::EndPopup();
+    }
+    w->DC.CursorPos    = back;
+    w->DC.CursorMaxPos = maxp;
+}
+
 static void drawsessions(Gui *g)
 {
     Arena a     = g->frame;
@@ -10498,6 +11083,8 @@ static void drawsessions(Gui *g)
     if (!drag) {
         g->edgeat = 0;
     }
+    pickprune(g);
+    g->pickrect = g->pickn>1 && !drag ? pickbarrect(g) : ImVec4{};
     ImGui::BeginDisabled(!cannew(g));
     if (iconbutton(ICON_ADD)) {
         g->newhost = 0;  // the default host
@@ -10667,6 +11254,7 @@ static void drawsessions(Gui *g)
                 }
             }
             e.group    = s->group;
+            e.pick     = pickable(s);
             e.folder   = sessfolder(s);
             e.archived = s->archived;
             e.trashed  = s->trashed != 0;
@@ -10712,6 +11300,7 @@ static void drawsessions(Gui *g)
                                                                          : Str("-")); break;
             }
             print(&d, r->away ? Str("@") : Str(""));
+            print(&d, r->kind==SROW_SESSION && sess[r->sess]->picked ? Str("*") : Str(""));
             print(&d, r->folded ? Str("+\n") : Str("\n"));
         }
         Str t = finish(&d);
@@ -10743,6 +11332,17 @@ static void drawsessions(Gui *g)
     drawrails(g, a, rows, at, drag != 0);
     if (!sess.len) {
         ImGui::TextDisabled("No sessions yet.");
+    }
+    if (g->pickhit) {
+        pickclick(g, a, &in, rows, sess);
+    }
+    pickkeys(g, a);
+    ImVec4 pr = g->pickrect;
+    if (pr.w>pr.y && g->pickn>1) {
+        ImGui::Dummy(v2(0, pr.w - pr.y + 6*g->scale));  // room to scroll the last rows above it
+        drawpickbar(g, a, pr);
+    } else {
+        g->pickrect = {};
     }
     if (drag) {
         ImVec4 t = g->trashrect;
@@ -10777,7 +11377,9 @@ static void drawsessdialogs(Gui *g)
     ImGui::SetNextWindowSize(v2(420*sc, 0));
     if (ImGui::BeginPopupModal("##namer", 0, ImGuiWindowFlags_NoTitleBar)) {
         ImGui::TextUnformatted(titles[g->nameask]);
-        if (g->nameask == NAME_NEWGROUP && g->namesess) {
+        if (g->nameask==NAME_NEWGROUP && g->nameroots.len) {
+            ImGui::TextDisabled("For %d sessions", (int)g->nameroots.len);
+        } else if (g->nameask == NAME_NEWGROUP && g->namesess) {
             ImGui::TextDisabled("For %s", cstr0(&a, shorten(&a, sesstitle(g->namesess), 60)));
         }
         ImGui::SetNextItemWidth(-1);
@@ -10804,7 +11406,10 @@ static void drawsessdialogs(Gui *g)
                 if (s && !s->gone) guirename(g, s, name);
                 break;
             case NAME_NEWGROUP:
-                if (s && !s->gone) guigroup(g, s, name);
+                for (iz i = 0; i < g->nameroots.len; i++) {
+                    if (!g->nameroots[i]->gone) guigroup(g, g->nameroots[i], name);
+                }
+                if (!g->nameroots.len && s && !s->gone) guigroup(g, s, name);
                 break;
             case NAME_GROUP: {
                 Slice<GuiSession *> roots = grouproots(g, &a, g->namegroup);
@@ -10895,12 +11500,17 @@ static void drawsessdialogs(Gui *g)
             print(&b, "Delete the group ");
             print(&b, g->delgroup);
             print(&b, " and its ");
+        } else if (g->delroots.len > 1) {
+            print(&b, "Delete ");
+            print(&b, (i64)g->delroots.len);
+            print(&b, " sessions");
+            print(&b, g->delcount>(i32)g->delroots.len ? Str(" with their subagents: ") : Str(""));
         } else {
             print(&b, "Delete ");
             print(&b, g->delroots.len ? shorten(&a, sesstitle(g->delroots[0]), 60) : Str(""));
             print(&b, g->delcount>1 ? Str(" with its subagents: ") : Str(""));
         }
-        if (g->delgroup.len || g->delcount>1) {
+        if (!g->delempty && (g->delgroup.len || g->delcount>(i32)g->delroots.len)) {
             print(&b, (i64)g->delcount);
             print(&b, g->delcount==1 ? Str(" session") : Str(" sessions"));
             if (g->delgroup.len && g->delcount>(i32)g->delroots.len) {
@@ -18253,7 +18863,10 @@ static void dockwindows(Gui *g)
             // Not Esc: the shown session's turn is not the rows' business
             backgroundkey(g);
             drawsessions(g);
-            drawtrashtoast(g, PANE_SESSIONS, drawhosttoast(g, PANE_SESSIONS));
+            // Toasts above the selection's bar, while it shows
+            ImVec4 pr  = g->pickrect;
+            f32    bar = pr.w>pr.y ? ImGui::GetWindowPos().y + ImGui::GetWindowHeight() - pr.y : 0;
+            drawtrashtoast(g, PANE_SESSIONS, bar + drawhosttoast(g, PANE_SESSIONS, bar));
         }
         ImGui::End();
     }

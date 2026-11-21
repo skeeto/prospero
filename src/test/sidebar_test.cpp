@@ -512,6 +512,52 @@ static void test_sidebar(Test *t)
                "F d 1\n S d\nF a 1\n S a2\nF b 1\n S b\nF c 1\n S c\nT 1+\n");
     }
 
+    // A Shift-click's picks (#95): the rows between, those that may be
+    // picked, in the clicked one's place (the Trash or not)
+    {
+        SideIn r = {};
+        r.hosts = push(&a, r.hosts, SideHost{"this", 1, 0});
+        r.sess  = push(&a, r.sess, sidesess(0, "a", {}, {}, 0));
+        r.sess  = push(&a, r.sess, sidesess(0, "k", "a", {}, 0));
+        r.sess  = push(&a, r.sess, sidesess(0, "b", {}, {}, 0));
+        r.sess  = push(&a, r.sess, sidesess(0, "c", {}, {}, 1));
+        r.sess  = push(&a, r.sess, sidesess(0, "t", {}, {}, 0));
+        r.sess  = push(&a, r.sess, sidesess(0, "u", {}, {}, 0));
+        r.sess[4].trashed = 1;
+        r.sess[5].trashed = 1;
+        for (iz i = 0; i < r.sess.len; i++) {
+            r.sess[i].pick = i != 1;  // not the subagent
+        }
+        *upsert(&r.folds, "a", &a) = 0;  // Archived and the Trash open
+        *upsert(&r.folds, "t", &a) = 0;
+        Slice<SideRow> rows = sidetree(&a, &r);
+        expect(t, "sidebar.pickrows", siderows(&a, &r, rows),
+               "S a\n S k\nS b\nA 1\n S c\nT 2\n S t\n S u\n");
+        struct { Str name; i32 from, to; Str want; } cases[] = {
+            {"sidebar.pickdown",  0,  3, "0 2 3 "},  // past the subagent, into Archived
+            {"sidebar.pickup",    3,  0, "0 2 3 "},  // in the rows' order either way
+            {"sidebar.pickother", 0,  4, "4 "},      // the anchor not in the Trash
+            {"sidebar.picktrash", 4,  5, "4 5 "},
+            {"sidebar.picknone", -1,  2, "2 "},      // no anchor
+            {"sidebar.pickself",  2,  2, "2 "},
+        };
+        for (iz c = 0; c < countof(cases); c++) {
+            Slice<i32> p = sidepickrange(&a, &r, rows, cases[c].from, cases[c].to);
+            Buf        b(&a, 64);
+            for (iz i = 0; i < p.len; i++) {
+                print(&b, (i64)p[i]);
+                putbyte(&b, ' ');
+            }
+            expect(t, cases[c].name, finish(&b), cases[c].want);
+        }
+        // An anchor folded away counts as none
+        *upsert(&r.folds, "a", &a) = 1;
+        rows = sidetree(&a, &r);
+        Slice<i32> p = sidepickrange(&a, &r, rows, 3, 2);
+        expect(t, "sidebar.pickfolded", istr(&a, p.len==1 && p[0]==2), "1");
+        expect(t, "sidebar.pickhidden", istr(&a, sidepickrange(&a, &r, rows, 0, 3).len), "0");
+    }
+
     // By folder under host headings: each host's own folders
     {
         SideIn r = {};

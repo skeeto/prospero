@@ -738,6 +738,7 @@ enum {
     GKEY_RBRACKET,
     GKEY_L,
     GKEY_F1,     // Help
+    GKEY_DELETE, // forward delete (the Sessions pane's picks to the Trash)
 };
 struct GuiEvent {
     i32 kind;

@@ -684,6 +684,7 @@ struct GuiSession {
     i64          asideid;   // its latest archive, group or trash command:
                             // unanswered, a list keeps the three as set here
     b32          gone;      // deleted: shown nowhere
+    b32          picked;    // in the sidebar's selection (pickable)
     Slice<SkillItem> skills;  // what /name invokes, as its engine lists them
     i64          skillsid;  // that list's skills in flight, 0 if none
     i64          fetchid;   // skill.fetch in flight, before its prompt
@@ -719,8 +720,9 @@ struct Request {
 // The toast for sessions just moved to the Trash: its Undo restores
 // them, its Delete now deletes them for good.
 struct TrashToast {
-    u64        host;   // their host's uid, 0 if none
+    u64        host;   // the first one's host's uid, 0 if none
     Slice<Str> sids;   // the roots
+    Slice<u64> hosts;  // and each one's host's uid
     Str        text;
     i64        until;  // when it goes, in sched µs, unless hovered
 };
@@ -1753,6 +1755,16 @@ struct Gui {
                                    // when it shows again
     u64                sideheld[SIDE_HELDMAX]; // its folder headings' keys, hashed,
     i32                sideheldlen;            // in the order last drawn
+    // The sidebar's selection: sessions picked by Ctrl/Cmd- and
+    // Shift-clicks (GuiSession.picked), for what is done to them all
+    i32                pickn;      // how many, this frame (pickprune)
+    GuiSession        *pickanchor; // the row a Shift-click picks from
+    GuiSession        *picknope;   // a row clicked so that cannot be picked, while
+                                   // the pointer stays: its tip says why
+    GuiSession        *pickhit;    // a row clicked with Ctrl/Cmd or Shift this
+    b32                picktoggle; // frame, and which: resolved once the rows
+    b32                pickrange;  // are known (pickclick)
+    ImVec4             pickrect;   // the selection's bar, x0 y0 x1 y1, while shown
     GuiSession        *menusess;   // the session the context menu is for
     b32                dragcancel; // a session's drag ended by Escape: none
                                    // again until the button is up
@@ -1768,6 +1780,7 @@ struct Gui {
     char              *namebuf;    // the naming dialog's field
     i32                nameask;    // NAME_*
     GuiSession        *namesess;
+    Slice<GuiSession *> nameroots; // or, for a new group, these (the picks)
     Str                namegroup;  // NAME_GROUP: the group renamed
     b32                opennamer;  // open it next frame
     Slice<GuiSession *> delroots;  // to delete once confirmed, with their subagents
@@ -10669,8 +10682,8 @@ static i32 trashcount(Gui *g, GuiHost *h)
     return n;
 }
 
-// Roots just moved to the Trash, all of one host, told in the toast,
-// which a newer one replaces. It takes the caller's arena.
+// Roots just moved to the Trash, of one host or several, told in the
+// toast, which a newer one replaces. It takes the caller's arena.
 static void trashtold(Gui *g, Arena a, Slice<GuiSession *> roots)
 {
     TrashToast *t = &g->trashtoast;
@@ -10678,10 +10691,14 @@ static void trashtold(Gui *g, Arena a, Slice<GuiSession *> roots)
     if (!roots.len) {
         return;
     }
-    GuiHost *h = roots[0]->host;
-    t->sids = {};
+    GuiHost *h    = roots[0]->host;
+    b32      days = 1;  // every host keeps them as long
+    t->sids  = {};
+    t->hosts = {};
     for (iz i = 0; i < roots.len; i++) {
-        t->sids = push(&g->perm, t->sids, clone(&g->perm, roots[i]->sid));
+        t->sids  = push(&g->perm, t->sids, clone(&g->perm, roots[i]->sid));
+        t->hosts = push(&g->perm, t->hosts, roots[i]->host->uid);
+        days    &= roots[i]->host->trashdays == h->trashdays;
     }
     Buf b(&a, 256);
     print(&b, "Moved ");
@@ -10693,9 +10710,12 @@ static void trashtold(Gui *g, Arena a, Slice<GuiSession *> roots)
         print(&b, (i64)roots.len);
         print(&b, " sessions");
     }
-    print(&b, " to the Trash, kept ");
-    print(&b, (i64)h->trashdays);
-    print(&b, h->trashdays==1 ? Str(" day") : Str(" days"));
+    print(&b, " to the Trash");
+    if (days) {
+        print(&b, ", kept ");
+        print(&b, (i64)h->trashdays);
+        print(&b, h->trashdays==1 ? Str(" day") : Str(" days"));
+    }
     t->text  = clone(&g->perm, finish(&b));
     t->host  = h->uid;
     t->until = g->sched.now + TRASHTOAST_LIFE;
@@ -10706,8 +10726,8 @@ static void trashtold(Gui *g, Arena a, Slice<GuiSession *> roots)
 static b32 trashtoasted(Gui *g, GuiSession *s)
 {
     TrashToast *t = &g->trashtoast;
-    for (iz i = 0; t->host==s->host->uid && i < t->sids.len; i++) {
-        if (t->sids[i] == s->sid) {
+    for (iz i = 0; t->host && i < t->sids.len; i++) {
+        if (t->hosts[i]==s->host->uid && t->sids[i]==s->sid) {
             return 1;
         }
     }
@@ -16156,6 +16176,17 @@ struct DriveOp {
     {OP_MOVE, T_SESSTITLE, 0, 0, 100, title}, {OP_DOWN, 0, 0, 0, 100, ""}, \
     {OP_MOVE, T_SESSTITLE, 4, 3, 100, title}, {OP_MOVE, T_SESSTITLE, 14, 8, 300, title}
 
+// A session's row clicked with Cmd held on macOS, else Ctrl: picked
+#define CMDCLICK(title, ms) \
+    {OP_KEYDOWN, 0, GKEY_CMD, KEY_CMD, 50, ""}, \
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, title}, {OP_DOWN, 0, 0, 0, 60, ""}, \
+    {OP_UP, 0, 0, 0, 100, ""}, {OP_KEYUP, 0, GKEY_CMD, 0, ms, ""}
+// And with Shift held: the rows from the anchor's to it picked
+#define SHIFTCLICK(title, ms) \
+    {OP_KEYDOWN, 0, GKEY_SHIFT, KEY_SHIFT, 50, ""}, \
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, title}, {OP_DOWN, 0, 0, 0, 60, ""}, \
+    {OP_UP, 0, 0, 0, 100, ""}, {OP_KEYUP, 0, GKEY_SHIFT, 0, ms, ""}
+
 // A key with Cmd held on macOS, else Ctrl
 #define CMDKEY(key, ms) \
     {OP_KEYDOWN, 0, GKEY_CMD, KEY_CMD, 50, ""}, \
@@ -20446,6 +20477,72 @@ static DriveOp sessionsops[] = {
     {OP_UP, 0, 0, 0, 1500, ""},
     {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "\n S Orphaned subagent\n"},
     {OP_CHECK, CHK_SIDE, 0, 0, 0, "\nT\n H this\n  S Orphaned subagent\n"},
+    // Several picked at once (#95), * in the tree: Cmd/Ctrl-click picks
+    // a row, and the one in view with it; a picked row's menu archives
+    // them, the bar brings them back (rows under Archived may sit behind
+    // the bar in a short pane, so only live rows are clicked); Cmd/Ctrl-click again lets one go, Esc
+    // the rest. The fork is in a group ("  S" either way); Greeting
+    // (imported) is " S" live, "  S" under Archived or the Trash.
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Whole fork (fork)"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_OPENED, 0, 0, 10000, ""},
+    CMDCLICK("Greeting (imported)", 500),
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "G Dropped\n H this\n  S Whole fork (fork)*\n"},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "\n S Greeting (imported)*\n"},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-picked"},
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Greeting (imported)"},
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Archive"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "G Dropped\n H this\n  S Whole fork (fork)"},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "  S Whole fork (fork)*\n"},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "\n  S Greeting (imported)*\n"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "picks archive"},  // all archived: Unarchive
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "G Dropped\n H this\n  S Whole fork (fork)*\n"},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "\n S Greeting (imported)*\n"},
+    CMDCLICK("Greeting (imported)", 500),
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "\n S Greeting (imported)\n"},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "  S Whole fork (fork)*\n"},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "*\n"},
+    // Shift-click picks the rows between (Whole fork too); a picked row
+    // drags them all (to the strip's Archive here), and Delete moves
+    // them to the Trash, told in one toast, whose Undo brings them back
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Whole fork (fork)"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    SHIFTCLICK("Greeting (imported)", 500),
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "  S Whole fork (fork)*\n"},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "  S Whole fork*\n"},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "\n S Greeting (imported)*\n"},
+    DRAGSESS("Whole fork (fork)"),
+    {OP_MOVE, T_NAMED, 0, 0, 300, "sessions archive"},
+    {OP_UP, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "G Dropped\n H this\n  S Whole fork"},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "\n  S Greeting (imported)*\n"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "picks archive"},  // all archived: Unarchive
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "\n S Greeting (imported)*\n"},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "G Dropped\n H this\n  S Whole fork"},
+    {OP_KEYDOWN, 0, GKEY_DELETE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_DELETE, 0, 1500, ""},
+    {OP_CHECK, CHK_TRASHTOAST, 1, 0, 0, ""},
+    {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "G Dropped\n H this\n  S Whole fork"},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "\n  S Greeting (imported)\n"},
+    {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "*\n"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "trash undo"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1500, ""},
+    {OP_CHECK, CHK_TRASHTOAST, 0, 0, 0, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "G Dropped\n H this\n  S Whole fork"},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "\n S Greeting (imported)\n"},
     // Idle: no frames
     {OP_MOVE, T_EMPTY, 0, 0, 6000, ""},  // hover delays and the layout's save
     {OP_MARK, 0, 0, 0, 3000, ""},

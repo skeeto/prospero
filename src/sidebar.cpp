@@ -31,6 +31,10 @@
 // heading's label is the folder's last segment, with as many before it
 // as tell it apart from the host's other folders (sidelabel).
 //
+// Several sessions can be picked at once (the GUI's selection): a
+// Shift-click picks the rows from the anchor's to its own that may be
+// picked (sidepickrange), all in the Trash or none of them.
+//
 // Every heading folds, and so does a session with subagents. The user's
 // choices are kept by key (folds: 1 folded, 0 open); without one, the
 // Archived and Trash headings are folded and everything else open. A session stays
@@ -95,6 +99,7 @@ struct SideSess {
     b32  active;    // runs a turn
     b32  asks;      // waits for the user
     b32  shown;     // the session in view
+    b32  pick;      // the GUI lets it be picked (a root of its own)
     i64  at;        // its time to sort by (byat), on its host's clock
 };
 
@@ -680,4 +685,36 @@ static Slice<SideRow> sidetree(Arena *a, SideIn *in)
         }
     }
     return t.rows;
+}
+
+// A Shift-click's picks: the rows from the anchor's (from) to the
+// clicked one's (to), both included, that may be picked (SideSess.pick)
+// and are in the clicked one's place, the Trash or not, as indices into
+// the sessions. With the anchor not among the rows, or in the other
+// place, the clicked one alone. Empty if the clicked one is not shown.
+static Slice<i32> sidepickrange(Arena *a, SideIn *in, Slice<SideRow> rows, i32 from, i32 to)
+{
+    iz i0 = -1;
+    iz i1 = -1;
+    for (iz i = 0; i < rows.len; i++) {
+        if (rows[i].kind == SROW_SESSION) {
+            i0 = rows[i].sess==from ? i : i0;
+            i1 = rows[i].sess==to   ? i : i1;
+        }
+    }
+    Slice<i32> r = {};
+    if (i1 < 0) {
+        return r;
+    } else if (i0<0 || !rows[i0].trashed!=!rows[i1].trashed) {
+        i0 = i1;
+    }
+    iz lo = i0<i1 ? i0 : i1;
+    iz hi = i0<i1 ? i1 : i0;
+    for (iz i = lo; i <= hi; i++) {
+        SideRow *w = &rows[i];
+        if (w->kind==SROW_SESSION && !w->trashed==!rows[i1].trashed && in->sess[w->sess].pick) {
+            r = push(a, r, w->sess);
+        }
+    }
+    return r;
 }
