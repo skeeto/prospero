@@ -151,12 +151,13 @@ raw log), archive it, or move it to the Trash (with its subagents),
 which keeps it `[sessions] trash_days` (30) before removing it, unless
 deleted permanently or emptied first. Dragging a session onto a group,
 onto Archived, or below the list moves it there too, on its own host,
-and onto the strip at the sidebar's foot, to the Trash. Ctrl+click
-(Cmd+click on macOS) picks several sessions, the one shown with them,
-and Shift+click the rows between; a bar at the sidebar's foot then
-archives, groups or trashes them all, as do a picked row's context
-menu, its buttons and a drag of it, and Delete (Backspace on macOS)
-moves them to the Trash. Esc or a plain click lets them go. The transcript's
+and onto the strip at the sidebar's foot, to the Trash. A row's box
+at its right end, shown under the pointer, picks it to act on several
+at once, as does Ctrl+click (Cmd+click on macOS); Shift+click picks
+the rows between. While two or more are picked, a bar at the sidebar's
+foot archives, groups or trashes them all, as do a picked row's
+context menu, its buttons and a drag of it, and Delete (Backspace on
+macOS) moves them to the Trash. Esc or a plain click lets them go. The transcript's
 context menu forks at a message: before a prompt, which then waits in
 the fork's prompt box, or after a turn. Fork into another folder
 copies the conversation into a new session that works in another

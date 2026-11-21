@@ -9201,6 +9201,7 @@ static void pickcount(Gui *g)
     g->pickn = 0;
     for (GuiSession *s = g->sessions; s; s = s->next) {
         g->pickn += s->picked;
+        g->picktrash = s->picked ? s->trashed!=0 : g->picktrash;
     }
 }
 
@@ -10074,7 +10075,7 @@ static b32 rowicon(Gui *g, char const *label, Str why)
 // context menu item does, and is left out where the row is too narrow.
 // Held, only the grip is there, unseen, as its drag's source.
 static void rowactions(Gui *g, Arena a, SideRow *r, GuiSession *s, ImVec2 r0, ImVec2 r1,
-                       b32 held)
+                       b32 held, f32 right)
 {
     f32         sc   = g->scale;
     ImDrawList *dl   = ImGui::GetWindowDrawList();
@@ -10083,7 +10084,7 @@ static void rowactions(Gui *g, Arena a, SideRow *r, GuiSession *s, ImVec2 r0, Im
     f32         gap  = 2*sc;
     b32         grip = !dragwhy(g, &a, s).len;
     f32         gw   = grip ? ImGui::CalcTextSize(ICON_GRIPPER).x + 8*sc : 0;
-    f32         x1   = r1.x - 2*sc;
+    f32         x1   = r1.x - 2*sc - right;  // left of the pick box
     f32         x0   = x1 - (2*bw + gap + gw + 4*sc);
     f32         y    = r0.y + (r1.y - r0.y - bh)/2;
     if (x0 - r0.x < 96*sc) {
@@ -10214,6 +10215,48 @@ static void rowactions(Gui *g, Arena a, SideRow *r, GuiSession *s, ImVec2 r0, Im
     win->DC.CursorMaxPos = maxp;
 }
 
+// A root's pick box, at the right of its row in boxw: checked while it is
+// picked; a click toggles it, or with Shift adds the rows up to it, as
+// the row's Ctrl- and Ctrl+Shift-clicks do (pickclick).
+static void pickbox(Gui *g, Arena a, GuiSession *s, ImVec2 r0, ImVec2 r1, f32 boxw)
+{
+    f32          sc   = g->scale;
+    ImDrawList  *dl   = ImGui::GetWindowDrawList();
+    ImGuiWindow *win  = ImGui::GetCurrentWindow();
+    ImVec2       back = win->DC.CursorPos;
+    ImVec2       maxp = win->DC.CursorMaxPos;
+    f32          x0   = r1.x - boxw;
+    ImGui::SetCursorScreenPos(v2(x0, r0.y));
+    b32 hit = ImGui::InvisibleButton("##pick", v2(boxw - 2*sc, r1.y - r0.y));
+    axrole(g, AX_CHECKBOX);
+    axname(g, concat(&a, "Pick ", sesstitle(s)));
+    axchecked(g, s->picked);
+    if (hit) {
+        g->pickhit    = s;
+        g->picktoggle = 1;  // with Shift, the rows between join the picks
+        g->pickrange  = ImGui::GetIO().KeyShift;
+    }
+    itemnamed(g, concat(&a, "pick ", sesstitle(s)));
+    b32 hov = ImGui::IsItemHovered();
+    itemtip(s->picked ? "Let it go from the picks"
+                      : "Pick it, to act on several at once (Shift: the rows between)");
+    f32    e  = ImGui::GetTextLineHeight() - 2*sc;  // the box's edge
+    ImVec2 c  = v2(x0 + (boxw - 2*sc)/2, (r0.y + r1.y)/2);
+    ImVec2 b0 = v2(c.x - e/2, c.y - e/2);
+    ImVec2 b1 = v2(c.x + e/2, c.y + e/2);
+    f32    rd = 3*sc;
+    if (s->picked) {
+        dl->AddRectFilled(b0, b1, g->pal->active, rd);
+        ImVec2 ck[] = {v2(b0.x + 0.22f*e, c.y), v2(c.x - 0.08f*e, b1.y - 0.25f*e),
+                       v2(b1.x - 0.2f*e, b0.y + 0.25f*e)};
+        dl->AddPolyline(ck, 3, g->pal->panel, 2*sc);
+    } else {
+        dl->AddRect(b0, b1, hov ? g->pal->paneltext : g->pal->paneldim, rd, 1.25f*sc);
+    }
+    win->DC.CursorPos    = back;
+    win->DC.CursorMaxPos = maxp;
+}
+
 static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other, i64 nowms)
 {
     f32         sc    = g->scale;
@@ -10230,11 +10273,12 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other, 
     ImVec4   pr = g->pickrect;  // the selection's bar, which takes the pointer
     b32      bar = pr.w>pr.y && io.MousePos.x>=pr.x && io.MousePos.x<pr.z &&
                    io.MousePos.y>=pr.y && io.MousePos.y<pr.w;
-    // Shown as selected: picked, or with nothing picked, the one in view.
-    // A click with Ctrl (Cmd on macOS) or Shift picks, once the rows are
-    // known (pickclick); a plain one lets the picks go and opens it, or
-    // in the Trash, where none opens, picks it alone.
-    b32 sel = s->picked || (!g->pickn && s==g->sess);
+    // The one in view keeps its highlight, picked or not: a pick has a
+    // tint and a checked box of its own, so the two never look alike.
+    // A click with Ctrl (Cmd on macOS) or Shift, or on its box, picks,
+    // once the rows are known (pickclick); a plain one lets the picks go
+    // and opens it, or in the Trash, where none opens, picks it alone.
+    b32 sel = s==g->sess && !r->trashed;
     ImGui::SetNextItemAllowOverlap();
     if (ImGui::Selectable("##s", sel, 0, v2(0, 2*lineh + 4*sc)) && !bar) {
         if (io.KeyCtrl || io.KeyShift) {
@@ -10253,13 +10297,12 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other, 
         }
     }
     axname(g, sesstitle(s));
-    axselected(g, sel);
+    axselected(g, g->pickn ? s->picked : sel);
     ImVec2 r0 = ImGui::GetItemRectMin();
     ImVec2 r1 = ImGui::GetItemRectMax();
     s->row = {r0.x, r0.y, r1.x, r1.y};
-    if (g->pickn && s==g->sess && !s->picked) {
-        // In view but not picked: a mark at its edge says which it is
-        dl->AddRectFilled(r0, v2(r0.x + 3*sc, r1.y), g->pal->active);
+    if (s->picked) {
+        dl->AddRectFilled(r0, r1, fade(g->pal->active, 0.16f));
     }
     // A root's actions show while the pointer is on its row; a held
     // grip stays, as the source of its drag
@@ -10273,6 +10316,11 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other, 
     if (acts && !held && !ImGui::IsItemHovered()) {
         dl->AddRectFilled(r0, r1, g->pal->rowhover);  // the pointer on an action
     }
+    // Its pick box, at the right end: while the pointer is on the row, and
+    // on every row that could join the picks while there are any
+    b32 boxed = pickable(s) && !bar && !dragged() && !g->dragcancel && w >= 160*sc &&
+                (acts || s->picked || (g->pickn && !s->trashed==!g->picktrash));
+    f32 boxw  = boxed ? lineh + 10*sc : 0;
     if (!*other && s!=g->sess) {
         itemrect(g, RECT_OTHERSESS);
         *other = 1;
@@ -10372,7 +10420,7 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other, 
     folddot(g, dl, v2(dx, p.y + 2*sc + lineh/2), color, r->kids && r->folded);
     f32 x = dx + 11*sc;
 
-    Pen t = {dl, &g->fonts, x, p.y + 2*sc, p.x + w, g->fonts.size};
+    Pen t = {dl, &g->fonts, x, p.y + 2*sc, p.x + w - boxw, g->fonts.size};
     pen(&t, sesstitle(s), 0, g->pal->text);
     if (r->folded) {
         Buf k(&a, 32);
@@ -10380,7 +10428,7 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other, 
         print(&k, (i64)(r->count - 1));
         pen(&t, finish(&k), 0, g->pal->dim);
     }
-    Pen b = {dl, &g->fonts, x, p.y + 2*sc + lineh, p.x + w, small};
+    Pen b = {dl, &g->fonts, x, p.y + 2*sc + lineh, p.x + w - boxw, small};
     if (sessparent(s).len && v && v->role.len) {
         pen(&b, v->role, 0, g->pal->dim);
         pen(&b, "  ", 0, g->pal->dim);
@@ -10454,7 +10502,10 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other, 
         gaugebar(g, dl, v, x, r1.y - 3*sc, p.x + w - 4*sc - x, 2*sc, sc);
     }
     if (acts) {
-        rowactions(g, a, r, s, r0, r1, held);
+        rowactions(g, a, r, s, r0, r1, held, boxw);
+    }
+    if (boxed) {
+        pickbox(g, a, s, r0, r1, boxw);
     }
     if (dragged() == s) {
         dl->AddRectFilled(r0, r1, fade(g->pal->panel, 0.6f));  // lifted out (dragcard)
@@ -10859,10 +10910,11 @@ static void drawrails(Gui *g, Arena a, Slice<SideRow> rows, Slice<RowAt> at, b32
 // The sidebar: a "+" for a new session, then the tree (sidebar.cpp) of
 // groups, hosts, sessions and subagents, the archived, and the Trash.
 // A row clicked with Ctrl (Cmd on macOS) or Shift this frame
-// (g->pickhit), once the rows are known: Ctrl toggles it, the first
-// time with the one in view picked too, as a file manager has it; Shift
-// picks the rows from the anchor (else the one in view) to it in place
-// of the picks, or with Ctrl as well, adding to them. The picks are all
+// (g->pickhit), or its box clicked, once the rows are known: Ctrl (or
+// the box) toggles it alone, since the row in view is not a pick, unlike
+// a file manager's selection (#95); Shift picks the rows from the anchor
+// (else the one in view) to it in place of the picks, or with Ctrl as
+// well, adding to them. The picks are all
 // in the Trash or none of them: a row in the other place starts anew.
 static void pickclick(Gui *g, Arena a, SideIn *in, Slice<SideRow> rows,
                       Slice<GuiSession *> sess)
@@ -10898,9 +10950,6 @@ static void pickclick(Gui *g, Arena a, SideIn *in, Slice<SideRow> rows,
         }
         g->pickanchor = from ? from : s;  // where the next Shift-click goes from
     } else {
-        if (!g->pickn && c && c!=s && pickable(c) && !c->trashed==!trash) {
-            c->picked = 1;
-        }
         s->picked     = !s->picked;
         g->pickanchor = s;
     }

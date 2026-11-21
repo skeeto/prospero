@@ -1758,6 +1758,7 @@ struct Gui {
     // The sidebar's selection: sessions picked by Ctrl/Cmd- and
     // Shift-clicks (GuiSession.picked), for what is done to them all
     i32                pickn;      // how many, this frame (pickprune)
+    b32                picktrash;  // they are in the Trash (all or none are)
     GuiSession        *pickanchor; // the row a Shift-click picks from
     GuiSession        *picknope;   // a row clicked so that cannot be picked, while
                                    // the pointer stays: its tip says why
@@ -20478,7 +20479,7 @@ static DriveOp sessionsops[] = {
     {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "\n S Orphaned subagent\n"},
     {OP_CHECK, CHK_SIDE, 0, 0, 0, "\nT\n H this\n  S Orphaned subagent\n"},
     // Several picked at once (#95), * in the tree: Cmd/Ctrl-click picks
-    // a row, and the one in view with it; a picked row's menu archives
+    // a row, not the one in view with it, and so does a row's box; a picked row's menu archives
     // them, the bar brings them back (rows under Archived may sit behind
     // the bar in a short pane, so only live rows are clicked); Cmd/Ctrl-click again lets one go, Esc
     // the rest. The fork is in a group ("  S" either way); Greeting
@@ -20488,8 +20489,14 @@ static DriveOp sessionsops[] = {
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_WAIT, W_OPENED, 0, 0, 10000, ""},
     CMDCLICK("Greeting (imported)", 500),
-    {OP_CHECK, CHK_SIDE, 0, 0, 0, "G Dropped\n H this\n  S Whole fork (fork)*\n"},
     {OP_CHECK, CHK_SIDE, 0, 0, 0, "\n S Greeting (imported)*\n"},
+    {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "S Whole fork (fork)*"},  // in view, not picked
+    {OP_MOVE, T_SESSTITLE, 0, 0, 300, "Whole fork (fork)"},  // its box shows
+    {OP_MOVE, T_NAMED, 0, 0, 100, "pick Whole fork (fork)"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_TITLE, 0, 0, 0, "Whole fork (fork)"},  // still in view
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "G Dropped\n H this\n  S Whole fork (fork)*\n"},
     {OP_SHOT, 0, 0, 0, 300, "sessions-picked"},
     {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Greeting (imported)"},
     {OP_RDOWN, 0, 0, 0, 60, ""},
