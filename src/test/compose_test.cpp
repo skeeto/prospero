@@ -299,6 +299,28 @@ static void test_compose(Test *t)
         expect(t, "skill.pickdesc", slashpickinfo(&a, p[0], sk).desc, "Read PDFs");
         expect(t, "skill.pickspace", istr(&a, slashpicks(&a, "/pdf x", sk).len), "0");
     }
+    // Tab: as far as the picks agree, with no space; then the pick (#95)
+    {
+        SkillItem items[] = {{"skill-lite", "", "", 0, 0, {}},
+                             {"skill", "", "", 0, 0, {}},
+                             {"sidecar", "", "", 0, 0, {}}};
+        Slice<SkillItem> sk = {items, countof(items)};
+        Slice<i32>       p  = slashpicks(&a, "/sk", sk);
+        expect(t, "tab.common", slashtab(&a, "/sk", p, 0, sk), "/skill");
+        p = slashpicks(&a, "/skill", sk);
+        expect(t, "tab.exactfirst", slashpickinfo(&a, p[0], sk).name, "/skill");
+        expect(t, "tab.exact", slashtab(&a, "/skill", p, 0, sk), "/skill ");
+        expect(t, "tab.moved", slashtab(&a, "/skill", p, 1, sk), "/skill-lite ");
+        p = slashpicks(&a, "/sk", sk);
+        expect(t, "tab.movedpart", slashtab(&a, "/sk", p, 1, sk), "/skill ");
+        // /side, /shell and /sidecar agree on no more than typed
+        p = slashpicks(&a, "/s", sk);
+        expect(t, "tab.nofurther", slashtab(&a, "/s", p, 0, sk), "/side");
+        p = slashpicks(&a, "/sid", sk);
+        expect(t, "tab.cmd", slashtab(&a, "/sid", p, 0, sk), "/side");
+        expect(t, "tab.one", slashtab(&a, "/skill-", slashpicks(&a, "/skill-", sk), 0, sk),
+               "/skill-lite ");
+    }
 
     // History: empty box, Up begins at the newest
     expect(t, "hist.begin", histstr(&a, histkey(1, 1, 0, 3, 1)), "recall 1");

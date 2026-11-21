@@ -479,6 +479,39 @@ static void test_sidebar(Test *t)
                "F - 1\n S n\nF p 3!\n S p1\n S p3!\n  S k\nF q 1\n S q2\nA 1+\n");
     }
 
+    // Held (#95): a folder whose newest session goes to the Trash keeps
+    // its place while the GUI holds the rows; a new folder takes its own
+    {
+        SideIn r = {};
+        r.hosts = push(&a, r.hosts, SideHost{"this", 1, 0});
+        r.sess  = push(&a, r.sess, sidesess(0, "a", {}, {}, 0));
+        r.sess  = push(&a, r.sess, sidesess(0, "a2", {}, {}, 0));
+        r.sess  = push(&a, r.sess, sidesess(0, "b", {}, {}, 0));
+        r.sess  = push(&a, r.sess, sidesess(0, "c", {}, {}, 0));
+        Str folder[] = {"/a", "/a", "/b", "/c"};
+        i64 at[]     = {9, 1, 5, 3};
+        for (iz i = 0; i < countof(at); i++) {
+            r.sess[i].folder = folder[i];
+            r.sess[i].at     = at[i];
+        }
+        r.byfolder = 1;
+        r.byat     = 1;
+        expect(t, "sidebar.heldbefore", siderows(&a, &r, sidetree(&a, &r)),
+               "F a 2\n S a\n S a2\nF b 1\n S b\nF c 1\n S c\n");
+        u64 held[] = {hash("f:this:/a"), hash("f:this:/b"), hash("f:this:/c")};
+        r.sess[0].trashed = 1;
+        expect(t, "sidebar.heldfree", siderows(&a, &r, sidetree(&a, &r)),
+               "F b 1\n S b\nF c 1\n S c\nF a 1\n S a2\nT 1+\n");
+        r.held = {held, countof(held)};
+        expect(t, "sidebar.held", siderows(&a, &r, sidetree(&a, &r)),
+               "F a 1\n S a2\nF b 1\n S b\nF c 1\n S c\nT 1+\n");
+        r.sess = push(&a, r.sess, sidesess(0, "d", {}, {}, 0));
+        r.sess[r.sess.len-1].folder = "/d";
+        r.sess[r.sess.len-1].at     = 7;
+        expect(t, "sidebar.heldnew", siderows(&a, &r, sidetree(&a, &r)),
+               "F d 1\n S d\nF a 1\n S a2\nF b 1\n S b\nF c 1\n S c\nT 1+\n");
+    }
+
     // By folder under host headings: each host's own folders
     {
         SideIn r = {};

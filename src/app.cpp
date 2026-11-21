@@ -1751,6 +1751,8 @@ struct Gui {
     i32                sideview;   // SIDEVIEW_*: and what it is under, likewise
     i64                sideframe;  // the frame the sidebar last drew, to tell
                                    // when it shows again
+    u64                sideheld[SIDE_HELDMAX]; // its folder headings' keys, hashed,
+    i32                sideheldlen;            // in the order last drawn
     GuiSession        *menusess;   // the session the context menu is for
     b32                dragcancel; // a session's drag ended by Escape: none
                                    // again until the button is up

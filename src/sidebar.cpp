@@ -23,7 +23,11 @@
 // under a heading for each project folder (SideSess.folder), those of no
 // folder under one of their own, the headings in the order of their
 // first roots, so that a folder ranks by its newest session as the
-// roots are sorted. Archived and the Trash are as without it. A
+// roots are sorted. Archived and the Trash are as without it. While
+// the GUI holds its rows still, the headings it last showed (held, by
+// key) keep that order among themselves in the slots they take, so that
+// a session leaving its folder never moves the folder from under the
+// pointer; a new heading takes its own place. A
 // heading's label is the folder's last segment, with as many before it
 // as tell it apart from the host's other folders (sidelabel).
 //
@@ -74,6 +78,7 @@ enum : i32 {
 enum : i32 {
     SIDE_DEPTH   = 16,  // levels of subagents placed under their parents
     SIDE_DONEMIN = 3,   // finished subagents that fold into a row of their own
+    SIDE_HELDMAX = 256, // folder headings whose order the GUI holds (SideIn.held)
 };
 
 // A session as the sidebar sees it.
@@ -110,6 +115,8 @@ struct SideIn {
     b32             heads;   // host headings shown
     b32             archive; // the Archived heading shown even if empty,
                              // as a place to drop a session
+    Slice<u64>      held;    // byfolder: the folder headings' keys, hashed,
+                             // in the order to hold them in, if any
 };
 
 struct SideRow {
@@ -370,6 +377,46 @@ static SideSum sidesums(SideTree *t, Slice<i32> roots, i32 h, i32 aside, Str gro
 
 static void sidehost(SideTree *, Slice<i32>, i32, i32, i32, Str, Str, b32);
 
+static Str sidefolderkey(Arena *a, SideIn *in, i32 h, Str folder)
+{
+    return concat(a, concat(a, concat(a, "f:", in->hosts[h].key), ":"), folder);
+}
+
+// A host's folders, in the order of their first roots, put back in the
+// held order (SideIn.held) among the slots the held ones take.
+static void sidehold(SideTree *t, Slice<Str> folders, i32 h)
+{
+    SideIn *in = t->in;
+    if (!in->held.len || folders.len < 2) {
+        return;
+    }
+    i32 *slot = alloc<i32>(t->a, folders.len);  // where the held ones are, ascending
+    i32 *at   = alloc<i32>(t->a, folders.len);  // and their places in held
+    Str *str  = alloc<Str>(t->a, folders.len);
+    i32  n    = 0;
+    for (iz f = 0; f < folders.len; f++) {
+        u64 k = hash(sidefolderkey(t->a, in, h, folders[f]));
+        for (iz i = 0; i < in->held.len; i++) {
+            if (in->held[i] == k) {
+                slot[n] = (i32)f;
+                at[n]   = (i32)i;
+                str[n]  = folders[f];
+                n++;
+                break;
+            }
+        }
+    }
+    for (i32 i = 1; i < n; i++) {  // few: insertion sort by place in held
+        for (i32 k = i; k>0 && at[k-1]>at[k]; k--) {
+            i32 p = at[k-1];   at[k-1]  = at[k];   at[k]  = p;
+            Str x = str[k-1];  str[k-1] = str[k];  str[k] = x;
+        }
+    }
+    for (i32 i = 0; i < n; i++) {
+        folders[slot[i]] = str[i];
+    }
+}
+
 // A host's live roots under a heading for each folder, in the order of
 // their first roots.
 static void sidefolders(SideTree *t, Slice<i32> roots, i32 h, i32 depth)
@@ -386,6 +433,7 @@ static void sidefolders(SideTree *t, Slice<i32> roots, i32 h, i32 depth)
             folders = push(t->a, folders, s->folder);
         }
     }
+    sidehold(t, folders, h);
     for (iz f = 0; f < folders.len; f++) {
         SideRow r = {};
         r.kind   = SROW_FOLDER;
@@ -394,8 +442,7 @@ static void sidefolders(SideTree *t, Slice<i32> roots, i32 h, i32 depth)
         r.sess   = -1;
         r.folder = folders[f];
         r.label  = folders[f].len ? sidelabel(t->a, folders, f) : Str{};
-        r.key    = concat(t->a, concat(t->a, concat(t->a, "f:", in->hosts[h].key), ":"),
-                          folders[f]);
+        r.key    = sidefolderkey(t->a, in, h, folders[f]);
         for (iz n = 0; n < roots.len; n++) {
             SideSess *s = &in->sess[roots[n]];
             if (s->host==h && sidein(in, s, SIDE_LIVE, {}) && s->folder==folders[f]) {

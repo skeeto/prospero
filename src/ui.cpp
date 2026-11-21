@@ -7943,8 +7943,10 @@ static void drawprompt(Gui *g)
     }
     SlashInfo c = pick ? slashpickinfo(&a, pick, s->skills) : SlashInfo{};
     if (pick && (cb.tab || (send && text!=c.name))) {
-        // Completed rather than sent, the box kept active
-        draftput(g, s, c.args.len ? concat(&a, c.name, " ") : c.name);
+        // Completed rather than sent, the box kept active: Tab as far as
+        // the picks agree, Enter to the pick
+        draftput(g, s, cb.tab ? slashtab(&a, text, picks, g->slashsel, s->skills)
+                              : c.args.len ? concat(&a, c.name, " ") : c.name);
         drafttyped(&s->dclock, g->sched.now);
         send = 0;
     }
@@ -10631,6 +10633,9 @@ static void drawsessions(Gui *g)
     in.groups  = g->groups;
     in.folds   = g->folds;
     in.archive = drag != 0;
+    if (hold && !resync) {
+        in.held = {g->sideheld, g->sideheldlen};  // headings hold still too
+    }
 
     // Its sessions, each host's newest made first, which sidetree orders
     // by sortat with byat
@@ -10680,6 +10685,12 @@ static void drawsessions(Gui *g)
 
     Slice<SideRow> rows  = sidetree(&a, &in);
     b32            other = 0;  // the checklist's first session not shown
+    g->sideheldlen = 0;
+    for (iz i = 0; i < rows.len && g->sideheldlen < SIDE_HELDMAX; i++) {
+        if (rows[i].kind == SROW_FOLDER) {
+            g->sideheld[g->sideheldlen++] = hash(rows[i].key);
+        }
+    }
     if (g->drive) {
         // The tree as text, for the checklist: a line a row, indented,
         // G group, H host, S title, A for Archived, T for the Trash, + if

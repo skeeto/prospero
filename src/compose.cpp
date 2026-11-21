@@ -692,6 +692,14 @@ static Slice<i32> slashpicks(Arena *a, Str text, Slice<SkillItem> skills)
     for (iz i = 0; i < skills.len; i++) {
         if (startswith(skills[i].name, word) && !slashtaken(skills[i].name)) {
             r = push(a, r, SLASH_COUNT + (i32)i);
+            if (skills[i].name==word && r.len>1) {
+                // The word typed whole comes first, so that it is the pick
+                i32 x = r[r.len-1];
+                for (iz k = r.len-1; k > 0; k--) {
+                    r[k] = r[k-1];
+                }
+                r[0] = x;
+            }
         }
     }
     return r;
@@ -709,6 +717,34 @@ static SlashInfo slashpickinfo(Arena *a, i32 pick, Slice<SkillItem> skills)
     r.args = "[args]";
     r.desc = k->desc.len ? k->desc : Str("(a skill)");
     return r;
+}
+
+
+// What Tab makes of the box's first word, with the popup's picks and
+// its highlighted one (sel). As a shell does, a word that more than one
+// pick starts with goes as far as they all agree, with no space, so
+// that Tab never chooses for the user; once it can go no further, or
+// once the user has moved the highlight, Tab takes the pick, with a
+// space after it if it takes arguments.
+static Str slashtab(Arena *a, Str text, Slice<i32> picks, i32 sel, Slice<SkillItem> skills)
+{
+    if (sel<0 || sel>=picks.len) {
+        return text;
+    }
+    if (!sel && picks.len>1) {
+        Str common = slashpickinfo(a, picks[0], skills).name;
+        for (iz i = 1; i < picks.len; i++) {
+            Str n = slashpickinfo(a, picks[i], skills).name;
+            iz  k = 0;
+            for (; k<common.len && k<n.len && common[k]==n[k]; k++) {}
+            common = takehead(common, k);
+        }
+        if (common.len > text.len) {
+            return common;
+        }
+    }
+    SlashInfo c = slashpickinfo(a, picks[sel], skills);
+    return c.args.len ? concat(a, c.name, " ") : c.name;
 }
 
 
