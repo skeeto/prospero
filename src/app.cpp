@@ -26114,8 +26114,11 @@ static b32 drivefileready(Gui *g)
     if (w->id || (ft->state==FTAB_READ && (w->stale || w->force) && acts)) {
         return 0;
     }
+    // A jump scrolls the frame after it is made, and only then is the
+    // view's top line recorded: not ready until a frame later still
+    b32 jumped = ft->jumped && g->total.frames>ft->jumpedat+1;
     return ft->state==FTAB_FAILED || g->fshowing!=ft ||
-           (!g->flines.restore && (!ft->jump || ft->jumped || ft->mode!=FMODE_TEXT));
+           (!g->flines.restore && (!ft->jump || jumped || ft->mode!=FMODE_TEXT));
 }
 
 // Whether s ends with end, a '/' there matching either separator.

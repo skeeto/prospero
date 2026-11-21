@@ -231,6 +231,7 @@ struct FileTab {
     i32       band1;
     i32       jump;       // a line to scroll to, 1-based, else 0
     b32       jumped;     // and the view went there
+    i64       jumpedat;   // in this frame (the checklist's, as top follows a frame later)
     i32       top;        // the line at the view's top, 0-based
     f32       dy;         // and how far past its top the view is
     f32       scrollx;    // unwrapped

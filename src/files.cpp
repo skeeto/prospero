@@ -3778,8 +3778,9 @@ static void drawfiles(Gui *g)
         fb->reveal = 0;
     }
     if (dl->jumped) {
-        ft->jumped  = 1;
-        dl->restore = 0;
+        ft->jumped   = 1;
+        ft->jumpedat = g->total.frames;
+        dl->restore  = 0;
     } else if (dl->restored) {
         dl->restore = 0;
     }
