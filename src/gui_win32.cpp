@@ -51,8 +51,22 @@ struct W32DragLoad {
     int       text;
 };
 
+// Accessibility's (a11y_win32.cpp): the core's answers to the edge's
+// adapter, on the GUI thread, between frames or inside them.
+enum {
+    W32AXLOG_ON   = 1,  // log the adapter's calls
+    W32AXLOG_TEXT = 2,  // and text, as a field the core knows, not a password, holds
+};
+struct W32AxHooks {
+    int  (*logging)(void *gui);  // W32AXLOG_*
+    // A line for the adapter's log, UTF-8, as the core's text model
+    // stands
+    void (*note)(void *gui, char const *line, int len);
+};
+
 // Shared by both halves: the core's callbacks, called on the GUI thread.
 struct W32Hooks {
+    W32AxHooks ax;
     void  *gui;
     void (*input)(void *gui, int kind);   // an input message went to ImGui
     void (*wake)(void *gui);              // the wake flag was cleared
@@ -562,6 +576,8 @@ static void placed(W32Gui *w)
     }
 }
 
+#include "a11y_win32.cpp"
+
 static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     W32Gui *w = (W32Gui *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
@@ -569,6 +585,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return DefWindowProcW(hwnd, msg, wp, lp);
     }
     W32Hooks *h = &w->hooks;
+    w32axtrace(w, msg, wp, lp);
 
     // Scripted input must not be undone by the real pointer, which is
     // somewhere else entirely.
@@ -2229,6 +2246,8 @@ static_assert(FLASH_CANCEL==0 && FLASH_BRIEFLY==1 && FLASH_UNTILFOCUSED==2);
 
 W32(i32, GetCurrentThreadId());
 
+#include "a11y_win32.cpp"
+
 static void hookinput(void *g, int kind) { gui_input((Gui *)g, kind); }
 // A wake, a tray pick, a toast's answer or a drop inside a frame (a COM
 // call's reentry) is held for after it (guilater).
@@ -2426,6 +2445,7 @@ static b32 os_guiopen(Os *os, Gui *g, Arena scratch, Str title)
         return 1;
     }
     W32Hooks h = {};
+    w32axhooks(&h.ax);
     h.gui       = g;
     h.input     = hookinput;
     h.wake      = hookwake;
