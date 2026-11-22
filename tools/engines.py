@@ -87,7 +87,12 @@ def say(msg):
 
 def run(argv, **kw):
     say(" ".join(shlex.quote(a) for a in argv))
-    subprocess.run(argv, check=True, **kw)
+    try:
+        subprocess.run(argv, check=True, **kw)
+    except FileNotFoundError:
+        sys.exit(f"engines: {argv[0]} is not installed")
+    except subprocess.CalledProcessError as e:
+        sys.exit(f"engines: {argv[0]} failed (exit {e.returncode})")
 
 
 def version():
@@ -190,6 +195,12 @@ def docker(args, ver, plats):
     stage(os.path.join(d, "src"), args.deps)
     if os.path.exists(os.path.join(d, "out")):
         shutil.rmtree(os.path.join(d, "out"))
+    if not shutil.which("docker"):
+        sys.exit("engines: docker is not installed (or give --linux HOST)")
+    if subprocess.run(["docker", "info"], stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL).returncode != 0:
+        sys.exit("engines: Docker isn't running: start Docker Desktop "
+                 "(open -a Docker), or give --linux HOST")
     run(["docker", "build", "-q", "-t", IMAGE, os.path.join(ROOT, "tools", "toolchain")],
         stdout=subprocess.DEVNULL)
     run(["docker", "run", "--rm", "-v", f"{os.path.abspath(d)}:/w", IMAGE,

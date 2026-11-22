@@ -5057,6 +5057,21 @@ int main(int argc, char **argv)
 
     #ifdef __linux__
     os.exe = (char *)"/proc/self/exe";  // this binary, even if replaced
+    if (access(os.exe, X_OK)) {
+        // No /proc, as for this Linux engine on FreeBSD (Linuxulator),
+        // where only programs under its /compat/linux see linprocfs:
+        // where it started from, made absolute, as reapers run later
+        // from another directory
+        Str self = {(u8 *)argv[0], 0};
+        while (self.data[self.len]) self.len++;
+        char cwd[4096];
+        if (self.len && self[0]!='/' && getcwd(cwd, sizeof(cwd))) {
+            Str dir = {(u8 *)cwd, 0};
+            while (dir.data[dir.len]) dir.len++;
+            self = join(&a, dir, self);
+        }
+        os.exe = cstr(&a, self);
+    }
     #else
     Str exe = os_exepath(&os, &a);
     os.exe = exe.len ? cstr(&a, exe) : argv[0];
