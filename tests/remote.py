@@ -3919,7 +3919,9 @@ def builtin_relay(t):
             end = c.stream.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid,
                                 timeout=60, what="turn.end")
             t.check(end.get("why") == "done", f"turn.end {end}")
-        posts = [h for h, _ in rl.calls if h["method"] == "POST"]
+        # Not the titles, which may or may not have come yet
+        posts = [h for h, _ in rl.calls if h["method"] == "POST" and
+                 b"Name this session" not in base64.b64decode(h.get("data", ""))]
         t.check(len(posts) == 2 and all(h.get("kind") == "builtin" and
                                         h["path"] == "v1/chat/completions" and
                                         not h.get("base") and not h.get("zlen") and
