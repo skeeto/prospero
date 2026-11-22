@@ -24488,6 +24488,52 @@ static DriveOp a11yops[] = {
     {OP_A11Y, 0, 0, 0, 0, "has group Transcript"},
     {OP_A11Y, 0, 0, 0, 0, "has button Send"},
     {OP_A11Y, 0, 0, 0, 0, "help button Send"},
+#ifdef _WIN32
+    // UI Automation's: the root as WM_GETOBJECT gives it to a client,
+    // and the tree under it through the providers' own methods, named,
+    // with control types and patterns, at its place on the screen
+    {OP_A11Y, 0, 0, 0, 300, "uia start"},
+    {OP_A11Y, 0, 0, 0, 0, "uia has Edit Prompt"},
+    {OP_A11Y, 0, 0, 0, 0, "uia focus Edit Prompt"},
+    {OP_A11Y, 0, 0, 0, 0, "uia hit Edit Prompt"},
+    {OP_A11Y, 0, 0, 0, 0, "uia has Button Send"},
+    {OP_A11Y, 0, 0, 0, 0, "uia can Invoke,!Toggle,!ExpandCollapse Button Send"},
+    {OP_A11Y, 0, 0, 0, 0, "uia hit Button Send"},
+    {OP_A11Y, 0, 0, 0, 0, "uia has Group Transcript"},
+    {OP_A11Y, 0, 0, 0, 0, "uia parent MenuBar MenuItem Help"},
+    // Send, invoked through its provider: the press reaches the app
+    {OP_TEXT, 0, 0, 0, 300, "UIA"},
+    {OP_A11Y, 0, 0, 0, 500, "uia press Button Send"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
+    // A menu of the bar, opened by a client's Invoke: its items under it,
+    // where they are drawn, and one does what it says (Select all, now
+    // that there are messages to select)
+    {OP_A11Y, 0, 0, 0, 300, "uia press MenuItem Edit"},
+    {OP_A11Y, 0, 0, 0, 0, "uia parent Menu MenuItem Select all"},
+    {OP_A11Y, 0, 0, 0, 0, "uia hit MenuItem Select all"},
+    {OP_A11Y, 0, 0, 0, 300, "uia press MenuItem Select all"},
+    {OP_CHECK, CHK_SELECTED, 0, 0, 0, ""},
+    // which let go of the prompt: a click lets go of the selection, and
+    // the prompt takes the keyboard again
+    CLICK(T_TRANSCRIPT, "", 300),
+    {OP_A11Y, 0, 0, 0, 300, "activate textarea Prompt"},
+    // From another process, through UI Automation, as Voice Access asks:
+    // gui.py runs tests/uiaprobe.ps1 once this is ready, which finds the
+    // prompt focused and invokes Send, or says why it can't
+    {OP_TEXT, 0, 0, 0, 300, "pressed from another process"},
+    {OP_TOUCH, 0, 0, 0, 0, "uiaprobe-ready"},
+    {OP_WAIT, W_FILE, 0, 0, 120000, "uiaprobe-done"},
+    {OP_A11Y, 0, 0, 0, 500, "has button Send"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
+    // A new session for what follows, whose rows are named for the
+    // first prompt sent below, not for these
+    {OP_NEWSESSION, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_MARKSESS, 0, 0, 0, 0, ""},
+    {OP_A11Y, 0, 0, 0, 300, "activate textarea Prompt"},
+#endif
     {OP_A11Y, 0, 0, 0, 0, "focus textarea Prompt"},
     // What is typed is the field's value, each frame
     {OP_TEXT, 0, 0, 0, 300, "hello there"},

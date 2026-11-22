@@ -681,6 +681,7 @@ class Local:
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                              text=True, start_new_session=True,
                              env=dict(os.environ, **(env or {})))
+        self.pid = p.pid  # the GUI running, for a watcher (Windows has no ps)
         lines = []
         meter = None
         deadline = time.monotonic() + timeout
@@ -1325,6 +1326,40 @@ def hungupfile(host, trapfile, pidfile):
 
 
 AXAPP_TEXT = "pressed from another process"  # the a11y checklist's
+
+
+def uiaprobewatch(args, host, done, problems):
+    """--mode a11y on Windows: once the checklist is ready
+    (uiaprobe-ready), tests/uiaprobe.ps1 checks the window from another
+    process through UI Automation, as Voice Access would, and invokes
+    Send; then uiaprobe-done, which the checklist waits for. Its
+    failures are problems."""
+    ready = host.path("work", "uiaprobe-ready")
+    if not waitfor(lambda: done.is_set() or os.path.exists(ready), args.timeout, 0.2) \
+            or done.is_set():
+        return
+    pid = getattr(host, "pid", None) or guipid(host.prospero, host.path("state"))
+    status, msg = "fail", "the GUI's pid was not found"
+    if pid:
+        probe = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uiaprobe.ps1")
+        try:
+            r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                                "-File", probe, str(pid)], capture_output=True,
+                               text=True, timeout=90)
+            out = r.stdout.splitlines()
+            for line in out:
+                print("uiaprobe: " + line, flush=True)
+            for line in r.stderr.splitlines():
+                print("uiaprobe: stderr: " + line, flush=True)
+            last = [x for x in out if x.startswith("status: ")]
+            msg = last[-1][len("status: "):] if last else f"exit {r.returncode}, no status"
+            status = "pass" if r.returncode == 0 and last and msg.startswith("pass") else "fail"
+        except (OSError, subprocess.TimeoutExpired) as e:
+            msg = f"could not run: {e}"
+    print(f"uiaprobe: {status}: {msg}", flush=True)
+    if status == "fail":
+        problems.append(f"uiaprobe: {msg}")
+    host.write(host.path("work", "uiaprobe-done"), status + "\n")
 
 
 def axappwatch(args, host, done, problems):
@@ -2399,6 +2434,11 @@ def main():
         bigfiles(host, "small-", 8, 160)
         bigfiles(host, "big-", 10, 512)
         filesfixtures(host)
+    elif args.mode == "a11y":
+        # A remote listed always, never reached: a second host, so the
+        # sidebar has host headings to check whatever this machine has
+        # (a container runtime makes one, but not everywhere)
+        before = config(curl, model, extra="\n[remote far]\nssh = far.invalid\n")
     else:
         before = config(curl, model)
     far = None
@@ -2571,6 +2611,10 @@ def main():
         axthread = None
         if args.mode == "a11y" and sys.platform == "darwin" and isinstance(host, Local):
             axthread = threading.Thread(target=axappwatch,
+                                        args=(args, host, axdone, problems))
+            axthread.start()
+        elif args.mode == "a11y" and os.name == "nt" and isinstance(host, Local):
+            axthread = threading.Thread(target=uiaprobewatch,
                                         args=(args, host, axdone, problems))
             axthread.start()
         try:

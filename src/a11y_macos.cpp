@@ -3766,6 +3766,7 @@ static void macaxtree(Gui *g)
     }
     g->ax->published = macpublished;
     g->ax->osdrive   = macdrive;
+    g->ax->osverb    = "ns";
 }
 
 // The checklist's "off": nothing of the above was installed

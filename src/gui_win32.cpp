@@ -57,11 +57,50 @@ enum {
     W32AXLOG_ON   = 1,  // log the adapter's calls
     W32AXLOG_TEXT = 2,  // and text, as a field the core knows, not a password, holds
 };
+// A node of the published tree, as a11y.cpp has it: its role (AX_*),
+// state (AXS_*) and actions (AXA_*), as numbered there, and where it
+// is, in the client area's pixels
+struct W32AxNode {
+    int      role;
+    unsigned state;
+    unsigned actions;
+    float    x0, y0, x1, y1;
+};
+enum { W32AX_ROOT = 1 };  // the root's key (AXKEY_ROOT)
+enum { W32AXSTR_NAME, W32AXSTR_HELP, W32AXSTR_VALUE };
+enum { W32AXACT_PRESS, W32AXACT_FOCUS, W32AXACT_MENU };  // AXACT_*
+// What changed at a publish: AxEventKind's
+enum {
+    W32AXE_DESTROYED, W32AXE_CREATED, W32AXE_CHILDREN, W32AXE_NAME,
+    W32AXE_VALUE, W32AXE_STATE, W32AXE_FOCUS, W32AXE_LAYOUT,
+};
+struct W32AxEvent {
+    unsigned key;
+    int      kind;
+};
 struct W32AxHooks {
     int  (*logging)(void *gui);  // W32AXLOG_*
     // A line for the adapter's log, UTF-8, as the core's text model
     // stands
     void (*note)(void *gui, char const *line, int len);
+    // A tool asks for the tree: built from the next frame, with events
+    // told through w32gui_axevents. 0 if accessibility is off.
+    int  (*start)(void *gui);
+    // The node with key: 0 if there is none
+    int  (*node)(void *gui, unsigned key, W32AxNode *out);
+    // Its parent as tools see it, past nodes hidden from them: the
+    // root's key at the top, 0 for the root or a node that is gone
+    unsigned (*parent)(void *gui, unsigned key);
+    // Its children as tools see them, those of hidden ones in their
+    // place: how many, of which the first cap are copied to out
+    int  (*kids)(void *gui, unsigned key, unsigned *out, int cap);
+    // Its name, help or value (W32AXSTR_*), as UTF-16: its length, of
+    // which the first cap units are copied to buf
+    int  (*text)(void *gui, unsigned key, int which, unsigned short *buf, int cap);
+    unsigned (*focus)(void *gui);                  // 0 for none
+    unsigned (*hit)(void *gui, float x, float y);  // the root's for none
+    // Act on it (W32AXACT_*), for the next frame: 0 if it can't
+    int  (*act)(void *gui, unsigned key, int kind);
 };
 
 // Shared by both halves: the core's callbacks, called on the GUI thread.
@@ -187,6 +226,13 @@ extern "C" int       w32gui_reveal(unsigned short const *dir);
 // Show a file selected in Explorer: a path with backslashes
 extern "C" int       w32gui_select(unsigned short const *file);
 extern "C" void      w32gui_letfront(unsigned long pid);  // AllowSetForegroundWindow
+// Accessibility (a11y_win32.cpp): what a publish changed, told to UI
+// Automation's clients, if any listen
+extern "C" void      w32gui_axevents(void *, W32AxEvent const *, int n);
+// The checklist's "ns" checks, through the providers' own methods as a
+// client's calls reach them: the result's text, "ok" if it passed,
+// into out (UTF-8, cap bytes with its NUL)
+extern "C" void      w32gui_axdrive(void *, char const *cmd, int len, char *out, int cap);
 
 
 #if PROSPERO_GUIEDGE
@@ -712,7 +758,15 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         DragFinish(d);
     } return 0;
 
+    case WM_GETOBJECT: {
+        LRESULT r;
+        if (w32axroot(w, wp, lp, &r)) {
+            return r;
+        }
+    } break;
+
     case WM_DESTROY:
+        w32axgone(w);
         PostQuitMessage(0);
         return 0;
     }
@@ -2446,6 +2500,7 @@ static b32 os_guiopen(Os *os, Gui *g, Arena scratch, Str title)
     }
     W32Hooks h = {};
     w32axhooks(&h.ax);
+    w32axinit(g);
     h.gui       = g;
     h.input     = hookinput;
     h.wake      = hookwake;

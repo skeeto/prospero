@@ -111,7 +111,8 @@ struct AxGui {
     i64                 calledlag;// the checklist's "aged": calls dated this much earlier
     Str                 tracepath;
     void              (*published)(AxGui *);  // the OS adapter's, after each publish
-    void              (*osdrive)(Gui *, Arena, Str); // its checklist verbs ("ns ...")
+    void              (*osdrive)(Gui *, Arena, Str); // its checklist verbs (osverb ...)
+    Str                 osverb;   // "ns" on macOS, "uia" on Windows
 };
 
 enum { AXLINT_CAP = 1<<12 };
@@ -1298,6 +1299,7 @@ static void axstart(Gui *g)
 //                    since the last OP_NSTEXT
 //   ns ...           the OS adapter's own checks, through the OS's API
 //                    (macOS: a11y_macos.cpp); skipped where there is none
+//   uia ...          likewise, Windows' (a11y_win32.cpp)
 //   put TEXT         put TEXT in the shown session's box, as a draft
 //                    reloaded from the engine is (draftput)
 //   off              accessibility is off: no tree, and the OS adapter
@@ -1563,8 +1565,8 @@ static void driveax(Gui *g, Arena scratch, Str cmd)
     } else if (verb == "logged") {
         axcheck(g, &a, axlogged(g, g->ax->logmark, c.tail) > 0,
                 concat(&a, "accessibility log: ", c.tail));
-    } else if (verb == "ns") {
-        if (g->ax->osdrive) {
+    } else if (verb=="ns" || verb=="uia") {
+        if (g->ax->osdrive && verb==g->ax->osverb) {
             g->ax->osdrive(g, a, c.tail);
         } else {
             guilog(g, concat(&a, "drive: skipped (no OS adapter here): ", cmd));
