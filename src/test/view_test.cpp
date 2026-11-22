@@ -1544,6 +1544,24 @@ static void test_viewpanels(Test *t)
         expect(t, "panels.pdfnote", v->msgs[v->msgs.len-1].label, "Attached: r.pdf, ");
     }
 
+    // A prompt's folded notes (files, sessions, a skill) come after it,
+    // and it still begins its turn, so it can be rewound to (#98)
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        apply(v, a, R"({"sid":"s","seq":1,"ts":0,"ev":"user","via":"prompt","skill":"pdf",)"
+                    R"("args":"x","text":"<skill name=\"pdf\">\nRead it.\n</skill>\n\nx",)"
+                    R"("files":[{"name":"files/1-a.txt","bytes":1,"lines":1}],)"
+                    R"("sessions":[{"sid":"t","title":"T"}]})");
+        apply(v, a, R"({"sid":"s","seq":2,"ts":0,"ev":"turn","n":1})");
+        expect(t, "panels.notesturn", concat(&a, istr(&a, v->msgs.len),
+                                             istr(&a, v->msgs[0].startsturn)), "41");
+        apply(v, a, R"({"sid":"s","seq":3,"ts":0,"ev":"turn.end","turn":1,"why":"done"})");
+        apply(v, a, R"({"sid":"s","seq":4,"ts":0,"ev":"user","via":"prompt","skill":"pdf","text":"y"})");
+        apply(v, a, R"({"sid":"s","seq":5,"ts":0,"ev":"turn","n":2})");
+        expect(t, "panels.skillturn", istr(&a, v->msgs[v->msgs.len-2].startsturn), "2");
+    }
+
     // Instruction files, each once as last told; a task's report as
     // markdown, its subagent named; a command moved to the background
     {

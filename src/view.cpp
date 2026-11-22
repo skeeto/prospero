@@ -2750,7 +2750,14 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
             // Asked for by the user (compact), with no message of its
             // own: its card (EV_COMPACT) says what it did
         } else if (v->msgs.len) {
-            ViewMsg *m = &v->msgs[v->msgs.len-1];
+            // The prompt, past the folded notes it brought (its files,
+            // the sessions it mentioned, a skill's instructions), which
+            // came in its own record, so share its seq
+            iz k = v->msgs.len - 1;
+            while (k>0 && v->msgs[k].role==VIEW_NOTE && v->msgs[k].seq==v->msgs[k-1].seq) {
+                k--;
+            }
+            ViewMsg *m = &v->msgs[k];
             if (m->role==VIEW_USER && !m->startsturn && m->label!="You (steering)") {
                 m->startsturn = v->turn;
             }
