@@ -1088,6 +1088,7 @@ static void testcfgjson(Test *t)
     expect(t, "json.settings", finish(&b),
         "//endpoint=*\n"
         "//model=*\n"
+        "//effort=*\n"
         "endpoint/team/kind=openai*\n"
         "endpoint/team/url=https://t/@/c/team.ini:2\n"
         "endpoint/team/key=(hidden)@/c/team.ini:3!\n"

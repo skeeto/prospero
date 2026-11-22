@@ -6924,6 +6924,50 @@ def effort_pick(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+@scenario(conf={**AN, "_top": {"effort": "xhigh"},
+                "_extra": "[model {model}]\neffort = high\n"}, bound=20)
+def effort_top(t):
+    """Defaults' effort is where a new session starts, as if picked but
+    not marked as the user's, the model's own still its Default."""
+    h = t.headless(env=ANENV)
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        rec = h.wait(lambda e: e.get("sid") == sid and e.get("ev") == "effort")
+        t.check(rec.get("effort") == "xhigh" and rec.get("default") == "high" and
+                "by" not in rec, f"the first record {rec}")
+        h.call("prompt", sid=sid, text="go")
+        te = ended(h, sid, 1)
+        t.check(t.requests(), f"a request: {te} {h.all('note', sid)}")
+        body = t.requests()[-1]["body"]
+        t.check(body.get("output_config") == {"effort": "xhigh"},
+                f"output_config {body.get('output_config')}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf={**AN, "_top": {"effort": "minimal"},
+                "_extra": "[model {model}]\neffort = high\n"}, bound=20)
+def effort_top_untaken(t):
+    """Defaults' effort that the model does not take (minimal, on
+    Anthropic) starts a new session at the model's own."""
+    h = t.headless(env=ANENV)
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        rec = h.wait(lambda e: e.get("sid") == sid and e.get("ev") == "effort")
+        t.check(rec.get("effort") == "" and rec.get("default") == "high",
+                f"the first record {rec}")
+        h.call("prompt", sid=sid, text="go")
+        te = ended(h, sid, 1)
+        t.check(t.requests(), f"a request: {te} {h.all('note', sid)}")
+        body = t.requests()[-1]["body"]
+        t.check(body.get("output_config") == {"effort": "high"},
+                f"output_config {body.get('output_config')}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 @scenario(conf=AN, bound=10)
 def an_attach(t):
     """Images attached to a prompt go before its text as image blocks, of

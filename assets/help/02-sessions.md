@@ -248,7 +248,8 @@ agent (<kbd>Tab</kbd> completes the name):
   focus names;
 - `/model [NAME]` switches the model, or picks one from a list;
 - `/effort [LEVEL]` sets the model's effort (`default`: its own), or
-  picks one from a list;
+  picks one from a list; a top-level `effort` in the configuration is
+  where new sessions start;
 - `/shell [NAME]` switches the shell, or picks one from a list;
 - `/rename TITLE` sets the title;
 - `/fork [TURN]` forks the session, or only its first turns;

@@ -4825,6 +4825,8 @@ def sc_an_plain(model, n, req):
 
 
 sc_effort_pick = sc_an_plain  # each request's output_config is what counts
+sc_effort_top = sc_an_plain
+sc_effort_top_untaken = sc_an_plain
 
 
 def sc_an_tools(model, n, req):

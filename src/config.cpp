@@ -281,6 +281,9 @@ static CfgKey cfgschema[] = {
     {"", "model", CFG_STRING, "", {}, {}, "general",
      "Model for new sessions: ENDPOINT/MODEL, or MODEL as the endpoint "
      "names it, at the endpoint above, else at one that lists it"},
+    {"", "effort", CFG_ENUM, "", {}, "none minimal low medium high xhigh max",
+     "general", "Effort for new sessions, as picked from the Prompt: one "
+     "their model takes, else its own default ([model] effort)"},
 
     {"endpoint", "kind", CFG_ENUM, "openai", {},
      "openai anthropic responses chatgpt copilot builtin",

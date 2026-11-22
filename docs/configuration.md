@@ -275,6 +275,10 @@ send it. A pick the next model cannot carry goes back to Default.
 Changing it mid-session can cost a cache miss, as Anthropic renders the
 effort into the prompt.
 
+A top-level `effort`, next to `model`, is the pick a new session starts
+with, where its model takes that level; else it starts at Default.
+Subagents still take their parent's, as above.
+
 A `[model NAME]` section applies wherever an endpoint lists NAME. Where
 two endpoints list the same model, `[model ENDPOINT/MODEL]` sets it on
 one of them only, each of its settings winning over `[model MODEL]`'s:

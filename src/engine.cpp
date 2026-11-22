@@ -21066,6 +21066,10 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
     s->scratch = newscratch(e, &s->perm, scratch, s->sid);
     sessionready(s, scratch);
     logsession(s, scratch);
+    // Defaults' effort, as if picked, where the model takes it
+    // (effortsync drops it otherwise); a subagent's is its parent's
+    i32 effix = effortindex(trim(cfgget(e->cfg, "", "", "effort", 0)));
+    s->effort = !task.ok && effix>0 ? effix : 0;
     effortsync(s, scratch, 0);
     instrlogstart(s, scratch);
     memlogstart(s, scratch);
