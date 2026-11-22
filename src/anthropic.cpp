@@ -731,6 +731,7 @@ static Chunk anchunk(Partial *p, Json *j, Arena *scratch)
         if (id.len && !p->id.data) {
             p->id = clone(p->a, id);
         }
+        partmodel(p, jsonget(m, "model"));
         anusage(p, jsonget(m, "usage"));
 
     } else if (type == "content_block_start") {
@@ -768,6 +769,7 @@ static Chunk anchunk(Partial *p, Json *j, Arena *scratch)
             anstart(p, &r, scratch, index++, cb, 1);
         }
         anstopped(p, j, jsonget(j, "stop_details"));
+        partmodel(p, jsonget(j, "model"));
         anusage(p, jsonget(j, "usage"));
         p->done = 1;
     }

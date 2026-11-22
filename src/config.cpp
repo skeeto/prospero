@@ -344,6 +344,11 @@ static CfgKey cfgschema[] = {
     {"model", "context", CFG_INT, "", {}, {}, "model",
      "Context limit in tokens, for a server that does not report it, or "
      "less than one reports, to compact sooner"},
+    {"model", "price", CFG_STRING, "", {}, {}, "model",
+     "Dollars per million tokens, for the cost a session shows: INPUT "
+     "OUTPUT [CACHE_READ [CACHE_WRITE]] (by default a tenth of input and a "
+     "quarter more than input), 0 if free, or none for no price; by "
+     "default Anthropic's list prices for its models"},
     {"model", "compactor", CFG_STRING, "", {}, {}, "model",
      "Model that summarizes long conversations, MODEL or ENDPOINT/MODEL, "
      "by default this one"},
@@ -1483,6 +1488,9 @@ static i32 cfgjudge(CfgKey *k, Str v, b32 shared)
         return cfgeffortas(v) ? CFG_OK : CFG_BAD;
     } else if (k->kind=="model" && k->key=="effort_map") {
         return cfgeffortmap(v) ? CFG_OK : CFG_BAD;
+    } else if (k->kind=="model" && k->key=="price") {
+        Price p = {};
+        return priceparse(v, &p) ? CFG_OK : CFG_BAD;
     } else if (k->kind=="ui" && k->key=="theme") {
         return CFG_OK;  // or a [theme NAME], which cfgvalidate checks
     }
@@ -1608,6 +1616,10 @@ static Str cfgproblem(Arena *a, CfgKey *k, Str v, b32 shared)
     } else if (k->kind=="model" && k->key=="effort_map") {
         return "expected EFFORT:VALUE words, such as high:xhigh none:off, "
                "each EFFORT one of none, minimal, low, medium, high, xhigh, max";
+    } else if (k->kind=="model" && k->key=="price") {
+        return "expected dollars per million tokens, INPUT OUTPUT and "
+               "optionally CACHE_READ and CACHE_WRITE, such as 3 15 or "
+               "3 15 0.3 3.75; or 0 if free, or none";
     }
     Buf b(a, 128);
     switch (k->type) {

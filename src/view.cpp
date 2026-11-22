@@ -465,6 +465,27 @@ struct ViewWork {
     i64 cached;    //   the prompts' read from the cache,
     i64 written;   //   and written to it (Anthropic)
     i32 requests;
+    // Cost (price.cpp), from the records' usage: microusd and the
+    // requests with no price, the session's own and, for a fork, a side
+    // chat or an import, those of the history it copied
+    i64 usd;
+    i64 unpriced;
+    i64 priced;    // requests with a price, $0 if free
+    i64 copyusd;
+    i64 copyunpriced;
+};
+
+// A subagent's spend as the parent's log reports it, by its sid, the
+// last report winning (a rewind delivers a notice again). Until it
+// reports, or for more than it reported, its own view says (viewcost).
+struct ViewKid {
+    Str  sid;
+    Str  host;      // the host it runs on, if not this one
+    Str  call;      // the task call that started it
+    i64  usd;       // its report's: it and its own subagents
+    i64  unpriced;
+    b32  reported;  // with a spend (a report from before costs: not)
+    b32  copied;    // in the copied history: not this session's spend
 };
 
 // A tool call's span, epoch ms
@@ -634,6 +655,9 @@ struct View {
                                 // notice again (after a compaction) is
                                 // the same move, still at movedat
     Str             sideof;     // a side chat's original session, else empty
+    Str             importedfrom; // an import's original session, else empty
+    b32             copying;    // the records are a copy's (copy_of ends it)
+    Slice<ViewKid>  kids;       // subagents' spend (ViewKid)
     i32             turn;
     i32             attempt;
     b32             busy;       // a turn is running
@@ -2368,16 +2392,90 @@ static void workrequest(View *v, Json *j)
         i64 f = jsonint(first, 0);
         f = f<0 ? 0 : f>ms ? ms : f;
         v->work.first += f;
-        if (out > 0) {
+        Str  fin = jsonstr(jsonget(j, "finish"));
+        b32  cut = fin=="interrupted" || fin=="error" || fin=="cancelled" ||
+                   fin=="paused";
+        if (out>0 && !cut) {  // a cut one's count is a guess (attemptcost)
             v->work.genms  += ms - f;
             v->work.genout += out;
         }
     }
-    if (u->type == JSON_OBJECT) {
+}
+
+// A subagent's entry, by sid, made at its first report.
+static ViewKid *viewkid(View *v, Str sid)
+{
+    for (iz i = 0; i < v->kids.len; i++) {
+        if (v->kids[i].sid == sid) {
+            return &v->kids[i];
+        }
+    }
+    ViewKid k = {};
+    k.sid   = clone(&v->aux, sid);
+    v->kids = push(&v->aux, v->kids, k);
+    return &v->kids[v->kids.len-1];
+}
+
+// A subagent's report, on its task's tool.end or a notice: its sid, its
+// host, its call, and its spend if the report has one.
+static void viewkidreport(View *v, Json *j)
+{
+    Str kid = jsonstr(jsonget(j, "child"));
+    if (!kid.len) {
+        return;
+    }
+    ViewKid *k    = viewkid(v, kid);
+    Str      host = jsonstr(jsonget(j, "host"));
+    Str      call = jsonstr(jsonget(j, "call"));
+    Json    *usd  = jsonget(j, "child_microusd");
+    k->host   = host.len ? clone(&v->aux, host) : k->host;
+    k->call   = call.len ? clone(&v->aux, call) : k->call;
+    k->copied = v->copying;
+    if (usd->type == JSON_NUMBER) {
+        k->usd      = jsonint(usd, 0);
+        k->unpriced = jsonint(jsonget(j, "child_unpriced"), 0);
+        k->reported = 1;
+    }
+}
+
+// What any record says was spent: its usage, any record's that has one
+// (a request's, a retry's, a compaction's, a title's, a search's), and a
+// subagent's report on a task's tool.end or a notice.
+static void viewspend(View *v, EvRec *r)
+{
+    Json *j = r->root;
+    if (r->ev==EV_TURN && v->copying && v->forkedfrom.len && v->forkturn>0 &&
+            jsonint(jsonget(j, "n"), 0)>v->forkturn) {
+        v->copying = 0;  // a copy from before copy_of: its turns are past
+    }
+    Json *u = jsonget(j, "usage");
+    if (u->type==JSON_OBJECT && r->ev!=EV_TASKREPORT) {
         v->work.in      += jsonint(jsonget(u, "in"), 0);
-        v->work.out     += out;
+        v->work.out     += jsonint(jsonget(u, "out"), 0);
         v->work.cached  += jsonint(jsonget(u, "cached"), 0);
         v->work.written += jsonint(jsonget(u, "written"), 0);
+        Json *usd = jsonget(u, "microusd");
+        b32   has = usd->type == JSON_NUMBER;
+        i64   c   = has ? jsonint(usd, 0) : 0;
+        if (v->copying) {
+            v->work.copyusd      += c;
+            v->work.copyunpriced += !has;
+        } else {
+            v->work.usd      += c;
+            v->work.unpriced += !has;
+            v->work.priced   += has;
+        }
+    }
+    if (r->ev==EV_NOTICE && jsonstr(jsonget(j, "kind"))=="task") {
+        viewkidreport(v, j);
+    }
+    if (r->ev==EV_TITLE && jsonget(j, "copy_of")->type==JSON_STRING) {
+        // The copy's end: what follows is this session's. A fork of a
+        // fork has the earlier copy's marker too, before its own.
+        Str of = jsonstr(jsonget(j, "copy_of"));
+        if (of==v->forkedfrom || of==v->sideof || of==v->importedfrom) {
+            v->copying = 0;
+        }
     }
 }
 
@@ -2396,6 +2494,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         }
         v->lastseq = r->seq;
     }
+    viewspend(v, r);
 
     Json *j = r->root;
     switch (r->ev) {
@@ -2415,6 +2514,9 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         v->forkturn   = jsonint(jsonget(j, "fork_turn"), 0);
         v->movedfrom  = clone(&v->aux, jsonstr(jsonget(j, "moved_from")));
         v->sideof     = clone(&v->aux, jsonstr(jsonget(j, "side_of")));
+        v->importedfrom = clone(&v->aux, jsonstr(jsonget(j, "imported_from")));
+        v->copying    = !v->movedfrom.len && (v->forkedfrom.len || v->sideof.len ||
+                                              v->importedfrom.len);
         {
             Buf b(&scratch, 256);
             for (Json *t = jsonget(j, "tools")->child; t; t = t->next) {
@@ -2432,13 +2534,6 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         v->title = clone(&v->aux, jsonstr(jsonget(j, "text")));
         if (jsonstr(jsonget(j, "by")) == "user") {
             addmark(v, r->seq, "Renamed", v->title);
-        }
-        if (Json *u = jsonget(j, "usage"); u->type == JSON_OBJECT) {
-            // A model's title: its tokens count, as any request's
-            v->work.in      += jsonint(jsonget(u, "in"), 0);
-            v->work.out     += jsonint(jsonget(u, "out"), 0);
-            v->work.cached  += jsonint(jsonget(u, "cached"), 0);
-            v->work.written += jsonint(jsonget(u, "written"), 0);
         }
         return 1;
 
@@ -2853,6 +2948,9 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         Str kid    = jsonstr(jsonget(j, "child"));
         t->child   = kid.len ? clone(&v->aux, kid) : t->child;  // task.host's
         taskhost(v, t, jsonstr(jsonget(j, "host")));
+        if (t->name == "task") {
+            viewkidreport(v, j);  // its spend (viewcost)
+        }
         Str to     = jsonstr(jsonget(j, "to"));
         Str title  = jsonstr(jsonget(j, "to_title"));
         if (t->name=="send_message" && (to.len || title.len)) {

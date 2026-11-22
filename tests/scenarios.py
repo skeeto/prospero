@@ -7060,6 +7060,175 @@ def an_midstream(t):
             f"the partial went back without its reasoning: {second[1]}")
 
 
+# Costs (price.cpp): each request's usage priced as it is logged, in
+# whole microusd, at [model] price here (the table is for Anthropic's
+# ids, which these fake models are not)
+
+PRICE = (3, 15, 0.3, 3.75)  # input, output, cache read, cache write
+
+
+def priceconf(base=None, models=("{model}",), price="3 15 0.3 3.75"):
+    conf = dict(base or {})
+    conf["_extra"] = conf.get("_extra", "") + "".join(
+        f"[model {m}]\nprice = {price}\n" for m in models)
+    return conf
+
+
+def microusd(u, p=PRICE):
+    """A usage object's cost, as costof works it out."""
+    plain = max(0, u["in"] - u.get("cached", 0) - u.get("written", 0))
+    c = (float(plain)*p[0] + float(u.get("written", 0))*p[3] +
+         float(u.get("cached", 0))*p[2] + float(u["out"])*p[1])
+    return int(c + 0.5)
+
+
+def priced(r, sid=None):
+    """Each record with usage, of a session if given."""
+    return [e for e in r.events if isinstance(e.get("usage"), dict) and
+            e.get("ev") not in ("task.report",) and (sid is None or e.get("sid") == sid)]
+
+
+def costcheck(t, r, sid=None):
+    """Every record with usage priced as PRICE has it. Their sum."""
+    recs = priced(r, sid)
+    t.check(recs, "records with usage")
+    bad = [e for e in recs if e["usage"].get("microusd") != microusd(e["usage"])]
+    t.check(not bad, f"priced as the setting: {bad}")
+    return sum(e["usage"].get("microusd", 0) for e in recs)
+
+
+@scenario(conf=priceconf(), bound=5)
+def cost_plain(t):
+    """The answer's record carries its cost, at the configured price."""
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    costcheck(t, r)
+    u = r.last("assistant")["usage"]
+    t.check(u["microusd"] > 0, f"a cost: {u}")
+
+
+@scenario(bound=5)
+def cost_unpriced(t):
+    """A model with no price: its usage, but no cost."""
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    recs = priced(r)
+    t.check(recs and all("microusd" not in e["usage"] for e in recs), f"unpriced: {recs}")
+
+
+@scenario(conf=priceconf(price="0"), bound=5)
+def cost_free(t):
+    """price = 0: free, which is a price."""
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    recs = priced(r)
+    t.check(recs and all(e["usage"].get("microusd") == 0 for e in recs), f"free: {recs}")
+
+
+@scenario(conf=priceconf(models=("{model}", "{model2}")), bound=20)
+def cost_task(t):
+    """A subagent's spend reaches its parent's tool.end, its own
+    subagent's included, to the microusd."""
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    own, kids = r.sessions()
+    one = [k for k in kids if k["depth"] == 1][0]["sid"]
+    two = [k for k in kids if k["depth"] == 2][0]["sid"]
+    s2 = costcheck(t, r, two)
+    s1 = costcheck(t, r, one)
+    costcheck(t, r, own)
+    end1 = [e for e in r.all("tool.end", one) if e.get("child") == two]
+    end0 = [e for e in r.all("tool.end", own) if e.get("child") == one]
+    t.check(end1 and end1[0].get("child_microusd") == s2 and end1[0].get("child_unpriced") == 0,
+            f"depth 1 heard {s2}: {end1}")
+    t.check(end0 and end0[0].get("child_microusd") == s1 + s2 and
+            end0[0].get("child_unpriced") == 0, f"the parent heard {s1} + {s2}: {end0}")
+
+
+@scenario(conf=priceconf(SMALL), bound=20, alone=True)
+def cost_compaction(t):
+    """The summary request's cost, on its compact record."""
+    bigfiles(t, 8, 150)
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    costcheck(t, r)
+    cps = r.all("compact")
+    t.check(len(cps) == 1 and cps[0].get("usage", {}).get("microusd", 0) > 0,
+            f"the summary's cost: {cps}")
+
+
+@scenario(conf=priceconf(AN), bound=8)
+def cost_an_midstream(t):
+    """A response cut off by an error still cost what it read, and at
+    least a token for each chunk it streamed."""
+    r = t.run(env=ANENV)
+    anok(t, r)
+    costcheck(t, r)
+    cut = r.all("assistant")[0]
+    t.check(cut["finish"] == "interrupted" and cut["usage"]["out"] >= 2 and
+            cut["usage"]["in"] > 0, f"the cut one's usage: {cut}")
+
+
+@scenario(conf=priceconf(), bound=20)
+def cost_title_rename(t):
+    """A title the user's rename overtook: its request was spent all the
+    same, in a usage record of its own."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text=LONG_PROMPT)
+        ended(h, sid, 1)
+        t.check(h.call("rename", sid=sid, title="Mine").get("ok") == 1, "renamed")
+        got = h.wait(lambda e: e.get("ev") == "usage" and e.get("sid") == sid)
+        t.check(got.get("purpose") == "title" and
+                got["usage"].get("microusd") == microusd(got["usage"]) > 0,
+                f"the title's usage: {got}")
+        t.check(not [e for e in h.all("title", sid) if e.get("by") == "model"],
+                "no model's title")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf=priceconf(models=("{model}", "{model2}")), bound=25)
+def cost_bg_task(t):
+    """A subagent in the background: its spend comes with its notice,
+    none on the call it left."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        kid = bgtask(t, h, sid)
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        bgheard(t, h, sid, kid, 2)
+        spent = [e["usage"]["microusd"] for e in h.events
+                 if e.get("sid") == kid and isinstance(e.get("usage"), dict)]
+        t.check(spent and all(isinstance(x, int) for x in spent), f"the child's: {spent}")
+        n = [e for e in h.all("notice", sid) if e.get("kind") == "task"]
+        t.check(n and n[0].get("child_microusd") == sum(spent) and
+                n[0].get("child_unpriced") == 0, f"the notice heard {sum(spent)}: {n}")
+        end = [e for e in h.all("tool.end", sid) if e.get("status") == "background"]
+        t.check(end and "child_microusd" not in end[0], f"none on the call: {end}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf=priceconf(models=("{model}", "an/fake:websearch")), bound=15)
+def cost_web_anthropic(t):
+    """Anthropic's search: the search model's tokens at its price, and
+    $0.01 a search, on each call's tool.end; a reply without a search,
+    refused, cost its tokens."""
+    t.host.write(t.config, t.host.read(t.config) + AN_WEB.format(url=t.host.url))
+    webconf(t, search="anthropic", url=None, model="an/fake:websearch", ask="false")
+    r = t.run(env=webenv(t, **ANENV))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    ends = r.all("tool.end")
+    us = [e.get("usage", {}) for e in ends]
+    # Each reply read 100 and wrote 20: 100*3 + 20*15 = 600 microusd
+    t.check([(u.get("in"), u.get("out"), u.get("microusd")) for u in us] ==
+            [(100, 20, 10600), (200, 40, 21200), (100, 20, 600)], f"usage {us}")
+
+
 @scenario(conf=AN, bound=8)
 def an_max_tokens(t):
     """The output limit cuts a call's input short: the call fails, saying

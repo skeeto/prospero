@@ -174,6 +174,21 @@ tokens sent, read from the cache and received, the requests, and the
 output's rate after the first token. Once a session was opened, its
 tooltip in the sidebar gives its time too.
 
+Info's Cost row estimates what the session spent, at list prices: each
+request's tokens, as the endpoint counted them, times the model's price
+per million tokens (`[model] price` in Configuration, by default
+Anthropic's own prices for its models), and Anthropic's price for each
+web search. Every request counts, whether it answered, failed,
+retried, was stopped, compacted or titled the session. Subagents' spend
+is added to their parent's and shown apart. A fork, a side chat or an
+import counts only its own requests: what the copied history cost is
+shown apart, as before the fork. It is an estimate, not a bill:
+discounts, plans and taxes are not known here, and a model with no price
+known (a ChatGPT or Copilot sign-in, which a plan pays for, or a model
+of another provider with no `price`) is counted as unpriced. The
+built-in model costs nothing. Sessions from before Prospero priced
+requests have no cost. The sidebar's tooltip gives the total too.
+
 The session bar's gauge is how much of the model's context the
 conversation takes, a tick where compaction begins, amber as it nears;
 its tooltip has the numbers. A server that does not report the window

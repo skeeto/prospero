@@ -141,7 +141,7 @@ static void testlogcopy(Test *t)
         "{\"sid\":\"B\",\"seq\":7,\"ts\":9,\"ev\":\"turn.end\",\"turn\":1,\"why\":\"done\"}\n"
         "{\"sid\":\"B\",\"seq\":8,\"ts\":9,\"ev\":\"job.end\",\"job\":1}\n"
         "{\"sid\":\"B\",\"seq\":9,\"ts\":100,\"ev\":\"title\",\"text\":\"First (fork)\","
-        "\"by\":\"auto\"}\n";
+        "\"by\":\"auto\",\"copy_of\":\"A\"}\n";
     expect(t, "logcopy", c.log, want);
     expect(t, "logcopy title", c.title, "First (fork)");
     expect(t, "logcopy files", joinlines(&a, c.files), "out/c1.logout/c2.logsnap/3.snap/3");
@@ -171,7 +171,7 @@ static void testlogcopy(Test *t)
                "{\"sid\":\"B\",\"seq\":4,\"ts\":100,\"ev\":\"mode\",\"mode\":\"default\","
                "\"by\":\"fork\",\"path\":\"/s/sessions/B/plan.md\"}\n"
                "{\"sid\":\"B\",\"seq\":5,\"ts\":100,\"ev\":\"title\",\"text\":\"Untitled (fork)\","
-               "\"by\":\"auto\"}\n");
+               "\"by\":\"auto\",\"copy_of\":\"A\"}\n");
         ml.len = 2;
         c = logcopy(&a, scratch, ml, "A", "B", posix, posixnew, -1, 100, 0);
         expect(t, "logcopy plan", logseqs(&a, c.log), "1 2 3");
@@ -239,7 +239,7 @@ static void testlogwt(Test *t)
         "{\"sid\":\"B\",\"seq\":7,\"ts\":6,\"ev\":\"user\",\"text\":\"edit /r/sub/a.c\"}\n"
         "{\"sid\":\"B\",\"seq\":8,\"ts\":100,\"ev\":\"notice\",\"kind\":\"worktree\","
         "\"text\":\"Here.\"}\n"
-        "{\"sid\":\"B\",\"seq\":9,\"ts\":100,\"ev\":\"title\",\"text\":\"\",\"by\":\"auto\"}\n");
+        "{\"sid\":\"B\",\"seq\":9,\"ts\":100,\"ev\":\"title\",\"text\":\"\",\"by\":\"auto\",\"copy_of\":\"A\"}\n");
 
     expect(t, "remap win", copyremap(&a, "c:\\R\\Sub\\a.c", "C:/r", "C:/r/.p/w", 1),
            "C:\\r\\.p\\w\\Sub\\a.c");
@@ -310,7 +310,7 @@ static void testlogside(Test *t)
         "where the main agent may still be working. Do not change files unless the "
         "user asks you to.\"}\n"
         "{\"sid\":\"B\",\"seq\":21,\"ts\":100,\"ev\":\"title\",\"text\":\"Work (side chat)\","
-        "\"by\":\"auto\"}\n");
+        "\"by\":\"auto\",\"copy_of\":\"A\"}\n");
 
     // Opened as it is: nothing left to close
     Os *os = newos(&a, 1<<20);
@@ -327,7 +327,7 @@ static void testlogside(Test *t)
         "\"status\":\"forked\",\"text\":\"still running in the original session when this "
         "fork was made\",\"notice\":0}\n"
         "{\"sid\":\"B\",\"seq\":10,\"ts\":100,\"ev\":\"title\",\"text\":\"Work (fork)\","
-        "\"by\":\"auto\"}\n");
+        "\"by\":\"auto\",\"copy_of\":\"A\"}\n");
     // Imported, the job is left for logopen
     c = logcopy(&a, scratch, lines, "A", "B", {}, {}, -1, 100, 0, COPY_IMPORT);
     expect(t, "logimport job", istr(&a, find(c.log, "forked")), "-1");
@@ -390,7 +390,7 @@ static void testlogimport(Test *t)
         "\"from_title\":\"U\",\"hop\":1,\"text\":\"hi\"}\n"
         "{\"sid\":\"N\",\"seq\":19,\"ts\":9,\"ev\":\"turn.end\",\"turn\":1,\"why\":\"done\"}\n"
         "{\"sid\":\"N\",\"seq\":20,\"ts\":100,\"ev\":\"title\",\"text\":\"First (imported)\","
-        "\"by\":\"auto\"}\n";
+        "\"by\":\"auto\",\"copy_of\":\"A\"}\n";
     expect(t, "logimport", r.log, want);
     expect(t, "logimport memory", istr(&a, importkeeps(EV_MEMORY)), "0");
     expect(t, "logimport err", r.err, "");
@@ -639,7 +639,8 @@ static void test_events(Test *t)
                "session title user turn attempt assistant tool.start "
                "tool.end ask answer retry nudge turn.end note compact job.start "
                "job.end todo snap rewind instructions notice prefix model grant mode "
-               "task.host task.report memory shell ask.deadline cut uncut pause revoke deny effort ");
+               "task.host task.report memory shell ask.deadline cut uncut pause revoke deny effort "
+               "usage ");
         expect(t, "synced events", finish(&sync),
                "tool.start ask answer turn.end rewind task.report cut uncut pause revoke deny ");
         expect(t, "unknown event", istr(a, evfind("tool")), istr(a, EV_NONE));
@@ -1292,7 +1293,7 @@ static void test_events(Test *t)
                "turn.end=1 note=0 compact=0 job.start=0 job.end=0 todo=0 snap=0 "
                "rewind=1 instructions=0 notice=0 prefix=0 model=0 grant=0 mode=0 "
                "task.host=0 task.report=1 memory=0 shell=0 ask.deadline=0 cut=1 uncut=1 pause=1 "
-               "revoke=1 deny=1 effort=0 ");
+               "revoke=1 deny=1 effort=0 usage=0 ");
         logclose(&log);
 
         Str start = "{\"sid\":\"s13\",\"seq\":1,\"ts\":0,\"ev\":\"tool.start\",\"call\":\"a\"}\n";

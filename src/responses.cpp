@@ -479,6 +479,7 @@ static void rsend(Partial *p, Chunk *r, Arena *scratch, Json *resp)
         index = index>=0 ? index : rsindexof(p, rsat(p->a, n));
         rsitem(p, r, scratch, index, item, 1);
     }
+    partmodel(p, jsonget(resp, "model"));
     rsusage(p, jsonget(resp, "usage"));
     Str status = jsonstr(jsonget(resp, "status"));
     Str why    = jsonstr(jsonget(jsonget(resp, "incomplete_details"), "reason"));
@@ -528,6 +529,7 @@ static Chunk rschunk(Partial *p, Json *j, Arena *scratch)
         if (id.len && !p->id.data) {
             p->id = clone(p->a, id);
         }
+        partmodel(p, jsonget(jsonget(j, "response"), "model"));
 
     } else if (type=="response.output_item.added" || type=="response.output_item.done") {
         b32 whole = type == "response.output_item.done";

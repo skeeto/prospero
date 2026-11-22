@@ -2460,3 +2460,124 @@ static void test_viewlines(Test *t)
         expect(t, "view.estimate.columns", finish(&b), "56 42");
     }
 }
+// The view's spend, as "usd/unpriced/priced copyusd/copyunpriced in/out"
+// then each subagent's "sid:usd:unpriced", with "r" if reported and "c"
+// if copied.
+static Str costshow(Arena *a, View *v)
+{
+    ViewWork *w = &v->work;
+    Buf b(a, 256);
+    print(&b, w->usd);  putbyte(&b, '/');
+    print(&b, w->unpriced);  putbyte(&b, '/');
+    print(&b, w->priced);  putbyte(&b, ' ');
+    print(&b, w->copyusd);  putbyte(&b, '/');
+    print(&b, w->copyunpriced);  putbyte(&b, ' ');
+    print(&b, w->in);  putbyte(&b, '/');
+    print(&b, w->out);
+    for (iz i = 0; i < v->kids.len; i++) {
+        ViewKid *k = &v->kids[i];
+        putbyte(&b, ' ');
+        print(&b, k->sid);  putbyte(&b, ':');
+        print(&b, k->usd);  putbyte(&b, ':');
+        print(&b, k->unpriced);
+        print(&b, k->reported ? Str("r") : Str{});
+        print(&b, k->copied ? Str("c") : Str{});
+    }
+    return finish(&b);
+}
+
+static void test_viewcost(Test *t)
+{
+    Arena perm = t->perm;
+
+    // A fork of a fork: the copy runs to the title marking its own
+    // original, past the earlier copy's marker. Then every record with
+    // usage counts, and each subagent's last report.
+    {
+        Str recs[] = {
+            R"({"sid":"s","seq":1,"ts":0,"ev":"session","forked_from":"A","fork_turn":1})",
+            R"({"sid":"s","seq":2,"ts":0,"ev":"turn","n":1})",
+            R"({"sid":"s","seq":3,"ts":0,"ev":"assistant","turn":1,"attempt":1,)"
+            R"("blocks":[{"t":"call","id":"c0","name":"task","args":"{}"}],)"
+            R"("usage":{"in":10,"out":1,"cached":0,"microusd":100}})",
+            R"({"sid":"s","seq":4,"ts":0,"ev":"tool.end","call":"c0","status":"ok","text":"x",)"
+            R"("child":"k0","child_microusd":50,"child_unpriced":0})",
+            R"({"sid":"s","seq":5,"ts":0,"ev":"title","text":"T","by":"auto","copy_of":"Z"})",
+            R"({"sid":"s","seq":6,"ts":0,"ev":"usage","purpose":"title",)"
+            R"("usage":{"in":1,"out":1,"cached":0,"microusd":7}})",
+            R"({"sid":"s","seq":7,"ts":0,"ev":"title","text":"T fork","by":"auto","copy_of":"A"})",
+            R"({"sid":"s","seq":8,"ts":0,"ev":"turn","n":2})",
+            R"({"sid":"s","seq":9,"ts":0,"ev":"retry","turn":2,"attempt":1,)"
+            R"("usage":{"in":100,"out":0,"cached":0,"microusd":30}})",
+            R"({"sid":"s","seq":10,"ts":0,"ev":"assistant","turn":2,"attempt":2,)"
+            R"("blocks":[{"t":"call","id":"c1","name":"task","args":"{}"}],"finish":"interrupted",)"
+            R"("usage":{"in":1000,"out":50,"cached":0,"microusd":1000},"ms":10,"first_ms":5})",
+            R"({"sid":"s","seq":11,"ts":0,"ev":"usage","purpose":"compact",)"
+            R"("usage":{"in":200,"out":20,"cached":0,"microusd":20}})",
+            R"({"sid":"s","seq":12,"ts":0,"ev":"usage","purpose":"chat",)"
+            R"("usage":{"in":5,"out":0,"cached":0}})",
+            R"({"sid":"s","seq":13,"ts":0,"ev":"tool.end","call":"c1","status":"ok","text":"x",)"
+            R"("child":"k1","child_microusd":400,"child_unpriced":1})",
+            R"({"sid":"s","seq":14,"ts":0,"ev":"notice","kind":"task","text":"n","child":"k2",)"
+            R"("child_microusd":200,"child_unpriced":0})",
+            R"({"sid":"s","seq":15,"ts":0,"ev":"notice","kind":"task","text":"n","child":"k2",)"
+            R"("child_microusd":250,"child_unpriced":0})",
+            R"({"sid":"s","seq":16,"ts":0,"ev":"title","text":"Named","by":"model",)"
+            R"("usage":{"in":3,"out":2,"cached":0,"microusd":5}})",
+            R"({"sid":"s","seq":17,"ts":0,"ev":"tool.end","call":"c9","status":"ok","text":"x",)"
+            R"("usage":{"in":4000,"out":30,"cached":0,"microusd":10050}})",
+            // A report from before costs: its subagent, but no spend
+            R"({"sid":"s","seq":18,"ts":0,"ev":"notice","kind":"task","text":"n","child":"k3"})",
+            // A subagent's report to its parent elsewhere is not a request
+            R"({"sid":"s","seq":19,"ts":0,"ev":"task.report","status":"ok","text":"r",)"
+            R"("usage":{"in":9,"out":9,"cached":0,"microusd":9}})",
+        };
+        Arena a = perm;
+        View *v = testview(&a);
+        for (Str r : recs) {
+            apply(v, a, r);
+        }
+        expect(t, "cost fork", costshow(&a, v),
+               "11105/1/5 107/0 5319/104 k0:50:0rc k1:400:1r k2:250:0r k3:0:0");
+        // An interrupted response's output is a guess: no rate from it
+        expect(t, "cost rate", istr(&a, v->work.genout), "0");
+    }
+
+    // A copy from before copy_of: its turns, to fork_turn, are the copy's
+    {
+        Str recs[] = {
+            R"({"sid":"s","seq":1,"ts":0,"ev":"session","forked_from":"A","fork_turn":1})",
+            R"({"sid":"s","seq":2,"ts":0,"ev":"turn","n":1})",
+            R"({"sid":"s","seq":3,"ts":0,"ev":"assistant","turn":1,"attempt":1,"blocks":[],)"
+            R"("usage":{"in":1,"out":1,"cached":0,"microusd":5}})",
+            R"({"sid":"s","seq":4,"ts":0,"ev":"title","text":"T fork","by":"auto"})",
+            R"({"sid":"s","seq":5,"ts":0,"ev":"turn","n":2})",
+            R"({"sid":"s","seq":6,"ts":0,"ev":"assistant","turn":2,"attempt":1,"blocks":[],)"
+            R"("usage":{"in":1,"out":1,"cached":0,"microusd":9}})",
+        };
+        Arena a = perm;
+        View *v = testview(&a);
+        for (Str r : recs) {
+            apply(v, a, r);
+        }
+        expect(t, "cost old fork", costshow(&a, v), "9/0/1 5/0 2/2");
+    }
+
+    // A fork into another folder is all its own; so is a session that
+    // was never copied, whose records before costs are unpriced
+    {
+        Str recs[] = {
+            R"({"sid":"s","seq":1,"ts":0,"ev":"session","forked_from":"A","fork_turn":1,"moved_from":"/w"})",
+            R"({"sid":"s","seq":2,"ts":0,"ev":"assistant","turn":1,"attempt":1,"blocks":[],)"
+            R"("usage":{"in":1,"out":1,"cached":0,"microusd":5}})",
+            R"({"sid":"s","seq":3,"ts":0,"ev":"assistant","turn":1,"attempt":1,"blocks":[],)"
+            R"("usage":{"in":1,"out":1,"cached":0}})",
+        };
+        Arena a = perm;
+        View *v = testview(&a);
+        for (Str r : recs) {
+            apply(v, a, r);
+        }
+        expect(t, "cost moved", costshow(&a, v), "5/1/1 0/0 2/2");
+    }
+}

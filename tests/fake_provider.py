@@ -6985,6 +6985,21 @@ sc_term_run_parked = sc_term_run
 sc_term_marks_run = sc_term_run
 
 
+# Costs (price.cpp): the same conversations, priced
+sc_cost_plain = sc_plain
+sc_cost_unpriced = sc_plain
+sc_cost_free = sc_plain
+sc_cost_task = sc_task_depth
+sc_cost_task_b = sc_task_depth_b
+sc_cost_compaction = sc_compaction
+sc_cost_an_midstream = sc_an_midstream
+sc_cost_title_rename = sc_title_fork
+sc_cost_title_rename_title = sc_title_rename_title
+sc_cost_bg_task = sc_bg_task
+sc_cost_bg_task_b = sc_bg_task_b
+sc_cost_web_anthropic = sc_web_anthropic
+
+
 SCENARIOS = {name[3:]: fn for name, fn in globals().items()
              if name.startswith("sc_")}
 

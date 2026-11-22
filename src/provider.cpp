@@ -470,6 +470,24 @@ struct Usage {
     i64 written;  // prompt tokens written to the cache (Anthropic)
 };
 
+// What a model's tokens cost ([model] price, else price.cpp's table).
+enum : i32 {
+    PRICE_UNSET,  // left to the endpoint's kind and the table
+    PRICE_NONE,   // no price: its requests go unpriced
+    PRICE_SET,
+};
+
+struct Price {
+    i32 how;      // PRICE_*
+    f64 in;       // dollars per million tokens: prompt tokens the cache
+                  // neither read nor wrote
+    f64 out;      // output
+    f64 cached;   // read from the cache
+    f64 written;  // written to the cache
+    i64 above;    // past this many prompt tokens (all of in), every
+    f64 times;    // token costs this many times as much; 0: no limit
+};
+
 static Str blockname(i32 type)
 {
     switch (type) {
@@ -657,6 +675,7 @@ struct ModelConf {
     i64          imgpixels;  // [model] image_pixels, 0 if unset
     b32          nopdf;      // [model] pdf off: read sends no PDFs
     b32          conf;       // from a [model NAME] section of its name
+    Price        price;      // [model] price, PRICE_UNSET if not set
 };
 
 struct ChatReq {
@@ -1019,6 +1038,7 @@ struct Partial {
     b32              indexed;     // so numbered: parts, not think and text
     Str              finish;      // finish_reason, null until one arrives
     Str              id;          // the completion's, null until one arrives
+    Str              model;       // the model that answered, as it says
     Str              refusal;     // why the model declined, if it did
     Usage            usage;
     b32              hasusage;
@@ -1034,6 +1054,16 @@ static Partial *newpartial(Arena *a)
     p->thinkblock = -1;
     p->textblock  = -1;
     return p;
+}
+
+// The model a response says answered it (a JSON string), the first named:
+// what its tokens are priced as (pricefor).
+static void partmodel(Partial *p, Json *model)
+{
+    Str m = jsonstr(model);
+    if (m.len && !p->model.data) {
+        p->model = clone(p->a, m);
+    }
 }
 
 enum : i32 {
@@ -1122,6 +1152,7 @@ static Chunk applychunk(Partial *p, Json *j, Arena *scratch)
     if (id.len && !p->id.data) {
         p->id = clone(p->a, id);
     }
+    partmodel(p, jsonget(j, "model"));
 
     Json *pp = jsonget(j, "prompt_progress");
     if (pp->type == JSON_OBJECT) {

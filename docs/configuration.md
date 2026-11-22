@@ -299,6 +299,36 @@ model llama.cpp has loaded), a smaller `context` caps it, so that a
 model with a 1M window can compact as one with a 256k window would,
 and a larger one changes nothing.
 
+`price` is the model's price, for the cost estimate in a session's
+Info: `INPUT OUTPUT [CACHE_READ [CACHE_WRITE]]`, in US dollars per
+million tokens, in that order. An omitted cache read defaults to a
+tenth of input, and an omitted cache write to a quarter more than input
+(5-minute cache writes, as Anthropic and most others price them).
+`price = 0` is free and `price = none` is unpriced. Unset, a request is
+priced by these rules, the first that applies:
+
+- an endpoint of kind `builtin` is free;
+- kinds `chatgpt` and `copilot` have no price, since a plan pays for
+  them;
+- Anthropic's models have the list prices from
+  platform.claude.com/docs/en/about-claude/pricing (fetched 2026-11-21),
+  found by the model the response names, else by the id sent, on any
+  endpoint: the id is lowercased, cut to what follows its last `/`, and
+  stripped of a Bedrock region and `anthropic.` prefix, an `@` or `:`
+  suffix, a `-vN` version and a `-YYYYMMDD` date, with `.` as `-`, so
+  `us.anthropic.claude-sonnet-4-5-20250929-v1:0`,
+  `claude-opus-4-1@20250805` and `anthropic/claude-opus-4.1` are all
+  found;
+- anything else has no price. A server on this machine is not assumed
+  free, as it may be a proxy to a paid one.
+
+The engine prices each request as it logs it, in whole millionths of
+a dollar (`usage.microusd`), at the price its configuration gives the
+model then; a thin remote's models take the price its relaying
+computer offers. Haiku 5.5's higher price past 100,000 tokens of
+prompt applies per request, and an Anthropic web search adds $0.01 a
+search.
+
 A default `model` that names no endpoint, with no `endpoint` set, goes
 to the first endpoint whose listing has it. When others list it too, a
 new session's note says which it went to; `model = ENDPOINT/MODEL`

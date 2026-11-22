@@ -57,6 +57,7 @@ enum : i32 {
     EV_REVOKE,      // a grant, or a deny, taken back (the Permissions pane)
     EV_DENY,        // a path the user keeps the file tools out of
     EV_EFFORT,      // the session's effort from here on, and its choices
+    EV_USAGE,       // a billed request's usage, which no other record carries
     // Transient: sent, never logged
     EV_DELTA,
     EV_PROGRESS,
@@ -128,6 +129,7 @@ static EvInfo evinfo[] = {
     {"revoke",     1, 1},  // lost, it would leave the access open
     {"deny",       1, 1},  // likewise
     {"effort",     1, 0},
+    {"usage",      1, 0},
     {"delta",      0, 0},
     {"progress",   0, 0},
     {"tool.out",   0, 0},
@@ -2043,6 +2045,9 @@ static LogCopy logcopy(Arena *a, Arena scratch, Slice<Str> lines, Str from,
         EvOut w = evbegin(&b, to, last+1, now, EV_TITLE);
         putstrkey(&w.json, "text", r.title);
         putstrkey(&w.json, "by", "auto");
+        // The copy ends here: the records before it are from, whose
+        // cost its own view counts, not this one's (copyusd)
+        putstrkey(&w.json, "copy_of", from);
         print(&out, evend(&w));
     }
     r.log   = finish(&out);

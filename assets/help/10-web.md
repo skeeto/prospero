@@ -22,8 +22,8 @@ it on.
   web search tool. `model`, as `ENDPOINT/MODEL`, names an endpoint of
   kind `anthropic` and a model there; by default, the first such
   endpoint and `claude-haiku-5-5`. Each search costs that model's
-  tokens and Anthropic's price per search, which the session's cost
-  does not count.
+  tokens and Anthropic's price per search ($0.01), which the session's
+  cost in Info counts.
 
 For example:
 

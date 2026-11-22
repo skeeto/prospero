@@ -709,6 +709,7 @@ static Str istr(Arena *a, i64 v)
 #include "test/provider_test.cpp"
 #include "test/anthropic_test.cpp"
 #include "test/responses_test.cpp"  // after anthropic_test.cpp: anblocks
+#include "test/price_test.cpp"
 #include "test/edit_test.cpp"
 #include "test/tools_test.cpp"
 #include "test/guard_test.cpp"
@@ -815,6 +816,7 @@ int main()
     test_provider(&t);
     test_anthropic(&t);
     test_responses(&t);
+    test_price(&t);
     test_edit(&t);
     test_tools(&t);
     test_guard(&t);
@@ -875,6 +877,7 @@ int main()
     test_viewpanels(&t);
     test_viewcuts(&t);
     test_viewwork(&t);
+    test_viewcost(&t);
     test_viewthinking(&t);
     test_viewwords(&t);
     test_viewtranscript(&t);

@@ -237,7 +237,11 @@ enum : i32 {
     REQ_CHAT,     // what a request is for: a step of the turn
     REQ_COMPACT,  // a summary of older messages
     REQ_TITLE,    // the session's title, after its turn (titling)
+    REQ_SEARCH,   // a web search an Anthropic model makes (Owed only)
 };
+
+static Str reqnames[] = {"chat", "compact", "title", "search"};
+
 
 enum : i32 {
     CW_THRESHOLD, // why a compaction: the prompt reached the threshold
@@ -308,6 +312,30 @@ struct Grant {
 // ended, files rewound, instructions for a directory, skills changed,
 // the mode, a message from another session, the report of a subagent
 // in the background, its permissions changed.
+// What a session's model requests cost at the prices known (price.cpp):
+// its own and its subagents', as a task's or a notice's report carries
+struct Spend {
+    i64 usd;       // microusd, for the requests with a price
+    i64 unpriced;  // requests with no price known
+    b32 has;       // reported at all (a report from before costs: not)
+};
+
+// A background subagent's spend, by its sid: a rewind delivers its
+// notice again, which must not count twice
+struct KidSpend {
+    Str   sid;
+    Spend sp;
+};
+
+// A finished request's usage, priced, for the next record to carry, else
+// a usage record of its own (flushowed)
+struct Owed {
+    b32   has;
+    i32   purpose;   // REQ_*
+    Usage u;
+    i64   microusd;  // -1: no price known
+};
+
 struct Notice {
     Str kind;    // "job", "rewind", "instructions", "skills", "budget",
                  // "mode", "message", "task", "shell", "terminal",
@@ -322,6 +350,7 @@ struct Notice {
     Str host;    // and for "task", its host, if another
     i32 hop;     // and its hop count (see "Messages")
     Slice<Str> urls;  // for "task": its report's URLs the subagent saw
+    Spend spend;      // and what it and its subagents spent
     i64 tid;     // for "terminal": the terminal a Run ran in, its exit
     i32 code;    // (-1 for its tab closed while it ran, 128+N for
     i64 ms;      // signal N), how long it ran, and its text's hash, by
@@ -441,6 +470,7 @@ struct TaskRun {
     Str spent;   // its context and requests (taskspent), once reported
     Str wtline;  // what it left in its worktree, if it had one (wtcheckline)
     Slice<Str> urls;  // the report's URLs the subagent saw (webvouch)
+    Spend spend;      // what it and its subagents spent, once reported
 };
 
 // A session parked while idle (park): what its log does not hold, for
@@ -557,7 +587,9 @@ struct WebRun {
     i32         conts;     // Anthropic: pause_turn continuations
     i32         more;      // Anthropic, or relayed: searches past the first
     b32         retried;
-    WebHits     acc;       // Anthropic: the replies so far
+    WebHits     acc;       // Anthropic: the replies so far, their usage
+                           // too if they failed (websearched)
+    Owed        relayuse;  // relayed: the usage the computer reported
     Str         model;     // Anthropic: the search model, at ep
     Endpoint    ep;
 };
@@ -1012,6 +1044,11 @@ struct Session {
     iz           pdfmemobytes;  // perm pdfmemo took, within PDF_MEMOBYTES
     i32          websearches;  // a tree's root's: the tree's searches
     Slice<Str>   callurls;   // a task call's report's URLs its subagent saw
+    Spend        callspend;  // and what it spent, for its tool.end
+    // Cost (price.cpp)
+    Owed         owed;       // the last request's usage, not yet logged
+    Spend        spent;      // its requests' and its task calls' subagents'
+    Slice<KidSpend> bgspent; // its background subagents' (spendall)
 };
 
 // One endpoint's listing for the models command (cmdmodels).
@@ -1743,6 +1780,126 @@ static void adduser(Session *s, Arena scratch, Str text, Str via,
     webnoteuser(s, scratch, via, text, urls);
 }
 
+// A usage object: the counts, the cost if priced, which the session's
+// total takes, and the prompt's bytes for calibration if known.
+static void putusage(Session *s, JsonOut *w, Usage *u, i64 microusd, i64 bytes)
+{
+    putkey(w, "usage");
+    putobject(w);
+    putintkey(w, "in", u->in);
+    putintkey(w, "out", u->out);
+    putintkey(w, "cached", u->cached);
+    if (u->written) {
+        putintkey(w, "written", u->written);
+    }
+    if (microusd >= 0) {
+        putintkey(w, "microusd", microusd);
+        s->spent.usd += microusd;
+    } else {
+        s->spent.unpriced++;
+    }
+    if (bytes) {
+        // The prompt's bytes as estimates count them: with in, the
+        // calibration a session opened again starts from
+        putintkey(w, "bytes", bytes);
+    }
+    putend(w);
+}
+
+// The owed usage, if any, for the record being written to carry.
+static void takeowed(Session *s, JsonOut *w, i64 bytes)
+{
+    if (s->owed.has) {
+        putusage(s, w, &s->owed.u, s->owed.microusd, bytes);
+        s->owed = {};
+    }
+}
+
+// The owed usage, if no record took it, in a usage record of its own.
+static void flushowed(Session *s, Arena scratch)
+{
+    if (!s->owed.has) {
+        return;
+    }
+    Buf   b(&scratch, 256);
+    EvOut w = sbegin(s, &b, EV_USAGE);
+    putintkey(&w.json, "turn", s->turn);
+    putstrkey(&w.json, "purpose", reqnames[s->owed.purpose]);
+    takeowed(s, &w.json, 0);
+    ssend(s, &w);
+}
+
+// A subagent's spend, on the record that reports it.
+static void putspend(JsonOut *w, Spend *sp)
+{
+    if (sp->has) {
+        putintkey(w, "child_microusd", sp->usd);
+        putintkey(w, "child_unpriced", sp->unpriced);
+    }
+}
+
+static Spend getspend(Json *j)
+{
+    Spend r    = {};
+    Json *usd  = jsonget(j, "child_microusd");
+    r.has      = usd->type == JSON_NUMBER;
+    r.usd      = jsonint(usd, 0);
+    r.unpriced = jsonint(jsonget(j, "child_unpriced"), 0);
+    return r;
+}
+
+// A background subagent's spend, its latest report replacing any before.
+static void bgspend(Session *s, Str sid, Spend sp)
+{
+    if (!sp.has) {
+        return;
+    }
+    for (iz i = 0; i < s->bgspent.len; i++) {
+        if (s->bgspent[i].sid == sid) {
+            s->bgspent[i].sp = sp;
+            return;
+        }
+    }
+    KidSpend k = {clone(&s->perm, sid), sp};
+    s->bgspent = push(&s->perm, s->bgspent, k);
+}
+
+// All the session spent, its subagents included, as it reports it.
+static Spend spendall(Session *s)
+{
+    Spend r = s->spent;
+    r.has = 1;
+    for (iz i = 0; i < s->bgspent.len; i++) {
+        r.usd      += s->bgspent[i].sp.usd;
+        r.unpriced += s->bgspent[i].sp.unpriced;
+    }
+    return r;
+}
+
+// The session's spend as its log tells it: every record with usage, and
+// its subagents' reports. A rewound request or task was spent all the
+// same; a background subagent's report counts once (bgspend).
+static void replayspend(Session *s, i32 ev, Json *j, b32 gone)
+{
+    (void)gone;
+    Json *u = jsonget(j, "usage");
+    if (u->type == JSON_OBJECT) {
+        Json *usd = jsonget(u, "microusd");
+        if (usd->type == JSON_NUMBER) {
+            s->spent.usd += jsonint(usd, 0);
+        } else {
+            s->spent.unpriced++;
+        }
+    }
+    if (ev == EV_TOOLEND) {
+        Spend sp = getspend(j);
+        s->spent.usd      += sp.usd;
+        s->spent.unpriced += sp.unpriced;
+    } else if (ev==EV_NOTICE && jsonstr(jsonget(j, "kind"))=="task") {
+        bgspend(s, jsonstr(jsonget(j, "child")), getspend(j));
+    }
+}
+
 // Log an assistant record. The blocks are in perm.
 static void logassistant(Session *s, Arena scratch, Slice<Block> blocks,
                          Str finishr, Usage *u)
@@ -1773,22 +1930,7 @@ static void logassistant(Session *s, Arena scratch, Slice<Block> blocks,
     }
     putend(&w.json);
     putstrkey(&w.json, "finish", finishr);
-    if (u) {
-        putkey(&w.json, "usage");
-        putobject(&w.json);
-        putintkey(&w.json, "in", u->in);
-        putintkey(&w.json, "out", u->out);
-        putintkey(&w.json, "cached", u->cached);
-        if (u->written) {
-            putintkey(&w.json, "written", u->written);
-        }
-        if (s->sentbytes) {
-            // The prompt's bytes as estimates count them: with in, the
-            // calibration a session opened again starts from
-            putintkey(&w.json, "bytes", s->sentbytes);
-        }
-        putend(&w.json);
-    }
+    takeowed(s, &w.json, u ? s->sentbytes : 0);
     putintkey(&w.json, "ms", (os_ticks(s->e->os) - s->sent)/MS);
     if (s->firstout > s->sent) {
         // Its first token: before it, the prompt was read
@@ -2004,6 +2146,10 @@ static void deliver(Session *s, Arena scratch)
             putskills(&w.json, s->skillseen, 0);
         }
         puturls(&w.json, n->urls);
+        if (n->kind == "task") {
+            putspend(&w.json, &n->spend);
+            bgspend(s, n->from, n->spend);
+        }
         ssend(s, &w);
 
         Msg m = {};
@@ -2280,6 +2426,31 @@ static ModelConf *reqmc(Session *s)
 {
     return s->purpose==REQ_COMPACT ? &s->cp.mc :
            s->purpose==REQ_TITLE   ? &s->tt.mc : &s->mc;
+}
+
+// Price the current request's usage, if it reported any, at its own
+// endpoint and model (before a fallback switches them), owed to the next
+// record. The response's model names the price before the id sent: a
+// proxy's alias, or a model the server fell back to.
+static void attemptcost(Session *s, Arena scratch, Partial *p)
+{
+    if (!p || !p->hasusage) {
+        return;
+    }
+    flushowed(s, scratch);  // never lost to a second one
+    Endpoint  *ep = reqep(s);
+    ModelConf *mc = reqmc(s);
+    Usage      u  = p->usage;
+    if (ep->wire==EP_ANTHROPIC && !p->finish.data && u.out<s->tokens) {
+        // Cut off before message_delta counted the output: at least a
+        // token for each chunk that streamed
+        u.out = s->tokens;
+    }
+    Price pr = pricefor(scratch, &mc->price, ep->kind, p->model, mc->name);
+    s->owed.has      = 1;
+    s->owed.purpose  = s->purpose;
+    s->owed.u        = u;
+    s->owed.microusd = costof(&pr, &u, 0);
 }
 
 static i32 confint(Config *cfg, Str kind, Str name, Str key)
@@ -2638,6 +2809,7 @@ static b32 startreq(Session *s, Arena scratch, Endpoint *ep, Str method,
 static void endturn(Session *, Arena, Str why, Str err);
 static void prepare(Session *, Arena);
 static void finalize(Session *, Arena);
+static void finalstep(Session *, Arena);
 static void nexttool(Session *, Arena);
 static void sendcompact(Session *, Arena);
 static void compact(Session *, Arena, i64 enough, i64 goal, i32 why);
@@ -3113,6 +3285,7 @@ static void retryevent(Session *s, Arena scratch, i32 kind, i32 cls,
     if (s->purpose == REQ_COMPACT) {
         putintkey(&w.json, "compact", 1);
     }
+    takeowed(s, &w.json, 0);  // the failed attempt's, if billed
     ssend(s, &w);
 }
 
@@ -3365,7 +3538,7 @@ static b32 refuseimage(Session *, Str);
 // slow retries follow (above). retryms is the server's wish, -1 if none.
 static void titleend(Session *, Arena);
 
-static void fail(Session *s, Arena scratch, i32 cls, i32 status, Str msg, i64 retryms)
+static void failstep(Session *s, Arena scratch, i32 cls, i32 status, Str msg, i64 retryms)
 {
     if (s->purpose == REQ_TITLE) {
         titleend(s, scratch);  // no retries: the prompt's title stays
@@ -3545,6 +3718,17 @@ static void fail(Session *s, Arena scratch, i32 cls, i32 status, Str msg, i64 re
     print(&b, msg);
     Str err = finish(&b);
     endturn(s, scratch, "error", err);
+}
+
+// A failed request, its usage, if any, priced (titles price their own),
+// carried by the record that follows if one does, else logged alone.
+static void fail(Session *s, Arena scratch, i32 cls, i32 status, Str msg, i64 retryms)
+{
+    if (s->purpose != REQ_TITLE) {
+        attemptcost(s, scratch, s->part);
+    }
+    failstep(s, scratch, cls, status, msg, retryms);
+    flushowed(s, scratch);
 }
 
 static void emitdelta(Session *s, Arena scratch, Delta *d)
@@ -4082,6 +4266,12 @@ static void toolend(Session *s, Arena scratch, Str status, Str text,
         putintkey(&w.json, "hop", s->msghop);
     }
     puturls(&w.json, s->callurls);  // a task's report's (webvouch)
+    putspend(&w.json, &s->callspend);
+    if (s->owed.purpose == REQ_SEARCH) {
+        takeowed(s, &w.json, 0);  // an Anthropic search's (webend)
+    }
+    s->spent.usd      += s->callspend.usd;
+    s->spent.unpriced += s->callspend.unpriced;
 
     Msg m = {};
     m.role   = ROLE_TOOL;
@@ -4114,6 +4304,7 @@ static void toolend(Session *s, Arena scratch, Str status, Str text,
     s->msgtitle  = {};
     s->msghow    = {};
     s->callurls  = {};
+    s->callspend = {};
     b32 done = status=="ok" || status=="background";
     s->progressed |= done;
     if (done && toolmutates(toolfind(c->name))) {
@@ -9580,17 +9771,47 @@ static void webcallend(Session *s, Arena scratch, Str status, Str text,
 }
 
 static void relaysearched(Engine *, Arena, RelayServe *, Str status, Str text,
-                          i32 searches);
+                          i32 searches, Usage *u = 0, i64 microusd = -1);
 
 // A search ended: its result, with text in scratch, to the session or
 // the thin engine whose call it served.
+// What an Anthropic search's replies cost: the search model's tokens at
+// its price, and the searches themselves. -1 for no price.
+static i64 webcost(Engine *e, WebRun *w, Arena scratch, Usage *u)
+{
+    WebHits *h = &w->acc;
+    u->in      = h->tin;
+    u->out     = h->tout;
+    u->cached  = h->tcached;
+    u->written = h->twritten;
+    ModelConf mc = {};
+    modelconf(e, &scratch, w->ep.name, w->model, &mc);
+    Price pr = pricefor(scratch, &mc.price, w->ep.kind, {}, w->model);
+    return costof(&pr, u, h->searches);
+}
+
 static void webend(Engine *e, WebRun *w, Arena scratch, Str status, Str text)
 {
+    Usage u   = {};
+    i64   usd = -1;
+    b32   has = w->service==WEBS_ANTHROPIC && w->acc.billed;
+    if (has) {
+        usd = webcost(e, w, scratch, &u);
+    }
     if (w->s) {
-        treeroot(w->s)->websearches += w->more;  // one counted at the start
-        webcallend(w->s, scratch, status, text);
+        Session *s = w->s;
+        treeroot(s)->websearches += w->more;  // one counted at the start
+        if (has) {
+            flushowed(s, scratch);
+            s->owed = {1, REQ_SEARCH, u, usd};  // for the tool.end
+        } else if (w->relayuse.has) {
+            flushowed(s, scratch);
+            s->owed = w->relayuse;  // as the computer searching priced it
+        }
+        webcallend(s, scratch, status, text);
     } else {
-        relaysearched(e, scratch, w->v, status, text, 1 + w->more);
+        relaysearched(e, scratch, w->v, status, text, 1 + w->more,
+                      has ? &u : 0, usd);
     }
 }
 
@@ -9929,7 +10150,7 @@ static void webtimeout(Session *s, Arena scratch)
     print(&b, w->tool==TOOL_WEBFETCH ? Str("the site")
                                      : webservices[w->service]);
     print(&b, " did not answer in time.");
-    webcallend(s, scratch, "timeout", finish(&b));
+    webend(s->e, w, scratch, "timeout", finish(&b));  // its usage, if any
 }
 
 // Why a request failed, for the agent: never its URL, which may hold a
@@ -10287,6 +10508,18 @@ static void websearched(Engine *e, WebRun *w, Arena scratch)
             text   = "Not done: the connected computer's search result was unsound.";
         }
         w->more = n>1 && n<=100 ? (i32)n-1 : 0;
+        Json *u = jsonget(d.root, "usage");
+        if (u->type == JSON_OBJECT) {
+            // Priced there, where its model is configured
+            Json *usd = jsonget(u, "microusd");
+            w->relayuse.has      = 1;
+            w->relayuse.purpose  = REQ_SEARCH;
+            w->relayuse.u.in      = jsonint(jsonget(u, "in"), 0);
+            w->relayuse.u.out     = jsonint(jsonget(u, "out"), 0);
+            w->relayuse.u.cached  = jsonint(jsonget(u, "cached"), 0);
+            w->relayuse.u.written = jsonint(jsonget(u, "written"), 0);
+            w->relayuse.microusd = usd->type==JSON_NUMBER ? jsonint(usd, 0) : -1;
+        }
         webend(e, w, scratch, status, text);
         return;
     }
@@ -10296,6 +10529,14 @@ static void websearched(Engine *e, WebRun *w, Arena scratch)
     case WEBS_EXA:      h = webexa(&scratch, body, max);       break;
     case WEBS_KEENABLE: h = webkeenable(&scratch, body, max);  break;
     default:            h = webanthropic(&scratch, body, max); break;
+    }
+    if (h.err.len && w->service==WEBS_ANTHROPIC) {
+        // Refused, but billed: its usage still counts (webend)
+        WebHits use = {};
+        use.tin = h.tin; use.tout = h.tout; use.tcached = h.tcached;
+        use.twritten = h.twritten; use.billed = h.billed;
+        use.searches = h.searches;
+        webmerge(&w->arena, &w->acc, use, max);
     }
     if (!h.err.len && w->service==WEBS_ANTHROPIC) {
         webmerge(&w->arena, &w->acc, webhitsclone(&w->arena, h), max);
@@ -15992,6 +16233,7 @@ static void compacted(Session *s, Arena scratch, Partial *p)
     Buf   b(&scratch, 512 + summary.len*2);
     EvOut w = sbegin(s, &b, EV_COMPACT);
     compactevent(s, &w, "summary", cp.why, cp.before);
+    takeowed(s, &w.json, 0);  // the summary request's
     putintkey(&w.json, "cutseq", cutseq);
     putstrkey(&w.json, "summary", summary);
     putstrkey(&w.json, "endpoint", cp.ep.url);
@@ -16084,7 +16326,7 @@ static i64 stephard(Session *s)
 
 static Str  cleantitle(Arena *, Str, iz);
 static i64  parkafter(Engine *);
-static void settitle(Session *, Arena, Str, Str, Usage *);
+static void settitle(Session *, Arena, Str, Str);
 static void cool(Session *);
 static b32  endpointconf(Engine *, Arena *, Str, Endpoint *);
 
@@ -16113,9 +16355,12 @@ static Str const titlesystem =
 // was. The prompt's title stays.
 static void titleend(Session *s, Arena scratch)
 {
-    (void)scratch;
     if (!s->titling) {
         return;
+    }
+    if (s->purpose==REQ_TITLE && s->part) {
+        attemptcost(s, scratch, s->part);  // killed, but billed so far
+        flushowed(s, scratch);
     }
     stopreq(s);
     release(s, 0);
@@ -16333,18 +16578,29 @@ static void titled(Session *s, Arena scratch, Partial *p)
 {
     Str   text = p->finish=="refusal" || p->calls.len ? Str{}
                : titletext(&scratch, finish(&p->text));
-    Usage u    = p->usage;
-    b32   has  = p->hasusage;
+    attemptcost(s, scratch, p);  // before titleend forgets the titler
     titleend(s, scratch);
     if (text.len && !s->usertitle) {
-        settitle(s, scratch, text, "model", has ? &u : 0);
+        settitle(s, scratch, text, "model");
     }
+    flushowed(s, scratch);  // no title applied: a record of its own
     if (!busy(s)) {
         arm(s, T_PARK, parkafter(s->e));
     }
 }
 
+// A finished response, its usage priced (titles price their own) for
+// the record it makes, else logged alone.
 static void finalize(Session *s, Arena scratch)
+{
+    if (s->purpose != REQ_TITLE) {
+        attemptcost(s, scratch, s->part);
+    }
+    finalstep(s, scratch);
+    flushowed(s, scratch);
+}
+
+static void finalstep(Session *s, Arena scratch)
 {
     Partial *p = s->part;
     stopreq(s);
@@ -16565,7 +16821,7 @@ static Str sidecarget(Engine *, Arena *, Str sid, Str name, iz max);
 // Title the session, by "auto" (its first prompt, or a subagent's task),
 // by "model" (titling, with what its request used) or by "user"
 // (rename), which no other title replaces.
-static void settitle(Session *s, Arena scratch, Str title, Str by, Usage *u)
+static void settitle(Session *s, Arena scratch, Str title, Str by)
 {
     if (!title.len) {
         return;
@@ -16577,16 +16833,8 @@ static void settitle(Session *s, Arena scratch, Str title, Str by, Usage *u)
     EvOut w = sbegin(s, &b, EV_TITLE);
     putstrkey(&w.json, "text", title);
     putstrkey(&w.json, "by", by);
-    if (u) {
-        putkey(&w.json, "usage");
-        putobject(&w.json);
-        putintkey(&w.json, "in", u->in);
-        putintkey(&w.json, "out", u->out);
-        putintkey(&w.json, "cached", u->cached);
-        if (u->written) {
-            putintkey(&w.json, "written", u->written);
-        }
-        putend(&w.json);
+    if (by == "model") {
+        takeowed(s, &w.json, 0);  // the title request's (titled)
     }
     ssend(s, &w);
     sidecarput(s->e, scratch, s->sid, "title", s->title);
@@ -16661,7 +16909,7 @@ static void startturn(Session *s, Arena scratch, Str text, Str via,
     adduser(s, scratch, text, via, images, files, refs);
     if (!s->title.len) {
         Str title = cleantitle(&scratch, text, TITLE_MAX);
-        settitle(s, scratch, title, "auto", 0);
+        settitle(s, scratch, title, "auto");
     }
     beginturn(s, scratch, {});
 }
@@ -16689,6 +16937,7 @@ static void endturn(Session *s, Arena scratch, Str why, Str err)
     if (why=="cancel" && s->paused) {
         why = "paused";  // a quit's: the pause outlives it (cancelturn)
     }
+    flushowed(s, scratch);  // a request's usage no record took
     release(s, 0);
     stopreq(s);
     deskstop(s);
@@ -16807,7 +17056,8 @@ static void cancelturn(Session *s, Arena scratch)
     switch (s->state) {
     case S_TOOL:
         if (s->web) {
-            webcallend(s, scratch, "cancelled", "Stopped: the user cancelled the turn.");
+            webend(s->e, s->web, scratch, "cancelled",  // its usage, if any
+                   "Stopped: the user cancelled the turn.");
             return;
         } else if (s->skillcall) {
             skillfetchfree(s->e, s->skillcall);
@@ -16844,6 +17094,7 @@ static void cancelturn(Session *s, Arena scratch)
     case S_HEAD:
     case S_STREAM:
     case S_ERRBODY:
+        attemptcost(s, scratch, s->part);  // billed so far (endturn logs)
         if (s->purpose==REQ_CHAT && s->part && committed(s->part)) {
             s->part->calls = {};
             Slice<Str> used = usedids(s, &scratch);
@@ -16928,6 +17179,7 @@ static void pausenow(Session *s, Arena scratch)
     if (!req || s->purpose!=REQ_CHAT || s->titling) {
         return;
     }
+    attemptcost(s, scratch, s->part);  // billed so far
     if (st == S_DISCOVER) {
         s->discovered = 0;  // looked at again as it continues
     } else if (s->part && committed(s->part)) {
@@ -16939,6 +17191,7 @@ static void pausenow(Session *s, Arena scratch)
             addassistant(s, scratch, f.blocks, "paused", 0);
         }
     }
+    flushowed(s, scratch);
     stopreq(s);
     release(s, 0);
     cool(s);
@@ -17140,6 +17393,7 @@ static void modelconf(Engine *e, Arena *perm, Str which, Str bare, ModelConf *mc
     Int ctx = parseint(trim(cfgget(cfg, "model", model, "context", 0)));
     mc->ctx    = ctx.ok && ctx.val>0 ? ctx.val : 0;
     mc->cfgctx = mc->ctx;
+    priceparse(cfgget(cfg, "model", model, "price", 0), &mc->price);
     Int rb  = parseint(trim(cfgget(cfg, "model", model, "reasoning_budget", 0)));
     mc->thinkmax = rb.ok && rb.val>0 ? rb.val : 0;
     mc->edit     = editformat(cfgget(cfg, "model", model, "edit_format", 0));
@@ -18842,7 +19096,7 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err,
     // Complete before scratch is passed on, which copies it
     Str title = cleantitle(&scratch, args->desc.len ? args->desc : args->prompt,
                            TITLE_MAX);
-    settitle(s, scratch, title, "auto", 0);
+    settitle(s, scratch, title, "auto");
     return s;
 }
 
@@ -19217,6 +19471,8 @@ static void logtaskreport(Session *c, Arena scratch, Str why, Str err)
     putstrkey(&w.json, "status", status);
     putstrkey(&w.json, "text", text);
     putstrkey(&w.json, "spent", spent);
+    Spend sp = spendall(c);
+    putspend(&w.json, &sp);
     ssend(c, &w);
 }
 
@@ -19285,6 +19541,7 @@ static void taskreport(Session *c, Arena scratch, Str why, Str err, Str wtline =
     text = reportcut(p, &scratch, p->calls[t->call].id, text, &t->spill, &t->bytes);
     t->text = clone(&p->perm, text);
     t->spent = clone(&p->perm, taskspent(&scratch, c));
+    t->spend = spendall(c);
     t->wtline = wtline.len ? clone(&p->perm, wtline) : Str{};
     t->urls = webvouch(c, &p->perm, scratch, text);  // for the parent's webseen
     t->took = os_ticks(p->e->os) - t->start;
@@ -19335,6 +19592,7 @@ static void taskflush(Session *s, Arena scratch)
         }
         s->callstart = t->start;
         s->callurls  = t->urls;
+        s->callspend = t->spend;
         toolend(s, a, t->status, text, 0, 0, t->spill, t->bytes, 0, t->child,
                 t->host);
     }
@@ -19427,8 +19685,8 @@ static Session *bgparent(Engine *e, Arena scratch, Str psid)
 // on host, if another, for call), status and text as reporttext's, as
 // a notice of kind task, which starts its turn if it is idle.
 static void bgnotice(Session *p, Arena scratch, Str call, Str sid, Str title,
-                     Str host, Str status, Str text, Slice<Str> urls = {},
-                     Str tail = {})
+                     Str host, Str status, Str text, Spend spend,
+                     Slice<Str> urls = {}, Str tail = {})
 {
     Str spill = {};
     i64 bytes = 0;
@@ -19462,6 +19720,7 @@ static void bgnotice(Session *p, Arena scratch, Str call, Str sid, Str title,
     n.ftitle = clone(&p->perm, title);
     n.host   = clone(&p->perm, host);
     n.urls   = urls;
+    n.spend  = spend;
     n.queued = p->log.seq;
     p->notices = push(&p->perm, p->notices, n);
     if (!busy(p)) {
@@ -19490,7 +19749,7 @@ static void bgreport(Session *c, Arena scratch, Str why, Str err, Str wtline)
     Str tail   = spentline(&scratch, ms, taskspent(&scratch, c));
     tail = wtline.len ? concat(&scratch, concat(&scratch, wtline, "\n\n"), tail) : tail;
     bgnotice(p, scratch, c->pcall, c->sid, c->title, {}, status, text,
-             webvouch(c, &p->perm, scratch, text), tail);
+             spendall(c), webvouch(c, &p->perm, scratch, text), tail);
 }
 
 // Whether a subagent's report waits that may start a turn.
@@ -20848,7 +21107,7 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
     if (task.ok) {
         Str title = task.title.len ? task.title : task.prompt;
         title = cleantitle(&scratch, title, TITLE_MAX);
-        settitle(s, scratch, title, "auto", 0);
+        settitle(s, scratch, title, "auto");
     }
     reply(e, scratch, id, 1, {}, s->sid);
 
@@ -21097,6 +21356,7 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
         Json *j = r.root;
         Msg   m = {};
         b32   gone = incut(&cuts, r.seq);  // rewound out of the conversation
+        replayspend(s, r.ev, j, gone);  // rewound, it was still spent
         if (gone && cutdrops(r.ev, j)) {
             // A job's end told in a notice there needs no telling again
             Job *jb = r.ev==EV_NOTICE ? jobfind(s, jsonint(jsonget(j, "job"), 0)) : 0;
@@ -21997,6 +22257,7 @@ static Slice<Notice> cutnotices(Arena *a, Arena scratch, Slice<Str> lines,
             n.from   = clone(a, jsonstr(jsonget(j, "child")));
             n.ftitle = clone(a, jsonstr(jsonget(j, "child_title")));
             n.host   = clone(a, jsonstr(jsonget(j, "host")));
+            n.spend  = getspend(j);
         } else if (kind == "terminal") {
             n.tid  = jsonint(jsonget(j, "tid"), 0);
             n.code = (i32)jsonint(jsonget(j, "code"), 0);
@@ -22974,7 +23235,7 @@ static void cmdrename(Engine *e, Arena scratch, i64 id, Json *j)
     Str      err       = !s          ? Str("no such session") :
                          s->readonly ? Str("open in another process") : Str{};
     if (!err.len) {
-        settitle(s, scratch, title, "user", 0);
+        settitle(s, scratch, title, "user");
     }
     if (transient) {
         forget(e, s);

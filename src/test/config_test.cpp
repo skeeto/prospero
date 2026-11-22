@@ -85,6 +85,14 @@ static void testcfgschema(Test *t)
         {"model", "effort_map", "huge:max", CFG_BAD, 0},
         {"model", "effort_map", "high", CFG_BAD, 0},
         {"model", "effort_map", "high:", CFG_BAD, 0},
+        {"model", "price", "3 15", CFG_OK, 0},
+        {"model", "price", "3 15 0.3 3.75", CFG_OK, 0},
+        {"model", "price", "0", CFG_OK, 0},
+        {"model", "price", "none", CFG_OK, 0},
+        {"model", "price", "3", CFG_BAD, 0},
+        {"model", "price", "3 15 0.3 3.75 1", CFG_BAD, 0},
+        {"model", "price", "-3 15", CFG_BAD, 0},
+        {"model", "price", "free", CFG_BAD, 0},
         {"endpoint", "idle_timeout", " 30 ", CFG_OK, 0},
         {"endpoint", "idle_timeout", "30s", CFG_OK, 0},
         {"endpoint", "idle_timeout", "1h30m", CFG_OK, 0},
@@ -1110,6 +1118,7 @@ static void testcfgjson(Test *t)
         "model/m/id=m*\n"
         "model/m/reasoning=reasoning_content*\n"
         "model/m/context=*\n"
+        "model/m/price=*\n"
         "model/m/compactor=*\n"
         "model/m/titler=*\n"
         "model/m/fallback=*\n"

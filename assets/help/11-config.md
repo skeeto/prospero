@@ -119,7 +119,8 @@ conversation as it stands: a server with a prompt cache already holds
 nearly all of it, so the request costs little more than the title it
 writes. It runs only while the session is idle, and a prompt sent
 meanwhile goes at once, the title asked for again after that turn.
-Its tokens count in the session's usage.
+Its tokens count in the session's usage, and in its cost, whether or
+not its title is used.
 
 A model of its own, small and fast, may title sessions instead, from
 the first prompt and the reply, with `titler` in the model's section,
@@ -226,6 +227,21 @@ and are asked to test their work, which a small model needs.
   engine whose environment you cannot set, such as one on a remote
   host or in WSL, where the host's own configuration names a file
   there. Keep it private (`chmod 600`).
+- **`[model] price`**: the model's price for the cost in Info, in
+  dollars per million tokens, as `INPUT OUTPUT [CACHE_READ
+  [CACHE_WRITE]]`: an omitted cache read costs a tenth of input, and
+  an omitted cache write a quarter more than input. `price = 0` is
+  free, and `price = none` leaves the model unpriced. Without it,
+  Anthropic's models have Anthropic's list prices (as of November
+  2026), by the id the response names, else the one sent, whichever
+  endpoint serves them, so a proxy's alias for a Claude model is
+  priced as that model; others have no price. A ChatGPT or Copilot
+  sign-in has none, as a plan pays for it, and the built-in model is
+  free:
+
+      [model large]
+      price = 0.6 2.4
+
 - **[`[tools] path_prepend`](settings:tools#path_prepend) and
   [`path_append`](settings:tools#path_append)**: directories, separated
   by `;`, added before and after PATH, for the agent's commands, its

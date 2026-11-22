@@ -2960,7 +2960,7 @@ static void inforow(char const *key, Str value)
     text(value.len ? value : Str("(none)"));
 }
 
-static b32  workrows(Arena, View *);
+static b32  workrows(Gui *, Arena, GuiSession *, View *);
 
 // The session's details: what it is, where it works, which model and
 // role, and the instruction files the agent was given.
@@ -2997,7 +2997,7 @@ static void drawinfo(Gui *g, Arena scratch, GuiSession *s, View *v)
         if (s->host->kind != GH_ENGINE) {
             inforow("Host", hostlabel(g, &a, s->host));
         }
-        g->infowork = workrows(a, v);
+        g->infowork = workrows(g, a, s, v);
         ImGui::EndTable();
     }
     ImGui::Separator();
@@ -3151,7 +3151,123 @@ static void printwork(Buf *b, i64 ms)
 
 // The info pane's rows of it: the time, the tokens and the rate.
 // Returns whether there were any.
-static b32 workrows(Arena a, View *v)
+// Dollars from microusd, to the cent: under a cent says so.
+static void printusd(Buf *b, i64 microusd)
+{
+    if (microusd>0 && microusd<5000) {
+        print(b, "under $0.01");
+        return;
+    }
+    i64 cents = (microusd + 5000) / 10000;
+    print(b, "$");
+    printgrouped(b, cents/100);
+    putbyte(b, '.');
+    putbyte(b, (u8)('0' + cents%100/10));
+    putbyte(b, (u8)('0' + cents%10));
+}
+
+// What a session spent at the prices known, its subagents' too: for
+// each, the more of what its report said and what its own view says now,
+// for one at work or one that spent after it reported (send_message).
+struct GuiSpend {
+    i64 own;       // microusd, the session's requests
+    i64 kids;      // and its subagents', all the way down
+    i64 copied;    // the history a fork, side chat or import copied
+    i64 unpriced;  // requests with no price known
+    b32 priced;    // any request had a price
+};
+
+static GuiSpend viewcost(Gui *g, Arena scratch, GuiSession *gs, View *v, i32 depth = 0)
+{
+    GuiSpend r = {};
+    r.own      = v->work.usd;
+    r.copied   = v->work.copyusd;
+    r.unpriced = v->work.unpriced;
+    r.priced   = v->work.priced > 0;
+    if (depth > 16) {
+        return r;  // a loop, never a real tree (treeroot's bound)
+    }
+    for (iz i = 0; i < v->kids.len; i++) {
+        ViewKid *k = &v->kids[i];
+        if (k->copied) {
+            r.copied += k->usd;  // the original's subagents
+            continue;
+        }
+        i64 usd = k->usd;
+        i64 unp = k->unpriced;
+        r.priced |= k->reported && k->usd>0;
+        ViewTool t = {};
+        t.child = k->sid;
+        t.host  = k->host;
+        t.call  = k->call;
+        GuiSession *c = taskchild(g, scratch, gs, &t);
+        if (c && c!=gs && c->view) {
+            GuiSpend l = viewcost(g, scratch, c, c->view, depth+1);
+            usd = l.own+l.kids>usd ? l.own+l.kids : usd;
+            unp = l.unpriced>unp ? l.unpriced : unp;
+            r.priced |= l.priced;
+        }
+        r.kids     += usd;
+        r.unpriced += unp;
+    }
+    for (iz i = 0; i < v->msgs.len; i++) {
+        // Subagents at work, which have not reported
+        ViewTool *t = v->msgs[i].tool;
+        if (!t || t->ended || t->name!="task") {
+            continue;
+        }
+        GuiSession *c = taskchild(g, scratch, gs, t);
+        b32 known = 0;
+        for (iz k = 0; c && k<v->kids.len; k++) {
+            known |= v->kids[k].sid == c->sid;
+        }
+        if (c && c!=gs && c->view && !known) {
+            GuiSpend l = viewcost(g, scratch, c, c->view, depth+1);
+            r.kids     += l.own + l.kids;
+            r.unpriced += l.unpriced;
+            r.priced   |= l.priced;
+        }
+    }
+    return r;
+}
+
+// The Cost row's text: the total at list prices, and its parts.
+static Str costtext(Arena *a, View *v, GuiSpend *c)
+{
+    Buf b(a, 256);
+    if (!c->priced && !c->copied) {
+        print(&b, "no price known");
+        if (c->unpriced) {
+            print(&b, " (");
+            printgrouped(&b, c->unpriced);
+            print(&b, c->unpriced==1 ? Str(" request)") : Str(" requests)"));
+        }
+        return finish(&b);
+    }
+    printusd(&b, c->own + c->kids);
+    print(&b, " at list prices");
+    if (c->kids) {
+        print(&b, ": this session ");
+        printusd(&b, c->own);
+        print(&b, ", subagents ");
+        printusd(&b, c->kids);
+    }
+    if (c->copied) {
+        print(&b, "; ");
+        printusd(&b, c->copied);
+        print(&b, v->sideof.len       ? Str(" before the side chat") :
+                  v->importedfrom.len ? Str(" before the import")    :
+                                        Str(" before the fork"));
+    }
+    if (c->unpriced) {
+        print(&b, "; ");
+        printgrouped(&b, c->unpriced);
+        print(&b, c->unpriced==1 ? Str(" request unpriced") : Str(" requests unpriced"));
+    }
+    return finish(&b);
+}
+
+static b32 workrows(Gui *g, Arena a, GuiSession *s, View *v)
 {
     ViewWork *w = &v->work;
     if (!w->requests && worktotal(v)<1000) {
@@ -3204,6 +3320,9 @@ static b32 workrows(Arena a, View *v)
         print(&r, " tok/s, from the first token on");
         inforow("Output", finish(&r));
     }
+
+    GuiSpend c = viewcost(g, a, s, v);
+    inforow("Cost", costtext(&a, v, &c));
     return 1;
 }
 
@@ -10362,6 +10481,14 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other, 
         if (v && worktotal(v)>=1000) {
             print(&tip, "\nWorked ");
             printwork(&tip, worktotal(v));
+        }
+        if (v) {
+            GuiSpend c = viewcost(g, a, s, v);
+            if (c.priced) {
+                print(&tip, "\nCost ");
+                printusd(&tip, c.own + c.kids);
+                print(&tip, " at list prices");
+            }
         }
         if (v && gaugescaled(v)) {
             putbyte(&tip, '\n');

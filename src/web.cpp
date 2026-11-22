@@ -45,6 +45,11 @@ struct WebHits {
     Str  note;      // e.g. SearXNG's unresponsive engines, or null
     Str  err;       // why the reply is unusable, or null
     i32  searches;  // Anthropic: usage.server_tool_use.web_search_requests; else 0
+    i64  tin;       // Anthropic: the search model's tokens, as Usage counts
+    i64  tout;      // them (provider.cpp): tin, the whole prompt, includes
+    i64  tcached;   // tcached and twritten
+    i64  twritten;
+    b32  billed;    // Anthropic: the reply had a usage object
     b32  searched;  // Anthropic: any web_search_tool_result block
     b32  pause;     // Anthropic: stop_reason "pause_turn"
 };
@@ -1854,6 +1859,15 @@ static WebHits webanthropic(Arena *perm, Str body, i32 max)
     Json *use = jsonget(jsonget(root, "usage"), "server_tool_use");
     i64   n   = jsonint(jsonget(use, "web_search_requests"), 0);
     r.searches = n<0 ? 0 : n>0x7fffffff ? 0x7fffffff : (i32)n;
+    Json *u = jsonget(root, "usage");
+    if (u->type == JSON_OBJECT) {
+        i64 in     = jsonint(jsonget(u, "input_tokens"), 0);
+        r.twritten = jsonint(jsonget(u, "cache_creation_input_tokens"), 0);
+        r.tcached  = jsonint(jsonget(u, "cache_read_input_tokens"), 0);
+        r.tout     = jsonint(jsonget(u, "output_tokens"), 0);
+        r.tin      = in + r.twritten + r.tcached;
+        r.billed   = 1;
+    }
     return r;
 }
 
@@ -1881,6 +1895,11 @@ static void webmerge(Arena *perm, WebHits *acc, WebHits more, i32 max)
     acc->note      = acc->note.data ? acc->note : more.note;
     acc->err       = acc->err.data  ? acc->err  : more.err;
     acc->searches += more.searches;
+    acc->tin      += more.tin;
+    acc->tout     += more.tout;
+    acc->tcached  += more.tcached;
+    acc->twritten += more.twritten;
+    acc->billed   |= more.billed;
     acc->searched |= more.searched;
     acc->pause     = more.pause;
 }

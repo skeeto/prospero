@@ -1403,14 +1403,29 @@ static void relaysearch(Engine *e, Arena scratch, RelayServe *v)
 
 // A relayed search ended: its result, as the body of a response.
 static void relaysearched(Engine *e, Arena scratch, RelayServe *v, Str status,
-                          Str text, i32 searches)
+                          Str text, i32 searches, Usage *u, i64 microusd)
 {
-    Buf     b(&scratch, 256 + 2*text.len);
+    Buf     b(&scratch, 512 + 2*text.len);
     JsonOut w = {&b};
     putobject(&w);
     putstrkey(&w, "status", status);
     putstrkey(&w, "text", text);
     putintkey(&w, "searches", searches);
+    if (u) {
+        // Its cost, priced here where the search model is configured
+        putkey(&w, "usage");
+        putobject(&w);
+        putintkey(&w, "in", u->in);
+        putintkey(&w, "out", u->out);
+        putintkey(&w, "cached", u->cached);
+        if (u->written) {
+            putintkey(&w, "written", u->written);
+        }
+        if (microusd >= 0) {
+            putintkey(&w, "microusd", microusd);
+        }
+        putend(&w);
+    }
     putend(&w);
     Str body = finish(&b);
     if (body.len > RELAY_HOLD) {

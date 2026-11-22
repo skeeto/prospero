@@ -852,6 +852,7 @@ static u32     os_guilimits(Os *);
 #include "provider.cpp"
 #include "anthropic.cpp"
 #include "responses.cpp"  // after anthropic.cpp: anpartblock, anappend
+#include "price.cpp"      // after provider.cpp: Price, Usage, EP_*
 #include "edit.cpp"
 #include "png.cpp"
 #include "image.cpp"
