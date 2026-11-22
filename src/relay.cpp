@@ -26,7 +26,12 @@
 // A thin engine whose [web] search is not set searches the same way,
 // through a computer that offers to: a call to the path "search" with
 // the query, which that computer runs with its own [web] settings and
-// answers with the tool's result, as JSON, for the agent to read.
+// answers with the tool's result, as JSON, for the agent to read. One
+// with no [web] at all reads web pages through a computer whose [web]
+// fetch is on: a call to the path "fetch" with the URL, which that
+// computer checks by its own address rules and GETs, its response
+// coming back as the thin engine's own GET's would, redirects and all
+// for the thin engine to judge.
 //
 // This is free and unencumbered software released into the public domain.
 
@@ -67,6 +72,7 @@ struct RelayPeer {
     u8             layername[80];  // "relayed from MACHINE", for cfg->layers
     Slice<RelayEp> eps;
     b32            search;   // it runs web searches ([web] search)
+    b32            fetch;    // it reads web pages ([web] fetch)
     Slice<Skill>   skills;   // its user's own that it shares, with no files
     Str            own;      // relays only sessions made with this token
     b32            away;     // no stream now: chosen by none
@@ -174,6 +180,7 @@ struct RelayServe {
     Str         text;
     b32         finished; // done was sent: it goes once its request has
     b32         search;   // a web search, run with this engine's [web]
+    b32         fetch;    // a page's GET, if this engine's [web] reads them
     WebRun     *web;      // which runs now
     b32         skill;    // skill/NAME: one of the user's own skills
     b32         invoked;  // the window vouches: the user's own /NAME
@@ -319,6 +326,7 @@ static void relayparse(RelayPeer *p, Arena *a, Json *o)
 {
     p->machine = relaymachine(a, jsonstr(jsonget(o, "machine")));
     p->search  = jsonflag(jsonget(o, "search"), 0);
+    p->fetch   = jsonflag(jsonget(o, "fetch"), 0);
     Str own    = jsonstr(jsonget(o, "own"));
     p->own     = relaytoken(own) ? clone(a, own) : Str{};
 
@@ -711,16 +719,28 @@ static b32 relaysearches(Engine *e)
     return 0;
 }
 
-// The computer to run a web search for session s (or none): the one its
-// model calls went to last, if it searches and may, else the newest
-// offer that does. 0 if none.
-static i64 relaysearcher(Engine *e, Session *s)
+// Whether a connected computer offers to read web pages.
+static b32 relayfetches(Engine *e)
+{
+    for (RelayPeer *p = e->relay->peers; p; p = p->next) {
+        if (p->fetch && !p->gone) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// The computer to run a web search, or a page's read (fetch), for
+// session s (or none): the one its model calls went to last, if it does
+// that and may, else the newest offer that does. 0 if none.
+static i64 relaysearcher(Engine *e, Session *s, b32 fetch)
 {
     Str        own  = s ? s->rrelay : Str{};
     i64        last = s ? s->relaypeer : 0;
     RelayPeer *best = 0;
     for (RelayPeer *p = e->relay->peers; p; p = p->next) {
-        b32 may = p->search && !p->away && !p->gone && (!p->own.len || p->own==own);
+        b32 does = fetch ? p->fetch : p->search;
+        b32 may  = does && !p->away && !p->gone && (!p->own.len || p->own==own);
         if (may && (!best || p->peer==last || (best->peer!=last && p->seq>best->seq))) {
             best = p;
         }
@@ -816,8 +836,8 @@ static void relayfailpeer(Engine *e, RelayPeer *p, Str why)
 
 // Start relaying a request for session s (or none), to the computer its
 // gate chose, or with no ep, at relay://PATH: a web search (search), to
-// one that searches, or a skill's fetch (skill/NAME), to the one that
-// listed it (to). With no session, sid names the one it is for, if any.
+// one that searches, a page's read (fetch), to one that reads them, or a
+// skill's fetch (skill/NAME), to the one that listed it (to). With no session, sid names the one it is for, if any.
 // Never fails here: a failure ends it at the next pass.
 static RelayCall *relaystart(Engine *e, Endpoint *ep, HttpReq *req,
                              Session *s, b32 keep, Arena scratch, i64 to, Str sid)
@@ -826,8 +846,9 @@ static RelayCall *relaystart(Engine *e, Endpoint *ep, HttpReq *req,
     Str    pre  = ep ? concat(&scratch, ep->url, "/") : Str("relay://");
     Str    path = startswith(req->url, pre) ? cuthead(req->url, pre.len) : Str{};
     b32    skill = !ep && startswith(path, "skill/");
-    path = ep || skill || path=="search" ? path : Str{};
-    i64    peer = skill ? to : !ep ? relaysearcher(e, s) : s ? s->relaypeer : 0;
+    path = ep || skill || path=="search" || path=="fetch" ? path : Str{};
+    i64    peer = skill ? to : !ep ? relaysearcher(e, s, path=="fetch") :
+                  s ? s->relaypeer : 0;
     Str    body = req->body;
     sid = s ? s->sid : sid;
     if (!peer && ep) {
@@ -882,8 +903,9 @@ static RelayCall *relaystart(Engine *e, Endpoint *ep, HttpReq *req,
     c->endpoint  = ep ? clone(&a, ep->relay) : Str{};
     c->path      = clone(&a, path);
     c->method    = clone(&a, req->method);
-    c->accept    = clone(&a, cut(cut(cuthead(req->headers,
-                                 find(req->headers, "Accept: ")+8), '\r').head, '\n').head);
+    iz at        = find(req->headers, "Accept: ");
+    c->accept    = at<0 ? Str{} : clone(&a, cut(cut(cuthead(req->headers, at+8),
+                                                    '\r').head, '\n').head);
     c->model     = s && ep ? clone(&a, reqmc(s)->name) : Str{};
     c->readms    = req->readms;
     c->kind      = ep ? ep->kind : EP_OPENAI;
@@ -913,6 +935,7 @@ static RelayCall *relaystart(Engine *e, Endpoint *ep, HttpReq *req,
         relayend(c, HTTP_ELOST, !path.len ? Str("not a relayed URL") :
                  body.len>relaybodymax() ? Str("the request is too large to relay") :
                  skill ? whose :
+                 !ep && path=="fetch" ? Str("no connected computer reads web pages now") :
                  !ep ? Str("no connected computer runs web searches now") :
                  Str("no connected computer relays it"));
     }
@@ -1401,6 +1424,34 @@ static void relaysearch(Engine *e, Arena scratch, RelayServe *v)
     v->webby = os_ticks(e->os) + (w->service==WEBS_ANTHROPIC ? 2*e->minute : e->minute/2);
 }
 
+// A thin engine's page read: the URL, if web_fetch here would read it,
+// as GET as a session's, its response going back as it comes, for the
+// thin engine to judge as its own (webpage). A redirect is the thin
+// engine's to follow, with another.
+static void relayfetch(Engine *e, Arena scratch, RelayServe *v)
+{
+    JsonDoc d   = jsonparse(&scratch, v->body);
+    Str     url = weburl(&scratch, jsonstr(jsonget(d.root, "url")));
+    Str     bad = !url.len ? Str("not a URL web_fetch reads") : webrefuse(url);
+    if (bad.len) {
+        relayfinish(v, "connect", concat(&scratch, "refused there: ", bad));
+        return;
+    }
+    HttpReq r = {};
+    r.method    = "GET";
+    r.url       = webtesturl(e, &scratch, url);
+    r.headers   = webfetchheaders;
+    r.connectms = 15000;
+    r.maxbytes  = 2*(i64)WEB_PDFMAX;  // the thin engine cuts it sooner
+    r.mbox      = e->in;
+    r.id        = v->httpid = ++e->nextid;
+    v->http     = os_http(e->os, &r, scratch);
+    if (!v->http) {
+        v->httpid = 0;
+        relayfinish(v, "connect", os_lasterr(e->os, &scratch));
+    }
+}
+
 // A relayed search ended: its result, as the body of a response.
 static void relaysearched(Engine *e, Arena scratch, RelayServe *v, Str status,
                           Str text, i32 searches, Usage *u, i64 microusd)
@@ -1640,6 +1691,7 @@ static void relayserve(Engine *e, Arena scratch, Json *j, i64 cid, Str origin,
                    v->ep.name==name && (!v->ep.relay.len || epwindow(e, &v->ep));
         i32 svc  = websearchservice(e);
         v->search = v->path=="search";
+        v->fetch  = v->path=="fetch";
         v->skill  = startswith(v->path, "skill/");
         if (v->skill) {
             v->invoked = !far && jsonflag(jsonget(j, "invoked"), 0);
@@ -1651,6 +1703,11 @@ static void relayserve(Engine *e, Arena scratch, Json *j, i64 cid, Str origin,
                                                         : webunready(e, &scratch);
             if (v->method!="POST" || why.len) {
                 relayfinish(v, "connect", why.len ? why : Str("not a search"));
+            }
+        } else if (v->fetch) {
+            Str why = cfgwebfetch(e->cfg) ? Str{} : Str("reading web pages is off there");
+            if (v->method!="POST" || why.len) {
+                relayfinish(v, "connect", why.len ? why : Str("not a page's read"));
             }
         } else if (!ok) {
             relayfinish(v, "connect", concat(&scratch, "no endpoint here is named ", name));
@@ -1682,6 +1739,9 @@ static void relayserve(Engine *e, Arena scratch, Json *j, i64 cid, Str origin,
     }
     if (v->search) {
         relaysearch(e, scratch, v);
+        return;
+    } else if (v->fetch) {
+        relayfetch(e, scratch, v);
         return;
     } else if (v->skill) {
         relayskill(e, scratch, v);
@@ -2113,9 +2173,10 @@ static void relaywindowmodels(Engine *e, JsonOut *w, Endpoint *ep)
 // listing gave, but never its URL or key; each [model] section flattened
 // through like, and for each offered endpoint whose chain differs there,
 // its ENDPOINT/MODEL too, as like no longer joins the two; the defaults;
-// whether it searches; the user's own skills it shares (ownskills), by
-// name and description; and for a hostlink (link), own, its token, for
-// the sessions it made alone. Scanning skills takes some scratch.
+// whether it searches, and reads pages; the user's own skills it shares
+// (ownskills), by name and description; and for a hostlink (link), own,
+// its token, for the sessions it made alone. Scanning skills takes some
+// scratch.
 static void relayofferput(Engine *e, JsonOut *w, Arena scratch, Str own, HostLink *link)
 {
     Config *cfg = e->cfg;
@@ -2128,6 +2189,7 @@ static void relayofferput(Engine *e, JsonOut *w, Arena scratch, Str own, HostLin
     Str dmo = trim(cfgget(cfg, "", "", "model", 0));
     Str web = trim(cfgget(cfg, "web", "", "search", 0));
     putintkey(w, "search", web.len && !(web=="none"));
+    putintkey(w, "fetch", cfgwebfetch(cfg));
 
     // None for a container with no network (farskills), and for any
     // hostlink none of the user's alone: only /NAME invokes those

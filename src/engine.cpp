@@ -9466,6 +9466,7 @@ enum : i64 {
 };
 
 static b32 relaysearches(Engine *);
+static b32 relayfetches(Engine *);
 
 // The service [web] search names, or on a thin engine where it is not
 // set, a connected computer that searches with its own (relay.cpp).
@@ -9481,12 +9482,26 @@ static i32 websearchservice(Engine *e)
            unset && e->cfg->thin && relaysearches(e) ? WEBS_RELAY : WEBS_NONE;
 }
 
-// Whether web_fetch is on: the configuration has [web], and its fetch
-// is on.
+// Whether a configuration's own [web] reads web pages: it has [web], and
+// its fetch is on. What a computer offers to do for thin engines.
+static b32 cfgwebfetch(Config *c)
+{
+    return inisection(c->ini, "web", "") &&
+           cfgbool(trim(cfgget(c, "web", "", "fetch", 0))) != 0;
+}
+
+// Whether web_fetch reads through a connected computer: on a thin engine
+// with no [web] of its own, one that offers to, with its own (relay.cpp).
+static b32 webfetchrelayed(Engine *e)
+{
+    return !inisection(e->ini, "web", "") && e->cfg->thin && relayfetches(e);
+}
+
+// Whether web_fetch is on: as this configuration's [web] says, else
+// through a connected computer.
 static b32 webfetchon(Engine *e)
 {
-    return inisection(e->ini, "web", "") &&
-           cfgbool(trim(cfgget(e->cfg, "web", "", "fetch", 0))) != 0;
+    return cfgwebfetch(e->cfg) || webfetchrelayed(e);
 }
 
 // read_terminal's bit, denied to a new session but where the user has
@@ -9844,6 +9859,12 @@ static void webputquerystr(Buf *b, Str s)
     }
 }
 
+// A page's GET's headers, here or for a thin engine (relayfetch).
+static char const webfetchheaders[] =
+    "Accept: text/markdown, text/html;q=0.9, text/plain;q=0.8, */*;q=0.1\r\n"
+    "Accept-Encoding: identity\r\n"
+    "User-Agent: prospero/" PROSPERO_VERSION "\r\n";
+
 // Send the web call's next request. Null if it went, else why not, in
 // the scratch, which then advances past it.
 static Str websend(Engine *e, WebRun *w, Arena *sa)
@@ -9852,13 +9873,22 @@ static Str websend(Engine *e, WebRun *w, Arena *sa)
     Buf     h(&scratch, 1024);
     HttpReq r = {};
     i64     max = WEB_REPLYMAX;
-    if (w->tool == TOOL_WEBFETCH) {
+    if (w->tool==TOOL_WEBFETCH && w->service==WEBS_RELAY) {
+        // The computer's GET comes back as this one's would
+        Buf     q(&scratch, 64 + 2*w->url.len);
+        JsonOut j = {&q};
+        putobject(&j);
+        putstrkey(&j, "url", w->url);
+        putend(&j);
+        r.method = "POST";
+        r.url    = "relay://fetch";
+        r.body   = finish(&q);
+        print(&h, webfetchheaders);  // its Accept, as relayed (relaystart)
+        max      = WEB_PDFMAX;
+    } else if (w->tool == TOOL_WEBFETCH) {
         r.method = "GET";
         r.url    = webtesturl(e, &scratch, w->url);
-        print(&h, "Accept: text/markdown, text/html;q=0.9, text/plain;q=0.8, "
-                  "*/*;q=0.1\r\n"
-                  "Accept-Encoding: identity\r\n"
-                  "User-Agent: prospero/" PROSPERO_VERSION "\r\n");
+        print(&h, webfetchheaders);
         max = WEB_PDFMAX;  // a page's body is cut sooner (webbodymax)
     } else if (w->service == WEBS_SEARXNG) {
         Str base = trim(cfgget(e->cfg, "web", "", "url", 0));
@@ -9963,9 +9993,10 @@ static b32 webrun(Session *s, Arena scratch, i32 tool, Args *args)
             why = webanthropicep(e, &w->arena, &w->ep, &w->model);
         }
     } else {
-        w->asked  = weburl(&w->arena, args->url);
-        w->url    = w->asked;
-        w->offset = args->offset;
+        w->asked   = weburl(&w->arena, args->url);
+        w->url     = w->asked;
+        w->offset  = args->offset;
+        w->service = webfetchrelayed(e) ? WEBS_RELAY : WEBS_NONE;
     }
     s->web = w;
     if (!why.len) {
@@ -10164,6 +10195,9 @@ static Str webfailure(Arena *a, WebRun *w, i32 err, Str why)
     case HTTP_ECONNECT: print(&b, " could not be reached");        break;
     case HTTP_ETRUST:   print(&b, "'s certificate was refused");   break;
     default:            print(&b, "'s response broke off");
+    }
+    if (w->tool==TOOL_WEBFETCH && w->service==WEBS_RELAY) {
+        print(&b, ", read through a connected computer");
     }
     if (why.len && w->service!=WEBS_EXA) {
         print(&b, ": ");

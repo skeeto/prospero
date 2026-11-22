@@ -112,6 +112,18 @@ def sc_remote_search(model, n, req):
             fake_provider.tool_results(req)))
 
 
+FETCHURL = "https://docs.example.com/relayed/page"
+
+
+def sc_remote_fetch(model, n, req):
+    """A web page read, then what it said."""
+    if n == 0:
+        yield from fake_provider.tool(model, n, "web_fetch", {"url": FETCHURL})
+    else:
+        yield from fake_provider.answer(model, "Heard: " + " | ".join(
+            fake_provider.tool_results(req)))
+
+
 def sc_remote_skill(model, n, req):
     """The skill notes, then its ref.txt read from where it was copied,
     then what both said; a prompt that invokes a skill, just answered."""
@@ -135,6 +147,7 @@ def sc_remote_skill(model, n, req):
 fake_provider.SCENARIOS["remote_skill"] = sc_remote_skill
 fake_provider.SCENARIOS["remote_slow"] = sc_remote_slow
 fake_provider.SCENARIOS["remote_search"] = sc_remote_search
+fake_provider.SCENARIOS["remote_fetch"] = sc_remote_fetch
 fake_provider.SCENARIOS["remote_tool"] = sc_remote_tool
 fake_provider.SCENARIOS["remote_big"] = sc_remote_big
 fake_provider.SCENARIOS["remote_flood"] = sc_remote_flood
@@ -3361,13 +3374,13 @@ def thinconfig(t, extra=""):
 
 
 def offer(t, model, machine="testbox", budget=None, name="fake", search=0, listed=(),
-          kind="openai", skills=()):
+          kind="openai", skills=(), fetch=0):
     ep = {"name": name, "kind": kind, "first_byte_timeout": "5",
           "idle_timeout": "5", "progress_timeout": "10", "models": list(listed)}
     if budget:
         ep["slow_retry_budget"] = str(budget)
     o = {"machine": machine, "endpoint": name, "model": model, "endpoints": [ep],
-         "search": search,
+         "search": search, "fetch": fetch,
          "models": [{"name": model, "settings": {"context": "100000"}}]}
     if skills:
         o["skills"] = list(skills)
@@ -3580,6 +3593,14 @@ class Relayer:
             time.sleep(self.skilldelay)
             self.send({"rid": rid, "head": {"status": 200, "headers": ""}})
             self.send({"rid": rid, "body": base64.b64encode(pkg.encode()).decode()})
+            self.send({"rid": rid, "done": {"err": "ok", "text": ""}})
+            return
+        if head["path"] == "fetch":
+            # As the computer's GET of the page would answer
+            page = f"<html><title>Relayed</title><p>Read at {json.loads(body)['url']}</p></html>"
+            self.send({"rid": rid, "head": {"status": 200,
+                                            "headers": "Content-Type: text/html\r\n"}})
+            self.send({"rid": rid, "body": base64.b64encode(page.encode()).decode()})
             self.send({"rid": rid, "done": {"err": "ok", "text": ""}})
             return
         if head["path"] == "search":
@@ -4383,6 +4404,86 @@ def relay_search(t):
         t.check(tools and "web_search" not in tools, f"tools {tools}")
     finally:
         rl.stop = True
+
+
+@scenario
+def relay_fetch(t):
+    """A thin host with no [web] of its own reads a page through a
+    computer that offers to, as a relayed call, asking first; with none
+    that does, the tool is not there."""
+    thinconfig(t)
+    model = t.model("remote_fetch")
+    c, rl = relayclient(t, model, fetch=1)
+    try:
+        r = c.call("new", cwd=t.work, prompt=f"Read {FETCHURL}", attended=1)
+        sid = r["sid"]
+        ask = c.stream.wait(lambda r: r.get("ev") == "ask" and r.get("sid") == sid,
+                            timeout=30, what="the ask")
+        t.check(ask.get("tool") == "web_fetch", f"ask {ask}")
+        c.call("answer", sid=sid, req=ask["req"], decision="allow")
+        end = c.stream.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid,
+                            timeout=30, what="turn.end")
+        t.check(end.get("why") == "done", f"turn.end {end}")
+        te = [r for r in c.all() if r.get("ev") == "tool.end" and r.get("sid") == sid]
+        t.check(len(te) == 1 and te[0]["status"] == "ok" and
+                f"Read at {FETCHURL}" in te[0]["text"] and
+                "--- begin web content" in te[0]["text"], f"tool.end {te}")
+        f = [(h, b) for h, b in rl.calls if h["path"] == "fetch"]
+        t.check(len(f) == 1 and json.loads(f[0][1]) == {"url": FETCHURL} and
+                f[0][0]["endpoint"] == "", f"the read relayed {f}")
+
+        # An offer without fetch: no web_fetch
+        c.call("relay.offer", offer=offer(t, model))
+        r = c.call("new", cwd=t.work, prompt="go")
+        sid = r["sid"]
+        c.stream.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid,
+                      timeout=30, what="turn.end")
+        q = fake_provider.STATE.log(model)
+        tools = [x["function"]["name"] for x in q[-1]["body"].get("tools", [])]
+        t.check(tools and "web_fetch" not in tools, f"tools {tools}")
+    finally:
+        rl.stop = True
+
+
+@scenario
+def relay_fetch_serve(t):
+    """An engine whose [web] reads pages offers to, and GETs a thin
+    engine's page by its own address rules, the response going back as it
+    came, a redirect too; one with no [web] refuses."""
+    env = dict(t.env, PROSPERO_TEST_WEB=t.args.url)
+    t.write_config(t.args.url, "[web]\nask = false\n")
+    c = Client(t)
+    c.attach(env=env)
+    c.call("hello")
+    t.check(c.call("offer")["offer"].get("fetch") == 1, "offered")
+    sv = Served(t, c)
+    def fetch(url):
+        a = sv.call(json.dumps({"url": url}).encode(), path="fetch", endpoint="", keep=0)
+        d = sv.done(a)
+        head = next((r["head"] for r in sv.records(a) if "head" in r), {})
+        return d, head, sv.text(a)
+
+    d, head, text = fetch(f"https://docs.example.com/{t.nonce}/page")
+    t.check(d["err"] == "ok" and head.get("status") == 200 and
+            "text/html" in head.get("headers", "") and t.nonce in text,
+            f"the page: {d} {head} {text[:200]}")
+    d, head, text = fetch(f"https://docs.example.com/{t.nonce}/same")
+    t.check(d["err"] == "ok" and head.get("status") == 301 and
+            f"www.docs.example.com/{t.nonce}/page" in head.get("headers", ""),
+            f"the redirect, not followed: {d} {head}")
+    d, head, text = fetch("https://127.0.0.1/admin")
+    t.check(d["err"] == "connect" and "refused there" in d.get("text", "") and not head,
+            f"a local address: {d} {head}")
+    c.call("quit")
+
+    t.write_config(t.args.url)
+    c = Client(t)
+    c.attach(env=env)
+    c.call("hello")
+    t.check(not c.call("offer")["offer"].get("fetch"), "not offered without [web]")
+    sv = Served(t, c)
+    d, head, text = fetch(f"https://docs.example.com/{t.nonce}/page")
+    t.check(d["err"] == "connect" and "off there" in d.get("text", ""), f"off: {d}")
 
 
 @scenario

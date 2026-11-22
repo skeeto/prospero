@@ -261,8 +261,10 @@ dropped connection to an endpoint.
 Web search on such a remote runs on the computer relaying it, with
 that computer's `[web]` settings, unless the remote's own
 configuration sets `[web] search`; `none` there turns it off. Reading
-web pages follows the remote's own `[web]`, so it is off until set
-there. A subagent that an agent here starts on the remote runs on its
+web pages goes through the relaying computer too, where its `[web]`
+reads them (`fetch`), unless the remote has a `[web]` of its own, which
+then decides; each read still asks on the remote, unless its own
+`[web] ask` is off. A subagent that an agent here starts on the remote runs on its
 parent's models the same way, with no window needed. Guard, tools and
 shell settings are the remote's own, its built-in defaults if it has
 no file.
