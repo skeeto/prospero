@@ -156,7 +156,10 @@ built in, used when neither directory has one: it extracts it into the
 state directory's `deploy/engines`, and deploys it from there. `tools/engines.py` builds them: macOS
 arm64, Windows x86-64 and i686, and Linux aarch64 and x86-64 (static,
 in the Docker image with `--docker`, or else on a Linux host given
-with `--linux HOST`, else left out).
+with `--linux HOST`, else left out). FreeBSD, for which none is built,
+gets Linux's engine of its machine, to run under its Linux binary
+compatibility (`linux_enable="YES"`), the engine being static; a deploy
+there that cannot run it says how to turn that on.
 A remote whose engine is older than this program shows the operations
 it lacks disabled, and a host's menu has Update engine, which deploys
 this version's engine there and reconnects to it once nothing runs.

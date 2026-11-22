@@ -486,6 +486,40 @@ def no_engine(t):
 
 
 @scenario
+def freebsd_linux(t):
+    """FreeBSD with no engine of its own here gets Linux's, of its
+    machine, for its Linux binary compatibility: on Linux, this engine,
+    recorded as Linux's; elsewhere, one that does not run there, failed
+    with how to turn that compatibility on."""
+    if os.name == "nt":
+        return  # the fake engine below is a shell script
+    if t.platform.startswith("linux-"):
+        arch = t.platform.split("-", 1)[1]
+        uname = "FreeBSD " + ("arm64" if arch == "aarch64" else "amd64")
+        src = t.engine()
+        p = t.deploy(env=dict(t.env, FAKEUNAME=uname))
+        t.check(p.returncode == 0, f"exit {p.returncode}: {p.stderr}")
+        t.check(f"here is {t.platform} ({uname}): FreeBSD, trying Linux's engine" in p.stderr,
+                f"stderr {p.stderr}")
+        t.check(sha256(t.deployed()) == sha256(src), "the engine is there")
+        t.check(t.record().get("platform") == t.platform, f"record {t.record()}")
+        return
+    name = f"prospero-engine-{t.version}-linux-aarch64"
+    dst = os.path.join(t.engines, name)
+    data = b"#!/bin/sh\necho 'ELF binary type \"3\" not known.' >&2\nexit 126\n"
+    with open(dst, "wb") as f:
+        f.write(data)
+    os.chmod(dst, 0o755)
+    with open(dst + ".sha256", "w", newline="") as f:
+        f.write(f"{hashlib.sha256(data).hexdigest()}  {name}\n")
+    p = t.deploy(env=dict(t.env, FAKEUNAME="FreeBSD arm64"))
+    t.check(p.returncode == 1 and "does not run on here" in p.stderr and
+            "linux_enable=YES" in p.stderr, f"exit {p.returncode}: {p.stderr}")
+    t.check("trying Linux's engine" in p.stderr, f"stderr {p.stderr}")
+    t.check(not os.path.exists(os.path.join(t.local, "deploy", "here.ini")), "recorded")
+
+
+@scenario
 def relative_engines(t):
     """An engines directory given relative to where deploy runs, which is
     not where scp runs."""

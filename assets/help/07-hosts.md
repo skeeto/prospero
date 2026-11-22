@@ -302,7 +302,9 @@ when the first has none for the platform, or are the executable itself
 when it is built for that platform. The Community Edition carries no
 others: the engines zip that `tools/engines.py --zip` builds unpacks
 into either place. The Professional Edition, from itch.io, has every
-engine built in, so it needs neither. Connecting deploys one by itself
+engine built in, so it needs neither. FreeBSD gets Linux's engine, which
+it runs with its Linux binary compatibility on (`sysrc linux_enable=YES`
+and `service linux start`, as root). Connecting deploys one by itself
 when the machine has none, or one of another protocol (`deploy = auto`,
 the default), as for a WSL distro the first time. A deploy that fails
 says why in a toast, at the foot of the Sessions or Hosts pane, where it

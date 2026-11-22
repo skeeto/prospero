@@ -135,6 +135,7 @@ struct Platform {
     Str name;   // OS-ARCH
     Str about;  // what the probe said, for messages
     i32 shell;
+    b32 linux;  // FreeBSD, to run Linux's engine (deploylinux)
     b32 ok;
 };
 
@@ -1419,6 +1420,11 @@ static DeployPut deployput(Deploy *d, Arena *perm, Arena scratch, Platform *pf,
             print(&b, ": ");
             print(&b, said);
         }
+        if (pf->linux) {
+            print(&b, " (this is Linux's engine, which FreeBSD runs only with "
+                      "its Linux binary compatibility on: sysrc linux_enable=YES "
+                      "and service linux start, as root)");
+        }
         Str why = finish(&b);
         if (!same && run.code!=255) {
             Str rm = deploycmd(&scratch, pf->shell, DEPLOY_REMOVE, f->rpath, stamp);
@@ -1487,6 +1493,31 @@ static Deployed deploy(Os *os, Arena *perm, Arena scratch, DeployConf *conf)
     return r;
 }
 
+// Whether a directory of dirs has the engine for a platform.
+static b32 deployfound(Os *os, Arena scratch, Slice<Str> dirs, Str platform, Str ext)
+{
+    DeployNames n = deploynames(&scratch, platform, ext);
+    for (iz i = 0; i < dirs.len; i++) {
+        Arena t = scratch;
+        Str path = join(&t, dirs[i], n.engine);
+        if (os_stat(os, t, path).type == STAT_FILE) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// FreeBSD with no engine of its own here runs Linux's, of its machine,
+// under its Linux binary compatibility (Linuxulator): the engines for
+// Linux are static, so they need none of Linux's libraries there. Its
+// first run (deployput) tells whether that is on.
+static void deploylinux(Arena *a, Platform *pf)
+{
+    pf->linux = 1;
+    pf->os    = "linux";
+    pf->name  = concat(a, "linux-", pf->arch);
+}
+
 // The steps of deploy, under its lock.
 static Deployed deploysteps(Deploy d, Arena *perm, Arena scratch, Str dest, Str name)
 {
@@ -1523,6 +1554,11 @@ static Deployed deploysteps(Deploy d, Arena *perm, Arena scratch, Str dest, Str 
     Slice<Str> dirs = {};
     dirs = conf->engines.len ? push(&scratch, dirs, conf->engines)
                              : enginesdirs(os, &scratch, exe);
+    if (pf.os=="freebsd" && pf.name!=deployself() &&
+            !deployfound(os, scratch, dirs, pf.name, ext)) {
+        deploylinux(&scratch, &pf);
+        self = pf.name==deployself() ? exe : Str{};
+    }
     DeployNames names = deploynames(&scratch, pf.name, ext);
     // Last, the built-in engines, if this build has them (itch.io's)
     Str zip = engineszip();
@@ -1595,6 +1631,8 @@ static Deployed deploysteps(Deploy d, Arena *perm, Arena scratch, Str dest, Str 
     print(&b, pf.about);
     print(&b, pf.shell==DEPLOY_CMD ? Str("; cmd.exe") : Str(""));
     print(&b, ")");
+    print(&b, pf.linux ? Str(": FreeBSD, trying Linux's engine under its Linux "
+                             "binary compatibility") : Str(""));
     deploynote(&d, scratch, "probe", finish(&b));
 
     i64       stamp = os_time(os);
