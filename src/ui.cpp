@@ -18767,6 +18767,7 @@ static void drawdialogs(Gui *g)
         ImGui::BulletText("FreeType: Copyright 1996 The FreeType Project (FTL)");
         ImGui::BulletText("MD4C: Copyright 2016 Martin Mitas (MIT)");
         ImGui::BulletText("Wuffs: Copyright 2017 The Wuffs Authors (Apache 2.0 or MIT)");
+        ImGui::BulletText("gemma4.c: Copyright 2026 Qmog AI (MIT)");
         #ifndef _WIN32
         ImGui::BulletText("SDL: Copyright 1997 Sam Lantinga (zlib)");
         ImGui::BulletText("cpp-httplib: Copyright 2017 Yuji Hirose (MIT)");

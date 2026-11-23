@@ -67,6 +67,8 @@ domain. See [UNLICENSE](UNLICENSE).
 Its programs include third-party code under its own licenses: Dear
 ImGui (MIT), FreeType (FTL), md4c (MIT), SDL3 (zlib), cpp-httplib
 (MIT), Mbed TLS (Apache-2.0), and Wuffs (Apache-2.0 or MIT, at your
-option), which every program with the engine includes.
+option), which every program with the engine includes. The built-in
+model's network, `src/gemma.cpp`, is derived from gemma4.c and stays
+under its MIT license.
 
 [w64devkit]: https://github.com/skeeto/w64devkit
