@@ -2607,6 +2607,11 @@ def main():
             env = FSSTALL
         if args.builtin and args.host:
             env = {"PROSPERO_BUILTIN_MODEL": args.builtin}
+        if args.mode == "a11y":
+            # The accessibility log, which the "logged" checks read, is
+            # kept only in a developer build (Debug) or with a trace: a
+            # trace, so any build passes, and a failure leaves its calls
+            env = dict(env or {}, PROSPERO_AXTRACE=host.path("axtrace.log"))
         axdone = threading.Event()
         axthread = None
         if args.mode == "a11y" and sys.platform == "darwin" and isinstance(host, Local):
