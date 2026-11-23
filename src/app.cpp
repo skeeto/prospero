@@ -24538,6 +24538,23 @@ static DriveOp a11yops[] = {
     SELALL,
     KEY(GKEY_BACKSPACE, 0, 300),
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    // Reconversion, through which an input method edits text already
+    // there ("delete that"): the text with its selection offered, a part
+    // of it settled on and selected, and an empty commit that deletes it
+    {OP_TEXT, 0, 0, 0, 300, "delete me now"},
+    {OP_A11Y, 0, 0, 0, 300, "uia textsel 7,10 Edit Prompt"},
+    {OP_A11Y, 0, 0, 0, 0, "uia reconvert 7,10"},
+    {OP_A11Y, 0, 0, 0, 300, "uia confirm 0,7"},
+    {OP_CHECK, CHK_PROMPTSEL, 0, 0, 0, "delete "},
+    {OP_A11Y, 0, 0, 0, 300, "uia emptycommit"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "me now"},
+    {OP_A11Y, 0, 0, 0, 0, "logged IME empty commit 0,7 -> deleted, reconverted"},
+    {OP_A11Y, 0, 0, 0, 300, "uia emptycommit"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "me now"},
+    {OP_A11Y, 0, 0, 0, 0, "logged IME empty commit -> nothing selected"},
+    SELALL,
+    KEY(GKEY_BACKSPACE, 0, 300),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
     // Send, invoked through its provider: the press reaches the app
     {OP_TEXT, 0, 0, 0, 300, "UIA"},
     {OP_A11Y, 0, 0, 0, 500, "uia press Button Send"},

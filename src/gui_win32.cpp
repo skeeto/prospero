@@ -667,6 +667,10 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     if (w32axspeechkey(w, hwnd, msg, wp, lp)) {
         return 0;
     }
+    LRESULT imr;
+    if (w32aximerequest(w, msg, wp, lp, &imr)) {
+        return imr;
+    }
     if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wp, lp)) {
         return 1;
     }

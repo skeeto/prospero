@@ -244,12 +244,16 @@ static char const *axvkname(WPARAM vk)
 enum { W32AX_SPEECHENTER_MS = 150 };
 static DWORD axcommitat;
 static int   axcommitted;
+static int   axreconverted;  // a reconversion confirmed, its commit to come
+
+static void axemptycommit(W32Gui *w, HWND hwnd);
 
 static int w32axspeechkey(W32Gui *w, HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     if (msg==WM_IME_COMPOSITION && (lp & GCS_RESULTSTR)) {
         axcommitat  = GetTickCount();
         axcommitted = 1;
+        axemptycommit(w, hwnd);
         return 0;
     } else if (msg!=WM_KEYDOWN || wp==VK_PROCESSKEY || wp==VK_PACKET) {
         return 0;
@@ -269,6 +273,152 @@ static int w32axspeechkey(W32Gui *w, HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         axsend(w, &l);
     }
     return 1;
+}
+
+// Reconversion, as an input method edits text already in the field:
+// what TSF's compatibility layer (CUAS) asks for to give a text service
+// the text around the caret, as Voice Access's "delete that" needs. A
+// request names the live field's text, its selection the part to
+// convert (IMR_RECONVERTSTRING) or none at the caret (IMR_DOCUMENTFEED);
+// a confirmation (IMR_CONFIRMRECONVERTSTRING) selects the part the input
+// method settled on, which its commit then replaces. An empty commit
+// replaces it with nothing, which ImGui, given no characters, wouldn't:
+// that is a Backspace. Returns whether msg was answered, into *out.
+
+static void axlogf(W32Gui *w, char const *a, long long n0, long long n1, char const *b)
+{
+    W32AxHooks *h = &w->hooks.ax;
+    if (!h->logging || !(h->logging(w->hooks.gui) & W32AXLOG_ON)) {
+        return;
+    }
+    W32AxLine l = {};
+    axlput(&l, a);
+    if (n0 != LLONG_MIN) {
+        axlput(&l, " ");
+        axlputn(&l, n0);
+    }
+    if (n1 != LLONG_MIN) {
+        axlput(&l, ",");
+        axlputn(&l, n1);
+    }
+    if (b) {
+        axlput(&l, " ");
+        axlput(&l, b);
+    }
+    axsend(w, &l);
+}
+
+// The live field's key and text, its length: -1 if there is none
+static int axlivetext(W32Gui *w, unsigned *key, W32AxText *info, unsigned short **buf)
+{
+    W32AxHooks *h = &w->hooks.ax;
+    *buf = 0;
+    if (!h->focus || !h->textget) {
+        return -1;
+    }
+    *key = h->focus(w->hooks.gui);
+    if (!*key || *key==W32AX_ROOT) {
+        return -1;
+    }
+    int len = h->textget(w->hooks.gui, *key, info, 0, 0);
+    if (!info->live || len<0) {
+        return -1;
+    }
+    *buf = (unsigned short *)HeapAlloc(GetProcessHeap(), 0, ((size_t)len+1)*2);
+    if (!*buf) {
+        return -1;
+    }
+    h->textget(w->hooks.gui, *key, info, *buf, len);
+    return len;
+}
+
+static int w32aximerequest(W32Gui *w, UINT msg, WPARAM wp, LPARAM lp, LRESULT *out)
+{
+    if (msg!=WM_IME_REQUEST ||
+            (wp!=IMR_RECONVERTSTRING && wp!=IMR_DOCUMENTFEED && wp!=IMR_CONFIRMRECONVERTSTRING)) {
+        return 0;
+    }
+    unsigned        key;
+    W32AxText       info = {};
+    unsigned short *text = 0;
+    int             len  = axlivetext(w, &key, &info, &text);
+    if (len < 0) {
+        return 0;  // no field: as before, the default's nothing
+    }
+    int lo = info.anchor<info.caret ? info.anchor : info.caret;
+    int hi = info.anchor<info.caret ? info.caret : info.anchor;
+    RECONVERTSTRING *r = (RECONVERTSTRING *)lp;
+    DWORD need = (DWORD)(sizeof(RECONVERTSTRING) + ((size_t)len+1)*2);
+
+    if (wp == IMR_CONFIRMRECONVERTSTRING) {
+        *out = FALSE;
+        if (r && r->dwSize>=sizeof(*r) && r->dwStrLen==(DWORD)len) {
+            int a = (int)(r->dwCompStrOffset/2);
+            int b = a + (int)r->dwCompStrLen;
+            if (a>=0 && a<=b && b<=len && !info.readonly &&
+                    w->hooks.ax.textselect(w->hooks.gui, key, a, b)) {
+                axreconverted = 1;
+                *out = TRUE;
+            }
+            axlogf(w, "IME confirm reconversion", a, b, *out ? "-> selected" : "-> refused");
+        } else {
+            axlogf(w, "IME confirm reconversion", LLONG_MIN, LLONG_MIN, "-> refused: not ours");
+        }
+    } else if (!r) {
+        *out = (LRESULT)need;  // the size, asked first
+    } else if (r->dwSize < need) {
+        *out = 0;
+    } else {
+        int doc  = wp == IMR_DOCUMENTFEED;
+        int a    = doc ? info.caret : lo;
+        int b    = doc ? info.caret : hi;
+        r->dwVersion         = 0;
+        r->dwStrLen          = (DWORD)len;
+        r->dwStrOffset       = sizeof(RECONVERTSTRING);
+        r->dwCompStrLen      = (DWORD)(b - a);
+        r->dwCompStrOffset   = (DWORD)a * 2;
+        r->dwTargetStrLen    = (DWORD)(b - a);
+        r->dwTargetStrOffset = (DWORD)a * 2;
+        memcpy((char *)r + sizeof(RECONVERTSTRING), text, (size_t)len*2);
+        ((unsigned short *)((char *)r + sizeof(RECONVERTSTRING)))[len] = 0;
+        *out = (LRESULT)need;
+    }
+    if (wp != IMR_CONFIRMRECONVERTSTRING) {
+        axlogf(w, wp==IMR_DOCUMENTFEED ? "IME document feed" : "IME reconvert string",
+               lo, hi, r ? (*out ? "-> given" : "-> too small") : "-> size");
+    }
+    HeapFree(GetProcessHeap(), 0, text);
+    return 1;
+}
+
+static void axemptycommit(W32Gui *w, HWND hwnd)
+{
+    int reconverted = axreconverted;
+    axreconverted   = 0;
+    HIMC imc = ImmGetContext(hwnd);
+    if (!imc) {
+        return;
+    }
+    LONG n = ImmGetCompositionStringW(imc, GCS_RESULTSTR, 0, 0);
+    ImmReleaseContext(hwnd, imc);
+    if (n != 0) {
+        return;
+    }
+    unsigned        key;
+    W32AxText       info = {};
+    unsigned short *text = 0;
+    int             len  = axlivetext(w, &key, &info, &text);
+    HeapFree(GetProcessHeap(), 0, text);
+    if (len<0 || info.anchor==info.caret || info.readonly) {
+        axlogf(w, "IME empty commit", LLONG_MIN, LLONG_MIN, "-> nothing selected");
+        return;
+    }
+    UINT scan = MapVirtualKeyW(VK_BACK, MAPVK_VK_TO_VSC);
+    ImGui_ImplWin32_WndProcHandler(hwnd, WM_KEYDOWN, VK_BACK, 1 | (LPARAM)scan<<16);
+    ImGui_ImplWin32_WndProcHandler(hwnd, WM_KEYUP, VK_BACK, 1 | (LPARAM)scan<<16 | (LPARAM)3<<30);
+    w->hooks.input(w->hooks.gui, W32IN_TEXT);
+    axlogf(w, "IME empty commit", info.anchor, info.caret,
+           reconverted ? "-> deleted, reconverted" : "-> deleted");
 }
 
 // Log msg, if it is one a speech tool sends and the core logs: before
@@ -2316,7 +2466,9 @@ extern "C" void w32gui_axdrive(void *gp, char const *cmd, int len, char *out, in
     char const *verb = s;
     while (s<e && *s!=' ') s++;
     int vlen = (int)(s - verb);
-    int want = axeq(verb, vlen, "start") || axeq(verb, vlen, "newline") ? 0
+    int want = axeq(verb, vlen, "start") || axeq(verb, vlen, "newline") ||
+               axeq(verb, vlen, "emptycommit") ? 0
+             : axeq(verb, vlen, "reconvert") || axeq(verb, vlen, "confirm") ? 1
              : axeq(verb, vlen, "can") || axeq(verb, vlen, "parent") ||
                axeq(verb, vlen, "value") || axeq(verb, vlen, "setvalue") ||
                axeq(verb, vlen, "textis") || axeq(verb, vlen, "textsel") ||
@@ -2352,6 +2504,60 @@ extern "C" void w32gui_axdrive(void *gp, char const *cmd, int len, char *out, in
         PostMessageW(w->hwnd, WM_KEYDOWN, VK_RETURN, 1 | (LPARAM)scan<<16);
         PostMessageW(w->hwnd, WM_KEYUP, VK_RETURN, 1 | (LPARAM)scan<<16 | (LPARAM)3<<30);
         axlput(&l, "ok");
+        axout(out, cap, &l);
+        return;
+    }
+    if (axeq(verb, vlen, "emptycommit")) {
+        // As "delete that" may end: a commit of nothing (the context's
+        // result string, the checklist's, is empty)
+        PostMessageW(w->hwnd, WM_IME_COMPOSITION, 0, GCS_RESULTSTR);
+        axlput(&l, "ok");
+        axout(out, cap, &l);
+        return;
+    }
+    if (axeq(verb, vlen, "reconvert") || axeq(verb, vlen, "confirm")) {
+        // reconvert LO,HI: the field's text with LO,HI to convert, as an
+        // input method asks for it; confirm LO,HI: that part settled on
+        int lo = 0, hi = 0, *at = &lo;
+        for (int i = 0; i < wlen[0]; i++) {
+            char c = word[0][i];
+            if (c == ',') {
+                at = &hi;
+            } else {
+                *at = *at*10 + (c - '0');
+            }
+        }
+        LRESULT need = SendMessageW(w->hwnd, WM_IME_REQUEST, IMR_RECONVERTSTRING, 0);
+        RECONVERTSTRING *r = need>(LRESULT)sizeof(RECONVERTSTRING)
+            ? (RECONVERTSTRING *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (size_t)need) : 0;
+        if (!r) {
+            axlput(&l, "no reconversion offered");
+            axout(out, cap, &l);
+            return;
+        }
+        r->dwSize = (DWORD)need;
+        LRESULT got = SendMessageW(w->hwnd, WM_IME_REQUEST, IMR_RECONVERTSTRING, (LPARAM)r);
+        int a = (int)(r->dwCompStrOffset/2), b = a + (int)r->dwCompStrLen;
+        if (got != need) {
+            axlput(&l, "not given");
+        } else if (axeq(verb, vlen, "reconvert")) {
+            if (a==lo && b==hi) {
+                axlput(&l, "ok");
+            } else {
+                axlput(&l, "offered ");
+                axlputn(&l, a);
+                axlput(&l, ",");
+                axlputn(&l, b);
+            }
+        } else {
+            r->dwCompStrOffset   = (DWORD)lo * 2;
+            r->dwCompStrLen      = (DWORD)(hi - lo);
+            r->dwTargetStrOffset = r->dwCompStrOffset;
+            r->dwTargetStrLen    = r->dwCompStrLen;
+            LRESULT ok = SendMessageW(w->hwnd, WM_IME_REQUEST, IMR_CONFIRMRECONVERTSTRING, (LPARAM)r);
+            axlput(&l, ok ? "ok" : "refused");
+        }
+        HeapFree(GetProcessHeap(), 0, r);
         axout(out, cap, &l);
         return;
     }
