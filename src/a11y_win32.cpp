@@ -461,6 +461,7 @@ struct W32Ax {
     HRESULT (WINAPI *raisetree)(IRawElementProviderSimple *, StructureChangeType, int *, int);
     BOOL    (WINAPI *listening)(void);
     HRESULT (WINAPI *disconnect)(IRawElementProviderSimple *);  // Windows 8
+    HRESULT (WINAPI *notsupported)(IUnknown **);
     W32AxProv  *root;
     W32AxProv **tab;     // by key, open addressing, null for empty
     int         exp;     // 1<<exp slots
@@ -489,6 +490,7 @@ static int axloaduia()
     AXFN(raisetree,  "UiaRaiseStructureChangedEvent");
     AXFN(listening,  "UiaClientsAreListening");
     AXFN(disconnect, "UiaDisconnectProvider");
+    AXFN(notsupported, "UiaGetReservedNotSupportedValue");
     #undef AXFN
     if (!w32ax.ret || !w32ax.host || !w32ax.raise || !w32ax.raiseprop ||
             !w32ax.raisetree || !w32ax.listening) {
@@ -564,10 +566,13 @@ static int axfocusable(W32AxNode *n)
 
 static W32AxProv *axprov(W32Gui *w, unsigned key);
 static void axasked(W32AxProv *p, int pattern, int id, VARIANT const *v, int has);
+static ITextRangeProvider *axrange(W32AxProv *p, int lo, int hi);
+static SAFEARRAY *axranges(ITextRangeProvider *r);
 
 struct W32AxProv : IRawElementProviderSimple, IRawElementProviderFragment,
                    IRawElementProviderFragmentRoot, IInvokeProvider, IToggleProvider,
-                   IExpandCollapseProvider, ISelectionItemProvider, IValueProvider {
+                   IExpandCollapseProvider, ISelectionItemProvider, IValueProvider,
+                   ITextProvider2 {
     LONG     refs;
     unsigned key;
     int      dead;
@@ -599,6 +604,9 @@ struct W32AxProv : IRawElementProviderSimple, IRawElementProviderFragment,
             *out = static_cast<ISelectionItemProvider *>(this);
         } else if (IsEqualIID(id, __uuidof(IValueProvider))) {
             *out = static_cast<IValueProvider *>(this);
+        } else if (IsEqualIID(id, __uuidof(ITextProvider)) ||
+                   IsEqualIID(id, __uuidof(ITextProvider2))) {
+            *out = static_cast<ITextProvider2 *>(this);
         } else {
             *out = 0;
             return E_NOINTERFACE;
@@ -672,6 +680,10 @@ struct W32AxProv : IRawElementProviderSimple, IRawElementProviderFragment,
             break;
         case UIA_ValuePatternId:
             p = axhasvalue(&n) ? static_cast<IValueProvider *>(this) : 0;
+            break;
+        case UIA_TextPatternId:
+        case UIA_TextPattern2Id:
+            p = axhasvalue(&n) ? static_cast<ITextProvider2 *>(this) : 0;
             break;
         }
         if (p) {
@@ -950,6 +962,89 @@ struct W32AxProv : IRawElementProviderSimple, IRawElementProviderFragment,
     }
 
     HRESULT STDMETHODCALLTYPE Invoke() override { return act(W32AXACT_PRESS); }
+
+    // ITextProvider2: a text field's text, as ranges of it (W32AxRange)
+    HRESULT STDMETHODCALLTYPE GetSelection(SAFEARRAY **out) override
+    {
+        *out = 0;
+        W32AxNode n;
+        if (!now(&n)) {
+            return UIA_E_ELEMENTNOTAVAILABLE;
+        }
+        W32AxText info;
+        w->hooks.ax.textget(w->hooks.gui, key, &info, 0, 0);
+        if (!info.live) {
+            *out = SafeArrayCreateVector(VT_UNKNOWN, 0, 0);
+            return *out ? S_OK : E_OUTOFMEMORY;
+        }
+        int lo = info.anchor<info.caret ? info.anchor : info.caret;
+        int hi = info.anchor<info.caret ? info.caret : info.anchor;
+        *out = axranges(axrange(this, lo, hi));
+        return *out ? S_OK : E_OUTOFMEMORY;
+    }
+    HRESULT STDMETHODCALLTYPE GetVisibleRanges(SAFEARRAY **out) override
+    {
+        ITextRangeProvider *r = 0;
+        HRESULT e = get_DocumentRange(&r);
+        *out = e==S_OK ? axranges(r) : 0;
+        return e!=S_OK ? e : *out ? S_OK : E_OUTOFMEMORY;
+    }
+    HRESULT STDMETHODCALLTYPE RangeFromChild(IRawElementProviderSimple *, ITextRangeProvider **out) override
+    {
+        *out = 0;
+        return E_INVALIDARG;  // a field has no children
+    }
+    HRESULT STDMETHODCALLTYPE RangeFromPoint(UiaPoint pt, ITextRangeProvider **out) override
+    {
+        *out = 0;
+        W32AxNode n;
+        if (!now(&n)) {
+            return UIA_E_ELEMENTNOTAVAILABLE;
+        }
+        POINT o = {0, 0};
+        ClientToScreen(w->hwnd, &o);
+        int at = w->hooks.ax.textat(w->hooks.gui, key, (float)(pt.x - o.x), (float)(pt.y - o.y));
+        at = at>0 ? at : 0;
+        *out = axrange(this, at, at);
+        return *out ? S_OK : E_OUTOFMEMORY;
+    }
+    HRESULT STDMETHODCALLTYPE get_DocumentRange(ITextRangeProvider **out) override
+    {
+        *out = 0;
+        W32AxNode n;
+        if (!now(&n)) {
+            return UIA_E_ELEMENTNOTAVAILABLE;
+        }
+        W32AxText info;
+        int len = w->hooks.ax.textget(w->hooks.gui, key, &info, 0, 0);
+        *out = axrange(this, 0, len);
+        return *out ? S_OK : E_OUTOFMEMORY;
+    }
+    HRESULT STDMETHODCALLTYPE get_SupportedTextSelection(SupportedTextSelection *out) override
+    {
+        *out = SupportedTextSelection_Single;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE RangeFromAnnotation(IRawElementProviderSimple *, ITextRangeProvider **out) override
+    {
+        *out = 0;
+        return E_INVALIDARG;
+    }
+    HRESULT STDMETHODCALLTYPE GetCaretRange(BOOL *active, ITextRangeProvider **out) override
+    {
+        *out    = 0;
+        *active = FALSE;
+        W32AxNode n;
+        if (!now(&n)) {
+            return UIA_E_ELEMENTNOTAVAILABLE;
+        }
+        W32AxText info;
+        w->hooks.ax.textget(w->hooks.gui, key, &info, 0, 0);
+        int at  = info.live ? info.caret : 0;
+        *active = info.live && GetForegroundWindow()==w->hwnd;
+        *out    = axrange(this, at, at);
+        return *out ? S_OK : E_OUTOFMEMORY;
+    }
 
     // IValueProvider: a text field's text, set only while it has the
     // keyboard, as the core's text model is of that field alone
@@ -1230,6 +1325,463 @@ static int w32axroot(W32Gui *w, WPARAM wp, LPARAM lp, LRESULT *out)
     return 1;
 }
 
+// A text field's text, loaded for a range's call: its units, and its
+// line starts (the live field's wrapped lines, else after newlines)
+struct W32AxDoc {
+    unsigned short *s;
+    int             len;
+    W32AxText       info;
+    int            *lines;
+    int             nlines;
+};
+
+static void axdocfree(W32AxDoc *d)
+{
+    HeapFree(GetProcessHeap(), 0, d->s);
+    HeapFree(GetProcessHeap(), 0, d->lines);
+    *d = {};
+}
+
+static int axdocload(W32Gui *w, unsigned key, W32AxDoc *d)
+{
+    *d = {};
+    W32AxHooks *h = &w->hooks.ax;
+    int len = h->textget(w->hooks.gui, key, &d->info, 0, 0);
+    d->s = (unsigned short *)HeapAlloc(GetProcessHeap(), 0, (size_t)len*2 + 2);
+    if (!d->s) {
+        return 0;
+    }
+    d->len = h->textget(w->hooks.gui, key, &d->info, d->s, len);
+    d->len = d->len<len ? d->len : len;
+    int n  = h->textlines(w->hooks.gui, key, 0, 0);
+    if (n <= 0) {
+        n = 1;
+        for (int i = 0; i < d->len; i++) {
+            n += d->s[i] == '\n';
+        }
+    }
+    d->lines = (int *)HeapAlloc(GetProcessHeap(), 0, (size_t)n*sizeof(int));
+    if (!d->lines) {
+        axdocfree(d);
+        return 0;
+    }
+    if (d->info.live && h->textlines(w->hooks.gui, key, d->lines, n) == n) {
+        d->nlines = n;
+    } else {
+        d->nlines = 0;
+        d->lines[d->nlines++] = 0;
+        for (int i = 0; i<d->len && d->nlines<n; i++) {
+            if (d->s[i] == '\n') {
+                d->lines[d->nlines++] = i + 1;
+            }
+        }
+    }
+    return 1;
+}
+
+static int axwclass(unsigned c)
+{
+    if (c==' ' || c=='\t' || c=='\n' || c=='\r' || c==0xa0 || c==0x3000) {
+        return 1;
+    }
+    int alnum = (c>='0' && c<='9') || (c>='a' && c<='z') || (c>='A' && c<='Z');
+    return alnum || c=='_' || c>=0x80 ? 2 : 3;
+}
+
+// Whether a unit (TextUnit_*) starts at i: words take their spaces after
+// them, as Windows' own fields count them; a line is drawn as one
+static int axisbound(W32AxDoc *d, int i, int unit)
+{
+    if (i<=0 || i>=d->len) {
+        return 1;
+    }
+    unsigned c = d->s[i], p = d->s[i-1];
+    if (c>=0xdc00 && c<0xe000 && p>=0xd800 && p<0xdc00) {
+        return 0;  // within a surrogate pair
+    }
+    switch (unit) {
+    case TextUnit_Character:
+        return 1;
+    case TextUnit_Word: {
+        int k = axwclass(c), q = axwclass(p);
+        return p=='\n' || (k!=1 && k!=q);
+    }
+    case TextUnit_Line: {
+        int lo = 0, hi = d->nlines;
+        while (lo < hi) {
+            int mid = lo + (hi - lo)/2;
+            if (d->lines[mid] < i) lo = mid + 1; else hi = mid;
+        }
+        return lo<d->nlines && d->lines[lo]==i;
+    }
+    case TextUnit_Paragraph:
+        return p == '\n';
+    }
+    return 0;  // Format, Page, Document: the whole
+}
+
+static int axnextbound(W32AxDoc *d, int i, int unit)
+{
+    for (i++; i < d->len && !axisbound(d, i, unit); i++) {}
+    return i<d->len ? i : d->len;
+}
+
+static int axprevbound(W32AxDoc *d, int i, int unit)
+{
+    for (i--; i > 0 && !axisbound(d, i, unit); i--) {}
+    return i>0 ? i : 0;
+}
+
+// A range of a text field's units, as the Text pattern hands them out:
+// clamped to its text as it is at each call, which edits change
+struct W32AxRange : ITextRangeProvider {
+    LONG       refs;
+    W32AxProv *p;
+    int        lo, hi;
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void **out) override
+    {
+        if (IsEqualIID(id, __uuidof(IUnknown)) || IsEqualIID(id, __uuidof(ITextRangeProvider))) {
+            *out = static_cast<ITextRangeProvider *>(this);
+            AddRef();
+            return S_OK;
+        }
+        *out = 0;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override
+    {
+        return (ULONG)InterlockedIncrement(&refs);
+    }
+    ULONG STDMETHODCALLTYPE Release() override
+    {
+        LONG r = InterlockedDecrement(&refs);
+        if (!r) {
+            p->Release();
+            HeapFree(GetProcessHeap(), 0, this);
+        }
+        return (ULONG)r;
+    }
+
+    // Its field's text now, the range clamped to it: 0 if the field is gone
+    int load(W32AxDoc *d)
+    {
+        W32AxNode n;
+        if (!p->now(&n) || !axdocload(p->w, p->key, d)) {
+            return 0;
+        }
+        lo = lo<0 ? 0 : lo>d->len ? d->len : lo;
+        hi = hi<lo ? lo : hi>d->len ? d->len : hi;
+        return 1;
+    }
+
+    static W32AxRange *of(ITextRangeProvider *r)
+    {
+        return static_cast<W32AxRange *>(r);
+    }
+
+    HRESULT STDMETHODCALLTYPE Clone(ITextRangeProvider **out) override
+    {
+        *out = axrange(p, lo, hi);
+        return *out ? S_OK : E_OUTOFMEMORY;
+    }
+    HRESULT STDMETHODCALLTYPE Compare(ITextRangeProvider *r, BOOL *out) override
+    {
+        W32AxRange *o = r ? of(r) : 0;
+        *out = o && o->p->key==p->key && o->lo==lo && o->hi==hi;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE CompareEndpoints(TextPatternRangeEndpoint ep, ITextRangeProvider *r,
+                                               TextPatternRangeEndpoint rep, int *out) override
+    {
+        *out = 0;
+        if (!r) {
+            return E_INVALIDARG;
+        }
+        W32AxRange *o = of(r);
+        int a = ep==TextPatternRangeEndpoint_Start ? lo : hi;
+        int b = rep==TextPatternRangeEndpoint_Start ? o->lo : o->hi;
+        *out = a<b ? -1 : a>b;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE ExpandToEnclosingUnit(TextUnit unit) override
+    {
+        W32AxDoc d;
+        if (!load(&d)) {
+            return UIA_E_ELEMENTNOTAVAILABLE;
+        }
+        int start = lo==d.len && d.len ? axprevbound(&d, d.len, unit)  // the last unit
+                  : axisbound(&d, lo, unit) ? lo : axprevbound(&d, lo, unit);
+        int end   = axnextbound(&d, start, unit);
+        if (hi > end) {
+            end = axisbound(&d, hi, unit) ? hi : axnextbound(&d, hi, unit);
+        }
+        lo = start;
+        hi = end;
+        axdocfree(&d);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE FindAttribute(TEXTATTRIBUTEID, VARIANT, BOOL, ITextRangeProvider **out) override
+    {
+        *out = 0;  // one style throughout
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE FindText(BSTR text, BOOL back, BOOL nocase, ITextRangeProvider **out) override
+    {
+        *out = 0;
+        W32AxDoc d;
+        if (!load(&d)) {
+            return UIA_E_ELEMENTNOTAVAILABLE;
+        }
+        int n = text ? (int)SysStringLen(text) : 0;
+        int found = -1;
+        for (int k = 0; n && k <= hi-lo-n; k++) {
+            int i = back ? hi-n-k : lo+k;
+            if (CompareStringOrdinal((wchar_t const *)d.s+i, n, text, n, nocase) == CSTR_EQUAL) {
+                found = i;
+                break;
+            }
+        }
+        axdocfree(&d);
+        if (found >= 0) {
+            *out = axrange(p, found, found+n);
+            return *out ? S_OK : E_OUTOFMEMORY;
+        }
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetAttributeValue(TEXTATTRIBUTEID id, VARIANT *out) override
+    {
+        out->vt = VT_EMPTY;
+        W32AxDoc d;
+        if (!load(&d)) {
+            return UIA_E_ELEMENTNOTAVAILABLE;
+        }
+        W32AxNode n = {};
+        p->now(&n);
+        int ro = d.info.live ? d.info.readonly : (n.state & W32S_READONLY) != 0;
+        axdocfree(&d);
+        if (id == UIA_IsReadOnlyAttributeId) {
+            out->vt      = VT_BOOL;
+            out->boolVal = ro ? VARIANT_TRUE : VARIANT_FALSE;
+        } else if (id == UIA_IsHiddenAttributeId) {
+            out->vt      = VT_BOOL;
+            out->boolVal = VARIANT_FALSE;
+        } else if (w32ax.notsupported && w32ax.notsupported(&out->punkVal) == S_OK) {
+            out->vt = VT_UNKNOWN;
+        }
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetBoundingRectangles(SAFEARRAY **out) override
+    {
+        *out = 0;
+        W32AxDoc d;
+        if (!load(&d)) {
+            return UIA_E_ELEMENTNOTAVAILABLE;
+        }
+        enum { MAXRECTS = 64 };
+        double r[4*MAXRECTS];
+        int    nr = 0;
+        POINT  o  = {0, 0};
+        ClientToScreen(p->w->hwnd, &o);
+        W32AxHooks *h = &p->w->hooks.ax;
+        for (int k = 0; d.info.live && k<d.nlines && nr<MAXRECTS; k++) {
+            int ls = d.lines[k], le = k+1<d.nlines ? d.lines[k+1] : d.len;
+            int a  = lo>ls ? lo : ls, b = hi<le ? hi : le;
+            if (lo==hi ? !(lo>=ls && (lo<le || k==d.nlines-1)) : a>=b) {
+                continue;
+            }
+            if (b>a && d.s[b-1]=='\n') {
+                b--;  // its newline drawn as nothing
+            }
+            float f[4];
+            if (h->textrect(p->w->hooks.gui, p->key, a, b, f)) {
+                r[4*nr+0] = o.x + f[0];
+                r[4*nr+1] = o.y + f[1];
+                r[4*nr+2] = f[2]>f[0] ? f[2]-f[0] : 0;
+                r[4*nr+3] = f[3]>f[1] ? f[3]-f[1] : 0;
+                nr++;
+            }
+            if (lo == hi) {
+                break;
+            }
+        }
+        W32AxNode n;
+        if (!nr && !d.info.live && hi>lo && p->now(&n) && !(n.state & W32S_OFFSCREEN)) {
+            r[0] = o.x + n.x0;  // where the field is, for a field not focused
+            r[1] = o.y + n.y0;
+            r[2] = n.x1>n.x0 ? n.x1-n.x0 : 0;
+            r[3] = n.y1>n.y0 ? n.y1-n.y0 : 0;
+            nr   = 1;
+        }
+        axdocfree(&d);
+        SAFEARRAY *a = SafeArrayCreateVector(VT_R8, 0, (ULONG)(4*nr));
+        if (!a) {
+            return E_OUTOFMEMORY;
+        }
+        for (LONG i = 0; i < 4*nr; i++) {
+            SafeArrayPutElement(a, &i, &r[i]);
+        }
+        *out = a;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetEnclosingElement(IRawElementProviderSimple **out) override
+    {
+        *out = static_cast<IRawElementProviderSimple *>(p);
+        p->AddRef();
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetText(int max, BSTR *out) override
+    {
+        *out = 0;
+        W32AxDoc d;
+        if (!load(&d)) {
+            return UIA_E_ELEMENTNOTAVAILABLE;
+        }
+        int n = hi - lo;
+        n = max>=0 && max<n ? max : n;
+        if (n>0 && lo+n<d.len && d.s[lo+n]>=0xdc00 && d.s[lo+n]<0xe000) {
+            n--;  // not half a pair
+        }
+        *out = SysAllocStringLen((wchar_t const *)d.s+lo, (UINT)(n>0 ? n : 0));
+        axdocfree(&d);
+        return *out ? S_OK : E_OUTOFMEMORY;
+    }
+    // An endpoint moved count units: the units moved, as far as the text
+    // goes. An endpoint within a unit takes one to reach its edge.
+    int step(W32AxDoc *d, int *at, TextUnit unit, int count)
+    {
+        int moved = 0;
+        if (unit==TextUnit_Format || unit==TextUnit_Page || unit==TextUnit_Document) {
+            unit = TextUnit_Document;
+        }
+        for (; count > 0 && *at < d->len; count--, moved++) {
+            *at = unit==TextUnit_Document ? d->len : axnextbound(d, *at, unit);
+        }
+        for (; count < 0 && *at > 0; count++, moved--) {
+            *at = unit==TextUnit_Document ? 0 : axprevbound(d, *at, unit);
+        }
+        return moved;
+    }
+    HRESULT STDMETHODCALLTYPE Move(TextUnit unit, int count, int *out) override
+    {
+        *out = 0;
+        W32AxDoc d;
+        if (!load(&d)) {
+            return UIA_E_ELEMENTNOTAVAILABLE;
+        }
+        int degenerate = lo == hi;
+        if (!degenerate) {
+            ExpandToEnclosingUnit(unit);  // whole units, then moved by them
+        }
+        int at = lo;
+        *out = count ? step(&d, &at, unit, count) : 0;
+        lo = at;
+        hi = at;
+        if (!degenerate) {
+            hi = unit==TextUnit_Document ? d.len : axnextbound(&d, lo, unit);
+            hi = lo==d.len ? d.len : hi;
+        }
+        axdocfree(&d);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE MoveEndpointByUnit(TextPatternRangeEndpoint ep, TextUnit unit, int count,
+                                                 int *out) override
+    {
+        *out = 0;
+        W32AxDoc d;
+        if (!load(&d)) {
+            return UIA_E_ELEMENTNOTAVAILABLE;
+        }
+        int at = ep==TextPatternRangeEndpoint_Start ? lo : hi;
+        *out = step(&d, &at, unit, count);
+        setend(ep, at);
+        axdocfree(&d);
+        return S_OK;
+    }
+    // One endpoint set: past the other, the other comes along
+    void setend(TextPatternRangeEndpoint ep, int at)
+    {
+        if (ep == TextPatternRangeEndpoint_Start) {
+            lo = at;
+            hi = hi<lo ? lo : hi;
+        } else {
+            hi = at;
+            lo = lo>hi ? hi : lo;
+        }
+    }
+    HRESULT STDMETHODCALLTYPE MoveEndpointByRange(TextPatternRangeEndpoint ep, ITextRangeProvider *r,
+                                                  TextPatternRangeEndpoint rep) override
+    {
+        if (!r) {
+            return E_INVALIDARG;
+        }
+        W32AxRange *o = of(r);
+        setend(ep, rep==TextPatternRangeEndpoint_Start ? o->lo : o->hi);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE Select() override
+    {
+        W32AxDoc d;
+        if (!load(&d)) {
+            return UIA_E_ELEMENTNOTAVAILABLE;
+        }
+        int live = d.info.live;
+        axdocfree(&d);
+        if (!live) {
+            return UIA_E_INVALIDOPERATION;  // a field without the keyboard
+        }
+        W32AxHooks *h = &p->w->hooks.ax;
+        return h->textselect(p->w->hooks.gui, p->key, lo, hi) ? S_OK : UIA_E_INVALIDOPERATION;
+    }
+    HRESULT STDMETHODCALLTYPE AddToSelection() override
+    {
+        return UIA_E_INVALIDOPERATION;  // one selection
+    }
+    HRESULT STDMETHODCALLTYPE RemoveFromSelection() override
+    {
+        return UIA_E_INVALIDOPERATION;
+    }
+    HRESULT STDMETHODCALLTYPE ScrollIntoView(BOOL) override
+    {
+        return S_OK;  // ImGui keeps the caret in view
+    }
+    HRESULT STDMETHODCALLTYPE GetChildren(SAFEARRAY **out) override
+    {
+        *out = SafeArrayCreateVector(VT_UNKNOWN, 0, 0);
+        return *out ? S_OK : E_OUTOFMEMORY;
+    }
+};
+
+static ITextRangeProvider *axrange(W32AxProv *p, int lo, int hi)
+{
+    void *m = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(W32AxRange));
+    if (!m) {
+        return 0;
+    }
+    W32AxRange *r = new (m) W32AxRange;
+    r->refs = 1;
+    r->p    = p;
+    r->lo   = lo;
+    r->hi   = hi>lo ? hi : lo;
+    p->AddRef();
+    return r;
+}
+
+// One range as an array of them, taking its reference
+static SAFEARRAY *axranges(ITextRangeProvider *r)
+{
+    if (!r) {
+        return 0;
+    }
+    SAFEARRAY *a = SafeArrayCreateVector(VT_UNKNOWN, 0, 1);
+    if (a) {
+        LONG i = 0;
+        SafeArrayPutElement(a, &i, r);  // its own reference
+    }
+    r->Release();
+    return a;
+}
+
 static void axraiseprop(W32AxProv *p, PROPERTYID id, VARIANT now)
 {
     VARIANT old = {};
@@ -1300,6 +1852,14 @@ extern "C" void w32gui_axevents(void *gp, W32AxEvent const *ev, int n)
             }
             w32ax.focused = (int)k;
         } break;
+        case W32AXE_TEXTEDIT:
+        case W32AXE_TEXTSEL:
+            if (p) {  // only a field a client has an element of
+                w32ax.raise(static_cast<IRawElementProviderSimple *>(p),
+                            ev[e].kind==W32AXE_TEXTEDIT ? UIA_Text_TextChangedEventId
+                                                        : UIA_Text_TextSelectionChangedEventId);
+            }
+            break;
         case W32AXE_NAME:
             if (p) {
                 VARIANT v = {};
@@ -1377,6 +1937,7 @@ static struct { char const *name; PATTERNID id; } const axpatnames[] = {
     {"Invoke", UIA_InvokePatternId}, {"Toggle", UIA_TogglePatternId},
     {"ExpandCollapse", UIA_ExpandCollapsePatternId},
     {"SelectionItem", UIA_SelectionItemPatternId}, {"Value", UIA_ValuePatternId},
+    {"Text", UIA_TextPatternId}, {"Text2", UIA_TextPattern2Id},
 };
 
 static char const *axpropname(int id)
@@ -1611,7 +2172,9 @@ extern "C" void w32gui_axdrive(void *gp, char const *cmd, int len, char *out, in
     int vlen = (int)(s - verb);
     int want = axeq(verb, vlen, "start") || axeq(verb, vlen, "newline") ? 0
              : axeq(verb, vlen, "can") || axeq(verb, vlen, "parent") ||
-               axeq(verb, vlen, "value") || axeq(verb, vlen, "setvalue") ? 2 : 1;
+               axeq(verb, vlen, "value") || axeq(verb, vlen, "setvalue") ||
+               axeq(verb, vlen, "textis") || axeq(verb, vlen, "textsel") ||
+               axeq(verb, vlen, "selis") || axeq(verb, vlen, "textunit") ? 2 : 1;
     for (; nwords < want; nwords++) {
         while (s<e && *s==' ') s++;
         word[nwords] = s;
@@ -1769,6 +2332,98 @@ extern "C" void w32gui_axdrive(void *gp, char const *cmd, int len, char *out, in
                 axlputw(&l, got ? got : L"", glen);
             }
             SysFreeString(got);
+        }
+        if (u) {
+            u->Release();
+        }
+    } else if (axeq(verb, vlen, "textis") || axeq(verb, vlen, "textsel") ||
+               axeq(verb, vlen, "selis") || axeq(verb, vlen, "textunit")) {
+        // Through the Text pattern: ARG a word, '_' for a space
+        //   textis TEXT          the document's text is TEXT
+        //   textsel LO,HI        select units [LO, HI)
+        //   selis LO,HI          the selection is [LO, HI)
+        //   textunit U,N,TEXT    at the start, moved N units U (c w l p d),
+        //                        then expanded to one, is TEXT
+        wchar_t arg[128];
+        int     n = MultiByteToWideChar(CP_UTF8, 0, word[0], wlen[0], arg, 127);
+        n = n>0 ? n : 0;
+        for (int i = 0; i < n; i++) {
+            arg[i] = arg[i]=='_' ? ' ' : arg[i];
+        }
+        arg[n] = 0;
+        int nums[2] = {};
+        int nn = 0;
+        wchar_t const *q = arg;
+        for (; nn < 2 && *q>='0' && *q<='9'; nn++) {
+            while (*q>='0' && *q<='9') nums[nn] = nums[nn]*10 + (*q++ - '0');
+            q += *q == ',';
+        }
+        IUnknown *u = 0;
+        if (fs->GetPatternProvider(UIA_TextPatternId, &u)!=S_OK || !u) {
+            axlput(&l, "no Text pattern");
+        } else {
+            ITextProvider      *tp = (ITextProvider *)u;
+            ITextRangeProvider *r  = 0;
+            BSTR                got = 0;
+            if (axeq(verb, vlen, "textis")) {
+                tp->get_DocumentRange(&r);
+                if (r) r->GetText(-1, &got);
+            } else if (axeq(verb, vlen, "textsel")) {
+                tp->get_DocumentRange(&r);
+                HRESULT e = E_FAIL;
+                if (r) {
+                    int m;
+                    r->MoveEndpointByUnit(TextPatternRangeEndpoint_End, TextUnit_Document, -1, &m);
+                    r->MoveEndpointByUnit(TextPatternRangeEndpoint_End, TextUnit_Character, nums[1], &m);
+                    r->MoveEndpointByUnit(TextPatternRangeEndpoint_Start, TextUnit_Character, nums[0], &m);
+                    e = r->Select();
+                }
+                got = SysAllocString(e==S_OK ? L"ok" : L"refused");
+                n   = 2;
+                memcpy(arg, L"ok", 6);
+            } else if (axeq(verb, vlen, "selis")) {
+                SAFEARRAY *a = 0;
+                tp->GetSelection(&a);
+                LONG i = 0;
+                if (a && a->rgsabound[0].cElements==1) {
+                    SafeArrayGetElement(a, &i, &r);
+                }
+                if (a) SafeArrayDestroy(a);
+                wchar_t b[32];
+                int lo = r ? W32AxRange::of(r)->lo : -1, hi = r ? W32AxRange::of(r)->hi : -1;
+                wsprintfW(b, L"%d,%d", lo, hi);
+                got = SysAllocString(b);
+            } else {
+                // textunit: the unit's letter, the count, then the text
+                TextUnit unit = arg[0]=='c' ? TextUnit_Character : arg[0]=='w' ? TextUnit_Word
+                              : arg[0]=='l' ? TextUnit_Line : arg[0]=='p' ? TextUnit_Paragraph
+                              : TextUnit_Document;
+                wchar_t const *t = arg + 2;
+                int count = 0;
+                while (*t>='0' && *t<='9') count = count*10 + (*t++ - '0');
+                t += *t == ',';
+                tp->get_DocumentRange(&r);
+                if (r) {
+                    int m;
+                    r->MoveEndpointByRange(TextPatternRangeEndpoint_End, r, TextPatternRangeEndpoint_Start);
+                    r->Move(unit, count, &m);
+                    r->ExpandToEnclosingUnit(unit);
+                    r->GetText(-1, &got);
+                }
+                n = lstrlenW(t);
+                memmove(arg, t, (size_t)(n+1)*2);
+            }
+            int glen = got ? (int)SysStringLen(got) : 0;
+            if (glen==n && !memcmp(got, arg, (size_t)n*2)) {
+                axlput(&l, "ok");
+            } else {
+                axlput(&l, "is ");
+                axlputw(&l, got ? got : L"", glen);
+            }
+            SysFreeString(got);
+            if (r) {
+                r->Release();
+            }
         }
         if (u) {
             u->Release();
@@ -2070,6 +2725,115 @@ static int hookaxsetvalue(void *p, unsigned key, unsigned short const *s, int n)
     return ok;
 }
 
+// The Text pattern's: the focused field's document in UTF-16 units (the
+// text with marked text, if any, in place of the selection), or another
+// field's value.
+
+static A11y *w32axlive(void *p, unsigned key)
+{
+    Gui   *g = (Gui *)p;
+    AxGui *x = g->ax && g->ax->on ? g->ax : 0;
+    return x && x->ax->text.live && x->ax->text.key==key ? x->ax : 0;
+}
+
+static i32 w32axto16(A11y *x, i32 d)  // document byte to unit
+{
+    return axdocunit(x, AXU_UTF16, d);
+}
+
+static int hookaxtextget(void *p, unsigned key, W32AxText *info, unsigned short *buf, int cap)
+{
+    *info = {};
+    A11y *x = w32axlive(p, key);
+    if (!x) {
+        return hookaxtext(p, key, W32AXSTR_VALUE, buf, cap);
+    }
+    AxText *t = &x->text;
+    info->live     = 1;
+    info->readonly = !axeditable(t);
+    info->anchor   = w32axto16(x, axtodoc(x, t->anchor));
+    info->caret    = w32axto16(x, axtodoc(x, t->caret));
+    Arena a   = ((Gui *)p)->ax->logmem;
+    Str   s   = axdoc(x, &a);
+    int   len = 0;
+    for (iz o = 0; o < s.len;) {
+        c16 u[2];
+        iz  k = utf16encode(u, utf8decode(s, &o));
+        for (iz j = 0; j < k; j++, len++) {
+            if (len < cap) {
+                buf[len] = u[j];
+            }
+        }
+    }
+    return len;
+}
+
+static int hookaxtextlines(void *p, unsigned key, int *starts, int cap)
+{
+    A11y *x = w32axlive(p, key);
+    if (!x) {
+        return 0;
+    }
+    i32  n;
+    i32 *lines = axlines(x, &n);
+    for (i32 k = 0; k<n && k<cap; k++) {
+        starts[k] = w32axto16(x, axtodoc(x, lines[k]));
+    }
+    return n;
+}
+
+static int hookaxtextrect(void *p, unsigned key, int lo, int hi, float *r)
+{
+    A11y *x = w32axlive(p, key);
+    if (!x || x->text.geom.rev!=x->text.rev) {
+        return 0;  // none, or of the text before an edit (stale)
+    }
+    AxSpan d = {axdocbyte(x, AXU_UTF16, lo), axdocbyte(x, AXU_UTF16, hi)};
+    AxRect b = axdocbounds(x, d);
+    r[0] = b.x0;
+    r[1] = b.y0;
+    r[2] = b.x1;
+    r[3] = b.y1;
+    return 1;
+}
+
+static int hookaxtextat(void *p, unsigned key, float px, float py)
+{
+    A11y *x = w32axlive(p, key);
+    if (!x || x->text.geom.rev!=x->text.rev) {
+        return -1;
+    }
+    return w32axto16(x, axdocat(x, px, py));
+}
+
+static int hookaxtextselect(void *p, unsigned key, int anchor, int caret)
+{
+    Gui  *g = (Gui *)p;
+    A11y *x = w32axlive(p, key);
+    if (!x) {
+        return 0;
+    }
+    i32 a  = axdoctext(x, axdocbyte(x, AXU_UTF16, anchor));
+    i32 c  = axdoctext(x, axdocbyte(x, AXU_UTF16, caret));
+    b32 ok = axtextselect(g, a, c);
+    if (ok) {
+        os_wake(g->os);
+    }
+    AxGui *ag = g->ax;
+    if (PROSPERO_DEVTOOLS || ag->tracefd>=0) {
+        Arena l = ag->logmem;
+        Buf   b(&l, 64);
+        print(&b, "Select ");
+        print(&b, (i64)anchor);
+        putbyte(&b, ',');
+        print(&b, (i64)caret);
+        print(&b, ok ? Str(" -> ok") : Str(" -> refused"));
+        Str line = finish(&b);
+        axnote(ag, l, line);
+    }
+    return ok;
+}
+
 // After each publish: its events to the edge, in batches
 static void w32axpublished(AxGui *x)
 {
@@ -2088,6 +2852,31 @@ static void w32axpublished(AxGui *x)
         }
         w32gui_axevents(w, ev, n);
     } while (e < t->events.len);
+
+    // The focused field's text or selection changed, as a tool reading
+    // it through the Text pattern is told
+    static u32 tkey;
+    static i64 trev;
+    static i32 tanchor, tcaret;
+    AxText *tx = &x->ax->text;
+    if (tx->live) {
+        b32 edited = tx->rev != trev;
+        if (tx->key==tkey && (edited || tx->anchor!=tanchor || tx->caret!=tcaret)) {
+            W32AxEvent te[2];
+            int        n = 0;
+            if (edited) {
+                te[n++] = {tx->key, W32AXE_TEXTEDIT};
+            }
+            te[n++] = {tx->key, W32AXE_TEXTSEL};
+            w32gui_axevents(w, te, n);
+        }
+        tkey    = tx->key;
+        trev    = tx->rev;
+        tanchor = tx->anchor;
+        tcaret  = tx->caret;
+    } else {
+        tkey = 0;
+    }
 }
 
 // The checklist's "uia ...": the edge's, through its providers
@@ -2121,7 +2910,12 @@ static void w32axhooks(W32AxHooks *h)
     h->focus   = hookaxfocus;
     h->hit     = hookaxhit;
     h->act     = hookaxact;
-    h->setvalue = hookaxsetvalue;
+    h->setvalue   = hookaxsetvalue;
+    h->textget    = hookaxtextget;
+    h->textlines  = hookaxtextlines;
+    h->textrect   = hookaxtextrect;
+    h->textat     = hookaxtextat;
+    h->textselect = hookaxtextselect;
 }
 
 // At the window's opening, with accessibility not off

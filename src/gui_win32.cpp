@@ -73,6 +73,16 @@ enum { W32AXACT_PRESS, W32AXACT_FOCUS, W32AXACT_MENU };  // AXACT_*
 enum {
     W32AXE_DESTROYED, W32AXE_CREATED, W32AXE_CHILDREN, W32AXE_NAME,
     W32AXE_VALUE, W32AXE_STATE, W32AXE_FOCUS, W32AXE_LAYOUT,
+    // The focused field's, after the tree's own: its text was edited,
+    // or only its selection moved
+    W32AXE_TEXTEDIT = 64, W32AXE_TEXTSEL,
+};
+// A text field's text, as the Text pattern sees it: offsets in UTF-16
+// units. live: the focused field, with a selection and geometry; else
+// its value alone.
+struct W32AxText {
+    int live, readonly;
+    int anchor, caret;
 };
 struct W32AxEvent {
     unsigned key;
@@ -104,6 +114,19 @@ struct W32AxHooks {
     // Replace the text of field key, UTF-16, which must be the focused
     // editable field: 0 if it isn't
     int  (*setvalue)(void *gui, unsigned key, unsigned short const *s, int n);
+    // The Text pattern's: field key's text, its length, of which the
+    // first cap units are copied to buf;
+    int  (*textget)(void *gui, unsigned key, W32AxText *info, unsigned short *buf, int cap);
+    // the live field's line starts, how many (0 if not live: lines are
+    // then its newlines'), the first cap copied;
+    int  (*textlines)(void *gui, unsigned key, int *starts, int cap);
+    // where its units [lo, hi) are, on one line, in client pixels (0 if
+    // not live or unknown);
+    int  (*textrect)(void *gui, unsigned key, int lo, int hi, float *rect);
+    // the unit at a client point, -1 if not live;
+    int  (*textat)(void *gui, unsigned key, float x, float y);
+    // and select from anchor to caret in it, 0 if not live.
+    int  (*textselect)(void *gui, unsigned key, int anchor, int caret);
 };
 
 // Shared by both halves: the core's callbacks, called on the GUI thread.

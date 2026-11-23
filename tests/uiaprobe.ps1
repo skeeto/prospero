@@ -15,7 +15,8 @@
 # 2. finds the element with the keyboard focus (HasKeyboardFocus) and
 #    requires the prompt: an Edit named Prompt. The window is not the
 #    user's (the checklist's never takes the foreground), so not the
-#    desktop's FocusedElement;
+#    desktop's FocusedElement. It reads its text through the Text pattern, finds a word of it,
+#    selects it and requires the selection and the word's rectangle;
 # 3. finds the Button named Send, requires its Invoke pattern, and
 #    invokes it; the checklist then requires the prompt empty, as the
 #    press sent it;
@@ -110,6 +111,33 @@ Check ($count -gt 10) "the tree has elements" "$count"
 $focus = $window.FindFirst($Scope::Descendants, (Cond $AE::HasKeyboardFocusProperty $true))
 $isprompt = $focus -and $focus.Current.ControlType -eq $CT::Edit -and $focus.Current.Name -eq "Prompt"
 Check $isprompt "the focus is the prompt, an Edit" (Describe $focus)
+
+# 2b. The prompt's text through the Text pattern, as Voice Access reads
+# it, and a word of it selected as "select WORD" does
+if ($isprompt) {
+    $tp = $null
+    $hastext = $focus.TryGetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern, [ref]$tp)
+    Check $hastext "the prompt has the Text pattern" "no"
+    if ($hastext) {
+        $all = $tp.DocumentRange.GetText(-1)
+        Check ($all -eq "pressed from another process") "the prompt's text through it" "'$all'"
+        $found = $tp.DocumentRange.FindText("another", $false, $true)
+        Check ($found -ne $null) "the word found in it" "none"
+        if ($found) {
+            $found.Select()
+            Start-Sleep -Milliseconds 500
+            $sel = $tp.GetSelection()
+            $got = if ($sel.Length -eq 1) { $sel[0].GetText(-1) } else { "$($sel.Length) ranges" }
+            Check ($got -eq "another") "the word selected" "'$got'"
+            $rects = $found.GetBoundingRectangles()
+            $r = if ($rects.Length) { $rects[0] } else { $null }
+            $pr = $focus.Current.BoundingRectangle
+            $within = $r -and $r.Width -gt 0 -and $r.Left -ge $pr.Left -and $r.Right -le $pr.Right -and
+                      $r.Top -ge $pr.Top -and $r.Bottom -le $pr.Bottom
+            Check $within "the word's rectangle in the prompt's" "$r in $pr"
+        }
+    }
+}
 
 # 3. Send, invoked
 $sendcond = New-Object System.Windows.Automation.AndCondition(
