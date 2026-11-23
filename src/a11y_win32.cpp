@@ -990,6 +990,7 @@ struct W32AxProv : IRawElementProviderSimple, IRawElementProviderFragment,
     HRESULT STDMETHODCALLTYPE GetVisibleRanges(SAFEARRAY **out) override
     {
         ITextRangeProvider *r = 0;
+        axtextlog(this, "GetVisibleRanges", 0, 0, 0, LLONG_MIN, LLONG_MIN, LLONG_MIN);
         HRESULT e = get_DocumentRange(&r);
         *out = e==S_OK ? axranges(r) : 0;
         return e!=S_OK ? e : *out ? S_OK : E_OUTOFMEMORY;
@@ -1066,6 +1067,7 @@ struct W32AxProv : IRawElementProviderSimple, IRawElementProviderFragment,
         VARIANT v = {};
         bstr(&v, W32AXSTR_VALUE);
         *out = v.vt==VT_BSTR ? v.bstrVal : SysAllocStringLen(L"", 0);
+        axtextlog(this, "Value.get_Value", 0, 0, 0, LLONG_MIN, LLONG_MIN, *out ? (long long)SysStringLen(*out) : -1);
         return *out ? S_OK : E_OUTOFMEMORY;
     }
     HRESULT STDMETHODCALLTYPE get_IsReadOnly(BOOL *out) override
@@ -1076,6 +1078,7 @@ struct W32AxProv : IRawElementProviderSimple, IRawElementProviderFragment,
             return UIA_E_ELEMENTNOTAVAILABLE;
         }
         *out = !(n.actions & W32A_EDIT) || (n.state & (W32S_READONLY|W32S_DISABLED));
+        axtextlog(this, "Value.IsReadOnly", 0, 0, 0, LLONG_MIN, LLONG_MIN, *out);
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE SetValue(LPCWSTR text) override
@@ -1539,12 +1542,14 @@ struct W32AxRange : ITextRangeProvider {
     HRESULT STDMETHODCALLTYPE Clone(ITextRangeProvider **out) override
     {
         *out = axrange(p, lo, hi);
+        axtextlog(p, "Clone", lo, hi, 0, LLONG_MIN, LLONG_MIN, LLONG_MIN);
         return *out ? S_OK : E_OUTOFMEMORY;
     }
     HRESULT STDMETHODCALLTYPE Compare(ITextRangeProvider *r, BOOL *out) override
     {
         W32AxRange *o = r ? of(r) : 0;
         *out = o && o->p->key==p->key && o->lo==lo && o->hi==hi;
+        axtextlog(p, "Compare", lo, hi, 0, o ? o->lo : -1, o ? o->hi : -1, *out);
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE CompareEndpoints(TextPatternRangeEndpoint ep, ITextRangeProvider *r,
@@ -1558,6 +1563,7 @@ struct W32AxRange : ITextRangeProvider {
         int a = ep==TextPatternRangeEndpoint_Start ? lo : hi;
         int b = rep==TextPatternRangeEndpoint_Start ? o->lo : o->hi;
         *out = a<b ? -1 : a>b;
+        axtextlog(p, "CompareEndpoints", lo, hi, axepname(ep), b, LLONG_MIN, *out);
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE ExpandToEnclosingUnit(TextUnit unit) override
@@ -1581,6 +1587,7 @@ struct W32AxRange : ITextRangeProvider {
     HRESULT STDMETHODCALLTYPE FindAttribute(TEXTATTRIBUTEID, VARIANT, BOOL, ITextRangeProvider **out) override
     {
         *out = 0;  // one style throughout
+        axtextlog(p, "FindAttribute", lo, hi, 0, LLONG_MIN, LLONG_MIN, LLONG_MIN);
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE FindText(BSTR text, BOOL back, BOOL nocase, ITextRangeProvider **out) override
@@ -1627,6 +1634,8 @@ struct W32AxRange : ITextRangeProvider {
         } else if (w32ax.notsupported && w32ax.notsupported(&out->punkVal) == S_OK) {
             out->vt = VT_UNKNOWN;
         }
+        axtextlog(p, "GetAttributeValue", lo, hi, id==UIA_IsReadOnlyAttributeId ? "IsReadOnly" : 0, id, LLONG_MIN,
+                  out->vt==VT_BOOL ? (long long)(out->boolVal != 0) : LLONG_MIN);
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE GetBoundingRectangles(SAFEARRAY **out) override
@@ -1680,12 +1689,14 @@ struct W32AxRange : ITextRangeProvider {
             SafeArrayPutElement(a, &i, &r[i]);
         }
         *out = a;
+        axtextlog(p, "GetBoundingRectangles", lo, hi, 0, LLONG_MIN, LLONG_MIN, nr);
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE GetEnclosingElement(IRawElementProviderSimple **out) override
     {
         *out = static_cast<IRawElementProviderSimple *>(p);
         p->AddRef();
+        axtextlog(p, "GetEnclosingElement", lo, hi, 0, LLONG_MIN, LLONG_MIN, LLONG_MIN);
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE GetText(int max, BSTR *out) override
@@ -1805,14 +1816,17 @@ struct W32AxRange : ITextRangeProvider {
     }
     HRESULT STDMETHODCALLTYPE RemoveFromSelection() override
     {
+        axtextlog(p, "RemoveFromSelection", lo, hi, "refused", LLONG_MIN, LLONG_MIN, LLONG_MIN);
         return UIA_E_INVALIDOPERATION;
     }
     HRESULT STDMETHODCALLTYPE ScrollIntoView(BOOL) override
     {
+        axtextlog(p, "ScrollIntoView", lo, hi, 0, LLONG_MIN, LLONG_MIN, LLONG_MIN);
         return S_OK;  // ImGui keeps the caret in view
     }
     HRESULT STDMETHODCALLTYPE GetChildren(SAFEARRAY **out) override
     {
+        axtextlog(p, "GetChildren", lo, hi, 0, LLONG_MIN, LLONG_MIN, LLONG_MIN);
         *out = SafeArrayCreateVector(VT_UNKNOWN, 0, 0);
         return *out ? S_OK : E_OUTOFMEMORY;
     }
@@ -1855,8 +1869,19 @@ static void axraiseprop(W32AxProv *p, PROPERTYID id, VARIANT now)
     w32ax.raiseprop(static_cast<IRawElementProviderSimple *>(p), id, old, now);
 }
 
+static void axdescribe(W32AxLine *l, W32AxProv *p);
+
 static void axraisebool(W32AxProv *p, PROPERTYID id, int on)
 {
+    W32Gui     *w = p->w;
+    W32AxHooks *h = &w->hooks.ax;
+    if (id==UIA_IsEnabledPropertyId && h->logging && (h->logging(w->hooks.gui) & W32AXLOG_ON)) {
+        W32AxLine l = {};  // what a tool that asked once is told since
+        axlput(&l, "event ");
+        axdescribe(&l, p);
+        axlput(&l, on ? " IsEnabled true" : " IsEnabled false");
+        axsend(w, &l);
+    }
     VARIANT v = {};
     v.vt      = VT_BOOL;
     v.boolVal = on ? VARIANT_TRUE : VARIANT_FALSE;

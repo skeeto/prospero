@@ -16,7 +16,7 @@
 # 2. finds the element with the keyboard focus (HasKeyboardFocus) and
 #    requires the prompt: an Edit named Prompt. The window is not the
 #    user's (the checklist's never takes the foreground), so not the
-#    desktop's FocusedElement. It reads its text through the Text pattern, finds a word of it,
+#    desktop's FocusedElement, enabled and not read-only. It reads its text through the Text pattern, finds a word of it,
 #    selects it and requires the selection and the word's rectangle;
 # 3. finds the Button named Send, requires its Invoke pattern, and
 #    invokes it; the checklist then requires the prompt empty, as the
@@ -128,6 +128,14 @@ if ($DumpOnly) {
 $focus = $window.FindFirst($Scope::Descendants, (Cond $AE::HasKeyboardFocusProperty $true))
 $isprompt = $focus -and $focus.Current.ControlType -eq $CT::Edit -and $focus.Current.Name -eq "Prompt"
 Check $isprompt "the focus is the prompt, an Edit" (Describe $focus)
+if ($isprompt) {
+    # As Voice Access checks before an edit such as "delete that"
+    Check $focus.Current.IsEnabled "the prompt is enabled" "IsEnabled false"
+    $vp = $null
+    if ($focus.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$vp)) {
+        Check (-not $vp.Current.IsReadOnly) "the prompt is not read-only" "IsReadOnly true"
+    }
+}
 
 # 2b. The prompt's text through the Text pattern, as Voice Access reads
 # it, and a word of it selected as "select WORD" does
