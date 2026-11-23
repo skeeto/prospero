@@ -567,6 +567,7 @@ static int axfocusable(W32AxNode *n)
 static W32AxProv *axprov(W32Gui *w, unsigned key);
 static void axasked(W32AxProv *p, int pattern, int id, VARIANT const *v, int has);
 static ITextRangeProvider *axrange(W32AxProv *p, int lo, int hi);
+static void axhitlog(W32AxProv *p, double x, double y);
 static SAFEARRAY *axranges(ITextRangeProvider *r);
 
 struct W32AxProv : IRawElementProviderSimple, IRawElementProviderFragment,
@@ -930,6 +931,7 @@ struct W32AxProv : IRawElementProviderSimple, IRawElementProviderFragment,
         if (p) {
             p->AddRef();
             *out = static_cast<IRawElementProviderFragment *>(p);
+            axhitlog(p, x, y);
         }
         return S_OK;
     }
@@ -2003,6 +2005,50 @@ static char const *axpatname(int id)
     return 0;
 }
 
+// An element as the trace names it: its control type and name
+static void axdescribe(W32AxLine *l, W32AxProv *p)
+{
+    W32Gui     *w = p->w;
+    W32AxHooks *h = &w->hooks.ax;
+    W32AxNode   n = {};
+    if (p->key == W32AX_ROOT) {
+        axlput(l, "root");
+    } else if (h->node(w->hooks.gui, p->key, &n)) {
+        long ct = axcontroltypes[n.role>=0 && n.role<W32R_N ? n.role : 0];
+        char const *tn = "?";
+        for (int j = 0; j < (int)(sizeof(axtypenames)/sizeof(*axtypenames)); j++) {
+            tn = axtypenames[j].id==ct ? axtypenames[j].name : tn;
+        }
+        axlput(l, tn);
+        axlput(l, " ");
+        unsigned short buf[48];
+        int len = h->text(w->hooks.gui, p->key, W32AXSTR_NAME, buf, 48);
+        axlputw(l, (wchar_t const *)buf, len<48 ? len : 48);
+    } else {
+        axlput(l, "(gone)");
+    }
+}
+
+// A client's hit test, logged: how it finds where to click an element
+static void axhitlog(W32AxProv *p, double x, double y)
+{
+    W32Gui     *w = p->w;
+    W32AxHooks *h = &w->hooks.ax;
+    if (!h->logging || !(h->logging(w->hooks.gui) & W32AXLOG_ON)) {
+        return;
+    }
+    POINT o = {0, 0};
+    ClientToScreen(w->hwnd, &o);
+    W32AxLine l = {};
+    axlput(&l, "hit ");
+    axlputn(&l, (long long)x - o.x);
+    axlput(&l, ",");
+    axlputn(&l, (long long)y - o.y);
+    axlput(&l, " -> ");
+    axdescribe(&l, p);
+    axsend(w, &l);
+}
+
 // The first ask of each element and property or pattern, with the
 // answer, while the log is read: a set of (key, id), let go when full
 static void axasked(W32AxProv *p, int pattern, int id, VARIANT const *v, int has)
@@ -2032,25 +2078,11 @@ static void axasked(W32AxProv *p, int pattern, int id, VARIANT const *v, int has
     nseen++;
 
     W32AxLine l = {};
-    W32AxNode n = {};
     axlput(&l, "ask ");
-    if (p->key == W32AX_ROOT) {
-        axlput(&l, "root");
-    } else if (h->node(w->hooks.gui, p->key, &n)) {
-        long ct = axcontroltypes[n.role>=0 && n.role<W32R_N ? n.role : 0];
-        char const *tn = "?";
-        for (int j = 0; j < (int)(sizeof(axtypenames)/sizeof(*axtypenames)); j++) {
-            tn = axtypenames[j].id==ct ? axtypenames[j].name : tn;
-        }
-        axlput(&l, tn);
-        axlput(&l, " ");
-        unsigned short buf[48];
-        int len = h->text(w->hooks.gui, p->key, W32AXSTR_NAME, buf, 48);
-        axlputw(&l, (wchar_t const *)buf, len<48 ? len : 48);
-    } else {
-        axlput(&l, "(gone)");
-    }
+    axdescribe(&l, p);
     char const *name = pattern ? axpatname(id) : axpropname(id);
+        axlput(&l, "root");
+
     axlput(&l, pattern ? " pattern " : " ");
     if (name) {
         axlput(&l, name);

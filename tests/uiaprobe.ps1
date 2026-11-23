@@ -11,7 +11,8 @@
 # 1. finds its window (class "prospero") among the desktop's, and dumps
 #    the tree under it, control types and names, as the control view
 #    walks it, with each element's patterns and, when a hit test at its
-#    center finds another, what (reported, not checked);
+#    center finds another, what, and when it pokes out of its parent,
+#    where (reported, not checked);
 # 2. finds the element with the keyboard focus (HasKeyboardFocus) and
 #    requires the prompt: an Edit named Prompt. The window is not the
 #    user's (the checklist's never takes the foreground), so not the
@@ -23,13 +24,17 @@
 # 4. finds a point in Send and asks the desktop what is there, which
 #    must be Send.
 #
+# With -DumpOnly, only the tree (step 1), touching nothing: for a user's
+# own window, as Voice Access sees it. Without PID, the first window of
+# class prospero.
+#
 # Each check prints "ok    WHAT" or "FAIL  WHAT: DETAIL", the tree
 # "tree: ...", and the last line "status: pass|fail: MESSAGE". Exits 1
 # if a check failed, else 0. It touches nothing but Send.
 #
 # This is free and unencumbered software released into the public domain.
 
-param([Parameter(Mandatory=$true)][int]$ProcessId)
+param([int]$ProcessId = 0, [switch]$DumpOnly)
 
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName UIAutomationClient
@@ -62,8 +67,12 @@ function Describe($e) {
 # The window, waited for: it may still be opening
 $window = $null
 $deadline = (Get-Date).AddSeconds(10)
-$both = New-Object System.Windows.Automation.AndCondition(
-    (Cond $AE::ProcessIdProperty $ProcessId), (Cond $AE::ClassNameProperty "prospero"))
+$both = if ($ProcessId) {
+    New-Object System.Windows.Automation.AndCondition(
+        (Cond $AE::ProcessIdProperty $ProcessId), (Cond $AE::ClassNameProperty "prospero"))
+} else {
+    Cond $AE::ClassNameProperty "prospero"  # any Prospero window, the first
+}
 while (-not $window -and (Get-Date) -lt $deadline) {
     $window = $AE::RootElement.FindFirst($Scope::Children, $both)
     if (-not $window) { Start-Sleep -Milliseconds 200 }
@@ -89,6 +98,11 @@ function Extra($e) {
     if (-not ($at -and [System.Windows.Automation.Automation]::Compare($at, $e))) {
         $out += " (its center is " + (Describe $at) + ")"
     }
+    $up = $walker.GetParent($e)
+    $pr = if ($up) { $up.Current.BoundingRectangle } else { $null }
+    if ($pr -and -not $pr.IsEmpty -and -not $pr.Contains($r)) {
+        $out += " (outside its parent: $r in $pr)"
+    }
     $out
 }
 
@@ -106,6 +120,9 @@ function Dump($e, $depth) {
 }
 Dump $window 0
 Check ($count -gt 10) "the tree has elements" "$count"
+if ($DumpOnly) {
+    exit 0
+}
 
 # 2. The keyboard's focus: the prompt
 $focus = $window.FindFirst($Scope::Descendants, (Cond $AE::HasKeyboardFocusProperty $true))
