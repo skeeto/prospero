@@ -24543,6 +24543,14 @@ static DriveOp a11yops[] = {
     SELALL,
     KEY(GKEY_BACKSPACE, 0, 300),
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    // And as Voice Access's comes with the TSF store: a root ask, no commit
+    {OP_TEXT, 0, 0, 0, 300, "spoken"},
+    {OP_A11Y, 0, 0, 0, 300, "uia newlineuia"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "spoken\n"},
+    {OP_A11Y, 0, 0, 0, 0, "logged Enter just after a UI Automation ask: a new line, not sent"},
+    SELALL,
+    KEY(GKEY_BACKSPACE, 0, 300),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
     // Reconversion, through which an input method edits text already
     // there ("delete that"): the text with its selection offered, a part
     // of it settled on and selected, and an empty commit that deletes it
