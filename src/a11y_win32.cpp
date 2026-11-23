@@ -377,8 +377,8 @@ static void w32axtrace(W32Gui *w, UINT msg, WPARAM wp, LPARAM lp)
         // Keys and characters: only those not from the keyboard itself
         char const *from;
         int         src = axsource(&from);
-        if (src == W32SRC_HARDWARE) {
-            return;
+        if (src==W32SRC_HARDWARE && !(msg==WM_KEYDOWN && axvkname(wp))) {
+            return;  // typing; but editing keys, as a speech tool's may come so
         }
         if (src==W32SRC_UNKNOWN && !(msg==WM_CHAR && wp>=0xd800 && wp<0xe000) &&
                 !(msg==WM_KEYDOWN && (wp==VK_PACKET || wp==VK_PROCESSKEY))) {
@@ -568,6 +568,8 @@ static W32AxProv *axprov(W32Gui *w, unsigned key);
 static void axasked(W32AxProv *p, int pattern, int id, VARIANT const *v, int has);
 static ITextRangeProvider *axrange(W32AxProv *p, int lo, int hi);
 static void axhitlog(W32AxProv *p, double x, double y);
+static void axtextlog(W32AxProv *p, char const *what, int lo, int hi, char const *arg, long long a,
+                      long long b, long long got);
 static SAFEARRAY *axranges(ITextRangeProvider *r);
 
 struct W32AxProv : IRawElementProviderSimple, IRawElementProviderFragment,
@@ -981,6 +983,7 @@ struct W32AxProv : IRawElementProviderSimple, IRawElementProviderFragment,
         }
         int lo = info.anchor<info.caret ? info.anchor : info.caret;
         int hi = info.anchor<info.caret ? info.caret : info.anchor;
+        axtextlog(this, "GetSelection", lo, hi, 0, LLONG_MIN, LLONG_MIN, LLONG_MIN);
         *out = axranges(axrange(this, lo, hi));
         return *out ? S_OK : E_OUTOFMEMORY;
     }
@@ -1007,6 +1010,7 @@ struct W32AxProv : IRawElementProviderSimple, IRawElementProviderFragment,
         ClientToScreen(w->hwnd, &o);
         int at = w->hooks.ax.textat(w->hooks.gui, key, (float)(pt.x - o.x), (float)(pt.y - o.y));
         at = at>0 ? at : 0;
+        axtextlog(this, "RangeFromPoint", at, at, 0, LLONG_MIN, LLONG_MIN, LLONG_MIN);
         *out = axrange(this, at, at);
         return *out ? S_OK : E_OUTOFMEMORY;
     }
@@ -1019,6 +1023,7 @@ struct W32AxProv : IRawElementProviderSimple, IRawElementProviderFragment,
         }
         W32AxText info;
         int len = w->hooks.ax.textget(w->hooks.gui, key, &info, 0, 0);
+        axtextlog(this, "DocumentRange", 0, len, 0, LLONG_MIN, LLONG_MIN, LLONG_MIN);
         *out = axrange(this, 0, len);
         return *out ? S_OK : E_OUTOFMEMORY;
     }
@@ -1044,6 +1049,7 @@ struct W32AxProv : IRawElementProviderSimple, IRawElementProviderFragment,
         w->hooks.ax.textget(w->hooks.gui, key, &info, 0, 0);
         int at  = info.live ? info.caret : 0;
         *active = info.live && GetForegroundWindow()==w->hwnd;
+        axtextlog(this, "GetCaretRange", at, at, *active ? "active" : "inactive", LLONG_MIN, LLONG_MIN, LLONG_MIN);
         *out    = axrange(this, at, at);
         return *out ? S_OK : E_OUTOFMEMORY;
     }
@@ -1434,6 +1440,54 @@ static int axprevbound(W32AxDoc *d, int i, int unit)
     return i>0 ? i : 0;
 }
 
+// A Text pattern call, logged with the range after it and what it
+// gave: how a tool finds "that" in "delete that". Text itself is not.
+static void axtextlog(W32AxProv *p, char const *what, int lo, int hi, char const *arg, long long a,
+                      long long b, long long got)
+{
+    W32Gui     *w = p->w;
+    W32AxHooks *h = &w->hooks.ax;
+    if (!h->logging || !(h->logging(w->hooks.gui) & W32AXLOG_ON)) {
+        return;
+    }
+    W32AxLine l = {};
+    axlput(&l, "text ");
+    axlput(&l, what);
+    if (arg) {
+        axlput(&l, " ");
+        axlput(&l, arg);
+    }
+    if (a != LLONG_MIN) {
+        axlput(&l, " ");
+        axlputn(&l, a);
+    }
+    if (b != LLONG_MIN) {
+        axlput(&l, " ");
+        axlputn(&l, b);
+    }
+    axlput(&l, " -> [");
+    axlputn(&l, lo);
+    axlput(&l, ",");
+    axlputn(&l, hi);
+    axlput(&l, ")");
+    if (got != LLONG_MIN) {
+        axlput(&l, " ");
+        axlputn(&l, got);
+    }
+    axsend(w, &l);
+}
+
+static char const *axunitname(int u)
+{
+    static char const *const names[] = {"char", "format", "word", "line", "para", "page", "doc"};
+    return u>=0 && u<7 ? names[u] : "?";
+}
+
+static char const *axepname(int ep)
+{
+    return ep==TextPatternRangeEndpoint_Start ? "start" : "end";
+}
+
 // A range of a text field's units, as the Text pattern hands them out:
 // clamped to its text as it is at each call, which edits change
 struct W32AxRange : ITextRangeProvider {
@@ -1521,6 +1575,7 @@ struct W32AxRange : ITextRangeProvider {
         lo = start;
         hi = end;
         axdocfree(&d);
+        axtextlog(p, "Expand", lo, hi, axunitname(unit), LLONG_MIN, LLONG_MIN, LLONG_MIN);
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE FindAttribute(TEXTATTRIBUTEID, VARIANT, BOOL, ITextRangeProvider **out) override
@@ -1545,6 +1600,7 @@ struct W32AxRange : ITextRangeProvider {
             }
         }
         axdocfree(&d);
+        axtextlog(p, "FindText", lo, hi, back ? "back" : "forward", n, found, LLONG_MIN);
         if (found >= 0) {
             *out = axrange(p, found, found+n);
             return *out ? S_OK : E_OUTOFMEMORY;
@@ -1646,6 +1702,7 @@ struct W32AxRange : ITextRangeProvider {
         }
         *out = SysAllocStringLen((wchar_t const *)d.s+lo, (UINT)(n>0 ? n : 0));
         axdocfree(&d);
+        axtextlog(p, "GetText", lo, hi, 0, max, LLONG_MIN, n);
         return *out ? S_OK : E_OUTOFMEMORY;
     }
     // An endpoint moved count units: the units moved, as far as the text
@@ -1684,6 +1741,7 @@ struct W32AxRange : ITextRangeProvider {
             hi = lo==d.len ? d.len : hi;
         }
         axdocfree(&d);
+        axtextlog(p, "Move", lo, hi, axunitname(unit), count, LLONG_MIN, *out);
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE MoveEndpointByUnit(TextPatternRangeEndpoint ep, TextUnit unit, int count,
@@ -1698,6 +1756,8 @@ struct W32AxRange : ITextRangeProvider {
         *out = step(&d, &at, unit, count);
         setend(ep, at);
         axdocfree(&d);
+        axtextlog(p, ep==TextPatternRangeEndpoint_Start ? "MoveStartBy" : "MoveEndBy", lo, hi,
+                  axunitname(unit), count, LLONG_MIN, *out);
         return S_OK;
     }
     // One endpoint set: past the other, the other comes along
@@ -1719,6 +1779,8 @@ struct W32AxRange : ITextRangeProvider {
         }
         W32AxRange *o = of(r);
         setend(ep, rep==TextPatternRangeEndpoint_Start ? o->lo : o->hi);
+        axtextlog(p, ep==TextPatternRangeEndpoint_Start ? "SetStartTo" : "SetEndTo", lo, hi,
+                  axepname(rep), LLONG_MIN, LLONG_MIN, LLONG_MIN);
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE Select() override
@@ -1730,13 +1792,15 @@ struct W32AxRange : ITextRangeProvider {
         int live = d.info.live;
         axdocfree(&d);
         if (!live) {
+            axtextlog(p, "Select", lo, hi, "refused: no keyboard", LLONG_MIN, LLONG_MIN, LLONG_MIN);
             return UIA_E_INVALIDOPERATION;  // a field without the keyboard
         }
         W32AxHooks *h = &p->w->hooks.ax;
-        return h->textselect(p->w->hooks.gui, p->key, lo, hi) ? S_OK : UIA_E_INVALIDOPERATION;
+        return h->textselect(p->w->hooks.gui, p->key, lo, hi) ? S_OK : UIA_E_INVALIDOPERATION;  // logged
     }
     HRESULT STDMETHODCALLTYPE AddToSelection() override
     {
+        axtextlog(p, "AddToSelection", lo, hi, "refused", LLONG_MIN, LLONG_MIN, LLONG_MIN);
         return UIA_E_INVALIDOPERATION;  // one selection
     }
     HRESULT STDMETHODCALLTYPE RemoveFromSelection() override
