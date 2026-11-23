@@ -433,6 +433,7 @@ static void w32axtrace(W32Gui *w, UINT msg, WPARAM wp, LPARAM lp)
     case WM_INPUTLANGCHANGE:
     case WM_KEYDOWN: case WM_KEYUP: case WM_SYSKEYDOWN: case WM_SYSKEYUP:
     case WM_CHAR: case WM_UNICHAR:
+    case WM_LBUTTONDOWN: case WM_RBUTTONDOWN:
         break;
     default:
         return;
@@ -522,6 +523,20 @@ static void w32axtrace(W32Gui *w, UINT msg, WPARAM wp, LPARAM lp)
         axlput(&l, "WM_INPUTLANGCHANGE hkl ");
         axlputx(&l, (unsigned long long)(ULONG_PTR)lp);
         break;
+    case WM_LBUTTONDOWN:
+    case WM_RBUTTONDOWN: {
+        // Where a click landed, in window pixels as a press's rectangle
+        // is logged: a speech tool's "click N" may click, not invoke
+        POINT       pt = {(short)LOWORD(lp), (short)HIWORD(lp)};
+        char const *from;
+        axsource(&from);
+        axlput(&l, msg==WM_LBUTTONDOWN ? "WM_LBUTTONDOWN " : "WM_RBUTTONDOWN ");
+        axlputn(&l, pt.x);
+        axlput(&l, ",");
+        axlputn(&l, pt.y);
+        axlput(&l, " from ");
+        axlput(&l, from);
+    } break;
 
     default: {
         // Keys and characters: only those not from the keyboard itself
@@ -4115,6 +4130,15 @@ static int hookaxact(void *p, unsigned key, int kind)
             print(&b, axrolenames[t->nodes[i].role]);
             putbyte(&b, ' ');
             axlogstr(&b, t->nodes[i].name);
+            AxRect r = t->nodes[i].rect;  // window pixels: which of rows named alike
+            print(&b, " at ");
+            print(&b, (i64)r.x0);
+            putbyte(&b, ',');
+            print(&b, (i64)r.y0);
+            putbyte(&b, ' ');
+            print(&b, (i64)(r.x1 - r.x0));
+            putbyte(&b, 'x');
+            print(&b, (i64)(r.y1 - r.y0));
         } else {
             print(&b, "(gone)");
         }
