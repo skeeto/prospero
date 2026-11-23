@@ -24511,6 +24511,15 @@ static DriveOp a11yops[] = {
     {OP_A11Y, 0, 0, 0, 0, "uia hit Button Send"},
     {OP_A11Y, 0, 0, 0, 0, "uia has Group Transcript"},
     {OP_A11Y, 0, 0, 0, 0, "uia parent MenuBar MenuItem Help"},
+    // Dictation's "new line": an Enter just after its commit is a new
+    // line, not a send
+    {OP_TEXT, 0, 0, 0, 300, "spoken"},
+    {OP_A11Y, 0, 0, 0, 300, "uia newline"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "spoken\n"},
+    {OP_A11Y, 0, 0, 0, 0, "logged Enter just after a commit: a new line, not sent"},
+    SELALL,
+    KEY(GKEY_BACKSPACE, 0, 300),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
     // Send, invoked through its provider: the press reaches the app
     {OP_TEXT, 0, 0, 0, 300, "UIA"},
     {OP_A11Y, 0, 0, 0, 500, "uia press Button Send"},

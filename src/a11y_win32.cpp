@@ -234,6 +234,43 @@ static char const *axvkname(WPARAM vk)
     return 0;
 }
 
+// Dictation's "new line" (Voice Access's, Win+H's): its words committed
+// through the input method, then, a few milliseconds later, an Enter
+// that says it came from the keyboard, which would send the prompt. No
+// one presses Enter that soon after a commit (an input method's own
+// Enter comes before its commit), so an Enter that soon is a new line:
+// a newline character for ImGui, the key itself kept from it. Returns
+// whether msg was taken.
+enum { W32AX_SPEECHENTER_MS = 150 };
+static DWORD axcommitat;
+static int   axcommitted;
+
+static int w32axspeechkey(W32Gui *w, HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    if (msg==WM_IME_COMPOSITION && (lp & GCS_RESULTSTR)) {
+        axcommitat  = GetTickCount();
+        axcommitted = 1;
+        return 0;
+    } else if (msg!=WM_KEYDOWN || wp==VK_PROCESSKEY || wp==VK_PACKET) {
+        return 0;
+    }
+    int soon = axcommitted && GetTickCount()-axcommitat < W32AX_SPEECHENTER_MS;
+    axcommitted = 0;
+    if (!soon || wp!=VK_RETURN || (lp & (1<<30)) || GetKeyState(VK_SHIFT)<0 ||
+            GetKeyState(VK_CONTROL)<0 || GetKeyState(VK_MENU)<0) {
+        return 0;
+    }
+    ImGui_ImplWin32_WndProcHandler(hwnd, WM_CHAR, '\n', 1);
+    w->hooks.input(w->hooks.gui, W32IN_TEXT);
+    W32AxHooks *h = &w->hooks.ax;
+    if (h->logging && (h->logging(w->hooks.gui) & W32AXLOG_ON)) {
+        W32AxLine l = {};
+        axlput(&l, "Enter just after a commit: a new line, not sent");
+        axsend(w, &l);
+    }
+    return 1;
+}
+
 // Log msg, if it is one a speech tool sends and the core logs: before
 // it is handled, so the text model is still as the message found it.
 static void w32axtrace(W32Gui *w, UINT msg, WPARAM wp, LPARAM lp)
@@ -1411,7 +1448,7 @@ extern "C" void w32gui_axdrive(void *gp, char const *cmd, int len, char *out, in
     char const *verb = s;
     while (s<e && *s!=' ') s++;
     int vlen = (int)(s - verb);
-    int want = axeq(verb, vlen, "start") ? 0
+    int want = axeq(verb, vlen, "start") || axeq(verb, vlen, "newline") ? 0
              : axeq(verb, vlen, "can") || axeq(verb, vlen, "parent") ||
                axeq(verb, vlen, "value") || axeq(verb, vlen, "setvalue") ? 2 : 1;
     for (; nwords < want; nwords++) {
@@ -1434,6 +1471,17 @@ extern "C" void w32gui_axdrive(void *gp, char const *cmd, int len, char *out, in
         // another process: here, only that the root was made counts
         SendMessageW(w->hwnd, WM_GETOBJECT, 0, (LPARAM)UiaRootObjectId);
         axlput(&l, w32ax.root && w32ax.asked ? "ok" : "no root made");
+        axout(out, cap, &l);
+        return;
+    }
+    if (axeq(verb, vlen, "newline")) {
+        // As dictation's "new line" comes: a commit, then Enter (posted,
+        // as the checklist's keys are, though dictation's say keyboard)
+        PostMessageW(w->hwnd, WM_IME_COMPOSITION, 0, GCS_RESULTSTR);
+        UINT scan = MapVirtualKeyW(VK_RETURN, MAPVK_VK_TO_VSC);
+        PostMessageW(w->hwnd, WM_KEYDOWN, VK_RETURN, 1 | (LPARAM)scan<<16);
+        PostMessageW(w->hwnd, WM_KEYUP, VK_RETURN, 1 | (LPARAM)scan<<16 | (LPARAM)3<<30);
+        axlput(&l, "ok");
         axout(out, cap, &l);
         return;
     }

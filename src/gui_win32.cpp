@@ -641,6 +641,9 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     if (h->drive && (msg==WM_MOUSELEAVE || msg==WM_NCMOUSELEAVE)) {
         return 0;
     }
+    if (w32axspeechkey(w, hwnd, msg, wp, lp)) {
+        return 0;
+    }
     if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wp, lp)) {
         return 1;
     }
