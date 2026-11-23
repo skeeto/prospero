@@ -585,6 +585,12 @@ static void w32axtrace(W32Gui *w, UINT msg, WPARAM wp, LPARAM lp)
             }
             axlput(&l, " scan ");
             axlputx(&l, (lp >> 16) & 0x1ff);
+            // What SendInput's caller may tag its keys with, and the
+            // flags: to tell a speech tool's Enter from the user's
+            axlput(&l, " extra ");
+            axlputx(&l, (unsigned long long)(ULONG_PTR)GetMessageExtraInfo());
+            axlput(&l, " lp ");
+            axlputx(&l, (unsigned long long)(DWORD)lp);
         }
         axlput(&l, " from ");
         axlput(&l, from);
