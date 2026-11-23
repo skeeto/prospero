@@ -2,8 +2,9 @@
 //
 // A reference is a Markdown link's destination as models write them and
 // as Claude Desktop takes them: a path, relative or not, or a file: URL,
-// then maybe a line or a range, after "#L" or ":", or a heading's slug
-// after "#". fileref parses one without touching any file system.
+// then maybe a line or a range, after "#L" or ":" (or a list after
+// ":", "a.c:10-12,20", taken as its first), or a heading's slug after
+// "#". fileref parses one without touching any file system.
 // filepath resolves it on the session's host, against its working
 // directory and home, and refuses what must not be opened: network
 // paths, other users' homes, and for a reference nobody asked about
@@ -99,12 +100,45 @@ static FrefLines freffrag(Str f)
     return r;
 }
 
+// The length of the ",N" and ",A-B" lines and ranges trailing more
+// digits ("10-12,20,30-40"), 0 if none.
+static iz frefmore(Str s)
+{
+    iz at = s.len;
+    for (;;) {
+        iz j = at;
+        for (; j>0 && digit(s[j-1]); j--) {}
+        if (j<at && j>0 && s[j-1]=='-') {
+            iz k = j - 1;
+            for (j = k; j>0 && digit(s[j-1]); j--) {}
+            if (j == k) {
+                break;
+            }
+        }
+        if (j==at || j<2 || s[j-1]!=',' || !digit(s[j-2])) {
+            break;
+        }
+        at = j - 1;
+    }
+    return s.len - at;
+}
+
 // The length of a trailing ":N", ":N:C" or ":A-B", each maybe with a
 // stray ':' after, or of a stray ':' alone; 0 if none, or if all left
-// before it is one letter (a drive). Its lines in *out, ok if any.
+// before it is one letter (a drive). A ":N" or ":A-B" may list more
+// after commas (":10-12,20"), of which only the first is kept. Its
+// lines in *out, ok if any.
 static iz frefsuffix(Str s, FrefLines *out)
 {
     *out = {};
+    if (iz more = frefmore(s)) {
+        FrefLines l = {};
+        iz        n = frefsuffix(cuttail(s, more), &l);
+        if (l.ok && !l.col) {
+            *out = l;
+            return n + more;
+        }
+    }
     iz end = s.len;
     end -= end && s[end-1]==':';
     iz j = end;
