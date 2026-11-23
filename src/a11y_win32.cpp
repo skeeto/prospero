@@ -2117,35 +2117,60 @@ static void axhitlog(W32AxProv *p, double x, double y)
 // answer, while the log is read: a set of (key, id), let go when full
 static void axasked(W32AxProv *p, int pattern, int id, VARIANT const *v, int has)
 {
+    // Logged the first time, and again whenever the answer changes: a
+    // tool may decide from a state it saw once (disabled, read-only)
     enum { SEEN = 1<<14 };
     static unsigned long long seen[SEEN];
+    static unsigned long long said[SEEN];
     static int                nseen;
     W32Gui     *w = p->w;
     W32AxHooks *h = w ? &w->hooks.ax : 0;
     if (!h || !h->logging || !(h->logging(w->hooks.gui) & W32AXLOG_ON)) {
         return;
     }
+    unsigned long long answer = 0x100;  // a digest of the answer
+    if (pattern) {
+        answer = has ? 1 : 0;
+    } else if (v && v->vt==VT_BOOL) {
+        answer = 0x200 | (v->boolVal ? 1u : 0u);
+    } else if (v && v->vt==VT_I4) {
+        answer = 0x300ull<<32 | (unsigned)v->lVal;
+    } else if (v && v->vt==VT_BSTR) {
+        answer = 0x400;
+        UINT n = SysStringLen(v->bstrVal);
+        for (UINT j = 0; j < n; j++) {
+            answer = (answer ^ v->bstrVal[j]) * 1111111111111111111u;
+        }
+    } else if (v) {
+        answer = 0x500u | v->vt;
+    }
     unsigned long long k = (unsigned long long)p->key<<32 | (unsigned)id<<1 | (pattern!=0);
     unsigned long long hash = (k + 1) * 0x9e3779b97f4a7c15u;
     int i = (int)(hash >> 50);
     for (; seen[i]; i = (i+1) & (SEEN-1)) {
         if (seen[i] == k+1) {
-            return;
+            break;
         }
     }
-    if (nseen >= SEEN/2) {
-        memset(seen, 0, sizeof(seen));
-        nseen = 0;
-        i = (int)(hash >> 50);
+    if (seen[i] == k+1) {
+        if (said[i] == answer) {
+            return;
+        }
+    } else {
+        if (nseen >= SEEN/2) {
+            memset(seen, 0, sizeof(seen));
+            nseen = 0;
+            i = (int)(hash >> 50);
+        }
+        seen[i] = k + 1;
+        nseen++;
     }
-    seen[i] = k + 1;
-    nseen++;
+    said[i] = answer;
 
     W32AxLine l = {};
     axlput(&l, "ask ");
     axdescribe(&l, p);
     char const *name = pattern ? axpatname(id) : axpropname(id);
-        axlput(&l, "root");
 
     axlput(&l, pattern ? " pattern " : " ");
     if (name) {
