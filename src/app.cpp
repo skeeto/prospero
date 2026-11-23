@@ -18825,6 +18825,16 @@ static DriveOp m3ops[] = {
     {OP_CHECK, CHK_FILEPATH, 0, 0, 0, "/cite/hello.c"},
     {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "7-7"},
     {OP_CHECK, CHK_FILELINE, 7, 0, 0, ""},
+    // A list of lines after commas: each a link of its own, to the
+    // same file at its own lines
+    {OP_CHECK, CHK_FILELINK, 1, 0, 0, "cite/hello.c:3"},
+    {OP_CHECK, CHK_FILELINK, 1, 0, 0, "cite/hello.c:30-32"},
+    {OP_MOVE, T_NAMED, 0, 0, 800, "codelink cite/hello.c:30-32"},
+    {OP_CHECK, CHK_LINKTIP, 0, 0, 0, "Files \xe2\x86\x92 cite/hello.c:30-32"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEBAND, 1, 0, 0, "30-32"},
     // A tool row's path opens its file: a read's at the lines it read,
     // while a click elsewhere on its header still folds the row
     {OP_PROMPT, 0, 0, 0, 1500, "Read the cited lines."},

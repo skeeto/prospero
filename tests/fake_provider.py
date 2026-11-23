@@ -3518,6 +3518,7 @@ def sc_gui(model, n, req):
                               "- [not there](cite/nothere.c:3)\n"
                               "- [mail](mailto:someone@example.com)\n"
                               "- in code, `cite/hello.c:7` and `cite/nothere.c:2`\n"
+                              "- in code with a list, `cite/hello.c:3,30-32`\n"
                               "- through links: `files/out/null`, `files/pipe` "
                               "and `files/in.c`\n")
     elif "Link the far file" in prompt:

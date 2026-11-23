@@ -1082,6 +1082,7 @@ static void drawblock(Gui *g, Arena scratch, ImDrawList *dl, ImDrawListSplitter 
     b32 selected = !poseq(sel.beg, sel.end) && sel.beg.msg<=msg && msg<=sel.end.msg;
     i32 candat   = -1;  // the last candidate piece looked up, and whether a link
     b32 candlink = 0;
+    Str candref  = {};  // and the reference it is
     i32 s0 = sel.beg.msg<msg ? 0 : sel.beg.off;
     i32 s1 = sel.end.msg>msg ? 0x7fffffff : sel.end.off;
     for (iz li = 0; li < bl->lines.len; li++) {
@@ -1144,6 +1145,7 @@ static void drawblock(Gui *g, Arena scratch, ImDrawList *dl, ImDrawListSplitter 
                 DocCand *c = from ? doccand(d, pc) : 0;
                 candat   = r->piece;
                 candlink = c && codelinkdrawn(g, scratch, from, c->text);
+                candref  = c ? c->text : Str{};
             }
             b32          cand = pc->flags&PIECE_CAND && candlink;
             ImFontBaked *bk   = stylebaked(f, pc->style);
@@ -1179,9 +1181,10 @@ static void drawblock(Gui *g, Arena scratch, ImDrawList *dl, ImDrawListSplitter 
                 namedrect(g, concat(&a, "link ", d->links[pc->link]),
                           v2(ox+r->x, ly), v2(ox+r->x+r->w, ly+l->h));
             } else if (g->drive && cand) {
-                // Inline code, found a file: "codelink " and its text
+                // Inline code, found a file: "codelink " and the
+                // reference it is
                 Arena a = scratch;
-                namedrect(g, concat(&a, "codelink ", pc->text),
+                namedrect(g, concat(&a, "codelink ", candref),
                           v2(ox+r->x, ly), v2(ox+r->x+r->w, ly+l->h));
             }
         }

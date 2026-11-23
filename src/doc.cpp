@@ -719,7 +719,10 @@ static int mdenterspan(MD_SPANTYPE type, void *detail, void *ud)
 }
 
 // A code span just closed: a candidate if it is one piece of source
-// text, outside any link, that codepath says may name a file.
+// text, outside any link, that codepath says may name a file. Lines
+// listed after commas ("a.c:10-12,20") are each a candidate of their
+// own, a piece naming the same file at those lines ("a.c:20"), and the
+// commas between are not.
 static void codecand(DocParse *p)
 {
     Doc *d = p->doc;
@@ -732,9 +735,48 @@ static void codecand(DocParse *p)
     if (pc->flags&PIECE_SYNTH || pc->len!=pc->text.len || !codepath(pc->text)) {
         return;
     }
+
+    Str       text = pc->text;
+    FrefLines l    = {};
+    iz        more = frefmore(text);
+    iz        suf  = more ? frefsuffix(text, &l) : 0;
+    if (!l.ok || suf<=more) {
+        more = 0;
+    }
+    Str path = cuttail(text, suf);  // its ':' and lines dropped
+    Str rest = cuthead(text, text.len-more);
+
+    Piece last = *pc;
     pc->flags |= PIECE_CAND;
-    DocCand c = {pc->off, pc->len, pc->text};
-    d->cands  = push(p->perm, d->cands, c);
+    if (more) {
+        pc->flags &= (u8)~PIECE_KBD1;  // the last piece's
+    }
+    pc->len    = (i32)(text.len - more);
+    pc->text   = takehead(text, pc->len);
+    d->cands   = push(p->perm, d->cands, DocCand{pc->off, pc->len, pc->text});
+
+    while (rest.len) {
+        Cut c   = cut(cuthead(rest, 1), ',');  // past its comma
+        i32 off = last.off + (i32)(rest.data - text.data);
+
+        Piece comma = last;
+        comma.flags = 0;
+        comma.off   = off;
+        comma.len   = 1;
+        comma.text  = takehead(rest, 1);
+        addpiece(p, comma);
+
+        Piece lines = last;
+        lines.flags = PIECE_CAND | (c.ok ? 0 : last.flags&PIECE_KBD1);
+        lines.off   = off + 1;
+        lines.len   = (i32)c.head.len;
+        lines.text  = c.head;
+        addpiece(p, lines);
+
+        Str ref  = concat(p->perm, concat(p->perm, path, ":"), c.head);
+        d->cands = push(p->perm, d->cands, DocCand{lines.off, lines.len, ref});
+        rest     = c.ok ? cuthead(rest, 1+c.head.len) : Str{};
+    }
 }
 
 // The candidate a PIECE_CAND piece is, else null.

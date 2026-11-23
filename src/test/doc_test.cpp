@@ -477,5 +477,31 @@ static void test_doc(Test *t)
         expect(t, "doc.cands.none", istr(&a, g->cands.len), "0");
     }
 
+    // Lines listed after commas: each a candidate of its own, the same
+    // file at those lines, the commas between not
+    {
+        Arena a   = perm;
+        Str   src = "At `src/m.cpp:465-468,515-517,9` and `a/b.c:3,x`.\n";
+        Doc  *d   = parsedoc(&a, src, 0);
+        Buf   b(&a, 128);
+        for (iz i = 0; i < d->cands.len; i++) {
+            DocCand *c = &d->cands[i];
+            print(&b, i ? Str(" ") : Str(""));
+            print(&b, c->text);
+            putbyte(&b, '@');
+            print(&b, (i64)c->off);
+            putbyte(&b, '+');
+            print(&b, (i64)c->len);
+        }
+        expect(t, "doc.candlist", finish(&b),
+               "src/m.cpp:465-468@4+17 src/m.cpp:515-517@22+7 src/m.cpp:9@30+1 a/b.c:3,x@38+9");
+        expect(t, "doc.candlist.check", doccheck(&a, d), "");
+        expect(t, "doc.candlist.comma", istr(&a, doccand(d, &d->pieces[2])!=0), "0");
+        expect(t, "doc.candlist.second", doccand(d, &d->pieces[3])->text, "src/m.cpp:515-517");
+        expect(t, "doc.candlist.third", doccand(d, &d->pieces[5])->text, "src/m.cpp:9");
+        expect(t, "doc.candlist.show", docshow(&a, d),
+               "P: At |c:src/m.cpp:465-468|c:,|c:515-517|c:,|c:9| and |c:a/b.c:3,x|.\n");
+    }
+
     test_docsource(t);
 }
