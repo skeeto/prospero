@@ -52,7 +52,7 @@ there too.
   sessions, and goes when Prospero quits.
 - <kbd>Ctrl+Shift+S</kbd>: fold, or show again, all of the session's shell
   output (the Shell output button above the transcript, the Bash
-  logo), short output too, leaving its other tool rows as they were.
+  logo), short output too, and grep's, leaving its other tool rows as they were.
 - <kbd>Ctrl+Shift+T</kbd>: open, or fold again, all of the session's tool
   output (the Tool output button above the transcript, a wrench and
   screwdriver).

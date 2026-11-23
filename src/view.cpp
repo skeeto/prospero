@@ -50,7 +50,7 @@
 // apply to every row. A row the user opened or closed keeps that, through
 // its end too. A session's own toggles (viewshowtools, viewshowthink)
 // open every row of their kind, hidden reasoning included, and another
-// (viewfoldshell) folds every shell row, over the tools toggle too,
+// (viewfoldshell) folds every shell and grep row, over the tools toggle too,
 // each until turned off, leaving the configuration alone.
 //
 // A search (ViewSearch) finds text in what the messages show, as copied
@@ -862,6 +862,14 @@ static b32 toolauto(ViewMsg *m)
            t->name=="web_search" || t->name=="web_fetch" || t->name=="read_terminal";
 }
 
+// Whether a tool row's output is a command's, which the session's Shell
+// output toggle folds: a shell command's, and grep's, its matches as
+// they would print.
+static b32 toolshellish(ViewTool *t)
+{
+    return t->name=="shell" || t->name=="grep";
+}
+
 // Whether a tool row folds: as the user chose, else as the session's
 // toggle or [ui] tools says. Arguments still arriving have no body yet,
 // and a skill's instructions, pages the agent reads, stay folded but
@@ -875,7 +883,7 @@ static b32 toolfolded(View *v, ViewMsg *m)
         return 1;
     } else if (t->name=="skill" && !(t->ended && t->status!=VTOOL_OK)) {
         return 1;
-    } else if (v->foldshell && t->name=="shell") {
+    } else if (v->foldshell && toolshellish(t)) {
         return 1;
     } else if (v->showtools) {
         return 0;
@@ -1250,7 +1258,7 @@ static b32 viewshowtools(View *v, b32 on)
     return 1;
 }
 
-// The session's toggle: every shell row folded, or else as the setting
+// The session's toggle: every shell and grep row folded, or else as the setting
 // and the tools toggle say. Returns whether anything changed.
 static b32 viewfoldshell(View *v, b32 on)
 {

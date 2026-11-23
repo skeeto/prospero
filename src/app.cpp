@@ -25939,7 +25939,7 @@ static b32 shellas(View *v)
         if (m->role!=VIEW_TOOL || m->chosen || m->prov) {
             continue;
         }
-        b32 shell = m->tool->name == "shell";
+        b32 shell = toolshellish(m->tool);
         opened += shell && !toolauto(m);
         if (m->collapsed != (shell ? 1 : toolauto(m))) {
             return 0;

@@ -2137,6 +2137,27 @@ static void test_viewtranscript(Test *t)
         expect(t, "toggle.off", foldshow(&a, v), "h;f*;f*;f*;");
     }
 
+    // The Shell output toggle folds grep's rows too, short ones as well,
+    // and leaves other tools' rows as they were
+    {
+        Str rs[] = {
+            R"({"sid":"s","seq":1,"ts":0,"ev":"tool.start","call":"g","name":"grep","args":"{}"})",
+            R"({"sid":"s","seq":2,"ts":0,"ev":"tool.end","call":"g","status":"ok","text":"a.c:1:x"})",
+            R"({"sid":"s","seq":3,"ts":0,"ev":"tool.start","call":"h","name":"shell","args":"{}"})",
+            R"({"sid":"s","seq":4,"ts":0,"ev":"tool.end","call":"h","status":"ok","text":"ok"})",
+            R"({"sid":"s","seq":5,"ts":0,"ev":"tool.start","call":"l","name":"glob","args":"{}"})",
+            R"({"sid":"s","seq":6,"ts":0,"ev":"tool.end","call":"l","status":"ok","text":"a.c"})",
+        };
+        Arena a = perm;
+        View *v = testview(&a);
+        for (iz i = 0; i < countof(rs); i++) apply(v, a, rs[i]);
+        expect(t, "foldshell.off", foldshow(&a, v), "o;o;o;");
+        viewfoldshell(v, 1);
+        expect(t, "foldshell.on", foldshow(&a, v), "f;f;o;");
+        viewfoldshell(v, 0);
+        expect(t, "foldshell.back", foldshow(&a, v), "o;o;o;");
+    }
+
     // A skill's instructions fold in every mode and with the toggle on,
     // but a failure to load one shows, and the user may open it
     {

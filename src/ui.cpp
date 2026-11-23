@@ -3961,7 +3961,7 @@ static void drawsessbar(Gui *g)
         setsessionshell(g, s, !v->foldshell);
     }
     itemrect(g, RECT_SHELLBTN);
-    itemtip("Shell output: %s\n\nFold every shell command's output in this session, "
+    itemtip("Shell output: %s\n\nFold every shell command's and grep's output in this session, "
             "or show it again as the settings say (%s)",
             v->foldshell ? "on, all of it folded" : "off, as the settings say",
             shortcutname(g, 2));

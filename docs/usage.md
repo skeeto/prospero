@@ -25,7 +25,7 @@ out of the transcript (the session log keeps it, and the model still
 gets it back). Tool rows fold by kind and outcome, or all of
 them with `[ui] tools = fold` or `open`. Above the transcript, a session's
 Shell output button (the Bash logo) folds every shell command's output,
-short ones too, and its Tool output and Reasoning buttons (a wrench and
+and grep's, short ones too, and its Tool output and Reasoning buttons (a wrench and
 screwdriver, a light bulb) open everything, each for that session alone. Cmd/Ctrl+F finds text
 in what the transcript shows, as shown rather than its Markdown, not in folded rows, and a code block's Copy button
 copies its code exactly. A block of the agent's tagged with a shell (`sh`,
