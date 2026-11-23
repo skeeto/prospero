@@ -31,7 +31,8 @@ here... in a host's menu in the sidebar, opens the New session dialog:
   later sessions while the endpoint still lists it.
 - **Role**, when the configuration has roles: start in one, with its
   instructions, model and tools (see [Subagents](help:jobs)). A
-  session with a role cannot use Plan mode.
+  session with a role starts outside Plan mode, and may use it only if
+  the role's tools name `exit_plan_mode`.
 - **Plan mode**: start in Plan mode (below).
 
 Once the session is made, the prompt box has the keyboard, so its first

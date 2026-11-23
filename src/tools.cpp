@@ -63,7 +63,8 @@ static Str toolnames[] = {
 static_assert(countof(toolnames) == TOOL_COUNT);
 
 // Tools a session lacks unless something offers them: the desktop.
-// Plan mode's are the user's own sessions', never a role's. Memory is
+// Plan mode's are the user's own sessions', and a role's only when its
+// tools name them ("*" and "default" do not). Memory is
 // offered only to sessions that have it (engine.cpp), whatever else
 // their tools say. The web's are offered only as [web] says (webdeny).
 // Questions to the user likewise: only the engine offers ask_user, to

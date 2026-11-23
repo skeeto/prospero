@@ -64,6 +64,13 @@ those a role has when it names none (every tool but desktop), and
 tool, and `tools = * -shell` gives every tool but the shell. The New
 session dialog's Role starts a session in a role, too.
 
+Plan mode's tools come only by name, never with `*` or `default`.
+With `exit_plan_mode`, a session in the role may use Plan mode: turn
+it on with `/plan` or the mode list once it starts. With
+`enter_plan_mode` as well, its agent may ask to plan first. So
+`tools = default exit_plan_mode enter_plan_mode`. A subagent never
+plans on its own, whatever its role says.
+
 A role's `prompt` is added to the system prompt. A longer one can go
 in a file, `prompt_file = roles/writer.md`, relative to the
 configuration file that sets it (or absolute, or under `~`), added

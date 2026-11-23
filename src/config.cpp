@@ -463,11 +463,13 @@ static CfgKey cfgschema[] = {
      "Model for the role, MODEL or ENDPOINT/MODEL, by default the "
      "session's, or for a subagent its parent's [model] subagent_model, "
      "else the parent's own"},
-    {"role", "tools", CFG_LIST, TOOLS_DEFAULT, {}, TOOLS_DEFAULT " desktop * default",
+    {"role", "tools", CFG_LIST, TOOLS_DEFAULT, {}, TOOLS_DEFAULT " desktop enter_plan_mode exit_plan_mode * default",
      "role", "Tools the role may use, read left to right: * is every tool, "
      "default those a role has unless it says, and -NAME takes one away, "
      "as in \"default desktop\" or \"* -shell\"; desktop also needs "
-     "[desktop] offer. MCP tools come with a role that names no tools; "
+     "[desktop] offer. Plan mode's tools come only by name: "
+     "exit_plan_mode lets you plan in the role's sessions, and "
+     "enter_plan_mode lets its agent ask to. MCP tools come with a role that names no tools; "
      "one that does names them, mcp__SERVER for a server's every tool or "
      "mcp__SERVER__TOOL for one, or * for all"},
 

@@ -18864,7 +18864,7 @@ static void putroles(Engine *e, JsonOut *w)
         putkey(w, "tools");
         putarray(w);
         for (i32 t = 0; t < TOOL_COUNT; t++) {
-            if (!(r.deny>>t & 1) && !((u32)(TOOL_PLANMASK|TOOL_ASKMASK)>>t & 1)) {
+            if (!(r.deny>>t & 1) && !((u32)TOOL_ASKMASK>>t & 1)) {
                 putstr(w, toolnames[t]);
             }
         }
@@ -18894,7 +18894,7 @@ static void taskroles(Engine *e, Arena *perm, Arena scratch, ToolEnv *te)
         print(&text, " (tools:");
         b32 any = 0;
         for (i32 t = 0; t < TOOL_COUNT; t++) {
-            if (!(r.deny>>t & 1)) {
+            if (!(r.deny>>t & 1) && !((u32)TOOL_PLANMASK>>t & 1)) {
                 print(&text, any ? Str(", ") : Str(" "));
                 print(&text, toolnames[t]);
                 any = 1;

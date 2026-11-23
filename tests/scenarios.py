@@ -5567,6 +5567,8 @@ tools = default desktop
 tools = * -shell, -job_kill
 [role odd]
 tools = read -bogus
+[role planner]
+tools = default exit_plan_mode
 """
 
 
@@ -5575,13 +5577,14 @@ def role_words(t):
     """A role's tools read left to right: * is every tool, default those
     of a role that names none, and -NAME takes one away. config.get lists
     the roles, built-in ones first, with the tools each gives, and a new
-    session takes one."""
+    session takes one. Plan mode's tools come only by name, and then the
+    session may plan."""
     h = t.headless(env=deskenv(t))
     try:
         h.call("hello", proto=0, client="scenarios")
         cfg = h.call("config.get")
         roles = {r["name"]: r for r in cfg.get("roles", [])}
-        t.check(list(roles) == ["explore", "general", "every", "gui", "lean", "odd"],
+        t.check(list(roles) == ["explore", "general", "every", "gui", "lean", "odd", "planner"],
                 f"roles {list(roles)}")
         default = ["read", "write", "edit", "shell", "grep", "glob", "todo_write", "jobs",
                    "job_output", "job_kill", "task", "skill", "sessions", "send_message",
@@ -5595,9 +5598,21 @@ def role_words(t):
         t.check(roles["lean"]["tools"] == [x for x in every if x not in ("shell", "job_kill")],
                 f"* -shell, -job_kill {roles['lean']}")
         t.check(roles["odd"]["tools"] == ["read"], f"read -bogus {roles['odd']}")
+        t.check(roles["planner"]["tools"] == default[:12] + ["exit_plan_mode"] + default[12:],
+                f"default exit_plan_mode {roles['planner']}")
         diags = [d["message"] for d in cfg.get("diags", [])]
         t.check(any('unknown value "-bogus"' in d for d in diags) and
-                not any("-shell" in d or "-job_kill" in d for d in diags), f"diags {diags}")
+                not any("-shell" in d or "-job_kill" in d or '"exit_plan_mode",' in d for d in diags),
+                f"diags {diags}")
+
+        r = h.call("new", cwd=t.work, model=t.model, endpoint="fake", role="every", plan=1)
+        t.check(r.get("ok") == 0 and "exit_plan_mode" in r.get("err", ""),
+                f"* has no plan mode: {r}")
+        r = h.call("new", cwd=t.work, model=t.model, endpoint="fake", role="planner", plan=1)
+        t.check(r.get("ok") == 1, f"planner plans: {r}")
+        rec = h.all("session", r["sid"])[0]
+        t.check("exit_plan_mode" in rec["tools"] and "enter_plan_mode" not in rec["tools"],
+                f"planner's session {rec}")
 
         r = h.call("new", cwd=t.work, model=t.model, endpoint="fake", role="gui")
         t.check("sid" in r, f"new {r}")
