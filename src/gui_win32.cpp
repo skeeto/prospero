@@ -127,6 +127,9 @@ struct W32AxHooks {
     int  (*textat)(void *gui, unsigned key, float x, float y);
     // and select from anchor to caret in it, 0 if not live.
     int  (*textselect)(void *gui, unsigned key, int anchor, int caret);
+    // A text service's write (TSF): replace units [lo, hi) of the live
+    // field key with s, the caret after it; 0 if refused
+    int  (*textedit)(void *gui, unsigned key, int lo, int hi, unsigned short const *s, int n);
 };
 
 // Shared by both halves: the core's callbacks, called on the GUI thread.

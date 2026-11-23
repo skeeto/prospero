@@ -599,6 +599,8 @@ static void w32axtrace(W32Gui *w, UINT msg, WPARAM wp, LPARAM lp)
 // asks, so a window no tool looks at never loads it.
 
 #include <uiautomation.h>
+#include <msctf.h>
+#include <olectl.h>
 
 struct W32AxProv;
 
@@ -1446,12 +1448,29 @@ static void axdrop(int i)
     p->Release();
 }
 
-// The window goes: every provider with it
+// The TSF store, below
+struct W32Tsf;
+static void tsfstart(W32Gui *w);
+static void tsfgone(W32Gui *w);
+static void tsfsync(W32Tsf *t, int published);
+static struct {
+    ITfThreadMgr   *tm;
+    TfClientId      cid;
+    ITfDocumentMgr *dm, *prev;  // ours, and the window's before
+    ITfContext     *ctx;
+    TfEditCookie    ec;
+    W32Tsf         *store;
+    DWORD           editcookie;  // the checklist's edit sink, advised
+    int             edits;       // ends of edits it was told of
+} w32tsf;
+
+// The window goes: every provider with it, and the TSF store
 static void w32axgone(W32Gui *w)
 {
     if (!w32ax.dll || axw!=w) {
         return;
     }
+    tsfgone(w);
     if (w->hwnd) {
         w32ax.ret(w->hwnd, 0, 0, 0);
     }
@@ -1482,6 +1501,7 @@ static int w32axroot(W32Gui *w, WPARAM wp, LPARAM lp, LRESULT *out)
     if (!r) {
         return 0;
     }
+    tsfstart(w);
     *out = w32ax.ret(w->hwnd, wp, lp, static_cast<IRawElementProviderSimple *>(r));
     return 1;
 }
@@ -2154,8 +2174,966 @@ extern "C" void w32gui_axevents(void *gp, W32AxEvent const *ev, int n)
             axchildren(w32ax.root);
         }
     }
+    tsfsync(w32tsf.store, 1);
 }
 
+
+// TSF: a text store for the live field
+//
+// Voice Access edits text already in a field ("delete that", "correct
+// that") as a text service of TSF's, and only through a document of the
+// application's own, a text store; TSF's compatibility layer (CUAS),
+// which serves typing and commits for a window without one, gives it
+// nothing to edit (decisions.md, 2026-11-23). So while accessibility is
+// on, the window has one: a document manager with one context over this
+// store, associated with the window (AssociateFocus). Its document is
+// the live field's text in UTF-16 units, as the Text pattern has it; with
+// no live field, or one not editable, it is empty and read-only, and
+// text services leave keys alone.
+//
+// A text service's write becomes the core's edit (hooks.textedit), which
+// the shadow shows at once and ImGui takes at the next frame. A change
+// from anywhere else, typing or ImGui's own, is told to TSF after the
+// publish that shows it (tsfsync), as the change from the document TSF
+// was last told of. Locks are granted at once when free, a queued one
+// when the holder lets go; nothing is told to TSF while one is held.
+
+struct W32TsfDoc {
+    unsigned        key;        // the live field, 0 for none
+    int             readonly;
+    int             anchor, caret;
+    unsigned short *text;       // HeapAlloc'd, or null when empty
+    int             len;
+    RECT            at;         // the field, in screen pixels
+};
+
+static void tsffree(W32TsfDoc *d)
+{
+    if (d->text) {
+        HeapFree(GetProcessHeap(), 0, d->text);
+    }
+    *d = {};
+}
+
+// The document as it is now
+static void tsfload(W32Gui *w, W32TsfDoc *d)
+{
+    *d = {};
+    W32AxText info = {};
+    int len = axlivetext(w, &d->key, &info, &d->text);
+    if (len<0 || info.readonly) {
+        // Nothing a text service may edit, a password's text among it
+        if (d->text) {
+            HeapFree(GetProcessHeap(), 0, d->text);
+        }
+        *d = {};
+        d->readonly = 1;
+        GetClientRect(w->hwnd, &d->at);
+        MapWindowPoints(w->hwnd, 0, (POINT *)&d->at, 2);
+        return;
+    }
+    d->len    = len;
+    d->anchor = info.anchor;
+    d->caret  = info.caret;
+    W32AxNode n;
+    if (w->hooks.ax.node(w->hooks.gui, d->key, &n)) {
+        d->at = {(LONG)n.x0, (LONG)n.y0, (LONG)n.x1, (LONG)n.y1};
+        MapWindowPoints(w->hwnd, 0, (POINT *)&d->at, 2);
+    }
+}
+
+static void tsflog(W32Gui *w, char const *what, long long a, long long b, char const *tail)
+{
+    axlogf(w, what, a, b, tail);
+}
+
+static GUID const tsfthreadmgr =  // CLSID_TF_ThreadMgr
+    {0x529a9e6b, 0x6587, 0x4f23, {0xab, 0x9e, 0x9c, 0x7d, 0x68, 0x3e, 0x3c, 0x50}};
+
+
+struct W32Tsf : ITextStoreACP, ITfContextOwnerCompositionSink {
+    LONG               refs = 1;
+    W32Gui            *w;
+    ITextStoreACPSink *sink   = 0;
+    IUnknown          *sinkid = 0;  // its identity, to know it again
+    DWORD              mask   = 0;
+    DWORD              lock   = 0;  // TS_LF_READ or TS_LF_READWRITE, held
+    DWORD              queued = 0;  // asked for while held, granted after
+    int                composing = 0;
+    int                nolayout  = 0;  // answered TS_E_NOLAYOUT: tell later
+    int                syncing   = 0;  // telling TSF now: not again within
+    W32TsfDoc          told = {};      // the document as TSF knows it
+
+    explicit W32Tsf(W32Gui *gw) : w(gw) {}
+
+    int reading() { return (lock & TS_LF_READ) == TS_LF_READ; }
+    int writing() { return (lock & TS_LF_READWRITE) == TS_LF_READWRITE; }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void **out) override
+    {
+        if (IsEqualIID(id, __uuidof(IUnknown)) || IsEqualIID(id, __uuidof(ITextStoreACP))) {
+            *out = static_cast<ITextStoreACP *>(this);
+        } else if (IsEqualIID(id, __uuidof(ITfContextOwnerCompositionSink))) {
+            *out = static_cast<ITfContextOwnerCompositionSink *>(this);
+        } else {
+            *out = 0;
+            return E_NOINTERFACE;
+        }
+        AddRef();
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override
+    {
+        return (ULONG)InterlockedIncrement(&refs);
+    }
+    ULONG STDMETHODCALLTYPE Release() override
+    {
+        LONG r = InterlockedDecrement(&refs);
+        if (!r) {
+            tsffree(&told);
+            delete this;
+        }
+        return (ULONG)r;
+    }
+
+    HRESULT STDMETHODCALLTYPE AdviseSink(REFIID id, IUnknown *punk, DWORD m) override
+    {
+        if (!punk || !IsEqualIID(id, __uuidof(ITextStoreACPSink))) {
+            return E_INVALIDARG;
+        }
+        IUnknown *who = 0;
+        punk->QueryInterface(__uuidof(IUnknown), (void **)&who);
+        if (who && who==sinkid) {
+            mask = m;
+            who->Release();
+            return S_OK;
+        }
+        if (sink) {
+            if (who) who->Release();
+            return CONNECT_E_ADVISELIMIT;
+        }
+        if (FAILED(punk->QueryInterface(__uuidof(ITextStoreACPSink), (void **)&sink))) {
+            sink = 0;
+            if (who) who->Release();
+            return E_NOINTERFACE;
+        }
+        sinkid = who;
+        mask   = m;
+        tsffree(&told);
+        tsfload(w, &told);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE UnadviseSink(IUnknown *punk) override
+    {
+        IUnknown *who = 0;
+        if (punk) {
+            punk->QueryInterface(__uuidof(IUnknown), (void **)&who);
+        }
+        int ours = who && who==sinkid;
+        if (who) who->Release();
+        if (!ours) {
+            return CONNECT_E_NOCONNECTION;
+        }
+        sink->Release();
+        sinkid->Release();
+        sink   = 0;
+        sinkid = 0;
+        mask   = 0;
+        return S_OK;
+    }
+
+    HRESULT grant(DWORD f)
+    {
+        lock = f;
+        HRESULT r = sink->OnLockGranted(f);
+        lock = 0;
+        return r;
+    }
+    HRESULT STDMETHODCALLTYPE RequestLock(DWORD flags, HRESULT *hr) override;
+
+    HRESULT STDMETHODCALLTYPE GetStatus(TS_STATUS *s) override
+    {
+        if (!s) {
+            return E_INVALIDARG;
+        }
+        W32TsfDoc d;
+        tsfload(w, &d);
+        s->dwDynamicFlags = d.readonly ? TS_SD_READONLY : 0;
+        s->dwStaticFlags  = TS_SS_NOHIDDENTEXT;
+        tsffree(&d);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE QueryInsert(LONG lo, LONG hi, ULONG, LONG *a, LONG *b) override
+    {
+        if (!a || !b) {
+            return E_INVALIDARG;
+        }
+        W32TsfDoc d;
+        tsfload(w, &d);
+        int len = d.len;
+        tsffree(&d);
+        if (lo<0 || lo>hi || hi>len) {
+            return E_INVALIDARG;
+        }
+        *a = lo;
+        *b = hi;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetSelection(ULONG i, ULONG n, TS_SELECTION_ACP *sel,
+                                           ULONG *got) override
+    {
+        if (!sel || !got) {
+            return E_INVALIDARG;
+        }
+        *got = 0;
+        if (!reading()) {
+            return TS_E_NOLOCK;
+        }
+        if (i!=0 && i!=(ULONG)TS_DEFAULT_SELECTION) {
+            return E_INVALIDARG;
+        }
+        if (!n) {
+            return S_OK;
+        }
+        W32TsfDoc d;
+        tsfload(w, &d);
+        int lo = d.anchor<d.caret ? d.anchor : d.caret;
+        int hi = d.anchor<d.caret ? d.caret : d.anchor;
+        sel[0].acpStart           = lo;
+        sel[0].acpEnd             = hi;
+        sel[0].style.ase          = d.caret<d.anchor ? TS_AE_START : TS_AE_END;
+        sel[0].style.fInterimChar = FALSE;
+        *got = 1;
+        tsffree(&d);
+        tsflog(w, "TSF GetSelection", lo, hi, 0);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE SetSelection(ULONG n, TS_SELECTION_ACP const *sel) override
+    {
+        if (!writing()) {
+            return TS_E_NOLOCK;
+        }
+        if (n<1 || !sel) {
+            return E_INVALIDARG;
+        }
+        W32TsfDoc d;
+        tsfload(w, &d);
+        LONG lo = sel[0].acpStart, hi = sel[0].acpEnd;
+        HRESULT r = S_OK;
+        if (lo<0 || lo>hi || hi>d.len) {
+            r = TF_E_INVALIDPOS;
+        } else if (d.readonly) {
+            r = TS_E_READONLY;
+        } else {
+            int start = sel[0].style.ase == TS_AE_START;
+            int ok    = w->hooks.ax.textselect(w->hooks.gui, d.key, start ? hi : lo, start ? lo : hi);
+            r = ok ? S_OK : E_FAIL;
+        }
+        tsffree(&d);
+        tsflog(w, "TSF SetSelection", lo, hi, r==S_OK ? "-> ok" : "-> refused");
+        if (r == S_OK) {
+            tsffree(&told);
+            tsfload(w, &told);  // its own change: not to be told back
+        }
+        return r;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetText(LONG lo, LONG hi, WCHAR *buf, ULONG cap, ULONG *got,
+                                      TS_RUNINFO *runs, ULONG nruns, ULONG *gotruns,
+                                      LONG *next) override
+    {
+        if (!got || !gotruns || !next) {
+            return E_INVALIDARG;
+        }
+        *got = *gotruns = 0;
+        if (!reading()) {
+            return TS_E_NOLOCK;
+        }
+        W32TsfDoc d;
+        tsfload(w, &d);
+        hi = hi==-1 ? d.len : hi;
+        if (lo<0 || lo>hi || hi>d.len) {
+            tsffree(&d);
+            return TF_E_INVALIDPOS;
+        }
+        ULONG n = (ULONG)(hi - lo);
+        if (buf && cap) {
+            n = n<cap ? n : cap;
+            memcpy(buf, d.text+lo, (size_t)n*2);
+            *got = n;
+        }
+        if (runs && nruns) {
+            runs[0].uCount = n;
+            runs[0].type   = TS_RT_PLAIN;
+            *gotruns = 1;
+        }
+        *next = lo + (LONG)n;
+        tsffree(&d);
+        tsflog(w, "TSF GetText", lo, hi, 0);
+        return S_OK;
+    }
+
+    // Replace [lo, hi) with s: the change as it came out, which the
+    // field's filtering (newlines, tabs) may make other than asked
+    HRESULT edit(char const *what, LONG lo, LONG hi, WCHAR const *s, ULONG n,
+                 TS_TEXTCHANGE *change, LONG *end)
+    {
+        W32TsfDoc d;
+        tsfload(w, &d);
+        HRESULT r = S_OK;
+        if (lo<0 || lo>hi || hi>d.len) {
+            r = TF_E_INVALIDPOS;
+        } else if (d.readonly) {
+            r = TS_E_READONLY;
+        } else if (!w->hooks.ax.textedit(w->hooks.gui, d.key, lo, hi, (unsigned short const *)s,
+                                         (int)n)) {
+            r = E_FAIL;
+        }
+        int before = d.len;
+        tsffree(&d);
+        if (r != S_OK) {
+            tsflog(w, what, lo, hi, "-> refused");
+            return r;
+        }
+        tsffree(&told);
+        tsfload(w, &told);  // its own change: not to be told back
+        LONG e = hi + (told.len - before);
+        if (change) {
+            change->acpStart  = lo;
+            change->acpOldEnd = hi;
+            change->acpNewEnd = e;
+        }
+        if (end) {
+            *end = e;
+        }
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE SetText(DWORD, LONG lo, LONG hi, WCHAR const *s, ULONG n,
+                                      TS_TEXTCHANGE *change) override
+    {
+        if (!writing()) {
+            return TS_E_NOLOCK;
+        }
+        if (!s && n) {
+            return E_INVALIDARG;
+        }
+        return edit("TSF SetText", lo, hi, s, n, change, 0);
+    }
+    HRESULT STDMETHODCALLTYPE InsertTextAtSelection(DWORD flags, WCHAR const *s, ULONG n,
+                                                    LONG *start, LONG *end,
+                                                    TS_TEXTCHANGE *change) override
+    {
+        W32TsfDoc d;
+        tsfload(w, &d);
+        LONG lo = d.anchor<d.caret ? d.anchor : d.caret;
+        LONG hi = d.anchor<d.caret ? d.caret : d.anchor;
+        tsffree(&d);
+        if (flags & TF_IAS_QUERYONLY) {
+            if (!reading()) {
+                return TS_E_NOLOCK;
+            }
+            if (start) *start = lo;
+            if (end) *end = hi;
+            return S_OK;
+        }
+        if (!writing()) {
+            return TS_E_NOLOCK;
+        }
+        if (!s && n) {
+            return E_INVALIDARG;
+        }
+        LONG    e = 0;
+        HRESULT r = edit("TSF InsertTextAtSelection", lo, hi, s, n, change, &e);
+        if (r==S_OK && start) *start = lo;
+        if (r==S_OK && end) *end = e;
+        return r;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetFormattedText(LONG, LONG, IDataObject **) override
+    {
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE GetEmbedded(LONG, REFGUID, REFIID, IUnknown **) override
+    {
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE QueryInsertEmbedded(GUID const *, FORMATETC const *,
+                                                  BOOL *ok) override
+    {
+        if (!ok) {
+            return E_INVALIDARG;
+        }
+        *ok = FALSE;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE InsertEmbedded(DWORD, LONG, LONG, IDataObject *,
+                                             TS_TEXTCHANGE *) override
+    {
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE InsertEmbeddedAtSelection(DWORD, IDataObject *, LONG *, LONG *,
+                                                        TS_TEXTCHANGE *) override
+    {
+        return E_NOTIMPL;
+    }
+
+    // No attributes: none supported, none at any place
+    HRESULT STDMETHODCALLTYPE RequestSupportedAttrs(DWORD, ULONG, TS_ATTRID const *) override
+    {
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE RequestAttrsAtPosition(LONG, ULONG, TS_ATTRID const *,
+                                                     DWORD) override
+    {
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE RequestAttrsTransitioningAtPosition(LONG, ULONG, TS_ATTRID const *,
+                                                                  DWORD) override
+    {
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE FindNextAttrTransition(LONG, LONG halt, ULONG, TS_ATTRID const *,
+                                                     DWORD, LONG *next, BOOL *found,
+                                                     LONG *offset) override
+    {
+        if (!next || !found || !offset) {
+            return E_INVALIDARG;
+        }
+        *next   = halt;
+        *found  = FALSE;
+        *offset = 0;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE RetrieveRequestedAttrs(ULONG, TS_ATTRVAL *, ULONG *got) override
+    {
+        if (!got) {
+            return E_INVALIDARG;
+        }
+        *got = 0;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetEndACP(LONG *end) override
+    {
+        if (!end) {
+            return E_INVALIDARG;
+        }
+        if (!reading()) {
+            return TS_E_NOLOCK;
+        }
+        W32TsfDoc d;
+        tsfload(w, &d);
+        *end = d.len;
+        tsffree(&d);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetActiveView(TsViewCookie *v) override
+    {
+        if (!v) {
+            return E_INVALIDARG;
+        }
+        *v = 1;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetACPFromPoint(TsViewCookie, POINT const *pt, DWORD,
+                                              LONG *acp) override
+    {
+        if (!pt || !acp) {
+            return E_INVALIDARG;
+        }
+        if (!reading()) {
+            return TS_E_NOLOCK;
+        }
+        W32TsfDoc d;
+        tsfload(w, &d);
+        POINT c = *pt;
+        ScreenToClient(w->hwnd, &c);
+        int at = d.key ? w->hooks.ax.textat(w->hooks.gui, d.key, (float)c.x, (float)c.y) : -1;
+        tsffree(&d);
+        if (at < 0) {
+            return TS_E_INVALIDPOINT;
+        }
+        *acp = at;
+        return S_OK;
+    }
+    // Where [lo, hi) is drawn, in screen pixels: the union of its pieces
+    // on each line it is on
+    HRESULT STDMETHODCALLTYPE GetTextExt(TsViewCookie, LONG lo, LONG hi, RECT *rc,
+                                         BOOL *clipped) override
+    {
+        if (!rc || !clipped) {
+            return E_INVALIDARG;
+        }
+        if (!reading()) {
+            return TS_E_NOLOCK;
+        }
+        W32TsfDoc d;
+        tsfload(w, &d);
+        int len = d.len, key = (int)d.key;
+        tsffree(&d);
+        if (lo<0 || lo>hi || hi>len) {
+            return TF_E_INVALIDPOS;
+        }
+        if (!key) {
+            // No field, nothing in it: the window, as a text service
+            // places its windows by it
+            RECT c;
+            GetClientRect(w->hwnd, &c);
+            MapWindowPoints(w->hwnd, 0, (POINT *)&c, 2);
+            *rc      = {c.left, c.top, c.left, c.top};
+            *clipped = FALSE;
+            return S_OK;
+        }
+        W32AxHooks *h = &w->hooks.ax;
+        int   starts[512];
+        int   nlines = key ? h->textlines(w->hooks.gui, (unsigned)key, starts, 512) : 0;
+        nlines = nlines<512 ? nlines : 512;
+        float u[4] = {}, r[4];
+        int   have = 0, ok = key != 0;
+        for (int a = lo, k = 0; ok;) {
+            while (k<nlines && starts[k]<=a) k++;
+            int b = k<nlines && starts[k]<hi ? starts[k] : hi;
+            ok = h->textrect(w->hooks.gui, (unsigned)key, a, b, r);
+            if (ok) {
+                if (!have) {
+                    memcpy(u, r, sizeof(u));
+                } else {
+                    u[0] = r[0]<u[0] ? r[0] : u[0];
+                    u[1] = r[1]<u[1] ? r[1] : u[1];
+                    u[2] = r[2]>u[2] ? r[2] : u[2];
+                    u[3] = r[3]>u[3] ? r[3] : u[3];
+                }
+                have = 1;
+            }
+            if (b >= hi) {
+                break;
+            }
+            a = b;
+        }
+        if (!ok || !have) {
+            nolayout = 1;
+            tsflog(w, "TSF GetTextExt", lo, hi, "-> no layout");
+            return TS_E_NOLAYOUT;
+        }
+        *rc = {(LONG)u[0], (LONG)u[1], (LONG)(u[2] + .999f), (LONG)(u[3] + .999f)};
+        MapWindowPoints(w->hwnd, 0, (POINT *)rc, 2);
+        *clipped = FALSE;
+        tsflog(w, "TSF GetTextExt", lo, hi, 0);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetScreenExt(TsViewCookie, RECT *rc) override
+    {
+        if (!rc) {
+            return E_INVALIDARG;
+        }
+        W32TsfDoc d;
+        tsfload(w, &d);
+        *rc = d.at;
+        tsffree(&d);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetWnd(TsViewCookie, HWND *out) override
+    {
+        if (!out) {
+            return E_INVALIDARG;
+        }
+        *out = w->hwnd;
+        return S_OK;
+    }
+
+    // Compositions, each allowed: their text is the document's
+    HRESULT STDMETHODCALLTYPE OnStartComposition(ITfCompositionView *, BOOL *ok) override
+    {
+        if (ok) {
+            *ok = TRUE;
+        }
+        composing++;
+        tsflog(w, "TSF composition starts", LLONG_MIN, LLONG_MIN, 0);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE OnUpdateComposition(ITfCompositionView *, ITfRange *) override
+    {
+        tsflog(w, "TSF composition updates", LLONG_MIN, LLONG_MIN, 0);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE OnEndComposition(ITfCompositionView *) override
+    {
+        composing -= composing > 0;
+        tsflog(w, "TSF composition ends", LLONG_MIN, LLONG_MIN, 0);
+        return S_OK;
+    }
+};
+
+HRESULT STDMETHODCALLTYPE W32Tsf::RequestLock(DWORD flags, HRESULT *hr)
+{
+    if (!sink) {
+        return E_UNEXPECTED;
+    }
+    if (!hr) {
+        return E_INVALIDARG;
+    }
+    DWORD want = flags & TS_LF_READWRITE;
+    if (lock) {
+        if (flags & TS_LF_SYNC) {
+            *hr = TS_E_SYNCHRONOUS;
+        } else {
+            queued |= want;
+            *hr     = TS_S_ASYNC;
+        }
+        tsflog(w, *hr==TS_S_ASYNC ? "TSF lock queued" : "TSF lock refused: held",
+               LLONG_MIN, LLONG_MIN, 0);
+        return S_OK;
+    }
+    AddRef();  // a sink's call may let the store go
+    *hr = grant(want);
+    while (queued && sink) {
+        DWORD q = queued;
+        queued  = 0;
+        grant(q);
+    }
+    tsfsync(this, 0);  // what changed meanwhile, held back while locked
+    Release();
+    return S_OK;
+}
+
+// Tell TSF what changed in the document since it was last told: typing,
+// ImGui's edits, another field taking the focus
+//
+// A layout once refused (TS_E_NOLAYOUT) is told only after a publish
+// (published), when there may be one: told at once, TSF would ask
+// again, be refused again, and be told again, without end.
+static void tsfsync(W32Tsf *t, int published)
+{
+    if (!t || !t->sink || t->lock || t->syncing) {
+        return;
+    }
+    W32TsfDoc now;
+    tsfload(t->w, &now);
+    W32TsfDoc was  = t->told;
+    t->told        = now;  // before telling: a sink's lock reads it
+    int field      = now.key != was.key;
+    if (field && t->composing && w32tsf.ctx) {
+        // A composition over another field's text ends with it
+        ITfContextOwnerCompositionServices *cs = 0;
+        if (SUCCEEDED(w32tsf.ctx->QueryInterface(__uuidof(ITfContextOwnerCompositionServices),
+                                                (void **)&cs))) {
+            cs->TerminateComposition(0);
+            cs->Release();
+        }
+        t->composing = 0;
+    }
+    int p = 0, oldend = was.len, newend = now.len;
+    if (!field) {
+        int n = was.len<now.len ? was.len : now.len;
+        while (p<n && was.text[p]==now.text[p]) p++;
+        while (oldend>p && newend>p && was.text[oldend-1]==now.text[newend-1]) {
+            oldend--;
+            newend--;
+        }
+    }
+    int edited = field || p<oldend || p<newend;
+    int moved  = memcmp(&was.at, &now.at, sizeof(RECT)) != 0;
+    int sel    = edited || was.anchor!=now.anchor || was.caret!=now.caret;
+    int status = was.readonly != now.readonly;
+    tsffree(&was);
+
+    t->AddRef();
+    t->syncing = 1;
+    if (edited && (t->mask & TS_AS_TEXT_CHANGE)) {
+        TS_TEXTCHANGE c = {p, oldend, newend};
+        t->sink->OnTextChange(0, &c);
+    }
+    if (t->sink && sel && (t->mask & TS_AS_SEL_CHANGE)) {
+        t->sink->OnSelectionChange();
+    }
+    if (t->sink && status && (t->mask & TS_AS_STATUS_CHANGE)) {
+        t->sink->OnStatusChange(now.readonly ? TS_SD_READONLY : 0);
+    }
+    int relayout = published && t->nolayout;
+    if (t->sink && (edited || moved || relayout) && (t->mask & TS_AS_LAYOUT_CHANGE)) {
+        t->nolayout = relayout ? 0 : t->nolayout;
+        t->sink->OnLayoutChange(TS_LC_CHANGE, 1);
+    }
+    if (edited || sel || status) {
+        axlogf(t->w, "TSF told", field ? -1 : p, edited ? newend : LLONG_MIN,
+               field ? "another field" : edited ? "text" : sel ? "selection" : "status");
+    }
+    t->syncing = 0;
+    t->Release();
+}
+
+// The checklist's sink: how many edits TSF said ended, as a text
+// service hears of a change it didn't make
+struct W32TsfEdits : ITfTextEditSink, ITfCompositionSink {
+    LONG refs = 1;
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void **out) override
+    {
+        if (IsEqualIID(id, __uuidof(IUnknown)) || IsEqualIID(id, __uuidof(ITfTextEditSink))) {
+            *out = static_cast<ITfTextEditSink *>(this);
+            AddRef();
+            return S_OK;
+        } else if (IsEqualIID(id, __uuidof(ITfCompositionSink))) {
+            *out = static_cast<ITfCompositionSink *>(this);
+            AddRef();
+            return S_OK;
+        }
+        *out = 0;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return (ULONG)InterlockedIncrement(&refs); }
+    ULONG STDMETHODCALLTYPE Release() override
+    {
+        LONG r = InterlockedDecrement(&refs);
+        if (!r) delete this;
+        return (ULONG)r;
+    }
+    HRESULT STDMETHODCALLTYPE OnEndEdit(ITfContext *, TfEditCookie, ITfEditRecord *) override
+    {
+        w32tsf.edits++;
+        return S_OK;
+    }
+    // Its compositions' owner, as a text service is
+    HRESULT STDMETHODCALLTYPE OnCompositionTerminated(TfEditCookie, ITfComposition *) override
+    {
+        return S_OK;
+    }
+};
+
+// At the first root asked for: the store, the window's document
+static void tsfstart(W32Gui *w)
+{
+    if (w32tsf.store) {
+        return;
+    }
+    char const *fail = 0;
+    if (FAILED(CoCreateInstance(tsfthreadmgr, 0, CLSCTX_INPROC_SERVER, __uuidof(ITfThreadMgr),
+                                (void **)&w32tsf.tm))) {
+        w32tsf.tm = 0;
+        fail      = "no thread manager";
+    } else if (FAILED(w32tsf.tm->Activate(&w32tsf.cid))) {
+        w32tsf.tm->Release();
+        w32tsf.tm = 0;
+        fail      = "not activated";
+    } else if (FAILED(w32tsf.tm->CreateDocumentMgr(&w32tsf.dm))) {
+        w32tsf.dm = 0;
+        fail      = "no document manager";
+    } else {
+        W32Tsf *s = new (std::nothrow) W32Tsf(w);
+        if (!s) {
+            fail = "no memory";
+        } else if (FAILED(w32tsf.dm->CreateContext(w32tsf.cid, 0, static_cast<ITextStoreACP *>(s),
+                                                   &w32tsf.ctx, &w32tsf.ec))) {
+            w32tsf.ctx = 0;
+            s->Release();
+            fail = "no context";
+        } else if (FAILED(w32tsf.dm->Push(w32tsf.ctx))) {
+            w32tsf.ctx->Release();
+            w32tsf.ctx = 0;
+            s->Release();
+            fail = "not pushed";
+        } else {
+            w32tsf.store = s;
+            w32tsf.tm->AssociateFocus(w->hwnd, w32tsf.dm, &w32tsf.prev);
+            ITfSource *src = 0;
+            if (SUCCEEDED(w32tsf.ctx->QueryInterface(__uuidof(ITfSource), (void **)&src))) {
+                W32TsfEdits *e = new (std::nothrow) W32TsfEdits;
+                if (e) {
+                    src->AdviseSink(__uuidof(ITfTextEditSink), static_cast<ITfTextEditSink *>(e),
+                                    &w32tsf.editcookie);
+                    e->Release();
+                }
+                src->Release();
+            }
+        }
+    }
+    if (fail) {
+        if (w32tsf.dm) {
+            w32tsf.dm->Release();
+            w32tsf.dm = 0;
+        }
+        if (w32tsf.tm) {
+            w32tsf.tm->Deactivate();
+            w32tsf.tm->Release();
+            w32tsf.tm = 0;
+        }
+    }
+    axlogf(w, "TSF store", LLONG_MIN, LLONG_MIN, fail ? fail : "-> associated");
+}
+
+// The window goes: its document with it, the one before given back
+static void tsfgone(W32Gui *w)
+{
+    if (!w32tsf.store) {
+        return;
+    }
+    ITfDocumentMgr *mine = 0;
+    if (w->hwnd) {
+        w32tsf.tm->AssociateFocus(w->hwnd, w32tsf.prev, &mine);
+    }
+    if (mine) mine->Release();
+    if (w32tsf.prev) w32tsf.prev->Release();
+    if (w32tsf.editcookie) {
+        ITfSource *src = 0;
+        if (SUCCEEDED(w32tsf.ctx->QueryInterface(__uuidof(ITfSource), (void **)&src))) {
+            src->UnadviseSink(w32tsf.editcookie);
+            src->Release();
+        }
+    }
+    w32tsf.dm->Pop(TF_POPF_ALL);
+    w32tsf.ctx->Release();
+    w32tsf.dm->Release();
+    w32tsf.store->Release();
+    w32tsf.tm->Deactivate();
+    w32tsf.tm->Release();
+    w32tsf = {};
+}
+
+// The checklist's text service: an edit session through the manager, as
+// Voice Access's come, on units [lo, hi)
+enum { TSFOP_SET, TSFOP_COMPOSE, TSFOP_SELECT, TSFOP_READ, TSFOP_SELIS, TSFOP_EXT };
+
+struct W32TsfSession : ITfEditSession {
+    LONG          refs = 1;
+    int           op, lo, hi;
+    WCHAR const  *s;
+    int           n;
+    WCHAR         got[256];
+    ULONG         gotn = 0;
+    LONG          a = -1, b = -1;
+    RECT          rc = {};
+    HRESULT       hr = E_FAIL;
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void **out) override
+    {
+        if (IsEqualIID(id, __uuidof(IUnknown)) || IsEqualIID(id, __uuidof(ITfEditSession))) {
+            *out = static_cast<ITfEditSession *>(this);
+            AddRef();
+            return S_OK;
+        }
+        *out = 0;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return (ULONG)InterlockedIncrement(&refs); }
+    ULONG STDMETHODCALLTYPE Release() override
+    {
+        LONG r = InterlockedDecrement(&refs);
+        if (!r) delete this;
+        return (ULONG)r;
+    }
+
+    ITfRange *range(TfEditCookie ec, int x, int y)
+    {
+        ITfRange    *r  = 0;
+        ITfRangeACP *ra = 0;
+        if (FAILED(w32tsf.ctx->GetStart(ec, &r))) {
+            return 0;
+        }
+        if (FAILED(r->QueryInterface(__uuidof(ITfRangeACP), (void **)&ra)) ||
+                FAILED(ra->SetExtent(x, y - x))) {
+            if (ra) ra->Release();
+            r->Release();
+            return 0;
+        }
+        ra->Release();
+        return r;
+    }
+
+    HRESULT STDMETHODCALLTYPE DoEditSession(TfEditCookie ec) override
+    {
+        ITfContext *ctx = w32tsf.ctx;
+        if (op == TSFOP_READ) {
+            ITfRange *r = 0, *e = 0;
+            if (SUCCEEDED(ctx->GetStart(ec, &r)) && SUCCEEDED(ctx->GetEnd(ec, &e))) {
+                r->ShiftEndToRange(ec, e, TF_ANCHOR_END);
+                hr = r->GetText(ec, 0, got, 255, &gotn);
+            }
+            if (r) r->Release();
+            if (e) e->Release();
+            return S_OK;
+        }
+        if (op == TSFOP_SELIS) {
+            TF_SELECTION sel = {};
+            ULONG        k   = 0;
+            hr = ctx->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &sel, &k);
+            if (SUCCEEDED(hr) && k==1) {
+                ITfRangeACP *ra = 0;
+                if (SUCCEEDED(sel.range->QueryInterface(__uuidof(ITfRangeACP), (void **)&ra))) {
+                    LONG cch = 0;
+                    ra->GetExtent(&a, &cch);
+                    b = a + cch;
+                    ra->Release();
+                }
+                sel.range->Release();
+            }
+            return S_OK;
+        }
+        ITfRange *r = range(ec, lo, hi);
+        if (!r) {
+            return S_OK;
+        }
+        if (op == TSFOP_SET) {
+            hr = r->SetText(ec, 0, s, n);
+        } else if (op == TSFOP_SELECT) {
+            TF_SELECTION sel = {};
+            sel.range          = r;
+            sel.style.ase      = TF_AE_END;
+            sel.style.fInterimChar = FALSE;
+            hr = ctx->SetSelection(ec, 1, &sel);
+        } else if (op == TSFOP_COMPOSE) {
+            ITfContextComposition *cc   = 0;
+            ITfComposition        *comp = 0;
+            hr = ctx->QueryInterface(__uuidof(ITfContextComposition), (void **)&cc);
+            W32TsfEdits *owner = new (std::nothrow) W32TsfEdits;
+            hr = SUCCEEDED(hr) && !owner ? E_OUTOFMEMORY : hr;
+            hr = SUCCEEDED(hr) ? cc->StartComposition(ec, r, owner, &comp) : hr;
+            if (owner) owner->Release();
+            hr = SUCCEEDED(hr) && !comp ? E_ABORT : hr;
+            if (SUCCEEDED(hr)) {
+                hr = r->SetText(ec, 0, s, n);
+                axlogf(axw, "checklist composition SetText", LLONG_MIN, LLONG_MIN,
+                       SUCCEEDED(hr) ? "-> ok" : "-> failed");
+                comp->EndComposition(ec);
+                comp->Release();
+            }
+            if (cc) cc->Release();
+        } else if (op == TSFOP_EXT) {
+            ITfContextView *v = 0;
+            BOOL clipped = FALSE;
+            if (SUCCEEDED(ctx->GetActiveView(&v))) {
+                hr = v->GetTextExt(ec, r, &rc, &clipped);
+                v->Release();
+            }
+        }
+        r->Release();
+        return S_OK;
+    }
+};
+
+// One session, synchronous: 0 if it couldn't run
+static W32TsfSession *tsfsession(int op, int lo, int hi, WCHAR const *s, int n)
+{
+    if (!w32tsf.ctx) {
+        return 0;
+    }
+    W32TsfSession *e = new (std::nothrow) W32TsfSession;
+    if (!e) {
+        return 0;
+    }
+    e->op = op;
+    e->lo = lo;
+    e->hi = hi;
+    e->s  = s;
+    e->n  = n;
+    HRESULT got = E_FAIL;
+    int     rw  = op==TSFOP_READ || op==TSFOP_SELIS || op==TSFOP_EXT ? TF_ES_READ : TF_ES_READWRITE;
+    if (FAILED(w32tsf.ctx->RequestEditSession(w32tsf.cid, e, TF_ES_SYNC | rw, &got)) ||
+            FAILED(got)) {
+        e->Release();
+        return 0;
+    }
+    return e;
+}
 
 // The checklist's "uia" checks: through the providers' methods, as a
 // client's calls come to them, from the root the window gives
@@ -2467,7 +3445,8 @@ extern "C" void w32gui_axdrive(void *gp, char const *cmd, int len, char *out, in
     while (s<e && *s!=' ') s++;
     int vlen = (int)(s - verb);
     int want = axeq(verb, vlen, "start") || axeq(verb, vlen, "newline") ||
-               axeq(verb, vlen, "emptycommit") ? 0
+               axeq(verb, vlen, "emptycommit") || axeq(verb, vlen, "tsf") ||
+               axeq(verb, vlen, "tsfread") || axeq(verb, vlen, "tsfedits") ? 0
              : axeq(verb, vlen, "reconvert") || axeq(verb, vlen, "confirm") ? 1
              : axeq(verb, vlen, "can") || axeq(verb, vlen, "parent") ||
                axeq(verb, vlen, "value") || axeq(verb, vlen, "setvalue") ||
@@ -2512,6 +3491,97 @@ extern "C" void w32gui_axdrive(void *gp, char const *cmd, int len, char *out, in
         // result string, the checklist's, is empty)
         PostMessageW(w->hwnd, WM_IME_COMPOSITION, 0, GCS_RESULTSTR);
         axlput(&l, "ok");
+        axout(out, cap, &l);
+        return;
+    }
+    if (vlen>=3 && axeq(verb, 3, "tsf")) {
+        // As a text service edits through TSF, an edit session each:
+        //   tsf                 the store is the window's, its sink advised
+        //   tsfset LO,HI TEXT   units [LO, HI) replaced with TEXT
+        //   tsfcompose LO,HI T  the same, in a composition
+        //   tsfsel LO,HI        selected
+        //   tsfselis LO,HI      the selection TSF reads is [LO, HI)
+        //   tsfread TEXT        the text TSF reads is TEXT
+        //   tsfext LO,HI        TSF finds [LO, HI) drawn in the window
+        //   tsfedits            TSF told a text service of an edit since
+        //                       the last ask
+        int lo = 0, hi = 0, *at = &lo;
+        for (int i = 0; i < wlen[0]; i++) {
+            char c = word[0][i];
+            if (c == ',') {
+                at = &hi;
+            } else {
+                *at = *at*10 + (c - '0');
+            }
+        }
+        WCHAR text[256];
+        int   tn = nlen>0 ? MultiByteToWideChar(CP_UTF8, 0, name, nlen, text, 255) : 0;
+        tn = tn>0 ? tn : 0;
+        text[tn] = 0;
+        W32TsfSession *e = 0;
+        if (!w32tsf.store) {
+            axlput(&l, "no store");
+        } else if (axeq(verb, vlen, "tsf")) {
+            axlput(&l, w32tsf.store->sink ? "ok" : "no sink advised");
+        } else if (axeq(verb, vlen, "tsfedits")) {
+            axlput(&l, w32tsf.edits ? "ok" : "no edit told");
+            w32tsf.edits = 0;
+        } else {
+            int op = axeq(verb, vlen, "tsfset")     ? TSFOP_SET
+                   : axeq(verb, vlen, "tsfcompose") ? TSFOP_COMPOSE
+                   : axeq(verb, vlen, "tsfsel")     ? TSFOP_SELECT
+                   : axeq(verb, vlen, "tsfselis")   ? TSFOP_SELIS
+                   : axeq(verb, vlen, "tsfread")    ? TSFOP_READ
+                   : axeq(verb, vlen, "tsfext")     ? TSFOP_EXT : -1;
+            e = op<0 ? 0 : tsfsession(op, lo, hi, text, tn);
+            RECT wr;
+            GetClientRect(w->hwnd, &wr);
+            MapWindowPoints(w->hwnd, 0, (POINT *)&wr, 2);
+            if (op < 0) {
+                axlput(&l, "unknown verb");
+            } else if (!e) {
+                axlput(&l, "no edit session");
+            } else if (FAILED(e->hr)) {
+                axlput(&l, "failed ");
+                axlputx(&l, (unsigned long)e->hr);
+            } else if (op == TSFOP_READ) {
+                if (e->gotn==(ULONG)tn && !memcmp(e->got, text, (size_t)tn*2)) {
+                    axlput(&l, "ok");
+                } else {
+                    axlput(&l, "read ");
+                    axlputw(&l, e->got, (int)e->gotn);
+                }
+            } else if (op == TSFOP_SELIS) {
+                if (e->a==lo && e->b==hi) {
+                    axlput(&l, "ok");
+                } else {
+                    axlput(&l, "selection ");
+                    axlputn(&l, e->a);
+                    axlput(&l, ",");
+                    axlputn(&l, e->b);
+                }
+            } else if (op == TSFOP_EXT) {
+                RECT r = e->rc;
+                if (r.bottom>r.top && r.right>=r.left && r.left>=wr.left && r.right<=wr.right &&
+                        r.top>=wr.top && r.bottom<=wr.bottom) {
+                    axlput(&l, "ok");
+                } else {
+                    axlput(&l, "rect ");
+                    axlputn(&l, r.left);
+                    axlput(&l, ",");
+                    axlputn(&l, r.top);
+                    axlput(&l, ",");
+                    axlputn(&l, r.right);
+                    axlput(&l, ",");
+                    axlputn(&l, r.bottom);
+                }
+            } else {
+                axlput(&l, "ok");
+            }
+        }
+        if (e) {
+            e->Release();
+        }
         axout(out, cap, &l);
         return;
     }
@@ -3186,6 +4256,44 @@ static int hookaxtextselect(void *p, unsigned key, int anchor, int caret)
     return ok;
 }
 
+// A text service's write through the TSF store: units [lo, hi) of the
+// document replaced, logged with its text, as SetValue is
+static int hookaxtextedit(void *p, unsigned key, int lo, int hi, unsigned short const *s, int n)
+{
+    Gui   *g  = (Gui *)p;
+    A11y  *x  = w32axlive(p, key);
+    AxGui *ag = g->ax;
+    b32    ok = 0;
+    Arena  a  = ag ? ag->logmem : Arena{};
+    Str    text = {};
+    if (x && lo>=0 && lo<=hi && n>=0) {
+        i32 blo = axdoctext(x, axdocbyte(x, AXU_UTF16, lo));
+        i32 bhi = axdoctext(x, axdocbyte(x, AXU_UTF16, hi));
+        text = fromwide(&a, (c16 *)s, n);
+        ok   = axtextedit(g, blo, bhi, text, AX_AFTER, AX_AFTER);
+    }
+    if (ok) {
+        os_wake(g->os);
+    }
+    if (ag && ag->on && (PROSPERO_DEVTOOLS || ag->tracefd>=0)) {
+        Buf b(&a, 80 + text.len);
+        print(&b, "TSF edit ");
+        print(&b, (i64)lo);
+        putbyte(&b, ',');
+        print(&b, (i64)hi);
+        putbyte(&b, ' ');
+        if (ok) {
+            axlogstr(&b, text);
+        } else {
+            print(&b, "(withheld)");
+        }
+        print(&b, ok ? Str(" -> ok") : Str(" -> refused"));
+        Str line = finish(&b);
+        axnote(ag, a, line);
+    }
+    return ok;
+}
+
 // After each publish: its events to the edge, in batches
 static void w32axpublished(AxGui *x)
 {
@@ -3268,6 +4376,7 @@ static void w32axhooks(W32AxHooks *h)
     h->textrect   = hookaxtextrect;
     h->textat     = hookaxtextat;
     h->textselect = hookaxtextselect;
+    h->textedit   = hookaxtextedit;
 }
 
 // At the window's opening, with accessibility not off

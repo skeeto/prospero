@@ -24555,6 +24555,33 @@ static DriveOp a11yops[] = {
     SELALL,
     KEY(GKEY_BACKSPACE, 0, 300),
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    // The TSF store, as Voice Access edits through it, the checklist a
+    // text service: typing told to TSF, the text and selection read
+    // through it, a word selected and deleted ("delete that"), text put
+    // in by a composition, and where text is
+    {OP_A11Y, 0, 0, 0, 0, "uia tsf"},
+    {OP_A11Y, 0, 0, 0, 0, "uia tsfedits"},
+    {OP_TEXT, 0, 0, 0, 300, "delete me now"},
+    {OP_A11Y, 0, 0, 0, 0, "uia tsfedits"},
+    {OP_A11Y, 0, 0, 0, 0, "uia tsfread delete me now"},
+    {OP_A11Y, 0, 0, 0, 0, "uia tsfselis 13,13"},
+    {OP_A11Y, 0, 0, 0, 300, "uia tsfsel 7,10"},
+    {OP_CHECK, CHK_PROMPTSEL, 0, 0, 0, "me "},
+    {OP_A11Y, 0, 0, 0, 0, "uia tsfselis 7,10"},
+    {OP_A11Y, 0, 0, 0, 300, "uia tsfset 7,10"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "delete now"},
+    {OP_A11Y, 0, 0, 0, 0, "uia tsfselis 7,7"},
+    {OP_A11Y, 0, 0, 0, 0, "logged TSF edit 7,10 \"\" -> ok"},
+    {OP_A11Y, 0, 0, 0, 300, "uia tsfcompose 7,7 right "},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "delete right now"},
+    {OP_A11Y, 0, 0, 0, 0, "logged TSF composition ends"},
+    {OP_A11Y, 0, 0, 0, 0, "uia tsfread delete right now"},
+    {OP_A11Y, 0, 0, 0, 0, "uia tsfext 0,6"},
+    {OP_A11Y, 0, 0, 0, 0, "uia tsfext 6,6"},
+    SELALL,
+    KEY(GKEY_BACKSPACE, 0, 300),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    {OP_A11Y, 0, 0, 0, 0, "uia tsfread "},
     // Send, invoked through its provider: the press reaches the app
     {OP_TEXT, 0, 0, 0, 300, "UIA"},
     {OP_A11Y, 0, 0, 0, 500, "uia press Button Send"},
