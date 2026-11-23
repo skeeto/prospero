@@ -24488,6 +24488,9 @@ static DriveOp a11yops[] = {
     {OP_A11Y, 0, 0, 0, 0, "has group Transcript"},
     {OP_A11Y, 0, 0, 0, 0, "has button Send"},
     {OP_A11Y, 0, 0, 0, 0, "help button Send"},
+    // The sidebar's sessions, a list of their own, as Voice Access
+    // numbers a list's items only in one
+    {OP_A11Y, 0, 0, 0, 0, "has group Session list"},
 #ifdef _WIN32
     // UI Automation's: the root as WM_GETOBJECT gives it to a client,
     // and the tree under it through the providers' own methods, named,
@@ -24528,6 +24531,8 @@ static DriveOp a11yops[] = {
     {OP_A11Y, 0, 0, 0, 0, "uia can Invoke,!Toggle,!ExpandCollapse Button Send"},
     {OP_A11Y, 0, 0, 0, 0, "uia hit Button Send"},
     {OP_A11Y, 0, 0, 0, 0, "uia has Group Transcript"},
+    {OP_A11Y, 0, 0, 0, 0, "uia has Group Session list"},
+    {OP_A11Y, 0, 0, 0, 0, "uia parent Group ListItem (untitled)"},
     {OP_A11Y, 0, 0, 0, 0, "uia parent MenuBar MenuItem Help"},
     // Dictation's "new line": an Enter just after its commit is a new
     // line, not a send

@@ -48,6 +48,18 @@ struct AxItem {
     Str    help;       // its tooltip's text
     u32    key;        // from axkey, else its ID
     Str    value;      // a combo's, as it shows it
+    u32    list;       // the axlist it went in, 0 for none
+};
+
+// A run of items in a container of their own (axlist): a node of its
+// own, as a child window's items have, which Voice Access needs to
+// number a list's items
+struct AxList {
+    u32    key;
+    u32    window;
+    Str    name;
+    ImRect rect;   // its items', together
+    b32    added;  // to this frame's tree
 };
 
 // A text field as drawn this frame, copied from its report
@@ -96,6 +108,8 @@ struct AxGui {
     i32                 nlinted;
     Str                 nextname; // axnextname's, for the next item in nextwin
     u32                 nextwin;
+    Slice<AxList>       lists;    // this frame's
+    iz                  inlist;   // the open one, its index + 1, or 0
     u32                 menuid;   // an item whose context menu was asked for
     i64                 menuwhen;
     u32                 tabid;    // a tab whose info came before its add
@@ -200,6 +214,15 @@ void ImGuiTestEngineHook_ItemAdd(ImGuiContext *ctx, ImGuiID id, ImRect const &bb
     it.rect      = item->Rect;
     it.offscreen = !bb.Overlaps(w->ClipRect);
     it.itemflags = item->ItemFlags;
+    if (x->inlist && x->lists[x->inlist-1].window==w->ID) {
+        AxList *l = &x->lists[x->inlist-1];
+        it.list   = l->key;
+        if (!it.offscreen) {
+            b32 first = l->rect.Min.x > l->rect.Max.x;
+            l->rect   = first ? item->Rect : l->rect;
+            l->rect.Add(item->Rect);
+        }
+    }
     if (x->nextname.len) {
         it.named     = w->ID == x->nextwin;  // else its window skipped it
         it.name      = it.named ? x->nextname : Str{};
@@ -508,6 +531,31 @@ static void axrole(Gui *g, AxRole role)
     }
 }
 
+// The items from here to axlistend go in a container of their own, key
+// (stable across frames), named name: a list, as tools number its items
+// only in one (the sidebar's sessions)
+static void axlist(Gui *g, u32 key, Str name)
+{
+    AxGui *x = g->ax && g->ax->on ? g->ax : 0;
+    if (x) {
+        AxList l = {};
+        l.key    = key;
+        l.window = ImGui::GetCurrentWindow()->ID;
+        l.name   = clone(&x->mem, name);
+        l.rect   = ImRect(1, 1, 0, 0);  // none yet: Min past Max
+        x->lists  = push(&x->mem, x->lists, l);
+        x->inlist = x->lists.len;
+    }
+}
+
+static void axlistend(Gui *g)
+{
+    AxGui *x = g->ax && g->ax->on ? g->ax : 0;
+    if (x) {
+        x->inlist = 0;
+    }
+}
+
 // The last item folds and opens what is under it, open now or not, as a
 // tree node does: a heading in the sidebar.
 static void axexpanded(Gui *g, b32 open)
@@ -708,6 +756,19 @@ static void axbuild(AxGui *x, ImGuiContext *ctx)
             continue;  // a window's first frame, sizing itself, or a popup's last
         }
         u32          parent = axwindowkey(x, w);
+        for (iz k = 0; it->list && k < x->lists.len; k++) {
+            AxList *l = &x->lists[k];
+            if (l->key != it->list) {
+                continue;
+            }
+            if (!l->added) {  // where its first item is, among its window's
+                AxNode *ln = axadd(b, parent, l->key, AX_GROUP, l->name);
+                ln->rect   = {l->rect.Min.x, l->rect.Min.y, l->rect.Max.x, l->rect.Max.y};
+                l->added   = 1;
+            }
+            parent = l->key;
+            break;
+        }
         AxFieldDraw *f      = it->role==AX_TEXTFIELD ? axfieldof(x, it->id) : 0;
         AxRole       role   = it->role;
         u32          state  = it->state;
@@ -1170,6 +1231,8 @@ static void axnewframe(ImGuiContext *ctx, ImGuiContextHook *hook)
     x->mem.beg = x->base;
     x->items   = {};
     x->fields  = {};
+    x->lists   = {};
+    x->inlist  = 0;
     x->nextname = {};
     x->last    = -1;
     x->tabid   = 0;

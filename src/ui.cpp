@@ -95,6 +95,8 @@ static b32  axmenuasked(Gui *, u32);
 // A text field's context menu, after the field (defined below)
 static void fieldmenu(Gui *, Arena, char const *, b32 = 0);
 static void axexpanded(Gui *, b32 open);
+static void axlist(Gui *, u32 key, Str name);
+static void axlistend(Gui *);
 // The Metrics pane's section for them
 static void axmetrics(Gui *, Arena);
 
@@ -11501,7 +11503,20 @@ static void drawsessions(Gui *g)
         at[i].x1 = c.x + ImGui::GetContentRegionAvail().x;
         at[i].ax = sidedotx(g, c.x, r->depth);
         if (r->kind == SROW_SESSION) {
+            // A run of rows, a list of its own under its heading, as a
+            // tool numbers a list's items only in one
+            if (!i || rows[i-1].kind!=SROW_SESSION) {
+                // Keyed by the heading above, or where it is without one
+                Buf k(&a, 64);
+                print(&k, "##sessions ");
+                print(&k, i && rows[i-1].key.len ? rows[i-1].key : Str(""));
+                print(&k, (i64)(i && rows[i-1].key.len ? 0 : i));
+                axlist(g, (u32)hash(finish(&k)), Str("Session list"));
+            }
             drawsessrow(g, a, r, sess[r->sess], &other, nowms);
+            if (i+1==rows.len || rows[i+1].kind!=SROW_SESSION) {
+                axlistend(g);
+            }
         } else {
             b32     on  = r->kind==SROW_HOST || r->kind==SROW_FOLDER;
             HostRef ref = on ? refs[r->host] : HostRef{};
