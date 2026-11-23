@@ -2302,6 +2302,8 @@ def main():
         model = f"fake:plan_gui:{nonce}"
         fake_provider.STATE.register(model)
         extra = f"\n[model fake:plan_gui_b:{nonce}]\ntemperature = 0.5\n"
+        # The session plans in a role that names plan mode's tools
+        extra += "\n[role planner]\ntools = default enter_plan_mode exit_plan_mode\n"
         if not args.host:
             # Edit plan's editor, a sh script (the checklist skips it
             # without one)

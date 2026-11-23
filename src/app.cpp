@@ -463,6 +463,7 @@ struct GuiRole {
     Str name;
     Str desc;
     Str tools;  // the tools it gives, as a line
+    b32 plans;  // whether they include exit_plan_mode, so plan mode
 };
 
 struct GuiHost {
@@ -2866,6 +2867,7 @@ static Slice<GuiRole> replyroles(Arena *a, Json *j)
         for (Json *t = jsonget(k, "tools")->child; t; t = t->next) {
             print(&b, b.len ? Str(", ") : Str(""));
             print(&b, jsonstr(t));
+            role.plans |= jsonstr(t) == "exit_plan_mode";
         }
         role.tools = finish(&b);
         if (role.name.len) {
@@ -2966,7 +2968,7 @@ static void onhostmodels(Gui *g, GuiHost *h, Arena scratch, Json *j, b32 ok, Str
         h->roles = {};
         for (iz i = 0; i < roles.len; i++) {
             GuiRole c = {clone(&g->perm, roles[i].name), clone(&g->perm, roles[i].desc),
-                         clone(&g->perm, roles[i].tools)};
+                         clone(&g->perm, roles[i].tools), roles[i].plans};
             h->roles = push(&g->perm, h->roles, c);
         }
     }
@@ -15433,7 +15435,8 @@ enum : i32 {
     CHK_SHEDQUIET,
     CHK_KEYLOST,
     CHK_SNAPLIVE,
-    CHK_PLANMODE,     // dx 1: the session shown is in plan mode, 0 not
+    CHK_PLANMODE,     // dx 1: the session shown is in plan mode, 0 not;
+                      // with text, also in that role
     CHK_PLANASK,      // the open ask is the plan's, in Markdown, its buttons drawn
     CHK_PLANTEXT,     // the Plan window shows the plan, with text in it
     CHK_PLANMODEL,    // the model picker is enabled while the plan waits
@@ -22030,8 +22033,9 @@ static DriveOp mcpops[] = {
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
 
-// Plan mode (--plan): a new session in plan mode from its dialog, the
-// chip in its bar; the agent refused a change, asking to approve its
+// Plan mode (--plan): a new session in plan mode from its dialog, in a
+// role whose tools name plan mode's (tests/gui.py sets it), the chip in
+// its bar; the agent refused a change, asking to approve its
 // plan, which the Plan window shows, its text selected and copied, the
 // file revealed (noted only), and revised by hand from the ask (Edit
 // plan, with [ui] editor a test script, where tests/gui.py sets one);
@@ -22055,6 +22059,12 @@ static DriveOp planops[] = {
     {OP_UP, 0, 0, 0, 1000, ""},
     {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
     {OP_TEXTCWD, 0, 0, 0, 300, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "new role"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "new role planner"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
     {OP_MOVE, T_NAMED, 0, 0, 100, "new plan"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
@@ -22064,7 +22074,7 @@ static DriveOp planops[] = {
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
     {OP_WAIT, W_NAMED, 0, 0, 10000, "session mode"},
-    {OP_CHECK, CHK_PLANMODE, 1, 0, 0, ""},
+    {OP_CHECK, CHK_PLANMODE, 1, 0, 0, "planner"},
     {OP_FOCUS, 0, 2, 0, 0, ""},
     {OP_TOASTMARK, 0, 0, 0, 0, ""},
     {OP_PROMPT, 0, 0, 0, 200, "Make inside.txt."},
@@ -29104,8 +29114,10 @@ static b32 drivecheck(Gui *g, i32 chk)
         // Frames since the mark: the probe's and the script's own
         return !ImGui::IsKeyDown(ImGuiKey_G) &&
                drivequiet(g, g->frame, "2 s after a key's release was lost", 2);
-    case CHK_PLANMODE:
-        return g->sess && v->plan==(b32)g->ops[g->drivepc-1].dx;
+    case CHK_PLANMODE: {
+        DriveOp *op = &g->ops[g->drivepc-1];
+        return g->sess && v->plan==(b32)op->dx && (!op->text.len || v->role==op->text);
+    }
     case CHK_BYPASS: {
         // In Bypass, the session bar's mode list's label in red
         b32 want = (b32)g->ops[g->drivepc-1].dx;

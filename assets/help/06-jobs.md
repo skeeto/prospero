@@ -65,8 +65,8 @@ tool, and `tools = * -shell` gives every tool but the shell. The New
 session dialog's Role starts a session in a role, too.
 
 Plan mode's tools come only by name, never with `*` or `default`.
-With `exit_plan_mode`, a session in the role may use Plan mode: turn
-it on with `/plan` or the mode list once it starts. With
+With `exit_plan_mode`, a session in the role may use Plan mode, from
+the New session dialog's Plan mode box as from `/plan`. With
 `enter_plan_mode` as well, its agent may ask to plan first. So
 `tools = default exit_plan_mode enter_plan_mode`. A subagent never
 plans on its own, whatever its role says.

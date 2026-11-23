@@ -13682,8 +13682,11 @@ static void drawnew(Gui *g)
         hostmodels(g, host);  // its roles come with its models
     }
     b32 hasrole = 0;
+    b32 noplan  = 0;  // in a role without plan mode's tools
     for (iz i = 0; i < roles.len; i++) {
-        hasrole |= roles[i].name == g->newrole;
+        b32 it   = roles[i].name == g->newrole;
+        hasrole |= it;
+        noplan  |= it && !roles[i].plans;
     }
     if (roles.len) {
         ImGui::Spacing();
@@ -13704,6 +13707,7 @@ static void drawnew(Gui *g)
                     g->newrole = clone(&g->perm, r->name);
                 }
                 axselected(g, r->name==g->newrole);
+                itemnamed(g, concat(&a, "new role ", r->name));
                 Buf tb(&a, 256);
                 print(&tb, r->desc.len ? r->desc : Str("(no description)"));
                 print(&tb, "\nTools: ");
@@ -13717,16 +13721,16 @@ static void drawnew(Gui *g)
     }
     b32 plan = !import && hostcap(host, "plan");
     if (plan) {
-        // Plan mode's tools are never a role's
+        // Plan mode's tools are a role's only when it names them
         ImGui::Spacing();
-        ImGui::BeginDisabled(hasrole);
+        ImGui::BeginDisabled(noplan);
         b32 off = 0;
-        checkbox("Plan mode", hasrole ? &off : &g->newplan);
+        checkbox("Plan mode", noplan ? &off : &g->newplan);
         ImGui::EndDisabled();
         itemnamed(g, "new plan");
-        whytip(hasrole ? Str("Not in a role: plan mode is for sessions without one")
-                       : Str("The agent explores and writes a plan for you to approve "
-                             "before it changes anything"));
+        whytip(noplan ? Str("Not in this role: its tools do not include exit_plan_mode")
+                      : Str("The agent explores and writes a plan for you to approve "
+                            "before it changes anything"));
     }
     if (g->newerr.len) {
         ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
@@ -13752,10 +13756,10 @@ static void drawnew(Gui *g)
         } else if (ctr) {
             Str image = {(u8 *)g->newimage, (iz)__builtin_strlen(g->newimage)};
             err = ctrnew(g, &a, image, g->newws, cwd, g->newnet, ep, model,
-                         hasrole ? g->newrole : Str{}, plan && g->newplan && !hasrole);
+                         hasrole ? g->newrole : Str{}, plan && g->newplan && !noplan);
         } else {
             guinew(g, host, cwd, ep, model, hasrole ? g->newrole : Str{},
-                   plan && g->newplan && !hasrole, nofolder, wt, wtname);
+                   plan && g->newplan && !noplan, nofolder, wt, wtname);
         }
         g->newerr = err.len ? clone(&g->perm, err) : Str{};
         if (!err.len) {
