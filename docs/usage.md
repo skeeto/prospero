@@ -430,10 +430,18 @@ included. Voice Control reads the prompt and edits it by words and
 ranges ("select previous word", "replace … with …"). It also sees the
 window's panes and controls by name (buttons, tabs, menus, the session
 list, Settings and the Terminal pane), presses them and opens their
-menus, and reads their tooltips as help. `[ui] accessibility` sets when
-assistive tools see the window: `auto` (the default) from the first time
-one asks, `on` from the start, or `off`. It is read at startup. Windows
-(Win+H and Voice Access), screen readers and Linux are not supported yet.
+menus, and reads their tooltips as help.
+
+On Windows, voice typing (Win+H) and Voice Access work in the window.
+Dictated text goes into the prompt where the cursor is, and "new line"
+starts a new line rather than sending. Voice Access numbers the window's
+controls ("show numbers"), clicks them by name or number, and edits the
+prompt by words ("select …", "delete that", "correct …").
+
+`[ui] accessibility` sets when assistive tools see the window: `auto`
+(the default) from the first time one asks, `on` from the start, or
+`off`. It is read at startup. Screen readers and Linux are not supported
+yet.
 
 `prospero run` runs one turn with no window and exits when it ends,
 printing its records as JSON lines, or readable text with `--pretty`.
