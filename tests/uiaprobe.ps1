@@ -10,7 +10,8 @@
 #
 # 1. finds its window (class "prospero") among the desktop's, and dumps
 #    the tree under it, control types and names, as the control view
-#    walks it, with each element's patterns and, when a hit test at its
+#    walks it, with each element's patterns, its rectangle (screen
+#    pixels: left,top widthxheight) and, when a hit test at its
 #    center finds another, what, and when it pokes out of its parent,
 #    where (reported, not checked);
 # 2. finds the element with the keyboard focus (HasKeyboardFocus) and
@@ -93,6 +94,7 @@ function Extra($e) {
     if ($r.IsEmpty) {
         return "$out (no rectangle)"
     }
+    $out += " at $([int]$r.Left),$([int]$r.Top) $([int]$r.Width)x$([int]$r.Height)"
     $pt = New-Object System.Windows.Point(($r.Left + $r.Width/2), ($r.Top + $r.Height/2))
     $at = $AE::FromPoint($pt)
     if (-not ($at -and [System.Windows.Automation.Automation]::Compare($at, $e))) {

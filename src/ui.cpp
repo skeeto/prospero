@@ -97,6 +97,7 @@ static void fieldmenu(Gui *, Arena, char const *, b32 = 0);
 static void axexpanded(Gui *, b32 open);
 static void axlist(Gui *, u32 key, Str name);
 static void axlistend(Gui *);
+static void axitemtop(Gui *, f32 h);
 // The Metrics pane's section for them
 static void axmetrics(Gui *, Arena);
 
@@ -10422,6 +10423,9 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other, 
     }
     axname(g, sesstitle(s));
     axselected(g, g->pickn ? s->picked : sel);
+    // Its title line, as tools find it: Voice Access numbers a row
+    // only about a line tall (the headings' height)
+    axitemtop(g, lineh + ImGui::GetStyle().ItemSpacing.y);
     ImVec2 r0 = ImGui::GetItemRectMin();
     ImVec2 r1 = ImGui::GetItemRectMax();
     s->row = {r0.x, r0.y, r1.x, r1.y};
@@ -15585,7 +15589,9 @@ static void drawcfgfind(Gui *g, Arena a, Slice<i32> found, b32 enter)
         ImVec2  p    = ImGui::GetCursorScreenPos();
         f32     w    = ImGui::GetContentRegionAvail().x;
         ImGui::PushID((int)i);
-        if (ImGui::Selectable("##found", cfgfocused(g, r), 0, v2(0, 2*lh + gap/2))) {
+        b32 picked = ImGui::Selectable("##found", cfgfocused(g, r), 0, v2(0, 2*lh + gap/2));
+        axitemtop(g, lh + gap);  // its title line, as a session row's
+        if (picked) {
             cfggoto(g, r);
         }
         axname(g, concat(&t, concat(&t, r->key, ", "), page));
@@ -17486,6 +17492,7 @@ static b32 palrow(Gui *g, Arena a, i32 i, b32 sel, i64 nowms)
     ImVec2 at = ImGui::GetCursorScreenPos();
     f32    w  = ImGui::GetContentRegionAvail().x;
     b32    hit = ImGui::Selectable("##r", sel, 0, v2(0, 2*lineh + 4*sc));
+    axitemtop(g, lineh + ImGui::GetStyle().ItemSpacing.y);  // as a session row
     axname(g, it->title);
     axselected(g, sel);
     ImGui::PopID();

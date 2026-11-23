@@ -1035,6 +1035,15 @@ struct W32AxProv : IRawElementProviderSimple, IRawElementProviderFragment,
         out->top    = o.y + n.y0;
         out->width  = n.x1>n.x0 ? n.x1-n.x0 : 0;
         out->height = n.y1>n.y0 ? n.y1-n.y0 : 0;
+        // Logged as an ask, again when it moves: where a tool finds it
+        wchar_t buf[64];
+        int     len = wsprintfW(buf, L"%d,%d %dx%d", (int)out->left, (int)out->top,
+                                (int)out->width, (int)out->height);
+        VARIANT v = {};
+        v.vt      = VT_BSTR;
+        v.bstrVal = SysAllocStringLen(buf, (UINT)len);
+        axasked(this, 0, UIA_BoundingRectanglePropertyId, &v, 1);
+        VariantClear(&v);
         return S_OK;
     }
 

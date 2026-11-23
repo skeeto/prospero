@@ -548,6 +548,18 @@ static void axlist(Gui *g, u32 key, Str name)
     }
 }
 
+// The last item's rectangle, as tools see it, is its top h pixels: a
+// row of two lines, its title's, as Voice Access numbers a list's row
+// only when it is about a line tall (a trial on 2026-11-23: the same row
+// 64 pixels tall had none, 32 had one). Pointer clicks are ImGui's.
+static void axitemtop(Gui *g, f32 h)
+{
+    AxItem *it = axlastitem(g);
+    if (it && it->rect.Max.y > it->rect.Min.y+h) {
+        it->rect.Max.y = it->rect.Min.y + h;
+    }
+}
+
 static void axlistend(Gui *g)
 {
     AxGui *x = g->ax && g->ax->on ? g->ax : 0;
