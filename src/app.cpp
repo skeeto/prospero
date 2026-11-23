@@ -24496,6 +24496,16 @@ static DriveOp a11yops[] = {
     {OP_A11Y, 0, 0, 0, 0, "uia has Edit Prompt"},
     {OP_A11Y, 0, 0, 0, 0, "uia focus Edit Prompt"},
     {OP_A11Y, 0, 0, 0, 0, "uia hit Edit Prompt"},
+    // The prompt's text through the Value pattern, which Voice Access
+    // needs to see the field at all: set, then read back
+    {OP_A11Y, 0, 0, 0, 0, "uia can Value,!Invoke Edit Prompt"},
+    {OP_A11Y, 0, 0, 0, 300, "uia setvalue voice Edit Prompt"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "voice"},
+    {OP_A11Y, 0, 0, 0, 0, "uia value voice Edit Prompt"},
+    {OP_A11Y, 0, 0, 0, 0, "logged SetValue \"voice\" -> ok"},
+    {OP_A11Y, 0, 0, 0, 300, "uia setvalue - Edit Prompt"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    {OP_A11Y, 0, 0, 0, 0, "uia can !Value Button Send"},
     {OP_A11Y, 0, 0, 0, 0, "uia has Button Send"},
     {OP_A11Y, 0, 0, 0, 0, "uia can Invoke,!Toggle,!ExpandCollapse Button Send"},
     {OP_A11Y, 0, 0, 0, 0, "uia hit Button Send"},
@@ -24524,9 +24534,9 @@ static DriveOp a11yops[] = {
     {OP_TEXT, 0, 0, 0, 300, "pressed from another process"},
     {OP_TOUCH, 0, 0, 0, 0, "uiaprobe-ready"},
     {OP_WAIT, W_FILE, 0, 0, 120000, "uiaprobe-done"},
-    {OP_A11Y, 0, 0, 0, 500, "has button Send"},
+    {OP_WAIT, W_IDLE, 0, 0, 10000, ""},  // Send is Steer while the turn runs
+    {OP_A11Y, 0, 0, 0, 0, "has button Send"},
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
-    {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
     // A new session for what follows, whose rows are named for the
     // first prompt sent below, not for these
     {OP_NEWSESSION, 0, 0, 0, 0, ""},

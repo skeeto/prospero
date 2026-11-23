@@ -93,7 +93,7 @@ static void axsend(W32Gui *w, W32AxLine *l)
 // Where the message being handled came from (GetCurrentInputMessageSource,
 // Windows 8): a program's injected input says so; posted messages, as
 // the checklist's, and older systems say nothing.
-enum { W32SRC_UNKNOWN, W32SRC_HARDWARE, W32SRC_INJECTED, W32SRC_SYSTEM };
+enum { W32SRC_UNKNOWN, W32SRC_HARDWARE, W32SRC_INJECTED, W32SRC_SYSTEM, W32SRC_UNAVAILABLE };
 
 static int axsource(char const **name)
 {
@@ -126,7 +126,7 @@ static int axsource(char const **name)
     buf[n] = 0;
     *name = buf;
     return s.origin==1 ? W32SRC_HARDWARE : s.origin==2 ? W32SRC_INJECTED
-         : s.origin==4 ? W32SRC_SYSTEM   : W32SRC_UNKNOWN;
+         : s.origin==4 ? W32SRC_SYSTEM   : W32SRC_UNAVAILABLE;
 }
 
 static char const *axobjid(LONG id)
@@ -345,13 +345,23 @@ static void w32axtrace(W32Gui *w, UINT msg, WPARAM wp, LPARAM lp)
         }
         if (src==W32SRC_UNKNOWN && !(msg==WM_CHAR && wp>=0xd800 && wp<0xe000) &&
                 !(msg==WM_KEYDOWN && (wp==VK_PACKET || wp==VK_PROCESSKEY))) {
-            // Posted (the checklist's), or an old system: as typing,
-            // unless it is what only a program or an input method sends
+            // An old system: as typing, unless it is what only a
+            // program or an input method sends
+            return;
+        }
+        if (src==W32SRC_UNAVAILABLE && (msg==WM_CHAR ? wp>=0x20 && wp!=0x7f
+                                        : msg==WM_UNICHAR || !axvkname(wp))) {
+            // Posted, as the checklist's and an input method's are, and
+            // as a speech tool's Enter came (Voice Access's "new line",
+            // which sent): the editing keys and control characters, but
+            // not text, which may be typing through an input method
             return;
         }
         if (msg==WM_CHAR || msg==WM_UNICHAR) {
             axlput(&l, msg==WM_CHAR ? "WM_CHAR " : "WM_UNICHAR ");
-            if (text && msg==WM_CHAR) {
+            if (msg==WM_CHAR && (wp<0x20 || wp==0x7f)) {
+                axlputx(&l, wp);  // a control character, never raw
+            } else if (text && msg==WM_CHAR) {
                 wchar_t c = (wchar_t)wp;
                 axlputw(&l, &c, 1);
             } else if (text) {
@@ -498,12 +508,18 @@ static int axhasselect(W32AxNode *n)
 {
     return n->role==W32R_TAB || n->role==W32R_LISTITEM || n->role==W32R_RADIO;
 }
+// A text field's: without it, Voice Access passes an Edit by, neither
+// labeling it nor dictating into it by name
+static int axhasvalue(W32AxNode *n)
+{
+    return n->role==W32R_TEXTFIELD || n->role==W32R_TEXTAREA;
+}
 
 static W32AxProv *axprov(W32Gui *w, unsigned key);
 
 struct W32AxProv : IRawElementProviderSimple, IRawElementProviderFragment,
                    IRawElementProviderFragmentRoot, IInvokeProvider, IToggleProvider,
-                   IExpandCollapseProvider, ISelectionItemProvider {
+                   IExpandCollapseProvider, ISelectionItemProvider, IValueProvider {
     LONG     refs;
     unsigned key;
     int      dead;
@@ -533,6 +549,8 @@ struct W32AxProv : IRawElementProviderSimple, IRawElementProviderFragment,
             *out = static_cast<IExpandCollapseProvider *>(this);
         } else if (IsEqualIID(id, __uuidof(ISelectionItemProvider))) {
             *out = static_cast<ISelectionItemProvider *>(this);
+        } else if (IsEqualIID(id, __uuidof(IValueProvider))) {
+            *out = static_cast<IValueProvider *>(this);
         } else {
             *out = 0;
             return E_NOINTERFACE;
@@ -588,6 +606,9 @@ struct W32AxProv : IRawElementProviderSimple, IRawElementProviderFragment,
             break;
         case UIA_SelectionItemPatternId:
             p = axhasselect(&n) ? static_cast<ISelectionItemProvider *>(this) : 0;
+            break;
+        case UIA_ValuePatternId:
+            p = axhasvalue(&n) ? static_cast<IValueProvider *>(this) : 0;
             break;
         }
         if (p) {
@@ -866,6 +887,41 @@ struct W32AxProv : IRawElementProviderSimple, IRawElementProviderFragment,
     }
 
     HRESULT STDMETHODCALLTYPE Invoke() override { return act(W32AXACT_PRESS); }
+
+    // IValueProvider: a text field's text, set only while it has the
+    // keyboard, as the core's text model is of that field alone
+    HRESULT STDMETHODCALLTYPE get_Value(BSTR *out) override
+    {
+        *out = 0;
+        W32AxNode n;
+        if (!now(&n)) {
+            return UIA_E_ELEMENTNOTAVAILABLE;
+        }
+        VARIANT v = {};
+        bstr(&v, W32AXSTR_VALUE);
+        *out = v.vt==VT_BSTR ? v.bstrVal : SysAllocStringLen(L"", 0);
+        return *out ? S_OK : E_OUTOFMEMORY;
+    }
+    HRESULT STDMETHODCALLTYPE get_IsReadOnly(BOOL *out) override
+    {
+        W32AxNode n;
+        *out = TRUE;
+        if (!now(&n)) {
+            return UIA_E_ELEMENTNOTAVAILABLE;
+        }
+        *out = !(n.actions & W32A_EDIT) || (n.state & (W32S_READONLY|W32S_DISABLED));
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE SetValue(LPCWSTR text) override
+    {
+        W32AxNode n;
+        if (!now(&n)) {
+            return UIA_E_ELEMENTNOTAVAILABLE;
+        }
+        int len = text ? lstrlenW(text) : 0;
+        return w->hooks.ax.setvalue(w->hooks.gui, key, (unsigned short const *)text, len)
+               ? S_OK : UIA_E_ELEMENTNOTENABLED;
+    }
     HRESULT STDMETHODCALLTYPE Toggle() override { return act(W32AXACT_PRESS); }
 
     HRESULT STDMETHODCALLTYPE get_ToggleState(ToggleState *out) override
@@ -1208,6 +1264,16 @@ extern "C" void w32gui_axevents(void *gp, W32AxEvent const *ev, int n)
                     axraisebool(p, UIA_SelectionItemIsSelectedPropertyId,
                                 (nd.state & W32S_SELECTED) != 0);
                 }
+                if (axhasvalue(&nd) && ev[e].kind==W32AXE_VALUE) {
+                    VARIANT v = {};
+                    p->bstr(&v, W32AXSTR_VALUE);
+                    if (v.vt != VT_BSTR) {
+                        v.vt      = VT_BSTR;
+                        v.bstrVal = SysAllocStringLen(L"", 0);
+                    }
+                    axraiseprop(p, UIA_ValueValuePropertyId, v);
+                    VariantClear(&v);
+                }
             }
             break;
         case W32AXE_CHILDREN:
@@ -1247,7 +1313,7 @@ static struct { char const *name; long id; } const axtypenames[] = {
 static struct { char const *name; PATTERNID id; } const axpatnames[] = {
     {"Invoke", UIA_InvokePatternId}, {"Toggle", UIA_TogglePatternId},
     {"ExpandCollapse", UIA_ExpandCollapsePatternId},
-    {"SelectionItem", UIA_SelectionItemPatternId},
+    {"SelectionItem", UIA_SelectionItemPatternId}, {"Value", UIA_ValuePatternId},
 };
 
 static int axeq(char const *a, int alen, char const *b)
@@ -1346,7 +1412,8 @@ extern "C" void w32gui_axdrive(void *gp, char const *cmd, int len, char *out, in
     while (s<e && *s!=' ') s++;
     int vlen = (int)(s - verb);
     int want = axeq(verb, vlen, "start") ? 0
-             : axeq(verb, vlen, "can") || axeq(verb, vlen, "parent") ? 2 : 1;
+             : axeq(verb, vlen, "can") || axeq(verb, vlen, "parent") ||
+               axeq(verb, vlen, "value") || axeq(verb, vlen, "setvalue") ? 2 : 1;
     for (; nwords < want; nwords++) {
         while (s<e && *s==' ') s++;
         word[nwords] = s;
@@ -1463,6 +1530,39 @@ extern "C" void w32gui_axdrive(void *gp, char const *cmd, int len, char *out, in
         } else {
             axlput(&l, "refused ");
             axlputx(&l, (unsigned long)r);
+        }
+    } else if (axeq(verb, vlen, "value") || axeq(verb, vlen, "setvalue")) {
+        // Through the Value pattern, TEXT a word, "-" for empty
+        IUnknown *u = 0;
+        int       set = axeq(verb, vlen, "setvalue");
+        wchar_t   want[128];
+        int       n = wlen[0]==1 && word[0][0]=='-' ? 0
+                    : MultiByteToWideChar(CP_UTF8, 0, word[0], wlen[0], want, 127);
+        want[n > 0 ? n : 0] = 0;
+        if (fs->GetPatternProvider(UIA_ValuePatternId, &u)!=S_OK || !u) {
+            axlput(&l, "no Value pattern");
+        } else if (set) {
+            HRESULT r = ((IValueProvider *)u)->SetValue(want);
+            if (r == S_OK) {
+                axlput(&l, "ok");
+            } else {
+                axlput(&l, "refused ");
+                axlputx(&l, (unsigned long)r);
+            }
+        } else {
+            BSTR got = 0;
+            ((IValueProvider *)u)->get_Value(&got);
+            int glen = got ? (int)SysStringLen(got) : 0;
+            if (glen==n && !memcmp(got, want, (size_t)n*2)) {
+                axlput(&l, "ok");
+            } else {
+                axlput(&l, "is ");
+                axlputw(&l, got ? got : L"", glen);
+            }
+            SysFreeString(got);
+        }
+        if (u) {
+            u->Release();
         }
     } else if (axeq(verb, vlen, "hit")) {
         UiaRect r = {};
@@ -1730,6 +1830,37 @@ static int hookaxact(void *p, unsigned key, int kind)
     return ok;
 }
 
+// UI Automation's SetValue: the field's whole text, as AXValue's set is
+// on macOS, for the focused editable field only
+static int hookaxsetvalue(void *p, unsigned key, unsigned short const *s, int n)
+{
+    Gui   *g  = (Gui *)p;
+    AxGui *x  = g->ax && g->ax->on ? g->ax : 0;
+    b32    ok = 0;
+    Arena  a  = x ? x->logmem : Arena{};
+    Str    text = {};
+    if (x && x->ax->text.live && x->ax->text.key==key) {
+        text = fromwide(&a, (c16 *)s, n);
+        ok   = axtextedit(g, 0, axtextlen(x->ax), text, AX_AFTER, AX_AFTER);
+    }
+    if (ok) {
+        os_wake(g->os);
+    }
+    if (x && x->on && (PROSPERO_DEVTOOLS || x->tracefd>=0)) {
+        Buf b(&a, 64 + text.len);
+        print(&b, "SetValue ");
+        if (ok) {  // the field took it: no password
+            axlogstr(&b, text);
+        } else {
+            print(&b, "(withheld)");
+        }
+        print(&b, ok ? Str(" -> ok") : Str(" -> refused"));
+        Str line = finish(&b);
+        axnote(x, a, line);
+    }
+    return ok;
+}
+
 // After each publish: its events to the edge, in batches
 static void w32axpublished(AxGui *x)
 {
@@ -1781,6 +1912,7 @@ static void w32axhooks(W32AxHooks *h)
     h->focus   = hookaxfocus;
     h->hit     = hookaxhit;
     h->act     = hookaxact;
+    h->setvalue = hookaxsetvalue;
 }
 
 // At the window's opening, with accessibility not off

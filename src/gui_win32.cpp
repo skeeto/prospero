@@ -101,6 +101,9 @@ struct W32AxHooks {
     unsigned (*hit)(void *gui, float x, float y);  // the root's for none
     // Act on it (W32AXACT_*), for the next frame: 0 if it can't
     int  (*act)(void *gui, unsigned key, int kind);
+    // Replace the text of field key, UTF-16, which must be the focused
+    // editable field: 0 if it isn't
+    int  (*setvalue)(void *gui, unsigned key, unsigned short const *s, int n);
 };
 
 // Shared by both halves: the core's callbacks, called on the GUI thread.

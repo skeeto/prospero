@@ -10,7 +10,8 @@
 #
 # 1. finds its window (class "prospero") among the desktop's, and dumps
 #    the tree under it, control types and names, as the control view
-#    walks it;
+#    walks it, with each element's patterns and, when a hit test at its
+#    center finds another, what (reported, not checked);
 # 2. finds the element with the keyboard focus (HasKeyboardFocus) and
 #    requires the prompt: an Edit named Prompt. The window is not the
 #    user's (the checklist's never takes the foreground), so not the
@@ -72,6 +73,24 @@ if (-not $window) {
     exit 1
 }
 
+# An element's patterns, and what a client clicking it by voice would
+# find at its center, if not itself (as Voice Access may check)
+function Extra($e) {
+    $pats = ($e.GetSupportedPatterns() | ForEach-Object {
+        $_.ProgrammaticName -replace 'PatternIdentifiers\.Pattern$', '' }) -join ','
+    $out = if ($pats) { " [$pats]" } else { "" }
+    $r = $e.Current.BoundingRectangle
+    if ($r.IsEmpty) {
+        return "$out (no rectangle)"
+    }
+    $pt = New-Object System.Windows.Point(($r.Left + $r.Width/2), ($r.Top + $r.Height/2))
+    $at = $AE::FromPoint($pt)
+    if (-not ($at -and [System.Windows.Automation.Automation]::Compare($at, $e))) {
+        $out += " (its center is " + (Describe $at) + ")"
+    }
+    $out
+}
+
 # 1. The tree, as the control view walks it
 $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
 $count = 0
@@ -79,7 +98,7 @@ function Dump($e, $depth) {
     $c = $walker.GetFirstChild($e)
     while ($c -and $script:count -lt 2000) {
         $script:count++
-        Write-Output ("tree: " + ("  " * $depth) + (Describe $c))
+        Write-Output ("tree: " + ("  " * $depth) + (Describe $c) + (Extra $c))
         if ($depth -lt 24) { Dump $c ($depth + 1) }
         $c = $walker.GetNextSibling($c)
     }
