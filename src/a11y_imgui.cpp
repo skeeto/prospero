@@ -58,7 +58,7 @@ struct AxList {
     u32    key;
     u32    window;
     Str    name;
-    ImRect rect;   // its items', together
+    ImRect clip;   // its window's visible part
     b32    added;  // to this frame's tree
 };
 
@@ -217,11 +217,6 @@ void ImGuiTestEngineHook_ItemAdd(ImGuiContext *ctx, ImGuiID id, ImRect const &bb
     if (x->inlist && x->lists[x->inlist-1].window==w->ID) {
         AxList *l = &x->lists[x->inlist-1];
         it.list   = l->key;
-        if (!it.offscreen) {
-            b32 first = l->rect.Min.x > l->rect.Max.x;
-            l->rect   = first ? item->Rect : l->rect;
-            l->rect.Add(item->Rect);
-        }
     }
     if (x->nextname.len) {
         it.named     = w->ID == x->nextwin;  // else its window skipped it
@@ -542,7 +537,7 @@ static void axlist(Gui *g, u32 key, Str name)
         l.key    = key;
         l.window = ImGui::GetCurrentWindow()->ID;
         l.name   = clone(&x->mem, name);
-        l.rect   = ImRect(1, 1, 0, 0);  // none yet: Min past Max
+        l.clip   = ImGui::GetCurrentWindow()->ClipRect;
         x->lists  = push(&x->mem, x->lists, l);
         x->inlist = x->lists.len;
     }
@@ -774,8 +769,19 @@ static void axbuild(AxGui *x, ImGuiContext *ctx)
                 continue;
             }
             if (!l->added) {  // where its first item is, among its window's
+                // Its rectangle: its rows' as reported (axitemtop's cut),
+                // together, and only what of them is in view
+                ImRect r(1, 1, 0, 0);  // none yet: Min past Max
+                for (iz j = i; j < x->items.len; j++) {
+                    AxItem *o = &x->items[j];
+                    if (o->list==l->key && !o->offscreen) {
+                        r = r.Min.x>r.Max.x ? o->rect : r;
+                        r.Add(o->rect);
+                    }
+                }
+                r.ClipWithFull(l->clip);
                 AxNode *ln = axadd(b, parent, l->key, AX_GROUP, l->name);
-                ln->rect   = {l->rect.Min.x, l->rect.Min.y, l->rect.Max.x, l->rect.Max.y};
+                ln->rect   = {r.Min.x, r.Min.y, r.Max.x, r.Max.y};
                 l->added   = 1;
             }
             parent = l->key;

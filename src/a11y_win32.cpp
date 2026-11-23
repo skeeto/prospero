@@ -743,10 +743,11 @@ struct W32AxProv : IRawElementProviderSimple, IRawElementProviderFragment,
                    IRawElementProviderFragmentRoot, IInvokeProvider, IToggleProvider,
                    IExpandCollapseProvider, ISelectionItemProvider, IValueProvider,
                    ITextProvider2 {
-    LONG     refs;
-    unsigned key;
-    int      dead;
-    W32Gui  *w;
+    LONG      refs;
+    unsigned  key;
+    int       dead;
+    W32Gui   *w;
+    W32AxNode told;  // its rectangle and state as clients last saw them
 
     // IUnknown
 
@@ -1447,6 +1448,7 @@ static W32AxProv *axprov(W32Gui *w, unsigned key)
     p->refs = 1;
     p->key  = key;
     p->w    = w;
+    p->told = n;
     if (!axinsert(p)) {
         p->Release();
         return 0;
@@ -2090,6 +2092,48 @@ static void axraiseint(W32AxProv *p, PROPERTYID id, int i)
     axraiseprop(p, id, v);
 }
 
+// Something moved (a scroll, a resize, a row opening): each element a
+// client holds whose rectangle changed since it was told says so, as a
+// native control's does, so a tool such as Voice Access doesn't place
+// its numbers or clicks by where things were
+static void axlayout(W32Gui *w)
+{
+    W32AxHooks *h    = &w->hooks.ax;
+    unsigned    size = w32ax.tab ? 1u<<w32ax.exp : 0;
+    POINT       o    = {0, 0};
+    ClientToScreen(w->hwnd, &o);
+    for (unsigned i = 0; i < size; i++) {
+        W32AxProv *p = w32ax.tab[i];
+        W32AxNode  n;
+        if (!p || p==w32ax.root || !h->node(w->hooks.gui, p->key, &n)) {
+            continue;
+        }
+        W32AxNode *t   = &p->told;
+        int        off = (n.state & W32S_OFFSCREEN) != 0;
+        int        was = (t->state & W32S_OFFSCREEN) != 0;
+        int        moved = n.x0!=t->x0 || n.y0!=t->y0 || n.x1!=t->x1 || n.y1!=t->y1;
+        *t = n;
+        if (off != was) {
+            axraisebool(p, UIA_IsOffscreenPropertyId, off);
+        }
+        if (moved || off!=was) {
+            SAFEARRAY *a = SafeArrayCreateVector(VT_R8, 0, 4);
+            if (a) {
+                double *d = (double *)a->pvData;  // as get_BoundingRectangle's
+                d[0] = off ? 0 : o.x + n.x0;
+                d[1] = off ? 0 : o.y + n.y0;
+                d[2] = off || n.x1<n.x0 ? 0 : n.x1 - n.x0;
+                d[3] = off || n.y1<n.y0 ? 0 : n.y1 - n.y0;
+                VARIANT v = {};
+                v.vt     = VT_R8 | VT_ARRAY;
+                v.parray = a;
+                axraiseprop(p, UIA_BoundingRectanglePropertyId, v);
+                VariantClear(&v);
+            }
+        }
+    }
+}
+
 static void axchildren(W32AxProv *p)
 {
     if (p == w32ax.root) {
@@ -2188,6 +2232,9 @@ extern "C" void w32gui_axevents(void *gp, W32AxEvent const *ev, int n)
             if (p) {
                 axchildren(p);
             }
+            break;
+        case W32AXE_LAYOUT:
+            axlayout(w);
             break;
         }
     }
