@@ -552,7 +552,18 @@ static int axhasvalue(W32AxNode *n)
     return n->role==W32R_TEXTFIELD || n->role==W32R_TEXTAREA;
 }
 
+// Whether it takes the keyboard, as tools see it: what ImGui can focus,
+// and the kinds a native app's always do, as Voice Access gives a
+// number to a tab, list item, link or drop-down only if it says so
+static int axfocusable(W32AxNode *n)
+{
+    return (n->actions & (W32A_FOCUS|W32A_EDIT)) || n->role==W32R_TAB ||
+           n->role==W32R_LISTITEM || n->role==W32R_LINK || n->role==W32R_COMBO ||
+           n->role==W32R_CHECKBOX || n->role==W32R_RADIO;
+}
+
 static W32AxProv *axprov(W32Gui *w, unsigned key);
+static void axasked(W32AxProv *p, int pattern, int id, VARIANT const *v, int has);
 
 struct W32AxProv : IRawElementProviderSimple, IRawElementProviderFragment,
                    IRawElementProviderFragmentRoot, IInvokeProvider, IToggleProvider,
@@ -623,7 +634,22 @@ struct W32AxProv : IRawElementProviderSimple, IRawElementProviderFragment,
         return S_OK;
     }
 
+    // What a client asks, and the answer, logged the first time: how a
+    // tool decides what it can click, label or dictate into
     HRESULT STDMETHODCALLTYPE GetPatternProvider(PATTERNID id, IUnknown **out) override
+    {
+        HRESULT r = pattern(id, out);
+        axasked(this, 1, id, 0, r==S_OK && *out);
+        return r;
+    }
+    HRESULT STDMETHODCALLTYPE GetPropertyValue(PROPERTYID id, VARIANT *out) override
+    {
+        HRESULT r = property(id, out);
+        axasked(this, 0, id, r==S_OK ? out : 0, 0);
+        return r;
+    }
+
+    HRESULT pattern(PATTERNID id, IUnknown **out)
     {
         *out = 0;
         W32AxNode n;
@@ -655,7 +681,7 @@ struct W32AxProv : IRawElementProviderSimple, IRawElementProviderFragment,
         return S_OK;
     }
 
-    HRESULT STDMETHODCALLTYPE GetPropertyValue(PROPERTYID id, VARIANT *out) override
+    HRESULT property(PROPERTYID id, VARIANT *out)
     {
         out->vt = VT_EMPTY;
         W32AxNode n;
@@ -691,7 +717,7 @@ struct W32AxProv : IRawElementProviderSimple, IRawElementProviderFragment,
             break;
         case UIA_IsKeyboardFocusablePropertyId:
             out->vt      = VT_BOOL;
-            out->boolVal = n.actions & (W32A_FOCUS|W32A_EDIT) ? VARIANT_TRUE : VARIANT_FALSE;
+            out->boolVal = axfocusable(&n) ? VARIANT_TRUE : VARIANT_FALSE;
             break;
         case UIA_HasKeyboardFocusPropertyId:
             out->vt      = VT_BOOL;
@@ -1352,6 +1378,141 @@ static struct { char const *name; PATTERNID id; } const axpatnames[] = {
     {"ExpandCollapse", UIA_ExpandCollapsePatternId},
     {"SelectionItem", UIA_SelectionItemPatternId}, {"Value", UIA_ValuePatternId},
 };
+
+static char const *axpropname(int id)
+{
+    switch (id) {
+    case UIA_ControlTypePropertyId:          return "ControlType";
+    case UIA_NamePropertyId:                 return "Name";
+    case UIA_HelpTextPropertyId:             return "HelpText";
+    case UIA_AutomationIdPropertyId:         return "AutomationId";
+    case UIA_IsKeyboardFocusablePropertyId:  return "IsKeyboardFocusable";
+    case UIA_HasKeyboardFocusPropertyId:     return "HasKeyboardFocus";
+    case UIA_IsEnabledPropertyId:            return "IsEnabled";
+    case UIA_IsOffscreenPropertyId:          return "IsOffscreen";
+    case UIA_IsPasswordPropertyId:           return "IsPassword";
+    case UIA_IsDialogPropertyId:             return "IsDialog";
+    case UIA_IsControlElementPropertyId:     return "IsControlElement";
+    case UIA_IsContentElementPropertyId:     return "IsContentElement";
+    case UIA_ClickablePointPropertyId:       return "ClickablePoint";
+    case UIA_LocalizedControlTypePropertyId: return "LocalizedControlType";
+    case UIA_AcceleratorKeyPropertyId:       return "AcceleratorKey";
+    case UIA_AccessKeyPropertyId:            return "AccessKey";
+    case UIA_ClassNamePropertyId:            return "ClassName";
+    case UIA_FrameworkIdPropertyId:          return "FrameworkId";
+    case UIA_ProcessIdPropertyId:            return "ProcessId";
+    case UIA_LabeledByPropertyId:            return "LabeledBy";
+    case UIA_ItemStatusPropertyId:           return "ItemStatus";
+    case UIA_ItemTypePropertyId:             return "ItemType";
+    case UIA_BoundingRectanglePropertyId:    return "BoundingRectangle";
+    case UIA_NativeWindowHandlePropertyId:   return "NativeWindowHandle";
+    case UIA_RuntimeIdPropertyId:            return "RuntimeId";
+    case UIA_ProviderDescriptionPropertyId:  return "ProviderDescription";
+    case UIA_IsPeripheralPropertyId:         return "IsPeripheral";
+    case UIA_LiveSettingPropertyId:          return "LiveSetting";
+    case UIA_LegacyIAccessibleRolePropertyId:          return "LegacyRole";
+    case UIA_LegacyIAccessibleDefaultActionPropertyId: return "LegacyDefaultAction";
+    case UIA_LegacyIAccessibleStatePropertyId:         return "LegacyState";
+    }
+    return 0;
+}
+
+static char const *axpatname(int id)
+{
+    switch (id) {
+    case UIA_InvokePatternId:           return "Invoke";
+    case UIA_TogglePatternId:           return "Toggle";
+    case UIA_ExpandCollapsePatternId:   return "ExpandCollapse";
+    case UIA_SelectionItemPatternId:    return "SelectionItem";
+    case UIA_SelectionPatternId:        return "Selection";
+    case UIA_ValuePatternId:            return "Value";
+    case UIA_TextPatternId:             return "Text";
+    case UIA_TextPattern2Id:            return "Text2";
+    case UIA_TextEditPatternId:         return "TextEdit";
+    case UIA_LegacyIAccessiblePatternId: return "LegacyIAccessible";
+    case UIA_ScrollItemPatternId:       return "ScrollItem";
+    case UIA_ScrollPatternId:           return "Scroll";
+    case UIA_RangeValuePatternId:       return "RangeValue";
+    case UIA_GridItemPatternId:         return "GridItem";
+    case UIA_TableItemPatternId:        return "TableItem";
+    case UIA_VirtualizedItemPatternId:  return "VirtualizedItem";
+    case UIA_ItemContainerPatternId:    return "ItemContainer";
+    case UIA_WindowPatternId:           return "Window";
+    }
+    return 0;
+}
+
+// The first ask of each element and property or pattern, with the
+// answer, while the log is read: a set of (key, id), let go when full
+static void axasked(W32AxProv *p, int pattern, int id, VARIANT const *v, int has)
+{
+    enum { SEEN = 1<<14 };
+    static unsigned long long seen[SEEN];
+    static int                nseen;
+    W32Gui     *w = p->w;
+    W32AxHooks *h = w ? &w->hooks.ax : 0;
+    if (!h || !h->logging || !(h->logging(w->hooks.gui) & W32AXLOG_ON)) {
+        return;
+    }
+    unsigned long long k = (unsigned long long)p->key<<32 | (unsigned)id<<1 | (pattern!=0);
+    unsigned long long hash = (k + 1) * 0x9e3779b97f4a7c15u;
+    int i = (int)(hash >> 50);
+    for (; seen[i]; i = (i+1) & (SEEN-1)) {
+        if (seen[i] == k+1) {
+            return;
+        }
+    }
+    if (nseen >= SEEN/2) {
+        memset(seen, 0, sizeof(seen));
+        nseen = 0;
+        i = (int)(hash >> 50);
+    }
+    seen[i] = k + 1;
+    nseen++;
+
+    W32AxLine l = {};
+    W32AxNode n = {};
+    axlput(&l, "ask ");
+    if (p->key == W32AX_ROOT) {
+        axlput(&l, "root");
+    } else if (h->node(w->hooks.gui, p->key, &n)) {
+        long ct = axcontroltypes[n.role>=0 && n.role<W32R_N ? n.role : 0];
+        char const *tn = "?";
+        for (int j = 0; j < (int)(sizeof(axtypenames)/sizeof(*axtypenames)); j++) {
+            tn = axtypenames[j].id==ct ? axtypenames[j].name : tn;
+        }
+        axlput(&l, tn);
+        axlput(&l, " ");
+        unsigned short buf[48];
+        int len = h->text(w->hooks.gui, p->key, W32AXSTR_NAME, buf, 48);
+        axlputw(&l, (wchar_t const *)buf, len<48 ? len : 48);
+    } else {
+        axlput(&l, "(gone)");
+    }
+    char const *name = pattern ? axpatname(id) : axpropname(id);
+    axlput(&l, pattern ? " pattern " : " ");
+    if (name) {
+        axlput(&l, name);
+    } else {
+        axlputn(&l, id);
+    }
+    axlput(&l, " -> ");
+    if (pattern) {
+        axlput(&l, has ? "yes" : "no");
+    } else if (!v || v->vt==VT_EMPTY) {
+        axlput(&l, "(default)");
+    } else if (v->vt == VT_BOOL) {
+        axlput(&l, v->boolVal ? "true" : "false");
+    } else if (v->vt == VT_I4) {
+        axlputn(&l, v->lVal);
+    } else if (v->vt==VT_BSTR && id!=UIA_ValueValuePropertyId) {
+        axlputw(&l, v->bstrVal, (int)SysStringLen(v->bstrVal));
+    } else {
+        axlput(&l, "vt ");
+        axlputn(&l, v->vt);
+    }
+    axsend(w, &l);
+}
 
 static int axeq(char const *a, int alen, char const *b)
 {
