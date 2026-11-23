@@ -43,10 +43,14 @@
 // hidden. A folded row's sessions are left out of the rows.
 //
 // A subagent cannot be resumed, so one whose task is over is done for
-// good. A session with SIDE_DONEMIN or more such subagents lists the
-// rest, those at work, asking, or in view (and those above them), then
-// a "finished" row over the done ones, folded unless opened, so that
-// dozens of done subagents do not bury the few still at work.
+// good; one between turns with background jobs running is not, since a
+// job's end starts its next turn (#99). A session with SIDE_DONEMIN or
+// more done subagents lists the rest, those at work, asking, with jobs,
+// or in view (and those above them), then a "finished" row over the
+// done ones, folded unless opened, so that dozens of done subagents do
+// not bury the few still at work. Under it, with byat, the done ones
+// come by their subtrees' latest time, most recent first, as roots do:
+// done, their times hold still, so none leapfrogs another (#99).
 //
 // Fold keys:
 //   g:NAME            a group
@@ -98,6 +102,7 @@ struct SideSess {
     b32  trashed;   // in the Trash: only a root's counts
     b32  active;    // runs a turn
     b32  asks;      // waits for the user
+    b32  jobs;      // has background jobs running, whose ends start turns
     b32  shown;     // the session in view
     b32  pick;      // the GUI lets it be picked (a root of its own)
     i64  at;        // its time to sort by (byat), on its host's clock
@@ -153,8 +158,8 @@ struct SideTree {
     i32                      *size;     // sessions in its subtree
     b32                      *active;   // something in its subtree runs or asks
     b32                      *asks;     // something in its subtree asks
-    b32                      *keep;     // something in its subtree runs, asks
-                                        // or is in view: not finished
+    b32                      *keep;     // something in its subtree runs, asks,
+                                        // has jobs or is in view: not finished
     i64                      *at;       // the latest at in its subtree, on
                                         // its root's host
 };
@@ -179,7 +184,7 @@ static void sideplace(SideTree *t, i32 i, i32 root, i32 depth)
     t->size[i]   = 1;
     t->active[i] = s->active || s->asks;
     t->asks[i]   = s->asks;
-    t->keep[i]   = s->active || s->asks || s->shown;
+    t->keep[i]   = s->active || s->asks || s->jobs || s->shown;
     t->at[i]     = s->at;
     i32 host     = t->in->sess[root].host;
     Slice<i32> k = t->kids[i];
@@ -200,8 +205,8 @@ static void sideplace(SideTree *t, i32 i, i32 root, i32 depth)
     }
 }
 
-// A root and its subtree's time, to sort roots by (sort hands its
-// comparator no context).
+// A session and its subtree's time, to sort roots or finished
+// subagents by (sort hands its comparator no context).
 struct SideAt {
     i64 at;
     i32 root;
@@ -275,10 +280,27 @@ static void sideemit(SideTree *t, i32 i, i32 depth, Str group, i32 aside, i32 le
     f.count    = size;
     f.folded   = sidefolded(t->in, f.key, 1);
     t->rows = push(t->a, t->rows, f);
-    for (iz n = 0; !f.folded && n < k.len; n++) {
-        if (t->under[k[n]]==i && !t->keep[k[n]]) {
-            sideemit(t, k[n], depth+2, group, aside, level+1);
+    if (f.folded) {
+        return;
+    }
+    // Oldest first, or with byat by their subtrees' latest time, most
+    // recent first: those on another host than the root's, another
+    // clock, after them as they came
+    SideAt *by   = alloc<SideAt>(t->a, done);
+    i32     nby  = 0;
+    i32     host = t->in->sess[t->root[i]].host;
+    for (iz n = 0; n < k.len; n++) {
+        i32 c = k[n];
+        if (t->under[c]==i && !t->keep[c]) {
+            b32 here = t->in->sess[c].host == host;
+            by[nby++] = {here ? t->at[c] : (i64)((u64)1<<63), c};
         }
+    }
+    if (t->in->byat) {
+        sort(by, nby, sideatafter, *t->a);
+    }
+    for (i32 n = 0; n < nby; n++) {
+        sideemit(t, by[n].root, depth+2, group, aside, level+1);
     }
 }
 

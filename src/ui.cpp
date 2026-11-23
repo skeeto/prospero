@@ -11437,6 +11437,7 @@ static void drawsessions(Gui *g)
             e.asks     = v && v->asks && !s->readonly;
             e.active   = v ? v->busy && !s->readonly
                            : s->state!=LIVE_IDLE && s->state!=LIVE_CLOSED;
+            e.jobs     = (v ? v->jobsrun : s->jobs) > 0;
             e.shown    = s == g->sess;
             if (!hold || resync || !s->sortat) {
                 s->sortat = s->lastact;  // a new one takes its place at once

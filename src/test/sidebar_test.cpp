@@ -143,6 +143,56 @@ static void test_sidebar(Test *t)
         *upsert(&d.folds, "d:this:p", &a) = 0;
         expect(t, "sidebar.doneopen", siderows(&a, &d, sidetree(&a, &d)),
                "S p\n D 6\n  S k1\n  S k2\n  S k3\n   S k3x\n  S k4\n  S k5\n");
+
+        // Between turns with background jobs is not finished (#99), but
+        // does not hold the session open as work or a question does
+        d.sess[1].jobs = 1;  // k4
+        expect(t, "sidebar.donejobs", siderows(&a, &d, sidetree(&a, &d)),
+               "S p\n S k4\n D 5\n  S k1\n  S k2\n  S k3\n   S k3x\n  S k5\n");
+        *upsert(&d.folds, "s:this:p", &a) = 1;
+        expect(t, "sidebar.donejobsfold", siderows(&a, &d, sidetree(&a, &d)), "S p+\n");
+        *upsert(&d.folds, "s:this:p", &a) = 0;
+
+        // With byat, the finished by their subtrees' latest time, most
+        // recent first (#99); those kept still as they came
+        d.byat = 1;
+        i64 at[] = {30, 70, 60, 20, 50, 10, 0};  // k5 k4 k3x k3 k2 k1 p
+        for (iz i = 0; i < countof(at); i++) {
+            d.sess[i].at = at[i];
+        }
+        expect(t, "sidebar.doneat", siderows(&a, &d, sidetree(&a, &d)),
+               "S p\n S k4\n D 5\n  S k3\n   S k3x\n  S k2\n  S k5\n  S k1\n");
+        d.sess[0].shown = 1;  // k5 kept: kept ones still oldest first
+        expect(t, "sidebar.doneatkept", siderows(&a, &d, sidetree(&a, &d)),
+               "S p\n S k4\n S k5\n D 4\n  S k3\n   S k3x\n  S k2\n  S k1\n");
+        d.sess[0].shown = 0;
+        d.byat = 0;
+        expect(t, "sidebar.doneatoff", siderows(&a, &d, sidetree(&a, &d)),
+               "S p\n S k4\n D 5\n  S k1\n  S k2\n  S k3\n   S k3x\n  S k5\n");
+    }
+
+    // Finished subagents on another host than their root's, another
+    // clock, come after the rest with byat, as they came
+    {
+        SideIn d = {};
+        d.hosts = push(&a, d.hosts, SideHost{"this", 1, 0});
+        d.hosts = push(&a, d.hosts, SideHost{"remote:r", 1, 0});
+        d.sess  = push(&a, d.sess, sidesess(0, "k4", "p", {}, 0));
+        d.sess  = push(&a, d.sess, sidesess(1, "r2", "p", {}, 0));
+        d.sess  = push(&a, d.sess, sidesess(0, "k3", "p", {}, 0));
+        d.sess  = push(&a, d.sess, sidesess(1, "r1", "p", {}, 0));
+        d.sess  = push(&a, d.sess, sidesess(0, "k2", "p", {}, 0));
+        d.sess  = push(&a, d.sess, sidesess(0, "p", {}, {}, 0));
+        d.sess[1].phost = 1;
+        d.sess[3].phost = 1;
+        i64 at[] = {10, 90, 30, 80, 20, 0};  // k4 r2 k3 r1 k2 p
+        for (iz i = 0; i < countof(at); i++) {
+            d.sess[i].at = at[i];
+        }
+        d.byat = 1;
+        *upsert(&d.folds, "d:this:p", &a) = 0;
+        expect(t, "sidebar.doneataway", siderows(&a, &d, sidetree(&a, &d)),
+               "S p\n D 5\n  S k3\n  S k2\n  S k4\n  S r1@\n  S r2@\n");
     }
 
     // Two hosts: headings, every host listed always even if empty, a
