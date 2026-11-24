@@ -1737,6 +1737,7 @@ static b32 axselect(A11y *x, i32 anchor, i32 caret, i64 now)
 static b32 axnextedit(A11y *x, u32 id, Str text, i64 now, AxEdit *out)
 {
     b32 r = 0;
+    *out  = {};  // none, as GCC -Os can't tell its callers read it only if r
     for (iz i = x->qhead; i < x->queue.len; i++) {
         AxEdit *e     = &x->queue[i];
         b32     stale = now-e->when > AXEDIT_TTL;
