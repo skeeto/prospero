@@ -21954,7 +21954,8 @@ static DriveOp mcpops[] = {
     {OP_NEWSESSION, 0, 0, 0, 0, ""},
     {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
     {OP_PROMPT, 0, 0, 0, 100, "Call the MCP server."},
-    {OP_WAIT, W_IDLE, 0, 0, 30000, ""},
+    // Its reply, not idle, which the session is before its turn begins
+    {OP_WAIT, W_SAID, 0, 0, 30000, "Called."},
     {OP_MARK, 0, 0, 0, 300, ""},
     {OP_CHECK, CHK_MCPCALL, 0, 0, 0, ""},
     {OP_WAIT, W_MCPSTATE, 0, 0, 10000, "web: running, "},
