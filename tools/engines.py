@@ -76,7 +76,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 IMAGE = "prospero-toolchain"
 # FetchContent sources: as --deps holds them, and as deps/ names them
 DEPS = [("mbedtls-src", "mbedtls"), ("cpp-httplib-src", "cpp-httplib"),
-        ("wuffs-src", "wuffs")]
+        ("wuffs-src", "wuffs"), ("unabashed-src", "unabashed")]
 PLATFORMS = ["macos-arm64", "linux-aarch64", "linux-x86_64",
              "windows-x86_64", "windows-i686"]
 
@@ -328,7 +328,7 @@ def main():
     ap.add_argument("--remote-dir", default="/tmp/prospero-engines",
                     help="its build directory (default: /tmp/prospero-engines)")
     ap.add_argument("--deps", help="FetchContent sources: mbedtls-src, cpp-httplib-src "
-                                   "(and wuffs-src, for --docker)")
+                                   "(and wuffs-src and unabashed-src, for --docker)")
     ap.add_argument("--docker", action="store_true",
                     help="build the Linux and Windows engines in the toolchain "
                          "image (tools/toolchain), as releases are")

@@ -78,6 +78,65 @@ gui --quit-after S --shot FILE`, SDL builds only):
 `--theme dark` takes the same shot in dark colors, as
 `docs/screenshot-dark.png`, which the itch.io page shows.
 
+## bash (builtin)
+
+The shell `builtin` is libunabashed ([Building](building.md)), run in
+a process of its own for each command, as a host bash would be: the
+reaper's program on Linux and macOS, the program in the call's job on
+Windows. That process is `prospero` itself, which runs one command and
+exits with its status:
+
+    prospero --bash [--root DIR] [--carry IN] [--state OUT] -c CMD
+
+The arguments after the options are bash's own (`-c CMD`, `-l`), with
+`$0` `bash`; `src/bashstate.cpp`'s head describes them all. `--root`,
+on Windows, is the directory of the Unix tools Prospero found for it
+(`ub_config.root`), whose install's `/`, fstab and profile the library
+then takes as its own. `--state OUT` is where a command that ended on
+its own (by `exit` or its end, not by a signal) leaves the directory
+it ended in, for the next: `out/STEM.state`, beside the command's
+output in the session's records, for foreground calls only. It is
+NUL-separated: a version line, `pwd` and `cwd` (logical and native),
+then, only once the library reports what a command itself exported,
+those exports, then `changed` and `end`; a file cut short or of
+another version reads as none. `--carry IN` names the file whose
+exports the command starts with. Its exports are those it started
+with, with the changes the library reports (`ub_exit.delta`, from
+unabashed 0.7.0) over them, and `changed` says whether there were any;
+the directory carries as the next command's working directory and
+`PWD`. By hand:
+
+    $ build/prospero --bash --state st -c 'cd /tmp; exit 3'; echo $?
+    3
+
+A build without the library prints that bash (builtin) is not in it,
+and exits 126, as does a run that fails to start (2 when out of
+memory); an option without its value exits 2.
+
+A command killed by a signal exits as its own bash would have, but
+for the signals that would dump core and leave a crash report naming
+`prospero`: QUIT, ILL, TRAP, ABRT, BUS, FPE, SEGV, SYS, XCPU, XFSZ,
+and EMT on macOS. For those it exits 128+n, as for a program killed by
+one, so `kill -ABRT $$` reads as exit code 134. On Windows every
+signal death exits 0xE0550000 plus 128+n, which Prospero reads back as
+signal n. A soft stop there is the named event
+`Local\prospero-stop-PID`, PID the host's own process ID, which the
+engine makes as it starts the host and sets to stop it, since a GUI
+build's host can't take CTRL_BREAK; the host sends TERM to the command
+and to every program it runs. On Linux and macOS a stop's TERM goes to
+the host, which passes it on the same way, since each program leads a
+session of its own. Either way, the library kills what its programs
+left running as soon as the command ends, so they get no stop grace of
+their own yet.
+
+On Linux and macOS, the host raises its soft limit on open files to
+1024, or the hard limit if lower, when it is below 512, and the
+programs a command runs inherit that limit. In a Debug build on Linux
+other than x86-64, whose fibers switch with `swapcontext`, ASan warns
+on standard error, once for each command, that it doesn't fully
+support `swapcontext`; the warning lands in the command's output, and
+means nothing more.
+
 ## Evals
 
 `prospero eval` measures models on a suite of tasks: how often each

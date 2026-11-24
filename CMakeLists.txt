@@ -187,6 +187,25 @@ set_property(SOURCE src/main_posix.cpp src/main_win32.cpp src/main_test.cpp
 # Every program with the core decodes images (src/wuffs.c)
 include(FetchWuffs)
 
+# "bash (builtin)": libunabashed, hosted by `prospero --bash`
+# (cmake/FetchUnabashed.cmake). On x86-64 its fibers are its own; on
+# other Linux they are glibc's getcontext, with GCC's builtin setjmp, so
+# it is off there with Clang or without getcontext (musl): the static
+# aarch64 engine and the Clang aarch64 GUI build.
+option(PROSPERO_UNABASHED "Build in bash (builtin), libunabashed" ON)
+if(PROSPERO_UNABASHED AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  include(CheckCXXSymbolExists)
+  check_cxx_symbol_exists(getcontext ucontext.h PROSPERO_HAVE_GETCONTEXT)
+  if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$" AND
+     (NOT PROSPERO_HAVE_GETCONTEXT OR CMAKE_CXX_COMPILER_ID MATCHES "Clang"))
+    message(STATUS "unabashed: off (no getcontext, or Clang off x86-64)")
+    set(PROSPERO_UNABASHED OFF)
+  endif()
+endif()
+if(PROSPERO_UNABASHED)
+  include(FetchUnabashed)
+endif()
+
 if(PROSPERO_GUI)
   include(FetchGui)
 endif()
@@ -289,6 +308,18 @@ else()
   endif()
 endif()
 target_link_libraries(prospero PRIVATE prospero_core_flags wuffs)
+if(PROSPERO_UNABASHED)
+  # Built as the core is: ASan in Debug (it annotates its fibers), and
+  # GCC without IPA bit propagation (see prospero_core_flags). Never in
+  # prospero_test, whose builds have no shell.
+  target_compile_options(libunabashed PRIVATE
+    "$<$<CONFIG:Debug>:${PROSPERO_ASANFLAGS}>"
+    "$<$<CXX_COMPILER_ID:GNU>:-fno-ipa-bit-cp>")
+  target_link_libraries(prospero PRIVATE unabashed::unabashed)
+  target_compile_definitions(prospero PRIVATE PROSPERO_UNABASHED=1)
+else()
+  target_compile_definitions(prospero PRIVATE PROSPERO_UNABASHED=0)
+endif()
 if(WIN32)
   # A zero PE timestamp, as w64devkit's ld writes by default, rather than
   # the link time, so the same sources link the same program with any

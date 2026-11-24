@@ -473,11 +473,29 @@ Right-click a session in the sidebar, or open the Session menu, for:
 - **Switch model**: a configured model, or another typed in.
 - **Switch shell**: a `[shell]` section of your configuration, or
   `bash` or `zsh` (not on Windows), `sh`, `powershell` or `cmd` where found, as the picker beside the model's
-  offers. Commands run there from then on; the agent is told at its
-  next request, once, and again after a compaction. A subagent starts
-  in its parent's shell. If the shell's program is gone when the
-  session opens again, commands run in the default shell, and the
-  agent is told.
+  offers, or **bash (builtin)**, the bash built into Prospero, where
+  this build has it. Commands run there from then on; the agent is
+  told at its next request, once, and again after a compaction. A
+  subagent starts in its parent's shell. If the shell's program is
+  gone when the session opens again, or bash (builtin) is not in this
+  build, commands run in the default shell, and the agent is told.
+
+  In bash (builtin), each command starts in the folder the last one
+  ended in, if that one ended on its own (not stopped, cancelled,
+  timed out, moved to the background or killed by a signal) and the
+  folder is still in the session's folder or one you granted;
+  otherwise it starts in the session's folder, and the agent is
+  told. Its exports and exported functions carry too, not other
+  variables, functions or aliases, and the agent's file tools still
+  take relative paths from the session's folder. A background job
+  starts where a command would, but never moves it. Switching shells,
+  even back to bash (builtin), starts over in the session's folder, as
+  does a new session (a worktree session too) or a subagent, and a
+  rewind undoes a `cd` with the rest. A fork or a side chat starts
+  where its original's next command would, and a fork into another
+  folder in that folder. bash (builtin) has no interactive mode yet, so
+  the Terminal pane's tabs and Run blocks of such a session use the
+  shell auto finds, and Open in external terminal the terminal's own.
 - **Export**: Markdown..., with or without reasoning and tool calls, to
   a file or the clipboard; or Raw log..., the session's log as it is.
 - **Archive**: move it under Archived, at the end of the sidebar.

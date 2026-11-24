@@ -802,6 +802,45 @@ static void test_termmarks(Test *t)
             expect(t, concat(&s, "termrunpick ", istr(&s, i)), got, cases[i].want);
         }
     }
+
+    // bash (builtin) has no interactive mode, so a session's terminal
+    // opens the shell auto finds instead, and the session's own shell
+    // otherwise; as a terminal's shell it has no command line at all
+    {
+        Arena   s  = *a;
+        Os     *os = newos(&s, 1<<16);
+        Arena   sc = carve(&s, 1<<20);
+        os_write(os, sc, "/c/t.ini", "");
+        os_write(os, sc, "/usr/bin/bash", "#!");
+        Config  *c = newconfig(os, &s, sc, "/c/t.ini", 0);
+        Engine  *e = alloc<Engine>(&s);
+        e->os          = os;
+        e->cfg         = c;
+        e->exedir      = "/exe";
+        e->env         = push(&s, e->env, Str("PATH=/usr/bin"));
+        e->te.exe      = "/exe/prospero";
+        e->te.bash.exe = "/exe/prospero";
+        Session *ss = alloc<Session>(&s);
+        ss->e  = e;
+        ss->te = e->te;
+        ss->te.shell.name = BUILTIN_NAME;
+        ss->te.shell.path = "/exe/prospero";
+        ss->te.shell.kind = SHELL_BUILTIN;
+        Shell sh = termshellof(e, &s, ss);
+        expect(t, "termshellof builtin", concat(&s, concat(&s, sh.name, " "), sh.path),
+               "bash /usr/bin/bash");
+        ss->te.shell      = {};
+        ss->te.shell.name = "zsh";
+        ss->te.shell.path = "/bin/zsh";
+        ss->te.shell.kind = SHELL_SH;
+        sh = termshellof(e, &s, ss);
+        expect(t, "termshellof own", concat(&s, concat(&s, sh.name, " "), sh.path),
+               "zsh /bin/zsh");
+        cfgfree(c);
+
+        expect(t, "termshell builtin", istr(&s, termshell(&s, "builtin", "/exe/prospero", 0).len +
+               termshell(&s, "builtin", "C:/p/prospero.exe", 1).len), "0");
+    }
 }
 
 // A Run's marks as its shell prints them, from its arming at 0 ms: each

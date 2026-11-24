@@ -29,9 +29,10 @@
 // act unasked, and any other setting that chooses a program to run here
 // (cfgruns): [tools] path_prepend and path_append, which say where
 // programs are found, a [tools] shell other than a keyword (auto, sh,
-// powershell, cmd), [tools] shells and git, and [ui] editor,
-// editor_line, editor_remote and terminal. A [shell] section counts only where the
-// user's own file has its header (cfgownsection), and an included
+// powershell, cmd, builtin or bash (builtin)), [tools] shells and git,
+// and [ui] editor, editor_line, editor_remote and terminal. A [shell]
+// section counts only where the user's own file has its header
+// (cfgownsection), and an included
 // file's settings in an [mcp] or [web] section that the user's own file
 // defines (its url or command, its search or url) are ignored
 // (cfgsealed): it may define those, but not change the user's. The
@@ -500,16 +501,21 @@ static CfgKey cfgschema[] = {
      "idle; 0 for none, -1 for no limit"},
     {"tools", "stop_grace", CFG_SECONDS, "", {}, {}, "tools",
      "Seconds between asking a command to stop (SIGTERM, or CTRL_BREAK on "
-     "Windows) and killing it (default: 2, or 3 on Windows)"},
+     "Windows) and killing it (default: 2, or 3 on Windows). bash (builtin) "
+     "takes the ask (on Windows as an event, not CTRL_BREAK) to its "
+     "programs too, but kills any still running once its command ends, "
+     "so they get no grace of their own yet"},
     {"tools", "shell", CFG_STRING, "auto", {}, {}, "tools",
-     "The agent's shell for new sessions: auto, sh, powershell, cmd, a "
-     "[shell] section by its name, or an executable, by its path (~/ the "
-     "home directory) or its name on PATH. auto is a POSIX sh, or on Windows sh.exe or busybox.exe "
-     "next to Prospero or on PATH, then PowerShell, then cmd"},
+     "The agent's shell for new sessions: auto, sh, powershell, cmd, "
+     "builtin, a [shell] section by its name, or an executable, by its "
+     "path (~/ the home directory) or its name on PATH. auto is a POSIX "
+     "sh, or on Windows sh.exe or busybox.exe next to Prospero or on PATH, "
+     "then PowerShell, then cmd. builtin is bash (builtin), the bash 5.3 "
+     "in Prospero itself, whose commands start where the last one left off"},
     {"tools", "shells", CFG_STRING, "", {}, {}, "tools",
      "Shells the agent may run a command in, besides the session's: "
-     "[shell] sections or sh, powershell and cmd, by name, separated by "
-     "blanks"},
+     "[shell] sections or sh, powershell, cmd and builtin, by name, "
+     "separated by blanks"},
     {"tools", "path_prepend", CFG_PATHS, "", {}, {}, "tools",
      "Directories to find programs in before PATH, separated by ;: for the "
      "agent's commands, its shell, ripgrep, and what Prospero runs itself "
@@ -532,8 +538,8 @@ static CfgKey cfgschema[] = {
 
     {"shell", "program", CFG_STRING, "", {}, {}, "shell",
      "Its executable, by its path (~/ the home directory) or its name on "
-     "PATH, or sh, powershell "
-     "or cmd as [tools] shell finds them; by default the section's name. "
+     "PATH, or sh, powershell, cmd "
+     "or builtin as [tools] shell finds them; by default the section's name. "
      "wsl runs commands in WSL's sh"},
     {"shell", "distro", CFG_STRING, "", {}, {}, "shell",
      "For program = wsl: the WSL distribution to run in, by its name as "
@@ -1356,8 +1362,9 @@ static b32 cfgruns(CfgKey *k, Str v)
     if (k->kind == "tools") {
         return k->key=="path_prepend" || k->key=="path_append" ||
                k->key=="shells" || k->key=="git" ||
-               (k->key=="shell" && !cfghasword("auto sh powershell cmd", v) &&
-                (HOST_WINDOWS || v!="bash"));
+               (k->key=="shell" && !cfghasword("auto sh powershell cmd builtin", v) &&
+                trim(v)!="bash (builtin)" &&
+                !builtinkw(trim(v)) && (HOST_WINDOWS || v!="bash"));
     }
     return (k->kind=="ui" && (k->key=="editor" || k->key=="editor_line" ||
                               k->key=="editor_remote" || k->key=="terminal")) ||
@@ -1598,7 +1605,7 @@ static Str cfgproblem(Arena *a, CfgKey *k, Str v, b32 shared)
     } else if (shared && cfgruns(k, v) && k->key=="shell") {
         return "a shell by its path or name in an included file is ignored, "
                "since it chooses what runs: set it in your own file, or "
-               "here one of auto, sh, bash, powershell, cmd";
+               "here one of auto, sh, bash, powershell, cmd, builtin";
     } else if (shared && cfgruns(k, v)) {
         Buf b(a, 128);
         print(&b, "[");

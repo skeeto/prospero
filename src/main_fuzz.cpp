@@ -196,6 +196,8 @@ static b32     os_remove(Os *, Arena, Str) { return 0; }
 static b32     os_print(Os *, i32, Str) { return 1; }
 static Str     os_getenv(Os *, Arena *, Str) { return {}; }
 static Str     os_exepath(Os *, Arena *) { return "prospero"; }
+static BashExe os_bash(Os *, Arena *) { return {}; }
+static b32     os_canenter(Os *, Arena, Str) { return 0; }
 static b32     os_thread(Os *, void (*)(void *), void *) { return 0; }
 static void    os_lockinit(Lock *) {}
 static void    os_lock(Lock *) {}

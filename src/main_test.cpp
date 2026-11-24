@@ -62,6 +62,9 @@ struct Os {
     i32        growevery;
     i32        growtimes;
     i32        growreads;
+    BashExe    bash;      // os_bash's answer: none unless a test sets it
+    Slice<Str> noenter;   // directories os_canenter refuses, VFiles having
+                          //   no mode bits
 };
 
 static VFile *vfind(Os *os, Str path, b32 create)
@@ -361,6 +364,14 @@ static Str os_getenv(Os *os, Arena *a, Str name)
     return {};
 }
 static Str os_exepath(Os *, Arena *) { return "prospero"; }
+static BashExe os_bash(Os *os, Arena *) { return os->bash; }
+static b32 os_canenter(Os *os, Arena scratch, Str dir)
+{
+    for (iz i = 0; i < os->noenter.len; i++) {
+        if (os->noenter[i] == dir) return 0;
+    }
+    return os_stat(os, scratch, dir).type == STAT_DIR;
+}
 
 static b32  os_thread(Os *, void (*)(void *), void *) { return 0; }
 static void os_lockinit(Lock *) {}
@@ -712,6 +723,7 @@ static Str istr(Arena *a, i64 v)
 #include "test/price_test.cpp"
 #include "test/edit_test.cpp"
 #include "test/tools_test.cpp"
+#include "test/bashstate_test.cpp"
 #include "test/guard_test.cpp"
 #include "test/fswork_test.cpp"
 #include "test/editjump_test.cpp"
@@ -819,6 +831,7 @@ int main()
     test_price(&t);
     test_edit(&t);
     test_tools(&t);
+    test_bashstate(&t);
     test_guard(&t);
     test_editjump(&t);
     test_fileref(&t);

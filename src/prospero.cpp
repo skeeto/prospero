@@ -154,6 +154,15 @@ static Str     os_getenv(Os *, Arena *, Str name);
 // is replaced, this names the replacement: exec /proc/self/exe to run
 // this same binary again.
 static Str     os_exepath(Os *, Arena *);
+// How this executable runs bash (builtin), `prospero --bash` (bashstate.cpp):
+// exe is empty when this build has no libunabashed.
+struct BashExe {
+    Str exe;      // what runs --bash (POSIX: os->exe, /proc/self/exe on Linux)
+    b32 exports;  // the library reports a run's own exports, which then carry
+};
+static BashExe os_bash(Os *, Arena *);
+// Whether a directory can be entered, as a process starting in it would.
+static b32     os_canenter(Os *, Arena, Str dir);
 
 // Listen at 127.0.0.1, on *port, or one the system picks (*port) when
 // it's 0, on a thread of its own, for an HTTP request for path (at most
@@ -245,6 +254,9 @@ struct Spawn {
                           // the programs the desktop helper starts do
     b32        holdin;    // Windows: input a pipe that sends nothing, held
                           // open until the Proc is freed, not NUL
+    b32        stopevent; // Windows: a soft stop sets the named event
+                          // Local\prospero-stop-PID, for a process with
+                          // no console to send Ctrl+Break to (bashhost)
 };
 // Null on failure, explained by os_lasterr. The process is not waited
 // for, and its records may arrive before this returns.
@@ -864,6 +876,7 @@ static u32     os_guilimits(Os *);
 #include "delta.cpp"
 #include "desktop.cpp"
 #include "tools.cpp"
+#include "bashstate.cpp"  // after tools.cpp: envset, envdel
 #include "guard.cpp"
 #include "fswork.cpp"    // after guard.cpp and mailbox.cpp: normpath, mailpost
 #include "editjump.cpp"  // after tools.cpp and guard.cpp: basename, pathroot

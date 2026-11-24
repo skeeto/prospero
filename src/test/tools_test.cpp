@@ -885,6 +885,175 @@ static void test_tools(Test *t)
             expect(t, "sameshell", istr(a, sameshell(&pre, &pre)*10 + sameshell(&pre, &now)), "10");
         }
 
+        // bash (builtin): cd carries, and exports too only where the
+        // library reports them; on Windows its Unix tools by their
+        // flavor, which counts only with a root, or none at all
+        {
+            struct {
+                b32 win; Str tools; Str root; i32 flavor; b32 exports;
+                Str has; Str hasnt;
+            } bt[] = {
+                {0, "", "", FLAVOR_NONE, 0,
+                 "Run a command with bash (builtin), Prospero's own bash 5.3 "
+                 "(bash -c). Each command starts in the directory the last one "
+                 "ended in, but variables don't carry over; a directory outside "
+                 "your workspace starts the next one back in the working "
+                 "directory.", "exported functions"},
+                {0, "", "", FLAVOR_NONE, 1,
+                 "ended in, with its exports and exported functions: other "
+                 "functions, aliases and unexported variables don't carry over;",
+                 ", but variables"},
+                {0, "", "", FLAVOR_NONE, 0,
+                 "its #! interpreter, and bash or sh as a command is the "
+                 "system's own.", "Unix tools"},
+                {1, "", "", FLAVOR_NONE, 0,
+                 "(sh and bash scripts in this shell), and bash or sh as a "
+                 "command is another program, if any. There are no Unix tools "
+                 "here: no ls, grep or sed", "Its Unix tools"},
+                {1, "", "", FLAVOR_NONE, 0,
+                 "/ is the root of the drive it starts on, which a cd to "
+                 "another drive changes.", "cygpath"},
+                {1, "C:/Git/usr/bin", "C:/Git/usr/bin", FLAVOR_MSYS, 0,
+                 "Its Unix tools are in C:/Git/usr/bin, MSYS2's, as Git Bash "
+                 "has them. It names drives as /c/x, as they do.", "no ls"},
+                {1, "C:/Git/usr/bin", "C:/Git/usr/bin", FLAVOR_MSYS, 0,
+                 "like /tmp or ~, what cygpath -m prints.", "/cygdrive"},
+                {1, "C:/cygwin64/bin", "C:/cygwin64/bin", FLAVOR_CYGWIN, 0,
+                 "Its Unix tools are in C:/cygwin64/bin, Cygwin's. It names "
+                 "drives as /c/x, and they as /cygdrive/c/x.", "MSYS2"},
+                {1, "C:/w64devkit/bin", "C:/w64devkit/bin", FLAVOR_BUSYBOX, 0,
+                 "Its Unix tools are in C:/w64devkit/bin, busybox's (w64devkit), "
+                 "with fewer options than GNU's.", "cygpath"},
+                {1, "C:/tools", "", FLAVOR_NONE, 0,
+                 "Its Unix tools are in C:/tools. It names drives as /c/x. Give "
+                 "the file tools Windows paths: C:/x for /c/x.", "no ls"},
+                {1, "C:/tools", "", FLAVOR_MSYS, 0,  // not an install's: no root
+                 "Its Unix tools are in C:/tools. It names", "MSYS2"},
+            };
+            for (iz i = 0; i < countof(bt); i++) {
+                ToolEnv be = {};
+                be.shell.name    = BUILTIN_NAME;
+                be.shell.path    = "/exe/prospero";
+                be.shell.kind    = SHELL_BUILTIN;
+                be.shell.win     = bt[i].win;
+                be.shell.tools   = bt[i].tools;
+                be.shell.root    = bt[i].root;
+                be.shell.flavor  = bt[i].flavor;
+                be.shell.exports = bt[i].exports;
+                be.windows       = bt[i].win;
+                Str desc = shelldesc(a, &be);
+                Str name = concat(a, istr(a, i), concat(a, ": ", bt[i].has));
+                expect(t, concat(a, "builtin description has ", name),
+                       istr(a, find(desc, bt[i].has)>=0), "1");
+                expect(t, concat(a, "builtin description lacks ",
+                                 concat(a, istr(a, i), concat(a, ": ", bt[i].hasnt))),
+                       istr(a, find(desc, bt[i].hasnt)<0), "1");
+                // The shared clause says that cd carries, as said above
+                expect(t, concat(a, "builtin description, clause ", istr(a, i)),
+                       istr(a, find(desc, ". Each command runs in a fresh shell, "
+                                    "where the last one ended, as said. There is "
+                                    "no input")>0), "1");
+                expect(t, concat(a, "builtin description, no fresh cd ", istr(a, i)),
+                       istr(a, find(desc, "cd does not carry over")<0), "1");
+            }
+
+            // With no builtin anywhere, the shared clause is as it always
+            // was, byte for byte, with shells listed or not; with one
+            // listed, it says which carries
+            Str same = " Each command runs in the working directory, in a fresh "
+                       "shell (cd does not carry over). There is no input or "
+                       "terminal: use non-interactive flags. GIT_EDITOR is true.";
+            Shell sv[3] = {};
+            sv[0].name = "sh";  sv[0].path = "/bin/sh";  sv[0].kind = SHELL_SH;
+            sv[1].name = "zsh"; sv[1].path = "/bin/zsh"; sv[1].kind = SHELL_SH;
+            sv[2].name = BUILTIN_NAME; sv[2].path = "/exe/prospero";
+            sv[2].kind = SHELL_BUILTIN;
+            ToolEnv pe = {};
+            pe.shell = sv[0];
+            expect(t, "plain description, shared clause",
+                   istr(a, find(shelldesc(a, &pe), concat(a, "(a POSIX shell).", same))>0), "1");
+            pe.shells = {sv, 2, 2};
+            expect(t, "plain description, shared clause, shells",
+                   istr(a, find(shelldesc(a, &pe), concat(a, "(a POSIX shell).", same))>0), "1");
+            Shell lv[2] = {sv[0], sv[2]};
+            pe.shells = {lv, 2, 2};
+            Str ld = shelldesc(a, &pe);
+            expect(t, "plain description, builtin listed",
+                   istr(a, find(ld, "(a POSIX shell). Each command runs in the working "
+                                "directory, in a fresh shell (cd does not carry over, "
+                                "but in bash (builtin)). There is no input")>0 &&
+                           find(ld, "(cd does not carry over).")<0 &&
+                           find(ld, "\n- bash (builtin): Run a command with bash "
+                                "(builtin), Prospero's own bash 5.3 (bash -c). Each "
+                                "command starts in the directory the last one ended "
+                                "in")>0), "1");
+
+            // The builtin first, with another listed: cd carries only in it,
+            // which the listed one's own entry never says
+            Shell bv[2] = {sv[2], sv[1]};
+            ToolEnv bo = {};
+            bo.shell  = sv[2];
+            bo.shells = {bv, 2, 2};
+            Str bd = shelldesc(a, &bo);
+            expect(t, "builtin description, others listed",
+                   istr(a, find(bd, ". Each command runs in a fresh shell, in bash "
+                                "(builtin) where the last one there ended, as said, "
+                                "and in another shell in the working directory (cd "
+                                "does not carry over). There is no input")>0 &&
+                           find(bd, "where the last one ended, as said.")<0), "1");
+            bo.shells = {bv, 1, 1};
+            expect(t, "builtin description, alone listed",
+                   istr(a, find(shelldesc(a, &bo), "where the last one ended, as "
+                                "said. There is no input")>0), "1");
+
+            // Two builtins are the same shell by name, wherever Prospero is
+            Shell moved = sv[2];
+            moved.path  = "/new/prospero";
+            Shell other = sv[2];
+            other.name  = "mine";
+            expect(t, "sameshell, builtin", istr(a, sameshell(&sv[2], &moved)*100 +
+                   sameshell(&sv[2], &other)*10 + sameshell(&sv[2], &sv[0])), "100");
+
+            // Notices: a builtin not in this build, by its name and not
+            // its path, the default in its place; switching away from it,
+            // the cd rule as it now is; switching to it, its own
+            Shell none = {};
+            expect(t, "shell notice, builtin gone",
+                   shellnotice(a, &sv[0], &sv[2], &sv[2], 0),
+                   "Your shell, bash (builtin), is not in this build of Prospero, "
+                   "so commands run in sh. It replaces the one the shell tool "
+                   "names, whose other rules still hold. Run a command with "
+                   "/bin/sh -c (a POSIX shell). Each command starts in the working "
+                   "directory: cd does not carry over.");
+            expect(t, "shell notice, builtin gone, back",
+                   shellnotice(a, &sv[0], &sv[0], &sv[2], 0),
+                   "Your shell, bash (builtin), is not in this build of Prospero, "
+                   "so commands run in sh, the one the shell tool names, from now on.");
+            expect(t, "shell notice, from builtin",
+                   shellnotice(a, &sv[1], &sv[2], &none, 1),
+                   "The user switched your shell to zsh. It replaces the one the "
+                   "shell tool names, whose other rules still hold. Run a command "
+                   "with /bin/zsh -c. Each command starts in the working "
+                   "directory: cd does not carry over.");
+            Str to = shellnotice(a, &sv[2], &sv[0], &none, 1);
+            expect(t, "shell notice, to builtin",
+                   istr(a, startswith(to, "The user switched your shell to bash "
+                                      "(builtin). It replaces the one the shell "
+                                      "tool names, whose other rules still hold. "
+                                      "Run a command with bash (builtin)") &&
+                           find(to, "Each command starts in the directory the "
+                                "last one ended in")>0 &&
+                           find(to, "cd does not carry over")<0), "1");
+            // From a builtin to a shell the tool lists: the tool said that
+            // cd carries, so the notice must say it no longer does
+            Shell bl[2] = {sv[2], sv[1]};
+            Str  fl = shellnotice(a, &sv[1], &sv[2], &none, 1, {bl, 2, 2});
+            expect(t, "shell notice, from builtin to listed",
+                   istr(a, startswith(fl, "The user switched your shell to zsh, one "
+                                      "of the shells the shell tool lists") &&
+                           find(fl, "cd does not carry over")>0), "1");
+        }
+
         Slice<Str> ev = {};
         ev = push(a, ev, Str("Path=C:\\x"));
         ev = push(a, ev, Str("A=1"));

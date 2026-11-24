@@ -543,6 +543,10 @@ struct ShellRun {
     Str  pattern;   // a search's, as given
     Str  glob;      // grep's file filter, or glob's pattern
     b32  fold;      // grep ignore_case
+    // bash (builtin), whose directory carries (decisions.md, 2026-11-24)
+    b32  carried;   // the carry applies to it
+    Str  startdir;  // where it started
+    Str  state;     // absolute: the state file it leaves, foreground only
 };
 
 // A session's desktop helper (deskrun), while it runs.
@@ -805,6 +809,14 @@ struct Session {
     Shell        shellfrom;  // a subagent's: its parent's, to start in
     b32          shellset;   // a shell record replayed (loadsession)
     b32          shelluser;  // the user switched it, untold
+    // bash (builtin)'s carry (decisions.md, 2026-11-24): where its next
+    // command starts, and with whose exports. A tool.end records each
+    // change (toolend), so replay and rewind follow it.
+    Str          shcwd;      // native, real; empty: the session folder
+    Str          shpwd;      // its logical form, for PWD; may be empty
+    Str          shenv;      // out/NAME.state, the exports; empty: none
+    b32          shdirty;    // changed during this call, for its tool.end
+    Str          shnote;     // what the call's result says of it
     Guard        guard;
     EventLog     log;
     iz           lock;       // os_lockfile handle, -1 if not held
@@ -4232,7 +4244,10 @@ static void toolend(Session *s, Arena scratch, Str status, Str text,
     Engine *e      = s->e;
     Block  *c      = &s->calls[s->callidx];
     Str     repair = status=="cancelled" ? Str{} : callrepair(&scratch, c, s->callfix);
-    Buf     b(&scratch, 512 + text.len);
+    if (s->shnote.len) {
+        text = concat(&scratch, text, concat(&scratch, "\n", s->shnote));
+    }
+    Buf     b(&scratch, 512 + text.len + s->shcwd.len + s->shpwd.len);
     EvOut   w = sbegin(s, &b, EV_TOOLEND);
     putstrkey(&w.json, "call", c->id);
     putstrkey(&w.json, "status", status);
@@ -4258,6 +4273,11 @@ static void toolend(Session *s, Arena scratch, Str status, Str text,
     }
     if (child.len) {
         putstrkey(&w.json, "child", child);
+    }
+    if (s->shdirty) {  // bash (builtin)'s carry from here on, "" for none
+        putstrkey(&w.json, "shell_cwd", s->shcwd);
+        putstrkey(&w.json, "shell_pwd", s->shpwd);
+        putstrkey(&w.json, "shell_env", s->shenv);
     }
     if (s->msgto.len) {
         putstrkey(&w.json, "to", s->msgto);  // send_message's target
@@ -4312,6 +4332,8 @@ static void toolend(Session *s, Arena scratch, Str status, Str text,
     }
     s->callfail = {};
     s->callfix  = {};
+    s->shdirty  = 0;
+    s->shnote   = {};
     s->callidx++;
 }
 
@@ -5157,6 +5179,25 @@ static void shellheed(Session *s, Arena scratch)
         notify(s, "shell", text, 0);
         s->notices[s->notices.len-1].shell = s->te.shell;
     }
+}
+
+// After a compaction, which may have left out the cd that bash
+// (builtin)'s commands start from, where that is, when one of the
+// session's shells is that shell.
+static void shcarryheed(Session *s, Arena scratch)
+{
+    b32 builtin = s->te.shell.kind == SHELL_BUILTIN;
+    for (iz i = 0; i < s->te.shells.len; i++) {
+        builtin |= s->te.shells[i].kind == SHELL_BUILTIN;
+    }
+    if (!builtin || !s->te.bash.exe.len || !s->shcwd.len) {
+        return;
+    }
+    Str dir  = s->shpwd.len ? s->shpwd : s->shcwd;
+    Str text = concat(&scratch, concat(&scratch,
+        "In bash (builtin), the next command starts in ", dir),
+        ", where the last one that ended on its own left off.");
+    notify(s, "shell_cwd", text, 0);
 }
 
 // Whether a normalized absolute path is the session's plan file.
@@ -6838,6 +6879,12 @@ static Slice<Str> shellover(Session *s, Arena *a, Shell *sh, Slice<Str> env, b32
     if (sh->flavor == FLAVOR_BUSYBOX) {
         env = envhome(a, env, e->home, win);
     }
+    // bash (builtin)'s Unix tools ahead of the rest, behind the section's own
+    Str base = enginepath(e, a, win);
+    if (sh->kind==SHELL_BUILTIN && sh->tools.len) {
+        base = concat(a, concat(a, sh->tools, win ? Str(";") : Str(":")), base);
+        env  = envsetpath(a, env, base, win);
+    }
     if (own) {
         Str pre  = cfgget(e->cfg, "shell", sh->name, "path_prepend", 0);
         Str post = cfgget(e->cfg, "shell", sh->name, "path_append", 0);
@@ -6845,12 +6892,14 @@ static Slice<Str> shellover(Session *s, Arena *a, Shell *sh, Slice<Str> env, b32
             sh->distro  = clone(a, trim(cfgget(e->cfg, "shell", sh->name, "distro", 0)));
             sh->prelude = wslprelude(a, pre, post);
         } else if (pre.len || post.len) {
-            Str path = searchpath(a, pre, enginepath(e, a, win), post, e->home, win);
+            Str path = searchpath(a, pre, base, post, e->home, win);
             env = envsetpath(a, env, path, win);
         }
         sh->login = cfgbool(cfgget(e->cfg, "shell", sh->name, "login", 0)) == 1;
     }
-    if ((sh->login || login) && win && (sh->kind==SHELL_SH || sh->kind==SHELL_BUSYBOX)) {
+    b32 msys = sh->kind==SHELL_SH || sh->kind==SHELL_BUSYBOX ||
+               (sh->kind==SHELL_BUILTIN && sh->root.len);  // its /etc/profile
+    if ((sh->login || login) && win && msys) {
         env = envset(a, env, "CHERE_INVOKING", "1", win);
         env = envset(a, env, "MSYS2_PATH_TYPE", "inherit", win);
         env = envdel(a, env, "ORIGINAL_PATH", win);
@@ -6919,13 +6968,99 @@ static b32 shellcall(Session *s, Arena scratch, Args *args)
     return 0;
 }
 
-// How a command runs in a shell: its argv and environment.
+// bash (builtin)'s carry (decisions.md, 2026-11-24)
+
+// Whether a command in shell sh starts where the last one ended.
+static b32 carries(Session *s, Shell *sh)
+{
+    return sh->kind==SHELL_BUILTIN && s->te.bash.exe.len;
+}
+
+// The carry from here on, recorded by the call's tool.end.
+static void shcarry(Session *s, Str cwd, Str pwd, Str env)
+{
+    s->shcwd   = clone(&s->perm, cwd);
+    s->shpwd   = clone(&s->perm, pwd);
+    s->shenv   = clone(&s->perm, env);
+    s->shdirty = 1;
+}
+
+// A tool.end's change to the carry, on replay: "" clears, and a key
+// missing leaves it. Exports only from a state file of this session's.
+static void shcarryrec(Session *s, Json *j)
+{
+    Json *cwd = jsonget(j, "shell_cwd");
+    if (cwd->type != JSON_STRING) {
+        return;
+    }
+    Str env  = jsonstr(jsonget(j, "shell_env"));
+    Str name = startswith(env, "out/") ? cuthead(env, 4) : Str{};
+    b32 ok   = name.len>6 && endswith(name, ".state") && find(name, "..")<0 &&
+               find(name, "/")<0 && find(name, "\\")<0;
+    s->shcwd = clone(&s->perm, jsonstr(cwd));
+    s->shpwd = clone(&s->perm, jsonstr(jsonget(j, "shell_pwd")));
+    s->shenv = ok ? clone(&s->perm, env) : Str{};
+}
+
+// Whether commands may start in a directory: one they can enter, in the
+// workspace or its grants.
+static b32 shcanstart(Session *s, Arena scratch, Str dir)
+{
+    return dir.len && os_canenter(s->e->os, scratch, dir) &&
+           guardpath(s->e->os, &scratch, &s->guard, dir, 1).inside;
+}
+
+// The carried directory dropped, with a note to the agent about it.
+static void shreset(Session *s, Arena scratch, Str dir, Str why)
+{
+    Buf b(&scratch, 256 + dir.len);
+    print(&b, why);
+    print(&b, dir);
+    print(&b, " is gone or outside your workspace]");
+    s->shnote = clone(&s->perm, finish(&b));
+    shcarry(s, {}, {}, s->shenv);
+}
+
+// Where a command in shell sh starts: for bash (builtin), where the last
+// one ended, while that may be; else the working directory.
+static Str shellstartdir(Session *s, Arena scratch, Shell *sh)
+{
+    if (!carries(s, sh) || !s->shcwd.len) {
+        return s->cwd;
+    } else if (shcanstart(s, scratch, s->shcwd)) {
+        return s->shcwd;
+    }
+    shreset(s, scratch, s->shpwd.len ? s->shpwd : s->shcwd,
+            "[this command started in the working directory: where the last "
+            "one ended, ");
+    return s->cwd;
+}
+
+// How a command runs in a shell: its argv, environment and directory,
+// and for bash (builtin) a foreground one's state file.
 static ShellCmd sessioncmd(Session *s, Arena *a, Shell *in, Str command,
-                           Slice<Str> *env)
+                           Slice<Str> *env, Str *cwd, Str state = {})
 {
     Shell    sh = *in;
     *env = shellenvfor(s, a, &sh);
-    ShellCmd sc = shellcmd(a, &sh, s->te.windows, command);
+    *cwd = shellstartdir(s, *a, &sh);
+    BuiltinRun run = {};
+    if (carries(s, &sh)) {
+        run.exe   = s->te.bash.exe;
+        run.carry = s->shenv.len ? join(a, s->dir, s->shenv) : Str{};
+        run.state = state;
+        if (!s->te.windows) {
+            Str pwd = *cwd!=s->shcwd ? *cwd : s->shpwd.len ? s->shpwd : s->shcwd;
+            *env = envset(a, *env, "PWD", pwd, 0);
+        } else if (*cwd==s->shcwd && s->shpwd.len) {
+            *env = envset(a, *env, "PWD", s->shpwd, 1);  // its own spelling, /c/x
+        } else {
+            // An inherited one naming the same directory, as a busybox
+            // shell exports it (C:/x), would win over the library's /c/x
+            *env = envdel(a, *env, "PWD", 1);
+        }
+    }
+    ShellCmd sc = shellcmd(a, &sh, s->te.windows, command, run);
     if (sc.env.len) {
         *env = push(a, *env, sc.env);
     }
@@ -6935,13 +7070,14 @@ static ShellCmd sessioncmd(Session *s, Arena *a, Shell *in, Str command,
 // Spawn a process for the current call, its output into spill.
 static Proc *spawncall(Session *s, Arena scratch, Slice<Str> argv, Str cmdline,
                        b32 holdin, Slice<Str> env, Str cwd, Str spill, i64 maxbytes,
-                       u64 *id)
+                       u64 *id, b32 stopevent = 0)
 {
     Engine *e  = s->e;
     Spawn   sp = {};
-    sp.argv     = argv;
-    sp.cmdline  = cmdline;
-    sp.holdin   = holdin;
+    sp.argv      = argv;
+    sp.cmdline   = cmdline;
+    sp.holdin    = holdin;
+    sp.stopevent = stopevent;
     sp.cwd      = cwd;
     sp.env      = env;
     sp.outpath  = spill;
@@ -7409,12 +7545,17 @@ static void startjob(Session *s, Arena scratch, Args *args)
     Str      rel   = {};
     Str      spill = spillfile(s, scratch, c->id, &rel);
     Slice<Str> env = {};
-    ShellCmd   sc  = sessioncmd(s, &scratch, callshell(s, args), args->command, &env);
+    Str        cwd = {};
+    ShellCmd   sc  = sessioncmd(s, &scratch, callshell(s, args), args->command, &env, &cwd);
     u64        id  = 0;
-    Proc      *p   = spawncall(s, scratch, sc.argv, sc.cmdline, sc.holdin, env, s->cwd,
-                               spill, SHELL_OUTMAX, &id);
+    Proc      *p   = spawncall(s, scratch, sc.argv, sc.cmdline, sc.holdin, env, cwd,
+                               spill, SHELL_OUTMAX, &id, sc.stopevent);
     if (!p) {
         Str err  = os_lasterr(e->os, &scratch);
+        if (cwd != s->cwd) {
+            shreset(s, scratch, s->shpwd.len ? s->shpwd : s->shcwd,
+                    "[the next command starts in the working directory: ");
+        }
         Str text = concat(&scratch, "The shell could not be started: ", err);
         toolend(s, scratch, "error", text, 0, 0, {}, 0);
         return;
@@ -7665,13 +7806,26 @@ static b32 startshell(Session *s, Arena scratch, Args *args)
     sh.command = clone(&s->perm, args->command);
     sh.desc    = clone(&s->perm, args->desc);
     sh.spill   = spillfile(s, scratch, c->id, &sh.rel);
+    sh.carried = carries(s, callshell(s, args));
+    if (sh.carried) {
+        // Beside the spill, out/ID.state, none left from before
+        sh.state = concat(&s->perm, cuttail(sh.spill, 4), ".state");
+        os_remove(e->os, scratch, sh.state);
+    }
     s->sh = sh;
 
     Slice<Str> env = {};
-    ShellCmd   sc  = sessioncmd(s, &scratch, callshell(s, args), args->command, &env);
-    s->proc = spawncall(s, scratch, sc.argv, sc.cmdline, sc.holdin, env, s->cwd,
-                        s->sh.spill, SHELL_OUTMAX, &s->procid);
+    Str        cwd = {};
+    ShellCmd   sc  = sessioncmd(s, &scratch, callshell(s, args), args->command,
+                                &env, &cwd, s->sh.state);
+    s->sh.startdir = clone(&s->perm, cwd);
+    s->proc = spawncall(s, scratch, sc.argv, sc.cmdline, sc.holdin, env, cwd,
+                        s->sh.spill, SHELL_OUTMAX, &s->procid, sc.stopevent);
     if (!s->proc) {
+        if (cwd != s->cwd) {
+            shreset(s, scratch, s->shpwd.len ? s->shpwd : s->shcwd,
+                    "[the next command starts in the working directory: ");
+        }
         return 0;
     }
     arm(s, T_TOOL, s->sh.timeout*SEC);
@@ -7770,6 +7924,54 @@ static b32 onlysleeps(Str cmd)
     return num;
 }
 
+// After a bash (builtin) command: where the next one starts, from the
+// state it left if it ended on its own (own), else as before.
+static void shellended(Session *s, Arena scratch, b32 own, i32 code)
+{
+    Engine *e     = s->e;
+    b32     win   = s->te.windows;
+    Str     state = s->sh.state;
+    Read    rd    = own && state.len ? os_read(e->os, &scratch, state, 1<<24) : Read{};
+    BashState st  = rd.data.data ? bashstatedecode(&scratch, rd.data) : BashState{};
+    Str     start = s->sh.startdir;
+    if (!st.ok) {
+        // None: a start that failed, as the reaper's chdir (126), resets
+        // only if the directory now could not be started in
+        if (own && code==126 && start!=s->cwd && !shcanstart(s, scratch, start)) {
+            shreset(s, scratch, start, "[the next command starts in the "
+                    "working directory: ");
+        }
+        if (state.len) os_remove(e->os, scratch, state);
+        return;
+    }
+
+    Str env = st.changed ? cuthead(state, s->dir.len+1) : s->shenv;
+    Str cwd = st.cwd.len ? realpathof(e->os, &scratch, st.cwd, win) : Str{};
+    Str was = realpathof(e->os, &scratch, start, win);
+    Str top = realpathof(e->os, &scratch, s->cwd, win);
+    if (!cwd.data || (was.data && cwd==was)) {
+        // Where it started, or unknown: the directory stays
+        if (env != s->shenv) {
+            shcarry(s, s->shcwd, s->shpwd, env);
+        }
+    } else if (top.data && cwd==top) {
+        shcarry(s, {}, {}, env);
+        s->shnote = "[the next command starts in the working directory]";
+    } else if (shcanstart(s, scratch, cwd)) {
+        Str pwd = st.pwd.len ? st.pwd : cwd;
+        shcarry(s, cwd, st.pwd, env);
+        s->shnote = clone(&s->perm, concat(&scratch, concat(&scratch,
+                          "[the next command starts in ", pwd), "]"));
+    } else {
+        shcarry(s, s->shcwd, s->shpwd, env);
+        shreset(s, scratch, st.pwd.len ? st.pwd : cwd,
+                "[the next command starts in the working directory: ");
+    }
+    if (cuthead(state, s->dir.len+1) != s->shenv) {
+        os_remove(e->os, scratch, state);  // no exports of its own to carry
+    }
+}
+
 // A command or search ends: cancelled with the turn, or stopped alone
 // by the user, or done.
 static void finishshell(Session *s, Arena scratch, b32 cancelled, b32 stopped = 0)
@@ -7841,6 +8043,11 @@ static void finishshell(Session *s, Arena scratch, b32 cancelled, b32 stopped = 
                  stopped      ? Str("stopped")   :
                  end.timedout ? Str("timeout")   :
                  o.ok         ? Str("ok")        : Str("error");
+    if (s->sh.carried) {
+        b32 own = !cancelled && !stopped && !end.timedout && !end.signal &&
+                  end.code>=0;
+        shellended(s, scratch, own, end.code);
+    }
     toolend(s, scratch, status, o.text, end.code,
             !cancelled && !stopped && !end.timedout, s->sh.rel, n);
 }
@@ -16305,6 +16512,7 @@ static void compacted(Session *s, Arena scratch, Partial *p)
     planheed(s, scratch);
     s->shellheard = s->shellpre;  // and a shell other than the tool's
     shellheed(s, scratch);
+    shcarryheed(s, scratch);  // and where bash (builtin) carried its cd
     grantforget(s);  // and the Permissions pane's grants, as they hold
     grantheed(s, scratch);
     wtheed(s, scratch);  // and a side chat in a worktree, where it works
@@ -17864,7 +18072,8 @@ static Shell findshell(Os *os, Arena *perm, Arena scratch, Str exedir,
 {
     pref = trim(pref);
     b32 named = pref.len && pref!="auto" && pref!="sh" &&
-                pref!="powershell" && pref!="cmd" && (win || pref!="bash");
+                pref!="powershell" && pref!="cmd" && (win || pref!="bash") &&
+                !builtinkw(pref);  // never auto's, nor a program by that name
     if (named && os_stat(os, scratch, pref).type==STAT_FILE) {
         return shellat(os, scratch, clone(perm, pref), shellkindof(pref, win), win);
     } else if (named && basename(pref)==pref) {
@@ -17965,11 +18174,72 @@ static Str shellkeywordof(Shell *sh, b32 win)
 }
 
 // Whether a name is a keyword of [tools] shell's: auto, sh, powershell
-// or cmd, and elsewhere than Windows bash and zsh. Empty is auto.
+// or cmd, builtin, and elsewhere than Windows bash and zsh. Empty is auto.
 static b32 shellkw(Str name, b32 win)
 {
     return !name.len || name=="auto" || name=="sh" || name=="powershell" ||
-           name=="cmd" || (!win && (name=="bash" || name=="zsh"));
+           name=="cmd" || builtinkw(name) || (!win && (name=="bash" || name=="zsh"));
+}
+
+// bash (builtin), this executable's own bash 5.3 (bashstate.cpp), if
+// this build has it, else a shell without a path. On Windows it finds
+// Unix tools for it along path (decisions.md, 2026-11-24): ls.exe beside
+// this executable, as w64devkit's, or on path, else Git for Windows'
+// usr/bin from its git.exe. The library's root is their directory when
+// that is an install's, MSYS2's, Cygwin's or busybox's, so that / and ~
+// mean what they do to its tools.
+static Shell builtinshell(Engine *e, Arena *perm, Arena scratch, Str path, b32 win)
+{
+    Shell sh = {};
+    if (!e->te.bash.exe.len) {
+        return sh;
+    }
+    sh.name    = BUILTIN_NAME;
+    sh.path    = e->te.exe;
+    sh.kind    = SHELL_BUILTIN;
+    sh.exports = e->te.bash.exports;
+    sh.win     = win;
+    if (!win) {
+        return sh;
+    }
+
+    Str tools = {};
+    Str ls    = join(&scratch, e->exedir, "ls.exe");
+    if (os_stat(e->os, scratch, ls).type == STAT_FILE) {
+        tools = e->exedir;
+    }
+    if (!tools.len) {
+        Arena t = carve(&scratch, 1<<16);
+        ls    = findpath(e->os, &scratch, t, path, "ls.exe", win);
+        tools = ls.len ? parentdir(ls) : Str{};
+    }
+    if (!tools.len) {
+        Arena t   = carve(&scratch, 1<<16);
+        Str   git = findpath(e->os, &scratch, t, path, "git.exe", win);
+        Str   up  = git.len ? parentdir(parentdir(git)) : Str{};
+        for (i32 i = 0; up.len && i<2 && !tools.len; i++, up = parentdir(up)) {
+            Str bin = join(&scratch, up, "usr/bin");
+            Str dll = join(&scratch, bin, "msys-2.0.dll");
+            tools = os_stat(e->os, scratch, dll).type==STAT_FILE ? bin : Str{};
+        }
+    }
+    if (!tools.len) {
+        return sh;
+    }
+    sh.tools = clone(perm, tools);
+    struct { Str file; i32 flavor; } marks[] = {
+        {"msys-2.0.dll", FLAVOR_MSYS},
+        {"cygwin1.dll",  FLAVOR_CYGWIN},
+        {"busybox.exe",  FLAVOR_BUSYBOX},
+    };
+    for (iz i = 0; i<countof(marks) && !sh.root.len; i++) {
+        Str mark = join(&scratch, tools, marks[i].file);
+        if (os_stat(e->os, scratch, mark).type == STAT_FILE) {
+            sh.root   = sh.tools;
+            sh.flavor = marks[i].flavor;
+        }
+    }
+    return sh;
 }
 
 // A shell by name: a [shell NAME] section of the user's own file, whose
@@ -17999,7 +18269,13 @@ static Shell shellnamed(Engine *e, Arena *perm, Arena scratch, Str name,
 
     Shell sh = {};
     b32   kw = shellkw(want, win);
-    if (kw) {
+    if (builtinkw(want)) {
+        sh = builtinshell(e, perm, scratch, path, win);
+        if (!sh.path.len) {
+            *err = "bash (builtin) is not in this build";
+            return {};
+        }
+    } else if (kw) {
         sh = findshell(e->os, perm, scratch, e->exedir, path, win, want);
         Str got = shellkeywordof(&sh, win);
         if (want!="auto" && got!=want) {
@@ -18079,7 +18355,12 @@ static Slice<Shell> listshells(Engine *e, Arena *perm, Arena scratch, Shell firs
         }
         Str   err = {};
         Shell sh  = shellnamed(e, perm, scratch, name, 0, win, &err);
-        if (sh.path.len) {
+        for (iz i = 0; sh.path.len && i<r.len; i++) {
+            dup |= r[i].name == sh.name;  // builtin, as bash (builtin)
+        }
+        if (dup) {
+            continue;
+        } else if (sh.path.len) {
             r = push(perm, r, sh);
         } else {
             print(&miss, miss.len ? Str("; ") : Str("[tools] shells: "));
@@ -18118,6 +18399,24 @@ static Shell shellrec(Engine *e, Arena *perm, Arena scratch, Json *j, Str key,
     Str   kind = jsonstr(jsonget(j, kindkey));
     Str   name = jsonstr(jsonget(j, namekey));
     Shell sh   = {};
+    if (path.len && kind=="builtin") {
+        // Found again, as its section's PATH has it now; without this
+        // build's library, a shell named as it was, for useshell to miss
+        Str rname = name.len ? name : BUILTIN_NAME;
+        Str err   = {};
+        b32 own   = cfgownsection(e->cfg, "shell", rname) &&
+                    builtinkw(trim(cfgget(e->cfg, "shell", rname, "program", 0)));
+        Str epath = own ? Str{} : enginepath(e, &scratch, HOST_WINDOWS);
+        sh = own ? shellnamed(e, perm, scratch, rname, 0, HOST_WINDOWS, &err)
+                 : builtinshell(e, perm, scratch, epath, HOST_WINDOWS);
+        if (!sh.path.len) {
+            sh.kind = SHELL_BUILTIN;
+            sh.path = clone(perm, path);
+            sh.win  = HOST_WINDOWS;
+        }
+        sh.name = clone(perm, rname);
+        return sh;
+    }
     for (i32 k = 0; path.len && k<countof(shellkinds); k++) {
         if (kind == shellkinds[k]) {
             sh = shellat(e->os, scratch, clone(perm, path), k, HOST_WINDOWS);
@@ -18137,7 +18436,10 @@ static Shell shellrec(Engine *e, Arena *perm, Arena scratch, Json *j, Str key,
 // found now, [tools] shell's, and the agent is told why (shellheed).
 static void useshell(Session *s, Arena scratch, Shell sh)
 {
-    if (sh.path.len && os_stat(s->e->os, scratch, sh.path).type==STAT_FILE) {
+    b32 found = sh.kind==SHELL_BUILTIN
+              ? s->te.bash.exe.len>0
+              : os_stat(s->e->os, scratch, sh.path).type==STAT_FILE;
+    if (sh.path.len && found) {
         s->te.shell  = sh;
         s->shellmiss = {};
     } else if (sh.path.len) {
@@ -18159,7 +18461,7 @@ static void prefixshell(Session *s, Arena scratch, Json *j)
     s->te.shells  = {};
     for (Json *k = jsonget(j, "shells")->child; k; k = k->next) {
         Shell x = shellrec(s->e, &s->perm, scratch, k, "path", "kind", "name");
-        if (x.path.len) {
+        if (x.path.len && (x.kind!=SHELL_BUILTIN || s->te.bash.exe.len)) {
             s->te.shells = push(&s->perm, s->te.shells, x);
         }
     }
@@ -21533,8 +21835,10 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             s->effinfo = effortkey(&s->perm, j);
         } break;
         case EV_SHELL: {
-            // Switched (shell): the shell from here on, if it is found
+            // Switched (shell): the shell from here on, if it is found,
+            // starting afresh in the working directory
             Shell sh = shellrec(e, &s->perm, t, j, "path", "kind", "name");
+            s->shcwd = s->shpwd = s->shenv = {};
             if (sh.path.len) {
                 s->shellset  = 1;
                 s->shelluser = jsonstr(jsonget(j, "by")) == "user";
@@ -21661,6 +21965,7 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
                 webnotetool(s, t, callname(s, m.callid), jsonstr(jsonget(j, "status")),
                             m.text, urls);
             }
+            shcarryrec(s, j);
             break;
         case EV_PREFIX:
             // As it began, rather than as the configuration has it now
@@ -23704,12 +24009,15 @@ static void cmdshell(Engine *e, Arena scratch, i64 id, Json *j)
         return;
     }
 
-    s->te.shell      = sh;
-    s->te.shell.name = clone(&s->perm, sh.name);
-    s->te.shell.path = clone(&s->perm, sh.path);
-    s->te.shell.desc = clone(&s->perm, sh.desc);
-    s->shellmiss     = {};
-    s->shelluser     = 1;
+    s->te.shell       = sh;
+    s->te.shell.name  = clone(&s->perm, sh.name);
+    s->te.shell.path  = clone(&s->perm, sh.path);
+    s->te.shell.desc  = clone(&s->perm, sh.desc);
+    s->te.shell.tools = clone(&s->perm, sh.tools);
+    s->te.shell.root  = clone(&s->perm, sh.root);
+    s->shellmiss      = {};
+    s->shelluser      = 1;
+    s->shcwd = s->shpwd = s->shenv = {};  // a fresh start, as on replay
     {
         Arena a = scratch;
         Buf   b(&a, 256 + sh.name.len + sh.path.len);
@@ -23791,6 +24099,10 @@ static void putshell(JsonOut *w, Str name, Shell *sh, Str err)
         putstrkey(w, "path", sh->path);
         putstrkey(w, "kind", shellkinds[sh->kind]);
     }
+    if (sh->path.len && sh->kind==SHELL_BUILTIN) {
+        putkey(w, "exports");  // they carry, not only cd
+        putbool(w, sh->exports);
+    }
     if (sh->desc.len) {
         putstrkey(w, "desc", sh->desc);
     }
@@ -23836,6 +24148,17 @@ static void cmdshells(Engine *e, Arena scratch, i64 id)
         Shell sh  = dup ? Shell{} : shellnamed(e, &scratch, tmp, kw[i], 0, win, &err);
         if (sh.path.len) {
             putshell(&w.json, kw[i], &sh, {});
+        }
+    }
+    {
+        b32 dup = 0;
+        for (iz k = 0; k < names.len; k++) {
+            dup |= builtinkw(names[k]);
+        }
+        Str   epath = enginepath(e, &tmp, win);
+        Shell sh    = dup ? Shell{} : builtinshell(e, &scratch, tmp, epath, win);
+        if (sh.path.len) {
+            putshell(&w.json, BUILTIN_NAME, &sh, {});
         }
     }
     Shell prog = shellprog(e, &scratch, tmp, win);
@@ -27504,8 +27827,9 @@ static Engine *newengine(Os *os, Arena *perm, Config *cfg, Str statedir,
     }
     Arena scratch = newarena(e->scratch);
     e->te.windows = HOST_WINDOWS;
+    e->te.exe     = exe;
+    e->te.bash    = os_bash(os, &e->perm);
     e->te.shell   = defaultshell(e, &e->perm, scratch, HOST_WINDOWS, 0);
-    e->te.exe   = exe;
     e->te.rg    = findrg(e, &e->perm, newarena(e->scratch));
     // The user's own instructions, next to the configuration
     Str conf = cfgdefault(os, &e->perm);

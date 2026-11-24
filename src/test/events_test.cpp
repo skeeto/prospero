@@ -249,6 +249,193 @@ static void testlogwt(Test *t)
     expect(t, "remap self", copyremap(&a, "/r", "/r", "/w", 0), "/w");
 }
 
+// The lines of a log whose seqs are lo through hi.
+static Str seqlines(Arena *a, Str log, i64 lo, i64 hi)
+{
+    Buf b(a, 1024);
+    for (Str rest = log; rest.len;) {
+        Cut   c   = cut(rest, '\n');
+        EvRec rec = evparse(a, c.head);
+        rest = c.tail;
+        if (rec.seq>=lo && rec.seq<=hi) {
+            print(&b, c.head);
+            putbyte(&b, '\n');
+        }
+    }
+    return finish(&b);
+}
+
+// A replayed session's carry (shcarryrec), for comparison.
+static Str carryshow(Arena *a, Session *s)
+{
+    Buf b(a, 256);
+    print(&b, "cwd=");
+    print(&b, s->shcwd);
+    print(&b, " pwd=");
+    print(&b, s->shpwd);
+    print(&b, " env=");
+    print(&b, s->shenv);
+    return finish(&b);
+}
+
+// bash (builtin)'s carry in tool results (shell_cwd, shell_pwd,
+// shell_env) through each kind of copy (copycarry): a plain fork keeps
+// the directory and exports but not the logical directory, which names
+// the original's folder by its links; a side chat in a worktree has the
+// directory remapped into the worktree when below the original's
+// checkout (on Windows in either case and separator), kept when empty
+// or outside, and no exports, which often name the old checkout; a fork
+// into another folder keeps none; an import drops all three; and a
+// result without them is copied as it was, untouched. Then the replay
+// of such results (shcarryrec): a missing key leaves the carry, ""
+// clears it, and exports only from a state file in this session's out/.
+static void testlogcarry(Test *t)
+{
+    Arena a       = t->perm;
+    Arena scratch = t->perm;
+    scratch.beg  += (scratch.end - scratch.beg)/2;
+    Str src[] = {
+        "{\"sid\":\"A\",\"seq\":1,\"ts\":5,\"ev\":\"session\",\"proto\":0,\"cwd\":\"/r\"}\n",
+        "{\"sid\":\"A\",\"seq\":2,\"ts\":6,\"ev\":\"user\",\"text\":\"one\"}\n",
+        "{\"sid\":\"A\",\"seq\":3,\"ts\":6,\"ev\":\"turn\",\"n\":1}\n",
+        "{\"sid\":\"A\",\"seq\":4,\"ts\":7,\"ev\":\"tool.end\",\"call\":\"c1\",\"text\":\"t\","
+        "\"shell_cwd\":\"/r/sub\",\"shell_pwd\":\"/l/sub\",\"shell_env\":\"out/c1.state\"}\n",
+        "{\"sid\":\"A\",\"seq\":5,\"ts\":7,\"ev\":\"tool.end\",\"call\":\"c2\",\"text\":\"t\","
+        "\"shell_cwd\":\"\",\"shell_pwd\":\"\"}\n",
+        "{\"sid\":\"A\",\"seq\":6,\"ts\":7,\"ev\":\"tool.end\",\"call\":\"c3\",\"text\":\"t\","
+        "\"shell_cwd\":\"/tmp/x\",\"shell_env\":\"out/c3.state\"}\n",
+        "{\"sid\":\"A\",\"seq\":7,\"ts\":7,\"ev\":\"tool.end\",\"call\":\"c4\",\"text\":\"t\","
+        "\"shell_cwd\":\"/rx/y\"}\n",
+        "{\"sid\":\"A\",\"seq\":8,\"ts\":7,\"ev\":\"tool.end\",\"call\":\"c5\", \"text\": \"plain\"}\n",
+        "{\"sid\":\"A\",\"seq\":9,\"ts\":8,\"ev\":\"turn.end\",\"turn\":1,\"why\":\"done\"}\n",
+    };
+    Slice<Str> lines = {src, countof(src), countof(src)};
+    // Spaced as no rewrite would leave it
+    Str plain = "{\"sid\":\"B\",\"seq\":8,\"ts\":7,\"ev\":\"tool.end\",\"call\":\"c5\", "
+                "\"text\": \"plain\"}\n";
+
+    // A plain fork
+    LogCopy c = logcopy(&a, scratch, lines, "A", "B", {}, {}, -1, 100, 0);
+    expect(t, "logcarry fork", seqlines(&a, c.log, 4, 8), concat(&a,
+        "{\"sid\":\"B\",\"seq\":4,\"ts\":7,\"ev\":\"tool.end\",\"call\":\"c1\",\"text\":\"t\","
+        "\"shell_cwd\":\"/r/sub\",\"shell_env\":\"out/c1.state\"}\n"
+        "{\"sid\":\"B\",\"seq\":5,\"ts\":7,\"ev\":\"tool.end\",\"call\":\"c2\",\"text\":\"t\","
+        "\"shell_cwd\":\"\"}\n"
+        "{\"sid\":\"B\",\"seq\":6,\"ts\":7,\"ev\":\"tool.end\",\"call\":\"c3\",\"text\":\"t\","
+        "\"shell_cwd\":\"/tmp/x\",\"shell_env\":\"out/c3.state\"}\n"
+        "{\"sid\":\"B\",\"seq\":7,\"ts\":7,\"ev\":\"tool.end\",\"call\":\"c4\",\"text\":\"t\","
+        "\"shell_cwd\":\"/rx/y\"}\n", plain));
+    expect(t, "logcarry fork files", joinlines(&a, c.files), "out/c1.stateout/c3.state");
+
+    // A side chat in a worktree
+    CopyWt wt = {};
+    wt.cwd    = "/r/.prospero/worktrees/w";
+    wt.record = "{\"name\":\"w\",\"src\":\"/r\"}";
+    wt.src    = "/r";
+    wt.path   = "/r/.prospero/worktrees/w";
+    wt.notice = "Here.";
+    c = logcopy(&a, scratch, lines, "A", "B", {}, {}, -1, 100, 0, COPY_SIDE, &wt);
+    Str side = seqlines(&a, c.log, 4, 8);
+    expect(t, "logcarry worktree", side, concat(&a,
+        "{\"sid\":\"B\",\"seq\":4,\"ts\":7,\"ev\":\"tool.end\",\"call\":\"c1\",\"text\":\"t\","
+        "\"shell_cwd\":\"/r/.prospero/worktrees/w/sub\"}\n"
+        "{\"sid\":\"B\",\"seq\":5,\"ts\":7,\"ev\":\"tool.end\",\"call\":\"c2\",\"text\":\"t\","
+        "\"shell_cwd\":\"\"}\n"
+        "{\"sid\":\"B\",\"seq\":6,\"ts\":7,\"ev\":\"tool.end\",\"call\":\"c3\",\"text\":\"t\","
+        "\"shell_cwd\":\"/tmp/x\"}\n"
+        "{\"sid\":\"B\",\"seq\":7,\"ts\":7,\"ev\":\"tool.end\",\"call\":\"c4\",\"text\":\"t\","
+        "\"shell_cwd\":\"/rx/y\"}\n", plain));
+    expect(t, "logcarry worktree files", istr(&a, joinlines(&a, c.files).len), "0");
+
+    // The same on Windows, the directory in another case and separator
+    {
+        Str winsrc[] = {
+            "{\"sid\":\"A\",\"seq\":1,\"ts\":5,\"ev\":\"session\",\"proto\":0,"
+            "\"cwd\":\"C:\\\\r\"}\n",
+            "{\"sid\":\"A\",\"seq\":2,\"ts\":7,\"ev\":\"tool.end\",\"call\":\"c1\","
+            "\"shell_cwd\":\"c:\\\\R\\\\sub\",\"shell_env\":\"out/c1.state\"}\n",
+        };
+        CopyWt ww = {};
+        ww.cwd    = "C:\\r\\.prospero\\worktrees\\w";
+        ww.record = "{\"name\":\"w\",\"src\":\"C:\\\\r\"}";
+        ww.src    = "C:/r";
+        ww.path   = "C:\\r\\.prospero\\worktrees\\w";
+        c = logcopy(&a, scratch, {winsrc, 2, 2}, "A", "B", {}, {}, -1, 100, 1, COPY_SIDE, &ww);
+        expect(t, "logcarry worktree windows", seqlines(&a, c.log, 2, 2),
+            "{\"sid\":\"B\",\"seq\":2,\"ts\":7,\"ev\":\"tool.end\",\"call\":\"c1\","
+            "\"shell_cwd\":\"C:\\\\r\\\\.prospero\\\\worktrees\\\\w\\\\sub\"}\n");
+    }
+
+    // A fork into another folder
+    CopyWt mv = {};
+    mv.cwd    = "/n";
+    mv.src    = "/r";
+    c = logcopy(&a, scratch, lines, "A", "B", {}, {}, -1, 100, 0, COPY_MOVE, &mv);
+    expect(t, "logcarry move", seqlines(&a, c.log, 4, 8), concat(&a,
+        "{\"sid\":\"B\",\"seq\":4,\"ts\":7,\"ev\":\"tool.end\",\"call\":\"c1\",\"text\":\"t\"}\n"
+        "{\"sid\":\"B\",\"seq\":5,\"ts\":7,\"ev\":\"tool.end\",\"call\":\"c2\",\"text\":\"t\"}\n"
+        "{\"sid\":\"B\",\"seq\":6,\"ts\":7,\"ev\":\"tool.end\",\"call\":\"c3\",\"text\":\"t\"}\n"
+        "{\"sid\":\"B\",\"seq\":7,\"ts\":7,\"ev\":\"tool.end\",\"call\":\"c4\",\"text\":\"t\"}\n",
+        plain));
+    expect(t, "logcarry move files", istr(&a, joinlines(&a, c.files).len), "0");
+
+    // An import
+    Buf data(&a, 2048);
+    for (iz i = 0; i < countof(src); i++) {
+        print(&data, src[i]);
+    }
+    LogImport r = logimport(&a, scratch, finish(&data), "N", "/here", "mm", "http://e/",
+                            {}, 100);
+    expect(t, "logcarry import err", r.err, "");
+    expect(t, "logcarry import", seqlines(&a, r.log, 4, 8),
+        "{\"sid\":\"N\",\"seq\":4,\"ts\":7,\"ev\":\"tool.end\",\"call\":\"c1\",\"text\":\"t\"}\n"
+        "{\"sid\":\"N\",\"seq\":5,\"ts\":7,\"ev\":\"tool.end\",\"call\":\"c2\",\"text\":\"t\"}\n"
+        "{\"sid\":\"N\",\"seq\":6,\"ts\":7,\"ev\":\"tool.end\",\"call\":\"c3\",\"text\":\"t\"}\n"
+        "{\"sid\":\"N\",\"seq\":7,\"ts\":7,\"ev\":\"tool.end\",\"call\":\"c4\",\"text\":\"t\"}\n"
+        "{\"sid\":\"N\",\"seq\":8,\"ts\":7,\"ev\":\"tool.end\",\"call\":\"c5\", "
+        "\"text\": \"plain\"}\n");
+
+    // Replayed in order: each result's carry, or the last where it has
+    // none (a missing or non-string shell_cwd); exports refused unless
+    // out/NAME.state, NAME with no separator or ".."
+    Session *s = alloc<Session>(&a);
+    s->perm = carve(&a, 1<<16);
+    struct {
+        Str rec;
+        Str want;
+    } replays[] = {
+        {"{\"shell_cwd\":\"/r/sub\",\"shell_pwd\":\"/l/sub\",\"shell_env\":\"out/c1.state\"}",
+         "cwd=/r/sub pwd=/l/sub env=out/c1.state"},
+        {"{\"text\":\"t\"}", "cwd=/r/sub pwd=/l/sub env=out/c1.state"},
+        {"{\"shell_cwd\":7,\"shell_env\":\"out/c2.state\"}",
+         "cwd=/r/sub pwd=/l/sub env=out/c1.state"},
+        {"{\"shell_cwd\":\"\"}", "cwd= pwd= env="},
+        {"{\"shell_cwd\":\"/a\",\"shell_env\":\"out/c3.state\"}", "cwd=/a pwd= env=out/c3.state"},
+        {"{\"shell_cwd\":\"/a\",\"shell_env\":\"out/../c3.state\"}", "cwd=/a pwd= env="},
+        {"{\"shell_cwd\":\"/a\",\"shell_env\":\"out/..state\"}", "cwd=/a pwd= env="},
+        {"{\"shell_cwd\":\"/a\",\"shell_env\":\"out/d/c3.state\"}", "cwd=/a pwd= env="},
+        {"{\"shell_cwd\":\"/a\",\"shell_env\":\"out/d\\\\c3.state\"}", "cwd=/a pwd= env="},
+        {"{\"shell_cwd\":\"/a\",\"shell_env\":\"/etc/c3.state\"}", "cwd=/a pwd= env="},
+        {"{\"shell_cwd\":\"/a\",\"shell_env\":\"snap/c3.state\"}", "cwd=/a pwd= env="},
+        {"{\"shell_cwd\":\"/a\",\"shell_env\":\"out/c3.log\"}", "cwd=/a pwd= env="},
+        {"{\"shell_cwd\":\"/a\",\"shell_env\":7}", "cwd=/a pwd= env="},
+    };
+    for (iz i = 0; i < countof(replays); i++) {
+        Arena tmp = scratch;
+        shcarryrec(s, evparse(&tmp, replays[i].rec).root);
+        expect(t, concat(&a, "logcarry replay ", istr(&a, i)), carryshow(&a, s),
+               replays[i].want);
+    }
+
+    // The worktree's copy replays to the worktree's directory, no exports
+    {
+        Arena tmp = scratch;
+        shcarryrec(s, evparse(&tmp, cut(side, '\n').head).root);
+        expect(t, "logcarry replay worktree", carryshow(&a, s),
+               "cwd=/r/.prospero/worktrees/w/sub pwd= env=");
+    }
+}
+
 // A side chat's copy (COPY_SIDE), cut into a turn at work: a result for
 // the call running there, an answer and a result for the one asking,
 // the job still running ended as forked, without a notice, then the
@@ -1339,6 +1526,7 @@ static void test_events(Test *t)
     testlogcopy(t);
     testlogside(t);
     testlogwt(t);
+    testlogcarry(t);
     testlogimport(t);
     testlogcuts(t);
     testolder(t);

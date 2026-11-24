@@ -29,6 +29,7 @@
 #include <sys/ioctl.h>  // TIOCSCTTY, TIOCSWINSZ
 #include <sys/mman.h>
 #include <sys/random.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -709,6 +710,27 @@ static Str os_getenv(Os *, Arena *a, Str name)
     Str r = {(u8 *)v, 0};
     while (r.data[r.len]) r.len++;
     return clone(a, r);  // non-null even when empty
+}
+
+static BashExe os_bash(Os *os, Arena *a)
+{
+    BashExe r = {};
+    #if PROSPERO_UNABASHED
+    r.exports = 1;  // ub_exit.delta, 0.7.0 on (bashhost)
+    r.exe     = os->exe ? clone(a, Str{(u8 *)os->exe, (iz)__builtin_strlen(os->exe)}) : Str{};
+    #else
+    (void)os;
+    (void)a;
+    #endif
+    return r;
+}
+
+static b32 os_canenter(Os *, Arena scratch, Str dir)
+{
+    if (!dir.len || hasnul(dir)) return 0;
+    char       *p = cstr(&scratch, dir);
+    struct stat st;
+    return !stat(p, &st) && S_ISDIR(st.st_mode) && !access(p, X_OK);
 }
 
 static Str os_exepath(Os *, Arena *a)
@@ -5004,10 +5026,295 @@ static void crashtest(i32 argc, char **argv)
     }
 }
 
+// "bash (builtin)": `prospero --bash ...` (bashstate.cpp), the process
+// that runs one command in libunabashed, as the reaper's tool in place
+// of a host bash, so the reaper, spill, jobs and Stop are as for any
+// shell. Modeled on unabashed's tools/ubhost.c. Each program it starts
+// leads a session of its own, so the soft stop's TERM, which reaches
+// only this process, goes on to every one of them (UB_GROUP).
+#if PROSPERO_UNABASHED
+#include "unabashed.h"
+
+struct BashRun {
+    Arena     *perm;
+    b32        ended;  // the exit hook ran
+    Str        pwd;
+    Str        cwd;
+    Slice<Str> delta;  // the run's own export changes (ub_exit.delta)
+    b32        known;  // delta was reported
+};
+
+static_assert(UB_VERSION >= 0x000700, "ub_exit.delta, linger, UB_SYSROOT");
+
+static ub_os *bashos;
+
+// What the forwarder waits for: as ubhost's, every signal but those a
+// fault of the host's own raises (sent with kill, they kill it), and
+// SIGPIPE and SIGXFSZ, which the run raises on its own thread.
+static void bashwaitset(sigset_t *set)
+{
+    sigemptyset(set);
+    for (i32 sig = 1; sig < 32; sig++) {
+        switch (sig) {
+        case SIGKILL: case SIGSTOP: case SIGCHLD:
+            continue;
+        #if !__linux__
+        case SIGILL: case SIGTRAP: case SIGBUS: case SIGFPE: case SIGSEGV:
+        case SIGSYS:
+            continue;
+        #endif
+        }
+        sigaddset(set, sig);
+    }
+}
+
+static void *bashforward(void *)
+{
+    sigset_t set;
+    bashwaitset(&set);
+    for (;;) {
+        i32 sig;
+        if (sigwait(&set, &sig)) continue;
+        b32 group = sig==SIGTERM || sig==SIGINT || sig==SIGHUP;
+        ub_signal(bashos, sig | (group ? UB_GROUP : 0));
+    }
+    return 0;
+}
+
+static Str bashcstr(char const *s)
+{
+    return s ? Str{(u8 *)s, (iz)__builtin_strlen(s)} : Str{};
+}
+
+// The exit hook, on the run's thread: copied only if it all fits, so
+// that it never fails partway.
+static void bashonexit(void *user, ub_exit const *e)
+{
+    BashRun *r   = (BashRun *)user;
+    Str      pwd = bashcstr(e->pwd);
+    Str      cwd = bashcstr(e->cwd);
+    iz       n   = 0;
+    iz       len = pwd.len + cwd.len + 64;
+    for (; e->delta && e->delta[n]; n++) {
+        len += bashcstr(e->delta[n]).len + (iz)sizeof(Str);
+    }
+    if (!fits(r->perm, len + (iz)sizeof(Str))) {
+        return;
+    }
+    r->pwd   = clone(r->perm, pwd);
+    r->cwd   = clone(r->perm, cwd);
+    r->known = e->delta != 0;
+    r->delta = {};
+    if (n) {
+        r->delta.data = alloc<Str>(r->perm, n);
+        r->delta.len  = r->delta.cap = n;
+        for (iz i = 0; i < n; i++) {
+            r->delta[i] = clone(r->perm, bashcstr(e->delta[i]));
+        }
+    }
+    r->ended = 1;
+}
+
+// A whole small file, or empty.
+static Str bashslurp(Arena *a, Str path)
+{
+    i32 fd = open(cstr(a, path), O_RDONLY|O_CLOEXEC);
+    if (fd < 0) return {};
+    Buf b(a, 1<<12);
+    for (;;) {
+        reserve(&b, 1<<12);
+        iz n = read(fd, b.data+b.len, (uz)(b.cap-b.len));
+        if (n < 0 && errno==EINTR) continue;
+        if (n <= 0) break;
+        b.len += n;
+    }
+    close(fd);
+    return finish(&b);
+}
+
+[[noreturn]] static void bashexit(i32 status)
+{
+    if (status < 0) {
+        if (status != -UB_ENOMEM) {
+            writeall(2, "prospero: bash (builtin): the run failed\n");
+        }
+        _exit(status==-UB_ENOMEM ? 2 : 126);
+    }
+    if (status & UB_SIGNALED) {
+        i32 sig = (status & 255) - 128;
+        switch (sig) {
+        // These would dump core or leave a crash report naming prospero
+        case SIGQUIT: case SIGILL: case SIGTRAP: case SIGABRT: case SIGBUS:
+        case SIGFPE: case SIGSEGV: case SIGSYS: case SIGXCPU: case SIGXFSZ:
+        #ifdef SIGEMT
+        case SIGEMT:
+        #endif
+            _exit(128 + sig);
+        }
+        signal(sig, SIG_DFL);
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, sig);
+        pthread_sigmask(SIG_UNBLOCK, &set, 0);
+        kill(getpid(), sig);
+        _exit(128 + sig);
+    }
+    _exit(status & 255);
+}
+
+[[noreturn]] static void bashhost(i32 argc, char **argv)
+{
+    Os      os  = {};
+    Region *reg = os_reserve(&os, sizeof(void *)==8 ? (iz)1<<32 : (iz)1<<26);
+    if (!reg) {
+        writeall(2, "prospero: out of memory\n");
+        _exit(2);
+    }
+    Arena a = newarena(reg);
+
+    Str *args = alloc<Str>(&a, argc);
+    for (i32 i = 0; i < argc; i++) {
+        args[i] = bashcstr(argv[i]);
+    }
+    BashArgs ba = bashargs(args, argc, 1);
+    if (!ba.ok) {
+        writeall(2, "prospero: --bash: an option needs a value\n");
+        _exit(2);
+    }
+
+    // Dispositions as a host bash would get them: SIGCHLD the default,
+    // for the library's waits, and ignored signals stay ignored. macOS
+    // directs SIGPIPE and SIGXFSZ at the process, so the host ignores
+    // them, unseen by the run.
+    signal(SIGCHLD, SIG_DFL);
+    u64 sigign = 0;
+    for (i32 sig = 1; sig < 64; sig++) {
+        struct sigaction sa;
+        if (!sigaction(sig, 0, &sa) && sa.sa_handler==SIG_IGN) {
+            sigign |= (u64)1 << (sig-1);
+        }
+    }
+    #if __APPLE__
+    signal(SIGPIPE, SIG_IGN);
+    signal(SIGXFSZ, SIG_IGN);
+    #endif
+
+    // Room for the run's descriptors (ub_config.fds), which programs
+    // inherit as their limit too; nothing inherited past stdio leaks on
+    struct rlimit rl;
+    if (!getrlimit(RLIMIT_NOFILE, &rl) && rl.rlim_cur<512) {
+        rlim_t want = rl.rlim_max<1024 ? rl.rlim_max : 1024;
+        if (want > rl.rlim_cur) {
+            rl.rlim_cur = want;
+            setrlimit(RLIMIT_NOFILE, &rl);
+        }
+    }
+    for (i32 fd = 3; fd < 1024; fd++) {
+        i32 fl = fcntl(fd, F_GETFD);
+        if (fl >= 0) fcntl(fd, F_SETFD, fl|FD_CLOEXEC);
+    }
+
+    // The environment, with the carried exports, and PWD only if it
+    // still names where this starts
+    Slice<Str> env = {};
+    for (char **e = environ; *e; e++) {
+        env = push(&a, env, bashcstr(*e));
+    }
+    BashState carry = {};
+    if (ba.carry.len) {
+        carry = bashstatedecode(&a, bashslurp(&a, ba.carry));
+        if (carry.ok && carry.known) {
+            env = bashapply(&a, env, carry.exports, 0);
+        }
+    }
+    Str pwd = envget(env, "PWD", 0);
+    if (pwd.len) {
+        struct stat p, d;
+        if (stat(cstr(&a, pwd), &p) || stat(".", &d) ||
+            p.st_dev!=d.st_dev || p.st_ino!=d.st_ino) {
+            env = envdel(&a, env, "PWD", 0);
+        }
+    }
+    char const **envp = alloc<char const *>(&a, env.len+1);
+    for (iz i = 0; i < env.len; i++) {
+        envp[i] = cstr(&a, env[i]);
+    }
+
+    i32 nargs = argc - ba.rest + 1;
+    char const **bargv = alloc<char const *>(&a, nargs+1);
+    bargv[0] = "bash";
+    for (i32 i = 1; i < nargs; i++) {
+        bargv[i] = argv[ba.rest+i-1];
+    }
+
+    BashRun run = {};
+    run.perm = &a;
+    ub_config cfg = {};
+    cfg.user = &run;
+    cfg.fds    = 256;
+    cfg.exit   = bashonexit;
+    cfg.linger = 1000;  // TERM, then this long, below the 2 s stop_grace
+
+    ub_cmd cmd = {};
+    cmd.argc   = nargs;
+    cmd.argv   = bargv;
+    cmd.env    = envp;
+    cmd.std[0] = 0;
+    cmd.std[1] = 1;
+    cmd.std[2] = 2;
+    cmd.pid    = getpid();
+    cmd.ppid   = getppid();
+    cmd.sigign = sigign;
+
+    sigset_t set;
+    bashwaitset(&set);
+    pthread_sigmask(SIG_BLOCK, &set, 0);
+    bashos = ub_new(&cfg);
+    if (!bashos) {
+        writeall(2, "prospero: bash (builtin): cannot start\n");
+        _exit(126);
+    }
+    pthread_t t;
+    pthread_create(&t, 0, bashforward, 0);
+    i32 status = ub_run(bashos, &cmd);
+
+    // The state for the next run, only from one that ended on its own:
+    // the exports carried in with the run's own changes over them, when
+    // it reported them (decisions.md, 2026-11-24)
+    if (ba.state.len && run.ended && status>=0 && !(status & UB_SIGNALED)) {
+        BashState st = {};
+        st.pwd = run.pwd;
+        st.cwd = run.cwd;
+        if (run.known) {
+            Slice<Str> base = carry.ok && carry.known ? carry.exports : Slice<Str>{};
+            st.exports = bashmerge(&a, base, run.delta, 0);
+            st.known   = 1;
+            st.changed = run.delta.len > 0;
+        }
+        Str data = bashstateencode(&a, &st);
+        i32 fd   = open(cstr(&a, ba.state), O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC|O_NOFOLLOW, 0600);
+        if (fd >= 0) {
+            writeall(fd, data);
+            close(fd);
+        }
+    }
+    // ub_free never: the forwarder may still be in ub_signal
+    bashexit(status);
+}
+#else
+[[noreturn]] static void bashhost(i32, char **)
+{
+    writeall(2, "prospero: bash (builtin) is not in this build\n");
+    _exit(126);
+}
+#endif
+
 int main(int argc, char **argv)
 {
     if (argc>1 && reapmode(argv[1])) {
         reap(argc, argv);
+    } else if (argc>1 && !__builtin_strcmp(argv[1], "--bash")) {
+        bashhost(argc, argv);
     } else if (argc>1 && !__builtin_strcmp(argv[1], "--tty-probe")) {
         ttyprobe(argv);
     } else if (argc>1 && !__builtin_strcmp(argv[1], "--tty-edit")) {

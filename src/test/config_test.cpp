@@ -2160,7 +2160,7 @@ static void testcfgpath(Test *t)
         "is ignored, since it chooses what runs: set it in your own file\n"
         "/c/shared.ini:4:9: error: a shell by its path or name in an included "
         "file is ignored, since it chooses what runs: set it in your own "
-        "file, or here one of auto, sh, bash, powershell, cmd\n"
+        "file, or here one of auto, sh, bash, powershell, cmd, builtin\n"
         "/c/shared.ini:6:10: error: [ui] editor in an included file is "
         "ignored, since it chooses what runs: set it in your own file");
     expect(t, "path.shared.prepend", cfgget(c, "tools", "", "path_prepend", 0), "");
@@ -2173,6 +2173,20 @@ static void testcfgpath(Test *t)
     os_write(v.os, a, "/c/h.ini", "include = shared.ini\ninclude = keyword.ini\n");
     c = newconfig(v.os, &a, v.scratch, "/c/h.ini", 0);
     expect(t, "path.keyword", cfgget(c, "tools", "", "shell", 0), "powershell");
+    cfgfree(c);
+
+    // bash (builtin) is a keyword too, by either of its names: it runs
+    // this executable, not a program the included file chooses
+    os_write(v.os, a, "/c/kb.ini", "[tools]\nshell = builtin\n");
+    os_write(v.os, a, "/c/h.ini", "include = kb.ini\n");
+    c = newconfig(v.os, &a, v.scratch, "/c/h.ini", 0);
+    expect(t, "path.keyword.builtin", concat(&a, cfgget(c, "tools", "", "shell", 0),
+           inidiags(&a, c->ini)), "builtin");
+    cfgfree(c);
+    os_write(v.os, a, "/c/kb.ini", "[tools]\nshell = bash (builtin)\n");
+    c = newconfig(v.os, &a, v.scratch, "/c/h.ini", 0);
+    expect(t, "path.keyword.builtin.name", concat(&a, cfgget(c, "tools", "", "shell", 0),
+           inidiags(&a, c->ini)), "bash (builtin)");
     cfgfree(c);
 
     // The user's own: in order, ~ the home directory, empty, relative
@@ -2473,6 +2487,223 @@ static void testcfgpath(Test *t)
         env = shellenvfor(s, &a, &deb);
         expect(t, "wsl shellenv, WSLENV kept", istr(&a, find(showlist(&a, env),
                "|WSLENV=USERPROFILE/p:FOO|")>0), "1");
+        cfgfree(c);
+    }
+
+    // bash (builtin): named by builtin or by its own name, as [tools]
+    // shell, in shells, or as a section's program, which keeps the
+    // section's name and description; never auto's; once among shells
+    // however it is named, while a section of it is a shell of its own
+    {
+        os_write(v.os, a, "/c/b.ini",
+                 "[tools]\n"
+                 "shell = builtin\n"
+                 "shells = builtin sh builtin mine\n"
+                 "[shell mine]\n"
+                 "program = builtin\n"
+                 "description = Mine, with carried cd\n");
+        Config *c = newconfig(v.os, &a, v.scratch, "/c/b.ini", 0);
+        Engine *e = alloc<Engine>(&a);
+        e->os          = v.os;
+        e->cfg         = c;
+        e->ini         = c->ini;
+        e->home        = "/home/u";
+        e->exedir      = "/exe";
+        e->env         = push(&a, e->env, Str("PATH=/usr/bin"));
+        e->te.exe      = "/exe/prospero";
+        e->te.bash.exe = "/exe/prospero";
+        expect(t, "builtin.diags", inidiags(&a, c->ini), "");
+
+        struct { Str name; b32 prog; Str want; } cases[] = {
+            {"builtin",        0, "bash (builtin) /exe/prospero  builtin"},
+            {"bash (builtin)", 0, "bash (builtin) /exe/prospero  builtin"},
+            {" builtin ",      1, "bash (builtin) /exe/prospero  builtin"},
+            {"mine",           0, "mine /exe/prospero Mine, with carried cd builtin"},
+            {"auto",           0, "sh /bin/sh  sh"},
+        };
+        for (iz i = 0; i < countof(cases); i++) {
+            Str   err = {};
+            Shell sh  = shellnamed(e, &a, v.scratch, cases[i].name, cases[i].prog, 0, &err);
+            Str   got = sh.path.len
+                ? concat(&a, concat(&a, concat(&a, sh.name, " "), concat(&a, sh.path, " ")),
+                         concat(&a, concat(&a, sh.desc, " "), shellkinds[sh.kind]))
+                : concat(&a, concat(&a, "(", err), ")");
+            expect(t, concat(&a, "shellnamed.builtin ", cases[i].name), got, cases[i].want);
+        }
+        Str   warn = {};
+        Shell sh   = defaultshell(e, &a, v.scratch, 0, &warn);
+        expect(t, "builtin.default", concat(&a, sh.name, warn), "bash (builtin)");
+        expect(t, "builtin.posix.tools", istr(&a, !sh.tools.len && !sh.root.len && !sh.win), "1");
+        expect(t, "builtin.exports.none", istr(&a, sh.exports), "0");
+        e->te.bash.exports = 1;
+        sh = shellnamed(e, &a, v.scratch, "builtin", 0, 0, &warn);
+        expect(t, "builtin.exports", istr(&a, sh.exports), "1");
+        e->te.bash.exports = 0;
+
+        // Auto never picks it, nor a program that goes by either name
+        os_write(v.os, a, "/usr/bin/builtin", "#!");
+        os_write(v.os, a, "/usr/bin/bash (builtin)", "#!");
+        for (iz i = 0; i < 2; i++) {
+            Str pref = i ? Str("bash (builtin)") : Str("builtin");
+            sh = findshell(v.os, &a, v.scratch, "/exe", "/usr/bin", 0, pref);
+            expect(t, concat(&a, "findshell.builtin ", pref),
+                   concat(&a, sh.path, shellkinds[sh.kind]), "/bin/shsh");
+        }
+        os_remove(v.os, a, "/usr/bin/builtin");
+        os_remove(v.os, a, "/usr/bin/bash (builtin)");
+
+        // Once among the shells, whichever name says it, first or not;
+        // a section of it apart, by its own name
+        sh = defaultshell(e, &a, v.scratch, 0, &warn);
+        Slice<Shell> list = listshells(e, &a, v.scratch, sh, 0, &warn);
+        Buf lb(&a, 256);
+        for (iz i = 0; i < list.len; i++) {
+            print(&lb, list[i].name);
+            putbyte(&lb, '|');
+        }
+        expect(t, "listshells.builtin", concat(&a, finish(&lb), warn),
+               "bash (builtin)|sh|mine|");
+        Str   serr  = {};
+        Shell first = shellnamed(e, &a, v.scratch, "sh", 0, 0, &serr);
+        list = listshells(e, &a, v.scratch, first, 0, &warn);
+        Buf sb(&a, 256);
+        for (iz i = 0; i < list.len; i++) {
+            print(&sb, list[i].name);
+            putbyte(&sb, '|');
+        }
+        expect(t, "listshells.builtin.second", concat(&a, finish(&sb), warn),
+               "sh|bash (builtin)|mine|");
+
+        // Records: found again as this build and the configuration have
+        // it now, at this executable's path, a section's by its name
+        JsonDoc rec = jsonparse(&a,
+            "{\"shell\":\"/old/prospero\",\"shell_kind\":\"builtin\","
+            "\"shell_name\":\"mine\",\"shells\":["
+            "{\"path\":\"/old/prospero\",\"kind\":\"builtin\",\"name\":\"mine\"},"
+            "{\"path\":\"/bin/sh\",\"kind\":\"sh\",\"name\":\"sh\"},"
+            "{\"path\":\"/old/prospero\",\"kind\":\"builtin\"}]}");
+        sh = shellrec(e, &a, v.scratch, rec.root, "shell", "shell_kind", "shell_name");
+        expect(t, "shellrec.builtin", concat(&a, concat(&a, sh.name, " "),
+               concat(&a, concat(&a, sh.path, " "), sh.desc)),
+               "mine /exe/prospero Mine, with carried cd");
+        Json *last = jsonat(jsonget(rec.root, "shells"), 2);
+        sh = shellrec(e, &a, v.scratch, last, "path", "kind", "name");
+        expect(t, "shellrec.builtin.unnamed", concat(&a, concat(&a, sh.name, " "),
+               concat(&a, sh.path, " ")), "bash (builtin) /exe/prospero ");
+
+        Session *s = alloc<Session>(&a);
+        s->e    = e;
+        s->perm = carve(&a, 1<<20);
+        s->te   = e->te;
+        prefixshell(s, v.scratch, rec.root);
+        Buf pb(&a, 256);
+        for (iz i = 0; i < s->te.shells.len; i++) {
+            print(&pb, s->te.shells[i].name);
+            putbyte(&pb, '|');
+        }
+        expect(t, "prefixshell.builtin", concat(&a, concat(&a, s->te.shell.name, " "),
+               concat(&a, concat(&a, s->te.shell.path, " "), finish(&pb))),
+               "mine /exe/prospero mine|sh|bash (builtin)|");
+        expect(t, "prefixshell.builtin.found", istr(&a, s->shellmiss.path.len), "0");
+
+        // Without the library: not in this build, says each name of it;
+        // a record of it misses, and the default (auto, since [tools]
+        // shell misses too) takes its place, its builtin shells dropped
+        e->te.bash = {};
+        for (iz i = 0; i < 2; i++) {
+            Str err  = {};
+            Str name = i ? Str("mine") : Str("builtin");
+            sh = shellnamed(e, &a, v.scratch, name, 0, 0, &err);
+            expect(t, concat(&a, "shellnamed.builtin.none ", name),
+                   concat(&a, sh.path, err), "bash (builtin) is not in this build");
+        }
+        warn = {};
+        sh   = defaultshell(e, &a, v.scratch, 0, &warn);
+        expect(t, "builtin.default.none", concat(&a, concat(&a, sh.name, ": "), warn),
+               "sh: [tools] shell: bash (builtin) is not in this build, so "
+               "commands run in sh");
+        Session *u = alloc<Session>(&a);
+        u->e    = e;
+        u->perm = carve(&a, 1<<20);
+        u->te   = e->te;
+        prefixshell(u, v.scratch, rec.root);
+        expect(t, "prefixshell.builtin.none",
+               concat(&a, concat(&a, u->te.shell.name, " "),
+                      concat(&a, concat(&a, u->shellmiss.name, " "),
+                             concat(&a, u->shellmiss.path, " "))),
+               "sh mine /old/prospero ");
+        expect(t, "prefixshell.builtin.none.kind",
+               istr(&a, u->shellmiss.kind==SHELL_BUILTIN && u->te.shells.len==1 &&
+                    u->shellpre.kind==SHELL_BUILTIN), "1");
+        expect(t, "prefixshell.builtin.none.notice",
+               istr(&a, startswith(shellnotice(&a, &u->te.shell, &u->shellpre,
+                                               &u->shellmiss, 0),
+                                   "Your shell, mine, is not in this build of "
+                                   "Prospero, so commands run in sh.")), "1");
+
+        // A record useshell takes back once the library is here again
+        e->te.bash.exe = "/exe/prospero";
+        u->te.bash     = e->te.bash;
+        useshell(u, v.scratch, u->shellmiss);
+        expect(t, "useshell.builtin", concat(&a, concat(&a, u->te.shell.name, " "),
+               istr(&a, u->shellmiss.path.len)), "mine 0");
+        cfgfree(c);
+    }
+
+    // On Windows, bash (builtin)'s Unix tools: ls.exe beside this
+    // executable, else on PATH, else Git for Windows' usr/bin, from its
+    // git.exe one or two levels down; their root and flavor by the
+    // files an install has; none found, neither
+    {
+        os_write(v.os, a, "/bx/ls.exe", "MZ");
+        os_write(v.os, a, "/bx/busybox.exe", "MZ");
+        os_write(v.os, a, "/m2/usr/bin/ls.exe", "MZ");
+        os_write(v.os, a, "/m2/usr/bin/msys-2.0.dll", "MZ");
+        os_write(v.os, a, "/cy/bin/ls.exe", "MZ");
+        os_write(v.os, a, "/cy/bin/cygwin1.dll", "MZ");
+        os_write(v.os, a, "/plain/ls.exe", "MZ");
+        os_write(v.os, a, "/gw/cmd/git.exe", "MZ");
+        os_write(v.os, a, "/gw/usr/bin/msys-2.0.dll", "MZ");
+        os_write(v.os, a, "/gm/mingw64/bin/git.exe", "MZ");
+        os_write(v.os, a, "/gm/usr/bin/msys-2.0.dll", "MZ");
+        os_write(v.os, a, "/gy/cmd/git.exe", "MZ");
+        os_write(v.os, a, "/c/w.ini", "");
+        Config *c = newconfig(v.os, &a, v.scratch, "/c/w.ini", 0);
+        Engine *e = alloc<Engine>(&a);
+        e->os          = v.os;
+        e->cfg         = c;
+        e->te.exe      = "C:/p/prospero.exe";
+        e->te.bash.exe = "C:/p/prospero.exe";
+        struct { Str exedir; Str path; Str tools; Str root; i32 flavor; } cases[] = {
+            {"/bx",  "/m2/usr/bin",             "/bx",         "/bx",         FLAVOR_BUSYBOX},
+            {"/exe", "C:/nowhere;/m2/usr/bin",  "/m2/usr/bin", "/m2/usr/bin", FLAVOR_MSYS},
+            {"/exe", "/cy/bin;/m2/usr/bin",     "/cy/bin",     "/cy/bin",     FLAVOR_CYGWIN},
+            {"/exe", "/plain;/m2/usr/bin",      "/plain",      "",            FLAVOR_NONE},
+            {"/exe", "/gw/cmd",                 "/gw/usr/bin", "/gw/usr/bin", FLAVOR_MSYS},
+            {"/exe", "/gw/cmd;/plain",          "/plain",      "",            FLAVOR_NONE},
+            {"/exe", "/gm/mingw64/bin",         "/gm/usr/bin", "/gm/usr/bin", FLAVOR_MSYS},
+            {"/exe", "/gy/cmd",                 "",            "",            FLAVOR_NONE},
+            {"/exe", "C:/nowhere",              "",            "",            FLAVOR_NONE},
+        };
+        for (iz i = 0; i < countof(cases); i++) {
+            e->exedir = cases[i].exedir;
+            Shell sh  = builtinshell(e, &a, v.scratch, cases[i].path, 1);
+            Str   got = concat(&a, concat(&a, sh.tools, "|"),
+                               concat(&a, concat(&a, sh.root, "|"), istr(&a, sh.flavor)));
+            Str   want = concat(&a, concat(&a, cases[i].tools, "|"),
+                                concat(&a, concat(&a, cases[i].root, "|"),
+                                       istr(&a, cases[i].flavor)));
+            expect(t, concat(&a, "builtinshell.windows ", cases[i].path), got, want);
+            expect(t, concat(&a, "builtinshell.windows.shell ", cases[i].path),
+                   concat(&a, concat(&a, sh.name, " "), sh.path),
+                   "bash (builtin) C:/p/prospero.exe");
+            expect(t, concat(&a, "builtinshell.windows.win ", cases[i].path),
+                   istr(&a, sh.win), "1");
+        }
+        // Not on POSIX, where the system's own tools serve
+        e->exedir = "/bx";
+        Shell px  = builtinshell(e, &a, v.scratch, "/m2/usr/bin", 0);
+        expect(t, "builtinshell.posix", istr(&a, px.tools.len + px.root.len + px.win), "0");
         cfgfree(c);
     }
 }

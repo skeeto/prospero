@@ -8,11 +8,32 @@ CMake 3.25 or later and a C++20 compiler with `#embed`, on macOS, Windows
 
 Dependencies are fetched at configure time, pinned by URL and SHA-256:
 Dear ImGui (docking branch), md4c, FreeType and SDL3 for the GUI, mbedTLS
-with cpp-httplib for HTTP on macOS and Linux, and Wuffs's single-file
-release for decoding images everywhere. To build offline, or with a
+with cpp-httplib for HTTP on macOS and Linux, Wuffs's single-file
+release for decoding images everywhere, and [unabashed][]'s release
+tarball for bash (builtin), below. To build offline, or with a
 modified dependency, put its source under `deps/` (`deps/imgui`,
 `deps/md4c`, `deps/freetype`, `deps/sdl3`, `deps/mbedtls`,
-`deps/cpp-httplib`, and `deps/wuffs` holding `wuffs-v0.4.c`).
+`deps/cpp-httplib`, `deps/wuffs` holding `wuffs-v0.4.c`, and
+`deps/unabashed`), or name a directory elsewhere with CMake's own
+`-DFETCHCONTENT_SOURCE_DIR_<NAME>=DIR`, such as
+`-DFETCHCONTENT_SOURCE_DIR_UNABASHED=$HOME/src/unabashed` for a
+checkout of unabashed.
+
+bash (builtin), the shell `[tools] shell = builtin` picks, is
+libunabashed, unabashed's from-scratch bash 5.3 as a library
+(`cmake/FetchUnabashed.cmake`, pinned to 0.7.0), linked into
+`prospero` and run as `prospero --bash` (see
+[Development](development.md#bash-builtin)). It makes the program
+about 1.7 MB larger (stripped, in a macOS Release build).
+`-DPROSPERO_UNABASHED=OFF` leaves it out: the shell picker never
+offers it then, and a setting or session that names it gets the
+default shell, with a note that it is not in this build. It leaves
+itself out, with a message as CMake configures, on Linux off x86-64
+where its fibers can't work yet: there they are glibc's `getcontext`,
+so not with musl (the static aarch64 engine) nor under Clang (the
+aarch64 GUI build). On x86-64 its fibers are its own. On Windows its one need of a C runtime, `strlen`, is
+Prospero's own, so the headless engine stays CRT-free, with the same
+imports.
 
 Distribution packages can use the system's SDL3 (3.4 or later),
 FreeType (2.14 or later) and mbedTLS (3.6, not 4) instead, found with
@@ -89,7 +110,8 @@ Each release on GitHub carries five files:
   is built in an Ubuntu 22.04 container, with everything but glibc
   linked statically, so it needs glibc 2.34 or later (Ubuntu 22.04,
   Debian 12, Fedora 35, RHEL 9), and shows its window through Wayland
-  or X11, which it loads at run time.
+  or X11, which it loads at run time. Clang builds them, so the aarch64
+  one has no bash (builtin) yet.
 
 Each program is its own engine, so `prospero deploy` from a release
 reaches machines of its own platform. Engines for the others, which
@@ -112,7 +134,7 @@ its security patches, mingw-w64, and Debian 10's glibc 2.28), and the
 macOS engine on the Mac itself. All are optimized for size:
 
 - the Linux engines link musl statically, so they run with any C
-  library, or none;
+  library, or none, but have no bash (builtin);
 - the Linux desktop helpers need glibc 2.28 or later;
 - the Windows engines are the same CRT-free programs as above;
 - the macOS engine, for Apple Silicon, needs macOS 11 or later.
@@ -152,5 +174,6 @@ an itch.io API key, from `butler login` or in `BUTLER_API_KEY`; without
 one, it builds nothing either.
 
 [w64devkit]: https://github.com/skeeto/w64devkit
+[unabashed]: https://github.com/skeeto/unabashed
 [itch]: https://skeeto.itch.io/prospero
 [butler]: https://itch.io/docs/butler/

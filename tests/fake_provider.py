@@ -485,6 +485,91 @@ def sc_shell_list(model, n, req):
         yield from answer(model, "Ran them.")
 
 
+def sc_builtin_carry(model, n, req):
+    calls = [
+        'echo "V=${BASH_VERSION}"; mkdir -p sub; cd sub; export X=1 Y=2; Z=3; '
+        'f() { :; }; g() { echo gee; }; export -f g',
+        'echo "PWD=$PWD"; echo "X=${X-unset} Y=${Y-unset} Z=${Z-unset} '
+        'F=$(type -t f || echo none) G=$(g)"',
+        'unset Y; cd /',
+        'echo "PWD=$PWD"; echo "X=${X-unset} Y=${Y-unset}"',
+        'export W=1; cd sub; kill -TERM $$',
+        'echo "PWD=$PWD"; echo "W=${W-unset}"; exit 3',
+    ]
+    if n < len(calls):
+        yield from tool(model, n, "shell", {"command": calls[n]})
+    else:
+        yield from answer(model, "Carried.")
+
+
+def sc_builtin_login(model, n, req):
+    show = ('echo "N=$(echo "$PATH" | tr : "\\n" | grep -c /loginbin) '
+            'L=$LOGINS A=${A-unset}"')
+    calls = [show + "; export A=1", show, show]
+    if n < len(calls):
+        yield from tool(model, n, "shell", {"command": calls[n]})
+    else:
+        yield from answer(model, "Logged in.")
+
+
+def sc_builtin_basic(model, n, req):
+    # bash 5.3 and its exit code; a program killed by TERM; a cd, then a
+    # background job, which starts where it left off
+    calls = [
+        {"command": 'echo "V=${BASH_VERSION}"; exit 3'},
+        {"command": "sh -c 'kill -TERM $$'"},
+        {"command": "mkdir -p sub; cd sub"},
+        {"command": 'echo "PWD=$PWD" > job.txt', "background": True},
+    ]
+    if n < len(calls):
+        yield from tool(model, n, "shell", calls[n])
+    else:
+        yield from answer(model, "Ran them.")
+
+
+def shprompt(req):
+    """The command a prompt of "sh: CMD" asks for since the agent last
+    answered (notices may follow the prompt), CMD being the shell tool's
+    arguments if it is JSON; and whether its call has run since."""
+    ran = False
+    for m in reversed(req.get("messages", [])):
+        role = m.get("role")
+        if role == "assistant" and not m.get("tool_calls"):
+            break
+        ran |= role == "tool"
+        c = m.get("content")
+        if role == "user" and isinstance(c, str) and c.startswith("sh: "):
+            cmd = c[4:]
+            return (json.loads(cmd) if cmd.startswith("{") else {"command": cmd}), ran
+    return None, ran
+
+
+def sc_builtin_say(model, n, req):
+    # One shell call per prompt "sh: CMD", then an answer
+    args, ran = shprompt(req)
+    if args is None or ran:
+        yield from answer(model, "Done.")
+    else:
+        yield from tool(model, n, "shell", args)
+
+
+sc_builtin_nocarry = sc_builtin_say
+sc_builtin_carry_reset = sc_builtin_say
+sc_builtin_rewind = sc_builtin_say
+sc_builtin_switch = sc_builtin_say
+sc_builtin_fork = sc_builtin_say
+sc_builtin_stop = sc_builtin_say
+
+
+def sc_builtin_compact(model, n, req):
+    # "read them" reads eight big files, as compact_manual's; the rest,
+    # one shell call per prompt
+    if last_user_text(req) == "read them":
+        yield from sc_compact_manual(model, n, req)
+    else:
+        yield from sc_builtin_say(model, n, req)
+
+
 def sc_bytewise(model, n, req):
     yield S.bytewise()
     if n == 0:

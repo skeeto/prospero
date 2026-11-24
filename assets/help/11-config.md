@@ -263,13 +263,26 @@ and are asked to test their work, which a small model needs.
   else PowerShell, then `cmd`), `sh` (`/bin/sh`, even where that is
   bash), `bash` (not a keyword on Windows, where it is a program),
   `zsh` (likewise; the agent is told it is not bash, though it is
-  never auto's choice), `powershell`, `cmd`, a `[shell]` section's name, or a program by its
+  never auto's choice), `powershell`, `cmd`, `builtin`, a `[shell]` section's name, or a program by its
   path or name. A
   session keeps the shell it began with, until you switch it (see
   Sessions and modes).
+
+  `builtin` is **bash (builtin)**, the bash 5.3 built into Prospero:
+  the same bash on every machine, with no bash to install. Each
+  command starts in the directory the last one ended in, when that one
+  ended on its own (not stopped, timed out or killed), and inside the
+  session's folders; elsewhere it starts over in the session's folder,
+  and the agent is told. Its exports and exported functions carry
+  too; other functions, aliases and unexported variables don't. The
+  programs it runs are the machine's own: on Windows it finds Unix
+  tools for them beside `prospero.exe` (as in w64devkit's `bin`),
+  `ls.exe` on PATH, or Git for Windows, and `/` and `~` then mean what they mean
+  to those tools. It is never auto's choice, and a build without it
+  says so. Its Terminal tabs open auto's shell.
 - **`[shell NAME]`**: a shell you name, for `[tools] shell`, `shells`
   and the shell picker. `program` is a path, a name on PATH, or `sh`,
-  `powershell` or `cmd`, and defaults to NAME. `login = true` starts
+  `powershell`, `cmd` or `builtin`, and defaults to NAME. `login = true` starts
   it as a login shell (`sh -l`, PowerShell with your profile, cmd with
   its AutoRun). On Windows, MSYS2's and Git's profile then keep the
   working directory and Prospero's PATH, after their own directories

@@ -51,9 +51,12 @@ secrets and `file:` secrets, `[remote]`, `[container]` and `[desktop]`
 settings, an
 `[mcp]` section's `command`, `cwd`, `env.NAME` and `trust = yes`,
 `[web] ask = no`, `[tools] path_prepend` and `path_append`, a
-`[tools] shell` other than a keyword, and `[ui] editor`, `editor_line`,
-`editor_remote` and `terminal`
-are ignored. It may define an MCP server by its url, and `[web]`, but
+`[tools] shell` other than a keyword (`auto`, `sh`, `powershell`,
+`cmd`, `builtin` or `bash (builtin)`, and `bash` except on Windows),
+`[tools] shells` and `git`, a `[shell]` section that your own file has
+no header for, and
+`[ui] editor`, `editor_line`, `editor_remote` and `terminal` are
+ignored. It may define an MCP server by its url, and `[web]`, but
 cannot change a server your own file gives the `url` or `command` of,
 nor a `[web]` whose `search` or `url` your file sets. Your file may add
 to an included section instead, such as `key = file:PATH` for an

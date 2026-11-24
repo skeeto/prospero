@@ -1891,6 +1891,17 @@ static Str termrunwin(Engine *e, Arena *a, TermRunAsk *run, Shell *sh, Slice<Str
     return {};
 }
 
+// A session's terminal's shell: its own, but for bash (builtin), which
+// has no interactive mode, the one auto finds.
+static Shell termshellof(Engine *e, Arena *a, Session *s)
+{
+    if (s->te.shell.kind != SHELL_BUILTIN) {
+        return s->te.shell;
+    }
+    Str err = {};
+    return shellnamed(e, a, carve(a, 1<<20), "auto", 0, s->te.windows, &err);
+}
+
 // Start a terminal's shell, or an edit's editor, and reply with its tid,
 // before its output.
 static Str termstart(Engine *e, Arena *scratch, i64 id, Json *j, Session *s, Str sid)
@@ -1940,7 +1951,7 @@ static Str termstart(Engine *e, Arena *scratch, i64 id, Json *j, Session *s, Str
     // this process started with, as a terminal's would: not the login
     // environment a desktop-started window took (macOS), whose EDITOR
     // would start zsh in vi mode, its PATH entries doubled
-    Shell      sh    = s->te.shell;
+    Shell      sh    = termshellof(e, scratch, s);
     b32        login = !(PTY_LINUX && e->gui);
     Slice<Str> env   = login && !win ? os_launchenv(e->os, scratch) : e->env;
     Str        path  = cfgsearchpath(e->cfg, scratch, envpath(env, win), e->home, win);

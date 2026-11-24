@@ -104,6 +104,7 @@ enum : i32 {
     SEM_NOGPFAULTERRORBOX             = 0x0002,
     SEM_NOOPENFILEERRORBOX            = 0x8000,
     STARTF_USESTDHANDLES              = 0x100,
+    STARTF_FORCEOFFFEEDBACK           = 0x80,
     STD_INPUT_HANDLE                  = -10,
     STD_OUTPUT_HANDLE                 = -11,
     ATTACH_PARENT_PROCESS             = -1,
@@ -414,6 +415,15 @@ extern "C" __attribute((used)) i32 memcmp(void const *a, void const *b, uz len)
         }
     }
     return 0;
+}
+
+// For libunabashed, which takes it from its host. In asm, since GCC
+// turns a plain loop into a call to strlen, itself.
+extern "C" __attribute((used)) uz strlen(char const *s)
+{
+    uz n = (uz)-1;
+    __asm volatile ("repne scasb" : "+D"(s), "+c"(n) : "a"(0) : "memory");
+    return ~n - 1;
 }
 #endif
 
@@ -1065,6 +1075,25 @@ static Str os_getenv(Os *, Arena *a, Str name)
     }
 }
 
+static BashExe os_bash(Os *os, Arena *a)
+{
+    BashExe r = {};
+    #if PROSPERO_UNABASHED
+    r.exe     = os_exepath(os, a);
+    r.exports = 1;  // ub_exit.delta, 0.7.0 on (bashhost)
+    #else
+    (void)os;
+    (void)a;
+    #endif
+    return r;
+}
+
+static b32 os_canenter(Os *, Arena scratch, Str dir)
+{
+    if (!dir.len || hasnul(dir)) return 0;
+    return statwide(widepath(&scratch, dir).data).type == STAT_DIR;
+}
+
 static Str os_exepath(Os *, Arena *a)
 {
     for (i32 cap = 260; cap <= 1<<16; cap *= 4) {
@@ -1648,6 +1677,7 @@ struct Proc {
     u8         tail[PROC_TAILMAX];
     u8         msg[8+PROC_TAILMAX];
     u8         buf[PROC_BUFLEN];
+    uz         stopev;    // Spawn.stopevent: what a soft stop sets
 };
 
 // How tools get jobs, decided once at startup: Windows 8 and later nest
@@ -1712,6 +1742,9 @@ static void procrelease(Proc *p)
         if (p->pty) {
             CloseHandle((uz)p->stop.h[0]);
             HeapFree(GetProcessHeap(), 0, p->ring);
+        }
+        if (p->stopev) {
+            CloseHandle(p->stopev);
         }
         HeapFree(GetProcessHeap(), 0, p);
     }
@@ -1859,9 +1892,14 @@ static void procwaiter(void *arg)
     i32   code = -1;
     WaitForSingleObject(p->process, INFINITE);
     GetExitCodeProcess(p->process, &code);
+    i32 sig = 0;
+    if ((u32)code>>16 == 0xe055) {  // a signal death, as bashhost exits
+        sig  = (code & 255) - 128;
+        code = -1;
+    }
     u8 msg[8];
     put32(msg, code);
-    put32(msg+4, 0);
+    put32(msg+4, sig);
     mailpost(p->mbox, PROC_EXIT, p->id, {msg, 8}, 1);
     procrelease(p);
 }
@@ -2013,7 +2051,7 @@ static Proc *spawnproc(Os *os, Spawn *sp, Arena scratch, b32 io)
     ProcessInfo pi = {};
     StartupInfo si = {};
     si.cb     = sizeof(si);
-    si.flags  = STARTF_USESTDHANDLES;
+    si.flags  = STARTF_USESTDHANDLES | STARTF_FORCEOFFFEEDBACK;  // no busy cursor
     si.input  = ir ? ir : nul;
     si.output = pw;
     si.error  = !io ? pw : file ? file : nul;
@@ -2056,6 +2094,19 @@ static Proc *spawnproc(Os *os, Spawn *sp, Arena scratch, b32 io)
     } else if (!job) {
         joblesswarn(os);
     }
+    // Made before it runs, which opens it as it starts; none if the
+    // name is taken, so that no one else's event stops it
+    uz stopev = 0;
+    if (sp->stopevent) {
+        Buf name(&scratch, 64);
+        print(&name, "Local\\prospero-stop-");
+        print(&name, (i64)pi.pid);
+        stopev = CreateEventW(0, 1, 0, towide(&scratch, finish(&name)).data);
+        if (stopev && GetLastError()==ERROR_ALREADY_EXISTS) {
+            CloseHandle(stopev);
+            stopev = 0;
+        }
+    }
     ResumeThread(pi.thread);
     CloseHandle(pi.thread);
 
@@ -2065,10 +2116,12 @@ static Proc *spawnproc(Os *os, Spawn *sp, Arena scratch, b32 io)
         killproc(job, pi.process);
         CloseHandle(pi.process);
         closeall(mine, countof(mine));
+        if (stopev) CloseHandle(stopev);
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return 0;
     }
     p->refs     = io ? 4 : 3;
+    p->stopev   = stopev;
     p->job      = job;
     p->pid      = pi.pid;
     p->process  = pi.process;
@@ -2090,6 +2143,7 @@ static Proc *spawnproc(Os *os, Spawn *sp, Arena scratch, b32 io)
         if (io) {
             DeleteCriticalSection((CriticalSection *)p->lock.opaque);
         }
+        if (stopev) CloseHandle(stopev);
         HeapFree(heap, 0, p);
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return 0;
@@ -2232,6 +2286,8 @@ static void os_kill(Os *os, Proc *p, b32 hard)
 {
     if (hard) {
         killproc(p->job, p->process);
+    } else if (p->stopev) {
+        SetEvent(p->stopev);
     } else {
         ctrlbreak(os, p);
     }
@@ -4698,6 +4754,223 @@ static void crashtest(Os *os, Arena a, Slice<Str> args)
     }
 }
 
+// "bash (builtin)": `prospero --bash ...` (bashstate.cpp), the process
+// that runs one command in libunabashed inside the call's kill-on-close
+// job, in place of a host bash. Modeled on unabashed's tools/ubhostw.c.
+// Its programs get hidden consoles of their own, so a soft stop comes
+// as the named event the engine made for it (spawnproc), and goes on
+// to them all as SIGTERM.
+#if PROSPERO_UNABASHED
+#include "unabashed.h"
+
+W32(uz, OpenEventW(i32, b32, c16 *));
+
+struct BashRun {
+    Arena     *perm;
+    b32        ended;  // the exit hook ran
+    Str        pwd;
+    Str        cwd;
+    Slice<Str> delta;  // the run's own export changes (ub_exit.delta)
+    b32        known;  // delta was reported
+};
+
+static_assert(UB_VERSION >= 0x000700, "ub_exit.delta, linger, UB_SYSROOT");
+
+static ub_os *bashos;
+
+static Str bashcstr(char const *s)
+{
+    iz len = 0;
+    for (; s && s[len]; len++) {}
+    return s ? Str{(u8 *)s, len} : Str{};
+}
+
+static char *bashz(Arena *a, Str s)
+{
+    char *r = alloc<char>(a, s.len+1);
+    copybytes(r, s.data, s.len);
+    return r;
+}
+
+static void bashonexit(void *user, ub_exit const *e)
+{
+    BashRun *r   = (BashRun *)user;
+    Str      pwd = bashcstr(e->pwd);
+    Str      cwd = bashcstr(e->cwd);
+    iz       n   = 0;
+    iz       len = pwd.len + cwd.len + 64;
+    for (; e->delta && e->delta[n]; n++) {
+        len += bashcstr(e->delta[n]).len + (iz)sizeof(Str);
+    }
+    if (!fits(r->perm, len + (iz)sizeof(Str))) {
+        return;
+    }
+    r->pwd   = clone(r->perm, pwd);
+    r->cwd   = clone(r->perm, cwd);
+    r->known = e->delta != 0;
+    r->delta = {};
+    if (n) {
+        r->delta.data = alloc<Str>(r->perm, n);
+        r->delta.len  = r->delta.cap = n;
+        for (iz i = 0; i < n; i++) {
+            r->delta[i] = clone(r->perm, bashcstr(e->delta[i]));
+        }
+    }
+    r->ended = 1;
+}
+
+// From a console of its own, when run at a prompt: its events as the
+// group's signals. Ctrl+Break is Prospero's stop, so SIGTERM.
+static b32 __stdcall bashonctrl(u32 type)
+{
+    switch (type) {
+    case 0: ub_signal(bashos, 2  | UB_GROUP); return 1;  // CTRL_C
+    case 1: ub_signal(bashos, 15 | UB_GROUP); return 1;  // CTRL_BREAK
+    case 2:                                              // CTRL_CLOSE
+        ub_signal(bashos, 1 | UB_GROUP);
+        for (;;) Sleep(1000);
+    }
+    return 0;
+}
+
+static u32 __stdcall bashwatch(void *event)
+{
+    if (!WaitForSingleObject((uz)event, -1)) {
+        ub_signal(bashos, 15 | UB_GROUP);
+    }
+    return 0;
+}
+
+static i64 bashparent()
+{
+    typedef i32 (__stdcall *Query)(uz, i32, void *, i32, i32 *);
+    Query q = (Query)GetProcAddress(GetModuleHandleW((c16 *)u"ntdll.dll"),
+                                    (char *)"NtQueryInformationProcess");
+    uz bi[6] = {};  // PROCESS_BASIC_INFORMATION
+    return q && !q(GetCurrentProcess(), 0, bi, sizeof(bi), 0) ? (i64)bi[5] : 0;
+}
+
+[[noreturn]] static void bashhost(Os *os, Arena a, Slice<Str> args)
+{
+    #if PROSPERO_GUI
+    guiconsole(os);
+    #endif
+    BashArgs ba = bashargs(args.data, (i32)args.len, 1);
+    if (!ba.ok) {
+        os_print(os, 2, "prospero: --bash: an option needs a value\n");
+        ExitProcess(2);
+    }
+
+    // No console of its own when the engine runs it, so none to keep
+    b32 console = 0;
+    for (i32 fd = 0; fd < 3; fd++) {
+        i32 mode;
+        console |= GetConsoleMode(os->std[fd], &mode);
+    }
+    if (!console) {
+        FreeConsole();
+    }
+    for (i32 fd = 0; fd < 3; fd++) {
+        uz h = os->std[fd];
+        if (h && h!=INVALID_HANDLE_VALUE) SetHandleInformation(h, 1, 0);
+    }
+
+    Slice<Str> env   = os_environ(os, &a);
+    BashState  carry = {};
+    if (ba.carry.len) {
+        Read rd = os_read(os, &a, ba.carry, 1<<24);
+        carry = rd.err ? BashState{} : bashstatedecode(&a, rd.data);
+        if (carry.ok && carry.known) {
+            env = bashapply(&a, env, carry.exports, 1);
+        }
+    }
+    char const **envp = alloc<char const *>(&a, env.len+1);
+    for (iz i = 0; i < env.len; i++) {
+        envp[i] = bashz(&a, env[i]);
+    }
+
+    i32 nargs = (i32)args.len - ba.rest + 1;
+    char const **bargv = alloc<char const *>(&a, nargs+1);
+    bargv[0] = "bash";
+    for (i32 i = 1; i < nargs; i++) {
+        bargv[i] = bashz(&a, args[ba.rest+i-1]);
+    }
+
+    BashRun run = {};
+    run.perm = &a;
+    ub_config cfg = {};
+    cfg.user = &run;
+    cfg.exit = bashonexit;
+    cfg.root = ba.root.len ? bashz(&a, ba.root) : 0;
+    // With no tools' root, / is the system drive's, wherever a carried
+    // cd started it; no linger, since softsig is unset: a stop kills
+    cfg.flags = cfg.root ? 0 : UB_SYSROOT;
+
+    ub_cmd cmd = {};
+    cmd.argc = nargs;
+    cmd.argv = bargv;
+    cmd.env  = envp;
+    for (i32 fd = 0; fd < 3; fd++) {
+        uz h = os->std[fd];
+        cmd.std[fd] = h && h!=INVALID_HANDLE_VALUE ? (intptr_t)h : -1;
+    }
+    cmd.pid  = GetCurrentProcessId();
+    cmd.ppid = bashparent();
+
+    bashos = ub_new(&cfg);
+    if (!bashos) {
+        os_print(os, 2, "prospero: bash (builtin): cannot start\n");
+        ExitProcess(126);
+    }
+    if (console) {
+        SetConsoleCtrlHandler((uz)bashonctrl, 1);
+    }
+    Buf name(&a, 64);
+    print(&name, "Local\\prospero-stop-");
+    print(&name, (i64)GetCurrentProcessId());
+    Str16 wname = towide(&a, finish(&name));
+    uz event = OpenEventW(0x00100000, 0, wname.data);  // SYNCHRONIZE
+    if (event) {
+        CreateThread(0, 1<<16, bashwatch, (void *)event, 0, 0);
+    }
+
+    i32 status = ub_run(bashos, &cmd);
+
+    if (ba.state.len && run.ended && status>=0 && !(status & UB_SIGNALED)) {
+        BashState st = {};
+        st.pwd = run.pwd;
+        st.cwd = run.cwd;
+        if (run.known) {
+            Slice<Str> base = carry.ok && carry.known ? carry.exports : Slice<Str>{};
+            st.exports = bashmerge(&a, base, run.delta, 1);
+            st.known   = 1;
+            st.changed = run.delta.len > 0;
+        }
+        Str data = bashstateencode(&a, &st);
+        os_write(os, a, ba.state, data);
+    }
+    if (status < 0) {
+        if (status != -UB_ENOMEM) {
+            os_print(os, 2, "prospero: bash (builtin): the run failed\n");
+        }
+        ExitProcess(status==-UB_ENOMEM ? 2 : 126);
+    }
+    // One code for every signal death, as unabashed.exe's SIGEXIT
+    // (procwaiter reads it back as signal n), Ctrl+C's too
+    i32 code = status & 255;
+    ExitProcess(status & UB_SIGNALED ? (i32)(0xe0550000u | (u32)code) : code);
+}
+#else
+[[noreturn]] static void bashhost(Os *os, Arena, Slice<Str>)
+{
+    #if PROSPERO_GUI
+    guiconsole(os);
+    #endif
+    os_print(os, 2, "prospero: bash (builtin) is not in this build\n");
+    ExitProcess(126);
+}
+#endif
+
 #if PROSPERO_GUI
 // GUI builds start in the CRT, whose wWinMain (gui_win32.cpp) calls this.
 extern "C" void prospero_main()
@@ -4741,6 +5014,9 @@ void mainCRTStartup()
     iz   len = 0;
     for (; cmd[len]; len++) {}
     Slice<Str> args = splitcmdline(&a, fromwide(&a, cmd, len));
+    if (args.len>1 && args[1]=="--bash") {
+        bashhost(&os, a, args);
+    }
     crashtest(&os, a, args);
 
     if (args.len>2 && args[1]=="--tty-nap") {

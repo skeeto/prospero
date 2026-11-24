@@ -136,8 +136,17 @@ enum : i32 {
     SHELL_PWSH,     // PowerShell 7: pwsh -Command BOOT, command in PSBOOTVAR
     SHELL_PS,       // Windows PowerShell 5.1, as SHELL_PWSH
     SHELL_WSL,      // wsl.exe [-d DISTRO] --exec sh -c COMMAND
+    SHELL_BUILTIN,  // bash (builtin): PROSPERO --bash [OPTIONS] -c COMMAND
 };
-static Str const shellkinds[] = {"sh", "busybox", "cmd", "pwsh", "powershell", "wsl"};
+static Str const shellkinds[] = {"sh", "busybox", "cmd", "pwsh", "powershell", "wsl",
+                                 "builtin"};
+static Str const BUILTIN_NAME = "bash (builtin)";
+
+// Whether a name is bash (builtin)'s: builtin, or its own name.
+static b32 builtinkw(Str name)
+{
+    return name=="builtin" || name==BUILTIN_NAME;
+}
 
 // What a POSIX sh is, as the files beside it tell: only its description
 // differs.
@@ -162,7 +171,13 @@ struct Shell {
     Str desc;      // its section's description, for the agent
     Str distro;    // wsl: its section's distribution, empty for the default
     Str prelude;   // wsl: its section's PATH, set before the command
+    // bash (builtin), as builtinshell (engine.cpp) finds it
+    Str tools;     // Windows: the Unix tools' directory, on PATH; empty: none
+    Str root;      // Windows: ub_config.root, tools when theirs is an install
+    b32 exports;   // exports carry from command to command, not only cd
+    b32 win;       // it runs on Windows
 };
+
 
 // What the tools need to know about where they run.
 struct ToolEnv {
@@ -173,6 +188,7 @@ struct ToolEnv {
     b32 windows;     // path rules and the environment's case
     Str rg;          // ripgrep's absolute path, empty if not used
     Str exe;         // this executable, for the built-in search
+    BashExe bash;    // and how it runs bash (builtin)
     i64 jobtimeout;  // seconds a job may run, unless asked otherwise
     i64 jobmax;      // seconds a job may be asked to run
     b32 resume;      // a job's end starts a turn: [tools] auto_resume
@@ -401,6 +417,60 @@ static void shellintro(Buf *b, Shell *sh)
                  "native program's exit status ($LASTEXITCODE) when it has "
                  "one.");
         break;
+    case SHELL_BUILTIN:
+        print(b, "Run a command with bash (builtin), Prospero's own bash 5.3 "
+                 "(bash -c). Each command starts in the directory the last "
+                 "one ended in");
+        print(b, sh->exports
+                 ? Str(", with its exports and exported functions: other "
+                       "functions, aliases and unexported variables don't "
+                       "carry over")
+                 : Str(", but variables don't carry over"));
+        print(b, "; a directory outside your workspace starts the next one "
+                 "back in the working directory. The file tools still take "
+                 "relative paths from the working directory. Run a script "
+                 "in this shell with . x.sh; by name, a script runs under "
+                 "its #! interpreter");
+        print(b, sh->win ? Str(" (sh and bash scripts in this shell), and bash "
+                               "or sh as a command is another program, if any.")
+                         : Str(", and bash or sh as a command is the system's own."));
+        if (!sh->win) {
+            break;
+        }
+        if (!sh->tools.len) {
+            print(b, " There are no Unix tools here: no ls, grep or sed, and "
+                     "find and sort are Windows' own, so look at files with "
+                     "the file tools. It names drives as /c/x, and / is the "
+                     "root of the drive it starts on, which a cd to another "
+                     "drive changes. Give the file tools Windows paths: C:/x "
+                     "for /c/x.");
+            break;
+        }
+        print(b, " Its Unix tools are in ");
+        print(b, sh->tools);
+        switch (sh->root.len ? sh->flavor : FLAVOR_NONE) {
+        case FLAVOR_MSYS:
+            print(b, ", MSYS2's, as Git Bash has them. It names drives as "
+                     "/c/x, as they do. Give the file tools Windows paths: "
+                     "C:/x for /c/x, and for its own paths, like /tmp or ~, "
+                     "what cygpath -m prints.");
+            break;
+        case FLAVOR_CYGWIN:
+            print(b, ", Cygwin's. It names drives as /c/x, and they as "
+                     "/cygdrive/c/x. Give the file tools Windows paths: C:/x "
+                     "for /c/x, and for its own paths, like /tmp or ~, what "
+                     "cygpath -m prints.");
+            break;
+        case FLAVOR_BUSYBOX:
+            print(b, ", busybox's (w64devkit), with fewer options than GNU's. "
+                     "It names drives as /c/x. Give the file tools Windows "
+                     "paths: C:/x for /c/x.");
+            break;
+        default:
+            print(b, ". It names drives as /c/x. Give the file tools Windows "
+                     "paths: C:/x for /c/x.");
+        }
+        break;
     case SHELL_WSL:
         print(b, "Run a command in WSL, Linux under Windows, with sh -c in ");
         if (sh->distro.len) {
@@ -434,6 +504,9 @@ static void shellabout(Buf *b, Shell *sh)
 
 static b32 sameshell(Shell *a, Shell *b)
 {
+    if (a->kind==SHELL_BUILTIN || b->kind==SHELL_BUILTIN) {
+        return a->kind==b->kind && a->name==b->name;  // wherever prospero is
+    }
     return a->path==b->path && a->name==b->name;
 }
 
@@ -449,7 +522,11 @@ static Str shellnotice(Arena *a, Shell *now, Shell *pre, Shell *gone, b32 user,
         named |= sameshell(now, &listed[i]);
     }
     Buf b(a, 1024 + now->path.len + now->desc.len + gone->path.len);
-    if (gone->path.len) {
+    if (gone->path.len && gone->kind==SHELL_BUILTIN) {
+        print(&b, "Your shell, ");
+        print(&b, gone->name);
+        print(&b, ", is not in this build of Prospero, so commands run in ");
+    } else if (gone->path.len) {
         print(&b, "Your shell, ");
         print(&b, gone->name);
         print(&b, " (");
@@ -472,6 +549,10 @@ static Str shellnotice(Arena *a, Shell *now, Shell *pre, Shell *gone, b32 user,
         shellintro(&b, now);
         shellabout(&b, now);
     }
+    if (!sameshell(now, pre) && pre->kind==SHELL_BUILTIN && now->kind!=SHELL_BUILTIN) {
+        print(&b, " Each command starts in the working directory: cd "
+                  "does not carry over.");
+    }
     return finish(&b);
 }
 
@@ -482,8 +563,27 @@ static Str shelldesc(Arena *a, ToolEnv *te)
     Buf b(a, 1024);
     shellintro(&b, &te->shell);
     shellabout(&b, &te->shell);
-    print(&b, " Each command runs in the working directory, in a fresh "
-              "shell (cd does not carry over). There is no input or "
+    b32 listed = 0;
+    b32 others = 0;  // listed shells where cd does not carry
+    for (iz i = 1; i < te->shells.len; i++) {
+        listed |= te->shells[i].kind == SHELL_BUILTIN;
+        others |= te->shells[i].kind != SHELL_BUILTIN;
+    }
+    if (te->shell.kind==SHELL_BUILTIN && others) {
+        print(&b, " Each command runs in a fresh shell, in bash (builtin) "
+                  "where the last one there ended, as said, and in another "
+                  "shell in the working directory (cd does not carry over).");
+    } else if (te->shell.kind == SHELL_BUILTIN) {
+        print(&b, " Each command runs in a fresh shell, where the last one "
+                  "ended, as said.");
+    } else if (listed) {
+        print(&b, " Each command runs in the working directory, in a fresh "
+                  "shell (cd does not carry over, but in bash (builtin)).");
+    } else {
+        print(&b, " Each command runs in the working directory, in a fresh "
+                  "shell (cd does not carry over).");
+    }
+    print(&b, " There is no input or "
               "terminal: use non-interactive flags. GIT_EDITOR is true. "
               "Output is cut to "
               "its first 20 KiB and last 30 KiB, all of it saved to a file. "
@@ -3614,7 +3714,7 @@ static Slice<Str> termshell(Arena *a, Str kind, Str path, b32 win, Str distro = 
 {
     Slice<Str> r = {};
     b32 dflt = !win && kind=="sh" && (path=="/bin/sh" || basename(path)=="bash");
-    if (!path.len || dflt) {
+    if (!path.len || dflt || kind=="builtin") {
         return r;
     }
     r = push(a, r, path);
@@ -3664,6 +3764,14 @@ struct ShellCmd {
     Str        cmdline;  // Windows cmd.exe only
     Str        env;      // PowerShell: NAME=value to add to the environment
     b32        holdin;   // WSL: input held open, as Spawn.holdin
+    b32        stopevent;  // bash (builtin) on Windows, as Spawn.stopevent
+};
+
+// bash (builtin)'s part of a command line (bashstate.cpp)
+struct BuiltinRun {
+    Str exe;    // what runs --bash; empty: the shell's path
+    Str carry;  // the state file whose exports it starts with
+    Str state;  // where it leaves its own
 };
 
 // How WSL runs a command, in sh -c, the command its $1. wsl.exe ended,
@@ -3702,10 +3810,33 @@ static char const psboot[] =
 // How a shell runs a command: as a login shell (sh -l, in WSL too,
 // PowerShell with its profile, cmd with its AutoRun) only if its section
 // says so.
-static ShellCmd shellcmd(Arena *a, Shell *sh, b32 windows, Str command)
+static ShellCmd shellcmd(Arena *a, Shell *sh, b32 windows, Str command,
+                         BuiltinRun run = {})
 {
     ShellCmd r = {};
     switch (sh->kind) {
+    case SHELL_BUILTIN:
+        r.argv = push(a, r.argv, run.exe.len ? run.exe : sh->path);
+        r.argv = push(a, r.argv, Str("--bash"));
+        if (windows && sh->root.len) {
+            r.argv = push(a, r.argv, Str("--root"));
+            r.argv = push(a, r.argv, sh->root);
+        }
+        if (run.carry.len) {
+            r.argv = push(a, r.argv, Str("--carry"));
+            r.argv = push(a, r.argv, run.carry);
+        }
+        if (run.state.len) {
+            r.argv = push(a, r.argv, Str("--state"));
+            r.argv = push(a, r.argv, run.state);
+        }
+        if (sh->login) {
+            r.argv = push(a, r.argv, Str("-l"));
+        }
+        r.argv      = push(a, r.argv, Str("-c"));
+        r.argv      = push(a, r.argv, command);
+        r.stopevent = windows;
+        break;
     case SHELL_BUSYBOX:
     case SHELL_SH:
         r.argv = push(a, r.argv, sh->path);

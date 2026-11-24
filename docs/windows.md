@@ -25,6 +25,21 @@ agent which it has. `[tools] shell` picks one instead (`sh`,
 PATH, `[tools] path_prepend` included) for new sessions; a
 session keeps the shell it began with. PowerShell takes a second or more
 to start, so each command is that much slower than in busybox.
+
+`[tools] shell = builtin` picks **bash (builtin)**, the bash 5.3 built
+into `prospero.exe`, so the agent has bash with nothing installed. It
+never needs a bash.exe, but the programs its commands run are the
+machine's own: it looks for Unix tools beside `prospero.exe` (as in
+w64devkit's `bin`), then for `ls.exe` on the PATH, then for Git for
+Windows' `usr\bin` beside `git.exe`, puts them first on its PATH, and
+tells the agent which it found. For MSYS2, Git's and Cygwin's tools,
+and busybox-w32, `/` and `~` then mean what they do to those tools,
+as in Git Bash, so `/c/Users` is `C:\Users`. With no tools found, there
+is no `ls` or `grep`, and `find` and `sort` are Windows' own: the
+agent is told to use its file tools. Each command starts in the
+directory the last one ended in. A stop reaches it as an event rather
+than CTRL_BREAK.
+
 Each tool runs in a job object, so that its whole process tree dies
 with it, or with Prospero.
 

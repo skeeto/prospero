@@ -3119,6 +3119,482 @@ def shell_list(t):
     t.check("WHICH=other" in (t.host.read(job) or ""), f"the job's shell: {t.host.read(job)!r}")
 
 
+def builtinconf(t, extra=""):
+    """bash (builtin) as the session's shell, with more sections."""
+    t.host.write(t.config, t.host.read(t.config) + "[tools]\nshell = builtin\n" + extra)
+
+
+def builtinon(h):
+    """bash (builtin) in the shells reply, or the scenario is skipped."""
+    r = h.call("shells")
+    sh = next((x for x in r.get("shells", []) if x.get("name") == "bash (builtin)"), None)
+    if not sh or not sh.get("ok"):
+        raise Skip("bash (builtin) is not in this build")
+    return sh
+
+
+def bish(t, h, sid, cmd, timeout=30):
+    """A turn of one shell call, as sc_builtin_say makes of "sh: CMD"
+    (CMD a dict: the call's arguments), and that call's tool.end."""
+    done = len(h.all("turn.end", sid))
+    calls = len(h.all("tool.end", sid))
+    text = cmd if isinstance(cmd, str) else json.dumps(cmd)
+    h.send("prompt", sid=sid, text="sh: " + text)
+    h.wait(lambda e: len(h.all("turn.end", sid)) > done, timeout)
+    ends = h.all("tool.end", sid)
+    t.check(len(ends) == calls + 1, f"one call for {text!r}: {ends[calls:]}")
+    return ends[-1]
+
+
+WHERE = 'echo "PWD=$PWD"'
+
+
+def bipwd(text):
+    """The directory WHERE printed, with forward slashes, or None."""
+    m = re.search(r"^PWD=(.*)$", text, re.M)
+    return m.group(1).replace("\\", "/") if m else None
+
+
+def biat(t, text, rel):
+    """Whether WHERE ran in this directory of the work directory ("" for
+    the work directory itself); by its tail, as PWD may be logical (a
+    link of the system's temporary directory) or not."""
+    want = "/" + os.path.basename(t.work) + ("/" + rel if rel else "")
+    got = bipwd(text)
+    return got is not None and got.rstrip("/").endswith(want)
+
+
+@scenario(bound=20)
+def builtin_carry(t):
+    """bash (builtin): bash 5.3 in this executable, and a command starts
+    in the directory the last one that ended on its own left off, the
+    result saying so, with its exports and exported functions, and an
+    unset too, when the library reports them (unabashed 0.7.0 on), never
+    other variables or functions; a directory outside the workspace
+    resets to it, with a note, though its exports still carry; a command
+    killed by a signal carries nothing, and an exit code passes through."""
+    builtinconf(t)
+    h = t.headless()
+    try:
+        builtinon(h)
+    finally:
+        h.close()
+    r = t.run(timeout=60)
+    ends = [e["text"] for e in r.all("tool.end")]
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    t.check(len(ends) == 6, f"{len(ends)} shell calls: {ends}")
+    t.check("V=5.3" in ends[0], f"bash 5.3: {ends[0]!r}")
+    t.check("[the next command starts in " in ends[0] and "sub]" in ends[0],
+            f"said where: {ends[0]!r}")
+    exports = "X=1" in ends[1]
+    t.check(biat(t, ends[1], "sub"), f"carried cd: {ends[1]!r}")
+    t.check(("X=1 Y=2" if exports else "X=unset Y=unset") in ends[1], f"exports: {ends[1]!r}")
+    t.check("Z=unset" in ends[1], f"no unexported variables: {ends[1]!r}")
+    t.check("F=none" in ends[1], f"no functions: {ends[1]!r}")
+    if exports:
+        t.check("G=gee" in ends[1], f"exported functions: {ends[1]!r}")
+        t.check("X=1 Y=unset" in ends[3], f"exports after a reset, and an unset: {ends[3]!r}")
+    else:
+        t.note("exports do not carry with this library")
+    t.check("[the next command starts in the working directory: / is gone or "
+            "outside your workspace]" in ends[2], f"reset note: {ends[2]!r}")
+    t.check(biat(t, ends[3], ""), f"reset to the workspace: {ends[3]!r}")
+    t.check("143" in ends[4] or "signal" in ends[4], f"killed: {ends[4]!r}")
+    t.check(biat(t, ends[5], "") and "W=unset" in ends[5] and
+            "[exit code 3, after " in ends[5], f"nothing carried: {ends[5]!r}")
+
+
+@scenario(bound=15, posix=True)
+def builtin_login(t):
+    """bash (builtin) as a login shell ([shell NAME] program = builtin,
+    login = true): each command reads the profile anew, and what the
+    profile exports is not carried as the command's own, so a PATH it
+    prepends to, or a variable it appends to, never compounds, while
+    the command's own exports still carry."""
+    home = t.host.join(t.base, "loginhome")
+    t.host.mkdir(home)
+    t.host.write(t.host.join(home, ".bash_profile"),
+                 'export PATH="/loginbin:$PATH"\nexport LOGINS="x$LOGINS"\n')
+    t.host.write(t.config, t.host.read(t.config) +
+                 "[tools]\nshell = login\n"
+                 f"[shell login]\nprogram = builtin\nlogin = true\nenv.HOME = {home}\n")
+    h = t.headless()
+    try:
+        exports = builtinon(h).get("exports")
+    finally:
+        h.close()
+    if not exports:
+        raise Skip("exports do not carry with this library")
+    r = t.run(timeout=60)
+    ends = [e["text"] for e in r.all("tool.end")]
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    t.check(len(ends) == 3, f"{len(ends)} shell calls: {ends}")
+    if len(ends) == 3:
+        t.check("N=1 L=x A=unset" in ends[0], f"the profile read: {ends[0]!r}")
+        t.check("N=1 L=x A=1" in ends[1], f"once, its own export carried: {ends[1]!r}")
+        t.check("N=1 L=x A=1" in ends[2], f"still once: {ends[2]!r}")
+
+
+@scenario(bound=10)
+def builtin_basic(t):
+    """bash (builtin): the shells reply lists it, as a builtin, with
+    whether exports carry; the shell tool says it is bash 5.3, which
+    $BASH_VERSION bears out; an exit code passes through, and so does a
+    program's death by TERM, as bash reports it (143); a background job
+    started after a cd starts there."""
+    builtinconf(t)
+    h = t.headless()
+    try:
+        sh = builtinon(h)
+        t.check(sh.get("kind") == "builtin" and isinstance(sh.get("exports"), bool),
+                f"listed: {sh}")
+        names = [x.get("name") for x in h.call("shells").get("shells", [])]
+        t.check(names.count("bash (builtin)") == 1, f"listed once: {names}")
+    finally:
+        h.close()
+    r = t.run(timeout=60)
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    ends = [e["text"] for e in r.all("tool.end")]
+    t.check(len(ends) == 4, f"{len(ends)} shell calls: {ends}")
+    desc = (tooldef(t.requests()[0]["body"], "shell") or {}).get("description", "")
+    t.check("Run a command with bash (builtin), Prospero's own bash 5.3" in desc,
+            f"described: {desc[:200]!r}")
+    t.check("V=5.3" in ends[0] and "[exit code 3, after " in ends[0], f"bash 5.3: {ends[0]!r}")
+    if t.host.windows:
+        # busybox-w32's kill ends its own shell with 0, as it does alone
+        t.check("[exit code " in ends[1], f"TERM: {ends[1]!r}")
+    else:
+        t.check("[exit code 143, after " in ends[1], f"TERM: {ends[1]!r}")
+    t.check("[the next command starts in " in ends[2], f"the cd: {ends[2]!r}")
+    job = t.host.join(t.work, "sub", "job.txt")
+    for _ in range(50):
+        if t.host.read(job):
+            break
+        time.sleep(0.1)
+    t.check(biat(t, t.host.read(job) or "", "sub"), f"the job in sub: {t.host.read(job)!r}")
+
+
+@scenario(conf={"_tools": {"auto_resume": 0}}, bound=20)
+def builtin_nocarry(t):
+    """bash (builtin): a command that did not end on its own carries
+    nothing, the directory staying where the last one left it: one the
+    user stopped, one moved to a job at its timeout, and one dead of
+    TERM or ABRT. ABRT, a core-dumping signal, reads as exit code 134 on
+    POSIX, as the host exits 128+n rather than dump core."""
+    builtinconf(t)
+    t.host.mkdir(t.host.join(t.work, "sub", "deep"))
+    h = t.headless()
+    try:
+        builtinon(h)
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        bish(t, h, sid, "cd sub")
+        t.check(biat(t, bish(t, h, sid, WHERE)["text"], "sub"), "carried to sub")
+
+        # Stopped by the user
+        done = len(h.all("turn.end", sid))
+        calls = len(h.all("tool.start", sid))
+        h.send("prompt", sid=sid, text="sh: " + json.dumps(
+            {"command": "cd deep; echo $$ > stoppid; echo started; sleep 30", "timeout": 60}))
+        h.wait(lambda e: len(h.all("tool.start", sid)) > calls)
+        start = h.all("tool.start", sid)[-1]
+        t.check(waitpids(t, "sub/deep/stoppid"), "the command started")
+        r = h.call("call.stop", sid=sid, call=start["call"])
+        t.check(r.get("ok") == 1, f"stopped: {r}")
+        h.wait(lambda e: len(h.all("turn.end", sid)) > done)
+        t.check(h.all("tool.end", sid)[-1]["status"] == "stopped", "its status")
+        end = bish(t, h, sid, WHERE)
+        t.check(biat(t, end["text"], "sub"), f"after the stop: {end['text']!r}")
+
+        # Timed out: a job, which never changes the carry
+        end = bish(t, h, sid, {"command": "cd deep; sleep 2", "timeout": 1})
+        t.check(end["status"] == "background", f"a job: {end}")
+        h.wait(lambda e: e.get("ev") == "job.end" and e.get("sid") == sid, 10)
+        end = bish(t, h, sid, WHERE)
+        t.check(biat(t, end["text"], "sub"), f"after the timeout: {end['text']!r}")
+
+        # Dead of a signal
+        end = bish(t, h, sid, "cd deep; kill -TERM $$")
+        t.check("[killed by signal 15" in end["text"] or "[exit code 143" in end["text"],
+                f"TERM: {end['text']!r}")
+        end = bish(t, h, sid, WHERE)
+        t.check(biat(t, end["text"], "sub"), f"after TERM: {end['text']!r}")
+        end = bish(t, h, sid, "cd deep; kill -ABRT $$")
+        if t.host.windows:
+            t.check("[killed by signal 6" in end["text"], f"ABRT: {end['text']!r}")
+        else:
+            t.check("[exit code 134, after " in end["text"], f"ABRT: {end['text']!r}")
+        end = bish(t, h, sid, WHERE)
+        t.check(biat(t, end["text"], "sub"), f"after ABRT: {end['text']!r}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+    if isinstance(t.host, LocalHost):
+        cores = [os.path.join(d, f) for d, _, fs in os.walk(t.work) for f in fs
+                 if f == "core" or f.startswith("core.")]
+        t.check(not cores, f"no core files: {cores}")
+
+
+@scenario(conf={"_tools": {"auto_resume": 0}}, bound=20)
+def builtin_carry_reset(t):
+    """bash (builtin): a carried directory that is gone, or (POSIX) can't
+    be entered, starts the next command back in the working directory,
+    whose result says why; a cd out of the workspace does the same at
+    once. A reset at the start of a call that then timed out, as a job,
+    is in its tool.end record, so a cut after it and a reopen keep it,
+    though the directory is back by then."""
+    builtinconf(t)
+    reset = "[this command started in the working directory: where the last one ended, "
+    h = t.headless()
+    try:
+        builtinon(h)
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        end = bish(t, h, sid, "mkdir -p sub; cd sub")
+        t.check("[the next command starts in " in end["text"], f"carried: {end['text']!r}")
+        rmtree(t, t.host.join(t.work, "sub"))
+        end = bish(t, h, sid, WHERE)
+        t.check(biat(t, end["text"], "") and reset in end["text"] and
+                "sub is gone or outside your workspace]" in end["text"],
+                f"removed: {end['text']!r}")
+
+        end = bish(t, h, sid, "cd /")
+        t.check("[the next command starts in the working directory: / is gone or "
+                "outside your workspace]" in end["text"], f"out of it: {end['text']!r}")
+        t.check(biat(t, bish(t, h, sid, WHERE)["text"], ""), "back in the workspace")
+
+        if not t.host.windows:
+            locked = t.host.join(t.work, "locked")
+            bish(t, h, sid, "mkdir -p locked; cd locked")
+            os.chmod(locked, 0)
+            try:
+                end = bish(t, h, sid, WHERE)
+            finally:
+                os.chmod(locked, 0o755)
+            t.check(biat(t, end["text"], "") and reset in end["text"] and
+                    "locked is gone or outside your workspace]" in end["text"],
+                    f"can't be entered: {end['text']!r}")
+
+        # The reset on a call that times out
+        bish(t, h, sid, "mkdir -p sub; cd sub")
+        rmtree(t, t.host.join(t.work, "sub"))
+        end = bish(t, h, sid, {"command": "sleep 2", "timeout": 1})
+        t.check(end["status"] == "background", f"a job: {end}")
+        h.wait(lambda e: e.get("ev") == "job.end" and e.get("sid") == sid, 10)
+        recs = [x for x in logged(t, sid) if x.get("ev") == "tool.end"]
+        t.check(recs[-1].get("shell_cwd") == "", f"recorded: {recs[-1]}")
+        t.host.mkdir(t.host.join(t.work, "sub"))
+        t.check(biat(t, bish(t, h, sid, WHERE)["text"], ""), "the reset kept")
+        turn = h.all("turn.end", sid)[-1]["turn"]
+        r = h.call("cut", sid=sid, turn=turn)
+        t.check(r.get("ok") == 1, f"cut: {r}")
+        t.check(biat(t, bish(t, h, sid, WHERE)["text"], ""), "after the cut")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+    h = t.headless()
+    try:
+        t.check(h.call("open", sid=sid).get("ok") == 1, "reopened")
+        end = bish(t, h, sid, WHERE)
+        t.check(biat(t, end["text"], ""), f"after the reopen: {end['text']!r}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=15)
+def builtin_rewind(t):
+    """bash (builtin): a cut back past the turn of a cd undoes it, as the
+    carry is replayed from the log; uncut brings it back; and a session
+    opened again starts where its log says."""
+    builtinconf(t)
+    t.host.mkdir(t.host.join(t.work, "sub"))
+    h = t.headless()
+    try:
+        builtinon(h)
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        t.check(biat(t, bish(t, h, sid, WHERE)["text"], ""), "the workspace first")
+        bish(t, h, sid, "cd sub")
+        t.check(biat(t, bish(t, h, sid, WHERE)["text"], "sub"), "carried to sub")
+        r = h.call("cut", sid=sid, turn=2)
+        t.check(r.get("ok") == 1, f"cut: {r}")
+        r = h.call("uncut", sid=sid)
+        t.check(r.get("ok") == 1, f"uncut: {r}")
+        t.check(biat(t, bish(t, h, sid, WHERE)["text"], "sub"), "back after uncut")
+        r = h.call("cut", sid=sid, turn=2)
+        t.check(r.get("ok") == 1, f"cut again: {r}")
+        end = bish(t, h, sid, WHERE)
+        t.check(biat(t, end["text"], ""), f"undone: {end['text']!r}")
+        bish(t, h, sid, "cd sub")
+        turn = h.all("turn.end", sid)[-1]["turn"]
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+    h = t.headless()
+    try:
+        t.check(h.call("open", sid=sid).get("ok") == 1, "reopened")
+        end = bish(t, h, sid, WHERE)
+        t.check(biat(t, end["text"], "sub"), f"after the reopen: {end['text']!r}")
+        r = h.call("cut", sid=sid, turn=turn)
+        t.check(r.get("ok") == 1, f"cut after the reopen: {r}")
+        end = bish(t, h, sid, WHERE)
+        t.check(biat(t, end["text"], ""), f"undone after the reopen: {end['text']!r}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=15)
+def builtin_switch(t):
+    """bash (builtin): a switch to another shell drops the carried
+    directory, the notice saying cd no longer carries, and a switch back
+    starts fresh, the notice pointing to the shell tool, whose
+    description says that cd carries."""
+    builtinconf(t, "[shell other]\nprogram = sh\nenv.WHICH = other\n")
+    t.host.mkdir(t.host.join(t.work, "sub"))
+
+    def told(sid):
+        return [x.get("text", "") for x in logged(t, sid)
+                if x.get("ev") == "notice" and x.get("kind") == "shell"]
+
+    show = 'echo "PWD=$PWD"; echo "WHICH=${WHICH-builtin}"'
+    h = t.headless()
+    try:
+        builtinon(h)
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        bish(t, h, sid, "cd sub")
+        t.check(biat(t, bish(t, h, sid, show)["text"], "sub"), "carried to sub")
+        r = h.call("shell", sid=sid, shell="other")
+        t.check(r.get("ok") == 1, f"to other: {r}")
+        end = bish(t, h, sid, show)
+        t.check("WHICH=other" in end["text"] and biat(t, end["text"], ""),
+                f"in other: {end['text']!r}")
+        n = told(sid)
+        t.check(len(n) == 1 and "Each command starts in the working directory: cd does "
+                "not carry over." in n[0], f"the notice: {n}")
+        r = h.call("shell", sid=sid, shell="bash (builtin)")
+        t.check(r.get("ok") == 1, f"back: {r}")
+        end = bish(t, h, sid, show)
+        t.check("WHICH=builtin" in end["text"] and biat(t, end["text"], ""),
+                f"fresh: {end['text']!r}")
+        n = told(sid)
+        t.check(len(n) == 2 and "the one the shell tool names, from now on" in n[1],
+                f"the notice back: {n[-1:]}")
+        desc = (tooldef(t.requests()[-1]["body"], "shell") or {}).get("description", "")
+        t.check("Each command starts in the directory the last one ended in" in desc,
+                f"which says that cd carries: {desc[:200]!r}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=40)
+def builtin_fork(t):
+    """bash (builtin): a fork keeps the carried directory; a fork into
+    another folder starts in that folder, with no reset note, as the
+    carry is dropped rather than found outside; a side chat in a
+    worktree (with git) starts at the same subdirectory of the
+    worktree."""
+    git = shutil.which("git") and isinstance(t.host, LocalHost)
+    env = gitrepo(t) if git else None
+    if not git:
+        t.host.mkdir(t.host.join(t.work, "src"))
+        t.note("no git here: the worktree side chat is left out")
+    builtinconf(t)
+    ext = t.host.join(t.base, "ext")
+    t.host.mkdir(ext)
+    hostenv = {k: env[k] for k in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM")} if git else None
+    h = t.headless(env=hostenv)
+    try:
+        builtinon(h)
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        bish(t, h, sid, "cd src")
+        t.check(biat(t, bish(t, h, sid, WHERE)["text"], "src"), "carried to src")
+
+        r = h.call("fork", sid=sid)
+        t.check(r.get("ok") == 1, f"fork: {r}")
+        h.call("open", sid=r["sid"])
+        end = bish(t, h, r["sid"], WHERE)
+        t.check(biat(t, end["text"], "src"), f"the fork: {end['text']!r}")
+
+        r = h.call("fork", sid=sid, cwd=ext)
+        t.check(r.get("ok") == 1, f"fork into ext: {r}")
+        h.call("open", sid=r["sid"])
+        end = bish(t, h, r["sid"], WHERE)
+        got = bipwd(end["text"]) or ""
+        t.check(got.rstrip("/").endswith("/ext") and "is gone or outside" not in end["text"],
+                f"the fork into ext: {end['text']!r}")
+
+        if git:
+            r = h.call("fork", sid=sid, side=1, worktree={"name": "side-bi"})
+            t.check(r.get("ok") == 1, f"side chat: {r}")
+            path = r["worktree"]["path"]
+            h.wait(lambda e: e.get("ev") == "worktree" and e.get("path") == path, 60)
+            h.call("open", sid=r["sid"])
+            end = bish(t, h, r["sid"], WHERE)
+            got = (bipwd(end["text"]) or "").rstrip("/")
+            want = "/.prospero/worktrees/side-bi/src"
+            t.check(got.endswith(want) and "is gone or outside" not in end["text"],
+                    f"the side chat: {end['text']!r}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf={"_tools": {"stop_grace": 2}}, bound=15, posix=True)
+def builtin_stop(t):
+    """bash (builtin): cancelling a command asks it to stop, which ends it
+    and the programs it started long before the kill would; programs
+    that ignore TERM, or take a while to clean up on it, are gone by the
+    end of the grace period. The host gives them a second (unabashed's
+    linger) after the TERM before its teardown kills them, so a TERM
+    handler that takes half a second finishes."""
+    builtinconf(t)
+    t.put("ignore.sh", "trap '' TERM\necho $$ >> gracepids\nwhile :; do sleep 0.1; done\n")
+    t.put("clean.sh", "trap 'sleep 0.5; echo cleaned > cleaned; exit 0' TERM\n"
+                      "echo $$ >> gracepids\nwhile :; do sleep 0.1; done\n")
+    h = t.headless()
+    left = []
+    try:
+        builtinon(h)
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        cmd = ("echo $$ >> softpids; sleep 30 & echo $! >> softpids; "
+               "sh -c 'echo $$ >> softpids; sleep 30' & wait")
+        h.send("prompt", sid=sid, text="sh: " + json.dumps({"command": cmd, "timeout": 60}))
+        h.wait(lambda e: e.get("ev") == "tool.start" and e.get("sid") == sid)
+        pids = waitpids(t, "softpids", 3)
+        left = pids
+        t.check(len(pids) == 3, f"started: {pids}")
+        time.sleep(0.3)
+        t0 = time.monotonic()
+        h.call("cancel", sid=sid)
+        end = ended(h, sid, 1)
+        t.check(end["why"] == "cancel", f"cancelled: {end}")
+        t.check(t.gone(pids, within=1.5), f"gone before the kill: {pids}")
+        dt = time.monotonic() - t0
+        t.check(dt < 1.8, f"by the soft stop: {dt:.1f} s")
+
+        cmd = "sh ignore.sh & sh clean.sh & wait"
+        h.send("prompt", sid=sid, text="sh: " + json.dumps({"command": cmd, "timeout": 60}))
+        h.wait(lambda e: len(h.all("tool.start", sid)) == 2)
+        pids = waitpids(t, "gracepids", 2)
+        left = pids
+        t.check(len(pids) == 2, f"started: {pids}")
+        time.sleep(0.3)
+        t0 = time.monotonic()
+        h.call("cancel", sid=sid)
+        t.check(t.gone(pids, within=5.0), f"gone by the grace: {pids}")
+        dt = time.monotonic() - t0
+        t.check(dt < 4.5, f"by the end of the grace: {dt:.1f} s")
+        t.check(dt >= 0.5, f"given time before the kill: {dt:.1f} s")
+        t.check(t.file("cleaned") is not None, "a TERM handler had time to clean up")
+        left = []
+    finally:
+        rc = h.close()
+        for p in left:
+            if t.host.alive(p):
+                t.host.killpid(p)
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 def skillput(t, parent, name, text):
     d = t.host.join(parent, name)
     t.host.mkdir(d)
@@ -9420,6 +9896,35 @@ def compact_shell(t):
     again = t.requests()[-1]["body"]
     t.check(again["tools"] == last["tools"], "the same tools, replayed")
     t.check(not toldafter(sid), f"not told after opening: {toldafter(sid)}")
+
+
+@scenario(conf=BIG, bound=25, alone=True)
+def builtin_compact(t):
+    """bash (builtin): after a compaction, which may have summarized away
+    the cd, the agent is told where the next command starts."""
+    builtinconf(t)
+    t.host.mkdir(t.host.join(t.work, "sub"))
+    bigfiles(t, 8, 256)
+    h = t.headless()
+    try:
+        builtinon(h)
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        bish(t, h, sid, "cd sub")
+        h.send("prompt", sid=sid, text="read them")
+        ended(h, sid, 2)
+        t.check(h.call("compact", sid=sid).get("ok") == 1, "compact")
+        ended(h, sid, 3)
+        h.send("prompt", sid=sid, text="after")
+        ended(h, sid, 4)
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+    msgs = chat(t.requests()[-1])
+    t.check(checkpointed(msgs), "summarized")
+    told = [str(m.get("content")) for m in msgs if m.get("role") == "user" and
+            str(m.get("content")).startswith("In bash (builtin), the next command starts in ")]
+    t.check(len(told) == 1 and "/sub, where the last one that ended on its own left off." in
+            told[0].replace("\\", "/"), f"told where: {told}")
 
 
 @scenario(conf=BIG, bound=25, alone=True)

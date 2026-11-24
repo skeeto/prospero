@@ -1190,8 +1190,17 @@ static void evalfail(Eval *ev, Arena scratch, EvalRun *run, Str error)
 static b32 evalspawn(Eval *ev, Arena scratch, EvalRun *run, Str command, Str log)
 {
     EvalTask  *t   = run->task;
-    ShellCmd   sc  = shellcmd(&scratch, &ev->te.shell, ev->te.windows, command);
+    BuiltinRun br  = {};
+    br.exe = ev->te.bash.exe;
+    ShellCmd   sc  = shellcmd(&scratch, &ev->te.shell, ev->te.windows, command, br);
     Slice<Str> env = shellenv(&scratch, ev->env, ev->te.windows, ev->secrets);
+    if (ev->te.shell.kind==SHELL_BUILTIN && ev->te.shell.tools.len) {
+        // its Unix tools first, as shellover puts them
+        b32 win  = ev->te.windows;
+        Str path = concat(&scratch, ev->te.shell.tools, win ? Str(";") : Str(":"));
+        path = concat(&scratch, path, envget(env, "PATH", win));
+        env  = envsetpath(&scratch, env, path, win);
+    }
     if (sc.env.len) {
         env = push(&scratch, env, sc.env);
     }
@@ -1200,6 +1209,7 @@ static b32 evalspawn(Eval *ev, Arena scratch, EvalRun *run, Str command, Str log
     Spawn sp = {};
     sp.argv     = sc.argv;
     sp.cmdline  = sc.cmdline;
+    sp.stopevent = sc.stopevent;
     sp.cwd      = run->work;
     sp.env      = env;
     sp.outpath  = join(&scratch, run->base, log);

@@ -1580,6 +1580,46 @@ static Str copyremapped(Arena *a, Arena scratch, EvRec *rec, CopyWt *wt, Str to,
     return any ? finish(&b) : Str{};
 }
 
+// A tool result carrying bash (builtin)'s cd and exports (shell_cwd,
+// shell_pwd, shell_env) as a fork has it, anew, else null if it carries
+// none. No fork keeps the logical directory, which names the original's
+// folder by its links; the native one stands in. A worktree's (wt) has
+// the directory in its own checkout, or as it was if outside, and no
+// exports, which often name the old checkout (VIRTUAL_ENV, PATH). One
+// into another folder (moved) keeps neither.
+static Str copycarry(Arena *a, Arena scratch, EvRec *rec, CopyWt *wt, b32 moved,
+                     Str to, b32 win)
+{
+    b32 any = 0;
+    for (Json *m = rec->root->child; rec->ev==EV_TOOLEND && m; m = m->next) {
+        any |= m->key=="shell_cwd" || m->key=="shell_pwd" || m->key=="shell_env";
+    }
+    if (!any) {
+        return {};
+    }
+    Buf     b(a, 1024);
+    JsonOut w = {&b};
+    putobject(&w);
+    putstrkey(&w, "sid", to);
+    for (Json *m = rec->root->child; m; m = m->next) {
+        if (m->key=="sid" || m->key=="shell_pwd" ||
+                (wt && m->key=="shell_env") || (moved && m->key=="shell_cwd")) {
+            continue;
+        }
+        putkey(&w, m->key);
+        Str re = wt && m->key=="shell_cwd" && m->type==JSON_STRING && m->str.len
+                 ? copyremap(&scratch, m->str, wt->src, wt->path, win) : Str{};
+        if (re.len) {
+            putstr(&w, re);
+        } else {
+            putjson(&w, m);
+        }
+    }
+    putend(&w);
+    putbyte(&b, '\n');
+    return finish(&b);
+}
+
 // Whether a fork into another folder leaves out a record: its prefix,
 // instructions, memory and snapshots, and grants, revokes and denies of
 // paths in the old folder (wt->src, or wt->alt).
@@ -1913,6 +1953,8 @@ static LogCopy logcopy(Arena *a, Arena scratch, Slice<Str> lines, Str from,
             line = evend(&w);
         } else if (moved && movedrops(t, &rec, wt, win)) {
             continue;  // of the old folder
+        } else if ((re = copycarry(&t, carve(&t, 1<<16), &rec, wt, moved, to, win)).len) {
+            line = re;  // bash (builtin)'s carried cd, as the fork has it
         } else if (wt && !moved &&
                    (re = copyremapped(&t, carve(&t, 1<<16), &rec, wt, to, win)).len) {
             line = re;  // its paths in the original's checkout, in the worktree's
@@ -2126,7 +2168,7 @@ static b32 importdrops(i32 ev, Str key)
     return key=="spill" || key=="bytes" || key=="image" || key=="images" ||
            key=="width" || key=="height" || key=="shot" || key=="pdf" ||
            key=="pages" || key=="child" || key=="host" || key=="job" ||
-           key=="to";
+           key=="to" || key=="shell_cwd" || key=="shell_pwd" || key=="shell_env";
 }
 
 // A tool result, notice or user record without the fields an import
