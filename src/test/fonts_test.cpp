@@ -137,4 +137,16 @@ static void test_fonts(Test *t)
     // Roboto's hhea: 1900 above, 500 below, 2048 units per em
     expect(t, "fonts.lineems", istr(&a, (i64)(fontlineems(rob, 0)*1000 + 0.5f)), "1172");
     expect(t, "fonts.lineems.ttc", istr(&a, fontlineems(ttc, 16)==fontlineems(rob, 0)), "1");
+
+    // Bold prose is Roboto Bold, of Medium's build: the same metrics, so
+    // the face lines up with prose and sizes alike, and the same
+    // characters, so fontprose, which reads Medium, holds for bold too
+    Str bold = fontbold();
+    expect(t, "fonts.bold.psname", fontpsname(&a, bold, 0), "Roboto-Bold");
+    expect(t, "fonts.bold.lineems", istr(&a, fontlineems(bold, 0)==fontlineems(rob, 0)), "1");
+    i32 differ = 0;
+    for (i32 cp = 0x20; cp < 0x10000; cp++) {
+        differ += fontcovers(bold, cp) != fontcovers(rob, cp);
+    }
+    expect(t, "fonts.bold.covers", istr(&a, differ), "0");
 }

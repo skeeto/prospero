@@ -31342,9 +31342,15 @@ static void addemoji(i32 flags)
     ImGui::GetIO().Fonts->AddFontFromMemoryTTF((void *)data.data, (i32)data.len, 15, &cfg);
 }
 
+// A face's first font gets the flags less what its file already is
+// (Roboto Bold, not Medium made bold), its fallbacks all of them.
 static ImFont *addface(Str data, i32 flags)
 {
-    ImFont *f = addfont(data, flags, 0);
+    i32 own = flags;
+    if (data.data == fontbold().data) {
+        own &= ~ImGuiFreeTypeLoaderFlags_Bold;
+    }
+    ImFont *f = addfont(data, own, 0);
     if (data.data != fontmono().data) {
         addfont(fontmono(), flags, 1);
     }
@@ -31406,9 +31412,9 @@ static void loadfonts(Gui *g)
     i32 italic = ImGuiFreeTypeLoaderFlags_Oblique;
     Fonts *f = &g->fonts;
     f->prose      = addface(fontroboto(), 0);
-    f->bold       = addface(fontroboto(), bold);
+    f->bold       = addface(fontbold(), bold);
     f->italic     = addface(fontroboto(), italic);
-    f->bolditalic = addface(fontroboto(), bold|italic);
+    f->bolditalic = addface(fontbold(), bold|italic);
     f->mono       = addface(fontmono(), 0);
     f->monobold   = addface(fontmono(), bold);
     f->size       = FONT_BASE;

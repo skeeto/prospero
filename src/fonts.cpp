@@ -1,6 +1,8 @@
 // The GUI's embedded fonts, and which characters they have
 //
-// Prose is Roboto Medium, code JetBrains Mono. Roboto lacks most of the
+// Prose is Roboto Medium, bold prose Roboto Bold (a real face: FreeType's
+// synthetic bold, a fraction of a pixel wider, blurred at 1x), code
+// JetBrains Mono, its bold synthetic. Roboto lacks most of the
 // symbols models write in prose (arrows, check marks, box drawing), so
 // each Roboto face falls back on JetBrains Mono, and both on small
 // subsets of Noto Sans Symbols 2 and Noto Sans Math for what neither has
@@ -33,6 +35,9 @@
 static u8 const robotottf[] = {
     #embed "../assets/Roboto-Medium.ttf"
 };
+static u8 const robotoboldttf[] = {
+    #embed "../assets/Roboto-Bold.ttf"
+};
 static u8 const monottf[] = {
     #embed "../assets/JetBrainsMono-Regular.ttf"
 };
@@ -55,6 +60,7 @@ static u8 const emojittf[] = {
 // Prose's fallbacks after Roboto, in order: JetBrains Mono, then the
 // symbol subsets, which are also code's fallbacks.
 static Str fontroboto()  { return {(u8 *)robotottf, countof(robotottf)}; }
+static Str fontbold()    { return {(u8 *)robotoboldttf, countof(robotoboldttf)}; }
 static Str fontmono()    { return {(u8 *)monottf, countof(monottf)}; }
 static Str fontsymbols() { return {(u8 *)symbolsttf, countof(symbolsttf)}; }
 static Str fontmath()    { return {(u8 *)mathttf, countof(mathttf)}; }

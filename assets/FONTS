@@ -7,6 +7,18 @@ Roboto-Medium.ttf
     Apache License, Version 2.0
     https://github.com/googlefonts/roboto-2
 
+Roboto-Bold.ttf
+    Roboto Bold, version 2.001150 (2014), Roboto Medium's sibling of the
+    same build (same metrics and characters), unchanged from google/fonts'
+    first commit, 90abd17b4f97, at apache/roboto/Roboto-Bold.ttf (whose
+    Roboto-Medium.ttf is byte for byte the one above): bold prose, drawn
+    rather than synthesized from Medium, which blurred at 1x.
+    Copyright 2011 Google Inc. All Rights Reserved.
+    Apache License, Version 2.0
+    https://github.com/google/fonts
+    SHA-256 ef2ab0e402d5cb9de893e263a2c44e57f57fec3974b0d981bfe84dec3dae83a1
+            Roboto-Bold.ttf
+
 JetBrainsMono-Regular.ttf
     JetBrains Mono Regular
     Copyright 2020 The JetBrains Mono Project Authors
