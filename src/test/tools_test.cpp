@@ -1126,9 +1126,10 @@ static void test_tools(Test *t)
         expect(t, "ask detail", istr(a, find(questiondetail(a, q.questions), "Which?")>=0 &&
                find(questiondetail(a, q.questions), "Allow takes the recommended")>=0), "1");
 
-        // Offered only by the engine: no tool list names it
+        // Never with "*" or "default", only by name
         expect(t, "ask in no list", istr(a, (tooldeny("*") & TOOL_ASKMASK) != 0 &&
-               toolbits("ask_user")==0), "1");
+               (tooldeny("default") & TOOL_ASKMASK) != 0 &&
+               (tooldeny("read ask_user") & TOOL_ASKMASK) == 0), "1");
         ToolEnv qe = {};
         qe.deny = TOOL_OFFMASK;
         Str with = systemprompt(a, "/w", &qe);

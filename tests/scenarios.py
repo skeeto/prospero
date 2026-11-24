@@ -5569,6 +5569,8 @@ tools = * -shell, -job_kill
 tools = read -bogus
 [role planner]
 tools = default exit_plan_mode
+[role asker]
+tools = read ask_user
 """
 
 
@@ -5578,13 +5580,15 @@ def role_words(t):
     of a role that names none, and -NAME takes one away. config.get lists
     the roles, built-in ones first, with the tools each gives, and a new
     session takes one. Plan mode's tools come only by name, and then the
-    session may plan."""
+    session may plan; ask_user too, and then an attended session may ask
+    questions."""
     h = t.headless(env=deskenv(t))
     try:
         h.call("hello", proto=0, client="scenarios")
         cfg = h.call("config.get")
         roles = {r["name"]: r for r in cfg.get("roles", [])}
-        t.check(list(roles) == ["explore", "general", "every", "gui", "lean", "odd", "planner"],
+        t.check(list(roles) == ["explore", "general", "every", "gui", "lean", "odd", "planner",
+                                "asker"],
                 f"roles {list(roles)}")
         default = ["read", "write", "edit", "shell", "grep", "glob", "todo_write", "jobs",
                    "job_output", "job_kill", "task", "skill", "sessions", "send_message",
@@ -5600,10 +5604,11 @@ def role_words(t):
         t.check(roles["odd"]["tools"] == ["read"], f"read -bogus {roles['odd']}")
         t.check(roles["planner"]["tools"] == default[:12] + ["exit_plan_mode"] + default[12:],
                 f"default exit_plan_mode {roles['planner']}")
+        t.check(roles["asker"]["tools"] == ["read", "ask_user"], f"read ask_user {roles['asker']}")
         diags = [d["message"] for d in cfg.get("diags", [])]
         t.check(any('unknown value "-bogus"' in d for d in diags) and
-                not any("-shell" in d or "-job_kill" in d or '"exit_plan_mode",' in d for d in diags),
-                f"diags {diags}")
+                not any("-shell" in d or "-job_kill" in d or '"exit_plan_mode",' in d or
+                        '"ask_user",' in d for d in diags), f"diags {diags}")
 
         r = h.call("new", cwd=t.work, model=t.model, endpoint="fake", role="every", plan=1)
         t.check(r.get("ok") == 0 and "exit_plan_mode" in r.get("err", ""),
@@ -5613,6 +5618,19 @@ def role_words(t):
         rec = h.all("session", r["sid"])[0]
         t.check("exit_plan_mode" in rec["tools"] and "enter_plan_mode" not in rec["tools"],
                 f"planner's session {rec}")
+        # Questions: attended, only in a role that names ask_user
+        asks = {}
+        for role, attended in [("planner", 1), ("asker", 1), ("asker", 0)]:
+            sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", role=role,
+                         attended=attended)["sid"]
+            asks[role, attended] = h.all("session", sid)[0].get("questions", 0)
+        t.check(asks == {("planner", 1): 0, ("asker", 1): 1, ("asker", 0): 0},
+                f"questions {asks}")
+        r = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1,
+                   tools="read ask_user")
+        rec = h.all("session", r["sid"])[0]
+        t.check(rec.get("questions") == 1 and rec.get("tools") == ["read"],
+                f"a tool list naming ask_user {r} {rec}")
 
         r = h.call("new", cwd=t.work, model=t.model, endpoint="fake", role="gui")
         t.check("sid" in r, f"new {r}")
@@ -13349,8 +13367,8 @@ def question_switch(t):
 @scenario(bound=20)
 def question_offered(t):
     """Only sessions of the user's own, attended as they begin, with every
-    tool: never a role's, a tools list's, an unattended new's or a run's,
-    and never named in a tools list. Plan mode has it."""
+    tool, or a role or tools list that names it: never one that does
+    not, an unattended new's or a run's. Plan mode has it."""
     h = t.headless()
     try:
         def tools_of(prompt="Ask me.", **new):
@@ -13375,9 +13393,18 @@ def question_offered(t):
         t.check("ask_user" in names and "ask with ask_user before you write the plan" in
                 t.requests()[-1]["body"]["messages"][-2]["content"] + json.dumps(
                     t.requests()[-1]["body"]["messages"]), f"plan mode {names}")
-        r = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1,
-                   tools="read ask_user")
-        t.check(r.get("ok") == 0 and "ask_user" in r.get("err", ""), f"never named: {r}")
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1,
+                     tools="read ask_user")["sid"]
+        n = len(t.requests())
+        h.send("prompt", sid=sid, text="Ask me.")
+        ask = h.wait(lambda e: e.get("ev") == "ask" and e.get("sid") == sid)
+        names = fake_provider.tool_names(t.requests()[n]["body"])
+        t.check(names == ["read", "ask_user"] and ask.get("tool") == "ask_user",
+                f"named {names} {ask}")
+        h.call("answer", sid=sid, req=ask["req"], decision="deny")
+        ended(h, sid, 1)
+        sid, names, _ = tools_of(tools="read ask_user")
+        t.check(names == ["read"], f"named, unattended {names}")
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")

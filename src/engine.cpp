@@ -18677,7 +18677,7 @@ static void logsession(Session *s, Arena scratch)
             putstrkey(&w.json, "relay", s->rrelay);
         }
     }
-    // Plan mode's tools go without saying: never a role's. Memory's, by
+    // Plan mode's tools go without saying: a role's only by name. Memory's, by
     // the memory record; questions to the user, by questions. The web's
     // are listed when offered, so that a session from before them
     // replays without them.
@@ -18864,7 +18864,7 @@ static void putroles(Engine *e, JsonOut *w)
         putkey(w, "tools");
         putarray(w);
         for (i32 t = 0; t < TOOL_COUNT; t++) {
-            if (!(r.deny>>t & 1) && !((u32)TOOL_ASKMASK>>t & 1)) {
+            if (!(r.deny>>t & 1)) {
                 putstr(w, toolnames[t]);
             }
         }
@@ -18894,7 +18894,7 @@ static void taskroles(Engine *e, Arena *perm, Arena scratch, ToolEnv *te)
         print(&text, " (tools:");
         b32 any = 0;
         for (i32 t = 0; t < TOOL_COUNT; t++) {
-            if (!(r.deny>>t & 1) && !((u32)TOOL_PLANMASK>>t & 1)) {
+            if (!(r.deny>>t & 1) && !((u32)(TOOL_PLANMASK|TOOL_ASKMASK)>>t & 1)) {
                 print(&text, any ? Str(", ") : Str(" "));
                 print(&text, toolnames[t]);
                 any = 1;
@@ -20771,7 +20771,7 @@ static Str unknowntools(Str list)
         Str word = takehead(rest, i);
         Str name = word.len>1 && word[0]=='-' ? cuthead(word, 1) : word;
         i32  t    = toolfind(name);
-        if (word.len && !toolbits(name) && (t==TOOL_NONE || t==TOOL_ASKUSER)) {
+        if (word.len && !toolbits(name) && t==TOOL_NONE) {
             return word;
         }
         rest = cuthead(rest, i);
@@ -21055,8 +21055,10 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
         s->te.deny |= (s->depth>=TASK_DEPTH ? (u32)1<<TOOL_TASK : 0) | TOOL_PLANMASK;
     }
     // Questions to the user only where the user is there to answer: a
-    // session of their own, attended as it begins, with every tool
-    b32 asks = s->attended && !task.ok && !role.ok && !tools.data;
+    // session of their own, attended as it begins, with every tool, or
+    // with a role or a tool list that names ask_user
+    u32  named = (role.ok ? role.deny : 0) | (tools.data ? tooldeny(tools) : 0);
+    b32  asks  = s->attended && !task.ok && !(named>>TOOL_ASKUSER & 1);
     s->te.deny |= asks ? 0 : (u32)TOOL_ASKMASK;
     s->te.deny |= termdeny(e, s->attended && !task.ok);
     s->mcpfilter  = tools.data ? clone(&s->perm, tools) :

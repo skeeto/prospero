@@ -68,8 +68,9 @@ static_assert(countof(toolnames) == TOOL_COUNT);
 // offered only to sessions that have it (engine.cpp), whatever else
 // their tools say. The web's are offered only as [web] says (webdeny).
 // Questions to the user likewise: only the engine offers ask_user, to
-// a session the user attends as it begins (cmdnew), and no tool list
-// names it. read_terminal is offered only where the user has terminals
+// a session the user attends as it begins (cmdnew), never a subagent,
+// and with a role or a tool list only when it names ask_user ("*" and
+// "default" do not). read_terminal is offered only where the user has terminals
 // to read (termdeny), and listed by name when offered, as the web's.
 enum : u32 {
     TOOL_OFFMASK  = (u32)1 << TOOL_DESKTOP,
@@ -229,7 +230,7 @@ static u32 toolbits(Str word)
         return all & ~(u32)TOOL_OFFMASK;
     }
     i32 t = toolfind(word);
-    return t==TOOL_NONE || t==TOOL_ASKUSER ? 0 : (u32)1<<t;
+    return t==TOOL_NONE ? 0 : (u32)1<<t;
 }
 
 // The tools a list names, separated by blanks or commas, as the bits of

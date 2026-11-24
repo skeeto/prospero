@@ -391,8 +391,9 @@ recommendations. In Plan mode the questions wait with no countdown;
 otherwise they are skipped after `[guard] question_timeout` (300 s;
 0 for no limit), a countdown that starts over whenever you work on the card. A
 notification tells of them (`[ui] notify` `allow`). Only the sessions
-you start yourself, attended, get the tool: never subagents, roles, a
-`tools` list or command-line runs. Over the protocol, an ask of kind
+you start yourself, attended, get the tool, in a role or with a `tools`
+list only if it names `ask_user`: never subagents or command-line
+runs. Over the protocol, an ask of kind
 `question` carries `questions`, and `answer {decision:"allow",
 answers:[{pick:[...], text?}, ...]}` answers it, one entry per question
 (cap `question`). `ask.touch {sid, req}` starts its countdown over, and
