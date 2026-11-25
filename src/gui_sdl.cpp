@@ -110,10 +110,6 @@ extern "C" void  objc_autoreleasePoolPop(void *);
 // its windows?" alert, before any window shows. Registered defaults, so
 // the user's own settings are untouched. Before SDL_Init, which finishes
 // the launch.
-// And no press and hold: a held key repeats, as terminals have it (vi's
-// motions), rather than bringing up the accent picker. AppKit reads it
-// once, at the first held key, so it can't follow the terminal's focus:
-// the text fields lose the picker too, keeping dead keys.
 static void nopersist()
 {
     using Get  = void *(*)(void *, void *);
@@ -131,21 +127,20 @@ static void nopersist()
     void *keys[] = {
         str(nstr, sel_registerName("stringWithUTF8String:"), "ApplePersistenceIgnoreState"),
         str(nstr, sel_registerName("stringWithUTF8String:"), "NSQuitAlwaysKeepsWindows"),
-        str(nstr, sel_registerName("stringWithUTF8String:"), "ApplePressAndHoldEnabled"),
     };
     void *ka   = ((Two)(void *)objc_msgSend)(objc_getClass("NSArray"),
                                              sel_registerName("arrayWithObjects:count:"),
-                                             keys, (void *)(uz)3);
-    void *vals[] = {yes, no, no};
+                                             keys, (void *)(uz)2);
+    void *vals[] = {yes, no};
     void *va   = ((Two)(void *)objc_msgSend)(objc_getClass("NSArray"),
                                              sel_registerName("arrayWithObjects:count:"),
-                                             vals, (void *)(uz)3);
+                                             vals, (void *)(uz)2);
     void *dict = ((Two)(void *)objc_msgSend)(objc_getClass("NSDictionary"),
                                              sel_registerName("dictionaryWithObjects:forKeys:"),
                                              va, ka);
     void *defs = ((Get)(void *)objc_msgSend)(objc_getClass("NSUserDefaults"),
                                              sel_registerName("standardUserDefaults"));
-    if (yes && no && keys[0] && keys[1] && keys[2] && dict && defs) {
+    if (yes && no && keys[0] && keys[1] && dict && defs) {
         ((Set)(void *)objc_msgSend)(defs, sel_registerName("registerDefaults:"), dict);
     }
     objc_autoreleasePoolPop(pool);
@@ -1742,6 +1737,14 @@ static b32 os_guiopen(Os *os, Gui *g, Arena scratch, Str title)
     // elsewhere on macOS: SDL turns that off unless asked, as it reads
     // the hint once, in SDL_Init
     SDL_SetHint(SDL_HINT_MAC_SCROLL_MOMENTUM, "1");
+    // No press and hold: a held key repeats, as terminals have it (vi's
+    // motions), rather than bringing up the accent picker. SDL registers
+    // ApplePressAndHoldEnabled by this hint in SDL_Init, over any default
+    // registered before it; the user's own setting for the app still
+    // wins. AppKit reads it once, at the first held key, so it can't
+    // follow the terminal's focus: the text fields lose the picker too,
+    // keeping dead keys.
+    SDL_SetHint(SDL_HINT_MAC_PRESS_AND_HOLD, "0");
     if (g->drive) {
         // Synthetic input must not compete with the real mouse, which
         // the backend reads directly while the window has focus.
