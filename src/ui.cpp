@@ -2967,6 +2967,16 @@ static void inforow(char const *key, Str value)
 }
 
 static b32  workrows(Gui *, Arena, GuiSession *, View *);
+static void filelinkgo(Gui *, GuiSession *, u64, Str, b32, i32, i32, Str);
+
+// Where a skill is from, as the info groups them: Prospero, a computer
+// that shares it, or the directory of skills its own is in.
+static Str skillwhere(Arena *a, View *v, SkillItem *k)
+{
+    return k->builtin  ? Str("Built into Prospero") :
+           k->from.len ? concat(a, "From ", k->from) :
+           k->path.len ? showpath(v, parentdir(parentdir(k->path))) : Str("Elsewhere");
+}
 
 // The session's details: what it is, where it works, which model and
 // role, and the instruction files the agent was given.
@@ -3041,7 +3051,9 @@ static void drawinfo(Gui *g, Arena scratch, GuiSession *s, View *v)
                               "system prompt has it");
     }
 
-    // Skills, as its engine last listed them: /name invokes one
+    // Skills, as its engine last listed them: their /names on a line for
+    // each place they are from, each a link to its SKILL.md where it has
+    // one to show, its description its tooltip (#102)
     ImGui::Separator();
     ImGui::TextUnformatted("Skills");
     if (!hostcap(s->host, "skills")) {
@@ -3049,18 +3061,69 @@ static void drawinfo(Gui *g, Arena scratch, GuiSession *s, View *v)
     } else if (!s->skills.len) {
         ImGui::TextDisabled("None: no SKILL.md in the project's skill directories, nor in yours.");
     }
+    b32 alone = 0;
     for (iz i = 0; i < s->skills.len; i++) {
-        SkillItem *k = &s->skills[i];
-        ImGui::Bullet();
-        text(concat(&a, "/", k->name));
-        if (k->desc.len) {
-            itemtip("%s", cstr0(&a, k->desc));
+        Str  where = skillwhere(&a, v, &s->skills[i]);
+        b32  seen  = 0;
+        for (iz j = 0; !seen && j < i; j++) {
+            seen = skillwhere(&a, v, &s->skills[j]) == where;
         }
-        ImGui::SameLine();
-        Str where = k->builtin  ? Str("built into Prospero") :
-                    k->from.len ? concat(&a, "from ", k->from) : showpath(v, k->path);
-        ImGui::TextDisabled("%s%s", cstr0(&a, where),
-                            k->hidden ? ", for you alone: not offered to the agent" : "");
+        if (seen) {
+            continue;
+        }
+        ImGui::TextDisabled("%s:", cstr0(&a, where));
+        ImGui::Indent();
+        for (iz j = i; j < s->skills.len; j++) {
+            SkillItem *k = &s->skills[j];
+            if (skillwhere(&a, v, k) != where) {
+                continue;
+            }
+            Str name = concat(&a, "/", k->name);
+            ImGui::SameLine();
+            if (ImGui::GetCursorPosX()+ImGui::CalcTextSize(cstr0(&a, name)).x > 560*sc) {
+                ImGui::NewLine();
+            }
+            Buf tip(&a, 256);
+            print(&tip, k->desc.len ? k->desc : Str("No description"));
+            if (k->hidden) {
+                print(&tip, "\n\nFor you alone: not offered to the agent");
+            }
+            if (k->path.len) {
+                print(&tip, "\n\nShow ");
+                print(&tip, showpath(v, k->path));
+                print(&tip, " in Files");
+            }
+            alone |= k->hidden;
+            if (k->hidden) {
+                ImGui::PushStyleColor(ImGuiCol_TextLink, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+            }
+            if (k->path.len) {
+                ImGui::PushID((int)j);
+                b32 click = ImGui::TextLink(cstr0(&a, name));
+                ImGui::PopID();
+                itemnamed(g, concat(&a, "skill ", k->name));
+                itemtip("%s", cstr0(&a, finish(&tip)));
+                if (click) {
+                    u64 uid = s->host->kind==GH_REMOTE ? s->host->uid : 0;
+                    navjump(g);
+                    filelinkgo(g, s, uid, k->path, hostwin(s->host), 0, 0, {});
+                    ImGui::CloseCurrentPopup();
+                }
+            } else if (k->hidden) {
+                ImGui::TextDisabled("%s", cstr0(&a, name));
+                itemtip("%s", cstr0(&a, finish(&tip)));
+            } else {
+                text(name);
+                itemtip("%s", cstr0(&a, finish(&tip)));
+            }
+            if (k->hidden) {
+                ImGui::PopStyleColor();
+            }
+        }
+        ImGui::Unindent();
+    }
+    if (alone) {
+        ImGui::TextDisabled("Dimmed: for you alone, not offered to the agent");
     }
 
     // Memory: the project's, its index as the agent knows it

@@ -2433,6 +2433,10 @@ def main():
         host.mkdir(host.path("gui-perms"))  # and one the Permissions pane grants
         # Instruction files for the info popup, and files to compact over
         host.write(host.path("work", "AGENTS.md"), "# Checklist rules\n\nKeep it short.\n")
+        # A skill of the project's, a link in the info popup to its SKILL.md
+        host.mkdir(host.path("work", ".claude", "skills", "zzinfo"))
+        host.write(host.path("work", ".claude", "skills", "zzinfo", "SKILL.md"),
+                   "---\ndescription: A skill for the info popup\n---\nInfo.\n")
         bigfiles(host, "small-", 8, 160)
         bigfiles(host, "big-", 10, 512)
         filesfixtures(host)

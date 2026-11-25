@@ -17653,10 +17653,24 @@ static DriveOp m3ops[] = {
     {OP_UP, 0, 0, 0, 600, ""},
     {OP_CHECK, CHK_INFO, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "13-info"},
-    {OP_MOVE, T_EMPTY, 0, 0, 100, ""},
+    // A skill's name, a link: its SKILL.md in Files, the popup gone (#102)
+    {OP_MOVE, T_NAMED, 0, 0, 100, "skill zzinfo"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 600, ""},
     {OP_CHECK, CHK_NOPOPUP, 0, 0, 0, ""},
+    {OP_WAIT, W_FILEREADY, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FILEPATH, 0, 0, 0, ".claude/skills/zzinfo/SKILL.md"},
+    {OP_CHECK, CHK_FILETEXT, 0, 0, 0, "---\ndescription: A skill for the info"},
+    // Its tab closed and Files hidden again, as the Files steps begin
+    {OP_MOVE, T_NAMED, 0, 0, 100, "file tab 1"},
+    {OP_MDOWN, 0, 0, 0, 60, ""},
+    {OP_MUP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_FILETABS, 0, 0, 0, ""},
+    {OP_MOVE, T_MENU, 0, 0, 100, ""}, {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_PANEITEM, 0, 0, 100, "Files"}, {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PANECLOSED, 0, 0, 0, "Files"},
     // Compaction: a summary in a small window, the strip saying so as it
     // runs, its card opened; then old outputs elided in a big one
     {OP_NEWSESSION, 0, 0, 0, 0, "small"},
