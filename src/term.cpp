@@ -1534,6 +1534,20 @@ static TermMetrics termmetrics(Gui *g)
     return m;
 }
 
+// History's scrollbar's strip, at the grid's right edge.
+static f32 termbarw()
+{
+    return ImGui::GetStyle().ScrollbarSize * 0.6f;
+}
+
+// The columns that fit w, the scrollbar's strip reserved whether or not
+// it shows, so history's coming doesn't resize the terminal. The room
+// past the last whole column goes to it first.
+static i32 termfitcols(f32 w, TermMetrics *m)
+{
+    return (i32)((w - termbarw()) / m->cw);
+}
+
 // One glyph's quad, its top left at x, y.
 static void termglyph(ImDrawList *dl, ImFontBaked *f, f32 x, f32 y, u32 cp, u32 col)
 {
@@ -3005,7 +3019,7 @@ static void drawterm(Gui *g)
 
     TermMetrics m     = termmetrics(g);
     ImVec2      avail = ImGui::GetContentRegionAvail();
-    i32         cols  = (i32)(avail.x / m.cw);
+    i32         cols  = termfitcols(avail.x, &m);
     i32         rows  = (i32)(avail.y / m.ch);
     cols = cols<2 ? 2 : cols;
     rows = rows<1 ? 1 : rows;
@@ -3114,11 +3128,11 @@ static void drawterm(Gui *g)
     axrole(g, AX_GROUP);  // no field: its text model is to come
     axfocusable(g);
     axmenu(g);  // termmenu
-    // History's scrollbar, over the grid's right edge, taking no column:
-    // the grid hovers apart from it
+    // History's scrollbar, in the strip reserved at the grid's right edge
+    // (termfitcols): the grid hovers apart from it
     ariel_View view  = ariel_view(tt->t);
     b32        sb    = view.total > tt->rows;
-    f32        barw  = ImGui::GetStyle().ScrollbarSize * 0.6f;
+    f32        barw  = termbarw();
     ImRect     barbb = ImRect(v2(bb.Max.x - barw, bb.Min.y), bb.Max);
     ImRect     hovbb = sb ? ImRect(bb.Min, v2(barbb.Min.x, bb.Max.y)) : bb;
 
@@ -3319,7 +3333,7 @@ static b32 termsizecheck(Gui *g)
     ariel_Modes mo   = ariel_modes(tt->t);
     f32         cw   = g->termgrid.GetWidth();
     f32         ch   = g->termgrid.GetHeight();
-    i32         cols = (i32)(cw / m.cw);
+    i32         cols = termfitcols(cw, &m);
     i32         rows = (i32)(ch / m.ch);
     Arena       a    = g->frame;
     Buf         b(&a, 128);
