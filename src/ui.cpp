@@ -2969,13 +2969,21 @@ static void inforow(char const *key, Str value)
 static b32  workrows(Gui *, Arena, GuiSession *, View *);
 static void filelinkgo(Gui *, GuiSession *, u64, Str, b32, i32, i32, Str);
 
+// A path as the info shows it: below the session's folder relative to
+// it, else in its host's home with ~ for the home (#102).
+static Str infopath(Arena *a, GuiSession *s, View *v, Str path)
+{
+    Str rel = showpath(v, path);
+    return rel.len<path.len ? rel : homeshow(a, s->host, path);
+}
+
 // Where a skill is from, as the info groups them: Prospero, a computer
 // that shares it, or the directory of skills its own is in.
-static Str skillwhere(Arena *a, View *v, SkillItem *k)
+static Str skillwhere(Arena *a, GuiSession *s, View *v, SkillItem *k)
 {
     return k->builtin  ? Str("Built into Prospero") :
            k->from.len ? concat(a, "From ", k->from) :
-           k->path.len ? showpath(v, parentdir(parentdir(k->path))) : Str("Elsewhere");
+           k->path.len ? infopath(a, s, v, parentdir(parentdir(k->path))) : Str("Elsewhere");
 }
 
 // The session's details: what it is, where it works, which model and
@@ -2988,7 +2996,7 @@ static void drawinfo(Gui *g, Arena scratch, GuiSession *s, View *v)
     if (ImGui::BeginTable("##info", 2, ImGuiTableFlags_SizingFixedFit)) {
         inforow("Session", s->sid);
         inforow("Title", sesstitle(s));
-        inforow("Directory", v->nofolder ? Str("No folder") : v->cwd);
+        inforow("Directory", v->nofolder ? Str("No folder") : homeshow(&a, s->host, v->cwd));
         Str model = v->model;
         if (model.len && hostcan(s->host, "models")) {
             model = modelshown(&a, s->host, v->endpoint, model);  // ENDPOINT/MODEL
@@ -3031,16 +3039,16 @@ static void drawinfo(Gui *g, Arena scratch, GuiSession *s, View *v)
                   Str(", from the start"));
         if (in->importer.len) {
             print(&b, ", imported by ");
-            print(&b, showpath(v, in->importer));
+            print(&b, infopath(&a, s, v, in->importer));
         }
         ImGui::Bullet();
-        text(showpath(v, in->path));
+        text(infopath(&a, s, v, in->path));
         ImGui::SameLine();
         ImGui::TextDisabled("%s", cstr0(&a, finish(&b)));
         agents += endswith(in->path, "AGENTS.md");
     }
     for (iz i = 0; i < v->skipped.len; i++) {
-        ImGui::TextDisabled("Not loaded: %s", cstr0(&a, showpath(v, v->skipped[i])));
+        ImGui::TextDisabled("Not loaded: %s", cstr0(&a, infopath(&a, s, v, v->skipped[i])));
     }
     if (v->instrtext.len) {
         if (iconbutton(ICON_COPY "##instrcopy")) {
@@ -3063,26 +3071,32 @@ static void drawinfo(Gui *g, Arena scratch, GuiSession *s, View *v)
     }
     b32 alone = 0;
     for (iz i = 0; i < s->skills.len; i++) {
-        Str  where = skillwhere(&a, v, &s->skills[i]);
+        Str  where = skillwhere(&a, s, v, &s->skills[i]);
         b32  seen  = 0;
         for (iz j = 0; !seen && j < i; j++) {
-            seen = skillwhere(&a, v, &s->skills[j]) == where;
+            seen = skillwhere(&a, s, v, &s->skills[j]) == where;
         }
         if (seen) {
             continue;
         }
-        ImGui::TextDisabled("%s:", cstr0(&a, where));
+        // Its place on a line of its own, as text, not dimmed: dimmed
+        // is a skill for the user alone
+        text(where);
         ImGui::Indent();
+        b32 first = 1;
         for (iz j = i; j < s->skills.len; j++) {
             SkillItem *k = &s->skills[j];
-            if (skillwhere(&a, v, k) != where) {
+            if (skillwhere(&a, s, v, k) != where) {
                 continue;
             }
             Str name = concat(&a, "/", k->name);
-            ImGui::SameLine();
-            if (ImGui::GetCursorPosX()+ImGui::CalcTextSize(cstr0(&a, name)).x > 560*sc) {
-                ImGui::NewLine();
+            if (!first) {
+                ImGui::SameLine();
+                if (ImGui::GetCursorPosX()+ImGui::CalcTextSize(cstr0(&a, name)).x > 560*sc) {
+                    ImGui::NewLine();
+                }
             }
+            first = 0;
             Buf tip(&a, 256);
             print(&tip, k->desc.len ? k->desc : Str("No description"));
             if (k->hidden) {
@@ -3090,7 +3104,7 @@ static void drawinfo(Gui *g, Arena scratch, GuiSession *s, View *v)
             }
             if (k->path.len) {
                 print(&tip, "\n\nShow ");
-                print(&tip, showpath(v, k->path));
+                print(&tip, infopath(&a, s, v, k->path));
                 print(&tip, " in Files");
             }
             alone |= k->hidden;
@@ -3135,7 +3149,7 @@ static void drawinfo(Gui *g, Arena scratch, GuiSession *s, View *v)
         ImGui::TextDisabled("None: memory is for your own sessions in a project, "
                             "while [memory] is on.");
     } else {
-        text(v->memdir);
+        text(homeshow(&a, s->host, v->memdir));
         ImGui::SameLine();
         Str why = s->host->kind==GH_REMOTE
                 ? concat(&a, "The memory is on ", concat(&a, s->host->name,
