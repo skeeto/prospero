@@ -521,6 +521,45 @@ static void highlightblock(DocParse *p, DocBlock *b)
     }
 }
 
+// Whether the piece opens with "**": bold text right after its delimiter.
+static b32 boldopen(DocParse *p, Piece *pc)
+{
+    return !(pc->flags&PIECE_SYNTH) && pc->style&STYLE_BOLD && pc->off>=2 &&
+           p->base[pc->off-2]=='*' && p->base[pc->off-1]=='*';
+}
+
+// A paragraph whose every line opens with bold text, such as
+// "**7. Title** — detail" lines one after another, is a list of lines
+// as GitHub comments show it: its soft breaks become hard. A wrapped
+// paragraph almost never has every line start that way.
+static void boldlines(DocParse *p, DocBlock *b)
+{
+    Doc *d = p->doc;
+    if (p->hardbreaks || (b->type!=DOC_PARA && b->type!=DOC_ITEM)) {
+        return;
+    }
+    i32 nsoft  = 0;
+    b32 atline = 1;
+    for (i32 i = 0; i < b->npiece; i++) {
+        Piece *pc = &d->pieces[b->piece0+i];
+        if (pc->flags & (PIECE_SOFT|PIECE_HARD)) {
+            nsoft += !!(pc->flags & PIECE_SOFT);
+            atline = 1;
+        } else if (atline) {
+            if (!boldopen(p, pc)) {
+                return;
+            }
+            atline = 0;
+        }
+    }
+    for (i32 i = 0; nsoft && i<b->npiece; i++) {
+        Piece *pc = &d->pieces[b->piece0+i];
+        if (pc->flags & PIECE_SOFT) {
+            pc->flags = (u8)((pc->flags & ~PIECE_SOFT) | PIECE_HARD);
+        }
+    }
+}
+
 static void closeblock(DocParse *p)
 {
     if (p->cur < 0) {
@@ -531,6 +570,7 @@ static void closeblock(DocParse *p)
     if (b->type==DOC_CODE && b->npiece) {
         highlightblock(p, b);
     }
+    boldlines(p, b);
     p->indent0 = -1;
     p->kbd     = 0;  // a <kbd> left open ends with its block
     p->kbd0    = 0;

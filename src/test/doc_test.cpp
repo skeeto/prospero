@@ -328,6 +328,35 @@ static void test_doc(Test *t)
         expect(t, "doc.typedkbd", docshow(&a, d2), "P: <kbd>x</kbd>\n");
     }
 
+    // Every line opening with bold: its soft breaks are hard. Each case
+    // shows its line breaks in order, s soft and h hard.
+    {
+        struct { Str name, src, want; } bl[] = {
+            {"doc.boldlines", "**7. a** — x\n**8. b** — y\n**9. c**", "hh"},
+            {"doc.boldwhy", "**Why:** x\n**How:** y", "h"},
+            {"doc.boldwrap", "has *it*, and\n**bold** text and\nmore", "ss"},
+            {"doc.boldlast", "**a** x\n**b** y\nwrapped", "ss"},
+            {"doc.boldmid", "**a** x\nthe **b** y", "s"},
+            {"doc.boldbr", "**a** x  \n**b** y\n**c**", "hh"},
+            {"doc.bolditem", "- **a** x\n  **b** y\n- c\n  d", "hs"},
+            {"doc.boldquote", "> **a** x\n> **b** y", "h"},
+            {"doc.boldunder", "__a__ x\n__b__ y", "s"},
+            {"doc.boldone", "**a** x", ""},
+        };
+        for (iz c = 0; c < countof(bl); c++) {
+            Arena a = perm;
+            Doc  *d = parsedoc(&a, bl[c].src, 0);
+            Buf   b(&a, 64);
+            for (iz i = 0; i < d->pieces.len; i++) {
+                u8 fl = d->pieces[i].flags;
+                if (fl & (PIECE_SOFT|PIECE_HARD)) {
+                    putbyte(&b, fl&PIECE_HARD ? 'h' : 's');
+                }
+            }
+            expect(t, bl[c].name, finish(&b), bl[c].want);
+        }
+    }
+
     // A line of many <kbd> spans: read in a loop, not a call per tag
     {
         Arena a = perm;
