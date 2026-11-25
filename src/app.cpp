@@ -6642,6 +6642,7 @@ static void onsesscmd(Gui *g, GuiHost *h, Arena scratch, Request *q, EvRec *r)
             f->sideof = clone(&g->perm, s->sid);  // until the list says
             setdraft(g, f, q->quote);
             g->promptfocus = 1;
+            g->promptend   = 1;  // under the quote, to write
             Str  title = shorten(&scratch, sesstitle(s), 60);
             Json *wt   = jsonget(j, "worktree");
             if (wt->type == JSON_OBJECT) {
@@ -7073,6 +7074,7 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
             // The transcript shown with it, as View > Transcript would
             setpane(g, PANE_TRANSCRIPT, 1);
             g->promptfocus = 1;
+            g->promptend   = 1;  // under the quote, if any
         }
         guilist(g, h);
         guiskills(g, s);
@@ -17566,6 +17568,7 @@ static DriveOp m3ops[] = {
     {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
     {OP_CHECK, CHK_NOTE, 0, 0, 0, "side chat of"},
     {OP_CHECK, CHK_SIDECHAT, 0, 0, 0, ""},
+    {OP_CHECK, CHK_CARET, 0, 0, 0, "end"},  // under the quote, to write
     {OP_SHOT, 0, 0, 0, 300, "10b-sidechat"},
     {OP_MOVE, T_SIDELINK, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
