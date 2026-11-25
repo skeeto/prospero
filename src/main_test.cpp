@@ -885,6 +885,7 @@ int main()
     test_sched(&t);
     test_highlight(&t);
     test_doc(&t);
+    test_docfront(&t);
     test_layout(&t);
     test_view(&t);
     test_viewpanels(&t);

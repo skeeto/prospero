@@ -648,7 +648,9 @@ static BlockLayout *layouttable(Arena *perm, Measure *m, Doc *d, i32 bi,
             f32 ch = w.y + sp.pad - y;
             rowh = ch>rowh ? ch : rowh;
         }
-        if (r == 0) {
+        if (first->keyed) {
+            adddeco(&w, DECO_HEADERBG, x0, y, colx[1]-x0, rowh, "");  // its keys
+        } else if (r == 0) {
             adddeco(&w, DECO_HEADERBG, x0, y, colx[ncols]-x0, rowh, "");
         }
         adddeco(&w, DECO_GRID, x0, y, colx[ncols]-x0, 1, "");

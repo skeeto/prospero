@@ -90,6 +90,7 @@ struct DocBlock {
     Str lang;         // code: the fence's info word
     i32 table;        // cells: table index in the document
     i32 row, col;     // cells: position, header row 0
+    u8  keyed;        // cells: a frontmatter's, keys in column 0, no header row
     u64 hash;         // everything layout depends on: the cache key
 };
 
@@ -584,7 +585,7 @@ static void closeblock(DocParse *p)
     Hash64 h = {};
     i64 attrs[] = {
         b->type, b->level, b->depth, b->quote, b->number, b->item, b->task,
-        b->align, b->row, b->col, b->fence,
+        b->align, b->row, b->col, b->fence, b->keyed,
     };
     hashbytes(&h, attrs, sizeof(attrs));
     hashbytes(&h, b->lang.data, b->lang.len);
@@ -1005,12 +1006,178 @@ static Doc *parsesource(Arena *perm, Str src, Slice<HlTok> toks, i32 tokoff)
     return d;
 }
 
+// Frontmatter: a Markdown file that opens with a "---" line, through
+// the next "---" or "..." line, is YAML, as a skill's SKILL.md and a
+// memory's file have. A file's Markdown (parsedoc's front) shows it as
+// a table, a row for each key: its key in a shaded column (keyed), its
+// value as the YAML says it, without quotes or a block scalar's | or >,
+// a plain value's lines joined, other lines (a list's items, a nested
+// mapping's keys) each on its own. YAML that is no key: value lines at
+// the top is no frontmatter, which a document that opens and goes on
+// with rules may be: then it is all Markdown, as before.
+
+struct DocFront {
+    i32 beg;   // its first line, after the opening ---
+    i32 end;   // the closing line's start
+    i32 past;  // past the closing line: where the Markdown begins
+};
+
+// The line at offset at, without its line break, and in *next where the
+// line after it begins.
+static Str frontline(Str src, i32 at, i32 *next)
+{
+    i32 e = lineend(src, at);
+    *next = e<src.len ? e+1 : e;
+    Str l = {src.data+at, (iz)(e-at)};
+    return l.len && l[l.len-1]=='\r' ? takehead(l, l.len-1) : l;
+}
+
+// src's frontmatter, else all zero.
+static DocFront docfront(Str src)
+{
+    DocFront r  = {};
+    i32      at = startswith(src, "\xef\xbb\xbf") ? 3 : 0;
+    i32      beg;
+    if (trimright(frontline(src, at, &beg)) != "---") {
+        return r;
+    }
+    for (i32 ln = beg, nx; ln < src.len; ln = nx) {
+        Str t = trimright(frontline(src, ln, &nx));
+        if (t=="---" || t=="...") {
+            r.beg  = beg;
+            r.end  = ln;
+            r.past = nx;
+            return r;
+        }
+    }
+    return r;
+}
+
+struct FrontKey {
+    Str key;
+    Str val;    // the value on its key's line, trimmed
+    i32 more0;  // its other lines: indented, blank, items, comments
+    i32 more1;
+};
+
+// Frontmatter's keys, in order, else none: a line at the top that is no
+// key: value, or no key at all.
+static Slice<FrontKey> frontkeys(Arena *perm, Str src, DocFront f)
+{
+    Slice<FrontKey> r = {};
+    for (i32 at = f.beg, nx; at < f.end;) {
+        Str line = frontline(src, at, &nx);
+        Str t    = trim(line);
+        if (!t.len || t[0]=='#') {
+            at = nx;
+            continue;
+        } else if (whitespace(line[0]) || t[0]=='-') {
+            return {};
+        }
+        Cut kv  = cut(line, ':');
+        Str key = trim(kv.head);
+        if (!kv.ok || !key.len || (kv.tail.len && !whitespace(kv.tail[0]))) {
+            return {};
+        }
+        FrontKey k = {};
+        k.key   = key;
+        k.val   = trim(kv.tail);
+        k.more0 = at = nx;
+        for (; at < f.end; at = nx) {
+            Str l = frontline(src, at, &nx);
+            if (trim(l).len && !whitespace(l[0]) && l[0]!='-' && l[0]!='#') {
+                break;
+            }
+        }
+        k.more1 = at;
+        r = push(perm, r, k);
+    }
+    return r;
+}
+
+// A piece of s, a slice of the source.
+static void addslice(DocParse *p, Str s, i32 style)
+{
+    Piece pc = {};
+    pc.off   = (i32)(s.data - p->base);
+    pc.len   = (i32)s.len;
+    pc.text  = s;
+    pc.style = style;
+    pc.link  = -1;
+    addpiece(p, pc);
+    p->lastoff = pc.off + pc.len;
+}
+
+// A line break of no source, at offset off.
+static void addbreak(DocParse *p, i32 off, u8 flag)
+{
+    Piece pc = {};
+    pc.off   = off;
+    pc.text  = "\n";
+    pc.flags = (u8)(PIECE_SYNTH | flag);
+    pc.link  = -1;
+    addpiece(p, pc);
+}
+
+static void opencell(DocParse *p, i32 table, i32 row, i32 col)
+{
+    DocBlock *b = &p->doc->blocks[openblock(p, DOC_CELL)];
+    b->table = table;
+    b->row   = row;
+    b->col   = col;
+    b->keyed = 1;
+}
+
+// The frontmatter's table, for its keys.
+static void addfront(DocParse *p, Str src, Slice<FrontKey> keys)
+{
+    i32 table = p->doc->ntables++;
+    for (i32 r = 0; r < (i32)keys.len; r++) {
+        FrontKey *k = &keys[r];
+        opencell(p, table, r, 0);
+        addslice(p, k->key, STYLE_BOLD);
+        closeblock(p);
+
+        opencell(p, table, r, 1);
+        Str v     = k->val;
+        b32 block = v.len && (v[0]=='|' || v[0]=='>');
+        b32 lines = !v.len || (block && v[0]=='|');  // a line break each
+        if (!block && v.len) {
+            b32 quoted = v.len>=2 && (v[0]=='"' || v[0]=='\'') && v[v.len-1]==v[0];
+            addslice(p, quoted ? Str{v.data+1, v.len-2} : v, 0);
+        }
+        i32 blanks = 0;
+        for (i32 at = k->more0, nx; at < k->more1; at = nx) {
+            Str l = frontline(src, at, &nx);
+            Str t = trim(l);
+            if (!t.len) {
+                blanks++;
+                continue;
+            } else if (t[0]=='#' && (!block || !whitespace(l[0]))) {
+                continue;  // a comment: in a block scalar, only unindented
+            }
+            if (p->doc->blocks[p->cur].npiece) {
+                b32 hard = lines || blanks;
+                addbreak(p, at, hard ? PIECE_HARD : PIECE_SOFT);
+                for (i32 b = 1; lines && b <= blanks; b++) {
+                    addbreak(p, at, PIECE_HARD);
+                }
+            }
+            blanks = 0;
+            addslice(p, t, 0);
+        }
+        closeblock(p);
+    }
+}
+
 // Parse markdown into a document in perm, referring into src. Messages
 // past DOC_MAXSIZE are shown as plain text. The memo, if given, keeps
 // highlighted code across parses of a growing message. With hardbreaks,
 // every line break stays one, as in what a person typed, where markdown
-// would join a paragraph's lines.
-static Doc *parsedoc(Arena *perm, Str src, HlMemo **memo, b32 hardbreaks = 0)
+// would join a paragraph's lines. With front, a file's Markdown, its
+// frontmatter is a table (addfront).
+static Doc *parsedoc(Arena *perm, Str src, HlMemo **memo, b32 hardbreaks = 0,
+                     b32 front = 0)
 {
     if (src.len > DOC_MAXSIZE) {
         return parseplain(perm, src, 0);
@@ -1038,8 +1205,18 @@ static Doc *parsedoc(Arena *perm, Str src, HlMemo **memo, b32 hardbreaks = 0)
     parser.enter_span  = mdenterspan;
     parser.leave_span  = mdleavespan;
     parser.text        = mdtext;
-    if (src.len) {
-        md_parse((MD_CHAR *)src.data, (MD_SIZE)src.len, &parser, &p);
+    i32 at = 0;
+    if (front) {
+        DocFront        f    = docfront(src);
+        Slice<FrontKey> keys = f.past ? frontkeys(perm, src, f) : Slice<FrontKey>{};
+        if (keys.len) {
+            addfront(&p, src, keys);
+            at        = f.past;
+            p.lastoff = at;
+        }
+    }
+    if (src.len > at) {
+        md_parse((MD_CHAR *)src.data+at, (MD_SIZE)(src.len-at), &parser, &p);
     }
     closeblock(&p);
     return d;

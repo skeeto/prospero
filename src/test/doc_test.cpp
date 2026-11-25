@@ -33,6 +33,7 @@ static Str docshow(Arena *a, Doc *d)
             print(&b, "r");   print(&b, (i64)k->row);
             print(&b, "c");   print(&b, (i64)k->col);
             if (k->align) { print(&b, "a"); print(&b, (i64)k->align); }
+            if (k->keyed) print(&b, " k");
         }
         print(&b, ":");
         for (i32 j = 0; j < k->npiece; j++) {
@@ -197,6 +198,65 @@ static void test_docsource(Test *t)
         expect(t, "doc.source.hlmax", sourceshow(&a, cuthead(src, last), toks, last),
                "S: c:/* c */\n");
     }
+}
+
+// A file's Markdown, its frontmatter a table of its keys (addfront)
+static void test_docfront(Test *t)
+{
+    Arena perm = t->perm;
+
+    struct { Str name, src, want; } cases[] = {
+        {"docfront.folded",
+         "---\nname: x\ndescription: >-\n  Line one\n  line two\n\n  Para\n---\n# Title\n",
+         "T t0r0c0 k: b:name\n"
+         "T t0r0c1 k: x\n"
+         "T t0r1c0 k: b:description\n"
+         "T t0r1c1 k: Line one|~:\\n|line two|~:\\n|Para\n"
+         "H1: Title\n"},
+        // Quotes dropped; a list's items and a literal's lines each on
+        // a line, its blank line kept; comments left out
+        {"docfront.kinds",
+         "---\n# about\ntitle: \"Quoted: yes\"\ntags:\n  - a\n  - b\n"
+         "body: |\n  one\n\n  two\n# end\n---\ntext",
+         "T t0r0c0 k: b:title\n"
+         "T t0r0c1 k: Quoted: yes\n"
+         "T t0r1c0 k: b:tags\n"
+         "T t0r1c1 k: - a|~:\\n|- b\n"
+         "T t0r2c0 k: b:body\n"
+         "T t0r2c1 k: one|~:\\n|~:\\n|two\n"
+         "P: text\n"},
+        {"docfront.crlf", "\xef\xbb\xbf---\r\na: b\r\n...\r\nx",
+         "T t0r0c0 k: b:a\nT t0r0c1 k: b\nP: x\n"},
+        {"docfront.only", "---\na: 1\n---",
+         "T t0r0c0 k: b:a\nT t0r0c1 k: 1\n"},
+    };
+    for (iz i = 0; i < countof(cases); i++) {
+        Arena a   = perm;
+        Doc  *d   = parsedoc(&a, cases[i].src, 0, 0, 1);
+        Str   bad = doccheck(&a, d);
+        expect(t, cases[i].name, bad.len ? bad : docshow(&a, d), cases[i].want);
+    }
+
+    // No frontmatter, or none a table shows: Markdown as before, rules
+    // and all; and a message's opening rule is never frontmatter
+    Str same[] = {
+        "---\nJust text\n---\nmore",
+        "---\na: b\n",
+        "---\n---\nx",
+        "---\n- a\n- b\n---\n",
+        "---\nkey:value\n---\n",
+        "x\n---\na: b\n---\n",
+    };
+    for (iz i = 0; i < countof(same); i++) {
+        Arena a = perm;
+        Str   s = docshow(&a, parsedoc(&a, same[i], 0, 0, 1));
+        expect(t, concat(&a, "docfront.same.", istr(&a, i)), s, docshow(&a, parsedoc(&a, same[i], 0)));
+    }
+    Arena a = perm;
+    expect(t, "docfront.message", mdshow(&a, "---\na: b\n---\n"),
+           docshow(&a, parsedoc(&a, "---\na: b\n---\n", 0)));
+    Str m = mdshow(&a, "---\na: b\n---\n");
+    expect(t, "docfront.message.notable", find(m, "T t0")<0 ? Str("no table") : m, "no table");
 }
 
 static void test_doc(Test *t)

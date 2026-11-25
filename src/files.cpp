@@ -338,6 +338,7 @@ static FileBody *filemake(Gui *g, FileTab *ft, Region *sr, Arena s, Str raw, i64
         m.text = b->body;
         m.nl   = countnl(b->body);
         m.md   = 1;
+        m.front = 1;
         b->md->v->msgs = push(&b->md->v->meta, b->md->v->msgs, m);
     }
 

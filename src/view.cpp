@@ -510,6 +510,7 @@ struct ViewMsg {
     b32       fold;       // its header shows and hides the rest
     i32       cuts;       // cuts in force that hide it: rewound away
     b32       md;         // markdown, not plain text
+    b32       front;      // a file's Markdown: its frontmatter a table
     b32       lines;      // a chunk of a file's lines (addlines)
     i32       line0;      //   and its first line's number
     i64       estper;     //   its rows when wrapped at estper bytes a
@@ -3816,7 +3817,7 @@ static Doc *msgdoc(View *v, i32 i)
         }
         break;
     default:
-        m->doc = parsedoc(&c->arena, m->text, &c->memo);
+        m->doc = parsedoc(&c->arena, m->text, &c->memo, 0, m->front);
     }
     m->docver = m->ver;
     m->docgen = c->gen;
