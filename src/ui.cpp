@@ -59,6 +59,39 @@ static void text(Str s)
     ImGui::TextUnformatted(s.cdata, s.cdata+s.len);
 }
 
+// A bullet's text, then a note in gray: on the same line where all of it
+// fits in what the text left of that line, else on a line of its own
+// under the text (#106). ImGui wraps a SameLine text in the width left
+// after the item before it, on every line it takes, and a text that
+// wrapped puts it beside its widest line, at its first line's height:
+// after a long path the note became a column of single letters.
+static void bulletnote(Str s, Str note)
+{
+    ImGui::Bullet();
+    f32 x = ImGui::GetCursorPosX();
+    text(s);
+    if (!note.len) {
+        return;
+    }
+    ImGuiWindow *w     = ImGui::GetCurrentWindow();
+    ImGuiStyle  &st    = ImGui::GetStyle();
+    f32          wrap  = w->DC.TextWrapPos;
+    f32          right = wrap<0  ? 0 :
+                         wrap==0 ? w->WorkRect.Max.x : wrap + w->Pos.x - w->Scroll.x;
+    ImVec2       lo    = ImGui::GetItemRectMin();
+    ImVec2       hi    = ImGui::GetItemRectMax();
+    f32          noted = ImGui::CalcTextSize(note.cdata, note.cdata+note.len).x;
+    b32          one   = hi.y - lo.y <= ImGui::GetTextLineHeight();
+    if (one && (wrap<0 || hi.x + st.ItemSpacing.x + noted <= right)) {
+        ImGui::SameLine();
+    } else {
+        ImGui::SetCursorPosX(x);
+    }
+    ImGui::PushStyleColor(ImGuiCol_Text, st.Colors[ImGuiCol_TextDisabled]);
+    text(note);
+    ImGui::PopStyleColor();
+}
+
 // Tooltips, as ImGui's SetItemTooltip and SetTooltip, but wrapped at
 // TIP_EMS: unwrapped, a long one spans the whole window. Tooltips built
 // by hand wrap at tipwrap too.
@@ -3041,10 +3074,7 @@ static void drawinfo(Gui *g, Arena scratch, GuiSession *s, View *v)
             print(&b, ", imported by ");
             print(&b, infopath(&a, s, v, in->importer));
         }
-        ImGui::Bullet();
-        text(infopath(&a, s, v, in->path));
-        ImGui::SameLine();
-        ImGui::TextDisabled("%s", cstr0(&a, finish(&b)));
+        bulletnote(infopath(&a, s, v, in->path), finish(&b));
         agents += endswith(in->path, "AGENTS.md");
     }
     for (iz i = 0; i < v->skipped.len; i++) {
@@ -3171,12 +3201,7 @@ static void drawinfo(Gui *g, Arena scratch, GuiSession *s, View *v)
         }
         for (iz i = 0; i < v->mems.len; i++) {
             ViewMem *m = &v->mems[i];
-            ImGui::Bullet();
-            text(m->name);
-            if (m->desc.len) {
-                ImGui::SameLine();
-                ImGui::TextDisabled("%s", cstr0(&a, m->desc));
-            }
+            bulletnote(m->name, m->desc);
         }
     }
     ImGui::PopTextWrapPos();
@@ -4125,11 +4150,8 @@ static void drawcut(Gui *g, GuiSession *s, View *v, Slice<ViewSnap> set)
         ImGui::BeginDisabled(!on);
         for (iz i = 0; i < set.len; i++) {
             ImGui::Indent();
-            ImGui::Bullet();
-            text(showpath(v, set[i].path));
-            ImGui::SameLine();
-            ImGui::TextDisabled(set[i].existed ? "put back as it was"
-                                               : "removed, as it did not exist then");
+            bulletnote(showpath(v, set[i].path), set[i].existed ? Str("put back as it was")
+                                                 : Str("removed, as it did not exist then"));
             ImGui::Unindent();
         }
         ImGui::EndDisabled();
@@ -4186,10 +4208,8 @@ static void drawrewind(Gui *g)
         ImGui::Text("Put back the files changed by write and edit from turn %d on:", g->rewturn);
     }
     for (iz i = 0; i < set.len; i++) {
-        ImGui::Bullet();
-        text(showpath(v, set[i].path));
-        ImGui::SameLine();
-        ImGui::TextDisabled(set[i].existed ? "put back as it was" : "removed, as it did not exist then");
+        bulletnote(showpath(v, set[i].path), set[i].existed ? Str("put back as it was")
+                                             : Str("removed, as it did not exist then"));
     }
     if (!set.len) {
         ImGui::TextDisabled("Nothing is left to rewind there.");
