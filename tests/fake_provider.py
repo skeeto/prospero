@@ -1608,6 +1608,16 @@ def sc_compaction(model, n, req):
         yield from real_answer(model, req, "All files read.")
 
 
+def sc_mcp_compact_threshold(model, n, req):
+    # sc_compaction's reads, then, compacted by then, an MCP call
+    if n < 8:
+        yield from real_tool(model, req, n, "read", {"path": f"f{n}.txt"})
+    elif n == 8:
+        yield from real_tool(model, req, n, "mcp__fake__echo", {"text": "after"})
+    else:
+        yield from real_answer(model, req, "Echoed.")
+
+
 def sc_compact_reasoning(model, n, req):
     # sc_compaction's reads, each step reasoning but never replying
     if n < 8:

@@ -1040,8 +1040,7 @@ struct Session {
     Slice<McpTool>    mcptools;   // offered, as its prefix has them
     Slice<McpServer *> mcpsrvs;   // the servers it offers
     Str          mcpfilter;  // its role's tools, null for every MCP tool
-    b32          mcpfixed;   // its tools were fixed by a request
-    b32          mcpquiet;   // they join a rebuilt prefix, untold (reprefix)
+    b32          mcpfixed;   // a request used its prefix (sendchat)
     Slice<Str>   mcpwarned;  // servers whose failure it was told
     McpServer   *mcpsrv;     // the server of the call running, if MCP's
     i64          mcpcall;    // that call's request id, -1 until it is sent
@@ -2971,6 +2970,7 @@ static void sendchat(Session *s, Arena scratch)
         putgauge(s, &w.json, s->sentest);
         ssend(s, &w);
     }
+    s->mcpfixed = 1;  // tools join it from now on as the prefix's (mcpgate)
 
     newattempt(s);
 
@@ -13362,10 +13362,6 @@ static void apprwake(Engine *e, Arena scratch, Session *except)
 
 static void logprefix(Session *, Arena);
 
-// Before a request: the session's servers started, and while its tools
-// are not fixed, waited for (S_MCP) until each is ready or failed. Then
-// the tools of those ready that it lacks join its prefix, logged anew.
-// Returns 0 while it waits: mcpwake goes on, through prepare.
 // Whether the configuration keeps a server's tool, by the server's name
 // for it, as it says now: the server's section enabled, and its tools
 // key (mcponly) offering it. A session's tool turned off since is not
@@ -13378,6 +13374,101 @@ static b32 mcpkept(Engine *e, Str server, Str tool)
            mcponly(trim(cfgget(c, "mcp", server, "tools", 0)), tool);
 }
 
+// The tools of a session's server that it lacks and may have, pushed on
+// add, in the scratch: those its filter allows and the configuration
+// keeps, whose names no other tool has. A failed server is warned of,
+// once.
+static void mcpnewtools(Session *s, Arena *scratch, McpServer *m, Slice<McpTool> *add)
+{
+    if (m->state == MCP_FAILED) {
+        b32 told = 0;
+        for (iz k = 0; k < s->mcpwarned.len; k++) {
+            told |= s->mcpwarned[k] == m->name;
+        }
+        if (!told) {
+            s->mcpwarned = push(&s->perm, s->mcpwarned, clone(&s->perm, m->name));
+            Str msg = concat(scratch, concat(scratch, "MCP server ", m->name),
+                             concat(scratch, " failed: ", m->err));
+            note(s, *scratch, "warn", msg);
+        }
+        return;
+    } else if (m->state != MCP_READY) {
+        return;
+    }
+    for (iz k = 0; k < m->tools.len; k++) {
+        McpTool *t = &m->tools[k];
+        if (!mcpallowed(s->mcpfilter, m->name, t->name) ||
+                !mcpkept(s->e, m->name, t->tool) || mcptoolof(s, t->name)) {
+            continue;
+        }
+        b32 clash = toolfind(t->name) != TOOL_NONE;
+        for (iz j = 0; j < add->len; j++) {
+            clash |= (*add)[j].name == t->name;
+        }
+        if (clash) {
+            Str msg = concat(scratch, "an MCP tool's name is taken already, so "
+                             "it is left out: ", t->name);
+            note(s, *scratch, "warn", msg);
+            continue;
+        }
+        McpTool c = *t;
+        c.name   = clone(&s->perm, t->name);
+        c.server = clone(&s->perm, t->server);
+        c.tool   = clone(&s->perm, t->tool);
+        c.desc   = clone(&s->perm, t->desc);
+        c.schema = clone(&s->perm, t->schema);
+        c.origin = clone(&s->perm, m->origin);
+        *add     = push(scratch, *add, c);
+    }
+}
+
+// The servers of tools about to join a session whose instructions it
+// has not had, as it had none of their tools: those that give some.
+static Slice<Str> mcpintro(Session *s, Arena *a, Slice<McpTool> add)
+{
+    Slice<Str> r = {};
+    for (iz i = 0; i < add.len; i++) {
+        McpServer *m   = mcpsrvof(s, add[i].server);
+        b32        had = !m || !m->instr.len;
+        for (iz k = 0; !had && k < s->mcptools.len; k++) {
+            had = s->mcptools[k].server == add[i].server;
+        }
+        for (iz k = 0; !had && k < r.len; k++) {
+            had = r[k] == add[i].server;
+        }
+        if (!had) {
+            r = push(a, r, add[i].server);
+        }
+    }
+    return r;
+}
+
+// Tools that join a session's prefix before its first request: into
+// its tools, with the instructions of their servers new to it into its
+// system prompt. Its record is for the caller to log.
+static void mcpbase(Session *s, Arena scratch, Slice<McpTool> add)
+{
+    if (!add.len) {
+        return;
+    }
+    Slice<Str> intro = mcpintro(s, &scratch, add);
+    for (iz i = 0; i < add.len; i++) {
+        s->mcptools = push(&s->perm, s->mcptools, add[i]);
+    }
+    s->tools = clone(&s->perm, mcpaddtools(&scratch, s->tools, add));
+    for (iz i = 0; i < intro.len; i++) {
+        McpServer *m     = mcpsrvof(s, intro[i]);
+        b32        first = find(s->system, "\n# MCP server instructions\n") < 0;
+        s->system = concat(&s->perm, s->system,
+                           mcpinstructions(&scratch, m->name, m->instr, first));
+    }
+}
+
+// Before a request: the session's servers started, and while its tools
+// are not fixed, waited for (S_MCP) until each is ready or failed. Then
+// the tools of those ready that it lacks join it: its prefix, before
+// the prefix's first request, else anew, told to the agent. Returns 0
+// while it waits: mcpwake goes on, through prepare.
 static b32 mcpgate(Session *s, Arena scratch)
 {
     if (s->readonly) {
@@ -13399,74 +13490,16 @@ static b32 mcpgate(Session *s, Arena scratch)
         setstate(s, S_IDLE);
     }
 
-    Slice<McpTool> add   = {};
-    Slice<Str>     intro = {};  // servers with instructions, new to it
-    b32            had   = s->mcptools.len > 0;
+    Slice<McpTool> add = {};
     for (iz i = 0; i < s->mcpsrvs.len; i++) {
-        McpServer *m = s->mcpsrvs[i];
-        if (m->state == MCP_FAILED) {
-            b32 told = 0;
-            for (iz k = 0; k < s->mcpwarned.len; k++) {
-                told |= s->mcpwarned[k] == m->name;
-            }
-            if (!told) {
-                s->mcpwarned = push(&s->perm, s->mcpwarned, clone(&s->perm, m->name));
-                Str msg = concat(&scratch, concat(&scratch, "MCP server ", m->name),
-                                 concat(&scratch, " failed: ", m->err));
-                note(s, scratch, "warn", msg);
-            }
-            continue;
-        } else if (m->state != MCP_READY) {
-            continue;
-        }
-        b32 any = 0;
-        for (iz k = 0; k < m->tools.len; k++) {
-            McpTool *t = &m->tools[k];
-            if (!mcpallowed(s->mcpfilter, m->name, t->name) ||
-                    !mcpkept(s->e, m->name, t->tool) || mcptoolof(s, t->name)) {
-                continue;
-            }
-            b32 clash = toolfind(t->name) != TOOL_NONE;
-            for (iz j = 0; j < add.len; j++) {
-                clash |= add[j].name == t->name;
-            }
-            if (clash) {
-                Str msg = concat(&scratch, "an MCP tool's name is taken already, so "
-                                 "it is left out: ", t->name);
-                note(s, scratch, "warn", msg);
-                continue;
-            }
-            McpTool c = *t;
-            c.name   = clone(&s->perm, t->name);
-            c.server = clone(&s->perm, t->server);
-            c.tool   = clone(&s->perm, t->tool);
-            c.desc   = clone(&s->perm, t->desc);
-            c.schema = clone(&s->perm, t->schema);
-            c.origin = clone(&s->perm, m->origin);
-            add      = push(&scratch, add, c);
-            any      = 1;
-        }
-        if (any && m->instr.len) {
-            intro = push(&scratch, intro, m->name);
-        }
+        mcpnewtools(s, &scratch, s->mcpsrvs[i], &add);
     }
-    b32 fixed = s->mcpfixed;
-    b32 quiet = s->mcpquiet;
-    s->mcpfixed = 1;  // logged with the tools, if any: else the session
-    s->mcpquiet = 0;
-    if (!add.len) {   // opened again waits for its servers once more
+    if (!add.len) {
         return 1;
     }
-    for (iz i = 0; i < add.len; i++) {
-        s->mcptools = push(&s->perm, s->mcptools, add[i]);
-    }
-    s->tools = clone(&s->perm, mcpaddtools(&scratch, s->tools, add));
-    for (iz i = 0; i < intro.len; i++) {
-        McpServer *m = mcpsrvof(s, intro[i]);
-        b32 first = find(s->system, "\n# MCP server instructions\n") < 0;
-        s->system = concat(&s->perm, s->system, mcpinstructions(&scratch, m->name, m->instr, first));
-    }
-    if (!quiet && (fixed || had || s->turn>1)) {
+    b32 fixed = s->mcpfixed;
+    mcpbase(s, scratch, add);
+    if (fixed) {
         // Mid-session: the agent is told what it has now
         Buf b(&scratch, 256);
         print(&b, "New tools from MCP servers are available now:");
@@ -18783,6 +18816,9 @@ static void buildprefix(Session *s, Arena scratch)
         s->system = concat(&s->perm, s->system, mem);
     }
     s->memsys = s->memseen;
+    // No MCP tools yet, and no request has used it (mcpgate)
+    s->mcptools = {};
+    s->mcpfixed = 0;
 }
 
 static void logprefix(Session *, Arena);
@@ -18791,10 +18827,14 @@ static void logprefix(Session *, Arena);
 // built as a new session's would be now, from its instructions, memory,
 // skills, configuration and tools as they are, so that a long session
 // learns what it gained since it began. It keeps the shell commands run
-// in, and its MCP tools join it again before the next request (mcpgate),
-// as they do a new session's. Recorded before the summary, which takes
-// the prefix as told (shellheard). Returns what it did for the summary's
-// card (PREFIX_*): nothing, or rebuilt, and what came of it new.
+// in. Its MCP servers' tools join it again: those of servers ready now
+// at once, for the request that may follow at once (compacted), and the
+// rest as they become ready, before the next request that waits for
+// them (mcpgate), else later, as they join a session (no project's
+// server is asked about here, nor waited for). Recorded before the
+// summary, which takes the prefix as told (shellheard). Returns what it
+// did for the summary's card (PREFIX_*): nothing, or rebuilt, and what
+// came of it new.
 static i32 reprefix(Session *s, Arena scratch)
 {
     if (s->readonly || s->wtdefer || !s->system.data) {
@@ -18835,9 +18875,12 @@ static i32 reprefix(Session *s, Arena scratch)
         logmem(s, scratch, "start");
     }
 
-    s->mcptools = {};
-    s->mcpfixed = 0;
-    s->mcpquiet = 1;
+    mcpoffer(s, scratch);
+    Slice<McpTool> add = {};
+    for (iz i = 0; i < s->mcpsrvs.len; i++) {
+        mcpnewtools(s, &scratch, s->mcpsrvs[i], &add);
+    }
+    mcpbase(s, scratch, add);
     logprefix(s, scratch);
 
     i32 r = PREFIX_REBUILT;
@@ -21887,6 +21930,7 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
                 i64 sent = jsonint(jsonget(j, "tokens"), 0);
                 s->tpeak = sent>s->tpeak ? sent : s->tpeak;
             }
+            s->mcpfixed = 1;  // as sendchat has it
             [[fallthrough]];
         case EV_TURNEND:
             s->ctxhint = jsonint(jsonget(j, "ctx"), s->ctxhint);

@@ -14793,6 +14793,34 @@ def mcp_compact(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+@scenario(conf={**SMALL, **mcpconf(trust="yes")}, bound=30, alone=True)
+def mcp_compact_threshold(t):
+    """A summary at the threshold, mid-turn: the request right after it
+    has the session's MCP tools still, from the servers running as the
+    prefix is rebuilt, so that a call to one goes through. Its card
+    says the tools are as they were, and the agent hears no news of
+    them."""
+    bigfiles(t, 8, 150)
+    r = t.run(env=mcpenv(t))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    t.check(r.text() == "Echoed.", f"text {r.text()!r}")
+    cps = r.all("compact")
+    t.check(len(cps) == 1 and cps[0]["why"] == "threshold", f"one summary: {cps}")
+    t.check(cps and "tools" not in cps[0].get("changed", []), f"tools unchanged: {cps}")
+    reqs = t.requests()
+    k = next((i for i, x in enumerate(reqs) if checkpointed(chat(x))), None)
+    t.check(k is not None, "a request after the summary")
+    for q in reqs[k:] if k is not None else []:
+        names = fake_provider.tool_names(q["body"])
+        t.check("mcp__fake__echo" in names, f"the MCP tools there: {names}")
+        t.check("New tools from MCP servers" not in json.dumps(chat(q)), "no news")
+    t.check([c["name"] for c in mcpcalls(t)] == ["echo"], f"calls {mcpcalls(t)}")
+    end = r.all("tool.end")[-1]
+    t.check(end["status"] == "ok" and end["text"] == "echo: after", f"echoed {end}")
+    # As it began, with its MCP tools for the first request, and rebuilt
+    t.check(len(r.all("prefix")) == 3, f"three prefix records: {len(r.all('prefix'))}")
+
+
 EXTRA_TOOLS = [
     {"name": "a.b", "description": "Dotted.", "inputSchema": {"type": "object"}},
     {"name": "a_b", "description": "Taken.", "inputSchema": {"type": "object"}},
