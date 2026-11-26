@@ -707,6 +707,9 @@ struct GuiSession {
                             // until it first asks
     TermSet      terms;     // a root's terminal tabs (term.cpp)
     FileSet      files;     // and its Files tabs (files.cpp)
+    b32          plantab;   // its plan is out in a Terminal tab of its
+                            //   root (Edit plan), read again as the
+                            //   editor is done (plantabsweep)
 };
 
 // A command awaiting its reply.
@@ -2022,6 +2025,7 @@ struct Gui {
     Str                editor;     // [ui] editor
     Str                edjumpfmt;  // [ui] editor_line, Open in editor's template
     Str                edremote;   // [ui] editor_remote, an ssh remote's file's template
+    Str                editorkept; // [ui] editor before OP_TERMEDITOR's
     Str                editjump;   // Open in editor's latest command, for the
     i64                editjumps;  //   checklist, and how many
     u64                edfoundkey; // editorfound's last answer, by program
@@ -7874,7 +7878,7 @@ static Str editorwhy(Gui *g, GuiSession *s, Arena *a)
     } else if (editorterm(cmd)) {
         Buf b(a, 160);
         print(&b, termeditname(cmdprog(cmd, 0)));
-        print(&b, " runs in a terminal: drafts, plans and the configuration file "
+        print(&b, " runs in a terminal: drafts and the configuration file "
                   "need [ui] editor to open a window of its own");
         return finish(&b);
     }
@@ -8084,13 +8088,29 @@ static i32 planask(View *v)
 }
 
 // Edit plan: the plan file at path, in the editor, in place, for the
-// plan's ask req, else with none waiting. Its scratch is a.
+// plan's ask req, else with none waiting; or, for an editor that runs
+// in a terminal (plantab), in a Terminal tab of the session's root,
+// Approve held while it runs. Its scratch is a.
 static Str planeditwhy(Gui *, GuiSession *, Str, Arena *);
 static EditJump planfar(Gui *, Arena *, GuiSession *, Str);
 static EditJump editorfind(Gui *, Arena *, EditJump);
+static b32 plantab(Gui *, Arena *, GuiSession *, Str);
+static TermTab *plantabof(Gui *, GuiSession *, Str);
+static Str plantabwhy(Gui *, Arena *, GuiSession *, Str);
+static void plantabrun(Gui *, Arena, GuiSession *, Str);
+static Str termeditname(TermTab *);
 
 static void planedit(Gui *g, Arena a, GuiSession *s, Str path, Str req)
 {
+    if (path.len && plantab(g, &a, s, path)) {
+        Str why = planeditwhy(g, s, path, &a);
+        if (why.len) {
+            setnote(g, s, why, 1);
+        } else {
+            plantabrun(g, a, s, path);
+        }
+        return;
+    }
     // An ssh remote's plan in the editor here that reaches it itself
     // (planfar): its program looked for only now, as the button's why
     // runs each frame and editorexe keeps one answer
@@ -8284,6 +8304,32 @@ static EditJump planfar(Gui *g, Arena *a, GuiSession *s, Str path)
     return farjump(g, a, s->host, editordraft(g, a), {}, path, 0, 0);
 }
 
+// Whether Edit plan opens session s's plan file at path in a Terminal
+// tab of its root, on the plan's host, as Files' Open in editor would
+// (fileedit), rather than in an editor with a window of its own, which
+// it waits for (editordraft). On this computer: when the editor set
+// ([ui] editor, $VISUAL, $EDITOR: editorset, so on macOS with no
+// fallback to TextEdit) runs in a terminal, or on Linux when none is
+// set at all, the login shell's then, else vi. On a remote: when no
+// editor here reaches the plan itself (planfar: not an ssh remote, or
+// no address form), and otherwise unless [ui] editor_remote is set,
+// which never falls back, when the editor is a terminal one or none.
+static b32 plantab(Gui *g, Arena *a, GuiSession *s, Str path)
+{
+    if (s->host->kind != GH_REMOTE) {
+        Str cmd  = trim(editorset(g, a));
+        b32 none = !cmd.len && !trim(g->edjumpfmt).len;
+        return (cmd.len && editorterm(cmd)) || (none && !g->mac && !HOST_WINDOWS);
+    }
+    if (planfar(g, a, s, path).noaddr) {
+        return 1;
+    } else if (trim(g->edremote).len) {
+        return 0;
+    }
+    Str cmd = trim(editordraft(g, a));
+    return !cmd.len || editorterm(cmd);
+}
+
 // Launch an editor's command (editorjumpfor's) from dir, left to run on
 // its own: in the checklist only noted (g->editjump), never run.
 static void editorjumprun(Gui *g, Arena a, EditJump j, Str dir)
@@ -8322,17 +8368,18 @@ static void editorjumprun(Gui *g, Arena a, EditJump j, Str dir)
 
 // The plan file as the editor left it, in its ask (or the plan's ask
 // that came while it was out), empty if it is gone or too long to put
-// to the user, and in the Plan window, fetched again.
-static void planedited(Gui *g, Arena scratch, GuiSession *s)
+// to the user, and in the Plan window, fetched again. The file is at
+// path, here; the ask is req's, else the plan's waiting.
+static void planedited(Gui *g, Arena scratch, GuiSession *s, Str path, Str req)
 {
     View *v = s->view;
     if (!v) {
         return;
     }
     Arena a = scratch;
-    i32   i = g->edreq.len ? findask(v, g->edreq) : planask(v);
+    i32   i = req.len ? findask(v, req) : planask(v);
     if (i >= 0) {
-        Read rd = os_read(g->os, &a, g->edpath, (iz)64<<10);
+        Read rd = os_read(g->os, &a, path, (iz)64<<10);
         Str  t  = rd.err==READ_OK ? trimright(rd.data) : Str{};
         settext(v, &v->msgs[i], t, 1);
         g->planedits++;
@@ -8354,7 +8401,7 @@ static void editend(Gui *g, Arena scratch, i32 status)
     } else if (g->edplan && g->edfar) {
         planreadstart(g, s, g->edreq);  // read again there, through its engine
     } else if (g->edplan) {
-        planedited(g, a, s);
+        planedited(g, a, s, g->edpath, g->edreq);
     } else if (status == 0) {
         Read rd = os_read(g->os, &a, g->edpath, DRAFT_MAX+2);
         Str  t  = editortext(rd.data);
@@ -15085,6 +15132,9 @@ enum : i32 {
     OP_A11Y,      // an accessibility command, text (driveax)
     OP_NSTEXT,    // macOS: text to the text input as Dictation sends it
                   // (GEV_NSTEXT, dx its kind), checked to be logged
+    OP_TERMEDITOR,// dy 0: [ui] editor gui.py's fake mg, a terminal editor,
+                  // by the path PROSPERO_TEST_MG gives, unless it is unset,
+                  // which skips dx ops; dy 1: [ui] editor as it was
 };
 // OP_TEXTCWD with text types the --cwd directory and text after it, on
 // Windows with backslashes, as a Windows user types a path.
@@ -15676,6 +15726,8 @@ enum : i32 {
     CHK_MARKSHOWN,    // the session OP_MARKSESS remembered is shown
     CHK_NOTED,        // idle, the latest note begins with text, or text
                       // "BEGINNING|PART" begins so and has that part
+    CHK_PLANTAB,      // the plan waiting is out in a Terminal tab (Edit
+                      // plan), Approve held, the window's editor idle
     CHK_COUNT,
 };
 
@@ -16024,6 +16076,7 @@ static Str chknames[] = {
     "the transcript's place is as said",
     "the session remembered is shown",
     "the latest note begins as said",
+    "the plan waiting is out in a Terminal tab, Approve held",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -22167,6 +22220,26 @@ static DriveOp planops[] = {
     {OP_CHECK, CHK_PLANMODE, 1, 0, 0, ""},
     {OP_CHECK, CHK_PLANMODEL, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "plan-4-again"},
+    // Edit plan with a terminal [ui] editor, gui.py's fake mg: in a
+    // Terminal tab of the session, Approve held while it runs; saved,
+    // the tab closes back to the session, and the ask and the Plan
+    // window show the plan as mg wrote it. Then the test script again.
+    {OP_TERMEDITOR, 0, 16, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "edit plan"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_TERM, 0, 0, 10000, "fake mg ["},
+    {OP_CHECK, CHK_PLANTAB, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TERMFOCUS, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "plan-terminal"},
+    {OP_TEXT, 0, 0, 0, 100, "w # Plan v3, typed in mg"},
+    TERMKEY(GKEY_ENTER, 300),
+    {OP_WAIT, W_TERMCOUNT, 0, 0, 5000, ""},
+    {OP_WAIT, W_PLAN, 0, 0, 10000, "typed in mg"},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PLANEDITED, 0, 0, 0, "typed in mg"},
+    {OP_CHECK, CHK_PLANMODE, 1, 0, 0, ""},
+    {OP_TERMEDITOR, 0, 0, 1, 0, ""},
     // The Plan window's editor button, which while the plan waits is
     // its ask's Edit plan: the plan file out in the editor, Approve
     // held meanwhile, then the ask and the Plan window show it as
@@ -29504,6 +29577,11 @@ static b32 drivecheck(Gui *g, i32 chk)
         return g->sess && !g->edproc && k>=0 && named &&
                planreading(g, g->sess, v->msgs[k].tool->req);
     }
+    case CHK_PLANTAB: {
+        i32 k = planask(v);
+        return g->sess && g->sess->plantab && !g->edproc && k>=0 &&
+               planediting(g, g->sess, v->msgs[k].tool->req);
+    }
     case CHK_PLANPLAIN:
         return g->sess && g->edsess==g->sess && g->edplan && g->edproc &&
                !g->edreq.len && planask(v)<0;
@@ -31093,6 +31171,18 @@ static void drivestep(Gui *g)
     case OP_EDITOR: {
         Str *dst = op->dx==0 ? &g->editor : op->dx==1 ? &g->edjumpfmt : &g->edremote;
         *dst = Str(op->text);
+    } break;
+    case OP_TERMEDITOR: {
+        Str mg = op->dy!=0 ? Str{} : os_getenv(g->os, &g->perm, "PROSPERO_TEST_MG");
+        if (op->dy != 0) {
+            g->editor = g->editorkept;
+        } else if (mg.len) {
+            g->editorkept = g->editor;
+            g->editor     = mg;
+        } else {
+            guilog(g, "drive: skip, with no fake mg (PROSPERO_TEST_MG)");
+            g->drivepc += (i32)op->dx;
+        }
     } break;
     case OP_IFFSSTALL:
         // gui.py sets it here, and passes it to a remote host it starts

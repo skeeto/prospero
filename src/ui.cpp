@@ -2356,9 +2356,13 @@ static void drawforce(Gui *g, GuiSession *s, ViewMsg *m)
 }
 
 // Whether the plan of the session is out in the editor, for the ask req
-// (Approve held), or for none, which holds any.
+// (Approve held), or for none, which holds any; or in a Terminal tab
+// (plantabof), which holds whichever plan waits as it closes.
 static b32 planediting(Gui *g, GuiSession *s, Str req)
 {
+    if (s->plantab && s->view && plantabof(g, s, s->view->planpath)) {
+        return 1;
+    }
     return g->edsess==s && g->edplan && (!g->edreq.len || g->edreq==req);
 }
 
@@ -2370,12 +2374,19 @@ static b32 planreading(Gui *g, GuiSession *s, Str req)
 }
 
 // Why a session's plan file cannot go out to the editor, or empty: a
-// plan on this computer does, and one on an ssh remote in an editor
-// here that reaches it itself (planfar).
+// plan on this computer does, one on an ssh remote in an editor here
+// that reaches it itself (planfar), and, for an editor that runs in a
+// terminal, any in a Terminal tab where the plan is (plantab).
 static Str planeditwhy(Gui *g, GuiSession *s, Str path, Arena *a)
 {
     if (!path.len) {
         return "No plan file";
+    } else if (plantab(g, a, s, path)) {
+        if (s->host->kind==GH_REMOTE && g->planread.s && g->planread.s!=s) {
+            return "Another session's plan is being read again from its host, as the "
+                   "editor left it";
+        }
+        return plantabwhy(g, a, s, path);
     } else if (s->host->kind != GH_REMOTE) {
         return editorwhy(g, s, a);
     }
@@ -2413,6 +2424,20 @@ static void planeditbutton(Gui *g, Arena scratch, GuiSession *s, Str path, Str r
             ImGui::TextDisabled("reading the plan from %s...", cstr0(&a, name));
         }
         itemnamed(g, "plan reading");
+        return;
+    }
+    TermTab *tt = s->plantab ? plantabof(g, s, path) : 0;
+    if (tt) {
+        Str name = termeditname(tt);
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextDisabled("editing in %s, in a Terminal tab...",
+                            name.len ? cstr0(&a, name) : "the editor");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Show##plantab")) {
+            plantabrun(g, a, s, path);
+        }
+        itemnamed(g, "show plan editor");
+        itemtip("Show its Terminal tab: Approve waits until the editor exits");
         return;
     }
     if (g->edsess==s && g->edplan) {

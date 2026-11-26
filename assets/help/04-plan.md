@@ -40,11 +40,16 @@ shows it:
   what to change.
 - **Edit plan** opens the plan file in your editor, to revise it by
   hand first. Approve plan waits until the editor is closed, and the
-  agent is told you revised the plan. This works for a session on
-  this computer, and for one on an ssh remote whose files your editor
-  reaches itself ([Hosts](help:hosts#sessions-on-a-remote)): once the
-  editor closes, Approve plan waits a moment more while the plan is
-  read again there.
+  agent is told you revised the plan. An editor that runs in a
+  terminal, such as `vim`, opens in a Terminal tab of the session, as
+  Files' Open in editor does, wherever the plan is (on Linux with no
+  editor set, the login shell's `$VISUAL` or `$EDITOR`, else `vi`);
+  its tab closes back to the session once it exits. An editor with a
+  window of its own works for a session on this computer, and for one
+  on an ssh remote whose files it reaches itself
+  ([Hosts](help:hosts#sessions-on-a-remote)). For a plan on a remote,
+  once the editor closes, Approve plan waits a moment more while the
+  plan is read again there.
 
 A plan approval has no countdown: it waits for you. The model may be
 switched from the Prompt's status line while it waits.
@@ -94,7 +99,7 @@ text, and right-click to copy it as text or as Markdown.
 
 Reveal is only for a plan on this computer; View in editor also opens
 an ssh remote's, as Edit plan does. The editor is `[ui] editor`, else
-`$VISUAL` or `$EDITOR`, and it must wait until you are done, as
-`gvim -f` does; for an ssh remote's plan,
+`$VISUAL` or `$EDITOR`, and one with a window of its own must wait
+until you are done, as `gvim -f` does; for an ssh remote's plan,
 [`[ui] editor_remote`](settings:ui#editor_remote) instead when it is
 set (see [Configuration](help:config)).

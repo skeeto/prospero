@@ -34,8 +34,8 @@ the X at the field's end, empties it.
 **Open in editor**, beside Reload, opens the file itself in your
 editor (`[ui] editor`, else `$VISUAL` or `$EDITOR`), to edit it by
 hand, in an editor with a window of its own: a `[ui] editor` that runs
-in a terminal, such as `vim`, is refused here, as for drafts and
-plans, while on macOS one named only by `$VISUAL` or `$EDITOR` gives
+in a terminal, such as `vim`, is refused here, as for drafts (plans
+open in a Terminal tab), while on macOS one named only by `$VISUAL` or `$EDITOR` gives
 way to the default text editor. A missing file is first created: from
 the built-in copy, as by a first save, or empty for one named by `-c`.
 Once the editor exits, Settings reads the file again.
@@ -331,11 +331,12 @@ and are asked to test their work, which a small model needs.
   or the configuration file in an editor, given the file as one more
   word, and the editor of the Files pane's Open in editor. For a
   draft, a plan or the configuration file it must wait until you are
-  done and open a window of its own, as `code --wait`, `subl -w` or
-  `gvim -f` do. Empty, it is `$VISUAL`, else `$EDITOR`, else on macOS
-  the default text editor, which you then quit; on macOS a terminal
-  editor named only by `$VISUAL` or `$EDITOR` gives way to that default
-  for drafts, plans and the configuration file. Open in editor runs an
+  done, as `code --wait`, `subl -w` or `gvim -f` do, and for a draft
+  or the configuration file open a window of its own. Empty, it is
+  `$VISUAL`, else `$EDITOR`, else on macOS the default text editor,
+  which you then quit; on macOS a terminal editor named only by
+  `$VISUAL` or `$EDITOR` gives way to that default for drafts and the
+  configuration file. Open in editor and Edit plan run an
   editor that runs in a terminal (`vim`, `nvim`, `nano`, `hx`,
   `emacs -nw`) in a Terminal tab of the file's session
   ([Files](help:sessions#files)), on Linux and macOS through your login

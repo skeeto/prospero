@@ -2310,6 +2310,21 @@ def main():
             editor = host.path("plan-edit.sh")
             host.write(editor, PLAN_EDITOR)
             extra += f"\n# Edit plan's editor, a test script\n[ui]\neditor = sh {shword(editor)}\n"
+            # And a terminal editor for Edit plan's Terminal tab, the fake
+            # mg by its full path, which the checklist sets as [ui] editor
+            # (OP_TERMEDITOR); the login shell its tab starts through,
+            # plain sh
+            mg = host.path("mg")
+            host.write(mg, MG_EDITOR)
+            if os.name == "nt":
+                sh = shutil.which("sh").replace("\\", "/")
+                host.write(host.path("mg.cmd"),
+                           f'@"{sh}" "%~dp0mg" %*\r\n@exit /b %errorlevel%\r\n')
+                mg = host.path("mg.cmd")
+            else:
+                os.chmod(mg, 0o755)
+                os.environ["SHELL"] = "/bin/sh"
+            os.environ["PROSPERO_TEST_MG"] = shword(mg)
         before = config(curl, model, 60, extra)
     elif args.mode == "mcp":
         # A fake MCP server over HTTP that wants a sign-in (OAuth), here,

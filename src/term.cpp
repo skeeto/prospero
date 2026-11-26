@@ -118,6 +118,7 @@ struct TermTab {
     i32         edcol;     // 0 for none
     b32         edpane;    // the Terminal pane was hidden as it opened
     b32         ednamed;   // title names the editor (OSC 1, or the reply)
+    b32         edplan;    // a session's plan, from Edit plan (plantabrun)
     // What Run in Terminal knows of its shell (termstate), times in µs
     // (os_ticks): from term.open's reply, its marks, and what was typed
     i32         kind;      // TERMK_*
@@ -151,7 +152,7 @@ struct TermTab {
 
 // Files' side of an editor tab (files.cpp): its file shown again, read
 // again, as the editor exits; or marked to be checked, as it ends.
-static void editdone(Gui *, GuiSession *, GuiHost *, Str, b32);
+static void editdone(Gui *, GuiSession *, GuiHost *, Str, b32, b32);
 static void termeditstale(Gui *, GuiSession *, TermTab *);
 
 // Cmd/Ctrl+click on a link or a path in a tab
@@ -743,6 +744,7 @@ static void termpend(Gui *g, TermTab *tt)
 }
 
 static void termlaunch(Gui *, GuiSession *, TermTab *, i32, i32);
+static void plantabsweep(Gui *);
 
 // An editor's or a Run's tab that waits to start (TT_NONE), started at
 // a size, or failed if its root can have no terminal now.
@@ -791,6 +793,7 @@ static void termsweep(Gui *g)
             termpend(g, tt);
         }
     }
+    plantabsweep(g);
 }
 
 // Start a shell in a tab of root s, at a size, or an editor tab's
@@ -979,6 +982,45 @@ static TermTab *termedit(Gui *g, GuiSession *s, Str path, i32 line, i32 col)
     }
     scheddirty(&g->sched);
     return tt;
+}
+
+// The Terminal tab with session s's plan file at path open (Edit plan,
+// or Open in editor on it), its editor running or about to, else null.
+static TermTab *plantabof(Gui *g, GuiSession *s, Str path)
+{
+    GuiSession *root = path.len ? termroot(g, s) : 0;
+    TermTab    *tt   = root && root->terms.n ? termeditof(root, path) : 0;
+    return tt && termediting(tt) ? tt : 0;
+}
+
+// Each frame: a plan out in a Terminal tab of Edit plan's (plantabrun),
+// its editor started again by Restart too, read again once the editor
+// is done, however it went: exited, its tab closed or killed, or its
+// host lost. A remote's is read through its engine there
+// (planreadstart), as a plan an editor here reached by ssh.
+static void plantabsweep(Gui *g)
+{
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        View    *v  = s->view;
+        TermTab *tt = !s->gone && v && v->planpath.len ? plantabof(g, s, v->planpath) : 0;
+        if (tt && tt->edplan) {
+            s->plantab = 1;
+            continue;
+        } else if (!s->plantab) {
+            continue;
+        }
+        s->plantab = 0;
+        if (s->gone || !v) {
+            continue;
+        }
+        guilog(g, "a plan's Terminal tab is done");
+        if (s->host->kind == GH_REMOTE) {
+            planreadstart(g, s, {});
+        } else {
+            planedited(g, g->frame, s, v->planpath, {});
+        }
+        scheddirty(&g->sched);
+    }
 }
 
 // The key of a message's code block, by which a tab knows the last Run
@@ -1475,8 +1517,9 @@ static b32 termapply(Gui *g, GuiHost *h, Arena scratch, EvRec *r)
                 GuiHost *eh   = tt->host;
                 Str      path = clone(&scratch, tt->edpath);
                 b32      pane = tt->edpane;
+                b32      plan = tt->edplan;
                 termdrop(g, o, termsetfind(&o->terms, tt), 0);
-                editdone(g, o, eh, path, pane);
+                editdone(g, o, eh, path, pane, !plan);
                 return 1;
             }
             termdrop(g, o, termsetfind(&o->terms, tt), 0);

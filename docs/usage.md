@@ -372,7 +372,10 @@ approval, showing the plan: Approve plan lets it go ahead, and Keep
 planning sends it a note. Edit plan opens the plan file in the editor
 (as Ctrl+G does a draft), on this computer or, in an editor that
 reaches it over ssh, on an ssh remote (read again there once the
-editor exits), to revise it by hand first: the agent carries out the plan as the file has it when
+editor exits); an editor that runs in a terminal opens it in a
+Terminal tab where the plan is, as Files' Open in editor does,
+Approve held until it exits and the tab closing back to the session.
+That is to revise it by hand first: the agent carries out the plan as the file has it when
 approved, told that you revised it. The model may be changed while
 the plan waits. The Plan pane shows the plan file, which stays after
 approval, rendered as the transcript renders Markdown, its text

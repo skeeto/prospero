@@ -1751,6 +1751,8 @@ struct FileEdit {
 // never falls back, else the address a known editor takes (farjump);
 // else in a Terminal tab of root there, with the editor editask sends,
 // or none, the host's own.
+static FileEdit fileedittab(Gui *, Arena *, GuiSession *, u64, Str, EditAsk);
+
 static FileEdit fileedit(Gui *g, Arena *a, GuiSession *root, u64 host, Str path, i32 line,
                          i32 col)
 {
@@ -1796,6 +1798,17 @@ static FileEdit fileedit(Gui *g, Arena *a, GuiSession *root, u64 host, Str path,
             }
         }
     }
+    return fileedittab(g, a, root, host, path, ask);
+}
+
+// Open in editor's Terminal tab of root, for a file of a host (uid, 0
+// for this computer) and the editor ask sends: FE_TAB, FE_SHOW the tab
+// open on it already, else FE_WHY.
+static FileEdit fileedittab(Gui *g, Arena *a, GuiSession *root, u64 host, Str path,
+                            EditAsk ask)
+{
+    FileEdit r = {};
+    r.root  = root;
     r.name  = ask.name;
     r.on    = host ? filehostname(g, a, host) : Str{};
     r.how   = FE_WHY;
@@ -1864,6 +1877,33 @@ static void fileeditrun(Gui *g, Arena a, GuiSession *root, u64 host, Str path, i
     }
 }
 
+// Edit plan's Terminal tab (plantab) for session s's plan file at path,
+// on its host, in its root's tabs: why not, else empty, as Files' Open
+// in editor has it (fileedittab).
+static Str plantabwhy(Gui *g, Arena *a, GuiSession *s, Str path)
+{
+    GuiHost *h = s->host->kind==GH_REMOTE ? s->host : 0;
+    FileEdit e = fileedittab(g, a, termroot(g, s), fileuid(s->host), path, editask(g, a, h));
+    return e.how==FE_WHY ? e.why : Str{};
+}
+
+// Edit plan in a Terminal tab (plantab): the tab open on the plan
+// already, shown, else a new one, run as Open in editor's, which closes
+// back to the session, not to Files, and has the plan read again as the
+// editor is done (plantabsweep). The caller checked it can
+// (plantabwhy).
+static void plantabrun(Gui *g, Arena a, GuiSession *s, Str path)
+{
+    navjump(g);
+    TermTab *tt = termedit(g, termroot(g, s), path, 0, 0);
+    tt->edplan = 1;
+    if (!s->plantab) {
+        guilog(g, concat(&a, "editing a plan in a Terminal tab: ", path));
+    }
+    s->plantab = 1;
+    s->note    = {};
+}
+
 // Open in editor's tooltip while it can, as fileedit has it.
 static Str fileedittip(Arena *a, FileEdit *e)
 {
@@ -1918,11 +1958,13 @@ static void termeditstale(Gui *g, GuiSession *root, TermTab *tt)
 }
 
 // An editor's tab in root closed as the editor exited with status 0:
-// its file, of host h, on path, shown again in Files, read again, with
-// the focus, as the root is shown; the Terminal pane hidden again if it
-// was as the editor opened (hide) and has no tab left. A root not shown
-// only has the file marked.
-static void editdone(Gui *g, GuiSession *root, GuiHost *h, Str path, b32 hide)
+// its file, of host h, on path, shown again in Files (files), read
+// again, with the focus, as the root is shown; else (Edit plan's) the
+// Plan pane, if shown, back in front of its node, which the Terminal
+// pane may have taken, and the prompt with the focus; the Terminal pane
+// hidden again if it was as the editor opened (hide) and has no tab
+// left. A root not shown only has the file marked.
+static void editdone(Gui *g, GuiSession *root, GuiHost *h, Str path, b32 hide, b32 files)
 {
     u64      uid = fileuid(h);
     GuiHost *fh  = filehost(g, uid);
@@ -1934,7 +1976,14 @@ static void editdone(Gui *g, GuiSession *root, GuiHost *h, Str path, b32 hide)
         return;
     }
     g->termletgo = 1;
-    filesopen(g, root, uid, path, 0, 0, {});
+    if (files) {
+        filesopen(g, root, uid, path, 0, 0, {});
+    } else {
+        if (g->panes[PANE_PLAN]) {
+            g->panefocus = PANE_PLAN + 1;
+        }
+        g->promptfocus = 1;
+    }
     if (hide && !root->terms.n) {
         setpane(g, PANE_TERMINAL, 0);
     }

@@ -67,7 +67,12 @@ its why shows). Edit plan on such a session's plan runs the same
 command, waited for, from the home directory; once it exits, the plan
 file is read again through the engine there (CMD_FILE `plan.md`, as
 the Plan pane does; `PlanRead`), Approve held until the text is in,
-asked again once the host is back if it drops. The engine itself is
+asked again once the host is back if it drops. Where no editor here
+reaches it (WSL, `exec`, a container, no address form) or the editor
+runs in a terminal, and `editor_remote` is not set, Edit plan opens it
+in a Terminal tab there instead, as Open in editor does (`plantab`,
+`fileedittab`); `plantabsweep` reads it again the same way once that
+editor is done, however its tab ended. The engine itself is
 unchanged: `planresolve` reads `plan.md` from its own disk at approval
 and tells the agent it was revised.
 
