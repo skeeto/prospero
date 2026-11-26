@@ -8908,12 +8908,52 @@ static b32 planwaits(View *v)
 // now, or empty: as the engine's mode command has it, at any time, even
 // mid-turn, which goes on in the new mode, but never while the agent
 // asks about plan mode itself.
+// Whether an endpoint, by name or relayed URL, is the built-in model,
+// as the host's listing has it.
+static b32 epbuiltin(GuiHost *h, Str name)
+{
+    if (relayurl(name).ok) {
+        return relayurl(name).kind == EP_BUILTIN;
+    }
+    for (iz i = 0; h && i < h->eps.len; i++) {
+        if (h->eps[i].name == name) {
+            return h->eps[i].kind == "builtin";
+        }
+    }
+    return 0;
+}
+
+// Why a session's tools leave out plan mode's, or empty. The record
+// lists them when they differ from the usual, and a role's include
+// plan mode's only by name, so a role's unlisted have none.
+static Str noplanwhy(GuiSession *s)
+{
+    View *v = s->view;
+    if (!v->tools.len) {
+        return v->role.len ? Str("Not in this role: its tools do not include exit_plan_mode")
+                           : Str{};
+    }
+    for (Cut c = {{}, v->tools, 1}; c.ok;) {
+        c = cut(c.tail, ' ');
+        if (c.head == "exit_plan_mode") {
+            return {};
+        }
+    }
+    return v->role.len ? Str("Not in this role: its tools do not include exit_plan_mode") :
+           epbuiltin(s->host, v->endpoint)
+               ? Str("Not with the built-in model: its sessions get a small set of "
+                     "tools, without plan mode's, unless a role names them")
+               : Str("Not with its tools: they do not include exit_plan_mode");
+}
+
 static Str modewhy(Gui *g, GuiSession *s, Str mode)
 {
     View *v   = s->view;
     Str   cap = mode=="bypass" ? Str("bypass") : Str("plan");
     Str   why = sesswhy(g, s, cap, 0, !sessremote(s));
     if (why.len || !v) {
+        return why;
+    } else if (mode=="plan" && !v->plan && (why = noplanwhy(s)).len) {
         return why;
     }
     for (iz i = v->msgs.len-1; v->asks && i >= 0; i--) {
@@ -13851,6 +13891,10 @@ static void drawnew(Gui *g)
         hasrole |= it;
         noplan  |= it && !roles[i].plans;
     }
+    // Without a role, the built-in model's sessions get a small set of
+    // tools, without plan mode's
+    Str epname  = trim({(u8 *)g->newep, (iz)__builtin_strlen(g->newep)});
+    b32 smallbl = !hasrole && !import && epbuiltin(host, epname.len ? epname : host->epdflt);
     if (roles.len) {
         ImGui::Spacing();
         ImGui::TextUnformatted("Role");
@@ -13888,15 +13932,18 @@ static void drawnew(Gui *g)
     if (plan) {
         // Plan mode's tools are a role's only when it names them
         ImGui::Spacing();
-        ImGui::BeginDisabled(noplan);
+        ImGui::BeginDisabled(noplan || smallbl);
         b32 off = 0;
-        checkbox("Plan mode", noplan ? &off : &g->newplan);
+        checkbox("Plan mode", noplan || smallbl ? &off : &g->newplan);
         ImGui::EndDisabled();
         itemnamed(g, "new plan");
-        whytip(noplan ? Str("Not in this role: its tools do not include exit_plan_mode")
-                      : Str("The agent explores and writes a plan for you to approve "
-                            "before it changes anything"));
+        whytip(noplan  ? Str("Not in this role: its tools do not include exit_plan_mode") :
+               smallbl ? Str("Not with the built-in model: its sessions get a small set "
+                             "of tools, without plan mode's, unless a role names them")
+                       : Str("The agent explores and writes a plan for you to approve "
+                             "before it changes anything"));
     }
+    noplan |= smallbl;
     if (g->newerr.len) {
         ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
         ImGui::TextWrapped("%s", cstr0(&a, g->newerr));

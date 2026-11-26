@@ -34,7 +34,9 @@ here... in a host's menu in the sidebar, opens the New session dialog:
   session with a role may use Plan mode only if the role's tools name
   `exit_plan_mode`.
 - **Plan mode**: start in Plan mode (below). Greyed out for a role
-  whose tools do not name `exit_plan_mode`.
+  whose tools do not name `exit_plan_mode`, and for the built-in model
+  without a role: its sessions get a small set of tools (read, write,
+  edit, shell, grep and glob), without Plan mode's.
 
 Once the session is made, the prompt box has the keyboard, so its first
 message may be typed at once.

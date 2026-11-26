@@ -432,6 +432,7 @@ enum : i32 {
 struct GuiEndpoint {
     Str        name;
     Str        url;
+    Str        kind;    // as configured: openai, builtin, ...
     b32        ok;
     Str        err;     // why not, if not
     Slice<Str> models;  // ids, as listed
@@ -3740,6 +3741,8 @@ static void onhostlist(Gui *g, GuiHost *h, Arena scratch, Json *j, b32 ok)
         putbyte(&sig, 0);
         print(&sig, jsonstr(jsonget(e, "url")));
         putbyte(&sig, 0);
+        print(&sig, jsonstr(jsonget(e, "kind")));
+        putbyte(&sig, 0);
         print(&sig, jsonint(jsonget(e, "ok"), 0));
         print(&sig, jsonstr(jsonget(e, "err")));
         print(&sig, jsonint(jsonget(e, "signedin"), 0));
@@ -3766,6 +3769,7 @@ static void onhostlist(Gui *g, GuiHost *h, Arena scratch, Json *j, b32 ok)
         GuiEndpoint ep = {};
         ep.name = clone(a, jsonstr(jsonget(e, "name")));
         ep.url  = clone(a, jsonstr(jsonget(e, "url")));
+        ep.kind = clone(a, jsonstr(jsonget(e, "kind")));
         ep.ok   = jsonint(jsonget(e, "ok"), 0) != 0;
         ep.err  = clone(a, jsonstr(jsonget(e, "err")));
         ep.signedin = jsonint(jsonget(e, "signedin"), 0) != 0;
