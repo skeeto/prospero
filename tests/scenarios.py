@@ -21542,7 +21542,11 @@ def term_read_commands(t):
         long = "Start-Sleep 30"
     else:
         shell = "bash"
-        env["HOME"] = hookhome(t, "home", {".bashrc": "PS1='p$ '\n"})
+        # No job control: on macOS under load, bash's child sometimes
+        # loses the setpgid race with its parent, about once in 4,000
+        # forks, and prints "child setpgid (N to N): Operation not
+        # permitted" into the output these checks compare exactly.
+        env["HOME"] = hookhome(t, "home", {".bashrc": "PS1='p$ '\nset +m\n"})
         env["BASH_SILENCE_DEPRECATION_WARNING"] = "1"
         cmds = [("echo one; echo two", "D;0"), ("sh -c 'echo bad; exit 3'", "D;3"),
                 ("seq -f n%g 300", "D;0")]
