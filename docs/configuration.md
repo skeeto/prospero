@@ -452,6 +452,14 @@ to an included server, a `token = file:PATH` say, or `trust = yes`,
 which for a url from a web include wait for your approval (see
 Includes).
 
+`lazy = yes` (or `[tools] mcp_lazy = yes`, for every server whose
+section doesn't say) keeps a server stopped and its tools out of
+sessions until the agent opens it with `open_mcp_server`, from a list
+in its prompt of such servers, each with its `description`. Its tools
+then join the session, and stay. A role that names the server has it
+from the start; subagents have those their parent opened. With many
+servers, this keeps each request to the tools of those in use.
+
 A project's `.mcp.json`, in Claude Code's format, with `${VAR}` and
 `${VAR:-default}` expanded, is read once as a session starts, from its
 folder up to the repository's root. Its servers start only once you
@@ -460,7 +468,8 @@ definitions change. A call to one may also trust its server in that
 project, from then on, under the same condition. Your own section of
 the same name wins if it has a `command` or `url`. One with neither
 adjusts projects' servers of that name instead, with `tools`,
-`enabled`, `timeout` and `startup_timeout` only: never `trust`, a
+`enabled`, `timeout`, `startup_timeout`, `lazy` and `description`
+only: never `trust`, a
 `token`, headers, `cwd`, `env.NAME` or the sign-in's client keys.
 
 A server over HTTP may take a bearer `token` (as `env:NAME`) or

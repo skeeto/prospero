@@ -5,7 +5,8 @@ Model Context Protocol over its standard input and output, or a
 service reached over HTTP. Its tools are offered beside the built-in
 ones, each named `mcp__SERVER__TOOL`, and a session's first request
 waits for its servers to start ("starting MCP servers"), at most each
-one's `startup_timeout`.
+one's `startup_timeout`. A lazy server waits instead until the agent
+opens it: see [Lazy servers](help:mcp#lazy-servers).
 
 ## Configuring one
 
@@ -43,6 +44,37 @@ file may add to an included server, such as its `token` or
 waits for your approval: see
 [Approving web includes' urls](help:config#approving-web-includes-urls).
 
+## Lazy servers
+
+Each server's tools cost a request their whole descriptions, used or
+not. With `lazy = yes` in its section, or `[tools] mcp_lazy = yes` for
+every server whose section doesn't say, a server stays stopped and its
+tools out of sessions. The agent's prompt lists such servers instead,
+each by its name and its `description`, one line:
+
+    [mcp tracker]
+    url = https://tracker.example.com/mcp
+    lazy = yes
+    description = The team's issue tracker: issues, comments, milestones
+
+When a task needs one, the agent calls `open_mcp_server` with its
+name: the server starts, the call waits for it as a first request
+would, and its tools join the session from then on, the result naming
+them with the server's instructions. Nothing ever closes it for that
+session. A Stop while it starts ends the call, the server not opened.
+
+On Anthropic's API, the new tools are defined in the conversation
+where they joined, so the cached prompt before them still serves (a
+model's `inline_tools` setting says where); elsewhere, the request
+after an open rewrites the cache once.
+
+A role that names the server (`mcp__NAME` or `mcp__NAME__TOOL`) has it
+from the start, as if not lazy. Subagents have the servers their
+parent opened, as far as their role allows. A summary keeps opened
+servers open, and a rewind to before an open undoes it. A project's
+server is still approved before the session's first request, so an
+open never stops to ask about it.
+
 ## Asks
 
 A call asks you first, as a write does, showing the server, the tool
@@ -71,8 +103,9 @@ section of your own by the same name, with a `command` or a `url`,
 wins.
 
 A section with neither only adjusts projects' servers of its name, in
-every project: its `tools`, `enabled`, `timeout` and
-`startup_timeout` apply to them, so `enabled = no` leaves them out
+every project: its `tools`, `enabled`, `timeout`,
+`startup_timeout`, `lazy` and `description` apply to them, so
+`enabled = no` leaves them out
 without asking, and nothing else does. A project chooses where its
 servers run and what they are sent, so such a section never gives
 them `trust`, a `token`, headers, `cwd`, `env.NAME` or a sign-in's

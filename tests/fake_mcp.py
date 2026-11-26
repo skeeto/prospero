@@ -22,7 +22,8 @@ nextCursor, and gives instructions. Its tools:
 After notifications/initialized it sends the client a ping and a
 roots/list request, and logs the responses. Every message it reads, and
 those responses, is appended as a JSON line to the file FAKE_MCP_LOG
-names, if set. FAKE_MCP_VERSION sets the protocol version it answers.
+names, if set. FAKE_MCP_VERSION sets the protocol version it answers,
+and FAKE_MCP_SLOW the seconds it takes to answer initialize.
 FAKE_MCP_EXTRA, a JSON list of tool definitions, adds them to its own;
 "@PATH" reads the list from a file, for one too large for the environment.
 
@@ -189,6 +190,7 @@ def main():
         if method is None:
             continue  # a response to our requests: logged
         if method == "initialize":
+            time.sleep(float(os.environ.get("FAKE_MCP_SLOW", "0")))
             send({"jsonrpc": "2.0", "id": rid, "result": {
                 "protocolVersion": version,
                 "capabilities": {"tools": {}},
@@ -420,6 +422,7 @@ def serve_http():
                 self.reply(202)
                 return
             if method == "initialize":
+                time.sleep(float(os.environ.get("FAKE_MCP_SLOW", "0")))
                 sid = uuid.uuid4().hex
                 with LOCK:
                     SESSIONS.add(sid)

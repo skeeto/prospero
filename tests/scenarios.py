@@ -6068,7 +6068,7 @@ def role_words(t):
                 f"roles {list(roles)}")
         default = ["read", "write", "edit", "shell", "grep", "glob", "todo_write", "jobs",
                    "job_output", "job_kill", "task", "skill", "sessions", "send_message",
-                   "memory", "web_search", "web_fetch", "read_terminal"]
+                   "memory", "web_search", "web_fetch", "read_terminal", "open_mcp_server"]
         every = default[:11] + ["desktop"] + default[11:]
         t.check(roles["general"]["tools"] == default, f"general {roles['general']}")
         t.check(roles["every"]["tools"] == every, f"* {roles['every']}")
@@ -14947,6 +14947,278 @@ def an_noinline_tick(t):
         thinks = [b for m in bodies[2]["messages"] if m["role"] == "assistant"
                   for b in m["content"] if b["type"] == "thinking"]
         t.check(not thinks, f"the reasoning left out: {thinks}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+def lazymcp(**kw):
+    """The fake MCP server, lazy, its echo tool alone, trusted."""
+    return mcpconf(trust="yes", tools="echo", lazy="yes", description="Echoes things.", **kw)
+
+
+LAZYAN = {**AN, **lazymcp(), "_extra": "[model {model}]\ninline_tools = yes\n"}
+
+
+def anroles(body):
+    return [m["role"] for m in body["messages"]]
+
+
+def anfull(t, h, sid, ks):
+    """Each request numbered in ks read all of the one before from the
+    cache."""
+    us = [e["usage"] for e in h.all("assistant", sid)]
+    for k in ks:
+        whole = us[k-1]["cached"] + us[k-1].get("written", 0)
+        t.check(us[k]["cached"] == whole, f"request {k} read all of {k-1}: {us}")
+
+
+def anopenrun(t, h, sid, turn, text="go"):
+    """A turn that opens the fake server, echoes and is done."""
+    h.send("prompt", sid=sid, text=text)
+    end = ended(h, sid, turn)
+    t.check(end["why"] == "done", f"turn {turn}: {end}")
+
+
+@scenario(conf=LAZYAN, bound=20)
+def an_lazy(t):
+    """A lazy server never starts until the agent opens it, listed in the
+    system prompt with its description; opened, its tools join inline,
+    the tools and system prompt as they were, every request reading the
+    whole of the one before from the cache, and its result names them
+    with the server's instructions. The record of it says which it
+    opened."""
+    h = t.headless(env={**ANENV, **mcpenv(t)})
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.send("prompt", sid=sid, text="nothing")
+        t.check(ended(h, sid, 1)["why"] == "done", "the first turn")
+        t.check(not mcplog(t), "the server never started")
+        first = t.requests()[0]["body"]
+        names = fake_provider.an_tool_names(first)
+        t.check("open_mcp_server" in names and
+                not [x for x in names if x.startswith("mcp__")], f"tools {names}")
+        sysp = first["system"][0]["text"]
+        t.check("\n# MCP servers to open\n" in sysp and
+                sysp.endswith("The servers:\n- fake: Echoes things."), f"listed: {sysp[-300:]!r}")
+
+        anopenrun(t, h, sid, 2)
+        ends = h.all("tool.end", sid)
+        t.check([e["status"] for e in ends] == ["ok", "ok"], f"statuses {ends}")
+        t.check(ends[0]["text"].startswith("Opened the MCP server fake. Its tools are "
+                                           "yours now: mcp__fake__echo.") and
+                "Use echo to repeat things." in ends[0]["text"], f"opened {ends[0]}")
+        t.check(ends[1]["text"] == "echo: hi", f"echoed {ends[1]}")
+        inits = [m for m in mcplog(t) if m.get("method") == "initialize"]
+        t.check(len(inits) == 1, f"started once: {len(inits)}")
+        reqs = t.requests()
+        t.check(len(reqs) == 4, f"four requests: {len(reqs)}")
+        bodies = [q["body"] for q in reqs]
+        t.check(all(b["tools"] == first["tools"] and b["system"] == first["system"]
+                    for b in bodies), "the tools and the system prompt as they were")
+        betas = [q["headers"].get("anthropic-beta") for q in reqs]
+        t.check(betas == [None, None, fake_provider.AN_INLINE, fake_provider.AN_INLINE],
+                f"the beta with the addition: {betas}")
+        t.check(anroles(bodies[3]) == ["user", "assistant", "user", "assistant", "user",
+                                       "system", "assistant", "user"],
+                f"the addition after the open's result: {anroles(bodies[3])}")
+        anfull(t, h, sid, (2, 3))
+        recs = logged(t, sid)
+        tools = [e for e in recs if e["ev"] == "tools"]
+        t.check(len(tools) == 1 and tools[0].get("open") == "fake", f"the record {tools}")
+        pre = [e for e in recs if e["ev"] == "prefix"][-1]
+        t.check(pre.get("mcp_lazy") == "\n- fake: Echoes things.", f"its list {pre}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf=LAZYAN, bound=20)
+def an_lazy_reload(t):
+    """A session that opened a server, opened again in another process:
+    the same bytes, read whole from the cache, and the server started
+    again for its tools, which work."""
+    env = {**ANENV, **mcpenv(t)}
+    h = b = None
+    try:
+        h = t.headless(env=env)
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        anopenrun(t, h, sid, 1)
+        t.check(h.close() == 0, "the first exits")
+        h = None
+        b = t.headless(env=env)
+        t.check(b.call("open", sid=sid, attended=1).get("ok") == 1, "open")
+        b.send("prompt", sid=sid, text="more")
+        t.check(b.wait(newevent(b, sid, "turn.end"))["why"] == "done", "the second turn")
+        end = b.all("tool.end", sid)[-1]
+        t.check(end["status"] == "ok" and end["text"] == "echo: again", f"echoed {end}")
+        reqs = t.requests()
+        t.check(len(reqs) == 5, f"five requests: {len(reqs)}")
+        body = reqs[3]["body"]
+        t.check(body["tools"] == reqs[0]["body"]["tools"] and
+                anroles(body).count("system") == 1, f"as it was: {anroles(body)}")
+        us = [e["usage"] for e in b.all("assistant", sid)][-2:]
+        t.check(us[0]["cached"] > 0 and
+                us[1]["cached"] == us[0]["cached"] + us[0].get("written", 0),
+                f"read from the cache: {us}")
+        inits = [m for m in mcplog(t) if m.get("method") == "initialize"]
+        t.check(len(inits) == 2, f"started in each process: {len(inits)}")
+    finally:
+        rc = h.close() if h else 0
+        rc2 = b.close() if b else 0
+    t.check(rc == 0 and rc2 == 0, f"headless exit {rc} {rc2}")
+
+
+@scenario(conf=LAZYAN, bound=20)
+def an_lazy_rewind(t):
+    """A cut to before an open closes the server again: the next request
+    has no addition and lists it to open, and the agent opens it again."""
+    h = t.headless(env={**ANENV, **mcpenv(t)})
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        anopenrun(t, h, sid, 1)
+        r = h.call("cut", sid=sid, turn=1)
+        t.check(r.get("ok") == 1, f"cut {str(r)[:300]}")
+        n = len(t.requests())
+        h.send("prompt", sid=sid, text="go")
+        t.check(h.wait(newevent(h, sid, "turn.end"))["why"] == "done", "the turn again")
+        body = t.requests()[n]["body"]
+        t.check(anroles(body) == ["user"], f"the conversation gone: {anroles(body)}")
+        t.check("- fake: Echoes things." in body["system"][0]["text"], "listed still")
+        ends = h.all("tool.end", sid)
+        t.check([e["status"] for e in ends] == ["ok"] * 4 and
+                ends[2]["text"].startswith("Opened the MCP server fake."), f"opened again {ends}")
+        recs = logged(t, sid)
+        t.check(len([e for e in recs if e["ev"] == "tools"]) == 2, "a second record")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf={**LAZYAN, **BIG}, bound=30)
+def an_lazy_compact(t):
+    """A summary keeps an opened server open: its tools in the rebuilt
+    prefix's tools, nothing inline, no servers left to list, and the
+    agent calls them as before."""
+    h = t.headless(env={**ANENV, **mcpenv(t)})
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        anopenrun(t, h, sid, 1, text="go " + "filler " * 20000)
+        r = h.call("compact", sid=sid)
+        t.check(r.get("ok") == 1, f"compact {r}")
+        ended(h, sid, 2)
+        n = len(t.requests())
+        h.send("prompt", sid=sid, text="more")
+        t.check(ended(h, sid, 3)["why"] == "done", "the turn after")
+        body = t.requests()[n]["body"]
+        t.check("mcp__fake__echo" in [x["name"] for x in body["tools"]] and
+                "system" not in anroles(body), f"in the tools: {anroles(body)}")
+        t.check("# MCP servers to open" not in body["system"][0]["text"], "none to open")
+        t.check(h.all("tool.end", sid)[-1]["text"] == "echo: again", "echoed")
+        pre = [e for e in logged(t, sid) if e["ev"] == "prefix"][-1]
+        t.check(pre.get("mcp_open") == ["fake"] and "mcp_lazy" not in pre, f"its prefix {pre}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf=LAZYAN, bound=20)
+def an_lazy_title(t):
+    """The fork's title, after an open: its tools inline where the turn's
+    requests had them, with the beta."""
+    h = t.headless(env={**ANENV, **mcpenv(t)})
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        anopenrun(t, h, sid, 1, text=LONG_PROMPT)
+        ev = titled(h, sid)
+        t.check(ev.get("text") == "Lazy servers", f"titled {ev}")
+        ask = t.titles()[0]
+        t.check(anroles(ask["body"]).count("system") == 1 and
+                ask["headers"].get("anthropic-beta") == fake_provider.AN_INLINE,
+                f"inline: {anroles(ask['body'])} {ask['headers']}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf=lazymcp(startup_timeout="2"), bound=40)
+def mcp_lazy_slow(t):
+    """An open waits for its server to start, else says why not: started
+    late, the open's result once it is ready; too slow, an error; and a
+    Stop meanwhile ends the open, cancelled."""
+    def opened(slow, cancel=False):
+        h = t.headless(env=mcpenv(t, FAKE_MCP_SLOW=slow))
+        try:
+            sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+            h.send("prompt", sid=sid, text="go")
+            if cancel:
+                h.wait(lambda e: e.get("ev") == "tool.start" and e.get("sid") == sid)
+                time.sleep(0.3)
+                h.call("cancel", sid=sid)
+                t.check(ended(h, sid, 1)["why"] == "cancel", "cancelled")
+            else:
+                t.check(ended(h, sid, 1)["why"] == "done", "the turn")
+            return [(e["status"], e["text"]) for e in h.all("tool.end", sid)]
+        finally:
+            t.check(h.close() == 0, "headless exit")
+    st = opened("1")
+    t.check([s for s, _ in st] == ["ok", "ok"] and st[1][1] == "echo: x", f"waited: {st}")
+    st = opened("4")
+    t.check(st[0][0] == "error" and "so it was not opened" in st[0][1] and
+            st[1][0] == "error" and "is not open" in st[1][1], f"too slow: {st}")
+    st = opened("4", cancel=True)
+    t.check(st == [("cancelled", "Stopped: the user cancelled the turn before the MCP "
+                    "server started, so it was not opened.")], f"stopped: {st}")
+
+
+@scenario(conf=lazymcp(), bound=20)
+def mcp_lazy_plan(t):
+    """Plan mode may open a server."""
+    h = t.headless(env=mcpenv(t))
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", plan=1,
+                     attended=1)["sid"]
+        h.send("prompt", sid=sid, text="go")
+        t.check(ended(h, sid, 1)["why"] == "done", "the turn")
+        ends = h.all("tool.end", sid)
+        t.check(ends[0]["status"] == "ok" and ends[0]["text"].startswith("Opened"),
+                f"opened {ends}")
+        names = fake_provider.tool_names(t.requests()[1]["body"])
+        t.check("mcp__fake__echo" in names, f"joined {names}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf={**lazymcp(), "_extra": "[role picky]\ntools = read mcp__fake\n"}, bound=20)
+def mcp_lazy_role(t):
+    """A role that names a lazy server has it from the start, with no open
+    tool and no list."""
+    h = t.headless(env=mcpenv(t))
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", role="picky")["sid"]
+        h.send("prompt", sid=sid, text="go")
+        t.check(ended(h, sid, 1)["why"] == "done", "the turn")
+        body = t.requests()[0]["body"]
+        names = fake_provider.tool_names(body)
+        t.check("mcp__fake__echo" in names and "open_mcp_server" not in names, f"tools {names}")
+        t.check("# MCP servers to open" not in fake_provider.system_of(body), "no list")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf=lazymcp(), bound=20)
+def mcp_lazy_subagent(t):
+    """A subagent has the servers its parent opened, from its start."""
+    h = t.headless(env=mcpenv(t))
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="go")
+        t.check(ended(h, sid, 1)["why"] == "done", "the turn")
+        ends = h.all("tool.end", sid)
+        t.check(len(ends) == 2 and report(ends[1]["text"]) == "mcp__fake__echo",
+                f"the subagent's: {[e['text'][:200] for e in ends]}")
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")

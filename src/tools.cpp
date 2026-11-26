@@ -22,7 +22,9 @@
 // web_fetch look things up and read pages over HTTP (engine.cpp, with
 // the text work in web.cpp), offered only where [web] says. read_terminal
 // reads the user's Terminal tabs (ptyhost.cpp), what was typed at a
-// password prompt hidden. A role may offer fewer tools, and a call to
+// password prompt hidden. open_mcp_server opens a lazy MCP server, whose
+// tools then join the session's (engine.cpp), offered only where some
+// server is lazy (lazydeny). A role may offer fewer tools, and a call to
 // one it does not is unknown.
 //
 // This is free and unencumbered software released into the public domain.
@@ -51,6 +53,7 @@ enum : i32 {
     TOOL_WEBFETCH,
     TOOL_ASKUSER,
     TOOL_READTERM,
+    TOOL_MCPOPEN,
     TOOL_COUNT,
 };
 
@@ -58,7 +61,7 @@ static Str toolnames[] = {
     "read", "write", "edit", "shell", "grep", "glob", "todo_write", "jobs",
     "job_output", "job_kill", "task", "desktop", "skill", "enter_plan_mode",
     "exit_plan_mode", "sessions", "send_message", "memory", "web_search",
-    "web_fetch", "ask_user", "read_terminal",
+    "web_fetch", "ask_user", "read_terminal", "open_mcp_server",
 };
 static_assert(countof(toolnames) == TOOL_COUNT);
 
@@ -71,7 +74,8 @@ static_assert(countof(toolnames) == TOOL_COUNT);
 // a session the user attends as it begins (cmdnew), never a subagent,
 // and with a role or a tool list only when it names ask_user ("*" and
 // "default" do not). read_terminal is offered only where the user has terminals
-// to read (termdeny), and listed by name when offered, as the web's.
+// to read (termdeny), and listed by name when offered, as the web's, and
+// open_mcp_server only where an MCP server is lazy (lazydeny), likewise.
 enum : u32 {
     TOOL_OFFMASK  = (u32)1 << TOOL_DESKTOP,
     TOOL_PLANMASK = (u32)1<<TOOL_PLANENTER | (u32)1<<TOOL_PLANEXIT,
@@ -79,6 +83,7 @@ enum : u32 {
     TOOL_WEBMASK  = (u32)1<<TOOL_WEBSEARCH | (u32)1<<TOOL_WEBFETCH,
     TOOL_ASKMASK  = (u32)1 << TOOL_ASKUSER,
     TOOL_TERMMASK = (u32)1 << TOOL_READTERM,
+    TOOL_MCPMASK  = (u32)1 << TOOL_MCPOPEN,
 };
 
 enum : i64 {
@@ -226,7 +231,8 @@ static b32 tooloffered(ToolEnv *te, i32 tool)
 // mode's. As a word of a tool list, "default".
 #define TOOLS_DEFAULT "read write edit shell grep glob todo_write jobs " \
                       "job_output job_kill task skill sessions send_message " \
-                      "memory web_search web_fetch read_terminal"
+                      "memory web_search web_fetch read_terminal " \
+                      "open_mcp_server"
 
 // The tools of a session on the built-in model, unless its role or its
 // caller names some: a small model did as well with these alone in the
@@ -1091,6 +1097,14 @@ static Str tooljson(Arena *a, ToolEnv *te)
                  "to end: you are told in a new turn, so end this one", 0, {}},
             },
         },
+        {
+            "open_mcp_server",
+            "Open an MCP server of those listed as not open yet: its tools "
+            "join yours from then on, to call as any other.",
+            {
+                {"server", "string", "Its name, as listed", 1, {}},
+            },
+        },
     };
     static_assert(countof(defs) == TOOL_COUNT);
 
@@ -1439,7 +1453,7 @@ struct Args {
     Slice<HashEdit> hedits;
     Patch           patch;      // edit as patch
     DeskArgs        desk;       // desktop
-    Str             name;       // skill, memory
+    Str             name;       // skill, memory, open_mcp_server's server
     Str             args;       // skill: its arguments, null if none
     Str             to;         // send_message: a session's id or title
     Str             text;       // send_message, memory
@@ -2593,6 +2607,12 @@ static Args parseargs(Arena *a, i32 tool, Str raw, i32 edit)
     case TOOL_PLANEXIT:
     case TOOL_SESSIONS:
         break;
+    case TOOL_MCPOPEN:
+        r.name = trim(argstr(a, &r, j, "server", 1));
+        if (r.name.data && !r.name.len) {
+            issue(a, &r, "server", "must not be empty");
+        }
+        break;
     case TOOL_MESSAGE:
         r.to   = trim(argstr(a, &r, j, "to", 1));
         r.text = argstr(a, &r, j, "text", 1);
@@ -2724,6 +2744,8 @@ static Str unknowntool(Arena *a, Str name, u32 deny)
         {"read_term", "read_terminal"}, {"readterminal", "read_terminal"},
         {"get_terminal_output", "read_terminal"},
         {"ask_followup_question", "ask_user"},
+        {"open_mcp", "open_mcp_server"}, {"mcp_open", "open_mcp_server"},
+        {"load_mcp_server", "open_mcp_server"}, {"use_mcp_server", "open_mcp_server"},
     };
     ToolEnv te = {};
     te.deny = deny;

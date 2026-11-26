@@ -874,7 +874,7 @@ static b32 toolshellish(ViewTool *t)
 // Whether a tool row folds: as the user chose, else as the session's
 // toggle or [ui] tools says. Arguments still arriving have no body yet,
 // and a skill's instructions, pages the agent reads, stay folded but
-// for a failure.
+// for a failure, as does an opened MCP server's list of tools.
 static b32 toolfolded(View *v, ViewMsg *m)
 {
     ViewTool *t = m->tool;
@@ -882,7 +882,8 @@ static b32 toolfolded(View *v, ViewMsg *m)
         return m->collapsed;
     } else if (t->status == VTOOL_STREAMING) {
         return 1;
-    } else if (t->name=="skill" && !(t->ended && t->status!=VTOOL_OK)) {
+    } else if ((t->name=="skill" || t->name=="open_mcp_server") &&
+               !(t->ended && t->status!=VTOOL_OK)) {
         return 1;
     } else if (v->foldshell && toolshellish(t)) {
         return 1;
@@ -1462,6 +1463,9 @@ static Str toolsummary(Arena *perm, Arena scratch, Str name, Str args, Str cwd)
             skill = concat(&scratch, concat(&scratch, skill, ": "), given);
         }
         return oneline(perm, skill.len ? skill : args);
+    } else if (name == "open_mcp_server") {
+        Str server = jsonstr(jsonget(j, "server"));
+        return oneline(perm, server.len ? concat(&scratch, "Open MCP server ", server) : args);
     } else if (name == "send_message") {
         // The target as given, until the result names its title
         Str to = jsonstr(jsonget(j, "to"));

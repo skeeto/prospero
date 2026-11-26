@@ -546,6 +546,9 @@ static CfgKey cfgschema[] = {
     {"tools", "task_budget", CFG_INT, "200", {}, {}, "tools",
      "Model requests a subagent may make before it is told to wrap up and "
      "report; it is stopped at half as many again"},
+    {"tools", "mcp_lazy", CFG_BOOL, "false", {}, {}, "tools",
+     "Whether MCP servers are lazy, unless their section says: started only "
+     "once the agent opens one (open_mcp_server)"},
 
     {"shell", "program", CFG_STRING, "", {}, {}, "shell",
      "Its executable, by its path (~/ the home directory) or its name on "
@@ -992,6 +995,13 @@ static CfgKey cfgschema[] = {
      "session's first request waits for"},
     {"mcp", "timeout", CFG_SECONDS, "600", {}, {}, "mcp",
      "Seconds a tool call may take"},
+    {"mcp", "lazy", CFG_BOOL, "", {}, {}, "mcp",
+     "Start the server only once the agent opens it (open_mcp_server), "
+     "from a list of such servers in its prompt, so that its tools cost "
+     "nothing until then; empty for [tools] mcp_lazy"},
+    {"mcp", "description", CFG_STRING, "", {}, {}, "mcp",
+     "What the server is for, one line, which the agent reads in its list "
+     "of servers to open (lazy)"},
 };
 
 // Value judgments
@@ -2571,7 +2581,9 @@ static void cfgsectionline(Ini *ini, Arena *perm, IniFile *f, IniFile *user,
     b32      mcpadj  = k && l->key=="mcp" &&
                        (inientry(l->section, "tools") || inientry(l->section, "enabled") ||
                         inientry(l->section, "timeout") ||
-                        inientry(l->section, "startup_timeout"));
+                        inientry(l->section, "startup_timeout") ||
+                        inientry(l->section, "lazy") ||
+                        inientry(l->section, "description"));
     b32      mcpbad  = k && l->key=="mcp" && l->value.len && mcpcmd==mcpurl &&
                        (mcpcmd || !mcpadj);
     IniEntry *search = k && l->key=="web" ? inientry(l->section, "search") : 0;
@@ -2609,7 +2621,8 @@ static void cfgsectionline(Ini *ini, Arena *perm, IniFile *f, IniFile *user,
         print(&b, mcpcmd ? Str(" has both a command and a url: set one of them")
                          : Str(" has neither a command nor a url, so it only "
                                "adjusts projects' servers of that name, with tools, "
-                               "enabled, timeout or startup_timeout"));
+                               "enabled, timeout, startup_timeout, lazy or "
+                               "description"));
     } else if (webbad) {
         print(&b, "[web] search is searxng but has no url: set it to the "
                   "instance's URL");
@@ -2879,7 +2892,8 @@ static void cfgvalidate(Config *c, Ini *ini, IniFile *user, Arena *perm)
                 }
             }
             b32 adjusts = inientry(s, "tools") || inientry(s, "enabled") ||
-                          inientry(s, "timeout") || inientry(s, "startup_timeout");
+                          inientry(s, "timeout") || inientry(s, "startup_timeout") ||
+                          inientry(s, "lazy") || inientry(s, "description");
             if (s->kind=="mcp" && s->name.len && v.len && cfgnotoverlay(e->key) && adjusts &&
                     !(inientry(s, "command") && trim(inientry(s, "command")->value).len) &&
                     !(inientry(s, "url") && trim(inientry(s, "url")->value).len)) {

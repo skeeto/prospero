@@ -176,6 +176,7 @@ static void prettyrecord(Cli *c, Arena scratch, EvRec *r)
         Str     what = name=="shell" ? jsonstr(jsonget(rp.root, "command")) :
                        name=="task"  ? jsonstr(jsonget(rp.root, "description")) :
                        name=="skill" ? jsonstr(jsonget(rp.root, "name")) :
+                       name=="open_mcp_server" ? jsonstr(jsonget(rp.root, "server")) :
                        name=="send_message" ? jsonstr(jsonget(rp.root, "to")) :
                        name=="web_search" ? jsonstr(jsonget(rp.root, "query")) :
                        name=="web_fetch" ? jsonstr(jsonget(rp.root, "url")) :
@@ -1003,6 +1004,7 @@ static i32 mcpmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
                 print(&out, jsonstr(jsonget(s, "name")));
                 print(&out, ": settings for projects' servers of that name");
                 print(&out, jsonint(jsonget(s, "enabled"), 1) ? Str("") : Str(", turned off"));
+                print(&out, jsonint(jsonget(s, "lazy"), 0) ? Str(", lazy") : Str(""));
                 putbyte(&out, '\n');
                 continue;
             }
@@ -1015,6 +1017,7 @@ static i32 mcpmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
                 print(&out, jsonget(s, "approve")->child ? Str(", waits for approval") : Str(""));
             }
             print(&out, jsonstr(jsonget(s, "source"))=="project" ? Str(" (a project's)") : Str(""));
+            print(&out, jsonint(jsonget(s, "lazy"), 0) ? Str(" (lazy)") : Str(""));
             putbyte(&out, '\n');
         }
         os_print(os, 1, finish(&out));

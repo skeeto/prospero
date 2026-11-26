@@ -3404,6 +3404,36 @@ def sc_mcp_late(model, n, req):
 sc_mcp_late_rewind = sc_mcp_late
 
 
+def sc_mcp_lazy_slow(model, n, req):
+    yield from mcp_steps(model, n, req, [
+        ("open_mcp_server", {"server": "fake"}), ("mcp__fake__echo", {"text": "x"}),
+        "Done."])
+
+
+def sc_mcp_lazy_plan(model, n, req):
+    yield from mcp_steps(model, n, req, [("open_mcp_server", {"server": "fake"}), "Done."])
+
+
+def sc_mcp_lazy_role(model, n, req):
+    yield from mcp_steps(model, n, req, ["Done."])
+
+
+def sc_mcp_lazy_subagent(model, n, req):
+    # The parent opens the server, then a subagent says which MCP tools
+    # it has and whether it was given servers to open
+    k = step(req)
+    if "# Subagent" in system_of(req):
+        mine = [x for x in tool_names(req) if x.startswith("mcp__")]
+        listed = "# MCP servers to open" in system_of(req)
+        yield from answer(model, ",".join(mine) + ("|listed" if listed else ""))
+    elif k == 0:
+        yield from tool(model, n, "open_mcp_server", {"server": "fake"})
+    elif k == 1:
+        yield from tool(model, n, "task", {"description": "check", "prompt": "Say."})
+    else:
+        yield from answer(model, "Done.")
+
+
 def sc_mcp_http_two(model, n, req):
     yield from mcp_steps(model, n, req, [("mcp__docs__where", {}), "Done."])
 
@@ -5167,6 +5197,47 @@ def sc_an_mcp_tick(model, n, req):
 
 
 sc_an_noinline_tick = sc_an_mcp_tick
+
+
+def an_last_call(req):
+    """The name of the call whose result ends a request, else None."""
+    msgs = [m for m in req.get("messages", []) if m.get("role") != "system"]
+    if len(msgs) < 2 or not any(b.get("type") == "tool_result" for b in msgs[-1]["content"]):
+        return None
+    calls = [b["name"] for b in msgs[-2]["content"] if b.get("type") == "tool_use"]
+    return calls[-1] if calls else None
+
+
+def sc_an_lazy(model, n, req):
+    # A prompt opens the lazy fake server, then echoes; with the server
+    # open, it only echoes; told "nothing", it only answers
+    last = an_last_call(req)
+    if last is None:
+        msgs = [m for m in req["messages"] if m.get("role") != "system"]
+        text = " ".join(b.get("text", "") for b in msgs[-1]["content"])
+        if "nothing" in text:
+            yield from an_answer(model, req, "Nothing opened.")
+        elif "mcp__fake__echo" in an_tool_names(req):
+            yield from an_call(model, req, n, "mcp__fake__echo", {"text": "again"},
+                               think="Echo again.")
+        else:
+            yield from an_call(model, req, n, "open_mcp_server", {"server": "fake"},
+                               think="Open it.")
+    elif last == "open_mcp_server":
+        yield from an_call(model, req, n, "mcp__fake__echo", {"text": "hi"},
+                           think="Now echo.")
+    else:
+        yield from an_answer(model, req, "Done.", think="Echoed.")
+
+
+sc_an_lazy_reload = sc_an_lazy
+sc_an_lazy_rewind = sc_an_lazy
+sc_an_lazy_compact = sc_an_lazy
+sc_an_lazy_title = sc_an_lazy
+
+
+def sc_an_lazy_title_title(model, n, req):
+    yield from an_answer(model, req, "Lazy servers")
 
 
 def sc_an_auth(model, n, req):

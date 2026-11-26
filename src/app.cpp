@@ -3399,8 +3399,13 @@ static Str mcpstatus(Gui *g, Arena *a, Str name, u32 *dot)
     } else if (state == "failed") {
         print(&b, "failed");
         *dot = g->pal->bad;
+    } else if (jsonint(jsonget(m, "lazy"), 0)) {
+        print(&b, "not running: lazy, it starts once an agent opens it");
     } else {
         print(&b, "not running: it starts for a session that uses it");
+    }
+    if (m && jsonint(jsonget(m, "lazy"), 0) && state=="ready") {
+        print(&b, "; lazy, opened by an agent");
     }
     if (m && http && state!="auth" && !confirm) {
         print(&b, jsonint(jsonget(m, "signedin"), 0) ? Str("; signed in")

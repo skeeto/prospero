@@ -1047,6 +1047,10 @@ struct Session {
     Slice<McpServer *> mcpsrvs;   // the servers it offers
     Str          mcpfilter;  // its role's tools, null for every MCP tool
     b32          mcpfixed;   // a request used its prefix (sendchat)
+    Slice<Str>   mcpopen;    // lazy servers the agent opened, whose tools
+                             // it has (open_mcp_server)
+    b32          mcpopening; // the call running opens mcpsrv, not calls it
+    Str          mcplazyon;  // the servers to open, as its prefix lists them
     Slice<Str>   mcpwarned;  // servers whose failure it was told
     McpServer   *mcpsrv;     // the server of the call running, if MCP's
     i64          mcpcall;    // that call's request id, -1 until it is sent
@@ -11983,6 +11987,7 @@ static b32 askusercall(Session *s, Arena scratch, Slice<AskQuestion> qs)
 
 enum : i64 {
     MCP_SOFT   = 2*SEC,    // standard input closed, then asked to stop
+    MCP_GRACE  = 5*SEC,    // an open waits past the server's startup_timeout
     MCP_HARD   = 5*SEC,    // then killed
     MCP_REGION = (i64)1 << (sizeof(void *)==8 ? 28 : 26),
 };
@@ -12050,11 +12055,11 @@ static Slice<Str> mcpnames(Engine *e, Arena *a)
 }
 
 // Whether a session's filter could offer any tool of a server: every
-// tool, its whole server, or one of its tools.
-static b32 mcpanyallowed(Str filter, Str server)
+// tool ("*", unless only named), its whole server, or one of its tools.
+static b32 mcpfilters(Str filter, Str server, b32 named)
 {
     if (!filter.data) {
-        return 1;
+        return !named;
     }
     for (Str rest = filter; rest.len;) {
         iz i = 0;
@@ -12064,7 +12069,10 @@ static b32 mcpanyallowed(Str filter, Str server)
         Str w = takehead(rest, i);
         rest  = cuthead(rest, i);
         if (w == "*") {
-            return 1;
+            if (!named) {
+                return 1;
+            }
+            continue;
         } else if (!startswith(w, "mcp__")) {
             continue;
         }
@@ -12081,6 +12089,99 @@ static b32 mcpanyallowed(Str filter, Str server)
         }
     }
     return 0;
+}
+
+static b32 mcpanyallowed(Str filter, Str server)
+{
+    return mcpfilters(filter, server, 0);
+}
+
+// Whether a session's filter names a server: the whole of it, or one of
+// its tools, as a role that wants it from the start does.
+static b32 mcpnamed(Str filter, Str server)
+{
+    return mcpfilters(filter, server, 1);
+}
+
+// Lazy servers start only once the agent opens one (open_mcp_server),
+// from a list in the system prompt, so that a session with many pays
+// for the tools of only those it uses. Opening only adds: an opened
+// server's tools join as any late server's do (mcpjoin), and stay. A
+// role that names a server has it from the start, as does a subagent
+// one its parent opened.
+
+// Whether the configuration has a server lazy: its section's lazy, else
+// [tools] mcp_lazy.
+static b32 mcplazy(Engine *e, Str name)
+{
+    Str v = trim(cfgget(e->cfg, "mcp", name, "lazy", 0));
+    v = v.len ? v : trim(cfgget(e->cfg, "tools", "", "mcp_lazy", 0));
+    return cfgbool(v) == 1;
+}
+
+static b32 mcpisopen(Session *s, Str name)
+{
+    for (iz i = 0; i < s->mcpopen.len; i++) {
+        if (s->mcpopen[i] == name) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Whether a server is lazy for a session: it can open servers, and its
+// filter does not name this one. Open or not.
+static b32 mcplazyfor(Session *s, Str name)
+{
+    return tooloffered(&s->te, TOOL_MCPOPEN) && mcplazy(s->e, name) &&
+           !mcpnamed(s->mcpfilter, name);
+}
+
+// Whether a session leaves a server stopped, as lazy and not opened.
+static b32 mcpclosed(Session *s, Str name)
+{
+    return mcplazyfor(s, name) && !mcpisopen(s, name);
+}
+
+// The lazy server a session has not opened that an MCP tool's name is
+// of, mcp__SERVER__TOOL, else null.
+static Str mcpclosedof(Session *s, Arena *a, Str fname)
+{
+    if (!startswith(fname, "mcp__")) {
+        return {};
+    }
+    Str srv = cuthead(fname, 5);
+    iz  at  = find(srv, "__");
+    srv = at<0 ? srv : takehead(srv, at);
+    Slice<Str> names = mcpnames(s->e, a);
+    for (iz i = 0; i < s->mcpdefs.len; i++) {
+        names = push(a, names, s->mcpdefs[i].name);
+    }
+    for (iz i = 0; i < names.len; i++) {
+        if (mcpident(a, names[i])==srv && mcpanyallowed(s->mcpfilter, names[i]) &&
+                mcpclosed(s, names[i])) {
+            return names[i];
+        }
+    }
+    return {};
+}
+
+// The open tool's bit denied to a new session of a filter: unless some
+// server may be lazy for it, a project's by [tools] mcp_lazy.
+static u32 lazydeny(Engine *e, Str filter)
+{
+    Str all = trim(cfgget(e->cfg, "tools", "", "mcp_lazy", 0));
+    if (cfgbool(all) == 1) {
+        return 0;
+    }
+    for (IniSection *t = inifirst(e->ini, "mcp"); t; t = ininext(t)) {
+        Str name = t->name;
+        if (name.len && cfgbool(trim(cfgget(e->cfg, "mcp", name, "enabled", 0)))!=0 &&
+                mcplazy(e, name) && mcpanyallowed(filter, name) && !mcpnamed(filter, name)) {
+            return 0;
+        }
+    }
+    return TOOL_MCPMASK;
 }
 
 // The tail of a server's standard error, for messages, or null.
@@ -12872,8 +12973,8 @@ static void mcpoffer(Session *s, Arena scratch)
         for (iz k = 0; k < i; k++) {
             seen |= names[k] == names[i];
         }
-        if (seen || !mcpanyallowed(s->mcpfilter, names[i])) {
-            continue;
+        if (seen || !mcpanyallowed(s->mcpfilter, names[i]) || mcpclosed(s, names[i])) {
+            continue;  // not its, or not opened
         }
         McpServer *m = mcpserver(s, scratch, names[i]);
         b32        have = !m;
@@ -13459,7 +13560,7 @@ static void mcpnewtools(Session *s, Arena *scratch, McpServer *m, Slice<McpTool>
             note(s, *scratch, "warn", msg);
         }
         return;
-    } else if (m->state != MCP_READY) {
+    } else if (m->state!=MCP_READY || mcpclosed(s, m->name)) {
         return;
     }
     for (iz k = 0; k < m->tools.len; k++) {
@@ -13510,13 +13611,68 @@ static Slice<Str> mcpintro(Session *s, Arena *a, Slice<McpTool> add)
     return r;
 }
 
+// The lazy servers a session may open, as its system prompt lists them:
+// a line each, "- NAME: DESCRIPTION", the description's first line, cut
+// short. In the order the servers are offered (mcpoffer).
+static Str mcplazylist(Session *s, Arena *a)
+{
+    Engine    *e     = s->e;
+    Slice<Str> names = mcpnames(e, a);
+    for (iz i = 0; i < s->mcpdefs.len; i++) {
+        if (mcpdefof(s, *a, s->mcpdefs[i].name) == &s->mcpdefs[i]) {
+            names = push(a, names, s->mcpdefs[i].name);
+        }
+    }
+    Buf b(a, 1024);
+    for (iz i = 0; i < names.len; i++) {
+        b32 seen = 0;
+        for (iz k = 0; k < i; k++) {
+            seen |= names[k] == names[i];
+        }
+        if (seen || !mcpanyallowed(s->mcpfilter, names[i]) || !mcpclosed(s, names[i])) {
+            continue;
+        }
+        Str desc = trim(cfgget(e->cfg, "mcp", names[i], "description", 0));
+        desc = trim(utf8head(cut(desc, '\n').head, 300));
+        print(&b, "\n- ");
+        print(&b, names[i]);
+        if (desc.len) {
+            print(&b, ": ");
+            print(&b, desc);
+        }
+    }
+    return finish(&b);
+}
+
+// The list of servers to open into a prefix's system prompt, once, as
+// its tools join it (mcpbase). Whether it went in.
+static b32 mcplazyshow(Session *s, Arena scratch)
+{
+    if (find(s->system, "\n# MCP servers to open\n") >= 0) {
+        return 0;
+    }
+    Str list = mcplazylist(s, &scratch);
+    s->mcplazyon = clone(&s->perm, list);
+    if (!list.len) {
+        return 0;
+    }
+    s->system = concat(&s->perm, s->system,
+                       "\n\n# MCP servers to open\n\nThese MCP servers have tools "
+                       "you do not have yet. When a task needs one, call "
+                       "open_mcp_server with its name, and its tools join yours. "
+                       "The servers:");
+    s->system = concat(&s->perm, s->system, list);
+    return 1;
+}
+
 // Tools that join a session's prefix before its first request: into
 // its tools, with the instructions of their servers new to it into its
-// system prompt. Its record is for the caller to log.
-static void mcpbase(Session *s, Arena scratch, Slice<McpTool> add)
+// system prompt, then the servers it may open. Its record is for the
+// caller to log. Whether the prefix changed.
+static b32 mcpbase(Session *s, Arena scratch, Slice<McpTool> add)
 {
     if (!add.len) {
-        return;
+        return mcplazyshow(s, scratch);
     }
     Slice<Str> intro = mcpintro(s, &scratch, add);
     for (iz i = 0; i < add.len; i++) {
@@ -13529,6 +13685,8 @@ static void mcpbase(Session *s, Arena scratch, Slice<McpTool> add)
         s->system = concat(&s->perm, s->system,
                            mcpinstructions(&scratch, m->name, m->instr, first));
     }
+    mcplazyshow(s, scratch);
+    return 1;
 }
 
 static void putmcprows(JsonOut *, Slice<McpTool>);
@@ -13542,8 +13700,9 @@ static void putmcprows(JsonOut *, Slice<McpTool>);
 static Str mcpjoin(Session *s, Arena *scratch, Slice<McpTool> add, Str open)
 {
     if (!s->mcpfixed) {
-        mcpbase(s, *scratch, add);
-        logprefix(s, *scratch);
+        if (mcpbase(s, *scratch, add)) {
+            logprefix(s, *scratch);
+        }
         return {};
     }
     Slice<Str> intro = mcpintro(s, scratch, add);
@@ -13558,6 +13717,9 @@ static Str mcpjoin(Session *s, Arena *scratch, Slice<McpTool> add, Str open)
             putstrkey(&w.json, "open", open);
         }
         ssend(s, &w);
+    }
+    if (open.len && !mcpisopen(s, open)) {
+        s->mcpopen = push(&s->perm, s->mcpopen, clone(&s->perm, open));
     }
     s->tools = clone(&s->perm, mcpjointools(scratch, s->tools, more));
     for (iz i = 0; i < add.len; i++) {
@@ -13611,10 +13773,10 @@ static b32 mcpgate(Session *s, Arena scratch)
     for (iz i = 0; i < s->mcpsrvs.len; i++) {
         mcpnewtools(s, &scratch, s->mcpsrvs[i], &add);
     }
-    if (!add.len) {
+    if (!s->mcpfixed) {
+        mcpjoin(s, &scratch, add, {});  // with the servers to open
         return 1;
-    } else if (!s->mcpfixed) {
-        mcpjoin(s, &scratch, add, {});
+    } else if (!add.len) {
         return 1;
     }
     // Mid-session: the agent is told what it has now, after its record,
@@ -13635,6 +13797,7 @@ static b32 mcpgate(Session *s, Arena scratch)
 // A server became ready, or failed: the sessions waiting for it go on,
 // and a call waiting for it is sent, or fails.
 static void mcpcallsend(Session *s, Arena scratch, b32 inrun = 0);
+static void mcpopened(Session *s, Arena scratch, b32 inrun = 0);
 
 static void mcpwake(Engine *e, Arena scratch, McpServer *m)
 {
@@ -13648,6 +13811,8 @@ static void mcpwake(Engine *e, Arena scratch, McpServer *m)
             if (mine) {
                 prepare(s, a);
             }
+        } else if (s->state==S_TOOL && s->mcpsrv==m && s->mcpcall<0 && s->mcpopening) {
+            mcpopened(s, a);
         } else if (s->state==S_TOOL && s->mcpsrv==m && s->mcpcall<0) {
             mcpcallsend(s, a);
         }
@@ -13662,8 +13827,9 @@ static void mcpwake(Engine *e, Arena scratch, McpServer *m)
 static void mcpend(Session *s, Arena scratch, Str status, Str text, b32 inrun = 0)
 {
     disarm(s, T_TOOL);
-    s->mcpsrv  = 0;
-    s->mcpcall = 0;
+    s->mcpsrv     = 0;
+    s->mcpcall    = 0;
+    s->mcpopening = 0;
     setstate(s, S_IDLE);
     toolend(s, scratch, status, text, 0, 0, {}, 0);
     if (!inrun) {
@@ -13772,6 +13938,141 @@ static b32 mcprun(Session *s, Arena scratch, McpTool *t)
     return s->state != S_TOOL;
 }
 
+// A lazy server opened, ready or failed: its tools joined, told in the
+// call's result with the server's instructions, else why not (as
+// mcpend, inrun as there).
+static void mcpopened(Session *s, Arena scratch, b32 inrun)
+{
+    McpServer *m = s->mcpsrv;
+    if (m->state != MCP_READY) {
+        Buf b(&scratch, 256 + m->err.len);
+        print(&b, "The MCP server ");
+        print(&b, m->name);
+        if (m->needauth) {
+            print(&b, " needs the user to sign in to it first (in Settings, or "
+                      "prospero mcp auth), so it was not opened.");
+        } else if (m->state == MCP_FAILED) {
+            print(&b, " failed to start, so it was not opened: ");
+            print(&b, m->err);
+        } else {
+            print(&b, " is not running, so it was not opened.");
+        }
+        mcpend(s, scratch, "error", finish(&b), inrun);
+        return;
+    }
+    if (!mcpisopen(s, m->name)) {
+        s->mcpopen = push(&s->perm, s->mcpopen, clone(&s->perm, m->name));
+    }
+    Slice<McpTool> add = {};
+    mcpnewtools(s, &scratch, m, &add);
+    Str instr = mcpjoin(s, &scratch, add, m->name);
+    Buf b(&scratch, 512 + instr.len + 64*add.len);
+    print(&b, "Opened the MCP server ");
+    print(&b, m->name);
+    if (!add.len) {
+        print(&b, ", but none of its tools are for this session.");
+    } else {
+        print(&b, ". Its tools are yours now:");
+        for (iz i = 0; i < add.len; i++) {
+            print(&b, i ? Str(", ") : Str(" "));
+            print(&b, add[i].name);
+        }
+        putbyte(&b, '.');
+    }
+    print(&b, instr);
+    mcpend(s, scratch, "ok", finish(&b), inrun);
+}
+
+// open_mcp_server: a lazy server started, its tools joined once it is
+// ready (mcpopened), waited for meanwhile as a call's server is. Named
+// as listed, else as an MCP tool's name has it. Returns 1 if it ended
+// already, 0 if it waits.
+static b32 toolmcpopen(Session *s, Arena scratch, Args *args)
+{
+    Engine    *e     = s->e;
+    Str        want  = args->name;
+    Slice<Str> names = mcpnames(e, &scratch);
+    for (iz i = 0; i < s->mcpdefs.len; i++) {
+        if (mcpdefof(s, scratch, s->mcpdefs[i].name) == &s->mcpdefs[i]) {
+            names = push(&scratch, names, s->mcpdefs[i].name);
+        }
+    }
+    Str name = {};
+    for (iz i = 0; !name.len && i < names.len; i++) {
+        name = names[i]==want && mcpanyallowed(s->mcpfilter, names[i]) ? names[i] : name;
+    }
+    Str ident = mcpident(&scratch, startswith(want, "mcp__") ? cuthead(want, 5) : want);
+    for (iz i = 0; !name.len && i < names.len; i++) {
+        b32 same = mcpident(&scratch, names[i]) == ident;
+        name = same && mcpanyallowed(s->mcpfilter, names[i]) ? names[i] : name;
+    }
+
+    if (!name.len || !mcplazyfor(s, name) || mcpisopen(s, name)) {
+        Buf b(&scratch, 1024);
+        if (!name.len) {
+            print(&b, "No MCP server is named \"");
+            print(&b, utf8head(want, 200));
+            print(&b, "\", so nothing was opened.");
+        } else {
+            print(&b, "The MCP server ");
+            print(&b, name);
+            print(&b, mcpisopen(s, name) ? Str(" is open already")
+                                         : Str(" is not one to open, as it starts "
+                                               "with the session"));
+            i32 n = 0;
+            for (iz i = 0; i < s->mcptools.len; i++) {
+                if (s->mcptools[i].server == name) {
+                    print(&b, n++ ? Str(", ") : Str(": its tools are "));
+                    print(&b, s->mcptools[i].name);
+                }
+            }
+            putbyte(&b, '.');
+        }
+        i32 n = 0;
+        for (iz i = 0; i < names.len; i++) {
+            if (mcpanyallowed(s->mcpfilter, names[i]) && mcpclosed(s, names[i])) {
+                print(&b, n++ ? Str(", ") : Str(" The servers to open: "));
+                print(&b, names[i]);
+            }
+        }
+        print(&b, n ? Str(".") : Str(" There are no others to open."));
+        if (!name.len) {
+            s->callfail = "mcp";
+        }
+        toolend(s, scratch, name.len ? Str("ok") : Str("error"), finish(&b), 0, 0, {}, 0);
+        return 1;
+    }
+
+    McpServer *m = mcpserver(s, scratch, name);
+    if (!m) {
+        Str why = concat(&scratch, concat(&scratch, "The MCP server ", name),
+                         Str(" is no longer in the configuration, so it was not opened."));
+        toolend(s, scratch, "error", why, 0, 0, {}, 0);
+        return 1;
+    }
+    b32 have = 0;
+    for (iz i = 0; i < s->mcpsrvs.len; i++) {
+        if (s->mcpsrvs[i]!=m && s->mcpsrvs[i]->name==m->name) {
+            s->mcpsrvs[i] = m;
+        }
+        have |= s->mcpsrvs[i] == m;
+    }
+    if (!have) {
+        s->mcpsrvs = push(&s->perm, s->mcpsrvs, m);
+    }
+    s->mcpsrv     = m;
+    s->mcpcall    = -1;
+    s->mcpopening = 1;
+    setstate(s, S_TOOL);
+    if (m->state==MCP_READY || m->state==MCP_FAILED || m->state==MCP_STOPPED) {
+        mcpopened(s, scratch, 1);  // stopped: it could not be started
+    } else {
+        i64 left = m->readyby - os_ticks(e->os);
+        arm(s, T_TOOL, (left>0 ? left : 0) + MCP_GRACE);
+    }
+    return s->state != S_TOOL;
+}
+
 // The current call ran out of time: the server is told, as for a cancel.
 static void mcpcancel(Session *s, Arena scratch, Str status, Str text)
 {
@@ -13805,7 +14106,12 @@ static void mcptimeout(Session *s, Arena scratch)
 {
     McpServer *m = s->mcpsrv;
     Buf b(&scratch, 256);
-    if (s->mcpcall < 0) {
+    if (s->mcpopening) {
+        print(&b, "The MCP server ");
+        print(&b, m->name);
+        print(&b, " did not start in time, so it was not opened. Try again "
+                  "later, or do without it.");
+    } else if (s->mcpcall < 0) {
         print(&b, "The MCP server ");
         print(&b, m->name);
         print(&b, " did not start in time, so the call was not made.");
@@ -15840,6 +16146,9 @@ static void putmcpserver(Engine *e, Arena scratch, JsonOut *w, Str name, McpServ
         }
     }
     putstrkey(w, "state", mcpstatename(m));
+    if (mcplazy(e, name)) {
+        putintkey(w, "lazy", 1);  // started once an agent opens it
+    }
     i32 kept = 0;
     for (iz i = 0; m && i < m->tools.len; i++) {
         kept += mcpkept(e, m->name, m->tools[i].tool);
@@ -16086,6 +16395,9 @@ static void cmdmcp(Engine *e, Arena scratch, i64 id, Json *j)
             if (cfgbool(trim(cfgget(e->cfg, "mcp", s->name, "enabled", 0))) == 0) {
                 putintkey(&w.json, "enabled", 0);
             }
+            if (mcplazy(e, s->name)) {
+                putintkey(&w.json, "lazy", 1);
+            }
             putend(&w.json);
             continue;
         }
@@ -16201,6 +16513,16 @@ static b32 runtool(Session *s, Arena scratch)
 
     if (tool == TOOL_NONE) {
         Str text = unknowntool(&scratch, c->name, s->te.deny);
+        Str shut = mcpclosedof(s, &scratch, c->name);
+        if (shut.len) {
+            // A lazy server's, not opened: its tools are not the agent's yet
+            Buf b(&scratch, 256);
+            print(&b, "The MCP server ");
+            print(&b, shut);
+            print(&b, " is not open, so nothing was run. Open it first with "
+                      "open_mcp_server, and its tools join yours.");
+            text = finish(&b);
+        }
         s->callfail = "unknown";
         toolend(s, scratch, "error", text, 0, 0, {}, 0);
         return 1;
@@ -16238,6 +16560,7 @@ static b32 runtool(Session *s, Arena scratch)
     case TOOL_MESSAGE: toolmessage(s, scratch, &args); return 1;
     case TOOL_MEMORY:  toolmemory(s, scratch, &args);  return 1;
     case TOOL_READTERM: toolreadterm(s, scratch, &args); return 1;
+    case TOOL_MCPOPEN: return toolmcpopen(s, scratch, &args);
     case TOOL_WEBSEARCH:
     case TOOL_WEBFETCH:  assert(0);  // webcall
     case TOOL_TASK:      assert(0);  // starttasks has these
@@ -17562,6 +17885,10 @@ static void cancelturn(Session *s, Arena scratch)
             setstate(s, S_IDLE);
             toolend(s, scratch, "cancelled", "Stopped: the user cancelled the turn.", 0, 0, {}, 0);
             nexttool(s, scratch);
+            return;
+        } else if (s->mcpsrv && s->mcpopening) {
+            mcpend(s, scratch, "cancelled", "Stopped: the user cancelled the turn "
+                   "before the MCP server started, so it was not opened.");
             return;
         } else if (s->mcpsrv) {
             mcpcancel(s, scratch, "cancelled", "Stopped: the user cancelled the "
@@ -18942,9 +19269,10 @@ static void buildprefix(Session *s, Arena scratch)
     }
     s->memsys = s->memseen;
     // No MCP tools yet, none joined, and no request has used it (mcpgate)
-    s->mcptools = {};
-    s->tooladds = {};
-    s->mcpfixed = 0;
+    s->mcptools  = {};
+    s->tooladds  = {};
+    s->mcpfixed  = 0;
+    s->mcplazyon = {};
 }
 
 static void logprefix(Session *, Arena);
@@ -19107,6 +19435,17 @@ static void logprefix(Session *s, Arena scratch)
     }
     if (s->mcpfilter.data) {
         putstrkey(&w.json, "mcp_filter", s->mcpfilter);
+    }
+    if (s->mcplazyon.len) {
+        putstrkey(&w.json, "mcp_lazy", s->mcplazyon);
+    }
+    if (s->mcpopen.len) {
+        putkey(&w.json, "mcp_open");
+        putarray(&w.json);
+        for (iz i = 0; i < s->mcpopen.len; i++) {
+            putstr(&w.json, s->mcpopen[i]);
+        }
+        putend(&w.json);
     }
     putmcprows(&w.json, s->mcptools);
     ssend(s, &w);
@@ -19276,9 +19615,9 @@ static void logsession(Session *s, Arena scratch)
     }
     // Plan mode's tools go without saying: a role's only by name. Memory's, by
     // the memory record; questions to the user, by questions. The web's
-    // are listed when offered, so that a session from before them
-    // replays without them.
-    u32 plain = TOOL_OFFMASK | TOOL_WEBMASK | TOOL_TERMMASK |
+    // and the open tool are listed when offered, so that a session from
+    // before them replays without them.
+    u32 plain = TOOL_OFFMASK | TOOL_WEBMASK | TOOL_TERMMASK | TOOL_MCPMASK |
                 (s->role.len ? (u32)TOOL_PLANMASK : 0);
     u32 aside = TOOL_MEMMASK | TOOL_ASKMASK;
     if ((s->te.deny | aside) != (plain | aside)) {
@@ -19677,6 +20016,13 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err,
                  TOOL_PLANMASK | TOOL_ASKMASK;
     s->mcpfilter = r.mcp.data ? clone(&s->perm, r.mcp) :
                    p->mcpfilter.data ? clone(&s->perm, p->mcpfilter) : Str{};
+    s->te.deny  |= lazydeny(e, s->mcpfilter);
+    for (iz i = 0; i < p->mcpopen.len; i++) {
+        // Those its parent opened, as far as its own filter allows
+        if (mcpanyallowed(s->mcpfilter, p->mcpopen[i])) {
+            s->mcpopen = push(&s->perm, s->mcpopen, clone(&s->perm, p->mcpopen[i]));
+        }
+    }
     s->pcall   = clone(&s->perm, c->id);
     s->intask  = 1;
     s->tbegan  = os_time(e->os);
@@ -21661,6 +22007,7 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
     s->te.deny |= termdeny(e, s->attended && !task.ok);
     s->mcpfilter  = tools.data ? clone(&s->perm, tools) :
                     role.mcp.data ? clone(&s->perm, role.mcp) : Str{};
+    s->te.deny   |= lazydeny(e, s->mcpfilter);
     s->stepmax    = steps>0 ? steps : 0;
     s->projinstr  = instr == "project";
     s->nofallback = !fall;
@@ -22043,7 +22390,7 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
                 // As it began: every tool but those offered by name, and
                 // plan mode's for a role
                 s->te.deny = TOOL_OFFMASK | TOOL_WEBMASK | TOOL_TERMMASK |
-                             (s->role.len ? (u32)TOOL_PLANMASK : 0);
+                             TOOL_MCPMASK | (s->role.len ? (u32)TOOL_PLANMASK : 0);
             }
             // Its edit format as it began: absent, the first one
             s->te.edit = editformat(jsonstr(jsonget(j, "edit_format")));
@@ -22285,6 +22632,11 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             getmcprows(&s->perm, s, jsonget(j, "mcp"));
             s->toolsbase     = s->tools;
             s->tooladds      = {};
+            s->mcplazyon     = clone(&s->perm, jsonstr(jsonget(j, "mcp_lazy")));
+            s->mcpopen       = {};
+            for (Json *k = jsonget(j, "mcp_open")->child; k; k = k->next) {
+                s->mcpopen = push(&s->perm, s->mcpopen, clone(&s->perm, jsonstr(k)));
+            }
             prefixed         = 1;
             break;
         case EV_TOOLS: {
@@ -22295,6 +22647,10 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             if (trim(more).len > 2) {
                 ToolAdd x = {r.seq, clone(&s->perm, more)};
                 s->tooladds = push(&s->perm, s->tooladds, x);
+            }
+            Str open = jsonstr(jsonget(j, "open"));
+            if (open.len && !mcpisopen(s, open)) {
+                s->mcpopen = push(&s->perm, s->mcpopen, clone(&s->perm, open));
             }
         } break;
         }

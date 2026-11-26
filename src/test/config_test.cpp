@@ -471,7 +471,7 @@ static void testcfgvalidate(Test *t)
         "/c/prospero.ini:20:9: warning: unknown value \"fly\", expected any "
         "of: read, write, edit, shell, grep, glob, todo_write, jobs, "
         "job_output, job_kill, task, skill, sessions, send_message, memory, "
-        "web_search, web_fetch, read_terminal, desktop, enter_plan_mode, exit_plan_mode, ask_user, *, default\n"
+        "web_search, web_fetch, read_terminal, open_mcp_server, desktop, enter_plan_mode, exit_plan_mode, ask_user, *, default\n"
         "/c/prospero.ini:21:2: warning: unknown section kind \"provider\", "
         "expected endpoint, model, role, guard, tools, shell, instructions, "
         "plan, skills, memory, worktree, sessions, ui, theme, terminal, desktop, web, "
@@ -1183,6 +1183,7 @@ static void testcfgjson(Test *t)
         "tools//git=*\n"
         "tools//turn_budget=0*\n"
         "tools//task_budget=200*\n"
+        "tools//mcp_lazy=false*\n"
         "instructions//files=AGENTS.md CLAUDE.md*\n"
         "plan//prompt=*\n"
         "plan//prompt_file=*\n"
@@ -1248,7 +1249,7 @@ static void testcfgjson(Test *t)
     expect(t, "json.schema.local", jsonstr(jsonget(ft, "local")), "1800");
     iz    ti    = cfgkey("role", "tools") - cfgschema;
     Json *tools = jsonget(jsonat(schema, ti), "choices");
-    expect(t, "json.schema.choices", istr(&a, jsonlen(tools)), "24");
+    expect(t, "json.schema.choices", istr(&a, jsonlen(tools)), "25");
     expect(t, "json.kinds", istr(&a, jsonlen(jsonget(j, "kinds"))),
            istr(&a, countof(cfgkinds)));
     Buf hb(&a, 256);
