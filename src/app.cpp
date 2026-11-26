@@ -15563,6 +15563,7 @@ enum : i32 {
                       // text POSIX|WINDOWS is the half for the session's host
     CHK_PLANPLAIN,    // the plan is out in the editor, no plan waiting
     CHK_PLANQUIET,    // the session is idle, asking nothing
+    CHK_PLANCLEARED,  // the newest compaction card is a plan's clean context
     CHK_PLANREVISED,  // the agent heard the plan approved was revised by hand
     CHK_PLANREADING,  // the plan waiting is being read again from its ssh
                       // remote, Approve held, and says so
@@ -16000,6 +16001,7 @@ static Str chknames[] = {
     "Open in external terminal opened one in its folder, as said",
     "the plan is open in the editor, with no plan waiting",
     "the session is idle and asks nothing: the agent was not told",
+    "the plan was approved with a clean context, a card saying so",
     "the agent heard that the plan it carries out was revised by hand",
     "the plan is being read again from its host, Approve held meanwhile",
     "Bypass mode is on or off as it should be, in red when on",
@@ -22378,11 +22380,14 @@ static DriveOp planops[] = {
     {OP_WAIT, W_ASK, 0, 0, 30000, ""},
     {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
     {OP_CHECK, CHK_PLANASK, 0, 0, 0, ""},
-    {OP_MOVE, T_ALLOW, 0, 0, 100, ""},
+    // Approved with a clean context (#109): the history gives way to
+    // the plan, a card saying so
+    {OP_MOVE, T_NAMED, 0, 0, 100, "approve clear"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_WAIT, W_IDLE, 0, 0, 15000, ""},
     {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PLANCLEARED, 0, 0, 0, ""},
     {OP_CHECK, CHK_PLANMODE, 0, 0, 0, ""},
     {OP_CHECK, CHK_BYPASS, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "plan-9-build"},
@@ -29195,6 +29200,11 @@ static b32 drivecheck(Gui *g, i32 chk)
         return m && m->card->kind=="summary" && m->card->before>m->card->after &&
                m->card->count>0 && find(m->text, "SUMMARY-")>=0 &&
                g->rects[RECT_COMPACTHDR].x1>0;
+    }
+    case CHK_PLANCLEARED: {
+        ViewMsg *m = lastof(v, VIEW_COMPACT);
+        return m && m->card->why=="plan" && m->card->count>0 &&
+               find(m->text, "## Approved plan")>=0;
     }
     case CHK_COMPACTOPEN: {
         ViewMsg *m = lastof(v, VIEW_COMPACT);

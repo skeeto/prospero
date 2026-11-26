@@ -36,6 +36,13 @@ shows it:
 
 - **Approve plan** ends Plan mode: the session goes to Build, and the
   agent carries out the plan as the file has it then.
+- **Approve, clear context** does the same in a clean context: the
+  conversation that planned it gives way to a checkpoint with the plan,
+  your own messages and the files read, written by Prospero itself
+  rather than summarized by a model. It frees the room planning took,
+  at the cost of the agent reading again what it needs; a card in the
+  transcript says so. The agent is told to write plans that stand on
+  their own for this.
 - **Keep planning…** puts the keyboard in the prompt box, to write
   what to change in the plan. While a plan waits, anything you send
   from the box keeps planning: Plan mode stays on, and the agent reads

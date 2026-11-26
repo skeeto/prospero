@@ -3217,6 +3217,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
                        kind=="memory"       ? Str("To the agent: memory") :
                        kind=="grants"       ? Str("To the agent: permissions") :
                        kind=="compacted"    ? Str("To the agent: summarized") :
+                       kind=="cleared"      ? Str("To the agent: context cleared") :
                        Str("To the agent");
         }
     } return 1;
@@ -3229,7 +3230,8 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         c->kind   = kind=="summary" ? Str("summary") : Str("prune");
         Str why   = jsonstr(jsonget(j, "why"));
         c->why    = why=="overflow" ? Str("overflow") :
-                    why=="manual"   ? Str("manual")   : Str("threshold");
+                    why=="manual"   ? Str("manual")   :
+                    why=="plan"     ? Str("plan")     : Str("threshold");
         c->before = jsonint(jsonget(j, "before"), 0);
         c->after  = jsonint(jsonget(j, "after"), 0);
         c->model  = clone(&v->aux, jsonstr(jsonget(j, "model")));
@@ -4936,7 +4938,9 @@ static void viewexport(Buf *b, View *v, Str sid, b32 think, b32 tools, b32 outpu
                 continue;
             }
             print(b, "\n_");
-            print(b, m->label.len ? m->label : m->role==VIEW_COMPACT ? Str("Compacted")
+            b32 clr = m->role==VIEW_COMPACT && m->card && m->card->why=="plan";
+            print(b, m->label.len ? m->label : clr ? Str("Context cleared")
+                                             : m->role==VIEW_COMPACT ? Str("Compacted")
                                              : m->role==VIEW_REWIND  ? Str("Rewound")
                                                                      : Str("Note"));
             print(b, ":_ ");

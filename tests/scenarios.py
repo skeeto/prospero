@@ -12946,6 +12946,71 @@ def plan_revised(t):
 
 
 @scenario(bound=15)
+def plan_clear(t):
+    """A plan approved with a clean context (#109): the result logged, then
+    the whole history gives way to a checkpoint of the harness's (a
+    compact record of why "plan", no summarizer), with the user's words,
+    the plan and the files, from which the agent carries it out; and a
+    session opened again sends the same."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1,
+                     plan=1)["sid"]
+        h.send("prompt", sid=sid, text="Write inside, and do not commit.")
+        ask = planask(h, sid)
+        r = h.call("answer", sid=sid, req=ask["req"], decision="clear", note="")
+        t.check(r.get("ok") == 1, f"cleared: {r}")
+        end = ended(h, sid, 1)
+        t.check(end["why"] == "done", f"done: {end}")
+        t.check(t.file("inside.txt") == "done\n", "carried out")
+        t.check(modes(h, sid)[-1] == "default/approved", f"modes: {modes(h, sid)}")
+        ans = [e for e in h.all("answer", sid) if e.get("req") == ask["req"]]
+        t.check(len(ans) == 1 and ans[0]["decision"] == "allow" and ans[0].get("clear") == 1,
+                f"the answer: {ans}")
+        cps = h.all("compact", sid)
+        t.check(len(cps) == 1 and cps[0]["why"] == "plan" and cps[0]["kind"] == "summary" and
+                cps[0]["cutseq"] > ask["seq"] and "model" not in cps[0], f"the record: {cps}")
+        t.check(not t.compactions(), "no summarizer")
+        summary = cps[0]["summary"]
+        t.check("Write inside, and do not commit." in summary and "# Plan" in summary and
+                ask["path"] in summary and "## Files (kept by the harness)" in summary and
+                "Plan mode is on" not in summary, f"the checkpoint: {summary}")
+
+        # The request after it: the checkpoint first, nothing of the planning
+        reqs = [q["body"]["messages"] for q in t.requests()]
+        after = [m for m in reqs if "conversation-checkpoint" in str(m)]
+        t.check(after, "a request with the checkpoint")
+        msgs = after[0]
+        t.check(msgs[1]["role"] == "user" and "conversation-checkpoint" in msgs[1]["content"] and
+                not [m for m in msgs if m["role"] in ("assistant", "tool")],
+                f"cleared: {msgs}")
+        t.check("cleared for the plan" in msgs[-1]["content"], f"told: {msgs[-1]}")
+        t.check(lastsaid(h, sid) == "Done.", f"said: {lastsaid(h, sid)}")
+
+        # Only a plan's approval clears: not the ask to plan first
+        h.send("prompt", sid=sid, text="Plan first.")
+        enter = h.wait(lambda e: e.get("ev") == "ask" and e.get("sid") == sid and
+                       e.get("kind") == "plan.enter")
+        r = h.call("answer", sid=sid, req=enter["req"], decision="clear")
+        t.check(r.get("ok") == 0 and "only a plan's approval" in r.get("err", ""),
+                f"refused: {r}")
+        h.call("answer", sid=sid, req=enter["req"], decision="deny")
+        ended(h, sid, 2)
+        t.check(len(h.all("compact", sid)) == 1, "no second clear")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+    # Opened again: the history as cleared, then the new turn
+    n = len(t.requests())
+    r = t.run("Write inside again.", resume=sid)
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    msgs = t.requests()[n]["body"]["messages"]
+    t.check(msgs[1]["role"] == "user" and "conversation-checkpoint" in msgs[1]["content"]
+            and "exit_plan_mode" not in str(msgs[2:4]), f"replayed: {msgs[:4]}")
+
+
+@scenario(bound=15)
 def plan_long(t):
     """A plan past what is repeated to the agent (64 KiB) is put to the
     user whole, and approved, the result names the file rather than

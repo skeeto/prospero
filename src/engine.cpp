@@ -247,10 +247,11 @@ enum : i32 {
     CW_THRESHOLD, // why a compaction: the prompt reached the threshold
     CW_OVERFLOW,  // the server rejected the prompt as too long
     CW_MANUAL,    // the user asked for one (compact)
+    CW_PLAN,      // a plan approved with a clean context (planclear)
     CW_COUNT,
 };
 
-static Str cwnames[] = {"threshold", "overflow", "manual"};
+static Str cwnames[] = {"threshold", "overflow", "manual", "plan"};
 static_assert(countof(cwnames) == CW_COUNT);
 
 enum : i32 {
@@ -904,6 +905,9 @@ struct Session {
     i32          titletries; // in this process
     b32          compactnext;  // the turn compacts, as asked (compact)
     Str          cpfocus;    // and what to keep of it
+    b32          planclear;  // the plan approved with a clean context:
+                             // cleared once the step's calls end
+    Str          planctext;  // the plan as approved, null for its file
     i64          ctxhint;    // the window as the log last gave it, shown
                              // until discovery tells (gauge)
     i64          ovctx;      // the window a server gave in refusing a
@@ -1784,6 +1788,7 @@ static void adduser(Session *s, Arena scratch, Str text, Str via,
     lastactput(s, scratch, w.ts);
     Msg m = {};
     m.role   = ROLE_USER;
+    m.user   = 1;
     m.text   = clone(&s->perm, text);
     m.images   = images;
     m.files    = files;
@@ -4972,8 +4977,12 @@ static Str planrules(Session *s, Arena *a)
     }
     print(&b, ". The plan file stays after plan mode ends. Write your plan there in "
               "Markdown: the goal, the changes file by file, and how to "
-              "verify them. Once it is complete, call exit_plan_mode to ask "
-              "the user to approve it. ");
+              "verify them. Make it stand on its own: the user may approve "
+              "it with a clean context, and then it is carried out without "
+              "this conversation, so name the files, the decisions made and "
+              "the user's constraints rather than refer to what was said. "
+              "Once it is complete, call exit_plan_mode to ask the user to "
+              "approve it. ");
     print(&b, tooloffered(&s->te, TOOL_ASKUSER)
               ? Str("If the user must decide something first, ask with "
                     "ask_user before you write the plan.")
@@ -5332,7 +5341,9 @@ static PlanText readplan(Session *s, Arena *a)
 static void planresolve(Session *s, Arena scratch, b32 allow, i32 by, Str note,
                         i64 wait)
 {
-    b32 leave = s->ask.tool == TOOL_PLANEXIT;
+    b32 leave  = s->ask.tool == TOOL_PLANEXIT;
+    b32 wclear = s->planclear;  // answered "clear" (cmd answer)
+    s->planclear = 0;
     toolstart(s, scratch);
     if (by == DENY_CANCEL) {
         toolend(s, scratch, "cancelled", "Not run: the user cancelled the turn.",
@@ -5342,12 +5353,25 @@ static void planresolve(Session *s, Arena scratch, b32 allow, i32 by, Str note,
 
     Str      rules = {};
     PlanText plan  = {};
+    b32      clear = allow && leave && wclear;
     if (allow && !leave) {
         setmode(s, scratch, MODE_PLAN, "agent");
         rules = planrules(s, &scratch);
     } else if (allow) {
         plan = readplan(s, &scratch);
         setmode(s, scratch, MODE_BUILD, "approved");
+    }
+    if (clear && (!plan.err.len || plan.big)) {
+        // Cleared once the step's calls end (toolsdone): the plan as
+        // approved, or where it is when too long to repeat
+        b32 inline_ = !plan.err.len && plan.text.len<=PLAN_INLINE;
+        s->planclear = 1;
+        s->planctext = inline_ ? clone(&s->perm, plan.text) : Str{};
+        toolend(s, scratch, "ok", "The user approved your plan with a clean "
+                "context: plan mode is off, and this conversation gives way to "
+                "a checkpoint with the plan, from which you carry it out.",
+                0, 0, {}, 0);
+        return;
     }
     Buf b(&scratch, 1024 + note.len + rules.len + plan.text.len);
     if (allow && !leave) {
@@ -5356,6 +5380,11 @@ static void planresolve(Session *s, Arena scratch, b32 allow, i32 by, Str note,
     } else if (allow) {
         print(&b, "The user approved your plan, and plan mode is off: carry "
                   "it out now. ");
+        if (clear) {
+            // Emptied since the ask: nothing to carry over
+            print(&b, "The user asked for a clean context, but the plan file "
+                      "was empty, so this conversation stays. ");
+        }
         if (tooloffered(&s->te, TOOL_TODO)) {
             print(&b, "If it has several steps, begin with a todo list of "
                       "them (todo_write), sent with your first tool call, and "
@@ -6621,6 +6650,9 @@ static void resolve(Session *s, Arena scratch, b32 allow, i32 by, Str note,
         }
         if (trust) {
             putintkey(&w.json, "trust", 1);
+        }
+        if (allow && s->planclear) {
+            putintkey(&w.json, "clear", 1);  // with a clean context
         }
         if (qa) {
             putkey(&w.json, "answers");
@@ -16079,10 +16111,14 @@ static b32 runtool(Session *s, Arena scratch)
     return 0;
 }
 
+static void clearforplan(Session *, Arena);
 static void toolsdone(Session *s, Arena scratch)
 {
     s->calls = {};
     setstate(s, S_IDLE);
+    if (s->planclear) {
+        clearforplan(s, scratch);  // the plan approved with a clean context
+    }
     if (s->cancelled) {
         endturn(s, scratch, "cancel", {});
         return;
@@ -16388,6 +16424,46 @@ enum {
 
 static i32 reprefix(Session *, Arena);
 
+// A compaction's record: the system prompt rebuilt (reprefix), and what
+// it has new, for its card.
+static void putrebuilt(JsonOut *w, i32 pre)
+{
+    if (!pre) {
+        return;
+    }
+    struct { i32 bit; Str name; } parts[] = {
+        {PREFIX_INSTR,  "instructions"},
+        {PREFIX_MEMORY, "memory"},
+        {PREFIX_SKILLS, "skills"},
+        {PREFIX_TOOLS,  "tools"},
+    };
+    putintkey(w, "rebuilt", 1);
+    putkey(w, "changed");
+    putarray(w);
+    for (iz i = 0; i < countof(parts); i++) {
+        if (pre & parts[i].bit) {
+            putstr(w, parts[i].name);
+        }
+    }
+    putend(w);
+}
+
+// After a checkpoint replaced the history: what it may have left out,
+// told again before the request that follows.
+static void reheed(Session *s, Arena scratch)
+{
+    s->modeheard = MODE_BUILD;  // plan mode
+    planheed(s, scratch);
+    s->shellheard = s->shellpre;  // and a shell other than the tool's
+    shellheed(s, scratch);
+    shcarryheed(s, scratch);  // and where bash (builtin) carried its cd
+    grantforget(s);  // and the Permissions pane's grants, as they hold
+    grantheed(s, scratch);
+    wtheed(s, scratch);  // and a side chat in a worktree, where it works
+    moveheed(s, scratch);  // and a fork into another folder, where it moved
+    compactheed(s, scratch);  // and what it was told of its instructions
+}
+
 // The summary arrived: rebuild the history around it, log it, and carry
 // on with the step, unless the prompt is still above the goal after a
 // compaction at the threshold (the progress guard): compacting again
@@ -16491,41 +16567,13 @@ static void compacted(Session *s, Arena scratch, Partial *p)
     if (cp.focus.len) {
         putstrkey(&w.json, "focus", cp.focus);
     }
-    if (pre) {
-        // The system prompt rebuilt, and what it has new, for its card
-        struct { i32 bit; Str name; } parts[] = {
-            {PREFIX_INSTR,  "instructions"},
-            {PREFIX_MEMORY, "memory"},
-            {PREFIX_SKILLS, "skills"},
-            {PREFIX_TOOLS,  "tools"},
-        };
-        putintkey(&w.json, "rebuilt", 1);
-        putkey(&w.json, "changed");
-        putarray(&w.json);
-        for (iz i = 0; i < countof(parts); i++) {
-            if (pre & parts[i].bit) {
-                putstr(&w.json, parts[i].name);
-            }
-        }
-        putend(&w.json);
-    }
+    putrebuilt(&w.json, pre);
     ssend(s, &w);
     s->thinkfrom = s->log.seq;
     s->purpose   = REQ_CHAT;
     s->cp        = {};
     setstate(s, S_IDLE);
-    // The summary may have left out plan mode: told again, before the
-    // request that follows
-    s->modeheard = MODE_BUILD;
-    planheed(s, scratch);
-    s->shellheard = s->shellpre;  // and a shell other than the tool's
-    shellheed(s, scratch);
-    shcarryheed(s, scratch);  // and where bash (builtin) carried its cd
-    grantforget(s);  // and the Permissions pane's grants, as they hold
-    grantheed(s, scratch);
-    wtheed(s, scratch);  // and a side chat in a worktree, where it works
-    moveheed(s, scratch);  // and a fork into another folder, where it moved
-    compactheed(s, scratch);  // and what it was told of its instructions
+    reheed(s, scratch);
     // Last, so the newest message: a step the instructions ask for after
     // a compaction is taken only when the agent is told of it here, not
     // from the checkpoint or the system prompt alone (#57, tried on a
@@ -16559,6 +16607,48 @@ static void compacted(Session *s, Arena scratch, Partial *p)
         return;
     }
     proceed(s, scratch);
+}
+
+// The plan approved with a clean context (issue #109): the whole history
+// gives way to a checkpoint the harness writes (planclearsummary), with
+// no model, logged as a summary of why "plan" so that a replay rebuilds
+// it alike. Run once the approving step's calls end (toolsdone), so no
+// call is left without its result, a cancelled turn's too.
+static void clearforplan(Session *s, Arena scratch)
+{
+    s->planclear = 0;
+    i64       before = estimate(s);
+    PlanClear pc     = {};
+    pc.prev     = summarytext(s->summary);
+    pc.plan     = s->planctext;
+    pc.planfile = s->planfile;
+    pc.todo     = tooloffered(&s->te, TOOL_TODO);
+    s->planctext = {};
+    Str text = planclearsummary(&scratch, s->history, &pc);
+
+    i32   pre = reprefix(s, scratch);
+    Files f   = summaryfiles(&scratch, s->summary);
+    f = addfiles(&scratch, f, s->history, 0, s->history.len);
+    Str summary = withfiles(&s->perm, text, f);
+    i64 cutseq  = s->log.seq + 1;  // nothing kept
+    summarize(s, summary, cutseq, s->log.seq+1);
+
+    Buf   b(&scratch, 512 + summary.len*2);
+    EvOut w = sbegin(s, &b, EV_COMPACT);
+    compactevent(s, &w, "summary", CW_PLAN, before);
+    putintkey(&w.json, "cutseq", cutseq);
+    putstrkey(&w.json, "summary", summary);
+    putrebuilt(&w.json, pre);
+    ssend(s, &w);
+    s->thinkfrom = s->log.seq;
+    reheed(s, scratch);
+    notify(s, "cleared", "Your conversation was just cleared for the plan the "
+           "user approved: the checkpoint has the plan, and the user's own "
+           "words. If your instructions say what to do after a compaction, do "
+           "it now, before you carry on.", 0);
+    if (!s->cancelled) {
+        deliver(s, scratch);
+    }
 }
 
 
@@ -17202,6 +17292,8 @@ static void endturn(Session *s, Arena scratch, Str why, Str err)
     s->cp          = {};
     s->compactnext = 0;
     s->cpfocus     = {};
+    s->planclear   = 0;  // done in toolsdone, which a cancel goes through
+    s->planctext   = {};
     s->slowing     = 0;
     s->slowfrom    = 0;
     s->slown       = 0;
@@ -21894,6 +21986,7 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
         case EV_USER:
         case EV_NUDGE:
             m.role   = ROLE_USER;
+            m.user   = r.ev == EV_USER;
             m.text   = clone(&s->perm, jsonstr(jsonget(j, "text")));
             m.seq    = r.seq;
             m.images = getimages(&s->perm, jsonget(j, "images"));
@@ -21919,7 +22012,7 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             if (sum->type == JSON_STRING) {
                 Str summary = clone(&s->perm, jsonstr(sum));
                 summarize(s, summary, jsonint(jsonget(j, "cutseq"), 0), r.seq);
-                s->tsumms++;
+                s->tsumms += jsonstr(jsonget(j, "why")) != "plan";
             }
             countbytes(s);
             s->thinkfrom = r.seq;
@@ -27358,9 +27451,12 @@ static void command(Engine *e, Arena scratch, Str line)
             Str err = concat(&scratch, "no such request: the one waiting is ", s->ask.req);
             reply(e, scratch, id, 0, err, sid);
         } else if (decision!="allow" && decision!="deny" && decision!="always" &&
-                   decision!="trust") {
+                   decision!="trust" && decision!="clear") {
             reply(e, scratch, id, 0, "decision must be \"allow\", \"always\", "
-                  "\"trust\" or \"deny\"", sid);
+                  "\"trust\", \"clear\" or \"deny\"", sid);
+        } else if (decision=="clear" && s->ask.tool!=TOOL_PLANEXIT) {
+            reply(e, scratch, id, 0, "only a plan's approval clears the context: "
+                  "allow or deny it", sid);
         } else if (decision=="always" && !s->ask.grant.len) {
             reply(e, scratch, id, 0, "this ask offers no always: allow or deny it", sid);
         } else if (decision=="trust" && !s->ask.trust.len) {
@@ -27388,6 +27484,7 @@ static void command(Engine *e, Arena scratch, Str line)
             reply(e, scratch, id, 1, {}, sid);
             Str note  = jsonstr(jsonget(j, "note"));
             b32 trust = decision == "trust";
+            s->planclear = decision == "clear";  // planresolve takes it
             resolve(s, scratch, decision!="deny", DENY_USER, note,
                     decision=="always" || trust, trust);
             nexttool(s, scratch);

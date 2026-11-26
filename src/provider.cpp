@@ -425,6 +425,8 @@ struct MsgSess {
 struct Msg {
     i32          role;
     Str          text;    // user and tool messages
+    b32          user;    // a user message the user wrote (adduser), not
+                          // a nudge or notice
     Slice<Block> blocks;  // assistant messages
     Str          callid;  // tool messages
     Str          spill;   // tool messages: the full output, relative to

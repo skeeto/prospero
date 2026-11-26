@@ -1403,7 +1403,8 @@ static Str headername(Arena *a, View *v, ViewMsg *m)
         Str       name = t->name.len ? t->name : Str("call");
         return t->summary.len ? concat(a, concat(a, name, ": "), utf8head(t->summary, 80)) : name;
     }
-    case VIEW_COMPACT: return "Compacted";
+    case VIEW_COMPACT: return m->card && m->card->why=="plan" ? Str("Context cleared")
+                                                              : Str("Compacted");
     case VIEW_THINK:   return live ? Str("Thinking\xe2\x80\xa6") : Str("Reasoning");
     default:           return m->label.len ? m->label : rolename(m->role);
     }
@@ -1490,7 +1491,8 @@ static ImVec2 drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
     case VIEW_COMPACT: {
         ViewCard *c = m->card;
         Buf b(&a, 128);
-        pen(p, "Compacted", STYLE_BOLD, dim);
+        b32 plan = c->why == "plan";
+        pen(p, plan ? Str("Context cleared") : Str("Compacted"), STYLE_BOLD, dim);
         print(&b, "  ");
         printgrouped(&b, c->before);
         print(&b, " to ");
@@ -1498,7 +1500,13 @@ static ImVec2 drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
         print(&b, " tokens");
         pen(p, finish(&b), STYLE_BOLD, pal->active);
         b.len = 0;
-        if (c->kind == "summary") {
+        if (plan) {
+            // A plan approved with a clean context: no summarizer
+            print(&b, "  ");
+            print(&b, (i64)c->count);
+            print(&b, c->count==1 ? Str(" message") : Str(" messages"));
+            print(&b, " gave way to the approved plan");
+        } else if (c->kind == "summary") {
             print(&b, "  summary of ");
             print(&b, (i64)c->count);
             print(&b, c->count==1 ? Str(" message") : Str(" messages"));
@@ -2792,6 +2800,21 @@ static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
                enter    ? Str("Plan mode: the agent explores and writes a plan, "
                               "changing nothing else until you approve it")
                         : Str("End plan mode: the agent carries out this plan"));
+        if (!enter && hostcap(s->host, "plan.clear")) {
+            // The same, its planning conversation cleared first (#109)
+            ImGui::SameLine();
+            ImGui::BeginDisabled(nogo.len != 0);
+            if (ImGui::Button("Approve, clear context")) {
+                guianswer(g, s, t->req, "clear", {});
+            }
+            ImGui::EndDisabled();
+            itemnamed(g, "approve clear");
+            whytip(nogo.len ? nogo :
+                   Str("End plan mode, and carry out this plan in a clean "
+                       "context: the conversation that planned it gives way "
+                       "to the plan and your own messages, which saves "
+                       "context, but the agent reads again what it needs"));
+        }
         ImGui::SameLine();
         if (ImGui::Button(enter ? "Go ahead without" : "Keep planning\xe2\x80\xa6")) {
             if (enter) {

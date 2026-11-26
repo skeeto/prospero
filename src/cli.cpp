@@ -233,7 +233,9 @@ static void prettyrecord(Cli *c, Arena scratch, EvRec *r)
     case EV_COMPACT: {
         prettyline(c);
         print(&b, "[compacted: ");
-        if (jsonstr(jsonget(j, "kind")) == "summary") {
+        if (jsonstr(jsonget(j, "why")) == "plan") {
+            print(&b, "context cleared for the approved plan");
+        } else if (jsonstr(jsonget(j, "kind")) == "summary") {
             print(&b, "older messages summarized by ");
             print(&b, jsonstr(jsonget(j, "model")));
         } else {

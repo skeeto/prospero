@@ -552,6 +552,109 @@ static Str checkpoint(Arena *a, Str summary)
 }
 
 
+// A plan approved with a clean context (issue #109)
+//
+// The conversation that planned it gives way to a checkpoint the harness
+// writes itself, with no summarizer: the user's own messages (Msg.user)
+// verbatim, long ones cut, as much of the newest as PLANCLEAR_USER
+// holds; what the summary before had of the goal and constraints, if
+// one did; then the plan, or where it is, and what to do next. Its
+// sections are a summary's, so that a later compaction updates it as
+// one (hasgoal). The caller adds the files section (withfiles).
+
+enum {
+    PLANCLEAR_MSG  = 4 << 10,   // a user message, cut to this
+    PLANCLEAR_USER = 16 << 10,  // the user's messages in all
+    PLANCLEAR_PREV = 4 << 10,   // the earlier summary's goal and constraints
+};
+
+struct PlanClear {
+    Str  prev;      // the summary before (summarytext), or null
+    Str  plan;      // the plan as approved, or null for "read it there"
+    Str  planfile;
+    b32  todo;      // the agent has todo_write
+};
+
+static Str planclearsummary(Arena *a, Slice<Msg> h, PlanClear *pc)
+{
+    // The newest user messages that fit, each cut, oldest first
+    Slice<Str> said = {};
+    iz         left = PLANCLEAR_USER;
+    iz         from = h.len;
+    for (iz i = h.len-1; i >= 0; i--) {
+        Msg *m = &h[i];
+        if (!m->user || m->role!=ROLE_USER) {
+            continue;
+        }
+        Str text = clip(a, trim(m->text), PLANCLEAR_MSG);
+        if (text.len > left) {
+            break;
+        }
+        left -= text.len;
+        from  = i;
+        said  = push(a, said, text);
+    }
+    iz dropped = 0;
+    for (iz i = 0; i < from; i++) {
+        dropped += h[i].user && h[i].role==ROLE_USER;
+    }
+
+    Str prev = pc->prev;
+    if (prev.len) {
+        // Its Goal and Constraints, which come before its Progress
+        iz at = find(prev, "\n## Progress");
+        prev  = clip(a, trim(at<0 ? prev : takehead(prev, at)), PLANCLEAR_PREV);
+    }
+
+    Buf b(a, 2048 + PLANCLEAR_USER + 64*said.len + prev.len + pc->plan.len +
+             2*pc->planfile.len);
+    print(&b, "## Goal\n"
+              "The user approved the plan below and cleared the conversation "
+              "that planned it, so this checkpoint stands for it. The harness "
+              "wrote it, not a summarizer: the plan and the user's own words "
+              "are as they were.");
+    if (prev.len) {
+        print(&b, "\n\nFrom the summary of the conversation before the plan:\n\n");
+        print(&b, prev);
+    }
+    if (said.len) {
+        print(&b, "\n\nThe user's messages, oldest first");
+        if (dropped) {
+            print(&b, " (");
+            print(&b, (i64)dropped);
+            print(&b, dropped==1 ? Str(" older one left out)") : Str(" older ones left out)"));
+        }
+        print(&b, ":");
+        for (iz i = said.len-1; i >= 0; i--) {
+            print(&b, "\n\n<user-message>\n");
+            print(&b, said[i]);
+            print(&b, "\n</user-message>");
+        }
+    }
+    print(&b, "\n\n## Approved plan\n");
+    if (pc->plan.len) {
+        print(&b, "As the user approved it, also in ");
+        print(&b, pc->planfile);
+        print(&b, ":\n\n");
+        print(&b, pc->plan);
+    } else {
+        print(&b, "In ");
+        print(&b, pc->planfile);
+        print(&b, ", too long to repeat here: read it first.");
+    }
+    print(&b, "\n\n## Next steps\n"
+              "Plan mode is off: carry out the approved plan now. What you "
+              "read while planning went with the conversation, so read again "
+              "what the work needs (the files listed below, say).");
+    if (pc->todo) {
+        print(&b, " If it has several steps, begin with a todo list of them "
+                  "(todo_write), sent with your first tool call, and keep it up "
+                  "to date.");
+    }
+    return finish(&b);
+}
+
+
 // Files read and written, kept by the harness across compactions as the
 // last section of each summary, one file to a line
 

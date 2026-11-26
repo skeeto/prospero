@@ -368,7 +368,12 @@ turn goes on, each call after the change held to the new mode, and the
 agent told at its next step; running subagents follow. While planning, its file tools may write only the
 session's plan file, `plan.md` in the session's directory, the desktop
 tool may only look, and subagents plan too. When it is done it asks for
-approval, showing the plan: Approve plan lets it go ahead, and Keep
+approval, showing the plan: Approve plan lets it go ahead, and Approve,
+clear context does too, in a clean context: the conversation that
+planned it gives way to a checkpoint with the plan, your own messages
+and the files it read, with no model involved, which saves the room
+planning took but has the agent read again what it needs (a card says
+so in the transcript). Keep
 planning puts the keyboard in the prompt box, from which anything sent
 while the plan waits keeps planning (the ask denied, the message read
 right after it as a steer). `[plan] prompt` and `prompt_file` add the

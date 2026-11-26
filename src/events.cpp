@@ -431,6 +431,9 @@ static Str capnames[] = {
                        // here on, "" for its model's own; the effort
                        // record says it, with the model's default, the
                        // levels to pick from, and off, why there are none
+    "plan.clear",      // answer {decision:"clear"} to a plan's ask: approved,
+                       // the history then gives way to a checkpoint with the
+                       // plan (compact {why:"plan"}), and answer {clear:1}
 };
 
 static Str evname(i32 ev)

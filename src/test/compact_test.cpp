@@ -336,4 +336,51 @@ static void test_compact(Test *t)
         expect(t, "files kept", istr(a, many.len), istr(a, COMPACT_FILES));
         expect(t, "files newest", many[many.len-1], "3");
     }
+
+    // A plan approved with a clean context: the harness's checkpoint
+    {
+        Slice<Msg> h = {};
+        Msg nudge = {};
+        nudge.role = ROLE_USER;
+        nudge.text = "A REMINDER";
+        Msg mine = {};
+        mine.role = ROLE_USER;
+        mine.user = 1;
+        mine.text = "  First, do not commit.  ";
+        h = push(a, h, mine);
+        h = push(a, h, testmsg(a, ROLE_ASSISTANT, 0, "read"));
+        h = push(a, h, nudge);
+        mine.text = "Second.";
+        h = push(a, h, mine);
+        PlanClear pc = {};
+        pc.prev     = "## Goal\nOLD GOAL\n\n## Progress\nOLD PROGRESS";
+        pc.plan     = "# Plan\n\n- PLANNED";
+        pc.planfile = "/s/plan.md";
+        pc.todo     = 1;
+        Str  s  = planclearsummary(a, h, &pc);
+        auto in = [&](Str x) { return find(s, x)>=0 ? Str("in") : Str("out"); };
+        expect(t, "planclear goal", istr(a, hasgoal(s)), "1");
+        expect(t, "planclear first", in("<user-message>\nFirst, do not commit.\n</user-message>"), "in");
+        expect(t, "planclear order", istr(a, find(s, "First,") < find(s, "Second.")), "1");
+        expect(t, "planclear no nudge", in("REMINDER"), "out");
+        expect(t, "planclear prev goal", in("OLD GOAL"), "in");
+        expect(t, "planclear prev progress", in("OLD PROGRESS"), "out");
+        expect(t, "planclear plan", in("also in /s/plan.md:\n\n# Plan\n\n- PLANNED"), "in");
+        expect(t, "planclear todo", in("todo_write"), "in");
+
+        // Too long to repeat, many messages: the file named, the oldest left out
+        Slice<Msg> many = {};
+        mine.text = testmsg(a, ROLE_USER, 6000, {}).text;
+        for (i32 i = 0; i < 6; i++) {
+            many = push(a, many, mine);
+        }
+        pc = {};
+        pc.planfile = "/s/plan.md";
+        s = planclearsummary(a, many, &pc);
+        expect(t, "planclear file", in("In /s/plan.md, too long to repeat here"), "in");
+        expect(t, "planclear dropped", in("(3 older ones left out)"), "in");
+        expect(t, "planclear cut", in("bytes omitted"), "in");
+        expect(t, "planclear no prev", in("summary of the conversation before"), "out");
+        expect(t, "planclear no todo", in("todo_write"), "out");
+    }
 }

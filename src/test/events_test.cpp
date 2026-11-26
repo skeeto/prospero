@@ -870,7 +870,7 @@ static void test_events(Test *t)
                "\"trash\",\"relay\",\"question.deadline\",\"ask.deadline\",\"ask.hold\",\"shell.env\",\"call.stop\","
                "\"cut\",\"approve\",\"files.path\",\"sessions.mention\",\"fork.cwd\",\"endpoint.auth\",\"endpoint.copilot\","
                "\"term\",\"term.host\",\"pdf\",\"fs\",\"pause\",\"skill.fetch\",\"term.edit\",\"term.run\",\"term.marks\","
-               "\"grants\",\"effort\"]}");
+               "\"grants\",\"effort\",\"plan.clear\"]}");
         b.len = 0;
         w = {&b};
         putobject(&w);
