@@ -200,6 +200,18 @@ static void test_mcp(Test *t)
         expect(t, "mcp tools after", takehead(two, 10), "[{\"a\":1},{");
         expect(t, "mcp tools parse", jsonparse(&a, two).root->type==JSON_ARRAY
                                      ? Str("ok") : Str("bad"), "ok");
+
+        // Joined later, from a record of their own: the same bytes
+        Slice<McpTool> add2 = add;
+        add2 = push(&a, add2, x);
+        Str more = mcpaddtools(&a, "[]", add2);
+        Str bases[] = {"[]", {}, "[{\"a\":1}]", " [{\"a\":1},{\"b\":2}] "};
+        for (iz i = 0; i < countof(bases); i++) {
+            Str name = concat(&a, "mcp tools joined ", bases[i]);
+            expect(t, name, mcpjointools(&a, bases[i], more), mcpaddtools(&a, bases[i], add2));
+        }
+        expect(t, "mcp tools joined none", mcpjointools(&a, "[{\"a\":1}]", "[]"), "[{\"a\":1}]");
+        expect(t, "mcp tools joined bad", mcpjointools(&a, "[{\"a\":1}]", "x"), "[{\"a\":1}]");
     }
 
     // Instructions

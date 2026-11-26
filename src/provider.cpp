@@ -680,6 +680,14 @@ struct ModelConf {
     Price        price;      // [model] price, PRICE_UNSET if not set
 };
 
+// Tools that joined a session mid-conversation, after its prefix's: the
+// array of functions, as the prefix's tools are encoded, and the seq of
+// their record, which orders them among the history's messages.
+struct ToolAdd {
+    i64 seq;
+    Str tools;
+};
+
 struct ChatReq {
     ModelConf *mc;
     Str        system;

@@ -801,7 +801,9 @@ struct Session {
     ModelInfo    info;
     b32          discovered;  // this turn
     Str          system;
-    Str          tools;
+    Str          tools;      // the prefix's, then those that joined it
+    Str          toolsbase;  // the prefix's alone, as logged (logprefix)
+    Slice<ToolAdd> tooladds; // those that joined since, in order (mcpjoin)
     ToolEnv      te;         // te.shell: the shell commands run in now
     Str          shellwarn;  // [tools] shell was not found (buildprefix)
     Shell        shellpre;   // the shell the prefix describes
@@ -13464,11 +13466,57 @@ static void mcpbase(Session *s, Arena scratch, Slice<McpTool> add)
     }
 }
 
+static void putmcprows(JsonOut *, Slice<McpTool>);
+
+// Tools that join a session, add: before its prefix's first request,
+// into the prefix, logged anew (mcpbase); after it, apart from the
+// prefix, which stays as it was, in a record of their own (EV_TOOLS),
+// which says which server it opened, if open names one. Returns the
+// instructions of their servers new to the session, for the agent, in
+// the scratch: a prefix's go into its system prompt instead.
+static Str mcpjoin(Session *s, Arena *scratch, Slice<McpTool> add, Str open)
+{
+    if (!s->mcpfixed) {
+        mcpbase(s, *scratch, add);
+        logprefix(s, *scratch);
+        return {};
+    }
+    Slice<Str> intro = mcpintro(s, scratch, add);
+    Str        more  = mcpaddtools(scratch, "[]", add);
+    {
+        Arena a = *scratch;
+        Buf   b(&a, 256 + 2*more.len + 256*add.len);
+        EvOut w = sbegin(s, &b, EV_TOOLS);
+        putstrkey(&w.json, "tools", more);
+        putmcprows(&w.json, add);
+        if (open.len) {
+            putstrkey(&w.json, "open", open);
+        }
+        ssend(s, &w);
+    }
+    s->tools = clone(&s->perm, mcpjointools(scratch, s->tools, more));
+    for (iz i = 0; i < add.len; i++) {
+        s->mcptools = push(&s->perm, s->mcptools, add[i]);
+    }
+    if (add.len) {
+        ToolAdd x = {s->log.seq, clone(&s->perm, more)};
+        s->tooladds = push(&s->perm, s->tooladds, x);
+    }
+    Str instr = {};
+    for (iz i = 0; i < intro.len; i++) {
+        McpServer *m = mcpsrvof(s, intro[i]);
+        instr = concat(scratch, instr, mcpinstructions(scratch, m->name, m->instr, !i));
+    }
+    return instr;
+}
+
 // Before a request: the session's servers started, and while its tools
 // are not fixed, waited for (S_MCP) until each is ready or failed. Then
-// the tools of those ready that it lacks join it: its prefix, before
-// the prefix's first request, else anew, told to the agent. Returns 0
-// while it waits: mcpwake goes on, through prepare.
+// the tools of those ready that it lacks join it (mcpjoin): its prefix,
+// before the prefix's first request, else apart from it, told to the
+// agent, but not right after a response that paused its turn, as no
+// tools may join there. Returns 0 while it waits: mcpwake goes on,
+// through prepare.
 static b32 mcpgate(Session *s, Arena scratch)
 {
     if (s->readonly) {
@@ -13489,6 +13537,10 @@ static b32 mcpgate(Session *s, Arena scratch)
     if (s->state == S_MCP) {
         setstate(s, S_IDLE);
     }
+    iz n = s->history.len;
+    if (s->mcpfixed && n && s->history[n-1].role==ROLE_ASSISTANT) {
+        return 1;  // a paused turn's: they join at its next step
+    }
 
     Slice<McpTool> add = {};
     for (iz i = 0; i < s->mcpsrvs.len; i++) {
@@ -13496,21 +13548,22 @@ static b32 mcpgate(Session *s, Arena scratch)
     }
     if (!add.len) {
         return 1;
+    } else if (!s->mcpfixed) {
+        mcpjoin(s, &scratch, add, {});
+        return 1;
     }
-    b32 fixed = s->mcpfixed;
-    mcpbase(s, scratch, add);
-    if (fixed) {
-        // Mid-session: the agent is told what it has now
-        Buf b(&scratch, 256);
-        print(&b, "New tools from MCP servers are available now:");
-        for (iz i = 0; i < add.len; i++) {
-            print(&b, i ? Str(", ") : Str(" "));
-            print(&b, add[i].name);
-        }
-        putbyte(&b, '.');
-        notify(s, "mcp", finish(&b), 0);
+    // Mid-session: the agent is told what it has now, after its record,
+    // so that a cut that takes the tools away takes the notice too
+    Str instr = mcpjoin(s, &scratch, add, {});
+    Buf b(&scratch, 256 + instr.len);
+    print(&b, "New tools from MCP servers are available now:");
+    for (iz i = 0; i < add.len; i++) {
+        print(&b, i ? Str(", ") : Str(" "));
+        print(&b, add[i].name);
     }
-    logprefix(s, scratch);
+    putbyte(&b, '.');
+    print(&b, instr);
+    notify(s, "mcp", finish(&b), 0);
     return 1;
 }
 
@@ -18816,8 +18869,9 @@ static void buildprefix(Session *s, Arena scratch)
         s->system = concat(&s->perm, s->system, mem);
     }
     s->memsys = s->memseen;
-    // No MCP tools yet, and no request has used it (mcpgate)
+    // No MCP tools yet, none joined, and no request has used it (mcpgate)
     s->mcptools = {};
+    s->tooladds = {};
     s->mcpfixed = 0;
 }
 
@@ -18896,11 +18950,55 @@ static i32 reprefix(Session *s, Arena scratch)
     return r;
 }
 
+// The MCP tools of a prefix, or of tools that joined it: by name, with
+// the server and its tool, whether it only reads, and whose server.
+static void putmcprows(JsonOut *w, Slice<McpTool> rows)
+{
+    if (!rows.len) {
+        return;
+    }
+    putkey(w, "mcp");
+    putarray(w);
+    for (iz i = 0; i < rows.len; i++) {
+        McpTool *t = &rows[i];
+        putobject(w);
+        putstrkey(w, "name", t->name);
+        putstrkey(w, "server", t->server);
+        putstrkey(w, "tool", t->tool);
+        if (t->ro) {
+            putintkey(w, "ro", 1);
+        }
+        if (t->origin.len) {
+            putstrkey(w, "origin", t->origin);
+        }
+        putend(w);
+    }
+    putend(w);
+}
+
+static void getmcprows(Arena *a, Session *s, Json *rows)
+{
+    for (Json *k = rows->child; k; k = k->next) {
+        McpTool t = {};
+        t.name   = clone(a, jsonstr(jsonget(k, "name")));
+        t.server = clone(a, jsonstr(jsonget(k, "server")));
+        t.tool   = clone(a, jsonstr(jsonget(k, "tool")));
+        t.ro     = jsonflag(jsonget(k, "ro"), 0);
+        t.origin = clone(a, jsonstr(jsonget(k, "origin")));
+        if (t.name.len && t.server.len && t.tool.len) {
+            s->mcptools = push(a, s->mcptools, t);
+        }
+    }
+}
+
 // The prefix's durable record, so that the session opened again, or
 // revived from parking, sends it byte for byte whatever the configuration
-// says then: only a compaction may break the prompt cache.
+// says then: only a compaction may break the prompt cache. Tools that
+// join it later are apart from it (mcpjoin).
 static void logprefix(Session *s, Arena scratch)
 {
+    s->toolsbase = s->tools;
+    s->tooladds  = {};
     if (s->readonly) {
         return;
     }
@@ -18938,25 +19036,7 @@ static void logprefix(Session *s, Arena scratch)
     if (s->mcpfilter.data) {
         putstrkey(&w.json, "mcp_filter", s->mcpfilter);
     }
-    if (s->mcptools.len) {
-        putkey(&w.json, "mcp");
-        putarray(&w.json);
-        for (iz i = 0; i < s->mcptools.len; i++) {
-            McpTool *t = &s->mcptools[i];
-            putobject(&w.json);
-            putstrkey(&w.json, "name", t->name);
-            putstrkey(&w.json, "server", t->server);
-            putstrkey(&w.json, "tool", t->tool);
-            if (t->ro) {
-                putintkey(&w.json, "ro", 1);
-            }
-            if (t->origin.len) {
-                putstrkey(&w.json, "origin", t->origin);
-            }
-            putend(&w.json);
-        }
-        putend(&w.json);
-    }
+    putmcprows(&w.json, s->mcptools);
     ssend(s, &w);
 }
 
@@ -22130,19 +22210,21 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             s->mcpfilter     = jsonget(j, "mcp_filter")->type==JSON_STRING
                                ? clone(&s->perm, jsonstr(jsonget(j, "mcp_filter"))) : Str{};
             s->mcptools      = {};
-            for (Json *k = jsonget(j, "mcp")->child; k; k = k->next) {
-                McpTool t = {};
-                t.name   = clone(&s->perm, jsonstr(jsonget(k, "name")));
-                t.server = clone(&s->perm, jsonstr(jsonget(k, "server")));
-                t.tool   = clone(&s->perm, jsonstr(jsonget(k, "tool")));
-                t.ro     = jsonflag(jsonget(k, "ro"), 0);
-                t.origin = clone(&s->perm, jsonstr(jsonget(k, "origin")));
-                if (t.name.len && t.server.len && t.tool.len) {
-                    s->mcptools = push(&s->perm, s->mcptools, t);
-                }
-            }
+            getmcprows(&s->perm, s, jsonget(j, "mcp"));
+            s->toolsbase     = s->tools;
+            s->tooladds      = {};
             prefixed         = 1;
             break;
+        case EV_TOOLS: {
+            // Joined after the prefix's, as mcpjoin had them
+            Str more = jsonstr(jsonget(j, "tools"));
+            s->tools = clone(&s->perm, mcpjointools(&t, s->tools, more));
+            getmcprows(&s->perm, s, jsonget(j, "mcp"));
+            if (trim(more).len > 2) {
+                ToolAdd x = {r.seq, clone(&s->perm, more)};
+                s->tooladds = push(&s->perm, s->tooladds, x);
+            }
+        } break;
         }
         replaytools(s, t, &r);
     }

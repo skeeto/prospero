@@ -827,7 +827,7 @@ static void test_events(Test *t)
                "tool.end ask answer retry nudge turn.end note compact job.start "
                "job.end todo snap rewind instructions notice prefix model grant mode "
                "task.host task.report memory shell ask.deadline cut uncut pause revoke deny effort "
-               "usage ");
+               "usage tools ");
         expect(t, "synced events", finish(&sync),
                "tool.start ask answer turn.end rewind task.report cut uncut pause revoke deny ");
         expect(t, "unknown event", istr(a, evfind("tool")), istr(a, EV_NONE));
@@ -1480,7 +1480,7 @@ static void test_events(Test *t)
                "turn.end=1 note=0 compact=0 job.start=0 job.end=0 todo=0 snap=0 "
                "rewind=1 instructions=0 notice=0 prefix=0 model=0 grant=0 mode=0 "
                "task.host=0 task.report=1 memory=0 shell=0 ask.deadline=0 cut=1 uncut=1 pause=1 "
-               "revoke=1 deny=1 effort=0 usage=0 ");
+               "revoke=1 deny=1 effort=0 usage=0 tools=0 ");
         logclose(&log);
 
         Str start = "{\"sid\":\"s13\",\"seq\":1,\"ts\":0,\"ev\":\"tool.start\",\"call\":\"a\"}\n";

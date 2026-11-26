@@ -3389,6 +3389,15 @@ def sc_mcp_untick(model, n, req):
         ("mcp__fake__echo", {"text": "b"}), "Two."])
 
 
+def sc_mcp_late(model, n, req):
+    # Nothing to call at first; echo once it joins; a turn after a reopen
+    yield from mcp_steps(model, n, req, [
+        "One.", ("mcp__fake__echo", {"text": "late"}), "Two.", "Three."])
+
+
+sc_mcp_late_rewind = sc_mcp_late
+
+
 def sc_mcp_http_two(model, n, req):
     yield from mcp_steps(model, n, req, [("mcp__docs__where", {}), "Done."])
 

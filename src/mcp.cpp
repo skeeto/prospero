@@ -28,8 +28,11 @@
 // servers to be ready (or failed, or past startup_timeout); its tools
 // are fixed then, and logged with the prefix (EV_PREFIX, its "mcp"
 // table), so that the session opened again offers the same. A server
-// ready later adds its tools at the next request, which logs a new
-// prefix; tools are never taken away mid-session.
+// ready later adds its tools at the next request, apart from the
+// prefix, which stays as it was: a record of its own (EV_TOOLS), which
+// the Messages API takes as an addition to the conversation where the
+// model can, so that the prompt cache holds (anthropic.cpp). Tools are
+// never taken away mid-session.
 //
 // This file holds what needs no engine: names, a command's words,
 // schemas, results, and the server's state. The engine's part is in
@@ -593,6 +596,24 @@ static Str mcpaddtools(Arena *a, Str tools, Slice<McpTool> add)
         more = 1;
     }
     putbyte(&b, ']');
+    return finish(&b);
+}
+
+// A request's tools array with the functions of another at its end, as
+// mcpaddtools would have added them: more is mcpaddtools's of none.
+static Str mcpjointools(Arena *a, Str tools, Str more)
+{
+    Str head = trim(tools);
+    head = head.len && head[head.len-1]==']' ? takehead(head, head.len-1) : Str("[");
+    Str tail = trim(more);
+    tail = tail.len>=2 && tail[0]=='[' && tail[tail.len-1]==']' ? cuthead(tail, 1) : Str("]");
+    b32 both = trim(cuthead(head, 1)).len>0 && trim(takehead(tail, tail.len-1)).len>0;
+    Buf b(a, head.len + tail.len + 1);
+    print(&b, head);
+    if (both) {
+        putbyte(&b, ',');
+    }
+    print(&b, tail);
     return finish(&b);
 }
 

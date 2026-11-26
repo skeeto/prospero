@@ -14755,6 +14755,116 @@ def mcp_untick(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+def newevent(h, sid, ev):
+    """The next event of a kind for a session, after those seen so far."""
+    seen = {id(e) for e in h.all(ev, sid)}
+    return lambda e: e.get("ev") == ev and e.get("sid") == sid and id(e) not in seen
+
+
+@scenario(conf=mcpconf(trust="yes", tools="none_such"), bound=40)
+def mcp_late(t):
+    """A server whose tools join after the session's first request: a
+    tools record, not a new prefix, so the system prompt and the tools
+    before them are as they were; the agent told of them, with the
+    server's instructions, in the conversation. A process that opens
+    the session again sends the same bytes."""
+    env = mcpenv(t)
+    h = b = None
+    try:
+        h = t.headless(env=env)
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.send("prompt", sid=sid, text="go")
+        t.check(ended(h, sid, 1)["why"] == "done", "the first turn ends")
+        first = t.requests()[0]["body"]
+        t.check(not [x for x in fake_provider.tool_names(first) if x.startswith("mcp__")],
+                f"no MCP tools at first: {fake_provider.tool_names(first)}")
+        prefixes = len([e for e in logged(t, sid) if e["ev"] == "prefix"])
+
+        r = h.call("config.set", kind="mcp", name="fake", key="tools", value="echo")
+        t.check(r.get("ok") == 1, f"set {r}")
+        n = len(t.requests())
+        h.send("prompt", sid=sid, text="again")
+        t.check(ended(h, sid, 2)["why"] == "done", "the second turn ends")
+        t.check([c["name"] for c in mcpcalls(t)] == ["echo"], f"calls {mcpcalls(t)}")
+        body = t.requests()[n]["body"]
+        names = fake_provider.tool_names(body)
+        t.check(names == fake_provider.tool_names(first) + ["mcp__fake__echo"],
+                f"echo after the others: {names}")
+        t.check(fake_provider.system_of(body) == fake_provider.system_of(first),
+                "the system prompt as it was")
+        told = json.dumps(body["messages"])
+        t.check(told.count("New tools from MCP servers are available now") == 1 and
+                "mcp__fake__echo" in told and "Use echo to repeat things." in told,
+                "told of the tools, with the server's instructions")
+        recs = logged(t, sid)
+        tools = [e for e in recs if e["ev"] == "tools"]
+        t.check(len(tools) == 1 and "mcp__fake__echo" in tools[0].get("tools", ""),
+                f"one tools record: {tools}")
+        t.check(len([e for e in recs if e["ev"] == "prefix"]) == prefixes,
+                "no new prefix")
+        t.check(h.close() == 0, "the first exits")
+        h = None
+
+        b = t.headless(env=env)
+        t.check(b.call("open", sid=sid, attended=1).get("ok") == 1, "open")
+        n = len(t.requests())
+        b.send("prompt", sid=sid, text="once more")
+        t.check(b.wait(newevent(b, sid, "turn.end"))["why"] == "done", "the third turn ends")
+        last = t.requests()[n]["body"]
+        t.check(json.dumps(last["tools"]) == json.dumps(t.requests()[n-1]["body"]["tools"]),
+                "the same tools, in the same bytes")
+        t.check(fake_provider.system_of(last) == fake_provider.system_of(first),
+                "the same system prompt")
+        t.check(json.dumps(last["messages"]).count("New tools from MCP servers") == 1,
+                "told once")
+        recs = logged(t, sid)
+        t.check(len([e for e in recs if e["ev"] == "tools"]) == 1 and
+                len([e for e in recs if e["ev"] == "prefix"]) == prefixes,
+                "no records of tools on reopening")
+    finally:
+        rc = h.close() if h else 0
+        rc2 = b.close() if b else 0
+    t.check(rc == 0 and rc2 == 0, f"headless exit {rc} {rc2}")
+
+
+@scenario(conf=mcpconf(trust="yes", tools="none_such"), bound=40)
+def mcp_late_rewind(t):
+    """A cut to before tools joined takes them back out: the next request
+    is as the one before they joined, and they join again, the agent
+    told once more, as if for the first time."""
+    h = t.headless(env=mcpenv(t))
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.send("prompt", sid=sid, text="go")
+        t.check(ended(h, sid, 1)["why"] == "done", "the first turn ends")
+        first = t.requests()[0]["body"]
+        r = h.call("config.set", kind="mcp", name="fake", key="tools", value="echo")
+        t.check(r.get("ok") == 1, f"set {r}")
+        h.send("prompt", sid=sid, text="again")
+        t.check(ended(h, sid, 2)["why"] == "done", "the second turn ends")
+
+        r = h.call("cut", sid=sid, turn=2)
+        t.check(r.get("ok") == 1 and r.get("next") == "again", f"cut {str(r)[:300]}")
+        n = len(t.requests())
+        h.send("prompt", sid=sid, text="again")
+        t.check(h.wait(newevent(h, sid, "turn.end"))["why"] == "done", "the turn ends again")
+        body = t.requests()[n]["body"]
+        names = fake_provider.tool_names(body)
+        t.check(names == fake_provider.tool_names(first) + ["mcp__fake__echo"],
+                f"echo joined again: {names}")
+        told = json.dumps(body["messages"])
+        t.check(told.count("New tools from MCP servers are available now") == 1 and
+                "Use echo to repeat things." in told, "told again, once")
+        t.check([c["name"] for c in mcpcalls(t)] == ["echo", "echo"], f"calls {mcpcalls(t)}")
+        ends = h.all("tool.end", sid)
+        t.check([e["status"] for e in ends] == ["ok", "ok"], f"echoed {ends}")
+        recs = logged(t, sid)
+        t.check(len([e for e in recs if e["ev"] == "tools"]) == 2, "a second tools record")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 @scenario(conf={**BIG, **mcpconf(trust="yes", tools="echo")}, bound=40)
 def mcp_compact(t):
     """A summary rebuilds the prefix as a new session's would be (#57):
@@ -14785,9 +14895,12 @@ def mcp_compact(t):
         sysp = fake_provider.system_of(body)
         t.check(sysp.count("# MCP server instructions") == 1 and
                 "Use echo to repeat things." in sysp, "the server's instructions, once")
-        # Told once, as its summary's request took it in, not again
+        # Not news: the summary's request, after a response, took nothing
+        # in, and the rebuilt prefix has it, as a new session's would
         told = json.dumps(body["messages"]).count("New tools from MCP servers")
-        t.check(told == 1, f"told once: {told}")
+        t.check(told == 0, f"not told: {told}")
+        recs = logged(t, sid)
+        t.check(not [e for e in recs if e["ev"] == "tools"], "no tools record")
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")
@@ -19125,7 +19238,7 @@ def fork_folder(t):
         t.check(first.get("cwd") == r["cwd"] and first.get("moved_from") == old and
                 first.get("forked_from") == sid, f"its record: {first}")
         evs = [e.get("ev") for e in recs]
-        t.check(not {"prefix", "instructions", "memory", "snap"} & set(evs),
+        t.check(not {"prefix", "tools", "instructions", "memory", "snap"} & set(evs),
                 f"none of the old folder's records: {evs}")
         grants = [e for e in recs if e.get("ev") == "grant"]
         t.check(len(grants) == 1, f"the grant outside, kept: {grants}")

@@ -58,6 +58,7 @@ enum : i32 {
     EV_DENY,        // a path the user keeps the file tools out of
     EV_EFFORT,      // the session's effort from here on, and its choices
     EV_USAGE,       // a billed request's usage, which no other record carries
+    EV_TOOLS,       // tools that joined mid-conversation, after the prefix's
     // Transient: sent, never logged
     EV_DELTA,
     EV_PROGRESS,
@@ -130,6 +131,7 @@ static EvInfo evinfo[] = {
     {"deny",       1, 1},  // likewise
     {"effort",     1, 0},
     {"usage",      1, 0},
+    {"tools",      1, 0},
     {"delta",      0, 0},
     {"progress",   0, 0},
     {"tool.out",   0, 0},
@@ -1278,10 +1280,11 @@ static b32 turncut(LogCuts *c, i64 turn)
 // Whether a cut drops a record of its range from the conversation: what
 // was said and done, but not the state that holds after it, as the
 // session's title, model, mode, shell, grants (revokes and denies too),
-// prefix and jobs, the
-// files changed (snap, rewind), nor the turns' numbers. Instruction
-// files and memory as the agent first had them stay, and later news of
-// them goes, to be told again.
+// prefix and jobs, the files changed (snap, rewind), nor the turns'
+// numbers. Instruction files and memory as the agent first had them
+// stay, and later news of them goes, to be told again. Tools that joined
+// the conversation go with it, to join again, told anew, and so does an
+// MCP server's opening.
 static b32 cutdrops(i32 ev, Json *root)
 {
     switch (ev) {
@@ -1301,6 +1304,7 @@ static b32 cutdrops(i32 ev, Json *root)
     case EV_TODO:
     case EV_NOTICE:
     case EV_TASKHOST:
+    case EV_TOOLS:
         return 1;
     case EV_INSTRUCTIONS:
     case EV_MEMORY:
@@ -1623,13 +1627,15 @@ static Str copycarry(Arena *a, Arena scratch, EvRec *rec, CopyWt *wt, b32 moved,
     return finish(&b);
 }
 
-// Whether a fork into another folder leaves out a record: its prefix,
-// instructions, memory and snapshots, and grants, revokes and denies of
-// paths in the old folder (wt->src, or wt->alt).
+// Whether a fork into another folder leaves out a record: its prefix and
+// the tools that joined it, instructions, memory and snapshots, and
+// grants, revokes and denies of paths in the old folder (wt->src, or
+// wt->alt).
 static b32 movedrops(Arena scratch, EvRec *rec, CopyWt *wt, b32 win)
 {
     switch (rec->ev) {
     case EV_PREFIX:
+    case EV_TOOLS:
     case EV_INSTRUCTIONS:
     case EV_MEMORY:
     case EV_SNAP:
@@ -1661,10 +1667,10 @@ struct CopyRef {
 // session record says so, with moved_from, and keeps only the roots
 // outside the old folder, and memory:1 if memory was on, to be decided
 // anew. Of the records that describe or act on the old folder, none
-// come along: its prefix, instructions and memory, which the new
-// folder's replace when it opens, its snapshots, which a rewind would
-// write back there, and its grants of paths there. A notice of kind
-// "moved" tells its agent, last.
+// come along: its prefix and the tools that joined it, instructions and
+// memory, which the new folder's replace when it opens, its snapshots,
+// which a rewind would write back there, and its grants of paths there.
+// A notice of kind "moved" tells its agent, last.
 static LogCopy logcopy(Arena *a, Arena scratch, Slice<Str> lines, Str from,
                        Str to, Slice<Str> olds, Slice<Str> news, i64 turn,
                        i64 now, b32 win, i32 kind = COPY_FORK, CopyWt *wt = 0)

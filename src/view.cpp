@@ -2557,6 +2557,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
     case EV_GRANT:
     case EV_REVOKE:
     case EV_DENY:
+    case EV_TOOLS:  // the MCP servers the session offers, too
         v->permrev++;  // nothing shows in the transcript
         return 0;
 
@@ -3218,6 +3219,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
                        kind=="grants"       ? Str("To the agent: permissions") :
                        kind=="compacted"    ? Str("To the agent: summarized") :
                        kind=="cleared"      ? Str("To the agent: context cleared") :
+                       kind=="mcp"          ? Str("To the agent: MCP tools") :
                        Str("To the agent");
         }
     } return 1;
