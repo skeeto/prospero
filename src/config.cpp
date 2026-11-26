@@ -286,6 +286,10 @@ static CfgKey cfgschema[] = {
     {"", "effort", CFG_ENUM, "", {}, "none minimal low medium high xhigh max",
      "general", "Effort for new sessions, as picked from the Prompt: one "
      "their model takes, else its own default ([model] effort)"},
+    {"", "role", CFG_STRING, "", {}, {}, "general",
+     "Role for new sessions you start, a [role] name or a built-in one "
+     "(explore, general), picked at first in the new session dialog; by "
+     "default none, the usual session"},
 
     {"endpoint", "kind", CFG_ENUM, "openai", {},
      "openai anthropic responses chatgpt copilot builtin",
@@ -2772,6 +2776,21 @@ static b32 cfgnotoverlay(Str key)
            startswith(key, "env.");
 }
 
+// Whether a role by this name exists: a [role NAME] section, or one
+// of the engine's built-in roles (builtinroles).
+static b32 cfgisrole(Ini *ini, Str name)
+{
+    return name=="explore" || name=="general" || inisection(ini, "role", name);
+}
+
+// The default role for a new session you start, trimmed, else empty,
+// as when it names no role (cfgvalidate warns).
+static Str cfgdefaultrole(Config *c)
+{
+    Str r = trim(cfgget(c, "", "", "role", 0));
+    return r.len && cfgisrole(c->ini, r) ? r : Str{};
+}
+
 static void cfgvalidate(Config *c, Ini *ini, IniFile *user, Arena *perm)
 {
     for (IniFile *f = ini->files; f; f = f->next) {
@@ -2818,6 +2837,15 @@ static void cfgvalidate(Config *c, Ini *ini, IniFile *user, Arena *perm)
             }
             if (s->kind=="model" && e->key=="like" && v.len) {
                 cfglikecheck(ini, perm, s->name, e);
+            }
+            if (!s->kind.len && e->key=="role" && v.len && !cfgisrole(ini, v)) {
+                Str msg = {};
+                if (!cfgmuted(e->file)) {
+                    msg = concat(perm, "no [role ", v);
+                    msg = concat(perm, msg, "], so new sessions have none");
+                }
+                cfgreport(ini, perm, e->file, e->line, INI_WARNING,
+                          e->line->valbeg, msg);
             }
             if (s->kind=="ui" && e->key=="theme" && v.len && !cfghasword(k->choices, v) &&
                     !inisection(ini, "theme", v)) {

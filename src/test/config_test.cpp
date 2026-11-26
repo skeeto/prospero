@@ -562,6 +562,23 @@ static void testcfgvalidate(Test *t)
            "and not a URL");
     cfgfree(c);
 
+    // The default role: a [role] section's, a built-in's, or none
+    static struct { Str ini, want, diags; } roles[] = {
+        {"role = review\n[role review]\n", "review", ""},
+        {"role =  explore \n", "explore", ""},
+        {"role = general\n", "general", ""},
+        {"", "", ""},
+        {"role = nobody\n[role review]\n", "",
+         "/c/role.ini:1:8: warning: no [role nobody], so new sessions have none"},
+    };
+    for (iz i = 0; i < countof(roles); i++) {
+        os_write(v.os, a, "/c/role.ini", roles[i].ini);
+        c = newconfig(v.os, &a, v.scratch, "/c/role.ini", 0);
+        expect(t, "role.default", cfgdefaultrole(c), roles[i].want);
+        expect(t, "role.diags", inidiags(&a, c->ini), roles[i].diags);
+        cfgfree(c);
+    }
+
     addenv(v.os, &a, "MISSING_VAR=s3cret");
     addenv(v.os, &a, "EMPTY_VAR=");
     os_write(v.os, a, "/c/env.ini",
@@ -1089,6 +1106,7 @@ static void testcfgjson(Test *t)
         "//endpoint=*\n"
         "//model=*\n"
         "//effort=*\n"
+        "//role=*\n"
         "endpoint/team/kind=openai*\n"
         "endpoint/team/url=https://t/@/c/team.ini:2\n"
         "endpoint/team/key=(hidden)@/c/team.ini:3!\n"

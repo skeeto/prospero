@@ -521,6 +521,7 @@ struct GuiHost {
     // from an engine older than config.get's roles), and its [model]
     // sections with their ids
     Slice<GuiRole> roles;
+    Str            roledflt;  // its configuration's role, for a new session there
     Slice<GuiModel> confs;
     // Its endpoints' listings (models), for the model pickers: the latest
     // answer, shown while another is asked for, with the defaults then
@@ -1950,6 +1951,7 @@ struct Gui {
     Str                wtquote;    // and the draft it gets
     b32                openwt;
     Str                newrole;    // in this role, if any
+    b32                newroleset; // newrole picked, else the host's default
     PathComp           pc;         // newcwd's completion
     PalWin             palw;       // the Ctrl/Cmd+K palette
     i64                viewseq;    // sessions shown so far (GuiSession.viewseq)
@@ -2882,6 +2884,32 @@ static Slice<GuiRole> replyroles(Arena *a, Json *j)
     return r;
 }
 
+// The default role in a config.get reply, trimmed, null if none.
+static Str replyrole(Json *j)
+{
+    for (Json *s = jsonget(j, "settings")->child; s; s = s->next) {
+        if (!jsonstr(jsonget(s, "kind")).len && jsonstr(jsonget(s, "key"))=="role") {
+            return trim(jsonstr(jsonget(s, "value")));
+        }
+    }
+    return {};
+}
+
+// The role a new session on h starts in unless another is picked: its
+// configuration's default role where h offers it, else none.
+static Str defaultrole(Gui *g, Arena *a, GuiHost *h)
+{
+    b32            main  = h == g->main;
+    Str            want  = main ? replyrole(g->cfg) : h->roledflt;
+    Slice<GuiRole> roles = main ? replyroles(a, g->cfg) : h->roles;
+    for (iz i = 0; want.len && i < roles.len; i++) {
+        if (roles[i].name == want) {
+            return want;
+        }
+    }
+    return {};
+}
+
 // Whether a [model] section's name in a config.get reply is a model's
 // settings on one endpoint, ENDPOINT/MODEL, ENDPOINT one with a URL.
 static b32 replyqualified(Json *j, Str name)
@@ -2976,6 +3004,10 @@ static void onhostmodels(Gui *g, GuiHost *h, Arena scratch, Json *j, b32 ok, Str
                          clone(&g->perm, roles[i].tools), roles[i].plans};
             h->roles = push(&g->perm, h->roles, c);
         }
+    }
+    Str role = ok ? replyrole(j) : Str{};
+    if (role != h->roledflt) {
+        h->roledflt = clone(&g->perm, role);
     }
     Slice<GuiModel> confs = ok ? replyconfs(&scratch, j) : Slice<GuiModel>{};
     same = confs.len == h->confs.len;
@@ -6443,9 +6475,10 @@ static void browsestart(Gui *g, Arena scratch, GuiHost *h)
 
 static void fieldput(char *, Str);
 
-// A new session in dir, with the configured model, in Build mode, as a
-// launch (prospero DIR) or an open event asked (why): shown once made,
-// or failing that, the new session dialog with dir and the error.
+// A new session in dir, with the configured model and role, in Build
+// mode, as a launch (prospero DIR) or an open event asked (why): shown
+// once made, or failing that, the new session dialog with dir and the
+// error.
 static void opendirnew(Gui *g, Arena scratch, Str dir, Str why)
 {
     Arena a = scratch;
@@ -6454,7 +6487,7 @@ static void opendirnew(Gui *g, Arena scratch, Str dir, Str why)
     g->cwdhost = 0;
     fieldput(g->newcwd, dir);
     guilog(g, concat(&a, concat(&a, concat(&a, "a new session in ", dir), ", as "), why));
-    guinew(g, g->main, dir, {}, {});
+    guinew(g, g->main, dir, {}, {}, defaultrole(g, &a, g->main));
     g->newmine = 0;  // not a jump of the user's
 }
 
@@ -22125,7 +22158,8 @@ static DriveOp mcpops[] = {
 };
 
 // Plan mode (--plan): a new session in plan mode from its dialog, in a
-// role whose tools name plan mode's (tests/gui.py sets it), the chip in
+// role whose tools name plan mode's, the dialog's pick at first as the
+// configuration's default role (tests/gui.py sets both), the chip in
 // its bar; the agent refused a change, asking to approve its
 // plan, which the Plan window shows, its text selected and copied, the
 // file revealed (noted only), and revised by hand from the ask (Edit
@@ -22150,12 +22184,7 @@ static DriveOp planops[] = {
     {OP_UP, 0, 0, 0, 1000, ""},
     {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
     {OP_TEXTCWD, 0, 0, 0, 300, ""},
-    {OP_MOVE, T_NAMED, 0, 0, 100, "new role"},
-    {OP_DOWN, 0, 0, 0, 60, ""},
-    {OP_UP, 0, 0, 0, 300, ""},
-    {OP_MOVE, T_NAMED, 0, 0, 100, "new role planner"},
-    {OP_DOWN, 0, 0, 0, 60, ""},
-    {OP_UP, 0, 0, 0, 300, ""},
+    // Plan mode's box is enabled only in a role with its tools
     {OP_MOVE, T_NAMED, 0, 0, 100, "new plan"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},

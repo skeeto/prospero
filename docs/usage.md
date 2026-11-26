@@ -353,7 +353,7 @@ there freely, a fork gets a copy of it, and it is deleted with the
 session. Such a session has only your own instructions and skills,
 none of a project's, and shows as "No folder" in the sidebar. Session
 → New session, no folder (Ctrl+Shift+N, Cmd+Shift+N on macOS) makes one
-at once, with the default model and no dialog. A new session's prompt
+at once, with the default model and role and no dialog. A new session's prompt
 box has the keyboard, for its first message.
 
 A message sent while a turn runs waits, dimmed, at the end of the
@@ -456,7 +456,8 @@ Nobody answers its asks, so they are denied. It exits 0 when the turn
 is done, 1 on error, 3 at the step budget (`[tools] turn_budget`, model
 requests, none by default), 130 when cancelled, and 2 for usage
 errors. Options: `-C DIR` (working directory), `-e ENDPOINT`,
-`-m MODEL` (or `ENDPOINT/MODEL`), `-r ROLE`, `-c FILE` (configuration)
+`-m MODEL` (or `ENDPOINT/MODEL`), `-r ROLE` (by default the
+configuration's `role`, `-r ''` for none), `-c FILE` (configuration)
 and `--state DIR`.
 
 A session that names no model gets the configuration's `model`, else

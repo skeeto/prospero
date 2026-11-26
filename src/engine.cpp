@@ -19065,6 +19065,7 @@ struct Role {
     b32 ok;
 };
 
+// Their names are cfgisrole's too
 static struct {
     Str name;
     Str desc;

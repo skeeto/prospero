@@ -30,7 +30,8 @@ static Str cliusage =
 "  -C DIR        working directory (default: the current one)\n"
 "  -e ENDPOINT   endpoint URL or configured name\n"
 "  -m MODEL      model name\n"
-"  -r ROLE       role, a [role] in the configuration (run only)\n"
+"  -r ROLE       role, a [role] in the configuration, '' for none (run only;\n"
+"                default: the configuration's role)\n"
 "  -c FILE       configuration file\n"
 "  --state DIR   session storage directory\n"
 "  --skillsdir DIR  more skills, in DIR (repeatable)\n"
@@ -697,6 +698,8 @@ static i32 climain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs, b32 
         putstr(&w.json, model);
         putkey(&w.json, "endpoint");
         putstr(&w.json, endpoint);
+        // Without -r, the configuration's default role, and -r '' none
+        role = role.data ? role : cfgdefaultrole(cfg);
         if (role.len) {
             putkey(&w.json, "role");
             putstr(&w.json, role);

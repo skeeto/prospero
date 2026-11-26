@@ -264,11 +264,12 @@ def composeconfig(editor, nonce):
     )
 
 
-def config(url, model, ask=3, extra=""):
+def config(url, model, ask=3, extra="", top=""):
     return (
         "# The GUI checklist's configuration\n"
         f"endpoint = fake\n"
         f"model = {model}\n"
+        f"{top}"
         "colour = blue  # unknown: the settings window lists the warning\n"
         "\n"
         "# The fake provider: a first byte may take longer than the GUI's\n"
@@ -2302,7 +2303,8 @@ def main():
         model = f"fake:plan_gui:{nonce}"
         fake_provider.STATE.register(model)
         extra = f"\n[model fake:plan_gui_b:{nonce}]\ntemperature = 0.5\n"
-        # The session plans in a role that names plan mode's tools
+        # The session plans in a role that names plan mode's tools, the
+        # default role, which the New session dialog starts at
         extra += "\n[role planner]\ntools = default enter_plan_mode exit_plan_mode\n"
         if not args.host:
             # Edit plan's editor, a sh script (the checklist skips it
@@ -2325,7 +2327,7 @@ def main():
                 os.chmod(mg, 0o755)
                 os.environ["SHELL"] = "/bin/sh"
             os.environ["PROSPERO_TEST_MG"] = shword(mg)
-        before = config(curl, model, 60, extra)
+        before = config(curl, model, 60, extra, top="role = planner\n")
     elif args.mode == "mcp":
         # A fake MCP server over HTTP that wants a sign-in (OAuth), here,
         # where the window's stand-in browser fetches from

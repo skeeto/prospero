@@ -13588,6 +13588,7 @@ static void drawnew(Gui *g)
         g->newplan = 0;
         g->newnofolder = 0;
         g->newrole = {};
+        g->newroleset = 0;  // the host's default role until one is picked
         if (!g->newerr.len) {
             g->newwt     = 0;  // as it was, should the engine have refused it
             g->wtname[0] = 0;
@@ -13817,10 +13818,13 @@ static void drawnew(Gui *g)
     if (host != g->main) {
         hostmodels(g, host);  // its roles come with its models
     }
+    // Until one is picked, the host's default role, which follows a
+    // change of host and comes with a remote's models
+    Str pick    = g->newroleset ? g->newrole : defaultrole(g, &a, host);
     b32 hasrole = 0;
     b32 noplan  = 0;  // in a role without plan mode's tools
     for (iz i = 0; i < roles.len; i++) {
-        b32 it   = roles[i].name == g->newrole;
+        b32 it   = roles[i].name == pick;
         hasrole |= it;
         noplan  |= it && !roles[i].plans;
     }
@@ -13828,21 +13832,23 @@ static void drawnew(Gui *g)
         ImGui::Spacing();
         ImGui::TextUnformatted("Role");
         ImGui::SetNextItemWidth(-1);
-        Str shown = hasrole ? g->newrole : Str("None");
+        Str shown = hasrole ? pick : Str("None");
         axnextname(g, "Role");
         if (ImGui::BeginCombo("##role", cstr0(&a, shown))) {
             if (ImGui::Selectable("None", !hasrole)) {
-                g->newrole = {};
+                g->newrole    = {};
+                g->newroleset = 1;
             }
             axselected(g, !hasrole);
             itemtip("No role: the usual session, with its usual tools");
             for (iz i = 0; i < roles.len; i++) {
                 GuiRole *r = &roles[i];
                 ImGui::PushID((i32)i);
-                if (ImGui::Selectable(cstr0(&a, r->name), r->name==g->newrole)) {
-                    g->newrole = clone(&g->perm, r->name);
+                if (ImGui::Selectable(cstr0(&a, r->name), r->name==pick)) {
+                    g->newrole    = clone(&g->perm, r->name);
+                    g->newroleset = 1;
                 }
-                axselected(g, r->name==g->newrole);
+                axselected(g, r->name==pick);
                 itemnamed(g, concat(&a, "new role ", r->name));
                 Buf tb(&a, 256);
                 print(&tb, r->desc.len ? r->desc : Str("(no description)"));
@@ -13892,9 +13898,9 @@ static void drawnew(Gui *g)
         } else if (ctr) {
             Str image = {(u8 *)g->newimage, (iz)__builtin_strlen(g->newimage)};
             err = ctrnew(g, &a, image, g->newws, cwd, g->newnet, ep, model,
-                         hasrole ? g->newrole : Str{}, plan && g->newplan && !noplan);
+                         hasrole ? pick : Str{}, plan && g->newplan && !noplan);
         } else {
-            guinew(g, host, cwd, ep, model, hasrole ? g->newrole : Str{},
+            guinew(g, host, cwd, ep, model, hasrole ? pick : Str{},
                    plan && g->newplan && !noplan, nofolder, wt, wtname);
         }
         g->newerr = err.len ? clone(&g->perm, err) : Str{};
@@ -17456,10 +17462,10 @@ static Str newfreewhy(Gui *g)
 
 // A session with no folder, with the defaults and no dialog: its
 // prompt takes the focus once it's made, for its first message.
-static void newfree(Gui *g)
+static void newfree(Gui *g, Arena scratch)
 {
     if (!newfreewhy(g).len) {
-        guinew(g, g->main, {}, {}, {}, {}, 0, 1);
+        guinew(g, g->main, {}, {}, {}, defaultrole(g, &scratch, g->main), 0, 1);
     }
 }
 
@@ -17939,7 +17945,7 @@ static void menukeys(Gui *g)
         newsession(g);
     }
     if (ImGui::Shortcut(ctrl|ImGuiMod_Shift|ImGuiKey_N, keep)) {
-        newfree(g);
+        newfree(g, g->frame);
     }
     // Zoom by the character typed (zoomkey). Both Shift chords route each
     // frame, since a route holds from the frame after it is asked for.
@@ -18630,7 +18636,7 @@ static void drawmenubar(Gui *g)
         if (menutip(g, &a, "New session, no folder", newfreewhy(g),
                     "Start a session with no working folder, with the default "
                     "model, and type its prompt", cmdkey(g, &a, "Shift+N"))) {
-            newfree(g);
+            newfree(g, a);
         }
         Str iwhy = !cannew(g) ? Str("No engine") : importwhy(g, g->main);
         if (menuitem(g, a, "Import session...", iwhy)) {

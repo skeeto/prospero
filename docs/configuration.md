@@ -282,6 +282,15 @@ A top-level `effort`, next to `model`, is the pick a new session starts
 with, where its model takes that level; else it starts at Default.
 Subagents still take their parent's, as above.
 
+A top-level `role` is the role a new session you start is in: the New
+session dialog's Role starts at it (None still picks none), each
+host's from its own configuration, and a session made without the
+dialog, with no folder or by `prospero DIR`, and `prospero run`
+without `-r` (`-r ''` for none) are in it too. Subagents, side chats
+and imports are not. A name that is neither a `[role NAME]` nor a
+built-in role (`explore`, `general`) is warned of, and sessions start
+in none.
+
 A `[model NAME]` section applies wherever an endpoint lists NAME. Where
 two endpoints list the same model, `[model ENDPOINT/MODEL]` sets it on
 one of them only, each of its settings winning over `[model MODEL]`'s:

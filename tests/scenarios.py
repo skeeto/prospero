@@ -6174,6 +6174,18 @@ def role_tools(t):
             f"nope {ends[2]}")
 
 
+@scenario(conf={"_top": {"role": "reader"}, "_extra": ROLES}, bound=10)
+def role_default(t):
+    """The configuration's role is a run's without -r, and -r '' is none;
+    -r names another."""
+    for extra, want in (((), "reader"), (("-r", ""), None), (("-r", "explore"), "explore")):
+        r = t.run(extra=extra)
+        t.check(r.rc == 0, f"{extra}: exit {r.rc}: {r.stderr}")
+        own, _ = r.sessions()
+        rec = r.all("session", own)[0]
+        t.check((rec.get("role") or None) == want, f"{extra}: role {rec.get('role')!r}")
+
+
 SMALLMODEL = """[endpoint g]
 kind = builtin
 [role peek]

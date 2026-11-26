@@ -2588,6 +2588,9 @@ def sc_plan_task_b(model, n, req):
 # plan_prompt: as plan_task, its subagent planning too
 sc_plan_prompt, sc_plan_prompt_b = sc_plan_task, sc_plan_task_b
 
+# role_default: a plain answer, in whatever role the session has
+sc_role_default = sc_plain
+
 
 # Bypass mode: the scenario's prompt, a task's or a message, says what
 # to call, as "do " and a JSON list of [name, args], all in one
