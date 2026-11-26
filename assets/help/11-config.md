@@ -327,6 +327,13 @@ and are asked to test their work, which a small model needs.
   missing, rather than asking to install them. The branch on the
   session bar needs no git. A remote host's engine uses its own
   configuration's.
+- **[`[plan] prompt`](settings:plan#prompt)** and
+  **[`[plan] prompt_file`](settings:plan#prompt_file)**: instructions
+  of your own for Plan mode, added to what the agent is told as it
+  turns on, the file's contents after prompt, read each time:
+  absolute, under `~`, or relative to the configuration file, at most
+  256 KiB, and not from an include by URL
+  ([Plan mode](help:plan#your-own-instructions-for-plan-mode)).
 - **[`[ui] editor`](settings:ui#editor)**: the command that opens a draft (<kbd>Ctrl+G</kbd>), a plan
   or the configuration file in an editor, given the file as one more
   word, and the editor of the Files pane's Open in editor. For a

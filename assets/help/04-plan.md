@@ -36,8 +36,12 @@ shows it:
 
 - **Approve plan** ends Plan mode: the session goes to Build, and the
   agent carries out the plan as the file has it then.
-- **Keep planning…** keeps Plan mode on, and sends the agent a note of
-  what to change.
+- **Keep planning…** puts the keyboard in the prompt box, to write
+  what to change in the plan. While a plan waits, anything you send
+  from the box keeps planning: Plan mode stays on, and the agent reads
+  your message as what to change, with all the box has: several lines,
+  attachments, `@` mentions, <kbd>Ctrl+G</kbd>. Commands such as
+  `/plan` work as usual.
 - **Edit plan** opens the plan file in your editor, to revise it by
   hand first. Approve plan waits until the editor is closed, and the
   agent is told you revised the plan. An editor that runs in a
@@ -53,6 +57,17 @@ shows it:
 
 A plan approval has no countdown: it waits for you. The model may be
 switched from the Prompt's status line while it waits.
+
+## Your own instructions for Plan mode
+
+[`[plan] prompt`](settings:plan#prompt) and
+[`[plan] prompt_file`](settings:plan#prompt_file) add instructions of
+your own, such as how you like a plan laid out, to what the agent is
+told as Plan mode turns on, and again after a compaction while it is
+on. They are not in the system prompt, so they cost nothing outside
+Plan mode, and they are for the session's agent only, not its
+subagents, which only report what they find. A remote host's engine
+uses its own configuration's.
 
 ## Questions from the agent
 

@@ -707,6 +707,8 @@ struct GuiSession {
                             // until it first asks
     TermSet      terms;     // a root's terminal tabs (term.cpp)
     FileSet      files;     // and its Files tabs (files.cpp)
+    Str          keepreq;   // the plan's ask to keep planning once the
+                            //   message with attachments is sent
     b32          plantab;   // its plan is out in a Terminal tab of its
                             //   root (Edit plan), read again as the
                             //   editor is done (plantabsweep)
@@ -1957,8 +1959,7 @@ struct Gui {
     GuiSession        *denysess;
     b32                denytimed;  // the ask has a deadline
     i64                denytouch;  // when ask.touch last went, epoch ms
-    i32                opendeny;   // 2 to keep planning
-    b32                denyplan;
+    i32                opendeny;   // to open "Deny with note"
     b32                openrewind; // the rewind confirmation, for
     GuiSession        *rewsess;
     Str                rewcall;    // a call's change and those after, or
@@ -5296,6 +5297,20 @@ static void guianswer(Gui *g, GuiSession *s, Str req, Str decision, Str note)
     cmdsend(g, &w, a);
 }
 
+// Keep planning from the Prompt: the plan's ask req, still waiting,
+// answered "deny" with no note, just after the message sent with it as
+// a steer, which the agent reads with that outcome (2026-11-25): so the
+// note has all the Prompt has, attachments, mentions, lines.
+static void keepplanning(Gui *g, GuiSession *s, Str req)
+{
+    View *v = s->view;
+    i32   i = v && req.len ? findask(v, req) : -1;
+    if (i>=0 && v->msgs[i].tool->kind=="plan" && v->msgs[i].tool->answer==VASK_PENDING) {
+        guianswer(g, s, req, "deny", {});
+        guilog(g, "kept planning, with the message sent");
+    }
+}
+
 // The user works on the answer to a waiting ask: its clock starts over
 // (ask.touch), at most every 10 s, where the engine can (cap).
 static void guitouch(Gui *g, GuiSession *s, Str req, i64 *touched, Str cap)
@@ -6166,6 +6181,7 @@ static void attachfail(Gui *g, GuiSession *s, Str err)
     x->id     = 0;
     x->off    = 0;
     x->toklen = 0;
+    s->keepreq = {};  // not sent: the plan waits as it was
     setnote(g, s, concat(&g->frame, "not sent: ", err), 1);
     if (s->cmdtext.len && !draftstr(s).len) {
         setdraft(g, s, s->cmdtext);
@@ -6252,6 +6268,10 @@ static void attachnext(Gui *g, GuiSession *s)
     x->id    = g->nextid;
     s->cmdid = g->nextid;  // its failure puts the text back (onsesscmd)
     cmdsend(g, &w, a);
+    if (s->keepreq.len) {
+        keepplanning(g, s, s->keepreq);
+        s->keepreq = {};
+    }
 }
 
 // Send the draft's text with its images.
@@ -22203,11 +22223,13 @@ static DriveOp planops[] = {
     {OP_WAIT, W_EDITED, 0, 0, 10000, ""},
     {OP_WAIT, W_PLAN, 0, 0, 10000, "Revised by hand."},
     {OP_CHECK, CHK_PLANEDITED, 0, 0, 0, "Revised by hand."},
-    // Keep planning, with a note: written again, asked again
+    // Keep planning, with what to change written in the Prompt, which
+    // the button gives the keyboard: sent, it answers the plan, and the
+    // agent reads it after; written again, asked again
     {OP_MOVE, T_DENY, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 500, ""},
-    {OP_CHECK, CHK_POPUP, 0, 0, 0, ""},
+    {OP_CHECK, CHK_PANEFOCUS, 0, 0, 0, "Prompt"},
     {OP_TEXT, 0, 0, 0, 300, "Test it too."},
     {OP_SHOT, 0, 0, 0, 300, "plan-3-note"},
     {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},

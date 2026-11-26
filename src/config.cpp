@@ -248,6 +248,7 @@ static CfgKind cfgkinds[] = {
     {"tools",    0, "Background jobs, stopping commands, and search"},
     {"shell",    1, "A shell for the agent's commands: its program, environment and description"},
     {"instructions", 0, "Instruction files for the agent: AGENTS.md and the like"},
+    {"plan",     0, "Plan mode: instructions of your own for the agent while it plans"},
     {"skills",   0, "Skills: SKILL.md instructions the agent uses as a task calls for them"},
     {"memory",   0, "Project memory: the agent's notes for later sessions in a project"},
     {"worktree", 0, "Worktree sessions: each in a git worktree and branch of its own"},
@@ -565,6 +566,17 @@ static CfgKey cfgschema[] = {
     {"instructions", "files", CFG_STRING, "AGENTS.md CLAUDE.md", {}, {},
      "instructions", "File names to load from each directory, the first "
      "found in each, separated by blanks"},
+
+    {"plan", "prompt", CFG_STRING, "", {}, {}, "plan",
+     "Instructions of your own for plan mode, added to what Prospero tells "
+     "the agent each time plan mode turns on, and again after a "
+     "compaction while it is on, never to the system prompt; for a "
+     "session's agent, not for its subagents, which only report what "
+     "they find"},
+    {"plan", "prompt_file", CFG_STRING, "", {}, {}, "plan",
+     "A file of plan mode instructions added after prompt, read each time "
+     "plan mode turns on: absolute, under ~, or relative to the file that "
+     "sets it, at most 256 KiB; not from an include by URL"},
 
     {"skills", "enabled", CFG_BOOL, "true", {}, {}, "skills",
      "Offer skills: SKILL.md files in .claude/skills, .agents/skills, "
@@ -2276,7 +2288,7 @@ static b32 cfgfromweb(IniFile *f)
 
 #define CFG_PROMPTMAX (256<<10)
 
-// The file a role's prompt_file names, e: ~ the home directory, and a
+// The file a role's or [plan]'s prompt_file names, e: ~ the home directory, and a
 // relative path against the directory of the file that sets it. Null
 // when unset, or when it comes from the web, which could otherwise send
 // any of the user's files to the model.
@@ -2292,17 +2304,36 @@ static Str cfgpromptpath(Config *c, Arena *perm, IniEntry *e)
     return inipath(perm, inidir(e->file->path), p);
 }
 
-// A role's prompt_file, read and trimmed: null when unset, unreadable,
-// or over CFG_PROMPTMAX.
-static Str cfgrolepromptfile(Config *c, Arena *perm, Str name)
+// A prompt_file's contents, e, read and trimmed: null when unset,
+// unreadable, or over CFG_PROMPTMAX.
+static Str cfgpromptread(Config *c, Arena *perm, IniEntry *e)
 {
-    IniEntry *e    = name.len ? inilookup(c->ini, "role", name, "prompt_file") : 0;
-    Str       path = cfgpromptpath(c, perm, e);
+    Str path = cfgpromptpath(c, perm, e);
     if (!path.len) {
         return {};
     }
     Read r = os_read(c->os, perm, path, CFG_PROMPTMAX);
     return r.err==READ_OK ? trim(r.data) : Str{};
+}
+
+// A role's prompt_file, read (cfgpromptread).
+static Str cfgrolepromptfile(Config *c, Arena *perm, Str name)
+{
+    IniEntry *e = name.len ? inilookup(c->ini, "role", name, "prompt_file") : 0;
+    return cfgpromptread(c, perm, e);
+}
+
+// Plan mode's instructions of the user's own: [plan] prompt, then its
+// prompt_file's contents, read now, a blank line between; null if
+// neither has any.
+static Str cfgplanprompt(Config *c, Arena *perm)
+{
+    Str pr   = trim(cfgget(c, "plan", "", "prompt", 0));
+    Str file = cfgpromptread(c, perm, cfgfind(c, "plan", "", "prompt_file").e);
+    if (!pr.len || !file.len) {
+        return pr.len ? pr : file;
+    }
+    return concat(perm, concat(perm, pr, "\n\n"), file);
 }
 
 // A credential's item, by its value: env:NAME, whoever wrote it, or
@@ -2663,8 +2694,8 @@ static void cfgkeyline(Ini *ini, Arena *perm, IniFile *f, IniFile *user,
         cfgreport(ini, perm, f, l, INI_ERROR, l->keybeg, msg);
         return;
     }
-    if (s->kind=="role" && l->key=="prompt_file" && trim(l->value).len &&
-            cfgfromweb(f)) {
+    if ((s->kind=="role" || s->kind=="plan") && l->key=="prompt_file" &&
+            trim(l->value).len && cfgfromweb(f)) {
         cfgreport(ini, perm, f, l, INI_ERROR, l->valbeg,
                   cfgmuted(f) ? Str{} :
                   Str("a prompt file in an include by URL is ignored, since "
@@ -2831,8 +2862,8 @@ static void cfgvalidate(Config *c, Ini *ini, IniFile *user, Arena *perm)
                 }
                 cfgreport(ini, perm, e->file, e->line, INI_WARNING, e->line->keybeg, msg);
             }
-            if (s->kind=="role" && e->key=="prompt_file" && v.len &&
-                    !cfgfromweb(e->file)) {
+            if ((s->kind=="role" || s->kind=="plan") && e->key=="prompt_file" &&
+                    v.len && !cfgfromweb(e->file)) {
                 Str   path = cfgpromptpath(c, perm, e);
                 Arena tmp  = *perm;
                 Read  r    = {};

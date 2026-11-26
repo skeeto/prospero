@@ -134,7 +134,9 @@ request (changing it can cost a cache miss). What you send while it works waits 
 the transcript, dimmed and marked "Next step", until the agent reads
 it at its next step (or marked "Queued", for a turn of its own, as it
 is when sent too late for this turn), and its Withdraw button takes it
-back into the box. Stop cancels the turn and kills any command it
+back into the box. While a plan waits for approval, a message sent
+keeps planning instead, as what to change in the plan
+([Plan mode](help:plan#approving)). Stop cancels the turn and kills any command it
 runs, and so does <kbd>Esc</kbd>, once nothing is left for it to close: from the
 prompt box, the first <kbd>Esc</kbd> leaves the box, and the second stops the
 turn.

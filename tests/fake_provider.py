@@ -2494,6 +2494,12 @@ def sc_plan(model, n, req):
     msgs = req.get("messages", [])
     last = str(msgs[-1].get("content", "")) if msgs else ""
     name, args = last_call(req)
+    prev = str(msgs[-2].get("content", "")) if len(msgs) > 1 else ""
+    # A message read after keeping planning, as the GUI's Prompt sends
+    # it, is the note; plan_mode's "Stop." still stops
+    kept = last.strip() if msgs and msgs[-1].get("role") == "user" and \
+        msgs[-2].get("role") == "tool" and "did not approve the plan yet" in prev and \
+        last != "Stop." else ""
     if msgs[-1].get("role") == "tool" and name == "write" and last.startswith(("Created", "Replaced")):
         if str(args.get("path", "")).endswith("plan.md"):
             yield from tool(model, n, "exit_plan_mode", {})
@@ -2501,8 +2507,10 @@ def sc_plan(model, n, req):
             yield from answer(model, "Done.")
     elif "approved your plan" in last:
         yield from tool(model, n, "write", {"path": "inside.txt", "content": "done"})
-    elif "did not approve the plan yet" in last:
-        note = last.split("The user's note: ", 1)[-1].split("\n", 1)[0]
+    elif "did not approve the plan yet" in last or kept:
+        # The note in the answer, or the message the Prompt sent with it,
+        # read after it (the GUI's Keep planning)
+        note = kept or last.split("The user's note: ", 1)[-1].split("\n", 1)[0]
         yield from tool(model, n, "write", {"path": plan_path(req),
                                             "content": f"# Plan v2\n\n- {note}\n"})
     elif "There is no plan to approve yet" in last or "too long to put to the user" in last:
@@ -2575,6 +2583,10 @@ def sc_plan_task_b(model, n, req):
         yield from tool(model, n, "write", {"path": "child.txt", "content": "child"})
     else:
         yield from answer(model, "Child: " + tool_results(req)[0])
+
+
+# plan_prompt: as plan_task, its subagent planning too
+sc_plan_prompt, sc_plan_prompt_b = sc_plan_task, sc_plan_task_b
 
 
 # Bypass mode: the scenario's prompt, a task's or a message, says what

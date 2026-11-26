@@ -369,7 +369,10 @@ agent told at its next step; running subagents follow. While planning, its file 
 session's plan file, `plan.md` in the session's directory, the desktop
 tool may only look, and subagents plan too. When it is done it asks for
 approval, showing the plan: Approve plan lets it go ahead, and Keep
-planning sends it a note. Edit plan opens the plan file in the editor
+planning puts the keyboard in the prompt box, from which anything sent
+while the plan waits keeps planning (the ask denied, the message read
+right after it as a steer). `[plan] prompt` and `prompt_file` add the
+user's own instructions to plan mode's rules, for the root agent. Edit plan opens the plan file in the editor
 (as Ctrl+G does a draft), on this computer or, in an editor that
 reaches it over ssh, on an ssh remote (read again there once the
 editor exits); an editor that runs in a terminal opens it in a

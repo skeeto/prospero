@@ -2797,17 +2797,15 @@ static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
             if (enter) {
                 guianswer(g, s, t->req, "deny", {});
             } else {
-                g->denyreq   = t->req;
-                g->denysess  = s;
-                g->denytimed = t->deadline != 0;
-                g->denynote[0] = 0;
-                g->opendeny  = 2;
+                // What to change is written in the Prompt, whose Send
+                // keeps planning (keepplanning)
+                g->promptfocus = 1;
             }
         }
         if (latest) itemrect(g, RECT_DENY);
         itemtip(enter ? "No plan mode: the agent works as before"
-                                    : "Plan mode stays on: tell the agent what to change "
-                                      "in the plan");
+                                    : "Plan mode stays on: write what to change in the "
+                                      "plan in the Prompt, and send it");
         if (enter) {
             return;
         }
@@ -6678,13 +6676,11 @@ static void drawtranscript(Gui *g)
 
     if (g->opendeny) {
         ImGui::OpenPopup("##denynote");
-        g->denyplan = g->opendeny == 2;
         g->opendeny = 0;
         g->denytouch = 0;
     }
     if (ImGui::BeginPopup("##denynote")) {
-        ImGui::TextUnformatted(g->denyplan ? "Keep planning, and tell the agent:"
-                                           : "Deny, and tell the agent:");
+        ImGui::TextUnformatted("Deny, and tell the agent:");
         if (ImGui::IsWindowAppearing()) {
             ImGui::SetKeyboardFocusHere();
         }
@@ -6698,7 +6694,7 @@ static void drawtranscript(Gui *g)
         if (g->denytimed && (ImGui::IsWindowAppearing() || ImGui::IsItemEdited())) {
             guitouch(g, g->denysess, g->denyreq, &g->denytouch, "ask.deadline");
         }
-        go |= ImGui::Button(g->denyplan ? "Keep planning" : "Deny");
+        go |= ImGui::Button("Deny");
         if (go) {
             Str note = {(u8 *)g->denynote, (iz)__builtin_strlen(g->denynote)};
             guianswer(g, g->denysess, g->denyreq, "deny", trim(note));
@@ -8163,6 +8159,13 @@ static void drawprompt(Gui *g)
         ImGui::GetWindowDrawList()->AddText(v2(r0.x + fp.x, r0.y + fp.y),
                                             ImGui::GetColorU32(ImGuiCol_TextDisabled),
                                             hint.cdata, hint.cdata + hint.len);
+    } else if (!none && !buf[0] && v && v->busy && planask(v)>=0) {
+        // A plan waits: what is sent keeps planning (keepplanning)
+        Str    hint = "What to change in the plan: Send keeps planning";
+        ImVec2 fp   = ImGui::GetStyle().FramePadding;
+        ImGui::GetWindowDrawList()->AddText(v2(r0.x + fp.x, r0.y + fp.y),
+                                            ImGui::GetColorU32(ImGuiCol_TextDisabled),
+                                            hint.cdata, hint.cdata + hint.len);
     }
     if (cb.recalled) {
         imedrop(g, s->draftid);
@@ -8350,6 +8353,8 @@ static void drawprompt(Gui *g)
     axname(g, v->busy ? Str("Steer") : Str("Send"));
     i32 waits = v->busy ? askwaits(v) : WAITS_NONE;
     itemtip(!v->busy               ? "Send the prompt (Enter; Shift+Enter for a new line)"
+            : planask(v) >= 0       ? "Keep planning: the plan is not approved, and the agent "
+                                      "reads this as what to change in it (Enter)"
             : waits==WAITS_QUESTION ? "Steer: send to the running turn, which the agent reads "
                                       "with your answers to its questions (Enter)"
             : waits==WAITS_ASK      ? "Steer: send to the running turn, which the agent reads "
@@ -8470,6 +8475,10 @@ static void drawprompt(Gui *g)
         Str   p  = trim(draftstr(s));
         Slash sl = parseslash(p);
         Slash sk = parseskill(p, s->skills);
+        // A plan waiting (keepplanning): a message sent answers it, after
+        i32   pk = v->busy ? planask(v) : -1;
+        Str   pr = pk>=0 ? clone(&a, v->msgs[pk].tool->req) : Str{};
+        b32   kept = 0;
         if (sl.cmd) {
             runslash(g, a, s, sl, p);
         } else if (s->fetchid && p.len) {
@@ -8485,6 +8494,7 @@ static void drawprompt(Gui *g)
             // the message sent and the box cannot disagree
             mentionreconcile(g, a, s, p);
             draftdone(&s->dclock);
+            s->keepreq = pr.len ? clone(&g->perm, pr) : Str{};
             attachsend(g, s, p);
             draftput(g, s, "");
         } else if (p.len) {
@@ -8493,6 +8503,10 @@ static void drawprompt(Gui *g)
             draftput(g, s, "");
             s->note      = {};  // sent: no note, fixed or not
             s->notefixed = 0;
+            kept = 1;
+        }
+        if (kept && pr.len) {
+            keepplanning(g, s, pr);
         }
         if (!g->pickmodel && !g->pickshell && !g->pickeffort && !g->openexport) {
             // To type the next, unless a popup of another window's

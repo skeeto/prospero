@@ -13088,6 +13088,43 @@ def plan_task(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+PLANPROMPT = """[plan]
+prompt = Inline plan rule. PLAN-INLINE
+prompt_file = plan/rules.md
+"""
+
+
+@scenario(conf={"_extra": PLANPROMPT}, bound=15)
+def plan_prompt(t):
+    """[plan] prompt, then prompt_file's contents (relative to the
+    configuration file), follow plan mode's rules in its notice to the
+    session's agent, never in the system prompt; a subagent planning
+    with it gets only its own short rules."""
+    t.host.mkdir(t.host.join(t.base, "plan"))
+    t.host.write(t.host.join(t.base, "plan", "rules.md"), "\nFrom the file. PLAN-FILE\n")
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", plan=1)["sid"]
+        h.send("prompt", sid=sid, text="go")
+        ended(h, sid, 1)
+        body = t.requests()[0]["body"]
+        told = [str(m.get("content")) for m in body["messages"]
+                if str(m.get("content", "")).startswith("Plan mode is on")]
+        t.check(told and "PLAN-INLINE" in told[0] and "PLAN-FILE" in told[0] and
+                told[0].index("PLAN-INLINE") < told[0].index("PLAN-FILE") and
+                "[plan]" in told[0], f"told: {told}")
+        system = fake_provider.system_of(body)
+        t.check("PLAN-INLINE" not in system and "PLAN-FILE" not in system, "not in the prompt")
+        req = t.requests(t.model2)[0]["body"]
+        kid = [str(m.get("content")) for m in req["messages"]
+               if str(m.get("content", "")).startswith("Plan mode is on")]
+        t.check(kid and "PLAN-INLINE" not in kid[0] and "PLAN-FILE" not in kid[0],
+                f"the subagent's: {kid}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 # Bypass mode: fake_provider.sc_bypass makes the calls its prompt names
 # (do), and the scenarios check what was asked, run and refused
 

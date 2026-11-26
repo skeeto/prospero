@@ -4940,11 +4940,14 @@ static void toolmemory(Session *s, Arena scratch, Args *args)
 // agent did not ask for reaches it as a notice (planheed), as changed
 // instructions do, and so does the mode again after a compaction.
 
-// What plan mode allows, for the agent.
+// What plan mode allows, for the agent, and for a root session's the
+// user's own instructions for it ([plan] prompt and prompt_file, read
+// each time: cfgplanprompt).
 static Str planrules(Session *s, Arena *a)
 {
     Str dir = s->scratch.len ? normpath(a, s->cwd, s->scratch, s->te.windows) : Str{};
-    Buf b(a, 1024 + s->planfile.len + dir.len);
+    Str own = s->depth ? Str{} : cfgplanprompt(s->e->cfg, a);
+    Buf b(a, 1024 + s->planfile.len + dir.len + own.len);
     if (s->depth) {
         print(&b, "Plan mode is on: the agent you work for is planning, so "
                   "you must not change anything. Do not write or edit "
@@ -4976,6 +4979,11 @@ static Str planrules(Session *s, Arena *a)
                     "ask_user before you write the plan.")
               : Str("If you need the user to decide something first, end "
                     "your turn with the question."));
+    if (own.len) {
+        print(&b, "\n\nThe user's own instructions for plan mode ([plan] in "
+                  "their configuration):\n\n");
+        print(&b, own);
+    }
     return finish(&b);
 }
 
