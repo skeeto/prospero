@@ -15141,6 +15141,66 @@ def an_lazy_title(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+@scenario(conf=LAZYAN, bound=40)
+def an_lazy_notice(t):
+    """A server to open changed, gone or new since the system prompt
+    listed it: a notice says so before the next request, once, and its
+    record keeps the list as the agent knows it, so a reopened session
+    does not tell it again. A server the agent opened is neither."""
+    env = {**ANENV, **mcpenv(t)}
+    h = b = None
+
+    def turn(h, text="nothing"):
+        n = len(t.requests())
+        h.send("prompt", sid=sid, text=text)
+        t.check(h.wait(newevent(h, sid, "turn.end"))["why"] == "done", f"turn {text}")
+        return t.requests()[n]["body"]
+
+    def told(body):
+        return " ".join(b.get("text", "") for b in body["messages"][-1]["content"])
+
+    def notices():
+        return [e for e in logged(t, sid) if e["ev"] == "notice" and e["kind"] == "mcp.lazy"]
+
+    def setkey(h, key, value):
+        r = h.call("config.set", kind="mcp", name="fake", key=key, value=value)
+        t.check(r.get("ok") == 1, f"config.set {key} {r}")
+
+    try:
+        h = t.headless(env=env)
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        turn(h)
+        setkey(h, "description", "Echoes louder.")
+        body = turn(h)
+        t.check(told(body).endswith("its tools join yours:\n- fake: Echoes louder. (changed)"),
+                f"changed: {told(body)!r}")
+        t.check("- fake: Echoes things." in body["system"][0]["text"], "the prompt as it was")
+        t.check([e.get("mcp_lazy") for e in notices()] == ["\n- fake: Echoes louder."],
+                f"its record: {notices()}")
+        t.check("open_mcp_server" not in told(turn(h)), "told once")
+
+        setkey(h, "enabled", "no")
+        t.check(told(turn(h)).endswith(":\n- fake (removed)"), "removed")
+        setkey(h, "enabled", "yes")
+        t.check(told(turn(h)).endswith(":\n- fake: Echoes louder. (new)"), "new")
+        t.check(not mcplog(t), "the server never started")
+        t.check(h.close() == 0, "the first exits")
+        h = None
+
+        b = t.headless(env=env)
+        t.check(b.call("open", sid=sid, attended=1).get("ok") == 1, "open")
+        t.check("open_mcp_server" not in told(turn(b)), "not told again after a reopen")
+        turn(b, "go")
+        t.check(b.all("tool.end", sid)[-1]["text"] == "echo: hi", "opened and echoed")
+        setkey(b, "description", "Echoes once more.")
+        t.check("open_mcp_server" not in told(turn(b, "go")), "opened: not told")
+        t.check(len(notices()) == 3, f"three notices: {notices()}")
+    finally:
+        rc = h.close() if h else 0
+        rc2 = b.close() if b else 0
+    t.check(rc == 0 and rc2 == 0, f"headless exit {rc} {rc2}")
+
+
 @scenario(conf=lazymcp(startup_timeout="2"), bound=40)
 def mcp_lazy_slow(t):
     """An open waits for its server to start, else says why not: started

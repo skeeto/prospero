@@ -3224,6 +3224,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
                        kind=="compacted"    ? Str("To the agent: summarized") :
                        kind=="cleared"      ? Str("To the agent: context cleared") :
                        kind=="mcp"          ? Str("To the agent: MCP tools") :
+                       kind=="mcp.lazy"     ? Str("To the agent: MCP servers") :
                        Str("To the agent");
         }
     } return 1;

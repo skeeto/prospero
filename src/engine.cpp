@@ -340,12 +340,13 @@ struct Owed {
 struct Notice {
     Str kind;    // "job", "rewind", "instructions", "skills", "budget",
                  // "mode", "message", "task", "shell", "terminal",
-                 // "grants"
+                 // "grants", "mcp", "mcp.lazy"
     Str text;
     i64 job;     // for "job"
     i32 mode;    // for "mode": MODE_*, the one it tells
     Shell shell; // for "shell": the one it tells
     b32 skills;  // its record lists the skills the agent knows now
+    b32 lazy;    // its record lists the MCP servers to open (mcp_lazy)
     Str from;    // for "message": the sender's sid and title; for
     Str ftitle;  // "task": the subagent's
     Str host;    // and for "task", its host, if another
@@ -2171,6 +2172,9 @@ static void deliver(Session *s, Arena scratch)
         if (n->skills) {
             putskills(&w.json, s->skillseen, 0);
         }
+        if (n->lazy) {
+            putstrkey(&w.json, "mcp_lazy", s->mcplazyon);
+        }
         puturls(&w.json, n->urls);
         if (n->kind == "task") {
             putspend(&w.json, &n->spend);
@@ -2847,6 +2851,7 @@ static void sendcompact(Session *, Arena);
 static void compact(Session *, Arena, i64 enough, i64 goal, i32 why);
 static void beginturn(Session *, Arena, Str via);
 static void turnready(Session *, Arena);
+static void mcplazycheck(Session *, Arena);
 static b32  busy(Session *);
 static void setpause(Session *, Arena, b32 on);
 static b32  pausehold(Session *);
@@ -13665,6 +13670,78 @@ static b32 mcplazyshow(Session *s, Arena scratch)
     return 1;
 }
 
+// The name of each line of a list of servers to open (mcplazylist).
+static Str mcplazyname(Str line)
+{
+    iz i = find(line, ": ");
+    return i < 0 ? line : takehead(line, i);
+}
+
+// Whether a list of servers to open has a line naming name, and which.
+static Str mcplazyline(Str list, Str name)
+{
+    for (Cut c = cut(list, '\n'); ; c = cut(c.tail, '\n')) {
+        if (startswith(c.head, "- ") && mcplazyname(cuthead(c.head, 2)) == name) {
+            return c.head;
+        }
+        if (!c.ok) {
+            break;
+        }
+    }
+    return {};
+}
+
+// Servers to open added, changed or gone since the agent was told of
+// them, once its prefix has been used: a notice for its next request,
+// as skillcheck's, since the system prompt stays as it was. A server it
+// opened is neither: it left the list by its doing.
+static void mcplazycheck(Session *s, Arena scratch)
+{
+    if (!s->mcpfixed || !tooloffered(&s->te, TOOL_MCPOPEN)) {
+        return;
+    }
+    Str now = mcplazylist(s, &scratch);
+    Buf b(&scratch, 1024);
+    for (Cut c = cut(now, '\n'); ; c = cut(c.tail, '\n')) {
+        if (startswith(c.head, "- ")) {
+            Str was = mcplazyline(s->mcplazyon, mcplazyname(cuthead(c.head, 2)));
+            if (!(was == c.head)) {
+                print(&b, "\n");
+                print(&b, c.head);
+                print(&b, was.len ? Str(" (changed)") : Str(" (new)"));
+            }
+        }
+        if (!c.ok) {
+            break;
+        }
+    }
+    for (Cut c = cut(s->mcplazyon, '\n'); ; c = cut(c.tail, '\n')) {
+        if (startswith(c.head, "- ")) {
+            Str name = mcplazyname(cuthead(c.head, 2));
+            if (!mcplazyline(now, name).len && !mcpisopen(s, name)) {
+                print(&b, "\n- ");
+                print(&b, name);
+                print(&b, " (removed)");
+            }
+        }
+        if (!c.ok) {
+            break;
+        }
+    }
+    if (!b.len) {
+        return;
+    }
+    Str list = finish(&b);
+    Buf t(&scratch, 256 + list.len);
+    print(&t, "The MCP servers you may open changed since your instructions "
+              "listed them. When a task needs one, call open_mcp_server with "
+              "its name, and its tools join yours:");
+    print(&t, list);
+    s->mcplazyon = clone(&s->perm, now);
+    notify(s, "mcp.lazy", finish(&t), 0);
+    s->notices[s->notices.len-1].lazy = 1;
+}
+
 // Tools that join a session's prefix before its first request: into
 // its tools, with the instructions of their servers new to it into its
 // system prompt, then the servers it may open. Its record is for the
@@ -17712,6 +17789,7 @@ static void turnready(Session *s, Arena scratch)
     }
     instrcheck(s, scratch);
     skillcheck(s, scratch);
+    mcplazycheck(s, scratch);
     memcheck(s, scratch);
     prepare(s, scratch);
 }
@@ -22177,6 +22255,9 @@ static void replaytools(Session *s, Arena scratch, EvRec *r)
         if (jsonget(j, "skills")->type == JSON_ARRAY) {
             skillseenfrom(s, jsonget(j, "skills"));  // as the agent knew them
         }
+        if (jsonget(j, "mcp_lazy")->type == JSON_STRING) {
+            s->mcplazyon = clone(&s->perm, jsonstr(jsonget(j, "mcp_lazy")));
+        }
     } break;
 
     case EV_TODO: {
@@ -23248,6 +23329,7 @@ static Slice<Notice> cutnotices(Arena *a, Arena scratch, Slice<Str> lines,
         n.text   = clone(a, jsonstr(jsonget(j, "text")));
         n.job    = jsonint(jsonget(j, "job"), 0);
         n.skills = jsonget(j, "skills")->type == JSON_ARRAY;
+        n.lazy   = jsonget(j, "mcp_lazy")->type == JSON_STRING;
         n.urls   = geturls(a, jsonget(j, "urls"));
         n.queued = jsonint(jsonget(j, "queued"), 0);
         if (kind == "message") {

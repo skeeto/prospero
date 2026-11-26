@@ -5234,6 +5234,7 @@ sc_an_lazy_reload = sc_an_lazy
 sc_an_lazy_rewind = sc_an_lazy
 sc_an_lazy_compact = sc_an_lazy
 sc_an_lazy_title = sc_an_lazy
+sc_an_lazy_notice = sc_an_lazy
 
 
 def sc_an_lazy_title_title(model, n, req):

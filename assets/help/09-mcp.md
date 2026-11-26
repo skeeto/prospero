@@ -61,7 +61,9 @@ When a task needs one, the agent calls `open_mcp_server` with its
 name: the server starts, the call waits for it as a first request
 would, and its tools join the session from then on, the result naming
 them with the server's instructions. Nothing ever closes it for that
-session. A Stop while it starts ends the call, the server not opened.
+session. A Stop while it starts ends the call, the server not opened. If
+the list changes during a session, a server added, described anew or
+turned off, the agent hears of it before its next request.
 
 On Anthropic's API, the new tools are defined in the conversation
 where they joined, so the cached prompt before them still serves (a
