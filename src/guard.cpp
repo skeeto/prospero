@@ -876,10 +876,6 @@ static Str guarddenial(Arena *a, GuardDenial *d)
         print(&b, "Permission denied by the user: ");
         print(&b, why);
         print(&b, ". Nothing was done.");
-        if (d->note.len) {
-            print(&b, " The user's note: ");
-            print(&b, d->note);
-        }
         break;
     case DENY_TIMEOUT:
         print(&b, "Permission denied: ");
@@ -901,9 +897,15 @@ static Str guarddenial(Arena *a, GuardDenial *d)
         return "Not run: the user cancelled the turn.";
     }
 
-    print(&b, " Do not retry this path, and do not reach it or anything in "
-              "it another way, as with the shell or through another path "
-              "to it. Continue without it, working inside ");
+    print(&b, d->by==DENY_USER
+              ? Str(" Do not retry this path unless the user asks you to, "
+                    "and do not reach it or anything in it another way, as "
+                    "with the shell or through another path to it. Continue "
+                    "without it, working inside ")
+              : Str(" Do not retry this path, and do not reach it or "
+                    "anything in it another way, as with the shell or "
+                    "through another path to it. Continue without it, "
+                    "working inside "));
     print(&b, d->cwd);
     if (d->hint.path.data && d->hint.exists) {
         print(&b, ". Did you mean ");
@@ -918,6 +920,12 @@ static Str guarddenial(Arena *a, GuardDenial *d)
     }
     print(&b, " If you cannot finish without it, finish what you can, then "
               "ask the user for it in your final response.");
+    // The note last, in its own paragraph, so that none of the guidance
+    // above reads as the user's words (#108)
+    if (d->by==DENY_USER && d->note.len) {
+        print(&b, "\n\nThe user's note: ");
+        print(&b, d->note);
+    }
     return finish(&b);
 }
 

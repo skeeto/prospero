@@ -356,7 +356,9 @@ static void test_guard(Test *t)
     d.note = "use the copy inside";
     deny   = guarddenial(a, &d);
     expect(t, "denial user", istr(a, find(deny, "denied by the user")>=0 &&
-                                    find(deny, "The user's note: use the copy inside")>0), "1");
+                                    find(deny, "unless the user asks you to")>0), "1");
+    expect(t, "denial user note last", istr(a, endswith(deny,
+           "final response.\n\nThe user's note: use the copy inside")), "1");
     d.by   = DENY_TIMEOUT;
     d.wait = 30;
     deny   = guarddenial(a, &d);
