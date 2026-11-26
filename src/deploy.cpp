@@ -73,7 +73,7 @@ enum : i64 {
     DEPLOY_STEPTIME = 90*SEC,   // an ssh command, at most
     DEPLOY_UPTIME   = 120*SEC,  // an upload, at most, plus a second per...
     DEPLOY_UPRATE   = 16<<10,   // ...this many bytes
-    DEPLOY_MAXSIZE  = sizeof(void *)==8 ? (i64)64<<20 : (i64)32<<20,
+    DEPLOY_MAXSIZE  = sizeof(void *)==8 ? (i64)128<<20 : (i64)32<<20,
     DEPLOY_OUTMAX   = 1<<16,    // standard output kept from a command
 };
 
