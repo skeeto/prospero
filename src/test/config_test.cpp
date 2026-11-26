@@ -1146,6 +1146,7 @@ static void testcfgjson(Test *t)
         "model/m/reasoning_budget=*\n"
         "model/m/thinking=adaptive*\n"
         "model/m/thinking_display=summarized*\n"
+        "model/m/inline_tools=auto*\n"
         "model/m/effort=*\n"
         "model/m/effort_as=reasoning_effort*\n"
         "model/m/effort_map=*\n"

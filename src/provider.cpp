@@ -646,6 +646,14 @@ enum : i32 {
     THINK_DEFAULT,   // not sent: the model's own default
 };
 
+// [model] inline_tools: whether tools that join mid-conversation go
+// inline on Anthropic's Messages API (anthropic.cpp)
+enum : i32 {
+    INLINE_AUTO,  // where known to work (inlineok)
+    INLINE_YES,
+    INLINE_NO,
+};
+
 struct ModelConf {
     Str          name;       // as sent in requests, the model's id
     Str          reasoning;  // field to send reasoning back in, empty: never
@@ -670,6 +678,7 @@ struct ModelConf {
     i32          think;      // THINK_*
     b32          hidethink;  // thinking_display omitted, else summarized
     Str          effort;     // output_config.effort, empty: not sent
+    i32          inlinetools;  // INLINE_*: [model] inline_tools
     // The desktop tool's screenshots (desktop.cpp)
     i32          coords;     // COORDS_*: how the model gives points
     b32          novision;   // the model takes no images
@@ -693,6 +702,13 @@ struct ChatReq {
     Str        system;
     Str        tools;    // the tools array, already encoded
     Slice<Msg> history;
+    // Anthropic: the tools of the prefix (tools is these and adds) and
+    // those that joined after it, each defined in the conversation where
+    // it joined if inlineok, which sets inlined if any went there
+    Str            base;
+    Slice<ToolAdd> adds;
+    b32            inlineok;
+    b32            inlined;
     i64        thinkfrom;  // reasoning of messages older than this seq
                            // is not sent back (Anthropic: compaction
                            // changed what it was bound to)

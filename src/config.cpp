@@ -387,6 +387,12 @@ static CfgKey cfgschema[] = {
     {"model", "thinking_display", CFG_ENUM, "summarized", {},
      "summarized omitted", "model",
      "Anthropic: summarized reasoning to show, or omitted"},
+    {"model", "inline_tools", CFG_ENUM, "auto", {}, "auto yes no", "model",
+     "Anthropic: whether tools that join mid-session (an MCP server ready "
+     "late, or opened, a tool turned on) are defined in the conversation "
+     "where they join, by the inline-tools beta, which keeps the prompt "
+     "cache, rather than added to the tools, which rewrites it: auto (at "
+     "api.anthropic.com, for the models known to take it), yes, or no"},
     {"model", "effort", CFG_ENUM, "", {}, "none minimal low medium high xhigh max",
      "model", "How much the model thinks and writes, by default its own "
      "default: Anthropic's output_config.effort (low to max), the "

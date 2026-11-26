@@ -827,6 +827,7 @@ int main()
     test_remotehello(&t);
     test_provider(&t);
     test_anthropic(&t);
+    test_aninline(&t);
     test_responses(&t);
     test_price(&t);
     test_edit(&t);

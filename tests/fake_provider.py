@@ -36,7 +36,13 @@ text, at most four cache breakpoints and none on reasoning, and reasoning
 returned verbatim with the signature this server gave it, to the model
 that gave it, still bound to the conversation before it (the system
 prompt, the tools and the messages before it, unchanged), which
-compaction and a model switch must respect. A request that fails
+compaction and a model switch must respect. Tools that join
+mid-conversation may come in system messages of tool_addition blocks
+(the inline-tools beta), checked as the API does: the anthropic-beta
+header, a system message only after a user or system message and only
+before an assistant message or last, each block a tool_definition whose
+name no other tool has; a model named an_noinline* refuses them, as
+older models do, with the API's words. A request that fails
 is answered 400 invalid_request_error, as the API does. Its usage counts
 cache reads and writes from the breakpoints of the requests seen so far.
 
@@ -4717,7 +4723,54 @@ def an_check_result(where, content):
     return None
 
 
-def an_check(req, prefill=False):
+AN_INLINE = "inline-tools-2026-09-15"
+
+
+def an_tool_names(req):
+    """The names of a request's tools: its tools, then those added in its
+    system messages."""
+    names = [t.get("name") for t in req.get("tools", [])]
+    for m in req.get("messages", []):
+        if m.get("role") == "system":
+            names += [b.get("tool", {}).get("definition", {}).get("name")
+                      for b in m.get("content", [])]
+    return names
+
+
+def an_check_addition(req, i, beta, noinline, names):
+    """Why the API would reject system message i of a request, of tools
+    added mid-conversation, or None."""
+    msgs = req["messages"]
+    if AN_INLINE not in [x.strip() for x in beta.split(",")]:
+        return f"`tool_addition` blocks require anthropic-beta: {AN_INLINE}"
+    if noinline:
+        return "tool_addition/tool_removal is not supported on this model"
+    if i == 0 or msgs[i - 1].get("role") not in ("user", "system"):
+        return f"messages.{i}: role 'system' must follow a 'user' or 'system' message"
+    if i + 1 < len(msgs) and msgs[i + 1].get("role") not in ("assistant", "system"):
+        return (f"messages.{i}: role 'system' must precede an 'assistant' message or "
+                "end the array; the directive-only form (content: [] with "
+                "output_config) is accepted at any position")
+    content = msgs[i].get("content")
+    if not isinstance(content, list) or not content:
+        return f"messages.{i}: all messages must have non-empty content"
+    for k, b in enumerate(content):
+        where = f"messages.{i}.content.{k}"
+        tool = b.get("tool", {})
+        d = tool.get("definition", {})
+        if b.get("type") != "tool_addition" or tool.get("type") != "tool_definition":
+            return f"{where}: unexpected block type {b.get('type')} in a system message"
+        if set(b) - {"type", "tool", "cache_control"} or "cache_control" in d:
+            return f"{where}: unexpected field"
+        if not d.get("name") or d.get("input_schema", {}).get("type") != "object":
+            return f"{where}.tool.definition: a name and an input_schema of type object"
+        if d["name"] in names:
+            return f"{where}.tool.definition.name: tool names must be unique: {d['name']}"
+        names.append(d["name"])
+    return None
+
+
+def an_check(req, prefill=False, beta="", noinline=False):
     """Why the API would reject a request, or None if it would not."""
     if not isinstance(req.get("max_tokens"), int) or req["max_tokens"] < 1:
         return "max_tokens: Field required"
@@ -4759,11 +4812,21 @@ def an_check(req, prefill=False):
                 and isinstance(c.get("source", {}).get("data"), str))
     if pages > 100:
         return "A maximum of 100 PDF pages may be provided."
+    names = [t.get("name") for t in req.get("tools", [])]
+    shown = 0  # messages but system ones, whose roles alternate
+    prev = None
     for i, m in enumerate(msgs):
         role = m.get("role")
-        if role != ("user" if i % 2 == 0 else "assistant"):
+        if role == "system":
+            err = an_check_addition(req, i, beta, noinline, names)
+            if err:
+                return err
+            marks += sum("cache_control" in b for b in m["content"])
+            continue
+        if role != ("user" if shown % 2 == 0 else "assistant"):
             return (f'messages.{i}: roles must alternate between "user" and '
                     '"assistant", starting with "user"')
+        shown += 1
         content = m.get("content")
         if not isinstance(content, list) or not content:
             return f"messages.{i}: all messages must have non-empty content"
@@ -4802,12 +4865,13 @@ def an_check(req, prefill=False):
             else:
                 return f"{where}: unexpected block type {kind} in a {role} message"
         if role == "user":
-            calls = [] if i == 0 else [b.get("id") for b in msgs[i - 1]["content"]
-                                       if b.get("type") == "tool_use"]
+            calls = [] if prev is None else [b.get("id") for b in prev["content"]
+                                             if b.get("type") == "tool_use"]
             if sorted(calls) != sorted(results):
                 return (f"messages.{i}: tool_use ids were found without tool_result "
                         f"blocks immediately after, or the reverse: {calls} {results}")
-    if msgs[-1]["role"] == "assistant" and not prefill:
+        prev = m
+    if prev is not None and prev["role"] == "assistant" and not prefill:
         return ("This model does not support assistant message prefill. The "
                 "conversation must end with a user message.")
     if marks > 4:
@@ -5088,6 +5152,21 @@ def sc_an_cache(model, n, req):
                            think=f"Read f{n} next.")
     else:
         yield from an_answer(model, req, "Read them all.")
+
+
+def sc_an_mcp_tick(model, n, req):
+    # Reasoning each step, which must stay bound across the join
+    k = step(req)
+    if k == 0:
+        yield from an_answer(model, req, "One.", think="Nothing to call yet.")
+    elif k == 1:
+        yield from an_call(model, req, n, "mcp__fake__echo", {"text": "late"},
+                           think="Echo has joined.")
+    else:
+        yield from an_answer(model, req, "Two.", think="Echoed.")
+
+
+sc_an_noinline_tick = sc_an_mcp_tick
 
 
 def sc_an_auth(model, n, req):
@@ -7634,7 +7713,9 @@ class Handler(BaseHTTPRequestHandler):
         n = STATE.take(key, req, headers)
         STATE.begin(prefix, model)
         try:
-            err = an_check(req, prefill=name.startswith("an_pause"))
+            err = an_check(req, prefill=name.startswith("an_pause"),
+                           beta=self.headers.get("anthropic-beta", ""),
+                           noinline=name.startswith("an_noinline"))
             if err:
                 fail(400, "invalid_request_error", err)
             else:

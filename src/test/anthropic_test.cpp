@@ -555,3 +555,176 @@ static void test_anthropic(Test *t)
         expect(t, "an.blocktype", blockname(blocktype("redacted")), "redacted");
     }
 }
+
+// Tools that joined mid-conversation, inline (anadds)
+static void test_aninline(Test *t)
+{
+    Arena *a   = &t->perm;
+    Arena  tmp = *a;
+    tmp.beg   += (tmp.end - tmp.beg)/2;
+
+    Str read = "{\"type\":\"function\",\"function\":{\"name\":\"read\",\"description\":"
+               "\"Read\",\"parameters\":{\"type\":\"object\"}}}";
+    Str echo = "{\"type\":\"function\",\"function\":{\"name\":\"echo\",\"description\":"
+               "\"Echo\",\"parameters\":{\"type\":\"object\"}}}";
+    Str base = concat(a, concat(a, "[", read), "]");
+    Str more = concat(a, concat(a, "[", echo), "]");
+    Str all  = concat(a, concat(a, concat(a, "[", read), ","), concat(a, echo, "]"));
+
+    ModelConf mc = {};
+    mc.name  = "claude-test";
+    mc.think = THINK_DEFAULT;
+    Block call1[1] = {{BLOCK_CALL, {}, {}, "toolu_1", "read", "{}"}};
+    Block call2[1] = {{BLOCK_CALL, {}, {}, "toolu_2", "echo", "{}"}};
+    Block done[1]  = {{BLOCK_TEXT, "Done.", {}, {}, {}, {}}};
+    Block think[1] = {{BLOCK_THINK, "hmm", {}, {}, {}, {}}};  // unsigned: not shown
+    Msg h[8] = {};
+    h[0].role = ROLE_USER;      h[0].text   = "go";              h[0].seq = 1;
+    h[1].role = ROLE_ASSISTANT; h[1].blocks = {call1, 1, 1};     h[1].seq = 2;
+    h[2].role = ROLE_TOOL;      h[2].callid = "toolu_1";         h[2].seq = 3;
+    h[2].text = "read it";
+    // The tools record, seq 4, then the notice of it
+    h[3].role = ROLE_USER;      h[3].text   = "New tools: echo"; h[3].seq = 5;
+    h[4].role = ROLE_ASSISTANT; h[4].blocks = {call2, 1, 1};     h[4].seq = 6;
+    h[5].role = ROLE_TOOL;      h[5].callid = "toolu_2";         h[5].seq = 7;
+    h[5].text = "echo: x";
+    h[6].role = ROLE_ASSISTANT; h[6].blocks = {done, 1, 1};      h[6].seq = 8;
+    ToolAdd add[2] = {{4, more}, {9, more}};
+
+    ChatReq r = {};
+    r.mc       = &mc;
+    r.system   = "S";
+    r.tools    = all;
+    r.base     = base;
+    r.adds     = {add, 1, 1};
+    r.inlineok = 1;
+
+    // The request right after they joined: the addition last, with the
+    // last breakpoint, and the tools the prefix's
+    r.history = {h, 4, 4};
+    Str one   = anencode(a, tmp, &r);
+    expect(t, "inline.inlined", istr(a, r.inlined), "1");
+    expect(t, "inline.shape", anshape(a, one),
+           "user:text* | assistant:tool_use | user:tool_result,text | "
+           "system:tool_addition*");
+    JsonDoc d1 = jsonparse(a, one);
+    expect(t, "inline.message", jsonat(jsonget(d1.root, "messages"), 3)->raw,
+           "{\"role\":\"system\",\"content\":[{\"type\":\"tool_addition\",\"tool\":"
+           "{\"type\":\"tool_definition\",\"definition\":{\"name\":\"echo\","
+           "\"description\":\"Echo\",\"input_schema\":{\"type\":\"object\"},"
+           "\"eager_input_streaming\":true}},\"cache_control\":{\"type\":\"ephemeral\"}}]}");
+    expect(t, "inline.tools", jsonget(d1.root, "tools")->raw,
+           "[{\"name\":\"read\",\"description\":\"Read\",\"input_schema\":"
+           "{\"type\":\"object\"},\"eager_input_streaming\":true,"
+           "\"cache_control\":{\"type\":\"ephemeral\"}}]");
+
+    // The call and its result: the addition before the response, the
+    // breakpoint before that on it, where the last request wrote one, and
+    // everything before the same
+    r.history = {h, 6, 6};
+    Str two   = anencode(a, tmp, &r);
+    expect(t, "inline.shape after", anshape(a, two),
+           "user:text | assistant:tool_use | user:tool_result,text | "
+           "system:tool_addition* | assistant:tool_use | user:tool_result*");
+    {
+        Str   p1   = anplain(a, one);
+        Str   p2   = anplain(a, two);
+        Json *m1   = jsonget(jsonparse(a, p1).root, "messages");
+        Json *m2   = jsonget(jsonparse(a, p2).root, "messages");
+        b32   same = jsonlen(m1)==4 && jsonlen(m2)==6;
+        for (iz i = 0; i < jsonlen(m1); i++) {
+            same &= jsonat(m1, i)->raw == jsonat(m2, i)->raw;
+        }
+        same &= takehead(p1, find(p1, ",\"messages\"")) ==
+                takehead(p2, find(p2, ",\"messages\""));
+        same &= cuthead(p1, find(p1, ",\"tools\"")) ==
+                cuthead(p2, find(p2, ",\"tools\""));
+        expect(t, "inline.prefix", istr(a, same), "1");
+    }
+
+    // Not inline: the request as it would be with no additions at all
+    r.inlineok = 0;
+    Str    no  = anencode(a, tmp, &r);
+    expect(t, "inline.off inlined", istr(a, r.inlined), "0");
+    ChatReq plain = r;
+    plain.adds    = {};
+    expect(t, "inline.off", istr(a, no==anencode(a, tmp, &plain)), "1");
+    r.inlineok = 1;
+
+    // A title's ask, which no record holds: the addition after it, last
+    {
+        Msg ask = {};
+        ask.role  = ROLE_USER;
+        ask.text  = "Title?";
+        Slice<Msg> hist = {};
+        for (iz i = 0; i < 4; i++) {
+            hist = push(a, hist, h[i]);
+        }
+        r.history = push(a, hist, ask);
+        expect(t, "inline.title", anshape(a, anencode(a, tmp, &r)),
+               "user:text* | assistant:tool_use | user:tool_result,text,text | "
+               "system:tool_addition*");
+    }
+
+    // Right after a response, as a paused turn's continuation would be:
+    // the second spills into the tools, the first still inline
+    r.history = {h, 7, 7};
+    r.adds    = {add, 2, 2};
+    Str spill = anencode(a, tmp, &r);
+    expect(t, "inline.spill", anshape(a, spill),
+           "user:text | assistant:tool_use | user:tool_result,text | "
+           "system:tool_addition | assistant:tool_use | user:tool_result* | "
+           "assistant:text*");
+    {
+        Json *tl = jsonget(jsonparse(a, spill).root, "tools");
+        expect(t, "inline.spill tools", istr(a, jsonlen(tl)), "2");
+        expect(t, "inline.spill names", jsonstr(jsonget(jsonat(tl, 1), "name")), "echo");
+    }
+    // ... and alone, nothing inline: the tools as they always were
+    r.adds = {add+1, 1, 1};
+    Str alone = anencode(a, tmp, &r);
+    expect(t, "inline.spill alone", istr(a, r.inlined), "0");
+    expect(t, "inline.spill tools", cuthead(alone, find(alone, ",\"tools\"")),
+           cuthead(no, find(no, ",\"tools\"")));
+
+    // With no tools of the prefix: in the tools
+    r.adds    = {add, 1, 1};
+    r.history = {h, 4, 4};
+    r.base    = "[]";
+    r.tools   = more;
+    expect(t, "inline.no base", anshape(a, anencode(a, tmp, &r)),
+           "user:text* | assistant:tool_use | user:tool_result,text*");
+    expect(t, "inline.no base inlined", istr(a, r.inlined), "0");
+    r.base  = base;
+    r.tools = all;
+
+    // A response of reasoning alone, not shown: the addition goes before
+    // the next shown, after the user's message between
+    {
+        Msg g[4] = {};
+        g[0].role = ROLE_USER;      g[0].text   = "go";     g[0].seq = 1;
+        g[1].role = ROLE_ASSISTANT; g[1].blocks = {think, 1, 1}; g[1].seq = 3;
+        g[2].role = ROLE_USER;      g[2].text   = "go on";  g[2].seq = 5;
+        g[3].role = ROLE_ASSISTANT; g[3].blocks = {done, 1, 1};  g[3].seq = 6;
+        ToolAdd early[1] = {{2, more}};
+        r.adds    = {early, 1, 1};
+        r.history = {g, 4, 4};
+        expect(t, "inline.reasoning only", anshape(a, anencode(a, tmp, &r)),
+               "user:text,text | system:tool_addition* | assistant:text*");
+    }
+
+    // The models known to take it
+    struct { Str model; b32 ok; } fams[] = {
+        {"claude-opus-5-5", 1}, {"claude-opus-5", 1}, {"claude-opus-4-8", 1},
+        {"claude-opus-4-8-20260115", 1}, {"claude-opus-5-20260301", 1},
+        {"claude-fable-5-2", 1}, {"claude-fable-5", 1}, {"claude-mythos-5-1", 1},
+        {"claude-sonnet-5-5", 1}, {"claude-haiku-5-5", 1}, {"claude-sonnet-6", 1},
+        {"claude-sonnet-5", 0}, {"claude-haiku-4-5", 0}, {"claude-opus-4-7", 0},
+        {"claude-opus-5-1", 0}, {"claude-fable-5-3", 0}, {"claude-sonnet-4-6", 0},
+        {"opus-5-5", 0}, {"claude-", 0}, {"claude-opus", 0}, {"claude-opus-x", 0},
+    };
+    for (iz i = 0; i < countof(fams); i++) {
+        expect(t, concat(a, "anfamily ", fams[i].model),
+               istr(a, anfamily(fams[i].model)), istr(a, fams[i].ok));
+    }
+}

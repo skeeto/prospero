@@ -14865,6 +14865,93 @@ def mcp_late_rewind(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+def an_tick(t, h):
+    """A turn, a tool of the fake MCP server turned on, and a turn that
+    calls it: the session's id."""
+    sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+    h.send("prompt", sid=sid, text="go")
+    t.check(ended(h, sid, 1)["why"] == "done", "the first turn ends")
+    r = h.call("config.set", kind="mcp", name="fake", key="tools", value="echo")
+    t.check(r.get("ok") == 1, f"set {r}")
+    h.send("prompt", sid=sid, text="again")
+    end = ended(h, sid, 2)
+    t.check(end["why"] == "done", f"the second turn ends: {end}")
+    t.check([c["name"] for c in mcpcalls(t)] == ["echo"], f"calls {mcpcalls(t)}")
+    ends = h.all("tool.end", sid)
+    t.check([e["status"] for e in ends] == ["ok"] and ends[0]["text"] == "echo: late",
+            f"echoed {ends}")
+    return sid
+
+
+@scenario(conf={**AN, **mcpconf(trust="yes", tools="none_such"),
+                "_extra": "[model {model}]\ninline_tools = yes\n"}, bound=20)
+def an_mcp_tick(t):
+    """A tool that joins mid-session goes inline: the tools as the prefix
+    had them, the new one defined in a system message right after the
+    turn's prompt, with the beta's header on the requests that carry
+    one, and every request after the join reads the whole of the one
+    before from the cache, its reasoning still bound."""
+    h = t.headless(env={**ANENV, **mcpenv(t)})
+    try:
+        an_tick(t, h)
+        reqs = t.requests()
+        t.check(len(reqs) == 3, f"three requests: {len(reqs)}")
+        bodies = [q["body"] for q in reqs]
+        betas = [q["headers"].get("anthropic-beta") for q in reqs]
+        t.check(betas == [None, fake_provider.AN_INLINE, fake_provider.AN_INLINE],
+                f"the beta with the addition: {betas}")
+        tools = [json.dumps(b["tools"]) for b in bodies]
+        t.check(len(set(tools)) == 1 and "mcp__fake__echo" not in tools[0],
+                "the tools as they were")
+        t.check("mcp__fake__echo" in fake_provider.an_tool_names(bodies[1]),
+                "echo defined in the conversation")
+        roles = [m["role"] for m in bodies[2]["messages"]]
+        t.check(roles == ["user", "assistant", "user", "system", "assistant", "user"],
+                f"the addition before the response: {roles}")
+        thinks = [b for m in bodies[2]["messages"] if m["role"] == "assistant"
+                  for b in m["content"] if b["type"] == "thinking"]
+        t.check(len(thinks) == 2, f"the reasoning went back: {thinks}")
+        us = [e["usage"] for e in h.all("assistant")]
+        t.check(len(us) == 3, f"usage {us}")
+        for k in (1, 2):
+            whole = us[k-1]["cached"] + us[k-1].get("written", 0)
+            t.check(us[k]["cached"] == whole, f"request {k} read all of {k-1}: {us}")
+        t.check(not h.all("retry"), "no retries")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf={**AN, **mcpconf(trust="yes", tools="none_such"),
+                "_extra": "[model {model}]\ninline_tools = yes\n"}, bound=20)
+def an_noinline_tick(t):
+    """A model that refuses tools inline: one quick retry with the tool in
+    the tools instead, its reasoning left out, as it is bound to the
+    tools it had, and the same from then on."""
+    h = t.headless(env={**ANENV, **mcpenv(t)})
+    try:
+        an_tick(t, h)
+        reqs = t.requests()
+        t.check(len(reqs) == 4, f"four requests: {len(reqs)}")
+        bodies = [q["body"] for q in reqs]
+        betas = [q["headers"].get("anthropic-beta") for q in reqs]
+        t.check(betas == [None, fake_provider.AN_INLINE, None, None],
+                f"tried once: {betas}")
+        retries = h.all("retry")
+        t.check(len(retries) == 1 and "not supported on this model" in
+                json.dumps(retries[0]), f"one retry: {retries}")
+        for b in bodies[2:]:
+            t.check(not [m for m in b["messages"] if m["role"] == "system"],
+                    "no system messages after")
+            t.check("mcp__fake__echo" in [x["name"] for x in b["tools"]], "echo in the tools")
+        thinks = [b for m in bodies[2]["messages"] if m["role"] == "assistant"
+                  for b in m["content"] if b["type"] == "thinking"]
+        t.check(not thinks, f"the reasoning left out: {thinks}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 @scenario(conf={**BIG, **mcpconf(trust="yes", tools="echo")}, bound=40)
 def mcp_compact(t):
     """A summary rebuilds the prefix as a new session's would be (#57):

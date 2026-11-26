@@ -555,6 +555,19 @@ static void fuzzprovider(Arena a, Str src)
         req.thinkfrom = run;
         body = anencode(&a, tmp, &req);
         assert(jsonparse(&a, body).ok);
+
+        // Tools that joined among them, the input as their array, which
+        // goes inline or in the tools, either way as JSON
+        m[0].seq = 1;
+        m[1].seq = 3;
+        m[2].seq = 5;
+        ToolAdd adds[3] = {{0, src}, {2+run%4, src}, {6, src}};
+        req.tools    = "[{\"type\":\"function\",\"function\":{\"name\":\"x\"}}]";
+        req.base     = req.tools;
+        req.adds     = {adds, 3, 3};
+        req.inlineok = 1;
+        body = anencode(&a, tmp, &req);
+        assert(jsonparse(&a, body).ok);
     }
 
     // Arguments sent back

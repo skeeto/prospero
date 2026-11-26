@@ -36,6 +36,17 @@
 //   so a long file shows progress and keeps the progress watchdog fed.
 //   It comes unchecked, and repairargs and the tools check it as they
 //   would any server's.
+// - Tools that joined after the prefix (MCP servers ready late, or
+//   opened) are defined where they joined, by value, in a system message
+//   of their own (anbeta's tool_addition blocks), rather than in the
+//   tools, whose change would rewrite the whole cache: the tools stay
+//   the prefix's. Each such message goes right before the first response
+//   that came after its tools joined, else at the end, as the API takes
+//   one only there, after a user message or another system message, and
+//   counts among the messages for the breakpoints. One that cannot go
+//   there (after a response, or with no tools of the prefix) goes in the
+//   tools as before. Where the engine finds the model or the endpoint
+//   without the beta (inlineok), all of them do.
 //
 // A response streams as message_start, then each content block by its
 // index (content_block_start, content_block_delta, content_block_stop),
@@ -77,6 +88,47 @@ static i64 anmaxtokens(ModelConf *mc)
 }
 
 static Str const anversion = "2023-06-01";
+static Str const anbeta    = "inline-tools-2026-09-15";
+
+// Whether a model takes tools defined mid-conversation (anbeta), by its
+// id, as the Models API does not say: Fable and Mythos 5 to 5.2, Opus 5,
+// 5.5 and 4.8, Sonnet and Haiku 5.5, and any of a major version past 5.
+// Sonnet 5 and Haiku 4.5 refuse it, and so, presumably, do older ones.
+static b32 anfamily(Str model)
+{
+    if (!startswith(model, "claude-")) {
+        return 0;
+    }
+    Cut fam = cut(cuthead(model, 7), '-');
+    Str v   = fam.tail;
+    i32 major = 0, minor = 0;
+    iz  i = 0;
+    for (; i<v.len && i<3 && v[i]>='0' && v[i]<='9'; i++) {
+        major = major*10 + (v[i] - '0');
+    }
+    if (!i || (i<v.len && v[i]!='-')) {
+        return 0;
+    }
+    // A minor version is a number of one or two digits, not a date
+    iz beg = ++i;
+    for (; i<v.len && v[i]>='0' && v[i]<='9'; i++) {}
+    if (i>beg && i-beg<=2 && (i==v.len || v[i]=='-')) {
+        for (iz k = beg; k < i; k++) {
+            minor = minor*10 + (v[k] - '0');
+        }
+    }
+    Str f = fam.head;
+    if (major >= 6) {
+        return 1;
+    } else if (f=="fable" || f=="mythos") {
+        return major==5 && minor<=2;
+    } else if (f == "opus") {
+        return (major==5 && (minor==0 || minor==5)) || (major==4 && minor==8);
+    } else if (f=="sonnet" || f=="haiku") {
+        return major==5 && minor==5;
+    }
+    return 0;
+}
 
 static void ancache(JsonOut *w)
 {
@@ -89,35 +141,52 @@ static void ancache(JsonOut *w)
 
 // Requests
 
-// The tools of a chat request (an array of functions) as the Messages
-// API takes them, the last with a cache breakpoint if cache.
-static void antools(JsonOut *w, Arena scratch, Str tools, b32 cache)
+// A tool of a chat request (a function) as the Messages API takes it,
+// in the tools or in a tool_addition, with a cache breakpoint if cache.
+static void andef(JsonOut *w, Json *t, b32 cache)
 {
-    JsonDoc d = jsonparse(&scratch, tools);
-    putarray(w);
-    for (Json *t = d.root->child; d.root->type==JSON_ARRAY && t; t = t->next) {
-        Json *fn = jsonget(t, "function");
-        putobject(w);
-        putstrkey(w, "name", jsonstr(jsonget(fn, "name")));
-        putstrkey(w, "description", jsonstr(jsonget(fn, "description")));
-        putkey(w, "input_schema");
-        putjson(w, jsonget(fn, "parameters"));
-        putkey(w, "eager_input_streaming");
-        putbool(w, 1);
-        if (cache && !t->next) {
-            ancache(w);
-        }
-        putend(w);
+    Json *fn = jsonget(t, "function");
+    putobject(w);
+    putstrkey(w, "name", jsonstr(jsonget(fn, "name")));
+    putstrkey(w, "description", jsonstr(jsonget(fn, "description")));
+    putkey(w, "input_schema");
+    putjson(w, jsonget(fn, "parameters"));
+    putkey(w, "eager_input_streaming");
+    putbool(w, 1);
+    if (cache) {
+        ancache(w);
     }
     putend(w);
 }
 
-// One content block of a request message, as the history holds it.
+// The tools of a chat request (arrays of functions, one after another)
+// as the Messages API takes them, the last with a cache breakpoint if
+// cache.
+static void antools(JsonOut *w, Arena scratch, Slice<Str> tools, b32 cache)
+{
+    Slice<Json *> all = {};
+    for (iz i = 0; i < tools.len; i++) {
+        JsonDoc d = jsonparse(&scratch, tools[i]);
+        for (Json *t = d.root->child; d.root->type==JSON_ARRAY && t; t = t->next) {
+            all = push(&scratch, all, t);
+        }
+    }
+    putarray(w);
+    for (iz i = 0; i < all.len; i++) {
+        andef(w, all[i], cache && i==all.len-1);
+    }
+    putend(w);
+}
+
+// One content block of a request message, as the history holds it, or
+// a tool that joined mid-conversation.
 struct AnPart {
     i32    n;      // the request message it goes in, merged
     b32    asst;
-    Msg   *msg;
+    Msg   *msg;    // null for a tool's
     Block *block;  // of an assistant message, else null
+    i32    add;    // a tool's: 1 + its addition, which is a system message
+    Json  *def;    // a tool's function
 };
 
 static b32 anblank(Str s)
@@ -163,13 +232,13 @@ static Slice<AnPart> anparts(Arena *a, Slice<Msg> h, i64 thinkfrom)
             for (iz k = 0; k < m->blocks.len; k++) {
                 Block *b = &m->blocks[k];
                 if (ansendable(b, m->seq<thinkfrom)) {
-                    AnPart p = {n, 1, m, b};
+                    AnPart p = {n, 1, m, b, 0, 0};
                     r = push(a, r, p);
                 }
             }
         } else if (m->role==ROLE_TOOL || !anblank(m->text) || m->images.len) {
             n += next;
-            AnPart p = {n, 0, m, 0};
+            AnPart p = {n, 0, m, 0, 0, 0};
             r = push(a, r, p);
         }
     }
@@ -201,6 +270,21 @@ static void animage(JsonOut *w, Arena scratch, MsgImage *g, b32 cache)
 
 static void anblock(JsonOut *w, Arena scratch, AnPart *p, b32 cache)
 {
+    if (p->add) {
+        putobject(w);
+        putstrkey(w, "type", "tool_addition");
+        putkey(w, "tool");
+        putobject(w);
+        putstrkey(w, "type", "tool_definition");
+        putkey(w, "definition");
+        andef(w, p->def, 0);
+        putend(w);
+        if (cache) {
+            ancache(w);
+        }
+        putend(w);
+        return;
+    }
     Msg *m = p->msg;
     if (!p->block && m->role==ROLE_USER && m->images.len) {
         // Its images first, then its text, if any, which has the
@@ -324,6 +408,65 @@ static void anblock(JsonOut *w, Arena scratch, AnPart *p, b32 cache)
     putend(w);
 }
 
+// The parts with the tools that joined mid-conversation (r->adds) among
+// them, if they may go there (r->inlineok), each addition a system
+// message of its own: before the first response shown that came after
+// it, else at the end (after a title's ask too), as the API takes one
+// only before an assistant message or last, and only after a user or
+// system message. One that cannot go there, after a response, or with
+// no tools of the prefix, goes in the tools instead (spill). Messages
+// numbered again, as additions part them.
+static Slice<AnPart> anadds(Arena *a, ChatReq *r, Slice<AnPart> parts,
+                            Slice<b32> *spill, b32 *inlined)
+{
+    *spill   = {alloc<b32>(a, r->adds.len), r->adds.len, r->adds.len};
+    *inlined = 0;
+    if (!r->adds.len) {
+        return parts;
+    }
+    JsonDoc base  = jsonparse(a, r->base);
+    b32     tools = base.root->type==JSON_ARRAY && base.root->child;
+    Slice<iz> at = {alloc<iz>(a, r->adds.len), r->adds.len, r->adds.len};
+    for (iz j = 0; j < r->adds.len; j++) {
+        iz pos = parts.len;
+        for (iz i = 0; i < parts.len; i++) {
+            if (parts[i].asst && parts[i].msg->seq>r->adds[j].seq) {
+                pos = i;
+                break;
+            }
+        }
+        b32 ok = r->inlineok && tools && pos>0 && !parts[pos-1].asst;
+        at[j]       = ok ? pos : -1;
+        (*spill)[j] = !ok;
+    }
+
+    Slice<AnPart> out = {};
+    for (iz i = 0; i <= parts.len; i++) {
+        for (iz j = 0; j < r->adds.len; j++) {
+            if (at[j] != i) {
+                continue;
+            }
+            JsonDoc d = jsonparse(a, r->adds[j].tools);
+            for (Json *t = d.root->child; d.root->type==JSON_ARRAY && t; t = t->next) {
+                AnPart p = {};
+                p.add = (i32)j + 1;
+                p.def = t;
+                out   = push(a, out, p);
+                *inlined = 1;
+            }
+        }
+        if (i < parts.len) {
+            out = push(a, out, parts[i]);
+        }
+    }
+    i32 n = -1;
+    for (iz k = 0; k < out.len; k++) {
+        n += !k || out[k].asst!=out[k-1].asst || out[k].add!=out[k-1].add;
+        out[k].n = n;
+    }
+    return out;
+}
+
 // Whether a request part may hold a cache breakpoint: reasoning may not.
 static b32 ancacheable(AnPart *p)
 {
@@ -334,24 +477,28 @@ static b32 ancacheable(AnPart *p)
 // Where a request's parts go and which hold cache breakpoints.
 struct AnPlan {
     Slice<AnPart> parts;
-    Slice<iz>     order;  // parts in the order they go, message by message
-    Slice<b32>    mark;   // by position in order: a cache breakpoint
-    b32           tools;  // the tools' breakpoint too
+    Slice<iz>     order;    // parts in the order they go, message by message
+    Slice<b32>    mark;     // by position in order: a cache breakpoint
+    b32           tools;    // the tools' breakpoint too
+    Slice<b32>    spill;    // by addition: in the tools, not inline
+    b32           inlined;  // an addition inline
 };
 
 static AnPlan anplan(Arena *a, ChatReq *r)
 {
     AnPlan        p     = {};
     Slice<AnPart> parts = anparts(a, r->history, r->thinkfrom);
+    parts = anadds(a, r, parts, &p.spill, &p.inlined);
     i32 nmsgs    = parts.len ? parts[parts.len-1].n+1 : 0;
     i32 lastasst = -1;
     b32 dropped  = 0;
     for (iz i = 0; i < parts.len; i++) {
         lastasst = parts[i].asst ? parts[i].n : lastasst;
-        dropped |= !parts[i].block && parts[i].msg->floor==FLOOR_READ;
+        dropped |= !parts[i].add && !parts[i].block && parts[i].msg->floor==FLOOR_READ;
     }
-    // Roles alternate: a user message, or none. Where screenshots were
-    // just dropped, the prefix changed before it, so it reads nothing
+    // Roles alternate: a user message (or an addition after one), or
+    // none. Where screenshots were just dropped, the prefix changed
+    // before it, so it reads nothing
     i32 prev = dropped ? -1 : lastasst-1;
 
     p.parts = parts;
@@ -367,7 +514,8 @@ static AnPlan anplan(Arena *a, ChatReq *r)
         iz first = p.order.len;
         for (i32 pass = 0; pass < 2; pass++) {
             for (iz i = beg; i < end; i++) {
-                b32 result = !parts[i].block && parts[i].msg->role==ROLE_TOOL;
+                b32 result = !parts[i].add && !parts[i].block &&
+                             parts[i].msg->role==ROLE_TOOL;
                 b32 lead   = asst || result;
                 if (lead == !pass) {
                     p.order = push(a, p.order, i);
@@ -389,7 +537,7 @@ static AnPlan anplan(Arena *a, ChatReq *r)
     // that may hold one
     for (iz k = 0; k < p.order.len; k++) {
         AnPart *q = &parts[p.order[k]];
-        if (q->block || q->msg->floor==FLOOR_NONE) {
+        if (q->add || q->block || q->msg->floor==FLOOR_NONE) {
             continue;
         }
         for (iz j = k-1; j >= 0; j--) {
@@ -419,7 +567,8 @@ static void anmessages(JsonOut *w, Arena scratch, AnPlan *p)
         i32     n     = first->n;
         for (end = beg; end<p->order.len && p->parts[p->order[end]].n==n; end++) {}
         putobject(w);
-        putstrkey(w, "role", first->asst ? Str("assistant") : Str("user"));
+        putstrkey(w, "role", first->add  ? Str("system")    :
+                             first->asst ? Str("assistant") : Str("user"));
         putkey(w, "content");
         putarray(w);
         for (iz k = beg; k < end; k++) {
@@ -457,9 +606,19 @@ static Str anencode(Arena *a, Arena tmp, ChatReq *r)
     AnPlan plan = anplan(&tmp, r);
     putkey(&w, "messages");
     anmessages(&w, tmp, &plan);
+    // The prefix's tools and the additions not inline, if any are, else
+    // all of them as they always were
+    Slice<Str> tools = {};
+    tools = push(&tmp, tools, plan.inlined ? r->base : r->tools);
+    for (iz j = 0; plan.inlined && j<r->adds.len; j++) {
+        if (plan.spill[j]) {
+            tools = push(&tmp, tools, r->adds[j].tools);
+        }
+    }
+    r->inlined = plan.inlined;
     if (r->tools.len) {
         putkey(&w, "tools");
-        antools(&w, tmp, r->tools, plan.tools);
+        antools(&w, tmp, tools, plan.tools);
         putkey(&w, "tool_choice");
         putobject(&w);
         putstrkey(&w, "type", "auto");

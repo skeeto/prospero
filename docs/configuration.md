@@ -118,6 +118,14 @@ system prompt and the conversation carry cache breakpoints, so cache
 reads grow turn over turn. A `[model NAME]` section sets `thinking`
 (adaptive by default), `thinking_display`, `effort` and `max_tokens`.
 
+Tools that join a session after its first request (an MCP server ready
+late, a tool turned on) are defined in the conversation where they
+join, by the API's inline-tools beta, so the cache still reads all
+that came before them. `[model NAME] inline_tools` says when: `auto`
+(the default) at `api.anthropic.com` for the models known to take it,
+`yes`, or `no`. Without it they are added to the tools, which rewrites
+the cache once, and so is a model that refuses them, from then on.
+
 `kind = responses` speaks OpenAI's Responses API (whose whole URL ends
 in `/responses`), with its key, at OpenAI or at a server that serves
 it, as llama-server does:
@@ -431,7 +439,9 @@ directory's `mcp/logs`. `tools` keeps only some of a server's tools,
 read left to right (`-NAME` leaves one out, and a list beginning with
 one starts from all), which the server's page in Settings edits with a
 checkbox each, and `prospero mcp tools NAME` lists; a tool left out
-mid-session is refused. `trust = yes` runs them without asking, and a role with a tools list
+mid-session is refused, and one turned on, like a server ready after a
+session's first request, joins at its next request, the agent told
+(see `inline_tools` for what that costs the prompt cache). `trust = yes` runs them without asking, and a role with a tools list
 names them as `mcp__NAME` or `mcp__NAME__TOOL`. Otherwise each call
 asks first, with an "always" for all of that server's tools, which for
 a server over HTTP holds only while its url stays the same. An included

@@ -804,6 +804,10 @@ struct Session {
     Str          tools;      // the prefix's, then those that joined it
     Str          toolsbase;  // the prefix's alone, as logged (logprefix)
     Slice<ToolAdd> tooladds; // those that joined since, in order (mcpjoin)
+    Slice<Str>   inlineno;   // Anthropic models that refused tools inline,
+                             // learned by this process (failstep)
+    Str          inlined;    // the model of the attempt in flight, if it
+                             // sent tools inline
     ToolEnv      te;         // te.shell: the shell commands run in now
     Str          shellwarn;  // [tools] shell was not found (buildprefix)
     Shell        shellpre;   // the shell the prefix describes
@@ -2278,9 +2282,9 @@ static void release(Session *s, b32 linger)
     pump(e, s->point);
 }
 
-static Str authheaders(Arena *a, Endpoint *ep, Str accept)
+static Str authheaders(Arena *a, Endpoint *ep, Str accept, Str beta = {})
 {
-    Buf b(a, 256);
+    Buf b(a, 256 + beta.len);
     print(&b, "Content-Type: application/json\r\n");
     print(&b, "Accept: ");
     print(&b, accept);
@@ -2288,6 +2292,11 @@ static Str authheaders(Arena *a, Endpoint *ep, Str accept)
     if (ep->wire == EP_ANTHROPIC) {
         print(&b, "anthropic-version: ");
         print(&b, anversion);
+        print(&b, "\r\n");
+    }
+    if (ep->wire==EP_ANTHROPIC && beta.len) {
+        print(&b, "anthropic-beta: ");
+        print(&b, beta);
         print(&b, "\r\n");
     }
     if (ep->kind == EP_ANTHROPIC) {
@@ -2780,10 +2789,11 @@ static CpHint cphint(Session *s)
 static Str copilotheaders(Engine *, Arena *, Endpoint *, Str sid, CpHint);
 
 // Start a request whose records go to this session, with keep for a
-// turn's body, which a relayed request's next may be a delta against.
-// 0 on failure.
+// turn's body, which a relayed request's next may be a delta against,
+// and an Anthropic beta it needs, if any. 0 on failure.
 static b32 startreq(Session *s, Arena scratch, Endpoint *ep, Str method,
-                    Str url, Str body, Str accept, i32 readms, b32 keep = 0)
+                    Str url, Str body, Str accept, i32 readms, b32 keep = 0,
+                    Str beta = {})
 {
     Engine *e = s->e;
     if (epheld(e, &s->perm, ep)) {
@@ -2792,7 +2802,7 @@ static b32 startreq(Session *s, Arena scratch, Endpoint *ep, Str method,
     HttpReq r = {};
     r.method    = method;
     r.url       = url;
-    r.headers   = authheaders(&scratch, ep, accept);
+    r.headers   = authheaders(&scratch, ep, accept, beta);
     if (ep->kind==EP_CHATGPT && !ep->relay.len) {
         Str more  = chatgptheaders(e, &scratch, ep, s->sid, &s->authsent);
         r.headers = concat(&scratch, r.headers, more);
@@ -2952,6 +2962,31 @@ static void newattempt(Session *s)
     s->cycleat  = -1;
     s->ctlwhy   = CTL_NONE;
     s->hiddenat = 0;
+    s->inlined  = {};
+}
+
+// Whether a request of a model at an endpoint may define tools that
+// joined mid-conversation where they joined (anthropic.cpp), which keeps
+// the prompt cache: as [model] inline_tools says, by default only at
+// Anthropic's own API (not Copilot's, nor through a relay, nor another
+// server of its format) for the models known to take it, and never for
+// one that refused it.
+static b32 inlineok(Session *s, Endpoint *ep, ModelConf *mc)
+{
+    if (ep->wire!=EP_ANTHROPIC || mc->inlinetools==INLINE_NO) {
+        return 0;
+    }
+    for (iz i = 0; i < s->inlineno.len; i++) {
+        if (s->inlineno[i] == mc->name) {
+            return 0;
+        }
+    }
+    if (mc->inlinetools == INLINE_YES) {
+        return 1;
+    }
+    Url u = parseurl(ep->url);
+    return ep->kind==EP_ANTHROPIC && !ep->relay.len && u.ok &&
+           equalfold(u.host, "api.anthropic.com") && anfamily(mc->name);
 }
 
 static void sendchat(Session *s, Arena scratch)
@@ -2989,6 +3024,9 @@ static void sendchat(Session *s, Arena scratch)
     req.history   = deskimages(s, &scratch);
     req.thinkfrom = s->thinkfrom;
     req.cachekey  = s->sid;
+    req.base      = s->toolsbase;
+    req.adds      = s->tooladds;
+    req.inlineok  = inlineok(s, &s->ep, &mc);
     s->reqseq     = s->log.seq;
     i32 wire      = s->ep.wire;
     Str body      = wire==EP_ANTHROPIC ? anencode(&s->attempt, scratch, &req) :
@@ -2996,8 +3034,10 @@ static void sendchat(Session *s, Arena scratch)
                                                   s->ep.kind==EP_CHATGPT)
                                        : encodechat(&s->attempt, scratch, &req);
     Str url       = callurl(&scratch, &s->ep);
+    Str beta      = req.inlined ? anbeta : Str{};
+    s->inlined    = req.inlined ? clone(&s->attempt, mc.name) : Str{};
 
-    if (!startreq(s, scratch, &s->ep, "POST", url, body, "text/event-stream", 0, 1)) {
+    if (!startreq(s, scratch, &s->ep, "POST", url, body, "text/event-stream", 0, 1, beta)) {
         Str err = os_lasterr(e->os, &scratch);
         err = s->ep.held ? epheldmsg(&scratch, &s->ep)
                          : concat(&scratch, "cannot start a request: ", err);
@@ -3557,9 +3597,24 @@ static b32 refuseimage(Session *, Str);
 // slow retries follow (above). retryms is the server's wish, -1 if none.
 static void titleend(Session *, Arena);
 
+// Whether a request's failure is its model's or endpoint's refusal of
+// tools inline (anbeta), which it learns for the rest of the session.
+static b32 inlinerefused(Session *s, i32 cls, Str msg)
+{
+    if (cls!=CLASS_DETERMINISTIC || !s->inlined.len ||
+            (!contains(msg, "tool_addition") && !contains(msg, "tool_definition") &&
+             !contains(msg, "inline-tools"))) {
+        return 0;
+    }
+    s->inlineno = push(&s->perm, s->inlineno, clone(&s->perm, s->inlined));
+    s->inlined  = {};
+    return 1;
+}
+
 static void failstep(Session *s, Arena scratch, i32 cls, i32 status, Str msg, i64 retryms)
 {
     if (s->purpose == REQ_TITLE) {
+        inlinerefused(s, cls, msg);
         titleend(s, scratch);  // no retries: the prompt's title stays
         return;
     }
@@ -3623,6 +3678,16 @@ static void failstep(Session *s, Arena scratch, i32 cls, i32 status, Str msg, i6
         // that no step could go (#93): the newest message's that no
         // request it took carried are left out, a text saying why in
         // their place, and the step goes again, the agent told
+        retryevent(s, scratch, RETRY_QUICK, cls, status, 0, msg);
+        request(s, scratch);
+        return;
+    }
+    if (inlinerefused(s, cls, msg)) {
+        // Tools inline, which the model or the endpoint does not take:
+        // from now on in the tools, as before, which changes what the
+        // reasoning is bound to, so that goes too, and the step goes
+        // again at once
+        unbind(s);
         retryevent(s, scratch, RETRY_QUICK, cls, status, 0, msg);
         request(s, scratch);
         return;
@@ -16961,6 +17026,9 @@ static void sendtitle(Session *s, Arena scratch)
         req.history   = push(&scratch, deskimages(s, &scratch), ask);
         req.thinkfrom = s->thinkfrom;
         req.cachekey  = s->sid;
+        req.base      = s->toolsbase;
+        req.adds      = s->tooladds;
+        req.inlineok  = inlineok(s, &tt->ep, &tt->mc);
     } else {
         Str first = {}, last = {};
         for (iz i = 0; i < s->history.len; i++) {
@@ -16990,7 +17058,9 @@ static void sendtitle(Session *s, Arena scratch)
                                              tt->ep.kind==EP_CHATGPT)
                                   : encodechat(&s->attempt, scratch, &req);
     Str url  = callurl(&scratch, &tt->ep);
-    if (!startreq(s, scratch, &tt->ep, "POST", url, body, "text/event-stream", 0)) {
+    Str beta = req.inlined ? anbeta : Str{};
+    s->inlined = req.inlined ? clone(&s->attempt, tt->mc.name) : Str{};
+    if (!startreq(s, scratch, &tt->ep, "POST", url, body, "text/event-stream", 0, 0, beta)) {
         titleend(s, scratch);
         return;
     }
@@ -17837,6 +17907,8 @@ static void modelconf(Engine *e, Arena *perm, Str which, Str bare, ModelConf *mc
                     th=="between_tools" ? THINK_BETWEEN :
                     th=="default"       ? THINK_DEFAULT : THINK_ADAPTIVE;
     mc->hidethink = td == "omitted";
+    Str it = trim(cfgget(cfg, "model", model, "inline_tools", 0));
+    mc->inlinetools = it=="yes" ? INLINE_YES : it=="no" ? INLINE_NO : INLINE_AUTO;
     mc->effort    = ef.len ? clone(perm, ef) : Str{};
     mc->effas     = clone(perm, trim(cfgget(cfg, "model", model, "effort_as", 0)));
     mc->effmap    = clone(perm, trim(cfgget(cfg, "model", model, "effort_map", 0)));
