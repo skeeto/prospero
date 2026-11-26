@@ -469,6 +469,10 @@ static CfgKey cfgschema[] = {
      "A file of instructions added to the system prompt after prompt, read "
      "when a session starts: absolute, under ~, or relative to the file "
      "that sets it, at most 256 KiB; not from an include by URL"},
+    {"role", "skills", CFG_STRING, "", {}, {}, "role",
+     "Names of skills always loaded in the role's sessions, separated by "
+     "blanks: each one's instructions go in the system prompt after the "
+     "role's prompt, so the agent need not call for them"},
     {"role", "endpoint", CFG_STRING, "", {}, {}, "role",
      "Endpoint for the role, by default the session's, or a subagent's parent's"},
     {"role", "model", CFG_STRING, "", {}, {}, "role",

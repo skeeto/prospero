@@ -1524,6 +1524,9 @@ static void wtready(Session *s, Arena scratch)
     if (built && s->shellwarn.len) {
         note(s, scratch, "warn", s->shellwarn);
     }
+    if (built) {
+        roleheed(s, scratch);
+    }
 }
 
 // Ask git to make a session's worktree: null if asked, else why not.

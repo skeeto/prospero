@@ -79,6 +79,14 @@ configuration file that sets it (or absolute, or under `~`), added
 after `prompt`. It is read as each session starts, so an edit counts
 from the next session on. An include by URL cannot set it.
 
+A role may always load skills: `skills = code-review checklist` puts
+each one's instructions in the system prompt after the role's
+prompt, so the agent has them from the start rather than calling the
+skill tool, and other roles can share the same skill. A skill hidden
+from the agent loads too; one disabled under `[skills]` does not, nor
+one from another computer. A name with no skill is left out, and the
+session says so when it starts.
+
 A subagent shows under its parent in the sidebar, folded away by its
 arrow. A subagent cannot be resumed, so once three or more under one
 parent are finished, they gather in a "finished" row of their own

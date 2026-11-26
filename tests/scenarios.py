@@ -6263,6 +6263,66 @@ def role_prompt_file(t):
             f"read again {rec}")
 
 
+ROLESKILLS = """[role reviewer]
+prompt = Review. ROLE-MARK
+skills = review missing, notes review
+[role lone]
+description = Only a skill
+skills = notes
+"""
+
+
+@scenario(conf={"_extra": ROLESKILLS}, bound=20)
+def role_skills(t):
+    """A role's skills go in the system prompt after its prompt, a hidden
+    one too, as skill blocks, the session recording their names; the
+    agent reads in a loaded skill's directory without asking, granted
+    where outside its roots; one not
+    found is left out with a warning; a subagent's role loads its own,
+    with no prompt of its own."""
+    env = skillhome(t)
+    t.host.mkdir(t.host.join(t.work, ".git"))
+    proj = t.host.join(t.work, ".claude", "skills")
+    review = skillput(t, proj, "review", "---\nname: review\ndescription: Review\n"
+                      "disable-model-invocation: true\n---\nREVIEW-BODY\n")
+    t.host.write(t.host.join(review, "ref.txt"), "reference text\n")
+    user = t.host.join(env["XDG_CONFIG_HOME"], "prospero", "skills")
+    skillput(t, user, "notes", "---\ndescription: Take notes\n---\nNOTES-BODY\n")
+
+    r = t.run(env=env, extra=["-r", "reviewer"])
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    own, kids = r.sessions()
+    rec = r.all("session", own)[0]
+    t.check(rec.get("role_skills") == "review missing, notes review" and
+            rec.get("prompt") == "Review. ROLE-MARK", f"record {rec}")
+    sysps = [fake_provider.system_of(q["body"]) for q in t.requests()]
+    parent = [x for x in sysps if "# Your role: reviewer" in x]
+    t.check(parent and all(x == parent[0] for x in parent), "the parent's prompt stays")
+    p = parent[0] if parent else ""
+    marks = [p.find(x) for x in ("ROLE-MARK", '<skill name="review" dir="', "REVIEW-BODY",
+                                 '<skill name="notes" dir="', "NOTES-BODY", "# Skills")]
+    t.check(-1 not in marks and marks == sorted(marks), f"in order {marks}")
+    t.check(p.count('<skill name="review"') == 1, "loaded once")
+    t.check("- notes: Take notes (loaded for your role, above)" in p and "- review:" not in p,
+            "the skills list")
+    ends = r.all("tool.end")
+    t.check(ends and ends[0]["status"] == "ok" and "reference text" in ends[0]["text"],
+            f"read {ends}")
+    t.check(not r.all("ask"), "no ask for the skill's directory")
+    grants = [g for g in r.all("grant") if g.get("by") == "skill" and g["sid"] == own]
+    t.check(sorted(g["path"].replace("\\", "/").rsplit("/", 1)[1] for g in grants) ==
+            ["notes"], f"grants, none inside the roots {grants}")
+    warns = [n["text"] for n in r.all("note")
+             if n.get("level") == "warn" and "[role reviewer] skills" in n["text"]]
+    t.check(len(warns) == 1 and "missing, as no skill has that name" in warns[0] and
+            "review," not in warns[0], f"warned {warns}")
+
+    t.check(len(kids) == 1 and kids[0]["role"] == "lone", f"kids {kids}")
+    child = [x for x in sysps if "# Your role: lone" in x]
+    t.check(child and "NOTES-BODY" in child[0] and "REVIEW-BODY" not in child[0] and
+            "# Your role: lone\n\nThese skills are loaded" in child[0], "the child's prompt")
+
+
 PARK = {"PROSPERO_TEST_MINUTE_MS": "20"}  # parked after 140 ms idle
 
 

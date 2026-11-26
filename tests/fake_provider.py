@@ -2349,6 +2349,23 @@ def sc_role_prompt_file(model, n, req):
         yield from answer(model, "Done.")
 
 
+def sc_role_skills(model, n, req):
+    sysp = system_of(req)
+    if "# Your role: lone" in sysp:
+        yield from answer(model, "Child has notes.")
+        return
+    k = step(req)
+    if k == 0:
+        i = sysp.index('<skill name="review" dir="') + len('<skill name="review" dir="')
+        base = sysp[i:sysp.index('"', i)].replace("&quot;", '"')
+        yield from tool(model, n, "read", {"path": base + "/ref.txt"})
+    elif k == 1:
+        yield from tool(model, n, "task", {"description": "Notes", "prompt": "Go.",
+                                           "role": "lone"})
+    else:
+        yield from answer(model, "Done.")
+
+
 def sc_park_revive(model, n, req):
     if step(req) == 0:
         yield from answer(model, "First answer.")

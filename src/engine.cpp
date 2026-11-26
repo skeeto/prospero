@@ -1012,6 +1012,9 @@ struct Session {
     // Roles and subagents
     Str          role;       // the role's name, empty if none
     Str          rolepr;     // its prompt, in the system prompt
+    Str          roleskills; // its skills' names, loaded there (buildprefix)
+    Str          rolewarn;   // those not loaded, and why (buildprefix)
+    Slice<Str>   roledirs;   // the loaded ones' directories, to grant
     i32          depth;      // 0 for a session of the user's
     Str          psid;       // a subagent's parent, else empty
     Str          pcall;      // and the call that started it
@@ -19191,6 +19194,91 @@ static void instrlogstart(Session *s, Arena scratch)
 
 static void taskroles(Engine *, Arena *, Arena, ToolEnv *);
 
+// The skills a role always loads ([role] skills), in the scratch: each
+// one's instructions in a skill block, as /NAME sends them, for the
+// system prompt after the role's prompt, their names pushed on loaded.
+// One that cannot be loaded is left out, with why in rolewarn; the
+// loaded ones' directories wait in roledirs, to be granted once the
+// session is recorded (roleheed). A relayed skill would need a fetch,
+// so it is left out too. At most ROLE_SKILLMAX bytes in all.
+#define ROLE_SKILLMAX (256<<10)
+static Str roleskillblocks(Session *s, Arena *a, Slice<Str> *loaded)
+{
+    s->rolewarn = {};
+    s->roledirs = {};
+    Slice<Str> names = instrnames(a, s->roleskills);
+    if (!names.len) {
+        return {};
+    }
+    Skills sk = sessskills(s, a);
+    Buf    b(a, 1024);
+    Buf    w(a, 256);
+    for (iz i = 0; i < names.len; i++) {
+        Str  name = names[i];
+        b32  dup  = 0;
+        for (iz j = 0; j < i; j++) {
+            dup |= names[j] == name;
+        }
+        if (dup) {
+            continue;
+        }
+        Skill *k   = skillbyname(sk.list, name);
+        Str    why = {};
+        Str    body = {};
+        if (skilldeny(s->e)) {
+            why = "skills are off ([skills] enabled)";
+        } else if (!k) {
+            why = "no skill has that name";
+        } else if (k->peer) {
+            why = "it is a copy from another computer, which a role cannot load";
+        } else if (k->builtin) {
+            body = builtinbody(s->e, a);
+        } else {
+            SkillMeta m = skillload(s->e->os, a, k);
+            why  = m.err;
+            body = m.err.data ? Str{} : m.body;
+        }
+        Str block = why.data ? Str{} : skillprompt(a, k, body, {});
+        if (!why.data && b.len+block.len+2 > ROLE_SKILLMAX) {
+            why = "the role's skills would be over 256 KiB together";
+        }
+        if (why.data) {
+            if (!w.len) {
+                print(&w, "[role ");
+                print(&w, s->role);
+                print(&w, "] skills: not loaded: ");
+            } else {
+                print(&w, "; ");
+            }
+            print(&w, utf8head(name, SKILL_NAME));
+            print(&w, ", as ");
+            print(&w, why);
+            continue;
+        }
+        print(&b, b.len ? Str("\n\n") : Str(""));
+        print(&b, block);
+        *loaded = push(a, *loaded, k->name);
+        if (k->dir.len && !k->builtin) {
+            s->roledirs = push(&s->perm, s->roledirs, clone(&s->perm, k->dir));
+        }
+    }
+    s->rolewarn = w.len ? clone(&s->perm, finish(&w)) : Str{};
+    return finish(&b);
+}
+
+// What became of a role's skills as the prefix was built, once the
+// session is recorded: those left out warned of, and the loaded ones'
+// directories granted for reads, as the skill tool grants them.
+static void roleheed(Session *s, Arena scratch)
+{
+    if (s->rolewarn.len) {
+        note(s, scratch, "warn", s->rolewarn);
+    }
+    for (iz i = 0; i < s->roledirs.len; i++) {
+        skillgrant(s, scratch, s->roledirs[i]);
+    }
+}
+
 // What every request of the session begins with, the system prompt and
 // the tools, built from the session and the configuration as they are
 // now, and the job limits the tools describe.
@@ -19226,11 +19314,22 @@ static void buildprefix(Session *s, Arena scratch)
     s->system = s->wt.name.len ? concat(&s->perm, s->system, wtpromptline(s, &scratch))
                                : s->system;
     s->tools  = tooljson(&s->perm, &s->te);
-    if (s->rolepr.len) {
+    Slice<Str> roleloaded = {};
+    Str        roleblocks = roleskillblocks(s, &scratch, &roleloaded);
+    if (s->rolepr.len || roleblocks.len) {
         s->system = concat(&s->perm, s->system, "\n\n# Your role: ");
         s->system = concat(&s->perm, s->system, s->role);
+    }
+    if (s->rolepr.len) {
         s->system = concat(&s->perm, s->system, "\n\n");
         s->system = concat(&s->perm, s->system, s->rolepr);
+    }
+    if (roleblocks.len) {
+        s->system = concat(&s->perm, s->system,
+                           "\n\nThese skills are loaded for your role. Follow "
+                           "them where they apply; there is no need to call "
+                           "the skill tool for them.\n\n");
+        s->system = concat(&s->perm, s->system, roleblocks);
     }
     if (s->ep.kind == EP_BUILTIN) {
         // Measured on the starter evals, for a small model
@@ -19324,6 +19423,12 @@ static void buildprefix(Session *s, Arena scratch)
             print(&t, s->skillseen[i].name);
             print(&t, ": ");
             print(&t, s->skillseen[i].desc);
+            for (iz j = 0; j < roleloaded.len; j++) {
+                if (roleloaded[j] == s->skillseen[i].name) {
+                    print(&t, " (loaded for your role, above)");
+                    break;
+                }
+            }
         }
         if (t.len) {
             s->system = concat(&s->perm, s->system,
@@ -19416,6 +19521,7 @@ static i32 reprefix(Session *s, Arena scratch)
     }
     mcpbase(s, scratch, add);
     logprefix(s, scratch);
+    roleheed(s, scratch);
 
     i32 r = PREFIX_REBUILT;
     r |= !(instr == s->instr)   ? PREFIX_INSTR  : 0;
@@ -19716,6 +19822,9 @@ static void logsession(Session *s, Arena scratch)
     if (s->rolepr.len) {
         putstrkey(&w.json, "prompt", s->rolepr);
     }
+    if (s->roleskills.len) {
+        putstrkey(&w.json, "role_skills", s->roleskills);
+    }
     if (s->te.edit != EDIT_REPLACE) {
         putstrkey(&w.json, "edit_format", editnames[s->te.edit]);
     }
@@ -19764,6 +19873,7 @@ struct Role {
     Str name;
     Str desc;
     Str prompt;
+    Str skills;    // names of skills it always loads, blank-separated
     Str model;     // empty for the session's own, or the parent's
     Str endpoint;
     u32 deny;      // tools not offered
@@ -19820,6 +19930,7 @@ static Role findrole(Engine *e, Str name)
     r.name     = name;
     r.desc     = desc.data ? trim(desc) : b>=0 ? builtinroles[b].desc : Str{};
     r.prompt   = pr.data ? trim(pr) : b>=0 ? builtinroles[b].prompt : Str{};
+    r.skills   = trim(cfgget(c, "role", name, "skills", 0));
     r.model    = trim(cfgget(c, "role", name, "model", 0));
     r.endpoint = trim(cfgget(c, "role", name, "endpoint", 0));
     r.deny     = tooldeny(tools);
@@ -20089,6 +20200,7 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err,
     s->te.edit = s->mc.edit;
     s->role    = clone(&s->perm, r.name);
     s->rolepr  = roleprompt(e, &s->perm, scratch, r);
+    s->roleskills = clone(&s->perm, r.skills);
     s->depth   = p->depth + 1;
     s->te.deny = r.deny | (s->depth>=TASK_DEPTH ? (u32)1<<TOOL_TASK : 0) |
                  deskdeny(e, scratch, 1) | skilldeny(e) | webdeny(e) |
@@ -20135,6 +20247,9 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err,
     }
     if (s->shellwarn.len) {
         note(s, scratch, "warn", s->shellwarn);
+    }
+    if (!s->wtdefer) {
+        roleheed(s, scratch);
     }
     for (iz i = 0; i < s->grants.len; i++) {
         loggrant(s, scratch, s->grants[i], "parent", {}, {});
@@ -22063,6 +22178,7 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
     s->attended   = jsonflag(jsonget(j, "attended"), 0);
     s->role       = clone(&s->perm, role.name);
     s->rolepr     = roleprompt(e, &s->perm, scratch, role);
+    s->roleskills = clone(&s->perm, role.skills);
     s->te.deny    = role.deny | (tools.data ? tooldeny(tools) : 0) |
                     deskdeny(e, scratch, role.ok) | skilldeny(e) | webdeny(e);
     if (task.ok) {
@@ -22139,6 +22255,9 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
     }
     if (s->shellwarn.len) {
         note(s, scratch, "warn", s->shellwarn);
+    }
+    if (!s->wtdefer) {
+        roleheed(s, scratch);
     }
     if (guess) {
         // The default model names no endpoint, and more than one lists it
@@ -22448,6 +22567,7 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             // Its role and place among subagents, as it began
             s->role   = clone(&s->perm, jsonstr(jsonget(j, "role")));
             s->rolepr = clone(&s->perm, jsonstr(jsonget(j, "prompt")));
+            s->roleskills = clone(&s->perm, jsonstr(jsonget(j, "role_skills")));
             // A parent on another host is no session here
             Str parent = clone(&s->perm, jsonstr(jsonget(j, "parent")));
             if (jsonflag(jsonget(j, "remote"), 0)) {
