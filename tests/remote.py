@@ -149,6 +149,7 @@ fake_provider.SCENARIOS["remote_slow"] = sc_remote_slow
 fake_provider.SCENARIOS["remote_search"] = sc_remote_search
 fake_provider.SCENARIOS["remote_fetch"] = sc_remote_fetch
 fake_provider.SCENARIOS["remote_tool"] = sc_remote_tool
+fake_provider.SCENARIOS["relay_inline"] = fake_provider.sc_an_plain
 fake_provider.SCENARIOS["remote_big"] = sc_remote_big
 fake_provider.SCENARIOS["remote_flood"] = sc_remote_flood
 fake_provider.SCENARIOS["remote_an"] = fake_provider.sc_an_plain
@@ -4148,6 +4149,38 @@ def relay_serve(t):
     c.stream.command({"cmd": "relay.call", "cid": e, "origin": "thin", "cancel": 1})
     d = sv.done(e)
     t.check(d["err"] == "cancel", f"cancel: {d}")
+
+
+@scenario
+def relay_inline(t):
+    """An engine offers the inline-tools beta only for its endpoints at
+    Anthropic's own API, and passes on a thin engine's anthropic-beta
+    only when it is that beta: another word never reaches the API."""
+    t.write_config(t.url, f"[endpoint an]\nurl = {t.url}/\nkind = anthropic\n"
+                          "key = env:PROSPERO_TEST_KEY\n"
+                          "[endpoint api]\nurl = https://api.anthropic.com\n"
+                          "kind = anthropic\nkey = env:PROSPERO_TEST_KEY\n")
+    t.env["PROSPERO_TEST_KEY"] = fake_provider.AN_KEY
+    c = Client(t)
+    c.attach()
+    c.call("hello")
+    r = c.call("offer")
+    t.check(r.get("ok") == 1, f"offer {r}")
+    betas = {e["name"]: e.get("betas") for e in r["offer"]["endpoints"]}
+    t.check(betas == {"fake": None, "an": None, "api": [fake_provider.AN_INLINE]},
+            f"betas {betas}")
+
+    sv = Served(t, c)
+    model = t.model("relay_inline")
+    body = json.dumps({"model": model, "max_tokens": 100, "stream": True,
+                       "messages": [{"role": "user", "content": "hi"}]}).encode()
+    for beta, want in ((fake_provider.AN_INLINE, fake_provider.AN_INLINE),
+                       ("other-2026-01-01", None), (None, None)):
+        d = sv.done(sv.call(body, path="v1/messages", endpoint="an", kind="anthropic",
+                            model=model, extra={"beta": beta} if beta else None))
+        t.check(d["err"] == "ok", f"{beta}: {d}")
+        got = fake_provider.STATE.log(model)[-1]["headers"].get("anthropic-beta")
+        t.check(got == want, f"{beta}: sent {got!r}")
 
 
 @scenario

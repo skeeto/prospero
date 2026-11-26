@@ -122,7 +122,8 @@ Tools that join a session after its first request (an MCP server ready
 late, a tool turned on) are defined in the conversation where they
 join, by the API's inline-tools beta, so the cache still reads all
 that came before them. `[model NAME] inline_tools` says when: `auto`
-(the default) at `api.anthropic.com` for the models known to take it,
+(the default) at `api.anthropic.com`, directly or relayed by a
+computer that connects to it, for the models known to take it,
 `yes`, or `no`. Without it they are added to the tools, which rewrites
 the cache once, and so is a model that refuses them, from then on.
 

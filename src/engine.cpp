@@ -2557,6 +2557,7 @@ static b32 admit(Session *s, Arena scratch)
 static RelayCall *relaystart(Engine *, Endpoint *, HttpReq *, Session *,
                              b32 keep, Arena scratch, i64 to, Str sid = {});
 struct RelayPeer;
+static b32 relayinline(Session *, Endpoint *);
 static Slice<Skill> relayskills(Engine *, Session *, Arena *);
 static void relaycancel(Engine *, RelayCall *);
 static void relayfree(Engine *, RelayCall *);
@@ -2977,9 +2978,9 @@ static void newattempt(Session *s)
 // Whether a request of a model at an endpoint may define tools that
 // joined mid-conversation where they joined (anthropic.cpp), which keeps
 // the prompt cache: as [model] inline_tools says, by default only at
-// Anthropic's own API (not Copilot's, nor through a relay, nor another
-// server of its format) for the models known to take it, and never for
-// one that refused it.
+// Anthropic's own API (not Copilot's, nor another server of its format),
+// directly or through a relay that passes on the beta, for the models
+// known to take it, and never for one that refused it.
 static b32 inlineok(Session *s, Endpoint *ep, ModelConf *mc)
 {
     if (ep->wire!=EP_ANTHROPIC || mc->inlinetools==INLINE_NO) {
@@ -2994,8 +2995,9 @@ static b32 inlineok(Session *s, Endpoint *ep, ModelConf *mc)
         return 1;
     }
     Url u = parseurl(ep->url);
-    return ep->kind==EP_ANTHROPIC && !ep->relay.len && u.ok &&
-           equalfold(u.host, "api.anthropic.com") && anfamily(mc->name);
+    b32 api = ep->relay.len ? relayinline(s, ep)
+                            : u.ok && equalfold(u.host, "api.anthropic.com");
+    return ep->kind==EP_ANTHROPIC && api && anfamily(mc->name);
 }
 
 static void sendchat(Session *s, Arena scratch)

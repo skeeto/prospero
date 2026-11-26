@@ -53,7 +53,8 @@ static void testrelayparse(Test *t)
         "{\"name\":\"fake\",\"kind\":\"openai\",\"url\":\"http://secret/\","
         "\"key\":\"sk-2\",\"first_byte_timeout\":\"5\",\"connect_timeout\":\"1\","
         "\"slow_retry_budget\":\"60\",\"models\":[\"m1\",\"m2\\nx\"]},"
-        "{\"name\":\"an\",\"kind\":\"anthropic\",\"idle_timeout\":\"9\\n[x]\"},"
+        "{\"name\":\"an\",\"kind\":\"anthropic\",\"idle_timeout\":\"9\\n[x]\","
+        "\"betas\":[\"x\",\"inline-tools-2026-09-15\"]},"
         "{\"name\":\"gpt\",\"kind\":\"chatgpt\"},{\"name\":\"next\",\"kind\":\"future\"},"
         "{\"name\":\"bad name\"},{\"name\":\"fake\"}],"
         "\"models\":["
@@ -77,6 +78,7 @@ static void testrelayparse(Test *t)
     expect(t, "relayparse.eps", istr(&a, p.eps.len), "3");
     expect(t, "relayparse.models", istr(&a, p.eps[0].models.len), "1");
     expect(t, "relayparse.kind", istr(&a, p.eps[1].kind), istr(&a, EP_ANTHROPIC));
+    expect(t, "relayparse.betas", istr(&a, p.eps[0].inlines*10 + p.eps[1].inlines), "1");
     expect(t, "relayparse.layer", p.layer,
            "# relayed from mybox.localwithaverylongnamethatgoesonandonandonpastsixty-three\n"
            "endpoint = fake\n"
@@ -334,6 +336,7 @@ static void testrelaycall(Test *t)
     c.path               = "v1/messages";
     c.method             = "POST";
     c.accept             = "text/event-stream";
+    c.beta               = anbeta;
     c.model              = "m1";
     c.readms             = 5000;
     c.kind               = EP_COPILOT;

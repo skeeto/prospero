@@ -58,6 +58,7 @@ struct RelayEp {
     Str        name;
     i32        kind;    // EP_*
     Slice<Str> models;  // as its listing gave them, none for any
+    b32        inlines; // it passes on anbeta, for tools defined inline
 };
 
 // A connected computer's offer, kept after it goes, so that the sessions
@@ -103,6 +104,7 @@ struct RelayCall {
     Str        path;     // after the endpoint's URL, as "v1/messages"
     Str        method;
     Str        accept;
+    Str        beta;     // its anthropic-beta header, if any
     Str        model;
     i32        readms;
     i32        kind;     // its endpoint's, EP_*
@@ -143,6 +145,7 @@ struct RelayServe {
     Str         path;
     Str         method;
     Str         accept;
+    Str         beta;    // anbeta or none: what the far side's said
     Str         model;
     i32         readms;
     b32         keep;
@@ -359,6 +362,9 @@ static void relayparse(RelayPeer *p, Arena *a, Json *o)
                 ep.models = push(a, ep.models, clone(a, id));
                 n++;
             }
+        }
+        for (Json *m = jsonget(x, "betas")->child; m; m = m->next) {
+            ep.inlines |= jsonstr(m) == anbeta;
         }
         p->eps = push(a, p->eps, ep);
 
@@ -672,6 +678,15 @@ static b32 relayeligible(RelayPeer *p, Endpoint *ep, Str own)
            relayepof(p, ep);
 }
 
+// Whether the computer that relays session s's calls to ep passes on
+// anbeta, which it offers only for Anthropic's own API (inlineok).
+static b32 relayinline(Session *s, Endpoint *ep)
+{
+    RelayPeer *p = s->relaypeer ? relaypeerbynum(s->e, s->relaypeer) : 0;
+    RelayEp   *x = p ? relayepof(p, ep) : 0;
+    return x && x->inlines;
+}
+
 // A listing of the models that computers here offer at ep, as /v1/models
 // gives them, into b. Returns 0 if none offers ep.
 static b32 relaylisting(Engine *e, Buf *b, Endpoint *ep)
@@ -905,6 +920,9 @@ static RelayCall *relaystart(Engine *e, Endpoint *ep, HttpReq *req,
     c->method    = clone(&a, req->method);
     iz at        = find(req->headers, "Accept: ");
     c->accept    = at<0 ? Str{} : clone(&a, cut(cut(cuthead(req->headers, at+8),
+                                                    '\r').head, '\n').head);
+    at           = find(req->headers, "anthropic-beta: ");
+    c->beta      = at<0 ? Str{} : clone(&a, cut(cut(cuthead(req->headers, at+16),
                                                     '\r').head, '\n').head);
     c->model     = s && ep ? clone(&a, reqmc(s)->name) : Str{};
     c->readms    = req->readms;
@@ -1258,7 +1276,8 @@ static void relaysend(Engine *e, Arena scratch, RelayServe *v)
     HttpReq r = {};
     r.method    = v->method;
     r.url       = url;
-    r.headers   = authheaders(&scratch, &v->ep, v->accept);
+    r.headers   = authheaders(&scratch, &v->ep, v->accept,
+                              v->ep.kind==EP_ANTHROPIC ? v->beta : Str{});
     if (v->ep.kind == EP_CHATGPT) {
         r.headers = concat(&scratch, r.headers,
                            chatgptheaders(e, &scratch, &v->ep, v->session, 0));
@@ -1543,7 +1562,7 @@ static void relayskill(Engine *e, Arena scratch, RelayServe *v)
 // (cid, origin), as the last of keys repeated would.
 static Str relaycallkeys[] = {
     "session", "endpoint", "anthropic", "kind", "path", "method", "accept",
-    "model", "readms", "initiator", "interaction", "vision", "keep", "base",
+    "beta", "model", "readms", "initiator", "interaction", "vision", "keep", "base",
     "len", "size", "zlen", "part", "parts", "data",
 };
 
@@ -1652,6 +1671,7 @@ static void relayserve(Engine *e, Arena scratch, Json *j, i64 cid, Str origin,
         v->path    = clone(&v->arena, jsonstr(jsonget(j, "path")));
         v->method  = clone(&v->arena, jsonstr(jsonget(j, "method")));
         v->accept  = clone(&v->arena, jsonstr(jsonget(j, "accept")));
+        v->beta    = jsonstr(jsonget(j, "beta"))==anbeta ? anbeta : Str{};
         v->model   = clone(&v->arena, jsonstr(jsonget(j, "model")));
         i64 readms = jsonint(jsonget(j, "readms"), 0);
         v->readms  = (i32)(readms>0 && readms<3600000 ? readms : 0);
@@ -1879,6 +1899,9 @@ static Str relaypartline(Arena *a, RelayCall *c, iz part, i64 ts)
         putstrkey(&w.json, "path", c->path);
         putstrkey(&w.json, "method", c->method);
         putstrkey(&w.json, "accept", c->accept);
+        if (c->beta.len) {
+            putstrkey(&w.json, "beta", c->beta);
+        }
         putstrkey(&w.json, "model", c->model);
         putintkey(&w.json, "readms", c->readms);
         if (c->hint.initiator.len) {
@@ -2228,6 +2251,14 @@ static void relayofferput(Engine *e, JsonOut *w, Arena scratch, Str own, HostLin
         putobject(w);
         putstrkey(w, "name", s->name);
         putstrkey(w, "kind", epkindname(ep.kind));
+        if (ep.kind==EP_ANTHROPIC && !local && u.ok &&
+                equalfold(u.host, "api.anthropic.com")) {
+            // Its requests may define tools inline (inlineok)
+            putkey(w, "betas");
+            putarray(w);
+            putstr(w, anbeta);
+            putend(w);
+        }
         for (iz i = 0; i < countof(relayepkeys); i++) {
             // In plain seconds, as an older engine reads them (#59)
             Str v = trim(cfgget(cfg, "endpoint", s->name, relayepkeys[i], local));
