@@ -2349,10 +2349,10 @@ def sc_role_prompt_file(model, n, req):
         yield from answer(model, "Done.")
 
 
-def sc_role_skills(model, n, req):
+def sc_load_skills(model, n, req):
     sysp = system_of(req)
-    if "# Your role: lone" in sysp:
-        yield from answer(model, "Child has notes.")
+    if "# Your role: reviewer" not in sysp:
+        yield from answer(model, "Loaded what was asked.")
         return
     k = step(req)
     if k == 0:

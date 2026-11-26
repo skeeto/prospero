@@ -1525,7 +1525,7 @@ static void wtready(Session *s, Arena scratch)
         note(s, scratch, "warn", s->shellwarn);
     }
     if (built) {
-        roleheed(s, scratch);
+        loadheed(s, scratch);
     }
 }
 

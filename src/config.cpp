@@ -470,9 +470,10 @@ static CfgKey cfgschema[] = {
      "when a session starts: absolute, under ~, or relative to the file "
      "that sets it, at most 256 KiB; not from an include by URL"},
     {"role", "skills", CFG_STRING, "", {}, {}, "role",
-     "Names of skills always loaded in the role's sessions, separated by "
-     "blanks: each one's instructions go in the system prompt after the "
-     "role's prompt, so the agent need not call for them"},
+     "Skills always loaded in the role's sessions, after [skills] load's, "
+     "read left to right: NAME adds one and -NAME takes one away, as in "
+     "\"-notes review\"; each one's instructions go in the system "
+     "prompt, so the agent need not call for them"},
     {"role", "endpoint", CFG_STRING, "", {}, {}, "role",
      "Endpoint for the role, by default the session's, or a subagent's parent's"},
     {"role", "model", CFG_STRING, "", {}, {}, "role",
@@ -608,6 +609,11 @@ static CfgKey cfgschema[] = {
     {"skills", "disabled", CFG_STRING, "", {}, {}, "skills",
      "Names of skills left out altogether, from the agent and from "
      "/NAME, separated by blanks; prospero is Prospero's own"},
+    {"skills", "load", CFG_STRING, "", {}, {}, "skills",
+     "Names of skills always loaded in every session, separated by "
+     "blanks: each one's instructions go in the system prompt, so the "
+     "agent need not call for them; a role's skills may take one away "
+     "with -NAME"},
     {"skills", "share", CFG_STRING, "yes", {}, {}, "skills",
      "Which of your own skills (never a project's) thin remotes may use, "
      "as they relay through this computer: yes, no, or their names, "

@@ -82,10 +82,13 @@ from the next session on. An include by URL cannot set it.
 A role may always load skills: `skills = code-review checklist` puts
 each one's instructions in the system prompt after the role's
 prompt, so the agent has them from the start rather than calling the
-skill tool, and other roles can share the same skill. A skill hidden
-from the agent loads too; one disabled under `[skills]` does not, nor
-one from another computer. A name with no skill is left out, and the
-session says so when it starts.
+skill tool, and other roles can share the same skill. They add to
+`[skills] load`, which every session loads, and `-NAME` takes one of
+those away, as in `skills = -notes code-review`. A subagent loads its
+own role's skills, never its parent's. A skill hidden from the agent
+loads too; one disabled under `[skills]` does not, nor one from
+another computer. A name with no skill is left out, and the session
+says so when it starts.
 
 A subagent shows under its parent in the sidebar, folded away by its
 arrow. A subagent cannot be resumed, so once three or more under one

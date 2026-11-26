@@ -123,6 +123,15 @@ disabled = frontend-design
 A change applies to running sessions from their next request, and the
 agent is told of the skills it lost.
 
+`[skills] load` names skills the agent always has: each one's
+`SKILL.md` goes in the system prompt of every new session, so the
+agent follows it without having to call for it, and the skill stays
+usable as any other. A role's `skills` add to the list, and `-NAME`
+there takes one away (see [Subagents](help:jobs#subagents)). A skill
+hidden from the agent loads too; a disabled one does not, nor one from
+another computer. A name with no skill is left out, and the session
+says so when it starts. The list is read as each session starts.
+
 A remote with no models of its own uses your skills here too, copied
 there as they are used: see
 [A remote with no models of its own](help:hosts#a-remote-with-no-models-of-its-own).

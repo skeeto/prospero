@@ -1191,6 +1191,7 @@ static void testcfgjson(Test *t)
         "skills//paths=*\n"
         "skills//hidden=*\n"
         "skills//disabled=*\n"
+        "skills//load=*\n"
         "skills//share=yes*\n"
         "memory//enabled=true*\n"
         "memory//path=*\n"
