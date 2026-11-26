@@ -575,6 +575,31 @@ struct PlanClear {
     b32  todo;      // the agent has todo_write
 };
 
+static Str const planclearintro =
+    "The user approved the plan below and cleared the conversation "
+    "that planned it, so this checkpoint stands for it. The harness "
+    "wrote it, not a summarizer: the plan and the user's own words "
+    "are as they were.";
+
+// What an earlier summary keeps for a plan's checkpoint: its Goal and
+// Constraints, before its Progress, or of an earlier plan's checkpoint
+// the user's words, before its plan, which was carried out, and without
+// its intro, which this one has. Cut to PLANCLEAR_PREV.
+static Str planclearprev(Arena *a, Str prev)
+{
+    iz at = find(prev, "\n## Progress");
+    iz pl = find(prev, "\n## Approved plan");
+    at = at<0 || (pl>=0 && pl<at) ? pl : at;
+    prev = trim(at<0 ? prev : takehead(prev, at));
+    if (startswith(prev, "## Goal\n")) {
+        prev = trim(cuthead(prev, 8));
+    }
+    if (startswith(prev, planclearintro)) {
+        prev = trim(cuthead(prev, planclearintro.len));
+    }
+    return clip(a, prev, PLANCLEAR_PREV);
+}
+
 static Str planclearsummary(Arena *a, Slice<Msg> h, PlanClear *pc)
 {
     // The newest user messages that fit, each cut, oldest first
@@ -599,20 +624,12 @@ static Str planclearsummary(Arena *a, Slice<Msg> h, PlanClear *pc)
         dropped += h[i].user && h[i].role==ROLE_USER;
     }
 
-    Str prev = pc->prev;
-    if (prev.len) {
-        // Its Goal and Constraints, which come before its Progress
-        iz at = find(prev, "\n## Progress");
-        prev  = clip(a, trim(at<0 ? prev : takehead(prev, at)), PLANCLEAR_PREV);
-    }
+    Str prev = pc->prev.len ? planclearprev(a, pc->prev) : Str{};
 
     Buf b(a, 2048 + PLANCLEAR_USER + 64*said.len + prev.len + pc->plan.len +
              2*pc->planfile.len);
-    print(&b, "## Goal\n"
-              "The user approved the plan below and cleared the conversation "
-              "that planned it, so this checkpoint stands for it. The harness "
-              "wrote it, not a summarizer: the plan and the user's own words "
-              "are as they were.");
+    print(&b, "## Goal\n");
+    print(&b, planclearintro);
     if (prev.len) {
         print(&b, "\n\nFrom the summary of the conversation before the plan:\n\n");
         print(&b, prev);

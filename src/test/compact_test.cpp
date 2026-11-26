@@ -368,6 +368,29 @@ static void test_compact(Test *t)
         expect(t, "planclear plan", in("also in /s/plan.md:\n\n# Plan\n\n- PLANNED"), "in");
         expect(t, "planclear todo", in("todo_write"), "in");
 
+        // Again, after a plan's checkpoint: its user's words, not its
+        // plan, which was carried out, nor its intro twice
+        PlanClear pc2 = {};
+        pc2.prev     = s;
+        pc2.plan     = "# Plan two";
+        pc2.planfile = "/s/plan.md";
+        Str  s2  = planclearsummary(a, h, &pc2);
+        auto in2 = [&](Str x) { return find(s2, x)>=0 ? Str("in") : Str("out"); };
+        auto n2  = [&](Str x) {
+            i64 n = 0;
+            for (iz at = find(s2, x); at >= 0; n++) {
+                iz next = find(cuthead(s2, at+1), x);
+                at = next<0 ? -1 : at+1+next;
+            }
+            return istr(a, n);
+        };
+        expect(t, "planclear again first plan", in2("PLANNED"), "out");
+        expect(t, "planclear again plan", in2("# Plan two"), "in");
+        expect(t, "planclear again words", in2("First, do not commit."), "in");
+        expect(t, "planclear again intro", n2("The user approved the plan below"), "1");
+        expect(t, "planclear again sections", n2("## Approved plan"), "1");
+        expect(t, "planclear again next", n2("## Next steps"), "1");
+
         // Too long to repeat, many messages: the file named, the oldest left out
         Slice<Msg> many = {};
         mine.text = testmsg(a, ROLE_USER, 6000, {}).text;

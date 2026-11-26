@@ -13034,6 +13034,8 @@ def plan_clear(t):
                      plan=1)["sid"]
         h.send("prompt", sid=sid, text="Write inside, and do not commit.")
         ask = planask(h, sid)
+        first = "# First plan\n\n- Write **inside.txt**, FIRST-ONLY.\n"
+        t.host.write(ask["path"], first)  # revised by hand: as approved
         r = h.call("answer", sid=sid, req=ask["req"], decision="clear", note="")
         t.check(r.get("ok") == 1, f"cleared: {r}")
         end = ended(h, sid, 1)
@@ -13048,7 +13050,7 @@ def plan_clear(t):
                 cps[0]["cutseq"] > ask["seq"] and "model" not in cps[0], f"the record: {cps}")
         t.check(not t.compactions(), "no summarizer")
         summary = cps[0]["summary"]
-        t.check("Write inside, and do not commit." in summary and "# Plan" in summary and
+        t.check("Write inside, and do not commit." in summary and "FIRST-ONLY" in summary and
                 ask["path"] in summary and "## Files (kept by the harness)" in summary and
                 "Plan mode is on" not in summary, f"the checkpoint: {summary}")
 
@@ -13073,6 +13075,24 @@ def plan_clear(t):
         h.call("answer", sid=sid, req=enter["req"], decision="deny")
         ended(h, sid, 2)
         t.check(len(h.all("compact", sid)) == 1, "no second clear")
+
+        # A second plan cleared alike: its checkpoint has this plan, not
+        # the first, which was carried out; the user's words from before
+        # stay, from the first checkpoint (issue #109's follow-up)
+        h.call("mode", sid=sid, mode="plan")
+        t.host.write(ask["path"], "")
+        h.send("prompt", sid=sid, text="Write inside, the second time.")
+        again = planask(h, sid, ask["seq"])
+        h.call("answer", sid=sid, req=again["req"], decision="clear")
+        ended(h, sid, 3)
+        cps = h.all("compact", sid)
+        second = cps[-1]["summary"] if len(cps) == 2 else ""
+        t.check("# Plan\n\n- Write **inside.txt**." in second and "FIRST-ONLY" not in second and
+                "Write inside, the second time." in second and
+                "Write inside, and do not commit." in second and
+                second.count("## Approved plan") == 1 and
+                second.count("The user approved the plan below") == 1 and
+                second.count("## Files (kept by the harness)") == 1, f"the second: {second}")
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")
