@@ -5305,6 +5305,27 @@ static b32 isplanfile(Session *s, Str path)
                                             : path==s->planfile);
 }
 
+// Whether a normalized absolute path leads to the plan file of one of
+// the session's ancestors in memory: its real path is that file (a
+// real path), however it is spelled, and a link there cannot lead
+// elsewhere. A subagent reads it without asking, as the agent it works
+// for may hand it the plan to carry out (#111), unless the user denied
+// it; it changes it only as any other file outside its roots.
+static b32 ancestorplan(Session *s, Arena scratch, Str path)
+{
+    if (!s->parent) {
+        return 0;
+    }
+    Str real = realpathof(s->e->os, &scratch, path, s->guard.win);
+    for (i32 n = 0; real.data && s->parent && n<=TASK_DEPTH; n++) {
+        s = s->parent;
+        if (isplanfile(s, real)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 // Whether a write to a normalized absolute path is one Bypass mode
 // refuses: under the state directory, lexically or for real, but
 // neither the plan file (a real path) nor inside the guard's roots, as
@@ -16545,7 +16566,9 @@ static b32 runtool(Session *s, Arena scratch)
     if (!s->blocked && tool!=TOOL_NONE && toolhaspath(tool) && !args.issues.len) {
         Str       want = args.path.data ? args.path : Str(".");
         GuardPath g    = guardpath(e->os, &scratch, &s->guard, want, toolreads(tool));
-        b32       mine = isplanfile(s, g.path);  // the harness's own file
+        b32       mine = isplanfile(s, g.path) ||  // the harness's own file
+                         (toolreads(tool) && !g.deny.data &&
+                          ancestorplan(s, scratch, g.path));
         b32       plan = planning(s) && !toolreads(tool);  // refused
         g.config = !toolreads(tool) && !mine && !plan && !bypass &&
                    cfgfile(s, scratch, g.path) && !cfggranted(s, scratch, g.path);

@@ -13261,6 +13261,38 @@ def plan_task(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+@scenario(bound=20)
+def plan_read(t):
+    """A subagent reads the plan file of the agent it works for without
+    an ask, in Build and in plan mode (#111), but nothing else in that
+    session's directory: asked about as before, so denied unattended."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        sdir = t.host.join(t.state, "sessions", sid)
+        plan = t.host.join(sdir, "plan.md")
+        log = t.host.join(sdir, "events.jsonl")
+        t.host.write(plan, "# Plan\n\n- PLAN-TEXT\n")
+        h.send("prompt", sid=sid, text=f"Read: {plan}|{log}")
+        ended(h, sid, 1)
+        h.call("mode", sid=sid, mode="plan")
+        h.send("prompt", sid=sid, text=f"Read: {plan}|{log}")
+        ended(h, sid, 2)
+        kids = [e["sid"] for e in h.all("session") if e.get("parent") == sid]
+        t.check(len(kids) == 2, f"two subagents: {kids}")
+        t.check(modes(h, kids[-1]) == ["plan/parent"], f"planning: {modes(h, kids[-1])}")
+        for kid in kids:
+            te = h.all("tool.end", kid)
+            t.check([e["status"] for e in te] == ["ok", "denied"] and
+                    "PLAN-TEXT" in te[0]["text"], f"read, then refused: {te}")
+            asks = h.all("ask", kid)
+            t.check(len(asks) == 1 and asks[0].get("path", "").endswith("events.jsonl"),
+                    f"asked only about the log: {asks}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 PLANPROMPT = """[plan]
 prompt = Inline plan rule. PLAN-INLINE
 prompt_file = plan/rules.md

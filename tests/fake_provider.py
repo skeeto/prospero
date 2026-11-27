@@ -2621,6 +2621,41 @@ def sc_plan_task_b(model, n, req):
 # plan_prompt: as plan_task, its subagent planning too
 sc_plan_prompt, sc_plan_prompt_b = sc_plan_task, sc_plan_task_b
 
+
+# plan_read: "Read: P1|P2|..." has the parent pass that prompt to a
+# subagent, once per such prompt, which reads each path in turn
+
+def read_prompt(req):
+    """The index and text of the last "Read: " prompt."""
+    msgs = req.get("messages", [])
+    for i in range(len(msgs) - 1, -1, -1):
+        c = msgs[i].get("content")
+        if isinstance(c, list):
+            c = "".join(b.get("text", "") for b in c if b.get("type") == "text")
+        if msgs[i].get("role") == "user" and str(c or "").startswith("Read: "):
+            return i, str(c)
+    return -1, ""
+
+
+def sc_plan_read(model, n, req):
+    at, prompt = read_prompt(req)
+    msgs = req.get("messages", [])
+    if at >= 0 and not any(m.get("role") == "assistant" for m in msgs[at+1:]):
+        yield from tool(model, n, "task", {"description": "Read the plan",
+                                           "prompt": prompt, "model": second(model)})
+    else:
+        yield from answer(model, "Parent heard: " + tool_results(req)[0])
+
+
+def sc_plan_read_b(model, n, req):
+    _, prompt = read_prompt(req)
+    paths = prompt[len("Read: "):].split("|")
+    k = step(req)
+    if k < len(paths):
+        yield from tool(model, n, "read", {"path": paths[k]})
+    else:
+        yield from answer(model, "Child read.")
+
 # role_default: a plain answer, in whatever role the session has
 sc_role_default = sc_plain
 
