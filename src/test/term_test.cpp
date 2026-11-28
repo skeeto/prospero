@@ -136,6 +136,26 @@ static void test_term(Test *t)
                                   "Ubuntu", {}, 1, 1);
         expect(t, "termargv wsl", termwords(a, wsl),
                "C:/Windows/system32/wsl.exe|-d|Ubuntu");
+
+        // bash (builtin): this program on the terminal, off Windows,
+        // unless [terminal] shell says otherwise
+        Str self = "/proc/self/exe";
+        expect(t, "termargv builtin login",
+               termwords(a, termargv(a, {}, "/h", "builtin", "/exe/prospero", {}, "/bin/zsh",
+                                     0, 1, self)),
+               "/proc/self/exe|--bash|--term|-l");
+        expect(t, "termargv builtin",
+               termwords(a, termargv(a, {}, "/h", "builtin", "/exe/prospero", {}, "/bin/zsh",
+                                     0, 0, self)),
+               "/proc/self/exe|--bash|--term");
+        expect(t, "termargv builtin conf",
+               termwords(a, termargv(a, "fish", "/h", "builtin", "/exe/prospero", {}, "",
+                                     0, 1, self)),
+               "fish");
+        expect(t, "termargv builtin no self",
+               termwords(a, termargv(a, {}, "/h", "builtin", "/exe/prospero", {}, "/bin/zsh",
+                                     0, 1)),
+               "/bin/zsh|-l");
     }
 
     // The environment: other terminals' variables out, this one's in,
@@ -688,6 +708,13 @@ static void test_termmarks(Test *t)
             {"C:/Program Files/Git/bin/bash.exe", 1, "sh", HOOK_NONE, 0},
             {"/usr/bin/cmd", 0, "", HOOK_NONE, 0},
             {"", 0, "", HOOK_NONE, 0},
+            {"/proc/self/exe|--bash|--term", 0, "sh", HOOK_BASH, 0},
+            {"/exe/prospero|--bash|--term|-l", 0, "sh", HOOK_BASH, 1},
+            {"/exe/prospero|--bash|--term|-i", 0, "", HOOK_NONE, 0},
+            {"/exe/prospero|--bash|-l", 0, "", HOOK_NONE, 0},
+            {"/exe/prospero|--term|--bash", 0, "", HOOK_NONE, 0},
+            {"/exe/prospero|--bash|--term|-l|-x", 0, "", HOOK_NONE, 0},
+            {"C:/p/prospero.exe|--bash|--term", 1, "", HOOK_NONE, 0},
         };
         for (iz i = 0; i < countof(cases); i++) {
             Arena      s     = *a;
@@ -700,6 +727,21 @@ static void test_termmarks(Test *t)
                    istr(&s, cases[i].hook));
             expect(t, concat(&s, "termhookable login ", cases[i].words), istr(&s, login),
                    istr(&s, cases[i].login));
+        }
+
+        // A hooked bash keeps its program, and bash (builtin) its mode
+        static struct { Str words, want; } hooks[] = {
+            {"/bin/bash|-l", "/bin/bash|--init-file|/hd/bashrc"},
+            {"/exe/prospero|--bash|--term|-l",
+             "/exe/prospero|--bash|--term|--init-file|/hd/bashrc"},
+            {"/proc/self/exe|--bash|--term",
+             "/proc/self/exe|--bash|--term|--init-file|/hd/bashrc"},
+        };
+        for (iz i = 0; i < countof(hooks); i++) {
+            Arena s = *a;
+            expect(t, concat(&s, "termbashhook ", hooks[i].words),
+                   termwords(&s, termbashhook(&s, termlist(&s, hooks[i].words), "/hd", 0)),
+                   hooks[i].want);
         }
     }
 
@@ -748,6 +790,57 @@ static void test_termmarks(Test *t)
         }
     }
 
+    // Marks from raw output, for a tab with no screen: split anywhere,
+    // BEL or ST, only the tab's, B never the last, junk ignored
+    {
+        Str n = "n1";
+        static struct { Str data; Str want; } cases[] = {
+            {"\x1b]133;A;nonce=n1\x07", "A"},
+            {"\x1b]133;C;nonce=n1\x1b\\", "C"},
+            {"\x1b]133;C;nonce=n1\x07\x1b]133;D;0;nonce=n1\x07", "D"},
+            {"\x1b]133;A;nonce=n1\x07\x1b]133;B;nonce=n1\x07", "A"},
+            {"\x1b]133;C;nonce=n2\x07", "0"},
+            {"\x1b]133;C\x07", "0"},
+            {"\x1b]133;D;0;x=\\y;nonce=n1\x07", "D"},
+            {"\x1b]133;C;no\x18nce=n1\x07", "0"},
+            {"\x1b]7;file://h/x?nonce=n1\x07", "0"},
+            {"\x1b[0m\x1b\x1b]133;C;nonce=n1\x07", "C"},
+            {"\x1b]2;title\x1b[1m\x1b]133;C;nonce=n1\x07", "C"},
+            {"]133;C;nonce=n1\x07", "0"},
+        };
+        for (iz i = 0; i < countof(cases); i++) {
+            Arena s = *a;
+            // Whole, then a byte at a time
+            for (i32 split = 0; split < 2; split++) {
+                TermMarkScan sc   = {};
+                i32          last = 0;
+                Str          d    = cases[i].data;
+                if (!split) {
+                    last = termmarkscan(&sc, d, n, last);
+                } else {
+                    for (iz k = 0; k < d.len; k++) {
+                        last = termmarkscan(&sc, Str{d.data+k, 1}, n, last);
+                    }
+                }
+                Str got = last ? Str{(u8 *)&last, 1} : Str("0");
+                expect(t, concat(&s, concat(&s, "termmarkscan ", istr(&s, i)),
+                                 split ? Str(" split") : Str{}),
+                       clone(&s, got), cases[i].want);
+            }
+        }
+        // An OSC past the buffer is no mark, and the next one is
+        Arena        s  = *a;
+        TermMarkScan sc = {};
+        Buf          b(&s, 512);
+        print(&b, "\x1b]133;C;nonce=n1;");
+        for (i32 k = 0; k < 200; k++) putbyte(&b, 'x');
+        print(&b, "\x07");
+        i32 last = termmarkscan(&sc, finish(&b), n, 'A');
+        expect(t, "termmarkscan long", istr(&s, last=='A'), "1");
+        last = termmarkscan(&sc, "\x1b]133;C;nonce=n1\x07", n, last);
+        expect(t, "termmarkscan after long", istr(&s, last=='C'), "1");
+    }
+
     {
         struct {
             Str lang;
@@ -784,6 +877,10 @@ static void test_termmarks(Test *t)
              "pwsh.exe|powershell.exe", 1, 0, "C:/bin/pwsh.exe|-NoLogo"},
             {"cmd", "C:/w/busybox.exe|sh|-l", "busybox", "C:/w/busybox.exe", "cmd.exe", 1, 0,
              "C:/Windows/system32/cmd.exe"},
+            {"sh", "/exe/prospero|--bash|--term|-l", "builtin", "/exe/prospero", "bash", 0, 1,
+             "/exe/prospero|--bash|--term|-l"},
+            {"zsh", "/exe/prospero|--bash|--term|-l", "builtin", "/exe/prospero", "bash|zsh",
+             0, 1, "/exe/prospero|--bash|--term|-l"},
         };
         for (iz i = 0; i < countof(cases); i++) {
             Arena       s = *a;
@@ -803,9 +900,10 @@ static void test_termmarks(Test *t)
         }
     }
 
-    // bash (builtin) has no interactive mode, so a session's terminal
-    // opens the shell auto finds instead, and the session's own shell
-    // otherwise; as a terminal's shell it has no command line at all
+    // bash (builtin) is a plain tab's shell off Windows; an edit tab or
+    // a term.run, and every Windows tab, opens the shell auto finds
+    // instead, and the session's own shell otherwise; for an external
+    // terminal it has no command line at all
     {
         Arena   s  = *a;
         Os     *os = newos(&s, 1<<16);
@@ -826,14 +924,21 @@ static void test_termmarks(Test *t)
         ss->te.shell.name = BUILTIN_NAME;
         ss->te.shell.path = "/exe/prospero";
         ss->te.shell.kind = SHELL_BUILTIN;
-        Shell sh = termshellof(e, &s, ss);
+        Shell sh = termshellof(e, &s, ss, 0);
         expect(t, "termshellof builtin", concat(&s, concat(&s, sh.name, " "), sh.path),
                "bash /usr/bin/bash");
+        sh = termshellof(e, &s, ss, 1);
+        expect(t, "termshellof builtin tab", concat(&s, concat(&s, sh.name, " "), sh.path),
+               "bash (builtin) /exe/prospero");
+        ss->te.windows = 1;
+        sh = termshellof(e, &s, ss, 1);
+        expect(t, "termshellof builtin windows", istr(&s, sh.kind==SHELL_BUILTIN), "0");
+        ss->te.windows = 0;
         ss->te.shell      = {};
         ss->te.shell.name = "zsh";
         ss->te.shell.path = "/bin/zsh";
         ss->te.shell.kind = SHELL_SH;
-        sh = termshellof(e, &s, ss);
+        sh = termshellof(e, &s, ss, 1);
         expect(t, "termshellof own", concat(&s, concat(&s, sh.name, " "), sh.path),
                "zsh /bin/zsh");
         cfgfree(c);

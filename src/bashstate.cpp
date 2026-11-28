@@ -4,11 +4,14 @@
 // this part is portable and needs no library, so the tests cover it.
 //
 //   prospero --bash [--root DIR] [--carry IN] [--state OUT] ARGS...
+//   prospero --bash --term ARGS...
 //
 // ARGS are bash's own (-c CMD, -l), with $0 "bash". --root is the
 // Windows tools' directory (ub_config.root). --carry names the state
 // file whose exports this run starts with; --state, where it leaves its
-// own once it ends on its own (not a signal, not an abort).
+// own once it ends on its own (not a signal, not an abort). --term runs
+// the shell on the terminal it leads, a Terminal tab's (UB_TERMINAL,
+// POSIX): it carries nothing, so it takes none of the others.
 //
 // The state file, NUL-separated: a version line, then key and value
 // pairs, pwd and cwd (logical and native, either empty), then, only
@@ -21,7 +24,9 @@ struct BashArgs {
     Str root;
     Str carry;
     Str state;
+    Str err;   // why not ok
     i32 rest;  // index of bash's arguments, after the options
+    b32 term;
     b32 ok;
 };
 
@@ -31,12 +36,23 @@ static BashArgs bashargs(Str *args, i32 argc, i32 at)
     BashArgs r = {};
     i32 i = at + 1;
     for (; i < argc; i++) {
+        if (args[i] == "--term") {
+            r.term = 1;
+            continue;
+        }
         Str *dst = args[i]=="--root"  ? &r.root  :
                    args[i]=="--carry" ? &r.carry :
                    args[i]=="--state" ? &r.state : 0;
         if (!dst) break;
-        if (i+1 >= argc) return r;
+        if (i+1 >= argc) {
+            r.err = "an option needs a value";
+            return r;
+        }
         *dst = args[++i];
+    }
+    if (r.term && (r.root.len || r.carry.len || r.state.len)) {
+        r.err = "--term takes no --root, --carry or --state";
+        return r;
     }
     r.rest = i;
     r.ok   = 1;

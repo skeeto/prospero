@@ -5044,16 +5044,25 @@ struct BashRun {
     b32        known;  // delta was reported
 };
 
-static_assert(UB_VERSION >= 0x000700, "ub_exit.delta, linger, UB_SYSROOT");
+static_assert(UB_VERSION >= 0x000800, "ub_exit.delta, linger, UB_SYSROOT, UB_TERMINAL");
 
 static ub_os *bashos;
+static b32    bashterm;  // --term: the run has the terminal (UB_TERMINAL)
 
 // What the forwarder waits for: as ubhost's, every signal but those a
 // fault of the host's own raises (sent with kill, they kill it), and
-// SIGPIPE and SIGXFSZ, which the run raises on its own thread.
+// SIGPIPE and SIGXFSZ, which the run raises on its own thread. On a
+// terminal, Linux's real-time signals too, as bash would get them.
 static void bashwaitset(sigset_t *set)
 {
     sigemptyset(set);
+    #if __linux__
+    if (bashterm) {
+        for (i32 sig = SIGRTMIN; sig <= SIGRTMAX; sig++) {
+            sigaddset(set, sig);
+        }
+    }
+    #endif
     for (i32 sig = 1; sig < 32; sig++) {
         switch (sig) {
         case SIGKILL: case SIGSTOP: case SIGCHLD:
@@ -5075,7 +5084,10 @@ static void *bashforward(void *)
     for (;;) {
         i32 sig;
         if (sigwait(&set, &sig)) continue;
-        b32 group = sig==SIGTERM || sig==SIGINT || sig==SIGHUP;
+        // On a terminal every signal goes plainly, and at once: the
+        // kernel sent the terminal's ^C to the programs already, and a
+        // program dead of one waits (up to 250 ms) for this copy
+        b32 group = !bashterm && (sig==SIGTERM || sig==SIGINT || sig==SIGHUP);
         ub_signal(bashos, sig | (group ? UB_GROUP : 0));
     }
     return 0;
@@ -5162,6 +5174,9 @@ static Str bashslurp(Arena *a, Str path)
     _exit(status & 255);
 }
 
+// A handler that never runs: the signal stays blocked in every thread
+static void bashnever(int) {}
+
 [[noreturn]] static void bashhost(i32 argc, char **argv)
 {
     Os      os  = {};
@@ -5178,8 +5193,24 @@ static Str bashslurp(Arena *a, Str path)
     }
     BashArgs ba = bashargs(args, argc, 1);
     if (!ba.ok) {
-        writeall(2, "prospero: --bash: an option needs a value\n");
+        writeall(2, "prospero: --bash: ");
+        writeall(2, ba.err);
+        writeall(2, "\n");
         _exit(2);
+    }
+
+    // --term: a Terminal tab's shell, under --reap-tty, which made this
+    // process its terminal's session leader with its group in front.
+    // The library checks this too, but an early refusal says why.
+    bashterm = ba.term;
+    if (bashterm) {
+        pid_t self = getpid();
+        if (!isatty(0) || !isatty(2) || getsid(0)!=self ||
+            tcgetsid(2)!=self || tcgetpgrp(2)!=getpgrp()) {
+            writeall(2, "prospero: --bash --term: needs a terminal whose "
+                        "session it leads\n");
+            _exit(2);
+        }
     }
 
     // Dispositions as a host bash would get them: SIGCHLD the default,
@@ -5197,6 +5228,14 @@ static Str bashslurp(Arena *a, Str path)
     #if __APPLE__
     signal(SIGPIPE, SIG_IGN);
     signal(SIGXFSZ, SIG_IGN);
+    // XNU discards a signal whose default is to ignore it, blocked or
+    // not, unless it has a handler: so a resize would never reach the
+    // forwarder. Programs still start with these at their default.
+    if (bashterm) {
+        signal(SIGWINCH, bashnever);
+        signal(SIGURG,   bashnever);
+        signal(SIGIO,    bashnever);
+    }
     #endif
 
     // Room for the run's descriptors (ub_config.fds), which programs
@@ -5252,8 +5291,11 @@ static Str bashslurp(Arena *a, Str path)
     ub_config cfg = {};
     cfg.user = &run;
     cfg.fds    = 256;
-    cfg.exit   = bashonexit;
+    cfg.exit   = bashterm ? 0 : bashonexit;  // a tab carries no state
     cfg.linger = 1000;  // TERM, then this long, below the 2 s stop_grace
+    // In a tab the run's programs outlive it as bash's would: a Close
+    // hangs them up with the host, and only nohup'd ones survive
+    cfg.flags  = bashterm ? UB_TERMINAL : 0;
 
     ub_cmd cmd = {};
     cmd.argc   = nargs;

@@ -4857,7 +4857,13 @@ static i64 bashparent()
     #endif
     BashArgs ba = bashargs(args.data, (i32)args.len, 1);
     if (!ba.ok) {
-        os_print(os, 2, "prospero: --bash: an option needs a value\n");
+        Arena scratch = a;
+        os_print(os, 2, concat(&scratch, concat(&scratch, "prospero: --bash: ", ba.err), "\n"));
+        ExitProcess(2);
+    }
+    if (ba.term) {
+        // UB_TERMINAL is POSIX: on Windows the library refuses it
+        os_print(os, 2, "prospero: --bash --term: not on Windows yet\n");
         ExitProcess(2);
     }
 

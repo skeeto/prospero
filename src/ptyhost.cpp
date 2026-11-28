@@ -273,6 +273,9 @@ struct Term {
     iz          cwdlen;
     u8          nonce[32];  // its hooks' marks', when hooked
     b32         hooked;
+    b32         builtin;    // bash (builtin) on it: busy by its marks, as
+                            // its programs share its group (bash +m)
+    TermMarkScan mscan;     // its marks, from its output, with no screen
     b32         win;        // its shell is on Windows: OSC 7's paths are
     i32         lastmark;   // the last verified mark's letter but B, 0 for none
     TermCmds    cmds;       // its command lines, while its screen is kept
@@ -439,12 +442,22 @@ static Slice<Str> termenv(Arena *a, Slice<Str> env, b32 win, b32 mac, Str term)
 // The shell's argv: the configured words, ~ for home, else the session's shell as
 // Open in external terminal opens it, unless it is the system's default, else
 // $SHELL, else that default, else /bin/sh; a POSIX sh as a login shell
-// where login.
+// where login. bash (builtin), off Windows, is this program (self) on
+// the terminal: `self --bash --term`.
 static Slice<Str> termargv(Arena *a, Str conf, Str home, Str kind, Str path,
-                           Str distro, Str envshell, b32 win, b32 login)
+                           Str distro, Str envshell, b32 win, b32 login, Str self = {})
 {
     Slice<Str> r = termsplit(a, conf, home, win);
     if (r.len) {
+        return r;
+    }
+    if (kind=="builtin" && !win && self.len) {
+        r = push(a, r, self);
+        r = push(a, r, Str("--bash"));
+        r = push(a, r, Str("--term"));
+        if (login) {
+            r = push(a, r, Str("-l"));
+        }
         return r;
     }
     r = termshell(a, kind, path, win, distro);
@@ -894,13 +907,30 @@ static b32 termprogis(Str prog, Str name, b32 win)
     return win ? equalfold(base, name) : base==name;
 }
 
+// Whether argv is bash (builtin) on a terminal, as termargv makes it:
+// `PROG --bash --term`, alone or with -l (*login).
+static b32 termisbuiltin(Slice<Str> argv, b32 win, b32 *login)
+{
+    *login = 0;
+    if (win || argv.len<3 || argv.len>4 || !(argv[1]=="--bash") || !(argv[2]=="--term")) {
+        return 0;
+    } else if (argv.len == 4) {
+        *login = argv[3] == "-l";
+        return *login;
+    }
+    return 1;
+}
+
 // A terminal program's family, as term.open's reply gives it (kind):
 // "sh" for a POSIX shell, "ps" for PowerShell, "cmd" for cmd.exe on
 // Windows, else empty.
 static Str termkind(Slice<Str> argv, b32 win)
 {
+    b32 login;
     if (!argv.len) {
         return {};
+    } else if (termisbuiltin(argv, win, &login)) {
+        return "sh";
     }
     Str shs[] = {"sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "yash"};
     for (iz i = 0; i < countof(shs); i++) {
@@ -923,6 +953,9 @@ static Str termkind(Slice<Str> argv, b32 win)
 // argument may change how it starts, so it gets none.
 static i32 termhookable(Slice<Str> argv, b32 win, b32 *login)
 {
+    if (termisbuiltin(argv, win, login)) {
+        return HOOK_BASH;
+    }
     *login = 0;
     if (!argv.len || argv.len>2) {
         return HOOK_NONE;
@@ -941,6 +974,22 @@ static i32 termhookable(Slice<Str> argv, b32 win, b32 *login)
         }
     }
     return HOOK_NONE;
+}
+
+// A hooked bash's argv: ours in place of ~/.bashrc (--init-file), which
+// runs a login's files, after bash's own words: the program, and for
+// bash (builtin) its --bash --term.
+static Slice<Str> termbashhook(Arena *a, Slice<Str> argv, Str hdir, b32 win)
+{
+    b32        login;
+    iz         keep = termisbuiltin(argv, win, &login) ? 3 : 1;
+    Slice<Str> v    = {};
+    for (iz i = 0; i < keep; i++) {
+        v = push(a, v, argv[i]);
+    }
+    v = push(a, v, Str("--init-file"));
+    v = push(a, v, join(a, hdir, "bashrc"));
+    return v;
 }
 
 // One step of a Run's: a mark, or a line typed. Returns 1 when its C
@@ -1638,6 +1687,12 @@ static void termpump(Engine *e, Arena scratch, Term *t)
         if (!termemit(e, evend(&w))) {
             break;
         }
+        if (!t->screen && t->builtin && t->hooked) {
+            // No screen to see its marks, which say when it is busy:
+            // as they go out, and nothing kept for a read
+            Str nonce   = {t->nonce, countof(t->nonce)};
+            t->lastmark = termmarkscan(&t->mscan, s, nonce, t->lastmark);
+        }
         t->sent    += s.len;
         if (!t->away && !t->stallat) {
             t->stallat = os_ticks(e->os) + (i64)TERM_STALL*SEC;
@@ -1891,11 +1946,14 @@ static Str termrunwin(Engine *e, Arena *a, TermRunAsk *run, Shell *sh, Slice<Str
     return {};
 }
 
-// A session's terminal's shell: its own, but for bash (builtin), which
-// has no interactive mode, the one auto finds.
-static Shell termshellof(Engine *e, Arena *a, Session *s)
+// A session's terminal's shell: its own, but for bash (builtin) where
+// it cannot be interactive, the one auto finds. It can be (builtin) a
+// plain tab's or a Run block's on macOS and Linux (termargv), not an
+// edit tab's or a term.run's, which start a POSIX shell by path, nor on
+// Windows, where the GUI's executable has no console to give it.
+static Shell termshellof(Engine *e, Arena *a, Session *s, b32 builtin)
 {
-    if (s->te.shell.kind != SHELL_BUILTIN) {
+    if (s->te.shell.kind!=SHELL_BUILTIN || (builtin && !s->te.windows)) {
         return s->te.shell;
     }
     Str err = {};
@@ -1951,7 +2009,7 @@ static Str termstart(Engine *e, Arena *scratch, i64 id, Json *j, Session *s, Str
     // this process started with, as a terminal's would: not the login
     // environment a desktop-started window took (macOS), whose EDITOR
     // would start zsh in vi mode, its PATH entries doubled
-    Shell      sh    = termshellof(e, scratch, s);
+    Shell      sh    = termshellof(e, scratch, s, !ed.on && !run.on);
     b32        login = !(PTY_LINUX && e->gui);
     Slice<Str> env   = login && !win ? os_launchenv(e->os, scratch) : e->env;
     Str        path  = cfgsearchpath(e->cfg, scratch, envpath(env, win), e->home, win);
@@ -2008,8 +2066,9 @@ static Str termstart(Engine *e, Arena *scratch, i64 id, Json *j, Session *s, Str
         argv = push(scratch, argv, Str("--tty-edit"));
     } else {
         Str conf = trim(cfgget(e->cfg, "terminal", {}, "shell", 0));
+        Str self = PTY_LINUX ? Str("/proc/self/exe") : e->te.exe;
         argv = termargv(scratch, conf, e->home, shellkinds[sh.kind], sh.path, sh.distro,
-                        envget(env, "SHELL", win), win, login);
+                        envget(env, "SHELL", win), win, login, self);
         if (!argv.len) {
             return "[terminal] shell: a quote is left open";
         }
@@ -2087,6 +2146,8 @@ static Str termstart(Engine *e, Arena *scratch, i64 id, Json *j, Session *s, Str
     }
     Str kind  = ed.on || run.on ? Str{} : termkind(argv, win);
     b32 hlog  = 0;
+    b32 blog  = 0;
+    b32 bterm = !ed.on && !run.on && termisbuiltin(argv, win, &blog);
     i32 hook  = ed.on || run.on || !termintegrate(e) ? (i32)HOOK_NONE
                                                     : termhookable(argv, win, &hlog);
     Str hdir  = hook ? termhookdir(e, scratch) : Str{};
@@ -2107,12 +2168,7 @@ static Str termstart(Engine *e, Arena *scratch, i64 id, Json *j, Session *s, Str
             env = envset(scratch, env, "ZDOTDIR", join(scratch, hdir, "zsh"), win);
         } break;
         case HOOK_BASH: {
-            // Ours in place of ~/.bashrc, running a login's files
-            Slice<Str> v = {};
-            v = push(scratch, v, argv[0]);
-            v = push(scratch, v, Str("--init-file"));
-            v = push(scratch, v, join(scratch, hdir, "bashrc"));
-            argv = v;
+            argv = termbashhook(scratch, argv, hdir, win);
             if (hlog) {
                 env = envset(scratch, env, hookvars[2], Str("1"), win);
             }
@@ -2160,8 +2216,9 @@ static Str termstart(Engine *e, Arena *scratch, i64 id, Json *j, Session *s, Str
     copybytes(t->shell, label.data, t->shelllen);
     t->cwdlen = cwd.len<TERM_CWDCAP ? cwd.len : 0;
     copybytes(t->cwd, cwd.data, t->cwdlen);
-    t->hooked = nonce.len > 0;
-    t->win    = win;
+    t->hooked  = nonce.len > 0;
+    t->builtin = bterm;
+    t->win     = win;
     copybytes(t->nonce, nonce.data, nonce.len);
     termcmdreset(&t->cmds);
     t->cols   = termsize(j).cols;
@@ -2438,7 +2495,10 @@ static void termtick(Engine *e, Arena scratch)
             termwaitheed(e, scratch, t);
         }
         if (look && t->proc && !t->exited) {
-            b32 busy = os_ptybusy(e->os, t->proc);
+            // A program in front of the shell, or with bash (builtin),
+            // whose programs never are, a command between its C and D
+            b32 busy = t->builtin ? t->hooked && t->lastmark=='C'
+                                  : os_ptybusy(e->os, t->proc);
             if (busy != t->busy) {
                 Arena a = scratch;
                 Buf   b(&a, 256);

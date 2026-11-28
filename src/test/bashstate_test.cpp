@@ -35,6 +35,23 @@ static void test_bashstate(Test *t)
         Str cut[] = {"prospero", "--bash", "--state"};
         r = bashargs(cut, countof(cut), 1);
         expect(t, "args cut short", istr(a, r.ok), "0");
+
+        Str term[] = {"prospero", "--bash", "--term", "-l"};
+        r = bashargs(term, countof(term), 1);
+        expect(t, "args term", istr(a, r.ok && r.term && r.rest==3), "1");
+
+        Str termlate[] = {"prospero", "--bash", "-l", "--term"};
+        r = bashargs(termlate, countof(termlate), 1);
+        expect(t, "args term is bash's after", istr(a, r.ok && !r.term && r.rest==2), "1");
+
+        Str termcarry[] = {"prospero", "--bash", "--term", "--carry", "in.state"};
+        r = bashargs(termcarry, countof(termcarry), 1);
+        expect(t, "args term carry", istr(a, r.ok), "0");
+        expect(t, "args term carry err", r.err, "--term takes no --root, --carry or --state");
+
+        Str statelate[] = {"prospero", "--bash", "--state", "o", "--term"};
+        r = bashargs(statelate, countof(statelate), 1);
+        expect(t, "args state term", istr(a, r.ok), "0");
     }
 
     // Round trips

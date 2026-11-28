@@ -497,9 +497,15 @@ Right-click a session in the sidebar, or open the Session menu, for:
   does a new session (a worktree session too) or a subagent, and a
   rewind undoes a `cd` with the rest. A fork or a side chat starts
   where its original's next command would, and a fork into another
-  folder in that folder. bash (builtin) has no interactive mode yet, so
-  the Terminal pane's tabs and Run blocks of such a session use the
-  shell auto finds, and Open in external terminal the terminal's own.
+  folder in that folder. On Linux and macOS the Terminal pane's tabs
+  and Run blocks of such a session run bash (builtin) too, with line
+  editing and history, apart from the agent's commands: nothing
+  carries between them. It has no job control yet, so Ctrl+Z does
+  nothing, and closing a tab ends what it started in the background
+  unless that was started with `nohup`. Without the terminal's shell
+  integration, such a tab never shows that a program is running. On Windows they use the shell
+  auto finds, and Open in external terminal uses the terminal's own
+  everywhere.
 - **Export**: Markdown..., with or without reasoning and tool calls, to
   a file or the clipboard; or Raw log..., the session's log as it is.
 - **Archive**: move it under Archived, at the end of the sidebar.

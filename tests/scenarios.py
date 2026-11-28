@@ -22188,6 +22188,143 @@ def term_marks_bash(t):
                 h.close()
 
 
+@scenario(bound=90, posix=True)
+def builtin_term(t):
+    """bash (builtin) as the session's shell is its tabs' too, on macOS
+    and Linux: this program on the terminal (--bash --term), hooked as a
+    bash tab is, with the line editor, read -s, /dev/tty, ^C, a resize
+    and logout; a Close hangs it up, its history saved and what nohup
+    started left running."""
+    builtinconf(t)
+    hist = t.host.join(t.base, "builtin-history")
+    home = hookhome(t, "home", {
+        ".bash_profile": "echo user-bash_profile\n. ~/.bashrc\n",
+        ".bashrc": f"echo user-bashrc\nPS1='p$ '\nHISTFILE='{hist}'\n",
+    })
+    h = t.headless(env={"HOME": home})
+    try:
+        builtinon(h)
+        sid = termsession(t, h)
+        tt = Tty(t, h, sid)
+        r = tt.reply
+        t.check(r.get("kind") == "sh" and re.fullmatch(r"[0-9a-f]{32}", r.get("nonce") or ""),
+                f"reply {r}")
+        argv = r.get("argv") or []
+        t.check(len(argv) == 5 and argv[1:4] == ["--bash", "--term", "--init-file"] and
+                argv[4].endswith("/bashrc"), f"argv {argv}")
+        t.check(markwait(tt, 1) == ["A"], f"marks {marksof(tt)}")
+        t.check(startorder(tt) == ["bash_profile", "bashrc"], f"order {startorder(tt)}")
+        tt.type("echo v=${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}\r")
+        got = markline(tt, "v=").strip()
+        t.check(got == "v=5.3", f"version {got}")
+        markwait(tt, 4)
+        markrun(tt, "echo one; echo two", ["C", "D;0", "A"])
+        markrun(tt, "", ["D", "A"])
+        markrun(tt, "false", ["C", "D;1", "A"])
+        markrun(tt, "(exit 3)", ["C", "D;3", "A"])
+        odd = os.path.join(t.base, "odd %?#\x01 dir")
+        os.makedirs(odd)
+        markfolder(tt, odd)
+        markfolder(tt, t.work)
+
+        # The line editor: a key moves the cursor back before the X
+        promptwait(tt)
+        tt.type("echo ed=abc\x02\x02X\r")
+        got = markline(tt, "ed=")
+        t.check(got.strip() == "ed=aXbc", f"line editor: {got}")
+
+        # read -s echoes nothing, and /dev/tty is the tab
+        promptwait(tt)
+        tt.type("read -s v; echo got=$v\r")
+        tt.pump(lambda x: marksof(x)[-1:] == ["C"], 20, "read -s running")
+        tt.type("hush42\r")
+        got = markline(tt, "got=")
+        t.check(got.strip() == "got=hush42", f"read -s: {got}")
+        t.check(bytes(tt.data).count(b"hush42") == 1, "read -s echoed nothing")
+        promptwait(tt)
+        tt.type("echo tty-ok >/dev/tty\r")
+        markline(tt, "tty-ok")
+
+        # ^C ends the program in front, 130, and the shell goes on
+        promptwait(tt)
+        have = len(marksof(tt))
+        tt.type("sleep 30\r")
+        markwait(tt, have + 1)
+        # Busy while it runs, by its marks: its programs share its group
+        tt.pump(lambda x: x.busy[-1:] == [1], 10, "busy")
+        tt.type("\x03")
+        got = markwait(tt, have + 3)[have:]
+        t.check(got == ["C", "D;130", "A"], f"^C: marks {got}")
+        tt.pump(lambda x: x.busy[-1:] == [0], 10, "not busy")
+
+        # A resize reaches the shell (checkwinsize) and its programs.
+        # The editor redraws its prompt, a B with no A, as bash's does.
+        promptwait(tt)
+        bs = marksof(tt, True).count("B")
+        h.send("term.resize", tid=tt.tid, cols=123, rows=40)
+        tt.pump(lambda x: marksof(x, True).count("B") > bs, 20, "the prompt redrawn")
+        tt.type("sleep 0.1; echo size=$COLUMNS:$(stty size)\r")
+        got = markline(tt, "size=")
+        t.check(got.strip() == "size=123:40 123", f"resize: {got}")
+
+        # No job control yet
+        promptwait(tt)
+        tt.type("set -m; echo m=$?\r")
+        got = markline(tt, "m=")
+        t.check(got.strip() == "m=1", f"set -m: {got}")
+
+        tt.type("logout\r")
+        end = tt.ended()
+        t.check(end.get("code") == 0, f"logout {end}")
+
+        # A Close: the shell dies of the hang-up, its history saved, and
+        # what nohup started lives on
+        tt = Tty(t, h, sid)
+        markwait(tt, 1)
+        shfile = t.host.join(t.base, "shell-pid")
+        markrun(tt, f"echo $$ >{shfile}", ["C", "D;0", "A"])
+        shpid = int(t.host.read(shfile))
+        pidfile = t.host.join(t.base, "nohup-pid")
+        markrun(tt, f"nohup sh -c 'echo $$ >{pidfile}; exec sleep 60' >/dev/null 2>&1 &",
+                ["C", "D;0", "A"])
+        got = waitfile(t, pidfile, 10)
+        t.check(got and got.strip().isdigit(), f"nohup's pid: {got!r}")
+        pid = int(got)
+        markrun(tt, "echo marker-before-close", ["C", "D;0", "A"])
+        # At the prompt drawn whole: a hang-up during PROMPT_COMMAND
+        # loses the session's history, in bash too
+        promptwait(tt)
+        h.send("term.close", tid=tt.tid)
+        deadline = time.monotonic() + 10
+        while "marker-before-close" not in (t.host.read(hist) or ""):
+            t.check(time.monotonic() < deadline, f"history at close: {t.host.read(hist)!r}")
+            time.sleep(0.1)
+        # Once the shell is gone, and so its group hung up
+        t.check(t.gone([shpid], 10), "the shell ended with the hang-up")
+        time.sleep(0.3)
+        t.check(t.host.alive(pid), "nohup's program lives on")
+        t.host.killpid(pid)
+        t.check(not tt.busy or tt.busy[-1] == 0, f"not busy with a job behind: {tt.busy}")
+        h.close()
+
+        # With the agent kept out of terminals there is no screen for it,
+        # but a tab is still busy by its marks
+        t.host.write(t.config, t.host.read(t.config) + "[terminal]\nagent = false\n")
+        h = t.headless(env={"HOME": home})
+        sid = termsession(t, h)
+        tt = Tty(t, h, sid)
+        markwait(tt, 1)
+        promptwait(tt)
+        tt.type("sleep 30\r")
+        tt.pump(lambda x: x.busy[-1:] == [1], 10, "busy, agent off")
+        tt.type("\x03")
+        tt.pump(lambda x: x.busy[-1:] == [0], 10, "not busy, agent off")
+        tt.type("logout\r")
+        tt.ended()
+    finally:
+        h.close()
+
+
 @scenario(bound=60, posix=True)
 def term_marks_bashpreexec(t):
     """With bash-preexec loaded, the hooks go in its arrays."""

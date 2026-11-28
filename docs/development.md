@@ -113,6 +113,28 @@ A build without the library prints that bash (builtin) is not in it,
 and exits 126, as does a run that fails to start (2 when out of
 memory); an option without its value exits 2.
 
+A Terminal tab of a session whose shell is bash (builtin) runs, on
+Linux and macOS, an interactive one on its terminal:
+
+    prospero --bash --term [-l]
+
+with the hooks' `--init-file` after it, as for a bash tab. It carries
+nothing, so it takes no other option. It runs under `--reap-tty`, which
+makes it its terminal's session leader with its group in front, as
+the library's terminal mode (`UB_TERMINAL`, unabashed 0.8.0) requires;
+elsewhere it refuses to start and exits 2. It forwards every signal
+but SIGCHLD to the run plainly, as it comes. This is the library's
+first stage, `bash +m`: programs stay in its process group, `set -m` is
+refused, and a hang-up ends what it started but what ignores SIGHUP
+(`nohup`). Windows refuses `--term`: the GUI's executable has no
+console to give the library. Its programs share its group, so a tab
+is busy by the hooks' marks (from a C to its D), not by its foreground
+group, and without them (`[terminal] integration = false`) never. By
+hand, in a terminal of its own, on macOS and on Linux:
+
+    $ script -q /dev/null build/prospero --bash --term
+    $ script -q -c 'build/prospero --bash --term' /dev/null
+
 A command killed by a signal exits as its own bash would have, but
 for the signals that would dump core and leave a crash report naming
 `prospero`: QUIT, ILL, TRAP, ABRT, BUS, FPE, SEGV, SYS, XCPU, XFSZ,

@@ -68,6 +68,60 @@ static TermMark termmarkparse(Str payload, Str nonce)
     return r;
 }
 
+// The marks in a tab's raw output, for a tab with no screen to parse
+// them (bash (builtin)'s busy with [terminal] agent off): OSC 133 as
+// above, ended by BEL or ST, across chunks. Returns the last mark of the
+// tab's but B (that is still its prompt), else last; a longer OSC, and
+// one CAN or SUB cuts off, is no mark.
+struct TermMarkScan {
+    u8  buf[128];
+    i32 len;    // -1: past buf
+    i32 state;  // 0 text, 1 after ESC, 2 in an OSC, 3 after ESC in one
+};
+
+static i32 termmarkscan(TermMarkScan *s, Str data, Str nonce, i32 last)
+{
+    for (iz i = 0; i < data.len; i++) {
+        u8 c = data[i];
+        switch (s->state) {
+        case 0:
+            s->state = c==0x1b;
+            break;
+        case 1:
+            s->state = c==']' ? 2 : c==0x1b;
+            s->len   = 0;
+            break;
+        case 3:
+            if (c != '\\') {
+                s->state = c==']' ? 2 : c==0x1b;  // ESC began something else
+                s->len   = 0;
+                break;
+            }
+            [[fallthrough]];
+        case 2:
+            if (c==0x07 || s->state==3) {  // BEL, or ESC backslash (ST)
+                Str p = {s->buf, s->len>0 ? s->len : 0};
+                if (s->len>4 && startswith(p, "133;")) {
+                    TermMark m = termmarkparse(cuthead(p, 4), nonce);
+                    last = m.ok && m.kind!='B' ? m.kind : last;
+                }
+                s->state = 0;
+            } else if (c==0x18 || c==0x1a) {
+                s->state = 0;
+            } else if (c == 0x1b) {
+                s->state = 3;
+            } else if (s->len >= 0) {
+                s->len = s->len<(i32)sizeof(s->buf) ? s->len : -1;
+                if (s->len >= 0) {
+                    s->buf[s->len++] = c;
+                }
+            }
+            break;
+        }
+    }
+    return last;
+}
+
 // An OSC 7 URI's folder (file://HOST/PATH?nonce=N), decoded into buf,
 // if its nonce is the tab's; else null. On Windows "/C:/x" is "C:/x".
 // A folder with a NUL, or none, is refused.

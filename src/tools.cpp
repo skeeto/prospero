@@ -3731,7 +3731,9 @@ static Slice<Str> envdel(Arena *a, Slice<Str> env, Str name, b32 windows)
 // program: a POSIX sh as a login shell, so its profile sets it up; wsl
 // in its section's distro, if any. None for a POSIX system's bash or
 // /bin/sh, the defaults, where the terminal's own shell, the user's, is
-// better.
+// better, nor for bash (builtin), which a Terminal tab runs itself
+// (ptyhost.cpp termargv) and an external terminal cannot: it may not
+// lead its terminal's session there.
 static Slice<Str> termshell(Arena *a, Str kind, Str path, b32 win, Str distro = {})
 {
     Slice<Str> r = {};
