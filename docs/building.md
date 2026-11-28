@@ -21,7 +21,7 @@ checkout of unabashed.
 
 bash (builtin), the shell `[tools] shell = builtin` picks, is
 libunabashed, unabashed's from-scratch bash 5.3 as a library
-(`cmake/FetchUnabashed.cmake`, pinned to 0.7.2), linked into
+(`cmake/FetchUnabashed.cmake`, pinned to 0.8.0), linked into
 `prospero` and run as `prospero --bash` (see
 [Development](development.md#bash-builtin)). It makes the program
 about 1.7 MB larger (stripped, in a macOS Release build).
