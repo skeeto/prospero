@@ -13,13 +13,21 @@
 # way to override fetch behavior; we just compute the right name
 # and point it at the right place.
 
+#
+# FetchContent caches the directory it was given, so once deps/<dir>
+# is removed the cache still names it and configuring fails. Forget it
+# then, but only when it is that deps/ path: a -D override stays.
+
 function(fetch_content_bundled name dir)
-  if(IS_DIRECTORY "${CMAKE_SOURCE_DIR}/deps/${dir}")
-    string(TOUPPER "${name}" upper)
-    set(FETCHCONTENT_SOURCE_DIR_${upper}
-        "${CMAKE_SOURCE_DIR}/deps/${dir}" PARENT_SCOPE)
+  string(TOUPPER "${name}" upper)
+  set(bundled "${CMAKE_SOURCE_DIR}/deps/${dir}")
+  if(IS_DIRECTORY "${bundled}")
+    set(FETCHCONTENT_SOURCE_DIR_${upper} "${bundled}" PARENT_SCOPE)
     message(STATUS "${name}: bundled (deps/${dir})")
   else()
+    if("$CACHE{FETCHCONTENT_SOURCE_DIR_${upper}}" STREQUAL "${bundled}")
+      unset(FETCHCONTENT_SOURCE_DIR_${upper} CACHE)
+    endif()
     message(STATUS "${name}: downloaded")
   endif()
 endfunction()
